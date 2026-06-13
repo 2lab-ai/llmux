@@ -2,6 +2,8 @@
 
 teamagent is a Rust local proxy for Claude Code. It sits between Claude Code and Anthropic-shaped APIs, exposes `ANTHROPIC_BASE_URL=http://localhost:3456`, manages multiple Claude Max/API-key accounts plus optional Codex overflow accounts, and spends the account whose quota would otherwise expire first.
 
+![teamagent demo](screenshots/teamagent-demo.gif)
+
 The project began with proxy/OAuth mechanics from [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT), but the shipped implementation is Rust.
 
 ## What ships today
@@ -110,8 +112,8 @@ Config lives at `~/.config/teamagent.json` (respects `$XDG_CONFIG_HOME`; overrid
       "name": "user@example.com",
       "type": "oauth",
       "account_uuid": "...",
-      "access_token": "sk-ant-oat01-...",
-      "refresh_token": "sk-ant-ort01-...",
+      "access_token": "<oauth-access-token>",
+      "refresh_token": "<oauth-refresh-token>",
       "expires_at_ms": 1774384968427
     }
   ]
