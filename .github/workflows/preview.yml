@@ -1,0 +1,185 @@
+name: Preview
+
+# Publishes a prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>` with 4 binaries
+# + SHA256SUMS on every push to main/master (and on demand). The tap's
+# bump-teamagent-preview job derives the brew version (YYYY.MM.DD.HHMM)
+# from this tag, so the tag format is load-bearing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-publish
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build_id: ${{ steps.plan.outputs.build_id }}
+      tag: ${{ steps.plan.outputs.tag }}
+      commit: ${{ steps.plan.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compute build identity
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          stamp="$(date -u +%Y-%m-%d-%H%M)"
+          build_id="$stamp-$short_sha"
+          {
+            echo "commit=$commit"
+            echo "build_id=$build_id"
+            echo "tag=preview-$build_id"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: preflight
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: teamagent-macos-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: teamagent-macos-x86_64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: teamagent-linux-x86_64
+          # Native arm64 runner (free for public repos) — no cross/zigbuild needed.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: teamagent-linux-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TEAMAGENT_BUILD_CHANNEL: preview
+      TEAMAGENT_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: preview-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "target/${{ matrix.target }}/release/teamagent" "${{ matrix.name }}"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  publish:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for asset in teamagent-macos-aarch64 teamagent-macos-x86_64 teamagent-linux-x86_64 teamagent-linux-aarch64; do
+            cp "artifacts/$asset/$asset" "release/$asset"
+          done
+          (cd release && sha256sum teamagent-* > SHA256SUMS)
+          cat release/SHA256SUMS
+          {
+            echo "Preview build \`${{ needs.preflight.outputs.build_id }}\` from ${{ needs.preflight.outputs.commit }}."
+            echo
+            echo "Install: \`brew install 2lab-ai/tap/teamagent-preview\`"
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+          } > PREVIEW_NOTES.md
+
+      - name: Create preview prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: Preview build ${{ needs.preflight.outputs.build_id }}
+          body_path: PREVIEW_NOTES.md
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ needs.preflight.outputs.commit }}
+          files: |
+            release/teamagent-macos-aarch64
+            release/teamagent-macos-x86_64
+            release/teamagent-linux-x86_64
+            release/teamagent-linux-aarch64
+            release/SHA256SUMS
+
+      - name: Prune old preview prereleases (keep 15)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isPrerelease,createdAt > preview-releases.json
+          python3 - <<'PY' > old-preview-tags.txt
+          import json
+          with open("preview-releases.json", encoding="utf-8") as handle:
+              data = json.load(handle)
+          releases = [
+              release for release in data
+              if release.get("isPrerelease") and str(release.get("tagName", "")).startswith("preview-")
+          ]
+          releases.sort(key=lambda release: str(release.get("createdAt", "")), reverse=True)
+          for release in releases[15:]:
+              print(release["tagName"])
+          PY
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < old-preview-tags.txt

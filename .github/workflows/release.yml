@@ -1,0 +1,126 @@
+name: Release
+
+# Stable release on tag v*. The tag must match Cargo.toml's version
+# (spec: Versioning — Cargo.toml v0.x.y must match release tag).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: teamagent-macos-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: teamagent-macos-x86_64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: teamagent-linux-x86_64
+          # Native arm64 runner (free for public repos) — no cross/zigbuild needed.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: teamagent-linux-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TEAMAGENT_BUILD_CHANNEL: stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "error: tag $GITHUB_REF_NAME doesn't match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Set build id
+        shell: bash
+        run: echo "TEAMAGENT_BUILD_ID=${GITHUB_REF_NAME}-$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "target/${{ matrix.target }}/release/teamagent" "${{ matrix.name }}"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for asset in teamagent-macos-aarch64 teamagent-macos-x86_64 teamagent-linux-x86_64 teamagent-linux-aarch64; do
+            cp "artifacts/$asset/$asset" "release/$asset"
+          done
+          (cd release && sha256sum teamagent-* > SHA256SUMS)
+          cat release/SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/teamagent-macos-aarch64
+            release/teamagent-macos-x86_64
+            release/teamagent-linux-x86_64
+            release/teamagent-linux-aarch64
+            release/SHA256SUMS

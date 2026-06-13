@@ -1,0 +1,1039 @@
+//! axum listener + routing: `/teamagent/status`, raw `/v1/oauth/token`
+//! relay, and a catch-all that forwards everything else upstream (FR1).
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::extract::{ConnectInfo, State};
+use axum::middleware::Next;
+use axum::response::{IntoResponse as _, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use http::{header, HeaderValue, StatusCode};
+
+use super::logging::RequestLogger;
+use super::{forward, ProxyError};
+use crate::auth::oauth::RefreshCoalescer;
+use crate::config::{AccountCredential, Config};
+use crate::dashboard::{self, DashboardHub};
+use crate::logging::LogLine;
+use crate::provider::anthropic::AnthropicPassthrough;
+use crate::scheduler::select::SelectParams;
+use crate::scheduler::usage::UsagePoller;
+use crate::scheduler::{AccountId, AccountPool, PoolSnapshot};
+use crate::tui::{ActivityEvent, EVENT_CHANNEL_CAPACITY};
+
+/// Periodic scheduler re-evaluation (FR3: selection runs on a tick, never
+/// per-request). Public so the TUI can show a next-evaluation countdown.
+pub const EVALUATE_TICK: Duration = Duration::from_secs(60);
+
+/// Background token-refresh cadence. Each tick refreshes every healthy
+/// oauth account whose remaining token lifetime is under
+/// `scheduler.refresh_ahead_secs` — so tokens stay fresh with ZERO client
+/// traffic (the request-time 5-minute proactive refresh in `forward` stays
+/// as defense in depth). The first tick fires immediately at startup.
+const REFRESH_TICK: Duration = Duration::from_secs(600);
+
+/// Per-account relayed-traffic totals, owned by the proxy (the scheduler
+/// pool deliberately tracks quota windows only; src/scheduler is untouched).
+#[derive(Debug, Default)]
+pub struct UsageTotals {
+    inner: Mutex<HashMap<String, AccountTotals>>,
+}
+
+/// Lifetime counters for one account (since proxy start).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AccountTotals {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl UsageTotals {
+    pub fn record(
+        &self,
+        account: &AccountId,
+        requests: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = inner.entry(account.0.clone()).or_default();
+        entry.requests = entry.requests.saturating_add(requests);
+        entry.input_tokens = entry.input_tokens.saturating_add(input_tokens);
+        entry.output_tokens = entry.output_tokens.saturating_add(output_tokens);
+    }
+
+    pub fn get(&self, account: &AccountId) -> AccountTotals {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&account.0)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Shared per-request state. Cloning is cheap (`Arc` inside the pool,
+/// `reqwest::Client` is internally reference-counted).
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: AccountPool,
+    pub client: reqwest::Client,
+    pub config: Config,
+    /// `None` when request logging is disabled.
+    pub logger: Option<Arc<RequestLogger>>,
+    /// The Anthropic passthrough provider (byte-identity fast path), held
+    /// concretely (the trait's async `auth` is not dyn-compatible). Provider
+    /// choice is per-account-credential at forward time: codex credentials
+    /// route through [`Self::codex`], everything else through this.
+    pub provider: Arc<AnthropicPassthrough>,
+    /// The OpenAI Codex provider (Responses API translation) for
+    /// `type: "codex"` accounts. Holds the per-process session id.
+    pub codex: Arc<crate::provider::codex::CodexProvider>,
+    /// Coalesces concurrent OAuth refreshes per account.
+    pub refresher: Arc<RefreshCoalescer>,
+    /// Per-account relayed-traffic totals for `/teamagent/status`.
+    pub totals: Arc<UsageTotals>,
+    /// Where refreshed tokens are persisted (read-merge-write). `None`
+    /// disables persistence (tests).
+    pub config_path: Option<PathBuf>,
+    /// Activity feed emit side. The proxy / poller / refresher `try_send` and
+    /// drop on full — best-effort observability, never backpressure (see
+    /// `tui::event`). The matching receiver is folded into [`Self::hub`] by
+    /// the `dashboard::fold` task `serve` spawns.
+    pub events: Option<tokio::sync::mpsc::Sender<ActivityEvent>>,
+    /// Server-owned dashboard fold (activity ring, totals, last switch,
+    /// poller health, log console). The local TUI renders it directly; the
+    /// `GET /teamagent/dashboard` endpoint serializes it.
+    pub hub: Arc<DashboardHub>,
+    /// Activity-event receiver, taken by `serve` to spawn the fold task.
+    /// `Mutex<Option<_>>` so `AppState` stays `Clone` (the receiver is a
+    /// single-consumer resource — only the first `serve` takes it).
+    pending_events: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<ActivityEvent>>>>,
+    /// Tracing-bridge receiver (TUI mode only — the `RUST_LOG` channel feed
+    /// into the hub's log console). `None` in plain/daemon mode, where the
+    /// fold re-traces activity events so `server.log` keeps the history.
+    pending_logs: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<LogLine>>>>,
+    /// Per-process request id source for activity-event correlation.
+    pub request_counter: Arc<AtomicU64>,
+    /// Server start, for `/teamagent/status` uptime.
+    pub started: Instant,
+    /// Actually bound port (config port until `serve` binds; the OS-assigned
+    /// port afterwards — matters for `proxy.port = 0` test servers).
+    pub bound_port: Arc<AtomicU16>,
+    /// Graceful-shutdown trigger fired by `POST /teamagent/shutdown`.
+    pub shutdown: Arc<tokio::sync::Notify>,
+}
+
+impl AppState {
+    /// Build the shared state. The activity-event channel is created here:
+    /// the emit `Sender` lands in [`Self::events`] and the matching `Receiver`
+    /// is parked in [`Self::pending_events`] for `serve` to fold into the hub.
+    /// `logs_rx` is the optional tracing-bridge feed (TUI mode); its absence
+    /// is what tells the fold to re-trace activity events into `server.log`
+    /// (daemon parity).
+    pub fn new(
+        config: Config,
+        pool: AccountPool,
+        logger: Option<Arc<RequestLogger>>,
+        logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
+    ) -> Result<Self, ProxyError> {
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let provider = Arc::new(AnthropicPassthrough::new(config.upstream.clone()));
+        let codex = Arc::new(crate::provider::codex::CodexProvider::new(
+            config.codex.upstream.clone(),
+        ));
+        // A non-default upstream (staging, e2e mock) must also receive the
+        // proxy's OWN token refreshes — otherwise refresh traffic would leak
+        // to the production endpoint while everything else is redirected.
+        let refresher = if config.upstream == crate::config::schema::DEFAULT_UPSTREAM {
+            RefreshCoalescer::new()
+        } else {
+            RefreshCoalescer::with_token_url(format!(
+                "{}/v1/oauth/token",
+                config.upstream.trim_end_matches('/')
+            ))
+        };
+        Ok(Self {
+            pool,
+            client,
+            logger,
+            provider,
+            codex,
+            refresher: Arc::new(refresher),
+            totals: Arc::new(UsageTotals::default()),
+            config_path: crate::config::config_path().ok(),
+            bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
+            config,
+            events: Some(events_tx),
+            hub: Arc::new(DashboardHub::default()),
+            pending_events: Arc::new(Mutex::new(Some(events_rx))),
+            pending_logs: Arc::new(Mutex::new(logs_rx)),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            started: Instant::now(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    pub fn select_params(&self) -> SelectParams {
+        SelectParams::from(&self.config.scheduler)
+    }
+
+    /// Next activity-event correlation id (never leaves this process).
+    pub fn next_request_id(&self) -> u64 {
+        self.request_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Emit an activity event: `try_send`, dropped on a full channel.
+    pub fn emit(&self, event: ActivityEvent) {
+        if let Some(events) = &self.events {
+            let _ = events.try_send(event);
+        }
+    }
+}
+
+/// Run the proxy until shutdown: bind `config.proxy.port`, spawn the usage
+/// poller and the re-evaluation tick next to the listener, serve [`router`].
+///
+/// Binds all interfaces (teamclaude parity — the proxy api key with
+/// loopback exemption exists precisely for non-local peers).
+pub async fn run(
+    config: Config,
+    pool: AccountPool,
+    log_dir: Option<PathBuf>,
+    logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
+) -> Result<(), ProxyError> {
+    let logger = match log_dir {
+        Some(dir) => {
+            let logger = RequestLogger::new(dir.clone())?;
+            tracing::info!(dir = %dir.display(), "request logging enabled");
+            Some(Arc::new(logger))
+        }
+        None => None,
+    };
+    let state = AppState::new(config, pool, logger, logs_rx)?;
+    serve(state, None).await
+}
+
+/// [`run`] over a pre-built [`AppState`]: prime usage state, run the initial
+/// selection, spawn the poller + evaluation tick, bind, and serve.
+///
+/// `ready` (when given) receives the actual bound address once listening —
+/// the seam for `proxy.port = 0` callers (e2e tests) that need the
+/// OS-assigned port.
+pub async fn serve(
+    state: AppState,
+    ready: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+) -> Result<(), ProxyError> {
+    let params = state.select_params();
+
+    // Dashboard fold: the single consumer of the activity-event channel (and,
+    // in TUI mode, the tracing-bridge channel) into the hub. Spawned once —
+    // the receiver is taken out of `pending_events`/`pending_logs`. Without a
+    // bridge feed (plain/daemon mode) the fold also re-traces each activity
+    // event so `server.log` keeps the request history the TUI would show.
+    let fold_events = state
+        .pending_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let fold_logs = state
+        .pending_logs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let fold_task = fold_events.map(|events| {
+        let trace_events = fold_logs.is_none();
+        tokio::spawn(dashboard::fold(
+            state.hub.clone(),
+            events,
+            fold_logs,
+            trace_events,
+        ))
+    });
+
+    // Background: active usage polling (FR3) + periodic re-evaluation tick.
+    // One priming pass runs BEFORE the initial selection so the very first
+    // pick already ranks by real window state (soonest 7d reset) instead of
+    // falling back to cold-account id order.
+    let mut poller = UsagePoller::new(
+        state.pool.clone(),
+        state.client.clone(),
+        state.config.upstream.clone(),
+        state.config.scheduler,
+    )
+    .with_events(state.events.clone());
+    poller.tick(SystemTime::now()).await;
+
+    // Initial selection so the first request doesn't pay for it.
+    state.pool.evaluate(&params, SystemTime::now());
+    if let Some(current) = state.pool.snapshot().current {
+        state.emit(ActivityEvent::AccountSwitched {
+            from: None,
+            to: current.0,
+            reason: Some("initial selection".into()),
+        });
+    }
+
+    let poller_task = tokio::spawn(poller.run());
+
+    // Background token refresh (A2): first tick immediately, then every
+    // REFRESH_TICK. Lives next to the usage poller, aborted on shutdown.
+    let refresh_state = state.clone();
+    let refresh_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REFRESH_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            background_refresh_pass(&refresh_state).await;
+        }
+    });
+
+    let tick_pool = state.pool.clone();
+    let tick_events = state.events.clone();
+    let tick_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(EVALUATE_TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let before = tick_pool.snapshot().current;
+            let decision = tick_pool.evaluate(&params, SystemTime::now());
+            tracing::debug!(?decision, "evaluation tick");
+            if let crate::scheduler::select::Decision::Switch { to } = decision {
+                if let Some(events) = &tick_events {
+                    let _ = events.try_send(ActivityEvent::AccountSwitched {
+                        from: before.map(|id| id.0),
+                        to: to.0,
+                        reason: Some("re-evaluation".into()),
+                    });
+                }
+            }
+        }
+    });
+
+    let port = state.config.proxy.port;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(|source| ProxyError::Bind { port, source })?;
+    let local_addr = listener.local_addr().map_err(ProxyError::Io)?;
+    state.bound_port.store(local_addr.port(), Ordering::Relaxed);
+    if let Some(ready) = ready {
+        let _ = ready.send(local_addr);
+    }
+    tracing::info!(
+        port = local_addr.port(),
+        upstream = %state.config.upstream,
+        accounts = state.config.accounts.len(),
+        "proxy listening (ANTHROPIC_BASE_URL=http://localhost:{})",
+        local_addr.port()
+    );
+    let shutdown = state.shutdown.clone();
+    let result = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { shutdown.notified().await })
+    .await;
+    poller_task.abort();
+    tick_task.abort();
+    refresh_task.abort();
+    if let Some(fold_task) = fold_task {
+        fold_task.abort();
+    }
+    result.map_err(ProxyError::Io)
+}
+
+/// One background-refresh pass (A2): refresh every HEALTHY oauth-style
+/// account (anthropic oauth AND codex) whose access token expires within
+/// `scheduler.refresh_ahead_secs`. Reuses the request-time path
+/// ([`forward::refresh_credential`]: coalescer for anthropic, direct token
+/// grant for codex, pool update, persistence). Auth-failed accounts are
+/// skipped — a dead refresh token must not be retried every tick (re-login
+/// heals via `update_credential`); transient failures are simply retried on
+/// the next tick.
+pub async fn background_refresh_pass(state: &AppState) {
+    let ahead_ms = state
+        .config
+        .scheduler
+        .refresh_ahead_secs
+        .saturating_mul(1000);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    for account in state.pool.snapshot().accounts {
+        if !account.healthy {
+            continue;
+        }
+        let Some(credential) = state.pool.credential(&account.id) else {
+            continue;
+        };
+        let expires_at_ms = match &credential {
+            AccountCredential::Oauth { expires_at_ms, .. }
+            | AccountCredential::Codex { expires_at_ms, .. } => *expires_at_ms,
+            AccountCredential::Apikey { .. } => continue,
+        };
+        if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
+            continue;
+        }
+        match forward::refresh_credential(state, &account.id, &credential).await {
+            forward::RefreshOutcome::Refreshed(fresh) => {
+                if let AccountCredential::Oauth { expires_at_ms, .. }
+                | AccountCredential::Codex { expires_at_ms, .. } = fresh
+                {
+                    let hours = expires_at_ms.saturating_sub(now_ms) as f64 / 3_600_000.0;
+                    tracing::info!(
+                        account = %account.id,
+                        "background token refresh: expires in {hours:.1}h"
+                    );
+                }
+            }
+            forward::RefreshOutcome::Permanent => {
+                state.pool.record_auth_failure(&account.id);
+                state.emit(ActivityEvent::Error {
+                    context: Some("refresh".into()),
+                    message: format!("{}: refresh token dead; re-login required", account.id),
+                });
+            }
+            forward::RefreshOutcome::Failed => {} // transient — next tick retries
+        }
+    }
+}
+
+/// Build the router: `GET /teamagent/status`, `POST /teamagent/shutdown`,
+/// `POST /v1/oauth/token` (raw relay), fallback → [`forward_any`]. Every
+/// route sits behind the proxy api-key check (loopback peers exempt).
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/teamagent/status", get(status))
+        .route("/teamagent/dashboard", get(dashboard_endpoint))
+        .route("/teamagent/switch", post(switch_endpoint))
+        .route("/teamagent/shutdown", post(shutdown))
+        .route("/v1/oauth/token", post(oauth_token_relay))
+        .fallback(forward_any)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            client_auth,
+        ))
+        .with_state(state)
+}
+
+/// Pure client-auth decision (FR1): when a proxy api key is configured,
+/// non-loopback peers must present it as `x-api-key`; loopback peers are
+/// exempt. An unknown peer address (no ConnectInfo) is NOT exempt.
+pub fn client_auth_ok(
+    required: Option<&str>,
+    peer: Option<std::net::IpAddr>,
+    presented: Option<&str>,
+) -> bool {
+    match required {
+        None => true,
+        Some(key) => presented == Some(key) || peer.is_some_and(|ip| ip.is_loopback()),
+    }
+}
+
+async fn client_auth(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let presented = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
+    if client_auth_ok(state.config.proxy.api_key.as_deref(), peer, presented) {
+        next.run(req).await
+    } else {
+        let body = serde_json::json!({
+            "type": "error",
+            "error": { "type": "authentication_error", "message": "Invalid proxy API key" },
+        });
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
+    }
+}
+
+fn epoch_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Server-process facts for `/teamagent/status` that are not pool state.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerMeta {
+    pub pid: u32,
+    pub uptime_secs: u64,
+    pub port: u16,
+}
+
+/// Serializable `/teamagent/status` document — pure function of a pool
+/// snapshot + totals + select params + server meta so the shape is
+/// unit-testable without a socket. Fields are additive only (the CLI parses
+/// this across versions). The `accounts` array is emitted in the
+/// scheduler's selection order (B1: current → eligible by rank →
+/// ineligible) with a 1-based `order` field and, for ineligible accounts, a
+/// `blocked` reason string.
+pub fn status_json(
+    snapshot: &PoolSnapshot,
+    totals: &UsageTotals,
+    params: &SelectParams,
+    now: SystemTime,
+    meta: &ServerMeta,
+) -> serde_json::Value {
+    let window = |w: &Option<crate::scheduler::window::QuotaWindow>| match w {
+        Some(w) => serde_json::json!({
+            "utilization": w.effective_utilization(now),
+            "resets_at": epoch_secs(w.resets_at),
+            "resets_in_secs": w.resets_at
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }),
+        None => serde_json::Value::Null,
+    };
+    let headers_only = crate::scheduler::select::headers_only_mode(snapshot, params, now);
+    let accounts: Vec<serde_json::Value> =
+        crate::scheduler::select::selection_order(snapshot, params, now)
+            .into_iter()
+            .enumerate()
+            .map(|(order, idx)| {
+                let account = &snapshot.accounts[idx];
+                let cooling = account.cooldown_until.is_some_and(|until| until > now);
+                let status = if !account.healthy {
+                    "auth_failed"
+                } else if cooling {
+                    "cooldown"
+                } else if snapshot.current.as_ref() == Some(&account.id) {
+                    "active"
+                } else {
+                    "ok"
+                };
+                let blocked =
+                    crate::scheduler::select::eligibility(account, params, now, headers_only).map(
+                        |reason| {
+                            crate::scheduler::select::blocking_reason(account, reason, params, now)
+                        },
+                    );
+                let lifetime = totals.get(&account.id);
+                serde_json::json!({
+                    "name": account.id.0,
+                    "type": account.credential_kind,
+                    "status": status,
+                    "order": order + 1,
+                    "blocked": blocked,
+                    "five_hour": window(&account.five_hour),
+                    "seven_day": window(&account.seven_day),
+                    "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
+                    "in_flight": account.in_flight,
+                    // Token health (additive): expiry + last refresh, epoch
+                    // ms; null for apikey accounts / unknown expiry / never
+                    // refreshed.
+                    "token_expires_at_ms": account.token_expires_at_ms,
+                    "last_refresh_ms": account.last_refresh_ms,
+                    "totals": {
+                        "requests": lifetime.requests,
+                        "input_tokens": lifetime.input_tokens,
+                        "output_tokens": lifetime.output_tokens,
+                    },
+                })
+            })
+            .collect();
+    serde_json::json!({
+        "version": crate::build_info::version_string(),
+        "pid": meta.pid,
+        "uptime_secs": meta.uptime_secs,
+        "port": meta.port,
+        "current": snapshot.current.as_ref().map(|c| c.0.clone()),
+        "accounts": accounts,
+    })
+}
+
+/// `GET /teamagent/status` — JSON scheduler/account state (pool snapshot,
+/// current account, cooldowns, build info, pid/uptime/port).
+async fn status(State(state): State<AppState>) -> Response {
+    let meta = ServerMeta {
+        pid: std::process::id(),
+        uptime_secs: state.started.elapsed().as_secs(),
+        port: state.bound_port.load(Ordering::Relaxed),
+    };
+    let body = status_json(
+        &state.pool.snapshot(),
+        &state.totals,
+        &state.select_params(),
+        SystemTime::now(),
+        &meta,
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{body:#}"),
+    )
+        .into_response()
+}
+
+/// `GET /teamagent/dashboard` — the [`crate::dashboard::DashboardDoc`]: a
+/// strict superset of `/teamagent/status` (same account fields and ordering)
+/// plus scheduler / poller / totals / activity / log state. Behind the same
+/// loopback + proxy-api-key gate as every route. The attach-mode client
+/// (`teamagent dashboard`) polls this; the local TUI builds the same document
+/// in-process — one contract, one renderer.
+async fn dashboard_endpoint(State(state): State<AppState>) -> Response {
+    let doc = dashboard::build_doc(&state, SystemTime::now());
+    match serde_json::to_string(&doc) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("dashboard serialize failed: {err}"),
+        ),
+    }
+}
+
+/// Request body for `POST /teamagent/switch`.
+#[derive(serde::Deserialize)]
+struct SwitchRequest {
+    account: String,
+}
+
+/// `POST /teamagent/switch` `{"account":"<name>"}` — manual account switch,
+/// the server-side of the dashboard's `s`-key path. Same gate as every route
+/// (loopback exempt, otherwise the proxy api key). Runs the identical
+/// `AccountPool::switch_to` the in-process TUI calls, emits the
+/// `AccountSwitched` activity event on success, and answers `{"ok":true,
+/// "current":"<name>"}`. A refused switch (ineligible / unknown account)
+/// is a 409 with the scheduler's own refusal reason.
+async fn switch_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<SwitchRequest>,
+) -> Response {
+    let target = AccountId(body.account.clone());
+    let now = SystemTime::now();
+    let from = state.pool.snapshot().current;
+    match state.pool.switch_to(&target, &state.select_params(), now) {
+        Ok(()) => {
+            state.emit(ActivityEvent::AccountSwitched {
+                from: from.map(|id| id.0),
+                to: target.0.clone(),
+                reason: Some("manual".into()),
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "ok": true, "current": target.0 }).to_string(),
+            )
+                .into_response()
+        }
+        Err(err) => relay_error(StatusCode::CONFLICT, &format!("switch refused: {err}")),
+    }
+}
+
+/// `POST /teamagent/shutdown` — graceful server exit (same loopback /
+/// proxy-api-key rules as every route, via the shared middleware). The 200
+/// is delivered before the process exits: hyper's graceful shutdown stops
+/// accepting new connections and completes in-flight responses first.
+async fn shutdown(State(state): State<AppState>) -> Response {
+    tracing::info!("shutdown requested via /teamagent/shutdown");
+    state.shutdown.notify_one();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"ok":true}"#.to_string(),
+    )
+        .into_response()
+}
+
+/// `POST /v1/oauth/token` relayed RAW to upstream — Claude Code's own token
+/// refresh passes through untouched (no auth rewrite, no account lease;
+/// intercepting client refreshes would cause token-rotation conflicts).
+/// Like the Node reference, only `content-type` / `accept` / `user-agent`
+/// travel upstream.
+async fn oauth_token_relay(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(body) => body,
+        Err(err) => {
+            return relay_error(StatusCode::BAD_REQUEST, &format!("body read failed: {err}"))
+        }
+    };
+    let path_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    let url = format!(
+        "{}{}",
+        state.config.upstream.trim_end_matches('/'),
+        path_query
+    );
+    let mut builder = state.client.post(url);
+    for name in [header::CONTENT_TYPE, header::ACCEPT, header::USER_AGENT] {
+        if let Some(value) = parts.headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+    let upstream = match builder.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth token relay failed");
+            return relay_error(StatusCode::BAD_GATEWAY, "Upstream unreachable");
+        }
+    };
+    let status = upstream.status();
+    let mut headers = upstream.headers().clone();
+    for name in ["transfer-encoding", "connection", "content-length"] {
+        headers.remove(name);
+    }
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "oauth token relay body failed");
+            return relay_error(StatusCode::BAD_GATEWAY, "Upstream body read failed");
+        }
+    };
+    let mut response = Response::new(axum::body::Body::from(bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+fn relay_error(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": { "type": "proxy_error", "message": message },
+    });
+    let mut response = Response::new(axum::body::Body::from(body.to_string()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// Catch-all: buffer, lease, rewrite, forward upstream, stream back
+/// (see `forward`).
+async fn forward_any(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    forward::forward(&state, req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AccountConfig, AccountCredential};
+    use crate::scheduler::headers::{ParsedRateLimitHeaders, WindowReading};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn oauth_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Oauth {
+                account_uuid: format!("uuid-{name}"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
+                tier: None,
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    fn apikey_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Apikey {
+                api_key: format!("sk-ant-api03-{name}"),
+            },
+        }
+    }
+
+    #[test]
+    fn client_auth_no_key_configured_allows_everyone() {
+        assert!(client_auth_ok(None, None, None));
+        assert!(client_auth_ok(
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))),
+            None
+        ));
+    }
+
+    #[test]
+    fn client_auth_loopback_is_exempt() {
+        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(client_auth_ok(Some("ta-secret"), Some(v4), None));
+        assert!(client_auth_ok(Some("ta-secret"), Some(v6), None));
+    }
+
+    #[test]
+    fn client_auth_remote_requires_matching_key() {
+        let remote = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        assert!(client_auth_ok(
+            Some("ta-secret"),
+            Some(remote),
+            Some("ta-secret")
+        ));
+        assert!(!client_auth_ok(Some("ta-secret"), Some(remote), None));
+        assert!(!client_auth_ok(
+            Some("ta-secret"),
+            Some(remote),
+            Some("wrong")
+        ));
+        assert!(
+            !client_auth_ok(Some("ta-secret"), None, None),
+            "unknown peer is not exempt"
+        );
+    }
+
+    fn params() -> SelectParams {
+        SelectParams {
+            five_hour_max: 0.90,
+            seven_day_max: 0.99,
+            usage_max_age: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn status_json_shape_covers_name_type_status_windows_and_totals() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let pool = AccountPool::new(&[oauth_account("a"), apikey_account("k")]);
+        pool.evaluate(&params(), now);
+        pool.record_headers(
+            &AccountId("a".into()),
+            &ParsedRateLimitHeaders {
+                five_hour: Some(WindowReading {
+                    utilization: 0.42,
+                    resets_at: now + Duration::from_secs(3600),
+                }),
+                seven_day: Some(WindowReading {
+                    utilization: 0.10,
+                    resets_at: now + Duration::from_secs(86_400),
+                }),
+                ..Default::default()
+            },
+            now,
+        );
+        pool.record_429(&AccountId("k".into()), Some(Duration::from_secs(120)), now);
+        let totals = UsageTotals::default();
+        totals.record(&AccountId("a".into()), 3, 100, 50);
+
+        let meta = ServerMeta {
+            pid: 4321,
+            uptime_secs: 7980,
+            port: 3456,
+        };
+        let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
+
+        assert_eq!(doc["current"], "a");
+        assert!(doc["version"]
+            .as_str()
+            .expect("version string")
+            .starts_with("teamagent "));
+        assert_eq!(doc["pid"], 4321);
+        assert_eq!(doc["uptime_secs"], 7980);
+        assert_eq!(doc["port"], 3456);
+        let accounts = doc["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 2);
+
+        let a = &accounts[0];
+        assert_eq!(a["name"], "a");
+        assert_eq!(a["type"], "oauth");
+        assert_eq!(a["status"], "active");
+        assert_eq!(a["order"], 1);
+        assert_eq!(a["blocked"], serde_json::Value::Null);
+        assert!((a["five_hour"]["utilization"].as_f64().expect("util") - 0.42).abs() < 1e-9);
+        assert_eq!(a["five_hour"]["resets_at"], 1_000_000 + 3600);
+        assert_eq!(a["five_hour"]["resets_in_secs"], 3600);
+        assert_eq!(a["seven_day"]["resets_in_secs"], 86_400);
+        assert_eq!(a["totals"]["requests"], 3);
+        assert_eq!(a["totals"]["input_tokens"], 100);
+        assert_eq!(a["totals"]["output_tokens"], 50);
+        assert_eq!(a["in_flight"], 0);
+
+        let k = &accounts[1];
+        assert_eq!(k["type"], "apikey");
+        assert_eq!(k["status"], "cooldown");
+        assert_eq!(k["order"], 2);
+        assert_eq!(k["blocked"], "cooldown 2m00s");
+        assert_eq!(k["cooldown_until"], 1_000_000 + 120);
+        assert_eq!(
+            k["five_hour"],
+            serde_json::Value::Null,
+            "cold window is null"
+        );
+        assert_eq!(k["totals"]["requests"], 0);
+    }
+
+    #[test]
+    fn status_json_carries_token_expiry_and_last_refresh() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000); // = 1_000_000_000 ms
+        let mut account = oauth_account("a");
+        if let AccountCredential::Oauth {
+            expires_at_ms,
+            last_refresh_ms,
+            ..
+        } = &mut account.credential
+        {
+            *expires_at_ms = 1_003_600_000; // 1h from `now`
+            *last_refresh_ms = Some(999_820_000); // 3m before `now`
+        }
+        let pool = AccountPool::new(&[account, apikey_account("k")]);
+        pool.evaluate(&params(), now);
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 0,
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        let accounts = doc["accounts"].as_array().expect("accounts");
+        let a = accounts.iter().find(|a| a["name"] == "a").expect("a");
+        assert_eq!(a["token_expires_at_ms"], 1_003_600_000u64);
+        assert_eq!(a["last_refresh_ms"], 999_820_000u64);
+        let k = accounts.iter().find(|a| a["name"] == "k").expect("k");
+        assert_eq!(
+            k["token_expires_at_ms"],
+            serde_json::Value::Null,
+            "apikey has no token"
+        );
+        assert_eq!(k["last_refresh_ms"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn status_json_marks_auth_failed_accounts() {
+        let now = SystemTime::now();
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&AccountId("a".into()));
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 0,
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        assert_eq!(doc["accounts"][0]["status"], "auth_failed");
+        assert_eq!(doc["accounts"][0]["blocked"], "auth failed");
+        assert_eq!(doc["current"], serde_json::Value::Null);
+    }
+
+    /// B1: the `accounts` array is emitted in scheduler preference order —
+    /// current first, then eligible accounts by rank (soonest 7d reset),
+    /// then ineligible accounts with their blocking reason.
+    #[test]
+    fn status_json_orders_accounts_by_selection_preference() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let pool = AccountPool::new(&[
+            oauth_account("parked"),
+            oauth_account("later"),
+            oauth_account("soon"),
+            oauth_account("cur"),
+        ]);
+        let window = |resets_in: u64| {
+            Some(WindowReading {
+                utilization: 0.5,
+                resets_at: now + Duration::from_secs(resets_in),
+            })
+        };
+        pool.record_headers(
+            &AccountId("later".into()),
+            &ParsedRateLimitHeaders {
+                seven_day: window(48 * 3600),
+                ..Default::default()
+            },
+            now,
+        );
+        pool.record_headers(
+            &AccountId("soon".into()),
+            &ParsedRateLimitHeaders {
+                seven_day: window(12 * 3600),
+                ..Default::default()
+            },
+            now,
+        );
+        pool.record_429(
+            &AccountId("parked".into()),
+            Some(Duration::from_secs(60)),
+            now,
+        );
+        pool.switch_to(&AccountId("cur".into()), &params(), now)
+            .expect("test switch");
+
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &ServerMeta {
+                pid: 1,
+                uptime_secs: 0,
+                port: 0,
+            },
+        );
+        let names: Vec<&str> = doc["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .map(|a| a["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["cur", "soon", "later", "parked"]);
+        let orders: Vec<u64> = doc["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .map(|a| a["order"].as_u64().expect("order"))
+            .collect();
+        assert_eq!(orders, vec![1, 2, 3, 4]);
+        assert_eq!(doc["accounts"][3]["blocked"], "cooldown 1m00s");
+    }
+
+    #[test]
+    fn usage_totals_accumulate_and_default_to_zero() {
+        let totals = UsageTotals::default();
+        let a = AccountId("a".into());
+        assert_eq!(totals.get(&a), AccountTotals::default());
+        totals.record(&a, 1, 10, 5);
+        totals.record(&a, 1, 2, 3);
+        assert_eq!(
+            totals.get(&a),
+            AccountTotals {
+                requests: 2,
+                input_tokens: 12,
+                output_tokens: 8,
+            }
+        );
+    }
+}
