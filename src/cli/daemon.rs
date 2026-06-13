@@ -21,6 +21,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// stopped server to release the port).
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Drain budget for a version-gated restart: longer than `stop`'s 5s so an
+/// in-flight request on the old daemon (it may hold several live accounts,
+/// one actively serving) finishes via cooperative shutdown instead of being
+/// cut off. If the port still isn't free after this, we error — never SIGKILL.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Poll interval while waiting for readiness / port release.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -38,8 +44,13 @@ pub enum ServerProbe {
 /// Outcome of [`ensure_server_running`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnsureOutcome {
+    /// A same-version daemon was already up — reused untouched.
     AlreadyRunning,
+    /// Nothing was listening; a fresh daemon was spawned.
     Started { pid: u32 },
+    /// A running daemon was a different version (or `--force`): drained and
+    /// replaced with a freshly spawned one.
+    Restarted { pid: u32 },
 }
 
 /// Probe the configured port for a running teamagent server.
@@ -106,15 +117,46 @@ fn is_teamagent_status(doc: &serde_json::Value) -> bool {
         && doc.get("accounts").is_some_and(serde_json::Value::is_array)
 }
 
+/// Should `run`/`restart` replace an already-running daemon? Compares the
+/// running daemon's reported version to THIS binary's version.
+///
+/// - `force` → always restart.
+/// - versions differ → restart (the running daemon predates this install).
+/// - versions match → reuse (must NOT churn a healthy same-version server).
+/// - version unparseable (`None`) and not forced → reuse: an old/odd status
+///   document is not a reason to drain live accounts.
+fn should_restart(running_version: Option<&str>, current_version: &str, force: bool) -> bool {
+    force || matches!(running_version, Some(v) if v != current_version)
+}
+
 /// Make sure a server is listening on `config.proxy.port`: probe, and when
 /// nothing is running spawn `teamagent server --no-tui` as a detached daemon
-/// (stderr → [`server_log_path`]) and wait until the status endpoint
-/// answers. A foreign listener on the port is an error, never spawned over.
-pub async fn ensure_server_running(config: &Config) -> Result<EnsureOutcome, CliError> {
+/// (stderr → [`server_log_path`]) and wait until the status endpoint answers.
+///
+/// When a daemon is already running, its version is compared to this binary's
+/// (`force` overrides): a mismatch drains the old daemon cooperatively
+/// ([`RESTART_DRAIN_TIMEOUT`]) and spawns a fresh one ([`EnsureOutcome::Restarted`]);
+/// a match reuses it untouched ([`EnsureOutcome::AlreadyRunning`]). A foreign
+/// listener on the port is an error, never spawned over.
+pub async fn ensure_server_running(
+    config: &Config,
+    force: bool,
+) -> Result<EnsureOutcome, CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
+    let mut restarting = false;
     match probe_server(port, api_key).await? {
-        ServerProbe::Running { .. } => return Ok(EnsureOutcome::AlreadyRunning),
+        ServerProbe::Running { status } => {
+            let current = crate::build_info::version_string();
+            let running = status.get("version").and_then(serde_json::Value::as_str);
+            if should_restart(running, &current, force) {
+                // Drain the old daemon cooperatively before we spawn over it.
+                shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT).await?;
+                restarting = true;
+            } else {
+                return Ok(EnsureOutcome::AlreadyRunning);
+            }
+        }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
                 "port {port} is in use by something that is not teamagent ({detail})\n\
@@ -140,7 +182,33 @@ pub async fn ensure_server_running(config: &Config) -> Result<EnsureOutcome, Cli
     wait_until_ready(port, api_key, READY_TIMEOUT)
         .await
         .map_err(|err| CliError::Message(format!("{err}\nServer log: {}", log_path.display())))?;
-    Ok(EnsureOutcome::Started { pid })
+    if restarting {
+        Ok(EnsureOutcome::Restarted { pid })
+    } else {
+        Ok(EnsureOutcome::Started { pid })
+    }
+}
+
+/// `teamagent restart` — explicitly drain-if-running and (re)spawn the daemon,
+/// then print status. Unlike `run`, this never execs `claude`: it is just the
+/// server-lifecycle half, with `force` so a same-version daemon is replaced too.
+pub async fn restart() -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let port = config.proxy.port;
+    let version = crate::build_info::version_string();
+    match ensure_server_running(&config, true).await? {
+        EnsureOutcome::Started { pid } => {
+            println!("started teamagent server (pid {pid}) on port {port} → {version}");
+        }
+        EnsureOutcome::Restarted { pid } => {
+            println!("restarted teamagent server (pid {pid}) on port {port} → {version}");
+        }
+        // With force=true this is unreachable, but stay total rather than panic.
+        EnsureOutcome::AlreadyRunning => {
+            println!("teamagent server already running on port {port} → {version}");
+        }
+    }
+    Ok(())
 }
 
 /// Spawn `current_exe() server --no-tui` fully detached: own process group
@@ -212,27 +280,17 @@ async fn wait_until_ready(
     }
 }
 
-/// `teamagent stop` — POST `/teamagent/shutdown` to the running server and
-/// poll until the port is released (5s timeout). A missing server is not an
-/// error (idempotent stop); a foreign listener is refused.
-pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
-    let config = crate::config::load_or_init()?;
-    let port = config.proxy.port;
-    let api_key = config.proxy.api_key.as_deref();
-
-    match probe_server(port, api_key).await? {
-        ServerProbe::NotRunning => {
-            println!("server not running on port {port}");
-            return Ok(());
-        }
-        ServerProbe::Foreign { detail } => {
-            return Err(CliError::Message(format!(
-                "port {port} is in use by something that is not teamagent ({detail}) — refusing to stop it"
-            )));
-        }
-        ServerProbe::Running { .. } => {}
-    }
-
+/// Cooperatively shut down the teamagent daemon on `port` and wait up to
+/// `timeout` for the port to free: POST `/teamagent/shutdown` (hyper graceful
+/// shutdown — in-flight requests finish) then poll [`probe_server`] until
+/// `NotRunning`. Never SIGKILLs; if the port is still held at the deadline it
+/// returns an error. The caller is responsible for having confirmed a
+/// teamagent (not foreign) daemon is on the port first.
+async fn shutdown_and_wait(
+    port: u16,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<(), CliError> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
@@ -254,20 +312,45 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
         )));
     }
 
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         if let ServerProbe::NotRunning = probe_server(port, api_key).await? {
-            println!("stopped teamagent server on port {port}");
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(CliError::Message(format!(
                 "server acknowledged shutdown but port {port} did not free within {}s",
-                READY_TIMEOUT.as_secs()
+                timeout.as_secs()
             )));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// `teamagent stop` — cooperatively shut down the running server and wait for
+/// the port to release (5s budget). A missing server is not an error
+/// (idempotent stop); a foreign listener is refused.
+pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let port = config.proxy.port;
+    let api_key = config.proxy.api_key.as_deref();
+
+    match probe_server(port, api_key).await? {
+        ServerProbe::NotRunning => {
+            println!("server not running on port {port}");
+            return Ok(());
+        }
+        ServerProbe::Foreign { detail } => {
+            return Err(CliError::Message(format!(
+                "port {port} is in use by something that is not teamagent ({detail}) — refusing to stop it"
+            )));
+        }
+        ServerProbe::Running { .. } => {}
+    }
+
+    shutdown_and_wait(port, api_key, READY_TIMEOUT).await?;
+    println!("stopped teamagent server on port {port}");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,6 +421,33 @@ mod tests {
         // just shows "pid ?".
         let doc = serde_json::json!({ "version": "teamagent 0.1.0", "accounts": [] });
         assert_eq!(status_pid(&doc), None);
+    }
+
+    /// The version-gated restart decision matrix (`should_restart`).
+    #[test]
+    fn should_restart_matrix() {
+        let cur = "teamagent 0.1.0 (dev dev)";
+        let same = "teamagent 0.1.0 (dev dev)";
+        let other = "teamagent 0.1.0 (preview preview-20260612-abc1234)";
+
+        // force always wins, regardless of version (or its absence).
+        assert!(should_restart(Some(same), cur, true), "force + same");
+        assert!(should_restart(Some(other), cur, true), "force + different");
+        assert!(should_restart(None, cur, true), "force + unparseable");
+
+        // Without force: only a parseable, differing version restarts.
+        assert!(
+            !should_restart(Some(same), cur, false),
+            "same version must reuse, never churn"
+        );
+        assert!(
+            should_restart(Some(other), cur, false),
+            "different version must restart"
+        );
+        assert!(
+            !should_restart(None, cur, false),
+            "unparseable version must not churn on its own"
+        );
     }
 
     /// Serve `body` (200) at `/teamagent/status` on 127.0.0.1:0.

@@ -16,11 +16,21 @@ use super::{proxy_base_url, CliError, RunArgs};
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
 
-    if let EnsureOutcome::Started { pid } = ensure_server_running(&config).await? {
-        eprintln!(
-            "started teamagent server (pid {pid}) on port {}",
-            config.proxy.port
-        );
+    match ensure_server_running(&config, args.force).await? {
+        EnsureOutcome::Started { pid } => {
+            eprintln!(
+                "started teamagent server (pid {pid}) on port {}",
+                config.proxy.port
+            );
+        }
+        EnsureOutcome::Restarted { pid } => {
+            eprintln!(
+                "restarted teamagent server (pid {pid}) on port {} → {}",
+                config.proxy.port,
+                crate::build_info::version_string()
+            );
+        }
+        EnsureOutcome::AlreadyRunning => {}
     }
 
     let mut claude_args = args.args.as_slice();

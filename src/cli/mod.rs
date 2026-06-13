@@ -50,6 +50,9 @@ pub enum Command {
     /// Stop a running server (POST /teamagent/shutdown, wait for the port
     /// to free).
     Stop(StopArgs),
+    /// Restart the daemon: cooperatively drain a running server (if any),
+    /// then spawn this binary's version. Does not exec `claude`.
+    Restart(RestartArgs),
     /// Add an account via browser OAuth (or paste an API key with --api).
     Login(LoginArgs),
     /// Import accounts from teamclaude config, ~/.claude/.credentials.json,
@@ -87,6 +90,11 @@ pub struct ServerArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Restart the daemon even when it already runs this binary's version
+    /// (by default a same-version daemon is reused; a different version is
+    /// always restarted).
+    #[arg(long)]
+    pub force: bool,
     /// Arguments passed through to `claude` after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
@@ -94,6 +102,9 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {}
+
+#[derive(Debug, Args)]
+pub struct RestartArgs {}
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
@@ -164,6 +175,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Server(args) => server(args).await,
         Command::Run(args) => run::run(args).await,
         Command::Stop(args) => daemon::stop(args).await,
+        Command::Restart(_) => daemon::restart().await,
         Command::Login(args) => login::run(args).await,
         Command::Import(args) => import::run(args).await,
         Command::Env(args) => env::run(args).await,
