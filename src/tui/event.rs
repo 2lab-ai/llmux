@@ -54,6 +54,14 @@ pub enum ActivityEvent {
         /// Tokens extracted from the response usage, when available — feeds
         /// the per-account in/out token totals.
         tokens: Option<TokenCounts>,
+        /// Backend group that served it (`"claude"`/`"codex"`), when known.
+        group: Option<String>,
+        /// Model slug actually served (codex: the configured model; claude:
+        /// the inbound model string), when known.
+        model: Option<String>,
+        /// Reasoning effort (codex: configured effort; claude: thinking
+        /// budget like `"16k"`), when known.
+        effort: Option<String>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

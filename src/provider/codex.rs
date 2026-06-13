@@ -17,28 +17,103 @@ use super::{ProviderError, ProviderRequest};
 use crate::config::AccountCredential;
 use crate::proxy::sse::{SseTransform, StreamUsage};
 
-/// Every upstream request goes out as this model, regardless of what the
-/// client asked for.
+/// Fallback model slug when none is configured. The configurable default now
+/// lives in `config.codex.default_model`; this const is the compile-time
+/// fallback and the value [`CodexShape::default`] uses (so tests and the
+/// `new(base_url)` constructor preserve the original pinned behavior).
 pub const CODEX_MODEL: &str = "gpt-5.5";
 
 /// Request path appended to the configured codex upstream.
 pub const RESPONSES_PATH: &str = "/responses";
 
-/// The codex provider: holds the upstream base URL and a per-process
-/// session id (sent as `session-id` and `prompt_cache_key`, stable so the
-/// backend's prompt cache keys stay warm across requests).
+/// Request-shaping knobs for the Responses request, sourced from
+/// `config.codex`. They mirror exactly what the codex CLI sets on the wire:
+/// the model slug, `service_tier: "priority"` when `fast`, and a
+/// `reasoning.effort` value. [`Default`] reproduces the original behavior
+/// (pinned `gpt-5.5`, no fast tier, backend-default effort) so existing tests
+/// and the bare `new` constructor are unaffected.
 #[derive(Debug, Clone)]
+pub struct CodexShape {
+    /// Model slug requested upstream.
+    pub model: String,
+    /// `true` → send `service_tier: "priority"` (codex "fast" mode).
+    pub fast: bool,
+    /// `reasoning.effort` value (`none|minimal|low|medium|high|xhigh`), or
+    /// `None` to omit the field and let the backend choose.
+    pub effort: Option<String>,
+}
+
+impl Default for CodexShape {
+    fn default() -> Self {
+        Self {
+            model: CODEX_MODEL.to_string(),
+            fast: false,
+            effort: None,
+        }
+    }
+}
+
+impl CodexShape {
+    /// Build from the on-disk codex config.
+    pub fn from_config(codex: &crate::config::schema::CodexConfig) -> Self {
+        Self {
+            model: codex.default_model.clone(),
+            fast: codex.fast,
+            effort: codex.reasoning_effort.clone(),
+        }
+    }
+}
+
+/// The codex provider: holds the upstream base URL, the (live-mutable) request
+/// shape (model/fast/effort), and a per-process session id (sent as
+/// `session-id` and `prompt_cache_key`, stable so the backend's prompt cache
+/// keys stay warm across requests).
+///
+/// The shape is behind an `RwLock` so the dashboard can toggle fast/model/
+/// effort on a running daemon (req8.1) without a restart: requests take a
+/// read lock (uncontended on the hot path), the control endpoint takes a write
+/// lock.
+#[derive(Debug)]
 pub struct CodexProvider {
     base_url: String,
+    shape: std::sync::RwLock<CodexShape>,
     session_id: String,
 }
 
 impl CodexProvider {
+    /// Construct with the default request shape (pinned `gpt-5.5`). Used by
+    /// tests; production uses [`CodexProvider::with_shape`].
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_shape(base_url, CodexShape::default())
+    }
+
+    /// Construct with an explicit request shape (from `config.codex`).
+    pub fn with_shape(base_url: impl Into<String>, shape: CodexShape) -> Self {
         Self {
             base_url: base_url.into(),
+            shape: std::sync::RwLock::new(shape),
             session_id: uuid_v4(),
         }
+    }
+
+    /// Snapshot the current request shape.
+    pub fn shape(&self) -> CodexShape {
+        self.shape.read().expect("codex shape lock").clone()
+    }
+
+    /// Replace the live request shape (dashboard fast/model/effort change).
+    pub fn set_shape(&self, shape: CodexShape) {
+        *self.shape.write().expect("codex shape lock") = shape;
+    }
+
+    /// The model slug this provider currently requests (for the activity log).
+    pub fn model(&self) -> String {
+        self.shape.read().expect("codex shape lock").model.clone()
+    }
+
+    /// The reasoning effort this provider currently sends (for the activity log).
+    pub fn effort(&self) -> Option<String> {
+        self.shape.read().expect("codex shape lock").effort.clone()
     }
 
     pub fn endpoint(&self) -> &str {
@@ -67,7 +142,8 @@ impl CodexProvider {
         };
         let body: Value = serde_json::from_slice(anthropic_body)
             .map_err(|err| ProviderError::Convert(format!("request body is not JSON: {err}")))?;
-        let (upstream_body, client_stream) = translate_request(&body, &self.session_id)?;
+        let (upstream_body, client_stream) =
+            translate_request_with(&body, &self.session_id, &self.shape())?;
 
         let mut headers = HeaderMap::new();
         let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -102,9 +178,10 @@ impl CodexProvider {
         ))
     }
 
-    /// Fresh per-request stream converter.
+    /// Fresh per-request stream converter, stamping responses with this
+    /// provider's configured model slug.
     pub fn converter(&self) -> CodexSseConverter {
-        CodexSseConverter::new()
+        CodexSseConverter::with_model(self.shape().model)
     }
 }
 
@@ -133,12 +210,28 @@ fn uuid_v4() -> String {
 /// rewritten to [`CODEX_MODEL`]; `max_tokens` and `tool_choice` are ignored
 /// (logged at debug); images and thinking blocks are dropped (warn/debug).
 pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool), ProviderError> {
+    translate_request_with(body, session_id, &CodexShape::default())
+}
+
+/// Like [`translate_request`] but with an explicit request [`CodexShape`]
+/// (configurable model / fast tier / reasoning effort). The model is ALWAYS
+/// rewritten to `shape.model`; `max_tokens` and `tool_choice` are ignored
+/// (logged at debug); images and thinking blocks are dropped (warn/debug).
+/// When `shape.fast`, `service_tier: "priority"` is added (the wire value the
+/// codex CLI sends for fast mode); when `shape.effort` is set, a
+/// `reasoning: { effort }` object is added.
+pub fn translate_request_with(
+    body: &Value,
+    session_id: &str,
+    shape: &CodexShape,
+) -> Result<(Value, bool), ProviderError> {
     let client_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if let Some(model) = body.get("model").and_then(Value::as_str) {
-        if model != CODEX_MODEL {
+        if model != shape.model {
             tracing::debug!(
                 client_model = model,
-                "codex: model rewritten to {CODEX_MODEL}"
+                "codex: model rewritten to {}",
+                shape.model
             );
         }
     }
@@ -164,8 +257,8 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
         .map(|tools| tools_to_functions(tools))
         .unwrap_or_default();
 
-    let upstream = json!({
-        "model": CODEX_MODEL,
+    let mut upstream = json!({
+        "model": shape.model,
         "instructions": instructions,
         "input": input,
         "tools": tools,
@@ -175,6 +268,19 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
         "prompt_cache_key": session_id,
         "include": ["reasoning.encrypted_content"],
     });
+    // Reasoning effort: codex CLI sends `reasoning: { effort }`; omit to keep
+    // the backend default. (Empty / "default" effort is treated as unset.)
+    if let Some(effort) = shape.effort.as_deref() {
+        let effort = effort.trim();
+        if !effort.is_empty() && !effort.eq_ignore_ascii_case("default") {
+            upstream["reasoning"] = json!({ "effort": effort.to_ascii_lowercase() });
+        }
+    }
+    // Fast mode: codex stores "fast" in config but sends `service_tier:
+    // "priority"` on the wire. Only emit the field when fast is on.
+    if shape.fast {
+        upstream["service_tier"] = json!("priority");
+    }
     Ok((upstream, client_stream))
 }
 
@@ -420,6 +526,9 @@ struct AggBlock {
 /// bytes out (`event: <type>\ndata: <json>\n\n`, indexes sequenced).
 #[derive(Debug)]
 pub struct CodexSseConverter {
+    /// Model slug stamped into the Anthropic `message_start` / aggregate
+    /// (what Claude Code sees as the response model).
+    model: String,
     started: bool,
     finished: bool,
     message_id: String,
@@ -441,8 +550,16 @@ impl Default for CodexSseConverter {
 }
 
 impl CodexSseConverter {
+    /// Converter stamping the fallback [`CODEX_MODEL`]. Used by tests; the
+    /// provider uses [`CodexSseConverter::with_model`].
     pub fn new() -> Self {
+        Self::with_model(CODEX_MODEL.to_string())
+    }
+
+    /// Converter that stamps `model` into the synthesized Anthropic response.
+    pub fn with_model(model: String) -> Self {
         Self {
+            model,
             started: false,
             finished: false,
             message_id: String::new(),
@@ -477,7 +594,7 @@ impl CodexSseConverter {
                     "id": self.message_id,
                     "type": "message",
                     "role": "assistant",
-                    "model": CODEX_MODEL,
+                    "model": self.model.clone(),
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
@@ -646,7 +763,7 @@ impl CodexSseConverter {
             },
             "type": "message",
             "role": "assistant",
-            "model": CODEX_MODEL,
+            "model": self.model.clone(),
             "content": content,
             "stop_reason": self.stop_reason.as_deref().unwrap_or("end_turn"),
             "stop_sequence": null,
@@ -933,6 +1050,52 @@ mod tests {
         assert_eq!(input[1]["content"][0]["type"], "output_text");
         assert_eq!(input[1]["content"][0]["text"], "hello");
         assert_eq!(input[2]["content"][0]["text"], "again");
+    }
+
+    #[test]
+    fn shape_sets_configurable_model_fast_tier_and_effort() {
+        let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });
+        let shape = CodexShape {
+            model: "gpt-5.5-codex".to_string(),
+            fast: true,
+            effort: Some("XHIGH".to_string()),
+        };
+        let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+        assert_eq!(upstream["model"], "gpt-5.5-codex", "model is config-driven");
+        // codex stores "fast" but sends service_tier=priority on the wire.
+        assert_eq!(upstream["service_tier"], "priority");
+        // effort lowercased into reasoning.effort.
+        assert_eq!(upstream["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn shape_default_omits_tier_and_reasoning() {
+        let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });
+        let (upstream, _) =
+            translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+        assert_eq!(upstream["model"], CODEX_MODEL);
+        assert!(
+            upstream.get("service_tier").is_none(),
+            "no tier when not fast"
+        );
+        assert!(upstream.get("reasoning").is_none(), "no effort by default");
+    }
+
+    #[test]
+    fn shape_treats_blank_or_default_effort_as_unset() {
+        let body = json!({ "model": "x", "messages": [{"role":"user","content":"hi"}] });
+        for e in ["", "  ", "default", "DEFAULT"] {
+            let shape = CodexShape {
+                model: CODEX_MODEL.to_string(),
+                fast: false,
+                effort: Some(e.to_string()),
+            };
+            let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+            assert!(
+                upstream.get("reasoning").is_none(),
+                "effort {e:?} should be treated as unset"
+            );
+        }
     }
 
     #[test]

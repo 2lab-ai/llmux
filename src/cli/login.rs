@@ -1,6 +1,6 @@
-//! `teamagent login [--api]` — add an account.
+//! `teamagent login [--api | --codex]` — add an account.
 
-use crate::auth::{oauth, profile};
+use crate::auth::{codex, oauth, profile};
 use crate::config::{AccountConfig, AccountCredential, Config, Upsert};
 
 use super::{prompt_line, CliError, LoginArgs};
@@ -8,8 +8,11 @@ use super::{prompt_line, CliError, LoginArgs};
 /// OAuth path: PKCE browser flow → profile fetch (accountUuid, email) →
 /// upsert into config by `account_uuid` (FR2 dedup).
 /// `--api` path: prompt for an API key, store as an apikey account.
+/// `--codex` path: ChatGPT OAuth browser flow → upsert a Codex account.
 pub async fn run(args: LoginArgs) -> Result<(), CliError> {
-    if args.api {
+    if args.codex {
+        login_codex().await
+    } else if args.api {
         login_api().await
     } else {
         login_oauth().await
@@ -70,16 +73,19 @@ async fn login_oauth() -> Result<(), CliError> {
     let mut final_name = String::new();
     let mut outcome = Upsert::Added;
     crate::config::update(|config: &mut Config| {
+        // Encode the model group in the name (`claude:<email>`) so the same
+        // email can hold a Claude AND a Codex subscription without colliding —
+        // mirrors the `codex:<email>` convention the `--codex` flow uses (req5).
         let resolved_name = if name.is_empty() {
             let n = config
                 .accounts
                 .iter()
-                .filter(|a| a.name.starts_with("account-"))
+                .filter(|a| a.name.starts_with("claude:account-"))
                 .count()
                 + 1;
-            format!("account-{n}")
+            format!("claude:account-{n}")
         } else {
-            name.clone()
+            format!("claude:{name}")
         };
         final_name = resolved_name.clone();
         outcome = config.upsert_account(AccountConfig {
@@ -105,4 +111,66 @@ async fn login_oauth() -> Result<(), CliError> {
     }
     println!("Saved to {}", crate::config::config_path()?.display());
     Ok(())
+}
+
+/// `--codex`: run the ChatGPT OAuth browser flow and upsert a Codex account.
+/// Falls back to importing `~/.codex/auth.json` (renamed to the
+/// `codex:{email}` convention) when the interactive flow cannot run.
+async fn login_codex() -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let client = reqwest::Client::new();
+
+    println!("Starting ChatGPT (Codex) OAuth login...");
+    let account = match codex::login_codex_interactive(&client, &config.codex.token_url).await {
+        Ok(account) => account,
+        Err(err) => {
+            // Headless / no-browser / port-bind failures degrade to importing
+            // the codex CLI's own credential store, still renamed to the
+            // `codex:{email}` convention so it never collides with a Claude
+            // account of the same email.
+            eprintln!("warning: interactive ChatGPT login failed ({err})");
+            account_from_codex_import()?.ok_or_else(|| {
+                CliError::Message(
+                    "interactive ChatGPT login failed and no ~/.codex/auth.json was found to \
+                         import — run `codex login` first, or retry with a browser available"
+                        .into(),
+                )
+            })?
+        }
+    };
+
+    let final_name = account.name.clone();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        outcome = config.upsert_account(account.clone());
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added codex account {final_name:?}"),
+        Upsert::Updated => println!("Updated codex account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// Import `~/.codex/auth.json` (when present) and rename it to the
+/// `codex:{email}` convention. `Ok(None)` when no auth.json exists.
+fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
+    let Some(path) = codex::default_codex_auth_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut account = codex::import_codex_auth(&path)?;
+    // `import_codex_auth` names the account after the raw email (or "codex");
+    // re-derive the `codex:{email}` name so imports match OAuth logins.
+    let account_id = account
+        .credential
+        .account_uuid()
+        .unwrap_or_default()
+        .to_string();
+    let email = (account.name != "codex").then_some(account.name.as_str());
+    account.name = codex::codex_account_name(email, &account_id);
+    Ok(Some(account))
 }

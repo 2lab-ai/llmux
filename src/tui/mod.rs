@@ -38,10 +38,26 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::dashboard::DashboardDoc;
+use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
 use crate::scheduler::select;
 use logs::LogPanelSize;
 use view::DashboardView;
+
+/// Codex models the dashboard cycles through with `m` (req8.1). Any model can
+/// still be set via config / the control endpoint; this is the quick-pick set.
+const CODEX_MODELS: &[&str] = &["gpt-5.5", "gpt-5.5-codex", "gpt-5-codex"];
+/// Reasoning-effort levels cycled with `e`; "" = unset (backend default).
+const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+
+/// One-line summary of codex settings for the status bar.
+fn codex_status_line(c: &CodexSettingsDoc) -> String {
+    format!(
+        "codex {} · fast {} · effort {}",
+        c.model,
+        if c.fast { "on" } else { "off" },
+        c.effort.as_deref().unwrap_or("default"),
+    )
+}
 
 /// Render cadence (FR6: 250ms tick) — also the cadence at which a fetched
 /// remote document is re-rendered between polls (countdowns keep ticking).
@@ -92,6 +108,9 @@ pub(crate) struct Chrome {
     pub show_detail: bool,
     pub log_panel: LogPanelSize,
     pub status_line: Option<String>,
+    /// Activity-log scroll offset: number of newest completed entries skipped
+    /// (0 = live tail). Lets the panel page through the full history (req6).
+    pub activity_scroll: usize,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
 }
@@ -140,6 +159,9 @@ struct Remote {
     /// Switch target chosen in select mode, performed by the event loop
     /// (key handling is sync; the POST is not).
     pending_switch: Option<String>,
+    /// Codex settings change (fast/model/effort) queued by a key, performed by
+    /// the event loop via `POST /teamagent/codex` (req8.1).
+    pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
 }
 
 /// One message from the remote fetch task.
@@ -159,6 +181,8 @@ struct App {
     /// Selected-account detail pane visibility (`d` toggles).
     show_detail: bool,
     log_panel: LogPanelSize,
+    /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
+    activity_scroll: usize,
 }
 
 impl App {
@@ -171,6 +195,7 @@ impl App {
             status: None,
             show_detail: true,
             log_panel: LogPanelSize::Small,
+            activity_scroll: 0,
         }
     }
 
@@ -195,6 +220,7 @@ impl App {
             mode: self.mode,
             show_detail: self.show_detail,
             log_panel: self.log_panel,
+            activity_scroll: self.activity_scroll,
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -286,8 +312,133 @@ impl App {
             }
             KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
+            // Activity-log scrolling (req6): up = into history, down = toward
+            // the live tail. Clamped to the number of completed entries.
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_activity(-1, view),
+            KeyCode::PageUp => self.scroll_activity(10, view),
+            KeyCode::PageDown => self.scroll_activity(-10, view),
+            KeyCode::Home => self.scroll_activity(i64::MAX, view),
+            KeyCode::End => self.activity_scroll = 0,
+            // Codex group settings (req8.1): f = fast on/off, m = cycle model,
+            // e = cycle reasoning effort. No-op (with a hint) when there is no
+            // codex account.
+            KeyCode::Char('f') => self.toggle_codex_fast(view),
+            KeyCode::Char('m') => self.cycle_codex_model(view),
+            KeyCode::Char('e') => self.cycle_codex_effort(view),
             _ => {}
         }
+    }
+
+    /// The live codex settings, or `None` when no codex account exists.
+    fn current_codex(&self, view: Option<&DashboardView>) -> Option<CodexSettingsDoc> {
+        view.and_then(|v| v.codex.available.then(|| v.codex.clone()))
+    }
+
+    fn toggle_codex_fast(&mut self, view: Option<&DashboardView>) {
+        match self.current_codex(view) {
+            Some(mut c) => {
+                c.fast = !c.fast;
+                self.set_codex(c);
+            }
+            None => {
+                self.set_status("codex: no codex account (run `teamagent login --codex`)".into())
+            }
+        }
+    }
+
+    fn cycle_codex_model(&mut self, view: Option<&DashboardView>) {
+        if let Some(mut c) = self.current_codex(view) {
+            let next = CODEX_MODELS
+                .iter()
+                .position(|m| *m == c.model)
+                .map(|i| (i + 1) % CODEX_MODELS.len())
+                .unwrap_or(0);
+            c.model = CODEX_MODELS[next].to_string();
+            self.set_codex(c);
+        } else {
+            self.set_status("codex: no codex account".into());
+        }
+    }
+
+    fn cycle_codex_effort(&mut self, view: Option<&DashboardView>) {
+        if let Some(mut c) = self.current_codex(view) {
+            let cur = c.effort.as_deref().unwrap_or("");
+            let next = CODEX_EFFORTS
+                .iter()
+                .position(|e| *e == cur)
+                .map(|i| (i + 1) % CODEX_EFFORTS.len())
+                .unwrap_or(0);
+            let e = CODEX_EFFORTS[next];
+            c.effort = (!e.is_empty()).then(|| e.to_string());
+            self.set_codex(c);
+        } else {
+            self.set_status("codex: no codex account".into());
+        }
+    }
+
+    /// Apply a codex settings change: locally in-process, or queued for the
+    /// event loop to POST in attach mode.
+    fn set_codex(&mut self, new: CodexSettingsDoc) {
+        match &mut self.backend {
+            Backend::Local(state) => {
+                state.codex.set_shape(crate::provider::codex::CodexShape {
+                    model: new.model.clone(),
+                    fast: new.fast,
+                    effort: new.effort.clone(),
+                });
+                if let Some(path) = &state.config_path {
+                    let _ = crate::config::update_path(path, |c| {
+                        c.codex.default_model = new.model.clone();
+                        c.codex.fast = new.fast;
+                        c.codex.reasoning_effort = new.effort.clone();
+                    });
+                }
+                self.set_status(codex_status_line(&new));
+            }
+            Backend::Remote(remote) => {
+                remote.pending_codex = Some(new.clone());
+                self.set_status(format!("applying {}…", codex_status_line(&new)));
+            }
+        }
+    }
+
+    fn take_pending_codex(&mut self) -> Option<CodexSettingsDoc> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_codex.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote codex change (`POST /teamagent/codex`).
+    async fn perform_remote_codex(&mut self, new: CodexSettingsDoc) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/teamagent/codex", remote.base_url);
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "fast": new.fast,
+            "default_model": new.model,
+            "reasoning_effort": new.effort.clone().unwrap_or_default(),
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => codex_status_line(&new),
+            Ok(response) => format!("codex change failed: {}", response.status()),
+            Err(err) => format!("codex change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Move the activity scroll offset by `delta` rows (positive = older),
+    /// clamped to `[0, completed_len - 1]`. `view` supplies the live length.
+    fn scroll_activity(&mut self, delta: i64, view: Option<&DashboardView>) {
+        let len = view.map_or(0, |v| v.completed.len());
+        let max = len.saturating_sub(1) as i64;
+        let next = (self.activity_scroll as i64).saturating_add(delta);
+        self.activity_scroll = next.clamp(0, max) as usize;
     }
 
     fn on_key_select(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
@@ -461,6 +612,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         doc: None,
         connected: false,
         pending_switch: None,
+        pending_codex: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
     ratatui::restore();
@@ -537,6 +689,10 @@ async fn event_loop(
         };
         if let Some(target) = app.take_pending_switch() {
             app.perform_remote_switch(target).await;
+            redraw = true;
+        }
+        if let Some(codex) = app.take_pending_codex() {
+            app.perform_remote_codex(codex).await;
             redraw = true;
         }
         if app.should_quit {

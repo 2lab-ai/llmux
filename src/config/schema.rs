@@ -67,8 +67,15 @@ impl Default for Config {
 /// so a config written before routing existed loads with `enabled = false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    /// Master switch. `false` (default) = today's behavior, no group filter.
-    #[serde(default)]
+    /// Master switch. When `true` (now the default), an inbound request's
+    /// `model` selects its backend group and the scheduler picks within it —
+    /// claude models → claude accounts, codex models → codex accounts,
+    /// independent of which account is "current". This is what makes
+    /// `gpt-5.5` reach a codex account instead of being forwarded verbatim to
+    /// Anthropic (which 404s "model not found"). When `false`, no group filter
+    /// is applied and codex stays a cross-group overflow pool (the original
+    /// behavior). Toggleable from the dashboard.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Models routed to the claude group (empty → builtin claude rules).
     #[serde(default)]
@@ -89,7 +96,7 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             claude_models: Vec::new(),
             codex_models: Vec::new(),
             default_group: default_routing_group(),
@@ -98,8 +105,11 @@ impl Default for RoutingConfig {
     }
 }
 
-/// OpenAI Codex backend endpoints. Defaults target the ChatGPT backend the
-/// codex CLI itself uses; overridable for tests/staging.
+/// OpenAI Codex backend endpoints + request defaults. Endpoint defaults target
+/// the ChatGPT backend the codex CLI itself uses; overridable for tests/staging.
+/// The request-shaping fields (`default_model`, `fast`, `reasoning_effort`)
+/// mirror what the codex CLI sets on its Responses requests and are settable
+/// from the dashboard's codex group.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodexConfig {
     /// Base URL the Responses request is POSTed to (`{upstream}/responses`).
@@ -108,6 +118,23 @@ pub struct CodexConfig {
     /// OAuth token endpoint for Codex refresh-token grants.
     #[serde(default = "default_codex_token_url")]
     pub token_url: String,
+    /// Model slug the codex provider requests upstream. Was a hardcoded
+    /// `gpt-5.5` const; now config-driven so the dashboard can change it.
+    /// Additive: configs written before this field load with the default.
+    #[serde(default = "default_codex_model")]
+    pub default_model: String,
+    /// "Fast" service tier. When `true`, the Responses request carries
+    /// `service_tier: "priority"` — the exact wire value the codex CLI sends
+    /// for its fast mode (config stores "fast", wire sends "priority"). When
+    /// `false`, no `service_tier` field is sent. Default `false`.
+    #[serde(default)]
+    pub fast: bool,
+    /// Reasoning effort for the Responses request: one of
+    /// `none|minimal|low|medium|high|xhigh` (the codex CLI's `ReasoningEffort`
+    /// wire values). `None` → omit `reasoning.effort` and let the backend use
+    /// the model's default. Display + request only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for CodexConfig {
@@ -115,6 +142,9 @@ impl Default for CodexConfig {
         Self {
             upstream: default_codex_upstream(),
             token_url: default_codex_token_url(),
+            default_model: default_codex_model(),
+            fast: false,
+            reasoning_effort: None,
         }
     }
 }
@@ -369,12 +399,21 @@ fn default_version() -> u32 {
     1
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_codex_upstream() -> String {
     DEFAULT_CODEX_UPSTREAM.to_string()
 }
 
 fn default_codex_token_url() -> String {
     DEFAULT_CODEX_TOKEN_URL.to_string()
+}
+
+/// Default codex model slug (the value `CODEX_MODEL` used to hardcode).
+fn default_codex_model() -> String {
+    "gpt-5.5".to_string()
 }
 
 fn default_port() -> u16 {

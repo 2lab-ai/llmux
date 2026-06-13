@@ -389,13 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn routing_config_is_additive_and_defaults_to_disabled() {
+    fn routing_config_is_additive_and_defaults_to_enabled() {
         // A config written before routing existed (no `routing` key) loads
-        // with routing OFF — the backward-compat guarantee. enabled=false ⇒
-        // exactly today's behavior.
+        // with routing ON — model→group routing is now the default so that
+        // `gpt-5.5` reaches a codex account instead of being forwarded
+        // verbatim to Anthropic. The other fields keep their safe defaults
+        // (default_group=claude, on_empty_group=error ⇒ a missing group 404s
+        // cleanly rather than misrouting).
         let config: Config =
             serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
-        assert!(!config.routing.enabled, "routing defaults to disabled");
+        assert!(config.routing.enabled, "routing defaults to enabled");
         assert_eq!(config.routing.default_group, "claude");
         assert_eq!(config.routing.on_empty_group, "error");
         assert!(config.routing.claude_models.is_empty());

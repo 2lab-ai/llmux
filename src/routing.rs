@@ -238,6 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_5_with_context_suffix_still_routes_to_codex() {
+        // Claude Code derives the displayed context window from the model-name
+        // string client-side; the `[1m]` suffix opts into a larger window and
+        // is stripped before the request leaves the client. teamagent must
+        // still route `gpt-5.5[1m]` to codex (the `gpt-` prefix matches), so a
+        // user can get a larger window readout while staying on codex. (req9-B)
+        assert_eq!(builtin().classify(Some("gpt-5.5[1m]")), BackendGroup::Codex);
+        assert_eq!(
+            builtin().classify(Some("gpt-5.5-codex")),
+            BackendGroup::Codex
+        );
+    }
+
+    #[test]
     fn o_series_prefixes_route_to_codex() {
         assert_eq!(builtin().classify(Some("o1")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("o1-mini")), BackendGroup::Codex);

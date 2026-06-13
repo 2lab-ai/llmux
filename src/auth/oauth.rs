@@ -74,10 +74,20 @@ impl PkcePair {
             challenge,
         }
     }
+
+    /// Crate-internal test seam: build a pair from a known verifier so other
+    /// modules' tests (e.g. the Codex code-exchange test) can assert against a
+    /// fixed `code_verifier`. Test-only — not a production entry point.
+    #[cfg(test)]
+    pub(crate) fn from_verifier_for_test(verifier: String) -> Self {
+        Self::from_verifier(verifier)
+    }
 }
 
-/// 32 CSPRNG bytes, base64url without padding (43 chars).
-fn random_b64url_32() -> String {
+/// 32 CSPRNG bytes, base64url without padding (43 chars). Used for both the
+/// PKCE verifier and the CSRF `state`; exposed crate-wide so the Codex login
+/// flow reuses the exact same entropy source.
+pub(crate) fn random_b64url_32() -> String {
     let mut bytes = [0u8; 32];
     if let Err(err) = getrandom::fill(&mut bytes) {
         // A failing OS CSPRNG must never degrade to weaker entropy for an
@@ -146,15 +156,59 @@ pub async fn login_interactive(client: &reqwest::Client) -> Result<OAuthTokens, 
     let pkce = PkcePair::generate();
     let state = random_b64url_32();
 
+    // Claude binds an ephemeral port (0) on path `/callback`.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://localhost:{port}/callback");
 
+    let url = authorize_url(&pkce, &state, &redirect_uri);
+    eprintln!("Opening browser for authentication...");
+    eprintln!("If it doesn't open, visit:\n  {url}\n");
+    open_browser(&url);
+
+    let code = run_callback_server(listener, "/callback", &state).await?;
+
+    exchange_code_with_state(client, TOKEN_URL, &code, Some(&state), &pkce, &redirect_uri).await
+}
+
+/// Bind a loopback TCP listener for the OAuth callback, preferring `ports` in
+/// order (e.g. Codex wants 1455 then 1457). Returns the listener and the port
+/// it actually bound. Errors only when every candidate is unavailable.
+///
+/// The redirect_uri hostname is always `localhost` (per the provider's
+/// registered redirect); the listener itself binds `127.0.0.1`.
+pub(crate) async fn bind_callback_listener(
+    ports: &[u16],
+) -> Result<(tokio::net::TcpListener, u16), AuthError> {
+    let mut last_err: Option<std::io::Error> = None;
+    for &port in ports {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                let bound = listener.local_addr()?.port();
+                return Ok((listener, bound));
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(AuthError::Io(last_err.unwrap_or_else(|| {
+        std::io::Error::other("no callback ports provided")
+    })))
+}
+
+/// Serve the OAuth callback on `listener` until a valid `code` arrives (state
+/// verified), racing against a manual-paste fallback on stdin under the
+/// 2-minute login timeout. Shared by the Claude and Codex flows — the only
+/// per-flow differences (bind port, callback path) are parameters.
+pub(crate) async fn run_callback_server(
+    listener: tokio::net::TcpListener,
+    callback_path: &str,
+    state: &str,
+) -> Result<String, AuthError> {
     let (code_tx, code_rx) = oneshot::channel::<Result<String, AuthError>>();
     let app = Router::new()
-        .route("/callback", get(callback_handler))
+        .route(callback_path, get(callback_handler))
         .with_state(CallbackState {
-            expected_state: state.clone(),
+            expected_state: state.to_string(),
             code_tx: Arc::new(StdMutex::new(Some(code_tx))),
         });
     let server = tokio::spawn(async move {
@@ -163,16 +217,9 @@ pub async fn login_interactive(client: &reqwest::Client) -> Result<OAuthTokens, 
         let _ = axum::serve(listener, app).await;
     });
 
-    let url = authorize_url(&pkce, &state, &redirect_uri);
-    eprintln!("Opening browser for authentication...");
-    eprintln!("If it doesn't open, visit:\n  {url}\n");
-    open_browser(&url);
-
-    let code = wait_for_code(code_rx, &state).await;
+    let code = wait_for_code(code_rx, state).await;
     server.abort();
-    let code = code?;
-
-    exchange_code_with_state(client, TOKEN_URL, &code, Some(&state), &pkce, &redirect_uri).await
+    code
 }
 
 /// Race the callback server against manual paste on stdin (TTY only,
@@ -330,8 +377,8 @@ fn failure_page() -> Response {
 }
 
 /// Launch the platform browser opener, best-effort (the URL is also printed
-/// for manual use, so failures are ignored).
-fn open_browser(url: &str) {
+/// for manual use, so failures are ignored). Shared with the Codex login flow.
+pub(crate) fn open_browser(url: &str) {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {

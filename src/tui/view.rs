@@ -42,6 +42,8 @@ pub(crate) struct DashboardView {
     pub completed: Vec<Completed>,
     /// Oldest→newest tail.
     pub logs: Vec<LogLine>,
+    /// Live codex settings (req8.1): shown + toggled from the dashboard.
+    pub codex: crate::dashboard::CodexSettingsDoc,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -167,6 +169,9 @@ impl DashboardView {
                     status,
                     duration_ms,
                     tokens,
+                    group,
+                    model,
+                    effort,
                 } => Completed {
                     at: ms_time(*at_ms),
                     body: CompletedBody::Request {
@@ -179,6 +184,9 @@ impl DashboardView {
                             input: t.input,
                             output: t.output,
                         }),
+                        group: group.clone(),
+                        model: model.clone(),
+                        effort: effort.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -229,6 +237,7 @@ impl DashboardView {
             in_flight,
             completed,
             logs,
+            codex: doc.codex.clone(),
         }
     }
 

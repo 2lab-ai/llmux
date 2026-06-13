@@ -34,6 +34,11 @@ pub(crate) enum CompletedBody {
         status: u16,
         duration: Duration,
         tokens: Option<TokenCounts>,
+        /// Backend group ("claude"/"codex"), model slug, and reasoning effort
+        /// served for this request, when known.
+        group: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
     },
     Note {
         text: String,
@@ -181,6 +186,9 @@ impl ActivityLog {
                 status,
                 duration,
                 tokens,
+                group,
+                model,
+                effort,
             } => {
                 let routed = self
                     .in_flight
@@ -212,6 +220,9 @@ impl ActivityLog {
                         status,
                         duration,
                         tokens,
+                        group,
+                        model,
+                        effort,
                     },
                 });
             }
@@ -300,6 +311,9 @@ mod tests {
             status,
             duration: Duration::from_millis(1_400),
             tokens: tokens.map(|(input, output)| TokenCounts { input, output }),
+            group: None,
+            model: None,
+            effort: None,
         }
     }
 

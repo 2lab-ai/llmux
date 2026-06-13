@@ -776,6 +776,12 @@ fn codex_config(mock: &MockUpstream, accounts: Vec<AccountConfig>) -> Config {
     };
     config.codex.upstream = mock.base_url();
     config.codex.token_url = format!("{}/v1/oauth/token", mock.base_url());
+    // These tests exercise the codex PROVIDER via the legacy cross-group
+    // overflow path (a codex-only pool serving arbitrary models). Routing now
+    // defaults ON, which would 404 non-codex models against an empty claude
+    // group, so disable it here to keep testing the provider in isolation.
+    // The dedicated routing tests (`routing_config`) set enabled=true.
+    config.routing.enabled = false;
     config
 }
 
@@ -1555,6 +1561,55 @@ async fn shutdown_endpoint_stops_the_server() {
     assert!(stopped, "port must stop accepting after shutdown");
 }
 
+/// req8 + req8.1: `POST /teamagent/codex` changes the LIVE request shape — the
+/// next codex upstream request carries the new model, `service_tier:"priority"`
+/// (the wire value for fast mode), and `reasoning.effort`.
+#[tokio::test]
+async fn codex_settings_endpoint_changes_the_upstream_request() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+
+    // Change codex settings via the control endpoint (loopback-exempt).
+    let resp = client
+        .post(proxy.url("/teamagent/codex"))
+        .json(&serde_json::json!({
+            "fast": true,
+            "default_model": "gpt-5.5-codex",
+            "reasoning_effort": "high"
+        }))
+        .send()
+        .await
+        .expect("codex endpoint reachable");
+    assert_eq!(resp.status(), 200);
+    let echoed: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(echoed["fast"], true);
+    assert_eq!(echoed["default_model"], "gpt-5.5-codex");
+    assert_eq!(echoed["reasoning_effort"], "high");
+
+    // The next codex request reflects the new shape on the wire.
+    let body = r#"{"model":"gpt-5.5","max_tokens":16,"stream":true,
+        "messages":[{"role":"user","content":"hi"}]}"#;
+    let response = post_messages(&client, &proxy, body).await;
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+
+    let sent = mock
+        .seen()
+        .into_iter()
+        .find(|r| r.path.contains("responses"))
+        .expect("a codex /responses request was sent");
+    let upstream: serde_json::Value = serde_json::from_slice(&sent.body).expect("upstream json");
+    assert_eq!(upstream["model"], "gpt-5.5-codex", "model is config-driven");
+    assert_eq!(
+        upstream["service_tier"], "priority",
+        "fast mode sends service_tier=priority"
+    );
+    assert_eq!(upstream["reasoning"]["effort"], "high");
+}
+
 // ---------------------------------------------------------------------------
 // 11. Model-aware backend-group routing
 // ---------------------------------------------------------------------------
@@ -1696,7 +1751,7 @@ async fn routing_disabled_preserves_overflow_behavior() {
     const UPSTREAM_BODY: &str = r#"{"id":"msg_legacy","type":"message"}"#;
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
-    // codex_config keeps routing.enabled at its default (false).
+    // codex_config explicitly disables routing (the legacy overflow path).
     let proxy = Proxy::spawn_config(codex_config(
         &mock,
         vec![

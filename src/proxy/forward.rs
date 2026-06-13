@@ -182,6 +182,11 @@ struct ForwardContext {
     /// `Some`, the scheduler is filtered to that group and the leased
     /// credential must belong to it.
     group: Option<BackendGroup>,
+    /// Whether the request was actually served by the codex provider, set once
+    /// the account is leased and the provider path is chosen (`None` before
+    /// then, e.g. a pre-routing failure). Drives the activity log's
+    /// group/model/effort columns even when `group` is `None` (routing off).
+    served_codex: Option<bool>,
 }
 
 impl ForwardContext {
@@ -199,6 +204,29 @@ impl ForwardContext {
         }
     }
 
+    /// The (group, model, effort) triple shown in the activity log. Codex: the
+    /// configured model + effort; Claude: the inbound model + the thinking
+    /// budget. All `None` before the provider path is chosen (early failures).
+    fn finished_meta(&self, state: &AppState) -> (Option<String>, Option<String>, Option<String>) {
+        match self.served_codex {
+            Some(true) => (
+                Some("codex".to_string()),
+                Some(state.codex.model()),
+                state.codex.effort(),
+            ),
+            Some(false) => (
+                Some("claude".to_string()),
+                self.model.clone(),
+                effort_from_thinking(&self.body),
+            ),
+            None => (
+                self.group.map(|g| g.as_str().to_string()),
+                self.model.clone(),
+                effort_from_thinking(&self.body),
+            ),
+        }
+    }
+
     /// Emit the terminal activity event for this request.
     fn emit_finished(
         &self,
@@ -207,6 +235,7 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
     ) {
+        let (group, model, effort) = self.finished_meta(state);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
             method: self.method.to_string(),
@@ -215,7 +244,25 @@ impl ForwardContext {
             status: status.as_u16(),
             duration: self.started.elapsed(),
             tokens,
+            group,
+            model,
+            effort,
         });
+    }
+}
+
+/// Map the inbound Anthropic `thinking` block to a compact effort label for
+/// the activity log: `{budget/1000}k` when extended thinking is enabled, else
+/// `None`. (For codex the effort comes from config, not the body.)
+fn effort_from_thinking(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let thinking = v.get("thinking")?;
+    if thinking.get("type").and_then(|t| t.as_str()) != Some("enabled") {
+        return None;
+    }
+    match thinking.get("budget_tokens").and_then(|b| b.as_u64()) {
+        Some(b) => Some(format!("{}k", (b / 1000).max(1))),
+        None => Some("on".to_string()),
     }
 }
 
@@ -312,6 +359,9 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 status: StatusCode::BAD_REQUEST.as_u16(),
                 duration: started.elapsed(),
                 tokens: None,
+                group: None,
+                model: None,
+                effort: None,
             });
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -346,6 +396,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         started,
         model,
         group,
+        served_codex: None,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -480,6 +531,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             Some(g) => g == BackendGroup::Codex,
             None => matches!(credential, AccountCredential::Codex { .. }),
         };
+        // Record the served provider so the activity log can show the right
+        // group/model/effort even on the legacy (routing-off) path.
+        ctx.served_codex = Some(is_codex);
         if is_codex {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
@@ -1066,6 +1120,7 @@ async fn relay(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let (group, model, effort) = ctx.finished_meta(state);
         sse::passthrough_body(response, BODY_LOG_LIMIT, move |usage, captured, error| {
             totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
             if log_enabled {
@@ -1093,6 +1148,9 @@ async fn relay(
                         input: usage.input_tokens,
                         output: usage.output_tokens,
                     }),
+                    group,
+                    model,
+                    effort,
                 });
             }
             // The lease (and its in-flight pin) lives exactly as long as
@@ -1228,6 +1286,7 @@ async fn relay_codex(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let (group, model, effort) = ctx.finished_meta(state);
         let body = sse::transform_body(
             response,
             converter,
@@ -1259,6 +1318,9 @@ async fn relay_codex(
                             input: usage.input_tokens,
                             output: usage.output_tokens,
                         }),
+                        group,
+                        model,
+                        effort,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.

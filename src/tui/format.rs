@@ -48,15 +48,6 @@ pub(crate) fn countdown(remaining: Duration) -> String {
     }
 }
 
-/// Countdown from `now` to `until`; `None` when `until` is absent or past.
-pub(crate) fn countdown_until(until: Option<SystemTime>, now: SystemTime) -> Option<String> {
-    let remaining = until?.duration_since(now).ok()?;
-    if remaining.is_zero() {
-        return None;
-    }
-    Some(countdown(remaining))
-}
-
 /// Fixed-width utilization bar, e.g. `▰▰▰▱▱▱▱▱` (utilization clamped 0..=1).
 pub(crate) fn gauge_bar(utilization: f64, width: usize) -> String {
     let clamped = utilization.clamp(0.0, 1.0);
@@ -278,17 +269,6 @@ mod tests {
             countdown(Duration::from_secs(2 * 86_400 + 4 * 3_600)),
             "2d 4h"
         );
-    }
-
-    #[test]
-    fn countdown_until_none_when_past_or_absent() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        assert_eq!(countdown_until(None, now), None);
-        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(999);
-        assert_eq!(countdown_until(Some(past), now), None);
-        assert_eq!(countdown_until(Some(now), now), None, "exactly now is over");
-        let future = now + Duration::from_secs(120);
-        assert_eq!(countdown_until(Some(future), now), Some("2m 00s".into()));
     }
 
     // ---- bar / labels ----

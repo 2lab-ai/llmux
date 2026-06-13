@@ -111,6 +111,10 @@ pub struct LoginArgs {
     /// Add a manual API key instead of running the OAuth browser flow.
     #[arg(long)]
     pub api: bool,
+    /// Add an OpenAI Codex (ChatGPT subscription) account via the ChatGPT
+    /// OAuth browser flow instead of the Claude flow.
+    #[arg(long, conflicts_with = "api")]
+    pub codex: bool,
 }
 
 #[derive(Debug, Args)]

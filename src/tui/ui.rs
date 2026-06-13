@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::logging::LogLine;
+use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
 use crate::scheduler::window::QuotaWindow;
 use crate::scheduler::{select, AccountSnapshot};
@@ -212,14 +213,18 @@ fn draw_accounts(
         }
     });
 
+    // "group" (claude/codex — the model group, colored + prominent) leads the
+    // data columns; "auth" (oauth/api) is the credential type, separated out
+    // (req5). Both appear in narrow mode too — group is load-bearing.
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         (
             vec![
-                "", "#", "account", "type", "status", "5h", "reset", "7d", "reset", "token", "if",
-                "req", "tok",
+                "", "group", "#", "account", "auth", "status", "5h", "reset", "7d", "reset",
+                "token", "if", "req", "tok",
             ],
             vec![
                 Constraint::Length(2),
+                Constraint::Length(7),
                 Constraint::Length(2),
                 Constraint::Fill(1),
                 Constraint::Length(6),
@@ -238,10 +243,11 @@ fn draw_accounts(
     } else {
         (
             vec![
-                "", "#", "account", "status", "5h", "reset", "7d", "reset", "token", "if",
+                "", "group", "#", "account", "status", "5h", "reset", "7d", "reset", "token", "if",
             ],
             vec![
                 Constraint::Length(2),
+                Constraint::Length(7),
                 Constraint::Length(2),
                 Constraint::Fill(1),
                 Constraint::Length(18),
@@ -308,13 +314,21 @@ fn account_row<'a>(
     );
     let totals = view.totals_for(&account.id.0);
 
+    let group_label = account.group.as_str();
     let mut cells = vec![
         Cell::from(marker),
+        Cell::from(Span::styled(
+            group_label.to_uppercase(),
+            group_color(Some(group_label)).add_modifier(Modifier::BOLD),
+        )),
         Cell::from(Span::styled(format!("{}", pos + 1), dim())),
         Cell::from(name),
     ];
     if wide {
-        cells.push(Cell::from(Span::styled(account.credential_kind, dim())));
+        cells.push(Cell::from(Span::styled(
+            auth_type(account.credential_kind),
+            dim(),
+        )));
     }
     cells.push(Cell::from(status_span(
         account, gate, is_current, params, now,
@@ -420,10 +434,11 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// One quota window → (gauge cell, reset cell). The gauge label is the
-/// percentage normally, or the reset countdown when the account is parked /
-/// the window is over its threshold (FR6). The reset cell shows the
-/// countdown, plus the absolute local time in wide mode ("1h02m (14:30)").
+/// One quota window → (gauge cell, reset cell). The gauge label is ALWAYS the
+/// percentage (req4: it used to flip to the reset countdown when parked / over
+/// threshold, which put a duration where a percent belongs and duplicated the
+/// reset column — confusing). Over-threshold is already signaled by the red
+/// color and a `!` marker; the countdown lives only in the reset column.
 fn window_cells(
     window: &Option<QuotaWindow>,
     threshold: f64,
@@ -439,10 +454,12 @@ fn window_cells(
         );
     };
     let utilization = window.effective_utilization(now);
-    let reset = format::countdown_until(Some(window.resets_at), now);
     let color = level_color(format::gauge_level(utilization));
-    let label = if (parked || utilization > threshold) && reset.is_some() {
-        reset.clone().unwrap_or_default()
+    // A trailing `!` flags an account that is parked or past its threshold —
+    // the signal the old countdown-swap was carrying, without hiding the %.
+    let over = parked || utilization > threshold;
+    let label = if over {
+        format!("{}!", format::percent(utilization))
     } else {
         format::percent(utilization)
     };
@@ -514,31 +531,50 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
     let label = |text: &'static str| Span::styled(format!(" {text:<9}"), dim());
     let mut lines: Vec<Line> = Vec::with_capacity(6);
 
-    // current + WHY (last committed switch).
-    let mut current_spans = vec![label("current")];
-    match snapshot.representative_current() {
-        Some(current) => {
-            current_spans.push(Span::styled(
-                current.to_string(),
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
-            if let Some(switch) = view.last_switch.as_ref().filter(|s| s.to == current.0) {
-                let ago = now
-                    .duration_since(switch.at)
-                    .map(select::compact_duration)
-                    .unwrap_or_else(|_| "0s".into());
-                let why = switch.reason.as_deref().unwrap_or("switch");
-                let from = switch
-                    .from
-                    .as_deref()
-                    .map(|f| format!("{f} → "))
-                    .unwrap_or_default();
-                current_spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
-            }
-        }
-        None => current_spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
+    // Per-group current subscription (req1): claude and codex pick their
+    // current account INDEPENDENTLY, so show one line per group present.
+    let groups_present: Vec<BackendGroup> = [BackendGroup::Claude, BackendGroup::Codex]
+        .into_iter()
+        .filter(|g| snapshot.accounts.iter().any(|a| a.group == *g))
+        .collect();
+    if groups_present.is_empty() {
+        lines.push(Line::from(vec![
+            label("current"),
+            Span::styled("(none)", Style::new().fg(Color::Red)),
+        ]));
     }
-    lines.push(Line::from(current_spans));
+    for (i, g) in groups_present.iter().enumerate() {
+        let mut spans = vec![
+            label(if i == 0 { "current" } else { "" }),
+            Span::styled(
+                format!("{:<7}", g.as_str()),
+                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        match snapshot.current_for_group(*g) {
+            Some(current) => {
+                spans.push(Span::styled(
+                    current.to_string(),
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(switch) = view.last_switch.as_ref().filter(|s| s.to == current.0) {
+                    let ago = now
+                        .duration_since(switch.at)
+                        .map(select::compact_duration)
+                        .unwrap_or_else(|_| "0s".into());
+                    let why = switch.reason.as_deref().unwrap_or("switch");
+                    let from = switch
+                        .from
+                        .as_deref()
+                        .map(|f| format!("{f} → "))
+                        .unwrap_or_default();
+                    spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
+                }
+            }
+            None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
+        }
+        lines.push(Line::from(spans));
+    }
 
     // next in line + next evaluation tick (approximate — the tick task and
     // the TUI start together; jitter is one render tick).
@@ -594,6 +630,29 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
             view.rpm_5m
         )),
     ]));
+
+    // Codex group settings (req8.1): model / fast tier / reasoning effort, with
+    // the keys that change them. Only when a codex account exists.
+    if view.codex.available {
+        let c = &view.codex;
+        let fast_style = if c.fast {
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            dim()
+        };
+        lines.push(Line::from(vec![
+            label("codex"),
+            Span::styled(
+                c.model.clone(),
+                group_color(Some("codex")).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" · fast "),
+            Span::styled(if c.fast { "on" } else { "off" }, fast_style),
+            Span::raw(" · effort "),
+            Span::raw(c.effort.clone().unwrap_or_else(|| "default".into())),
+            Span::styled("   [f fast · m model · e effort]", dim()),
+        ]));
+    }
 
     let block = Block::new().borders(Borders::TOP).title(" scheduler ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -861,41 +920,53 @@ fn draw_activity(
     now: SystemTime,
 ) {
     let in_flight = &view.in_flight;
-    let title = if in_flight.is_empty() {
-        " activity ".to_string()
-    } else {
-        format!(" activity — {} in flight ", in_flight.len())
-    };
-    let block = Block::new().borders(Borders::TOP).title(title);
     let capacity = area.height.saturating_sub(1) as usize; // top border
 
     let spinner = SPINNER[chrome.frame % SPINNER.len()];
     let mut lines: Vec<Line> = Vec::with_capacity(capacity);
-    // In-flight rows pinned on top (newest start first), spinner + elapsed.
-    for request in in_flight.iter().rev().take(capacity) {
-        let elapsed = now.duration_since(request.started_at).unwrap_or_default();
-        let mut spans = vec![
-            Span::styled(format!(" {spinner} "), Style::new().fg(Color::Cyan)),
-            Span::styled(format::clock_hms_utc(request.started_at), dim()),
-            Span::raw(format!("  {} {}", request.method, request.path)),
-        ];
-        if let Some(account) = &request.account {
-            spans.push(Span::raw(format!(" → {account}")));
+    // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
+    // while scrolled into history they'd steal rows from the page being read.
+    if chrome.activity_scroll == 0 {
+        for request in in_flight.iter().rev().take(capacity) {
+            let elapsed = now.duration_since(request.started_at).unwrap_or_default();
+            let mut spans = vec![
+                Span::styled(format!(" {spinner} "), Style::new().fg(Color::Cyan)),
+                Span::styled(format::clock_hms_utc(request.started_at), dim()),
+                Span::raw(format!("  {} {}", request.method, request.path)),
+            ];
+            if let Some(account) = &request.account {
+                spans.push(Span::raw(format!(" → {account}")));
+            }
+            spans.push(Span::styled(
+                format!(" ({}…)", format::elapsed_secs(elapsed)),
+                dim(),
+            ));
+            lines.push(Line::from(spans));
         }
-        spans.push(Span::styled(
-            format!(" ({}…)", format::elapsed_secs(elapsed)),
-            dim(),
-        ));
-        lines.push(Line::from(spans));
     }
-    // Completed entries, newest first.
-    for entry in view
-        .completed
-        .iter()
-        .take(capacity.saturating_sub(lines.len()))
-    {
+    // Completed entries, newest first, windowed by the scroll offset (req6:
+    // the whole history is reachable, not just the rows that happen to fit).
+    let total = view.completed.len();
+    let completed_rows = capacity.saturating_sub(lines.len());
+    let scroll = chrome.activity_scroll.min(total.saturating_sub(1).max(0));
+    for entry in view.completed.iter().skip(scroll).take(completed_rows) {
         lines.push(completed_line(entry));
     }
+
+    // Title carries the scroll position so it's obvious you're in history.
+    let shown_last = (scroll + completed_rows).min(total);
+    let title = if scroll > 0 {
+        format!(
+            " activity — {}–{} of {total} (↑ history) ",
+            scroll + 1,
+            shown_last
+        )
+    } else if in_flight.is_empty() {
+        format!(" activity — {total} ")
+    } else {
+        format!(" activity — {} in flight ", in_flight.len())
+    };
+    let block = Block::new().borders(Borders::TOP).title(title);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -909,6 +980,9 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             status,
             duration,
             tokens,
+            group,
+            model,
+            effort,
         } => {
             let account = account.as_deref().unwrap_or("?");
             let status_style = if *status < 400 {
@@ -920,12 +994,17 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             if let Some(tokens) = tokens {
                 detail.push_str(&format!(", {} tok", format::human_count(tokens.total())));
             }
-            Line::from(vec![
-                stamp,
-                Span::raw(format!("{method} {path} → {account} (")),
-                Span::styled(status.to_string(), status_style),
-                Span::raw(format!(", {detail})")),
-            ])
+            let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
+            // [group model·effort] badge, when known (req7).
+            if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref())
+            {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(meta, group_color(group.as_deref())));
+            }
+            spans.push(Span::raw(format!(" → {account} (")));
+            spans.push(Span::styled(status.to_string(), status_style));
+            spans.push(Span::raw(format!(", {detail})")));
+            Line::from(spans)
         }
         CompletedBody::Note { text, error } => {
             let style = if *error {
@@ -936,6 +1015,51 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             Line::from(vec![stamp, Span::styled(text.clone(), style)])
         }
     }
+}
+
+/// The credential's auth TYPE (oauth/api), orthogonal to its model group.
+/// Codex accounts authenticate via ChatGPT OAuth, so they are `oauth` too —
+/// the only `api` credential is a plain Anthropic API key (req5).
+fn auth_type(credential_kind: &str) -> &'static str {
+    match credential_kind {
+        "apikey" => "api",
+        _ => "oauth",
+    }
+}
+
+/// Color a backend-group label: codex = cyan, claude = magenta, unknown = gray.
+/// Shared by the account table (req5) and the activity log (req7) so the group
+/// reads the same everywhere.
+fn group_color(group: Option<&str>) -> Style {
+    match group {
+        Some("codex") => Style::new().fg(Color::Cyan),
+        Some("claude") => Style::new().fg(Color::Magenta),
+        _ => dim(),
+    }
+}
+
+/// Compose the `[group model·effort]` badge for an activity line, or `None`
+/// when nothing is known. Examples: `[codex gpt-5.5·high]`, `[claude
+/// claude-sonnet-4-5·16k]`, `[claude]`.
+fn activity_meta(group: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Option<String> {
+    if group.is_none() && model.is_none() && effort.is_none() {
+        return None;
+    }
+    let mut label = String::new();
+    if let Some(g) = group {
+        label.push_str(g);
+    }
+    if let Some(m) = model {
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(m);
+    }
+    if let Some(e) = effort {
+        label.push('·');
+        label.push_str(e);
+    }
+    Some(format!("[{label}]"))
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -996,6 +1120,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
             Span::raw(" detail  "),
             key("l"),
             Span::raw(" logs  "),
+            key("f/m/e"),
+            Span::raw(" codex  "),
+            key("↑↓"),
+            Span::raw(" scroll  "),
             Span::styled("a/r/R disabled (attached)", dim()),
         ]),
         Mode::Normal => Line::from(vec![
@@ -1013,7 +1141,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
             key("R"),
             Span::raw(" reload  "),
             key("l"),
-            Span::raw(" logs"),
+            Span::raw(" logs  "),
+            key("f/m/e"),
+            Span::raw(" codex  "),
+            key("↑↓"),
+            Span::raw(" scroll"),
         ]),
         Mode::Select { .. } => Line::from(vec![
             Span::raw(" "),

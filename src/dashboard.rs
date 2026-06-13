@@ -25,9 +25,11 @@ use crate::tui::activity::{ActivityLog, Completed, CompletedBody, InFlight, Tota
 use crate::tui::logs::LogConsole;
 use crate::tui::{ActivityEvent, LastSwitch, PollHealth, TokenCounts};
 
-/// Completed-activity entries served in the document (the hub ring keeps
-/// more; the document is a glance surface).
-pub const ACTIVITY_TAIL: usize = 50;
+/// Completed-activity entries served in the document. Matches the hub ring
+/// ([`crate::tui::activity::LOG_CAPACITY`]) so the attach client can scroll
+/// the FULL retained history (the activity panel is scrollable now), not just
+/// a glance window. At a 1 Hz poll this is ~200 small JSON objects — cheap.
+pub const ACTIVITY_TAIL: usize = 200;
 /// Tracing lines served in the document.
 pub const LOG_TAIL: usize = 100;
 /// Trailing window for the requests-per-minute figure.
@@ -208,6 +210,9 @@ fn trace_event(event: &ActivityEvent) {
             status,
             duration,
             tokens,
+            group,
+            model,
+            effort,
         } => {
             tracing::info!(
                 id, %method, %path,
@@ -215,6 +220,9 @@ fn trace_event(event: &ActivityEvent) {
                 status,
                 duration_ms = duration.as_millis() as u64,
                 tokens = tokens.map(TokenCounts::total).unwrap_or(0),
+                group = group.as_deref().unwrap_or("-"),
+                model = model.as_deref().unwrap_or("-"),
+                effort = effort.as_deref().unwrap_or("-"),
                 "request finished"
             );
         }
@@ -282,6 +290,25 @@ pub struct DashboardDoc {
     pub activity: ActivityDoc,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
+    /// Live codex request settings (req8.1 — dashboard fast/model/effort).
+    /// Additive: absent in docs written before this existed.
+    #[serde(default)]
+    pub codex: CodexSettingsDoc,
+}
+
+/// Live codex provider settings, surfaced so the dashboard can show and toggle
+/// them (req8.1). `available` is false when no codex account is configured —
+/// the dashboard then hides the controls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexSettingsDoc {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub fast: bool,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -430,6 +457,14 @@ pub enum CompletedDoc {
         status: u16,
         duration_ms: u64,
         tokens: Option<TokensDoc>,
+        /// Backend group / served model / reasoning effort (additive: absent
+        /// in docs written before these fields existed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     Note {
         at_ms: u64,
@@ -461,6 +496,7 @@ pub struct DocMeta {
     pub config_path: Option<String>,
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
+    pub codex: CodexSettingsDoc,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -635,6 +671,9 @@ pub(crate) fn dashboard_doc(
                     status,
                     duration,
                     tokens,
+                    group,
+                    model,
+                    effort,
                 } => CompletedDoc::Request {
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
@@ -646,6 +685,9 @@ pub(crate) fn dashboard_doc(
                         input: t.input,
                         output: t.output,
                     }),
+                    group: group.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -688,6 +730,7 @@ pub(crate) fn dashboard_doc(
                 text: line.text.clone(),
             })
             .collect(),
+        codex: meta.codex.clone(),
     }
 }
 
@@ -697,6 +740,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let snapshot = state.pool.snapshot();
     let params = state.select_params();
     let hub = state.hub.view(now);
+    let codex_shape = state.codex.shape();
     let meta = DocMeta {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
@@ -705,6 +749,15 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         config_path: state.config_path.as_ref().map(|p| p.display().to_string()),
         refresh_ahead_secs: state.config.scheduler.refresh_ahead_secs,
         evaluate_tick_secs: EVALUATE_TICK.as_secs(),
+        codex: CodexSettingsDoc {
+            available: snapshot
+                .accounts
+                .iter()
+                .any(|a| a.group == crate::routing::BackendGroup::Codex),
+            fast: codex_shape.fast,
+            model: codex_shape.model,
+            effort: codex_shape.effort,
+        },
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -739,6 +792,12 @@ mod tests {
             config_path: Some("/tmp/teamagent.json".into()),
             refresh_ahead_secs: 7 * 3600,
             evaluate_tick_secs: 60,
+            codex: CodexSettingsDoc {
+                available: true,
+                fast: false,
+                model: "gpt-5.5".into(),
+                effort: None,
+            },
         }
     }
 
@@ -788,6 +847,9 @@ mod tests {
                     input: 700,
                     output: 300,
                 }),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: Some("high".into()),
             },
             now() - Duration::from_secs(58),
         );
@@ -929,6 +991,20 @@ mod tests {
                 ..
             }
         ));
+        // group/model/effort (req7) are carried into the doc.
+        match &doc.activity.completed[0] {
+            CompletedDoc::Request {
+                group,
+                model,
+                effort,
+                ..
+            } => {
+                assert_eq!(group.as_deref(), Some("codex"));
+                assert_eq!(model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(effort.as_deref(), Some("high"));
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
         assert!(doc
             .activity
             .completed
@@ -971,9 +1047,10 @@ mod tests {
     }
 
     #[test]
-    fn activity_tail_caps_at_fifty_entries() {
+    fn activity_tail_caps_at_capacity() {
         let hub = DashboardHub::default();
-        for i in 0..80u64 {
+        let seeded = ACTIVITY_TAIL as u64 + 30;
+        for i in 0..seeded {
             hub.apply_event(
                 ActivityEvent::RequestFinished {
                     id: i,
@@ -983,15 +1060,21 @@ mod tests {
                     status: 200,
                     duration: Duration::from_millis(10),
                     tokens: None,
+                    group: None,
+                    model: None,
+                    effort: None,
                 },
-                now() - Duration::from_secs(80 - i),
+                now() - Duration::from_secs(seeded - i),
             );
         }
         let view = hub.view(now());
         assert_eq!(view.completed.len(), ACTIVITY_TAIL);
         // Newest first: the last-applied id leads.
+        let newest = seeded - 1;
         match &view.completed[0].body {
-            CompletedBody::Request { path, .. } => assert_eq!(path, "/v1/messages/79"),
+            CompletedBody::Request { path, .. } => {
+                assert_eq!(path, &format!("/v1/messages/{newest}"))
+            }
             other => panic!("expected request, got {other:?}"),
         }
     }

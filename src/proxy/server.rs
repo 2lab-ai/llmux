@@ -157,8 +157,9 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let provider = Arc::new(AnthropicPassthrough::new(config.upstream.clone()));
-        let codex = Arc::new(crate::provider::codex::CodexProvider::new(
+        let codex = Arc::new(crate::provider::codex::CodexProvider::with_shape(
             config.codex.upstream.clone(),
+            crate::provider::codex::CodexShape::from_config(&config.codex),
         ));
         // The classifier is built from config.routing whether or not routing
         // is enabled (it is simply not consulted on the forward path while
@@ -462,6 +463,7 @@ pub fn router(state: AppState) -> Router {
         .route("/teamagent/status", get(status))
         .route("/teamagent/dashboard", get(dashboard_endpoint))
         .route("/teamagent/switch", post(switch_endpoint))
+        .route("/teamagent/codex", post(codex_config_endpoint))
         .route("/teamagent/shutdown", post(shutdown))
         .route("/v1/oauth/token", post(oauth_token_relay))
         .fallback(forward_any)
@@ -702,6 +704,63 @@ async fn switch_endpoint(
         }
         Err(err) => relay_error(StatusCode::CONFLICT, &format!("switch refused: {err}")),
     }
+}
+
+/// Partial update for `POST /teamagent/codex` (req8.1 — dashboard codex
+/// settings). Every field is optional; an omitted field keeps its current
+/// value. For `reasoning_effort`, an empty string or `"unset"` clears it
+/// (back to the backend default). Applies to the LIVE provider immediately and
+/// persists to the config file so it survives a restart.
+#[derive(serde::Deserialize)]
+struct CodexConfigRequest {
+    fast: Option<bool>,
+    default_model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+async fn codex_config_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<CodexConfigRequest>,
+) -> Response {
+    let mut shape = state.codex.shape();
+    if let Some(fast) = body.fast {
+        shape.fast = fast;
+    }
+    if let Some(model) = body.default_model.as_deref() {
+        if !model.trim().is_empty() {
+            shape.model = model.trim().to_string();
+        }
+    }
+    if let Some(effort) = body.reasoning_effort.as_deref() {
+        let e = effort.trim();
+        shape.effort = if e.is_empty() || e.eq_ignore_ascii_case("unset") {
+            None
+        } else {
+            Some(e.to_ascii_lowercase())
+        };
+    }
+    // Apply live (takes effect on the next request) ...
+    state.codex.set_shape(shape.clone());
+    // ... and persist so it survives a daemon restart (best-effort).
+    if let Some(path) = &state.config_path {
+        let _ = crate::config::update_path(path, |c| {
+            c.codex.default_model = shape.model.clone();
+            c.codex.fast = shape.fast;
+            c.codex.reasoning_effort = shape.effort.clone();
+        });
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "ok": true,
+            "fast": shape.fast,
+            "default_model": shape.model,
+            "reasoning_effort": shape.effort,
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 /// `POST /teamagent/shutdown` — graceful server exit (same loopback /

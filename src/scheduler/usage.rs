@@ -40,32 +40,59 @@ pub enum UsageError {
 /// epoch seconds or an RFC3339 string. Only undecodable JSON is an error.
 pub fn parse_usage_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
     let value: Value = serde_json::from_slice(body)?;
+    let five = raw_window(value.get("five_hour"));
+    let seven = raw_window(value.get("seven_day"));
+    // SCALE is decided PER RESPONSE, not per window. The live `/api/oauth/usage`
+    // endpoint returns PERCENTAGES (captured 2026-06-13: five_hour=16.0,
+    // seven_day=1.0 == 16% / 1%, matching the response headers' 0.15 / 0.01
+    // fractions). But a single sub-1.0 value is ambiguous — `0.9` could be
+    // 0.9% or a 90% fraction. The two windows always share one scale, so if
+    // EITHER raw value exceeds 1.0 the whole response is percentages (÷100);
+    // if both are ≤1.0 they are already 0..1 fractions and pass through.
+    //
+    // This fixes the "7d looks weird" bug: a 7d utilization of 1.0 (== 1%, the
+    // common state just after the weekly window resets) was previously read as
+    // the fraction 1.0 == 100% because it didn't exceed the old per-window
+    // `>1.0` threshold. Now it is normalized against the 5h value's scale.
+    let max_raw = five
+        .map(|(u, _)| u)
+        .unwrap_or(0.0)
+        .max(seven.map(|(u, _)| u).unwrap_or(0.0));
+    let as_percentage = max_raw > 1.0;
     Ok(UsageSnapshot {
-        five_hour: window_from_json(value.get("five_hour")),
-        seven_day: window_from_json(value.get("seven_day")),
+        five_hour: five.map(|(u, at)| scaled_reading(u, at, as_percentage)),
+        seven_day: seven.map(|(u, at)| scaled_reading(u, at, as_percentage)),
     })
 }
 
-fn window_from_json(value: Option<&Value>) -> Option<WindowReading> {
+/// Parse one window's RAW (un-scaled) utilization + reset, or `None` when
+/// either is missing/invalid. Scaling (percent vs fraction) is decided by the
+/// caller across both windows.
+fn raw_window(value: Option<&Value>) -> Option<(f64, std::time::SystemTime)> {
     let value = value?;
     let raw = value.get("utilization")?.as_f64()?;
     if !raw.is_finite() || raw < 0.0 {
         return None;
     }
-    let utilization = if raw > 1.0 {
-        (raw / 100.0).clamp(0.0, 1.0)
-    } else {
-        raw
-    };
     let resets_at = match value.get("resets_at")? {
         Value::Number(n) => parse_epoch_seconds(&n.to_string())?,
         Value::String(s) => parse_rfc3339(s).or_else(|| parse_epoch_seconds(s))?,
         _ => return None,
     };
-    Some(WindowReading {
-        utilization,
+    Some((raw, resets_at))
+}
+
+/// Apply the response-wide scale and clamp to a 0..1 fraction.
+fn scaled_reading(
+    raw: f64,
+    resets_at: std::time::SystemTime,
+    as_percentage: bool,
+) -> WindowReading {
+    let utilization = if as_percentage { raw / 100.0 } else { raw };
+    WindowReading {
+        utilization: utilization.clamp(0.0, 1.0),
         resets_at,
-    })
+    }
 }
 
 /// One-shot fetch of usage for one oauth account. Pure IO — no pool access —
@@ -421,6 +448,44 @@ mod tests {
         let body = br#"{"five_hour": {"utilization": 42, "resets_at": 1781222400}}"#;
         let snapshot = parse_usage_body(body).unwrap();
         assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sub_one_percent_seven_day_is_not_misread_as_full() {
+        // Ground truth from the live endpoint (2026-06-13): percentages, with a
+        // 7d of 1.0 meaning 1% — NOT the fraction 1.0 (100%). The 5h value
+        // (16.0) sets the response scale, so the 7d normalizes to 0.01.
+        let body = br#"{
+            "five_hour": {"utilization": 16.0, "resets_at": 1781350800},
+            "seven_day": {"utilization": 1.0, "resets_at": 1781946000}
+        }"#;
+        let snapshot = parse_usage_body(body).unwrap();
+        assert!((snapshot.five_hour.unwrap().utilization - 0.16).abs() < 1e-9);
+        assert!(
+            (snapshot.seven_day.unwrap().utilization - 0.01).abs() < 1e-9,
+            "7d at 1.0% must read as 0.01, not 1.0 (the old per-window bug)"
+        );
+    }
+
+    #[test]
+    fn both_windows_share_one_scale() {
+        // All-fraction response (max ≤ 1.0) passes through unchanged.
+        let frac = br#"{
+            "five_hour": {"utilization": 0.42, "resets_at": 1781222400},
+            "seven_day": {"utilization": 0.9, "resets_at": 1781222400}
+        }"#;
+        let s = parse_usage_body(frac).unwrap();
+        assert_eq!(s.five_hour.unwrap().utilization, 0.42);
+        assert_eq!(s.seven_day.unwrap().utilization, 0.9);
+        // Percentage response (5h>1.0): BOTH windows divide by 100, including a
+        // 7d that on its own (0.5) would have looked like a fraction.
+        let pct = br#"{
+            "five_hour": {"utilization": 88.0, "resets_at": 1781222400},
+            "seven_day": {"utilization": 0.5, "resets_at": 1781222400}
+        }"#;
+        let s = parse_usage_body(pct).unwrap();
+        assert!((s.five_hour.unwrap().utilization - 0.88).abs() < 1e-9);
+        assert!((s.seven_day.unwrap().utilization - 0.005).abs() < 1e-9);
     }
 
     #[test]
