@@ -298,7 +298,9 @@ pub async fn serve(
     for group in eval_groups(&state.pool, state.config.routing.enabled) {
         state.pool.evaluate(group, &params, SystemTime::now());
     }
-    if let Some(current) = state.pool.snapshot().representative_current() {
+    // Announce each group's initial selection (req1 symmetry): claude and codex
+    // both surface in the activity log, not just the representative slot.
+    for current in state.pool.snapshot().current.values() {
         state.emit(ActivityEvent::AccountSwitched {
             from: None,
             to: current.0.clone(),

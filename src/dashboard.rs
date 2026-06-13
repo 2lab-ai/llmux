@@ -11,7 +11,7 @@
 //!   so both render paths share one contract (`tui::view` converts it into
 //!   the view-model the draw code consumes).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -276,6 +276,14 @@ pub struct DashboardDoc {
     pub uptime_secs: u64,
     pub port: u16,
     pub current: Option<String>,
+    /// Per-group sticky current account (req1): `"claude"`/`"codex"` → account
+    /// name, one entry per group that has a selection. The scalar `current`
+    /// above stays the representative (claude slot first) for back-compat; this
+    /// map drives the per-group `current` lines. Additive: docs written before
+    /// this field default to an empty map and the renderer falls back to the
+    /// scalar.
+    #[serde(default)]
+    pub current_by_group: BTreeMap<String, String>,
     pub upstream: String,
     pub config_path: Option<String>,
     pub select_params: SelectParamsDoc,
@@ -704,6 +712,11 @@ pub(crate) fn dashboard_doc(
         uptime_secs: meta.uptime_secs,
         port: meta.port,
         current: snapshot.representative_current().map(|c| c.0.clone()),
+        current_by_group: snapshot
+            .current
+            .iter()
+            .map(|(group, id)| (group.as_str().to_string(), id.0.clone()))
+            .collect(),
         upstream: meta.upstream.clone(),
         config_path: meta.config_path.clone(),
         select_params: SelectParamsDoc::from(params),
@@ -810,6 +823,19 @@ mod tests {
                 refresh_token: format!("rt-{name}"),
                 expires_at_ms: 0,
                 tier: None,
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    fn codex_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Codex {
+                account_id: format!("acct-{name}"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
                 last_refresh_ms: None,
             },
         }
@@ -951,6 +977,34 @@ mod tests {
         assert_eq!(doc.accounts[0].session.requests, 1);
         assert_eq!(doc.accounts[0].session.ok, 1);
         assert_eq!(doc.accounts[0].session.tokens_out, 300);
+    }
+
+    #[test]
+    fn doc_carries_per_group_current_slots() {
+        // Routing on: claude and codex each pick a current independently, so
+        // the doc must carry BOTH slots — not just the representative scalar.
+        let pool = AccountPool::new(&[oauth_account("a"), codex_account("c")]);
+        pool.evaluate(Some(crate::routing::BackendGroup::Claude), &params(), now());
+        pool.evaluate(Some(crate::routing::BackendGroup::Codex), &params(), now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &seeded_hub().view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        // Representative scalar stays the claude slot (back-compat).
+        assert_eq!(doc.current.as_deref(), Some("a"));
+        // The new per-group map carries both group currents.
+        assert_eq!(
+            doc.current_by_group.get("claude").map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(
+            doc.current_by_group.get("codex").map(String::as_str),
+            Some("c")
+        );
     }
 
     #[test]

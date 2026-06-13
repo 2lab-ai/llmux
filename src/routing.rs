@@ -42,6 +42,16 @@ impl BackendGroup {
             Self::Codex => "codex",
         }
     }
+
+    /// Inverse of [`Self::as_str`]: parse a group label back into the enum.
+    /// Unknown labels degrade to [`Self::Claude`] (the representative group),
+    /// so a newer server's group never strands the display.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "codex" => Self::Codex,
+            _ => Self::Claude,
+        }
+    }
 }
 
 impl std::fmt::Display for BackendGroup {
@@ -222,6 +232,20 @@ mod tests {
             BackendGroup::from_kind("anything-else"),
             BackendGroup::Claude
         );
+    }
+
+    // ---- from_label (inverse of as_str) ----
+
+    #[test]
+    fn from_label_is_inverse_of_as_str() {
+        for g in [BackendGroup::Claude, BackendGroup::Codex] {
+            assert_eq!(BackendGroup::from_label(g.as_str()), g);
+        }
+    }
+
+    #[test]
+    fn from_label_defaults_unknown_to_claude() {
+        assert_eq!(BackendGroup::from_label("mystery"), BackendGroup::Claude);
     }
 
     // ---- builtin codex rules ----

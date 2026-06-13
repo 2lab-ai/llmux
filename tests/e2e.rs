@@ -749,6 +749,75 @@ async fn background_refresh_renews_expiring_token_without_traffic() {
     );
 }
 
+/// req1 symmetry: with routing on and both groups present, the proxy selects a
+/// current for EACH group independently, logs an initial selection for each,
+/// and the dashboard doc carries the per-group current map (so the TUI renders
+/// both `current` lines instead of `codex (none)`).
+#[tokio::test]
+async fn startup_selects_and_logs_each_group_independently() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn(
+        &mock.base_url(),
+        vec![
+            oauth_account("claudeacct", "at-a"),
+            codex_account("codexacct", "at-c"),
+        ],
+    )
+    .await;
+
+    // Engine state: both groups have an independent initial selection.
+    let snap = proxy.pool.snapshot();
+    assert_eq!(
+        snap.current_for_group(teamagent::routing::BackendGroup::Claude)
+            .cloned(),
+        Some(AccountId("claudeacct".into()))
+    );
+    assert_eq!(
+        snap.current_for_group(teamagent::routing::BackendGroup::Codex)
+            .cloned(),
+        Some(AccountId("codexacct".into()))
+    );
+
+    // The startup AccountSwitched events fold into the activity hub on a
+    // spawned task, so poll briefly for the codex initial-selection note.
+    let client = reqwest::Client::new();
+    let mut doc = serde_json::Value::Null;
+    let mut found_codex_note = false;
+    for _ in 0..40 {
+        doc = client
+            .get(proxy.url("/teamagent/dashboard"))
+            .send()
+            .await
+            .expect("dashboard")
+            .json()
+            .await
+            .expect("dashboard json");
+        found_codex_note = doc["activity"]["completed"]
+            .as_array()
+            .map(|notes| {
+                notes.iter().any(|c| {
+                    c["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("codexacct") && t.contains("initial selection"))
+                })
+            })
+            .unwrap_or(false);
+        if found_codex_note {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        found_codex_note,
+        "codex initial-selection note missing from activity log: {:?}",
+        doc["activity"]["completed"]
+    );
+
+    // The doc carries BOTH per-group currents (drives the TUI current lines).
+    assert_eq!(doc["current_by_group"]["claude"], "claudeacct");
+    assert_eq!(doc["current_by_group"]["codex"], "codexacct");
+}
+
 // ---------------------------------------------------------------------------
 // 9b. Codex provider: Anthropic SSE out of a Responses stream
 // ---------------------------------------------------------------------------

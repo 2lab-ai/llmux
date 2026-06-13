@@ -576,22 +576,35 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
         lines.push(Line::from(spans));
     }
 
-    // next in line + next evaluation tick (approximate — the tick task and
-    // the TUI start together; jitter is one render tick).
-    let next = next_in_line(view, ctx);
+    // Per-group next-in-line (req1 symmetry with the current block) + the
+    // shared eval-tick countdown. One tick re-evaluates every group, so the
+    // "eval in ~Xs" is shown once, on the first row.
     let tick = view.evaluate_tick.as_secs().max(1);
     let to_next_eval = tick - (view.uptime.as_secs() % tick);
-    lines.push(Line::from(vec![
-        label("next"),
-        Span::raw(next.unwrap_or_else(|| "—".into())),
-        Span::styled(
-            format!(
-                "  eval in ~{}",
-                select::compact_duration(Duration::from_secs(to_next_eval))
+    if groups_present.is_empty() {
+        lines.push(Line::from(vec![label("next"), Span::raw("—")]));
+    }
+    for (i, g) in groups_present.iter().enumerate() {
+        let next = select::next_in_line(snapshot, &view.select_params, now, Some(*g));
+        let mut spans = vec![
+            label(if i == 0 { "next" } else { "" }),
+            Span::styled(
+                format!("{:<7}", g.as_str()),
+                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
             ),
-            dim(),
-        ),
-    ]));
+            Span::raw(next.map(|n| n.to_string()).unwrap_or_else(|| "—".into())),
+        ];
+        if i == 0 {
+            spans.push(Span::styled(
+                format!(
+                    "  eval in ~{}",
+                    select::compact_duration(Duration::from_secs(to_next_eval))
+                ),
+                dim(),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
 
     lines.push(Line::from(vec![
         label("poller"),
@@ -656,19 +669,6 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
 
     let block = Block::new().borders(Borders::TOP).title(" scheduler ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Name of the first eligible non-current account in selection order —
-/// exactly the account `pick` would switch to next.
-fn next_in_line(view: &DashboardView, ctx: &FrameCtx) -> Option<String> {
-    let snapshot = &view.snapshot;
-    let params = &view.select_params;
-    ctx.order
-        .iter()
-        .map(|&i| &snapshot.accounts[i])
-        .filter(|a| !snapshot.is_current(&a.id))
-        .find(|a| select::eligibility(a, params, ctx.now, ctx.headers_only).is_none())
-        .map(|a| a.id.to_string())
 }
 
 /// One-line usage-poller health: oauth count, last-success age spread,

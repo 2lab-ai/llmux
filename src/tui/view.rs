@@ -100,11 +100,20 @@ impl DashboardView {
                 last_refresh_ms: a.last_refresh_ms,
             })
             .collect();
-        // The remote dashboard doc carries a representative scalar `current`;
-        // rebuild the per-group map by placing it into its own group's slot
-        // (best-effort — the display only needs to know which row is active).
+        // Rebuild the per-group current map. A current daemon sends the full
+        // per-group map (`current_by_group`), so each group's sticky slot
+        // renders independently (req1). Fall back to the representative scalar
+        // (`current`) — placed into its own group's slot — for docs from an
+        // older daemon that predates the map.
         let mut current = std::collections::BTreeMap::new();
-        if let Some(name) = &doc.current {
+        if !doc.current_by_group.is_empty() {
+            for (label, name) in &doc.current_by_group {
+                current.insert(
+                    crate::routing::BackendGroup::from_label(label),
+                    AccountId(name.clone()),
+                );
+            }
+        } else if let Some(name) = &doc.current {
             let id = AccountId(name.clone());
             let group = accounts
                 .iter()
@@ -343,6 +352,56 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn from_doc_rebuilds_per_group_current_from_map() {
+        use crate::routing::BackendGroup;
+        let mut json = doc_json();
+        // A codex account joins the roster, and the doc carries a per-group
+        // current map with BOTH slots (what a current daemon emits).
+        json["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "c", "type": "codex", "status": "active", "order": 3,
+                "blocked": null, "healthy": true,
+                "five_hour": null, "seven_day": null,
+                "cooldown_until": null, "cooldown_source": null,
+                "in_flight": 0,
+                "token_expires_at_ms": null, "last_refresh_ms": null,
+                "totals": { "requests": 0, "input_tokens": 0, "output_tokens": 0 },
+                "session": { "requests": 0, "ok": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0 },
+            }));
+        json["current_by_group"] = serde_json::json!({ "claude": "a", "codex": "c" });
+
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+
+        assert_eq!(
+            view.snapshot.current_for_group(BackendGroup::Claude),
+            Some(&AccountId("a".into()))
+        );
+        assert_eq!(
+            view.snapshot.current_for_group(BackendGroup::Codex),
+            Some(&AccountId("c".into()))
+        );
+        assert!(view.snapshot.is_current(&AccountId("c".into())));
+    }
+
+    #[test]
+    fn from_doc_falls_back_to_scalar_current_when_map_absent() {
+        use crate::routing::BackendGroup;
+        // Legacy daemon: no current_by_group, only the scalar `current`.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        assert!(doc.current_by_group.is_empty());
+        let view = DashboardView::from_doc(&doc);
+        // "a" is oauth (claude) → lands in the claude slot; codex stays empty.
+        assert_eq!(
+            view.snapshot.current_for_group(BackendGroup::Claude),
+            Some(&AccountId("a".into()))
+        );
+        assert_eq!(view.snapshot.current_for_group(BackendGroup::Codex), None);
     }
 
     #[test]

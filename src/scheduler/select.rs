@@ -215,6 +215,30 @@ fn group_current(snapshot: &PoolSnapshot, group: Option<BackendGroup>) -> Option
     }
 }
 
+/// THE next-in-line account for a scope: the one `pick` would switch to if the
+/// scope's current became ineligible — the best eligible candidate that is NOT
+/// the current slot. `None` when the scope has no other eligible account. Pure,
+/// reusing the same `eligibility` gate + `rank` comparator as [`pick`], so the
+/// displayed "next" can never disagree with the selector. With `group` `Some`
+/// the search is scoped to that backend group (per-group `next` lines).
+pub fn next_in_line(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+    group: Option<BackendGroup>,
+) -> Option<AccountId> {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    let current = group_current(snapshot, group);
+    snapshot
+        .accounts
+        .iter()
+        .filter(|a| in_group(a, group))
+        .filter(|a| Some(&a.id) != current)
+        .filter(|a| eligibility(a, params, now, headers_only).is_none())
+        .min_by(|a, b| rank(a, b, group, now))
+        .map(|a| a.id.clone())
+}
+
 /// Ranking comparator: provider tier first (codex accounts are the overflow
 /// pool — they have no Anthropic quota windows and must never be auto-picked
 /// over a healthy anthropic account; manual TUI switch still works), then
@@ -641,6 +665,59 @@ mod tests {
         a.credential_kind = "codex";
         a.group = BackendGroup::Codex;
         a
+    }
+
+    /// Snapshot with explicit per-group current slots.
+    fn pool_groups(
+        accounts: Vec<AccountSnapshot>,
+        currents: &[(BackendGroup, &str)],
+    ) -> PoolSnapshot {
+        let mut map = std::collections::BTreeMap::new();
+        for (g, c) in currents {
+            map.insert(*g, AccountId(c.to_string()));
+        }
+        PoolSnapshot {
+            accounts,
+            current: map,
+        }
+    }
+
+    // ---- next_in_line (per-group) ----
+
+    #[test]
+    fn next_in_line_returns_best_eligible_non_current_in_group() {
+        let snap = pool(vec![account("a"), account("b")], Some("a"));
+        assert_eq!(
+            next_in_line(&snap, &params(), now(), Some(BackendGroup::Claude)),
+            Some(id("b"))
+        );
+    }
+
+    #[test]
+    fn next_in_line_is_none_when_group_has_only_its_current() {
+        let snap = pool_groups(vec![codex_account("c")], &[(BackendGroup::Codex, "c")]);
+        assert_eq!(
+            next_in_line(&snap, &params(), now(), Some(BackendGroup::Codex)),
+            None
+        );
+    }
+
+    #[test]
+    fn next_in_line_is_scoped_to_its_own_group() {
+        // claude a(current)+b, codex c(current). Claude's next is b (never the
+        // codex account); codex has no other account so its next is none.
+        let snap = pool_groups(
+            vec![account("a"), account("b"), codex_account("c")],
+            &[(BackendGroup::Claude, "a"), (BackendGroup::Codex, "c")],
+        );
+        assert_eq!(
+            next_in_line(&snap, &params(), now(), Some(BackendGroup::Claude)),
+            Some(id("b"))
+        );
+        assert_eq!(
+            next_in_line(&snap, &params(), now(), Some(BackendGroup::Codex)),
+            None
+        );
     }
 
     #[test]
