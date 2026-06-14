@@ -537,7 +537,14 @@ pub struct CodexSseConverter {
     /// kind of the LAST entry in `blocks`).
     open_index: Option<usize>,
     saw_tool_use: bool,
+    /// `usage.input_tokens` is the FRESH (non-cached) prompt count, matching
+    /// Anthropic's convention; the cached subset lives in
+    /// `cached_input_tokens`. OpenAI Responses reports the cache-INCLUSIVE
+    /// total, so `complete()` subtracts the cached part — otherwise the
+    /// dashboard counts cached tokens that the Claude side never counts (≈90×
+    /// inflation) and the client's context bar fills on cache reads.
     usage: StreamUsage,
+    cached_input_tokens: u64,
     blocks: Vec<AggBlock>,
     stop_reason: Option<String>,
     error: Option<String>,
@@ -567,6 +574,7 @@ impl CodexSseConverter {
             open_index: None,
             saw_tool_use: false,
             usage: StreamUsage::default(),
+            cached_input_tokens: 0,
             blocks: Vec::new(),
             stop_reason: None,
             error: None,
@@ -691,11 +699,21 @@ impl CodexSseConverter {
         self.ensure_started(out);
         self.close_block(out);
         if let Some(usage) = response.and_then(|r| r.get("usage")) {
+            // OpenAI `input_tokens` is the cache-INCLUSIVE total; the cached
+            // subset is `input_tokens_details.cached_tokens`. Record fresh =
+            // total − cached so codex is comparable to the Anthropic side
+            // (which already counts uncached input only).
+            let total_input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            self.cached_input_tokens = usage
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             self.usage = StreamUsage {
-                input_tokens: usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                input_tokens: total_input.saturating_sub(self.cached_input_tokens),
                 output_tokens: usage
                     .get("output_tokens")
                     .and_then(Value::as_u64)
@@ -716,6 +734,7 @@ impl CodexSseConverter {
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                 "usage": {
                     "input_tokens": self.usage.input_tokens,
+                    "cache_read_input_tokens": self.cached_input_tokens,
                     "output_tokens": self.usage.output_tokens,
                 },
             }),
@@ -769,6 +788,7 @@ impl CodexSseConverter {
             "stop_sequence": null,
             "usage": {
                 "input_tokens": self.usage.input_tokens,
+                "cache_read_input_tokens": self.cached_input_tokens,
                 "output_tokens": self.usage.output_tokens,
             },
         }))
@@ -1448,6 +1468,43 @@ mod tests {
             StreamUsage {
                 input_tokens: 12,
                 output_tokens: 5
+            }
+        );
+    }
+
+    #[test]
+    fn cached_input_is_excluded_from_fresh_and_emitted_as_cache_read() {
+        // OpenAI reports the cache-INCLUSIVE total in `input_tokens` with the
+        // cached subset in `input_tokens_details.cached_tokens`. Record fresh =
+        // total − cached (comparable to the Anthropic side, which counts
+        // uncached input only) and surface the cached part as
+        // `cache_read_input_tokens` so the client's context bar doesn't fill on
+        // cache reads. Regression for the ~90× codex token inflation.
+        let (converter, events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 200_000,
+                "input_tokens_details": {"cached_tokens": 199_000},
+                "output_tokens": 42
+            }}}),
+        ]);
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        assert_eq!(
+            message_delta["usage"]["input_tokens"], 1_000,
+            "fresh = 200000 - 199000"
+        );
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 199_000);
+        assert_eq!(message_delta["usage"]["output_tokens"], 42);
+        // Dashboard totals read converter.usage(): fresh only.
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 1_000,
+                output_tokens: 42
             }
         );
     }
