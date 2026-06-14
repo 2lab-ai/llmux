@@ -1,6 +1,7 @@
 //! Log console state: a bounded ring of tracing [`LogLine`]s (newest last,
-//! auto-follow — the renderer shows the tail) and the `l`-key panel size
-//! toggle. Pure state — rendering lives in `ui`.
+//! auto-follow — the renderer shows the tail). The `l` key now summons a
+//! full-screen Logs overlay (issue #5), so there is no panel-size toggle. Pure
+//! state — rendering lives in `ui`.
 
 use std::collections::VecDeque;
 
@@ -39,33 +40,6 @@ impl LogConsole {
     }
 }
 
-/// Log panel height, cycled by the `l` key: small → large → hidden → small.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LogPanelSize {
-    Small,
-    Large,
-    Hidden,
-}
-
-impl LogPanelSize {
-    pub(crate) fn cycle(self) -> Self {
-        match self {
-            Self::Small => Self::Large,
-            Self::Large => Self::Hidden,
-            Self::Hidden => Self::Small,
-        }
-    }
-
-    /// Panel height in terminal rows, including the top border. 0 = hidden.
-    pub(crate) fn height(self) -> u16 {
-        match self {
-            Self::Small => 8,
-            Self::Large => 16,
-            Self::Hidden => 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,17 +62,5 @@ mod tests {
         assert_eq!(all, vec!["l2", "l3", "l4"], "capacity 3, oldest evicted");
         let tail: Vec<&str> = console.tail(2).map(|l| l.text.as_str()).collect();
         assert_eq!(tail, vec!["l3", "l4"], "tail keeps the newest, in order");
-    }
-
-    #[test]
-    fn panel_size_cycles_small_large_hidden() {
-        let mut size = LogPanelSize::Small;
-        size = size.cycle();
-        assert_eq!(size, LogPanelSize::Large);
-        size = size.cycle();
-        assert_eq!(size, LogPanelSize::Hidden);
-        assert_eq!(size.height(), 0, "hidden takes no rows");
-        size = size.cycle();
-        assert_eq!(size, LogPanelSize::Small, "full cycle returns to small");
     }
 }
