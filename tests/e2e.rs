@@ -494,6 +494,44 @@ async fn exhausted_pool_returns_429_with_soonest_reset_retry_after() {
     );
 }
 
+/// A 429 WITHOUT `retry-after` is a transient, server-side limit (Anthropic
+/// "Server is temporarily limiting requests (not your usage limit)"), NOT the
+/// account's quota. Each account gets only a SHORT self-healing park, so when
+/// every account momentarily 429s the client is told to retry in seconds — not
+/// the 60-minute heuristic that used to strand fully-usable accounts.
+#[tokio::test]
+async fn no_retry_after_429_parks_briefly_not_an_hour() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::RateLimited { retry_after: None });
+    mock.push(ScriptedResponse::RateLimited { retry_after: None });
+    let proxy = Proxy::spawn(
+        &mock.base_url(),
+        vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 429);
+    let retry_after: u64 = response
+        .headers()
+        .get("retry-after")
+        .expect("retry-after header")
+        .to_str()
+        .expect("ascii")
+        .parse()
+        .expect("seconds");
+    assert!(
+        retry_after <= 30,
+        "transient 429 → short park, got {retry_after}s (was 3600 before the fix)"
+    );
+    assert_eq!(
+        mock.seen_bearers(),
+        vec!["Bearer at-a".to_string(), "Bearer at-b".to_string()],
+        "both accounts were tried before giving up"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 7. Expired token → exactly one (coalesced) refresh, config updated
 // ---------------------------------------------------------------------------

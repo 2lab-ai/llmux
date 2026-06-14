@@ -336,7 +336,7 @@ fn exhausted_response(retry_after: Option<Duration>, accounts: usize) -> Respons
     let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
-        &format!("All {accounts} accounts exhausted. Retry in {secs}s."),
+        &format!("All {accounts} accounts are rate-limited right now; retry in {secs}s."),
     );
     if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -718,10 +718,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         tokio::time::sleep(wait).await;
                         continue;
                     }
-                    _ => {
+                    Some(wait) => {
+                        // Real rate limit with explicit timing: park exactly
+                        // that long, switch. Exhaustion here is a genuine "no
+                        // quota" 429 → tell the client when to come back.
                         state
                             .pool
-                            .record_429(&account, retry_after, SystemTime::now());
+                            .record_429(&account, Some(wait), SystemTime::now());
                         drop(lease);
                         switches += 1;
                         if switches > max_switches {
@@ -735,6 +738,24 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                                 None,
                             );
                             return exhausted_response(retry, accounts);
+                        }
+                        continue;
+                    }
+                    None => {
+                        // No retry-after = transient, server-side limit (not the
+                        // account's quota). Brief self-healing park, switch. If
+                        // EVERY account is momentarily limited, return a
+                        // transient 502 so the client retries promptly — never a
+                        // long "quota exhausted" park on a server-side blip.
+                        state.pool.record_429(&account, None, SystemTime::now());
+                        drop(lease);
+                        switches += 1;
+                        if switches > max_switches {
+                            ctx.flush_log(state);
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            return transient_response(
+                                "upstream is temporarily rate-limiting (not a usage limit)",
+                            );
                         }
                         continue;
                     }

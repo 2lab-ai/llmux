@@ -28,9 +28,15 @@ use window::{QuotaWindow, WindowSource};
 /// real per-group slots in one process.
 const LEGACY_GROUP: BackendGroup = BackendGroup::Claude;
 
-/// Heuristic cooldown applied to a 429 without `retry-after` (soma-work
-/// default: 60 minutes). Self-healed early by fresh data showing capacity.
-pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+/// Heuristic cooldown applied to a 429 WITHOUT `retry-after`. Such a 429 is
+/// almost always a transient, server-side limit (Anthropic "Server is
+/// temporarily limiting requests (not your usage limit)") rather than the
+/// account's own quota — a real quota 429 carries `retry-after`/reset headers,
+/// and the 5h/7d usage windows are the authoritative quota gate anyway. So this
+/// is SHORT (recover fast, let the client retry) and self-heals early on fresh
+/// data showing capacity. A 60-minute park here would strand a fully-usable
+/// account (≈2% utilized) for an hour on a momentary blip.
+pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Stable account identifier — the config `name`. Newtype so ids don't get
 /// mixed up with credentials or display strings.
