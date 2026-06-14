@@ -22,9 +22,8 @@ use crate::scheduler::{select, AccountSnapshot};
 use super::activity::{Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
 use super::view::DashboardView;
-use super::{Chrome, Mode};
+use super::{anim, Chrome, Mode};
 
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const GAUGE_BAR_WIDTH: usize = 8;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
@@ -52,6 +51,8 @@ struct FrameCtx {
     /// Indices into `view.snapshot.accounts` in scheduler preference order.
     order: Vec<usize>,
     headers_only: bool,
+    /// Monotonic animation frame counter (drives `anim` glyphs).
+    frame: usize,
 }
 
 /// Top-level draw entry. `view` is `None` only in attach mode before the
@@ -70,6 +71,7 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
         tz_offset: format::local_offset_secs(now),
         order: view.display_order(now),
         headers_only: select::headers_only_mode(snapshot, &view.select_params, None, now),
+        frame: chrome.frame,
     };
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     // Log console sits at the bottom, between activity and the keybar.
@@ -228,7 +230,7 @@ fn draw_accounts(
                 Constraint::Length(2),
                 Constraint::Fill(1),
                 Constraint::Length(6),
-                Constraint::Length(18),
+                Constraint::Length(20),
                 Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
                 Constraint::Length(19),
                 Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
@@ -250,7 +252,7 @@ fn draw_accounts(
                 Constraint::Length(7),
                 Constraint::Length(2),
                 Constraint::Fill(1),
-                Constraint::Length(18),
+                Constraint::Length(20),
                 Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
                 Constraint::Length(7),
                 Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
@@ -331,7 +333,7 @@ fn account_row<'a>(
         )));
     }
     cells.push(Cell::from(status_span(
-        account, gate, is_current, params, now,
+        account, gate, is_current, params, now, ctx.frame,
     )));
     cells.extend([
         five_gauge,
@@ -358,26 +360,45 @@ fn status_span(
     is_current: bool,
     params: &select::SelectParams,
     now: SystemTime,
+    frame: usize,
 ) -> Span<'static> {
     let Some(reason) = gate else {
+        // Eligible. The current account is "active" — a braille working
+        // spinner while it has in-flight traffic, otherwise a calm bar
+        // heartbeat. Other eligible accounts get a faint "ready" drift.
         return if is_current {
+            let glyph = if account.in_flight > 0 {
+                anim::braille_spin(frame)
+            } else {
+                anim::bar_pulse(frame)
+            };
             Span::styled(
-                "active",
+                format!("{glyph} active"),
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::raw("ready")
+            Span::styled(format!("{} ready", anim::idle_drift(frame)), dim())
         };
     };
     let text = select::blocking_reason(account, reason, params, now);
-    let style = match reason {
-        IneligibleReason::AuthUnhealthy
-        | IneligibleReason::FiveHourOverThreshold
-        | IneligibleReason::SevenDayOverThreshold => Style::new().fg(Color::Red),
-        IneligibleReason::CoolingDown => Style::new().fg(Color::Yellow),
-        IneligibleReason::UsageStale => dim(),
+    // Each blocked state gets its own animated glyph so the WHY reads at a
+    // glance: blinking alert (auth), shade filling up (over quota), a rotating
+    // timer (cooldown), a faint drift (stale data).
+    let (glyph, style) = match reason {
+        IneligibleReason::AuthUnhealthy => (
+            anim::blink(frame, '!'),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => {
+            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
+        }
+        IneligibleReason::CoolingDown => (
+            anim::half_block_clock(frame),
+            Style::new().fg(Color::Yellow),
+        ),
+        IneligibleReason::UsageStale => (anim::idle_drift(frame), dim()),
     };
-    Span::styled(text, style)
+    Span::styled(format!("{glyph} {text}"), style)
 }
 
 /// Full token cell: expiry countdown (with due/expired coloring) plus, in
@@ -769,7 +790,7 @@ fn draw_detail(
     lines.push(Line::from(vec![
         Span::styled(format!(" order #{}", pos + 1), Style::new()),
         Span::raw(" · "),
-        status_span(account, gate, is_current, params, now),
+        status_span(account, gate, is_current, params, now, ctx.frame),
     ]));
     let mut token_line = vec![Span::styled(" token ", dim())];
     token_line.extend(token_detail_spans(
@@ -922,15 +943,24 @@ fn draw_activity(
     let in_flight = &view.in_flight;
     let capacity = area.height.saturating_sub(1) as usize; // top border
 
-    let spinner = SPINNER[chrome.frame % SPINNER.len()];
+    let anim_frame = chrome.frame;
     let mut lines: Vec<Line> = Vec::with_capacity(capacity);
     // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
     // while scrolled into history they'd steal rows from the page being read.
     if chrome.activity_scroll == 0 {
         for request in in_flight.iter().rev().take(capacity) {
             let elapsed = now.duration_since(request.started_at).unwrap_or_default();
+            // Working spinner differs by backend group: Claude gets the braille
+            // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
+            // colors as the group labels — so you can tell what's running where
+            // at a glance. Pre-routing rows (no account yet) are a dim braille.
+            let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
+                Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
+                Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
+                None => (anim::braille_spin(anim_frame), Color::DarkGray),
+            };
             let mut spans = vec![
-                Span::styled(format!(" {spinner} "), Style::new().fg(Color::Cyan)),
+                Span::styled(format!(" {glyph} "), Style::new().fg(color)),
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
                 Span::raw(format!("  {} {}", request.method, request.path)),
             ];
@@ -1025,6 +1055,16 @@ fn auth_type(credential_kind: &str) -> &'static str {
         "apikey" => "api",
         _ => "oauth",
     }
+}
+
+/// Backend group of the account named `account` in the current snapshot, for
+/// coloring/animating its in-flight rows. `None` if not found (pre-routing).
+fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
+    view.snapshot
+        .accounts
+        .iter()
+        .find(|a| a.id.0 == account)
+        .map(|a| a.group)
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, unknown = gray.

@@ -18,6 +18,7 @@
 //! JSON) — the draw code in [`ui`] is never forked.
 
 pub(crate) mod activity;
+mod anim;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
 // `teamagent status` output and the dashboard agree on the display.
@@ -59,9 +60,11 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
     )
 }
 
-/// Render cadence (FR6: 250ms tick) — also the cadence at which a fetched
-/// remote document is re-rendered between polls (countdowns keep ticking).
-const RENDER_TICK: Duration = Duration::from_millis(250);
+/// Render cadence — also the cadence at which a fetched remote document is
+/// re-rendered between polls (countdowns keep ticking). 120ms (~8fps) so the
+/// status/spinner animations (see `anim`) step smoothly rather than the choppy
+/// 4fps the original 250ms FR6 tick gave; still trivial CPU for a glance TUI.
+const RENDER_TICK: Duration = Duration::from_millis(120);
 /// Input drain cadence — faster than the render tick so keys feel immediate.
 const INPUT_TICK: Duration = Duration::from_millis(33);
 /// Remote poll cadence for `GET /teamagent/dashboard`.
