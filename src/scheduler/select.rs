@@ -46,7 +46,7 @@ pub enum Decision {
     Exhausted { retry_after: Option<Duration> },
 }
 
-/// Why an account was skipped — surfaced in `/teamagent/status` and the TUI
+/// Why an account was skipped — surfaced in `/llmux/status` and the TUI
 /// so operators can see WHY the scheduler did what it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IneligibleReason {
@@ -190,16 +190,34 @@ pub fn pick(
         .filter(|a| eligibility(a, params, now, headers_only).is_none())
         .collect();
 
-    if let Some(current) = group_current(snapshot, group) {
-        if eligible.iter().any(|a| &a.id == current) {
-            return Decision::Stay;
+    let best = eligible
+        .iter()
+        .copied()
+        .min_by(|a, b| rank(a, b, params, group, now));
+
+    // Stickiness with a perishability override: stay on an eligible current
+    // unless some account is worth CLEARLY more right now — its score exceeds
+    // the current's by SWITCH_MARGIN. This proactively burns soon-to-reset
+    // quota instead of camping an account with a long weekly runway, while the
+    // margin (plus the 60s evaluation cadence) damps cache-thrashing hand-offs
+    // between near-equal accounts. A switch off an *ineligible* current is
+    // handled below (current is not in `eligible`, so this block is skipped).
+    if let Some(current_id) = group_current(snapshot, group) {
+        if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
+            let clearly_better = match best {
+                Some(best) if &best.id != current_id => {
+                    account_score(best, params, now)
+                        > account_score(current, params, now) * (1.0 + SWITCH_MARGIN)
+                }
+                _ => false,
+            };
+            if !clearly_better {
+                return Decision::Stay;
+            }
         }
     }
 
-    match eligible
-        .into_iter()
-        .min_by(|a, b| rank(a, b, params, group, now))
-    {
+    match best {
         Some(best) => Decision::Switch {
             to: best.id.clone(),
         },
@@ -242,22 +260,28 @@ pub fn next_in_line(
         .map(|a| a.id.clone())
 }
 
-/// 5h session-window length — Anthropic's rolling session window. Used to count
-/// how many fresh 5h windows still fit before a 7d reset (`W`): how many more
-/// times an account can burst before its leftover weekly quota evaporates.
-const FIVE_HOUR_WINDOW: Duration = Duration::from_secs(5 * 3600);
+/// The weekly window length — the horizon over which 7d-reset perishability
+/// ramps. An account whose 7d window resets a full `SEVEN_DAY_PERIOD` from now
+/// (a just-started window) is maximally non-perishable (urgency 1.0); one whose
+/// window resets imminently is maximally perishable (urgency [`URGENCY_MAX`]).
+const SEVEN_DAY_PERIOD: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Deadline-urgency reference: an account with this many 5h windows (≈15h) or
-/// more of weekly runway gets no urgency boost; fewer windows scale the boost up
-/// toward [`URGENCY_MAX`].
-const URGENCY_REF_WINDOWS: f64 = 3.0;
+/// Cap on the perishability multiplier, so a near-reset account with little
+/// usable burst can't dominate a healthy one. With `URGENCY_MAX = 4`, a
+/// soonest-reset account wins over a full cold one only while it can still serve
+/// at least ~`0.9 / 4 ≈ 0.22` of headroom — below that it is too gated to be
+/// worth chasing and `servable_now` lets the usable account win.
+const URGENCY_MAX: f64 = 4.0;
 
-/// Cap on the urgency multiplier, so a near-reset account with little usable
-/// burst can't dominate a healthy one.
-const URGENCY_MAX: f64 = 3.0;
+/// Relative score margin a non-current account must beat the current account by
+/// before the scheduler proactively switches off an *eligible* current. Burning
+/// soon-to-reset quota is worth a switch; a marginal or tiebreak-only difference
+/// is not (it would only cost upstream prompt-cache locality). See
+/// `.prd/09-scheduler-perishability.md`.
+const SWITCH_MARGIN: f64 = 0.25;
 
 /// The scheduler's value for an account — higher is preferred. Derivation in
-/// `.prd/07-scheduler-research.md`.
+/// `.prd/09-scheduler-perishability.md` (supersedes `07`).
 ///
 /// `servable_now = min(5h headroom, 7d headroom)` is the work the account can
 /// serve before it next gates on EITHER limit. The 5h window rate-caps the 7d
@@ -265,15 +289,14 @@ const URGENCY_MAX: f64 = 3.0;
 /// little right now, and one with a full 5h window but little weekly budget is
 /// likewise capped — the binding limit wins.
 ///
-/// `urgency` boosts an account whose 7d window resets within a few 5h windows:
-/// only `W` more bursts of weekly quota are drainable before the rest
-/// evaporates, so what IS drainable is perishable and should be burned first —
-/// but only while it is still usable (a gated 5h window drives `servable_now`
-/// toward 0, so the boost cannot rescue an urgent-but-unusable account). An
-/// account with no live 7d window (cold/expired) is not perishable: urgency 1.0.
-///
-/// In the comfortable regime (ample weekly budget, distant reset) urgency is
-/// 1.0 and `score ≈ 5h headroom`, i.e. "most burst available now first".
+/// `urgency` scales with how far an account is through its weekly window: budget
+/// that resets soon refreshes regardless, so it is perishable and should be
+/// burned first, while a long-runway account is preserved as a reservoir. The
+/// ramp is linear across the whole `SEVEN_DAY_PERIOD` — a reset ~1 day out gets
+/// ≈3.5×, ~6 days out ≈1.4×, and a just-reset / no-live-7d (cold) account 1.0×
+/// (least perishable, used last). The boost is gated by `servable_now`: a maxed
+/// 5h window or drained weekly budget drives it toward 0, so an
+/// urgent-but-unusable account cannot win — it would gate immediately.
 pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> f64 {
     let five = account
         .five_hour
@@ -290,8 +313,10 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
                 .duration_since(now)
                 .unwrap_or(Duration::ZERO)
                 .as_secs_f64();
-            let windows_left = (secs_left / FIVE_HOUR_WINDOW.as_secs_f64()).max(1.0);
-            (URGENCY_REF_WINDOWS / windows_left).clamp(1.0, URGENCY_MAX)
+            // Fraction of a full weekly window still on the clock: 1.0 = just
+            // reset (not perishable), 0.0 = resets right now (most perishable).
+            let frac_left = (secs_left / SEVEN_DAY_PERIOD.as_secs_f64()).clamp(0.0, 1.0);
+            1.0 + (URGENCY_MAX - 1.0) * (1.0 - frac_left)
         }
         None => 1.0,
     };
@@ -301,11 +326,10 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
 /// Ranking comparator: provider tier first (codex accounts are the overflow
 /// pool — they have no Anthropic quota windows and must never be auto-picked
 /// over a healthy anthropic account; manual TUI switch still works), then
-/// **higher [`account_score`]** (most useful burst now, boosted by weekly-quota
-/// perishability — this replaces the old blind "soonest 7d reset" primary key,
-/// which over-prioritized accounts whose leftover quota was unsalvageable),
-/// then lower 5h effective utilization, then soonest 7d reset as a deep
-/// tiebreak (known reset before unknown), then stable id.
+/// **higher [`account_score`]** (usable burst now × weekly-quota perishability,
+/// so among usable accounts the soonest-to-reset is preferred and a long-runway
+/// account is preserved), then lower 5h effective utilization, then soonest 7d
+/// reset as a deep tiebreak (known reset before unknown), then stable id.
 ///
 /// Under a group filter (`group.is_some()`, routing on) the codex `tier`-last
 /// rule is a NO-OP: every candidate is already in the same group, so there is
@@ -401,7 +425,7 @@ pub fn selection_order(
 /// Human-readable blocking reason for an ineligible account, with the
 /// concrete numbers an operator acts on: "cooldown 3m12s",
 /// "7d 99.4% > 99%", "usage stale 14m03s", "auth failed". Shared by the TUI
-/// status column and `/teamagent/status` so the wording never drifts.
+/// status column and `/llmux/status` so the wording never drifts.
 pub fn blocking_reason(
     account: &AccountSnapshot,
     reason: IneligibleReason,
@@ -722,33 +746,35 @@ mod tests {
 
     #[test]
     fn account_score_is_servable_now_times_urgency() {
-        // Comfortable: distant 7d reset → urgency 1.0 → score = min(r5, r7).
+        // Reset 6 days out (frac_left = 6/7) → mild urgency 1 + 3*(1 - 6/7) =
+        // 10/7; servable = min(r5 0.70, r7 0.89) = 0.70 → score 0.70 * 10/7 = 1.0.
         let mut comfy = account("c");
         comfy.five_hour = Some(window(0.20, HOUR)); // r5 = 0.70
-        comfy.seven_day = Some(window(0.10, 6 * 24 * HOUR)); // r7 = 0.89, far reset
-        assert!((account_score(&comfy, &params(), now()) - 0.70).abs() < 1e-9);
+        comfy.seven_day = Some(window(0.10, 6 * 24 * HOUR)); // r7 = 0.89
+        assert!((account_score(&comfy, &params(), now()) - 1.0).abs() < 1e-9);
 
-        // Imminent 7d reset (≤ one 5h window) → urgency clamps to URGENCY_MAX (3).
+        // Resets in 1h (frac_left = 1/168) → urgency 1 + 3*(167/168) = 669/168;
+        // servable 0.70 → score 0.70 * 669/168 = 2.7875.
         let mut urgent = account("u");
         urgent.five_hour = Some(window(0.20, HOUR)); // r5 = 0.70
         urgent.seven_day = Some(window(0.10, HOUR)); // r7 = 0.89, resets in 1h
-                                                     // servable_now = min(0.70, 0.89) = 0.70 ; urgency = 3 → 2.10
-        assert!((account_score(&urgent, &params(), now()) - 2.10).abs() < 1e-9);
+        assert!((account_score(&urgent, &params(), now()) - 2.7875).abs() < 1e-9);
     }
 
     #[test]
-    fn non_urgent_known_reset_does_not_outrank_fuller_cold_account() {
-        // New contract: a half-used account whose 7d reset is far off (plenty of
-        // 5h windows left to drain it) is NOT perishable, so it does not beat a
-        // fuller cold account. The old policy burned soonest-reset blindly.
-        let cold = account("aaa"); // full budget → score 0.90
+    fn perishable_known_reset_outranks_fuller_cold_account() {
+        // Use-it-or-lose-it: an account half-used but resetting in ~1 day
+        // (frac_left 1/7 → urgency 25/7 ≈ 3.57, score 0.49 * 3.57 ≈ 1.75) beats a
+        // full cold account (score 0.90). The cold account has a long runway and
+        // is preserved as a reservoir; the perishable one is burned first.
+        let cold = account("aaa"); // full budget, no live 7d → score 0.90
         let mut known = account("zzz");
-        known.seven_day = Some(window(0.5, 24 * HOUR)); // r7 0.49, far reset → urgency 1 → 0.49
+        known.seven_day = Some(window(0.5, 24 * HOUR)); // resets in 1 day → perishable
         let decision = pick(&pool(vec![cold, known], None), &params(), None, now());
         assert_eq!(
             decision,
-            Decision::Switch { to: id("aaa") },
-            "fuller cold account wins when the known account's quota is in no danger"
+            Decision::Switch { to: id("zzz") },
+            "soon-resetting, still-usable weekly quota is burned before a long-runway account"
         );
     }
 
@@ -1006,7 +1032,11 @@ mod tests {
     // ---- stickiness ----
 
     #[test]
-    fn stays_on_eligible_current_even_when_outranked() {
+    fn proactively_switches_off_eligible_current_for_clearly_more_perishable() {
+        // The current account is eligible but low-value (5h 0.80 → servable 0.10,
+        // reset 2 days out → score ≈ 0.31). Another account resets within the hour
+        // with a fresh 5h window (servable 0.49 → score ≈ 1.95) — over 6× the
+        // current, well past SWITCH_MARGIN, so the scheduler moves to burn it.
         let mut current = account("a");
         current.seven_day = Some(window(0.5, 48 * HOUR));
         current.five_hour = Some(window(0.80, HOUR));
@@ -1019,6 +1049,19 @@ mod tests {
             None,
             now(),
         );
+        assert_eq!(decision, Decision::Switch { to: id("b") });
+    }
+
+    #[test]
+    fn stays_on_eligible_current_within_switch_margin() {
+        // The alternative outranks the current, but only by ~6% (0.85 vs 0.80),
+        // under SWITCH_MARGIN (25%). Not worth a prompt-cache-busting hand-off —
+        // stickiness holds.
+        let mut current = account("a");
+        current.five_hour = Some(window(0.10, HOUR)); // servable 0.80, urgency 1
+        let mut alt = account("b");
+        alt.five_hour = Some(window(0.05, HOUR)); // servable 0.85, urgency 1
+        let decision = pick(&pool(vec![current, alt], Some("a")), &params(), None, now());
         assert_eq!(decision, Decision::Stay);
     }
 
@@ -1352,6 +1395,289 @@ mod tests {
         assert_eq!(
             soonest_reset(&pool(vec![a], None), now()),
             Some(Duration::from_secs(500))
+        );
+    }
+
+    // ---- perishability policy verification (.prd/09-scheduler-perishability.md) ----
+
+    /// Account with both windows live: 5h `u5`, 7d `u7`, 7d resets `reset_h`
+    /// hours out. The 5h window's own reset is parked far enough out to never
+    /// expire during a test.
+    fn acct7(id_: &str, u5: f64, u7: f64, reset_h: u64) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.five_hour = Some(window(u5, 12 * HOUR));
+        a.seven_day = Some(window(u7, reset_h * HOUR));
+        a
+    }
+
+    /// The live fleet from the bug report: six idle Claude accounts, all far
+    /// under their limits, 7d resets spread 1.3d–6.4d. The OLD scheduler picked
+    /// dev1 (most 5h headroom) and camped ai2 — both with the LONGEST runway —
+    /// while ai3/notify (barely-used quota, resets ~1 day) sat unused. The fix
+    /// must pick the soonest-resetting *usable* account and proactively leave
+    /// the long-runway current.
+    fn owner_fleet() -> Vec<AccountSnapshot> {
+        vec![
+            acct7("ai2", 0.17, 0.04, 101),   // 4d5h
+            acct7("dev1", 0.03, 0.02, 136),  // 5d16h
+            acct7("info", 0.04, 0.04, 147),  // 6d3h
+            acct7("notify", 0.05, 0.03, 38), // 1d14h
+            acct7("ai3", 0.06, 0.06, 30),    // 1d6h  (soonest)
+            acct7("ai", 0.17, 0.04, 154),    // 6d10h
+        ]
+    }
+
+    #[test]
+    fn owner_fleet_burns_soonest_reset_first_not_most_headroom() {
+        let snap = pool(owner_fleet(), Some("ai2"));
+        // Proactively leaves the eligible-but-long-runway current (ai2) for the
+        // most-perishable usable account (ai3, resets in ~1d6h).
+        assert_eq!(
+            pick(&snap, &params(), None, now()),
+            Decision::Switch { to: id("ai3") },
+            "must switch off ai2 to ai3 (soonest reset), NOT stay or pick dev1"
+        );
+        // The displayed "next" agrees with the selector.
+        assert_eq!(next_in_line(&snap, &params(), now(), None), Some(id("ai3")));
+        // Full ranked order: current first, then perishable-first.
+        let order: Vec<String> = selection_order(&snap, &params(), now())
+            .into_iter()
+            .map(|i| snap.accounts[i].id.0.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["ai2", "ai3", "notify", "dev1", "info", "ai"],
+            "ai3 and notify (resets ~1 day) outrank the 4–6 day accounts"
+        );
+    }
+
+    #[test]
+    fn owner_fleet_burn_down_sequence_visits_accounts_in_perishability_order() {
+        // Drain the fleet: each round pick the best, then max its 5h window so it
+        // can no longer serve (servable → 0), and pick again. The SEQUENCE of
+        // first picks must be soonest-reset-among-usable throughout — never a
+        // long-runway account while a more-perishable usable one remains.
+        let mut accts = owner_fleet();
+        let mut sequence = Vec::new();
+        for _ in 0..accts.len() {
+            let snap = pool(accts.clone(), None);
+            let Decision::Switch { to } = pick(&snap, &params(), None, now()) else {
+                panic!("expected a switch while usable accounts remain");
+            };
+            sequence.push(to.0.clone());
+            let idx = accts
+                .iter()
+                .position(|a| a.id == to)
+                .expect("picked account");
+            // Gate its 5h window (still eligible at the boundary, but servable 0).
+            accts[idx].five_hour = Some(window(0.90, 12 * HOUR));
+        }
+        assert_eq!(
+            sequence,
+            vec!["ai3", "notify", "ai2", "dev1", "info", "ai"],
+            "perishable-first burn-down: 1-day accounts, then by soonest reset"
+        );
+    }
+
+    // ---- comparator invariants ----
+
+    /// A deliberately diverse fleet: cold, mixed util/reset, 5h-only, 7d-only,
+    /// fully-gated, and a codex overflow account — to stress the comparator.
+    fn diverse_fleet() -> Vec<AccountSnapshot> {
+        let mut five_only = account("five_only");
+        five_only.five_hour = Some(window(0.30, 12 * HOUR));
+        let mut seven_only = account("seven_only");
+        seven_only.seven_day = Some(window(0.40, 50 * HOUR));
+        vec![
+            account("cold"),
+            acct7("soon_light", 0.10, 0.10, 6),
+            acct7("mid", 0.40, 0.50, 60),
+            acct7("far_light", 0.05, 0.02, 150),
+            acct7("gated5", 0.90, 0.10, 20),
+            acct7("full7", 0.10, 1.00, 20),
+            five_only,
+            seven_only,
+            codex_account("cx"),
+        ]
+    }
+
+    #[test]
+    fn rank_is_a_total_order() {
+        let fleet = diverse_fleet();
+        let le = |a: &AccountSnapshot, b: &AccountSnapshot| {
+            rank(a, b, &params(), None, now()) != std::cmp::Ordering::Greater
+        };
+        // Antisymmetry: a≤b and b≤a ⇒ they compare Equal both ways.
+        for a in &fleet {
+            for b in &fleet {
+                let ab = rank(a, b, &params(), None, now());
+                let ba = rank(b, a, &params(), None, now());
+                match ab {
+                    std::cmp::Ordering::Less => assert_eq!(ba, std::cmp::Ordering::Greater),
+                    std::cmp::Ordering::Greater => assert_eq!(ba, std::cmp::Ordering::Less),
+                    std::cmp::Ordering::Equal => assert_eq!(ba, std::cmp::Ordering::Equal),
+                }
+            }
+        }
+        // Transitivity: a≤b ∧ b≤c ⇒ a≤c, over every triple.
+        for a in &fleet {
+            for b in &fleet {
+                for c in &fleet {
+                    if le(a, b) && le(b, c) {
+                        assert!(le(a, c), "transitivity violated");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_gated_account_never_outranks_a_usable_one() {
+        // gated resets very soon (max perishability) but its 5h window is maxed,
+        // so servable → 0: it must still rank AFTER a usable, far-reset account.
+        let usable = acct7("usable", 0.10, 0.10, 120);
+        let gated = acct7("gated", 0.90, 0.10, 1);
+        assert!(account_score(&gated, &params(), now()) <= f64::EPSILON);
+        assert_eq!(
+            rank(&usable, &gated, &params(), None, now()),
+            std::cmp::Ordering::Less,
+            "usable beats an urgent-but-unusable account"
+        );
+    }
+
+    #[test]
+    fn more_perishable_outranks_equally_usable_less_perishable() {
+        // Identical except 7d reset time: the sooner-resetting account scores
+        // higher (more urgency, same servable) and ranks first.
+        let sooner = acct7("sooner", 0.20, 0.20, 24);
+        let later = acct7("later", 0.20, 0.20, 120);
+        assert!(account_score(&sooner, &params(), now()) > account_score(&later, &params(), now()));
+        assert_eq!(
+            rank(&sooner, &later, &params(), None, now()),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn pick_next_and_order_agree_with_no_current() {
+        // With no current slot, pick's target, next_in_line, and the head of
+        // selection_order must all be the same account.
+        let snap = pool(diverse_fleet(), None);
+        let Decision::Switch { to } = pick(&snap, &params(), None, now()) else {
+            panic!("expected an initial switch");
+        };
+        assert_eq!(
+            next_in_line(&snap, &params(), now(), None),
+            Some(to.clone())
+        );
+        let head = selection_order(&snap, &params(), now())[0];
+        assert_eq!(snap.accounts[head].id, to);
+    }
+
+    // ---- wasted-quota simulation (the core claim, measured) ----
+
+    /// Phase = one 5h window. Score with the SAME shape production uses, for the
+    /// new (linear-over-7d) vs the old (15h-cliff) urgency. `seven_max = 1.0`
+    /// keeps weekly budgets clean (0.5 steps); see `sim_score_matches_production`.
+    const PHASE_SECS: f64 = 5.0 * 3600.0;
+    const SEVEN_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
+    fn sim_score(new_policy: bool, u7: f64, reset_secs: f64) -> f64 {
+        let r5 = 0.90_f64; // 5h fresh in this low-utilization regime
+        let r7 = (1.0 - u7).max(0.0);
+        let servable = r5.min(r7);
+        let urgency = if new_policy {
+            let frac_left = (reset_secs / SEVEN_SECS).clamp(0.0, 1.0);
+            1.0 + (URGENCY_MAX - 1.0) * (1.0 - frac_left)
+        } else {
+            // The replaced policy: urgency = clamp(3 / windows_left, 1, 3),
+            // dormant until the reset is within 3 five-hour windows (15h).
+            let windows_left = (reset_secs / PHASE_SECS).max(1.0);
+            (3.0 / windows_left).clamp(1.0, 3.0)
+        };
+        servable * urgency
+    }
+
+    #[test]
+    fn sim_score_matches_production() {
+        // The simulation's new-policy scorer must equal the real account_score
+        // (with five_max 0.90, seven_max 1.0, a fresh 5h window).
+        let p = SelectParams {
+            five_hour_max: 0.90,
+            seven_day_max: 1.0,
+            usage_max_age: Duration::from_secs(600),
+        };
+        for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
+            let a = {
+                let mut a = account("x");
+                a.five_hour = Some(window(0.0, 100 * HOUR));
+                a.seven_day = Some(window(u7, reset_h * HOUR));
+                a
+            };
+            let real = account_score(&a, &p, now());
+            let sim = sim_score(true, u7, (reset_h as f64) * 3600.0);
+            assert!((real - sim).abs() < 1e-9, "u7={u7} reset_h={reset_h}");
+        }
+    }
+
+    /// Greedy single-consumer simulation: each phase route demand to the
+    /// argmax-score account (isolating the RANKING effect — stickiness is tested
+    /// separately), serve up to the 5h RATE and the account's weekly budget,
+    /// drop the rest. Returns total dropped demand.
+    fn simulate(new_policy: bool, demand: &[f64], resets: &[Vec<usize>]) -> f64 {
+        const RATE: f64 = 0.5;
+        let n = resets.len();
+        let mut u7 = vec![0.0_f64; n];
+        let mut dropped = 0.0;
+        for (p, &d) in demand.iter().enumerate() {
+            for (i, sched) in resets.iter().enumerate() {
+                if sched.contains(&p) {
+                    u7[i] = 0.0; // weekly window reset (any unused budget is lost)
+                }
+            }
+            let mut best = 0usize;
+            let mut best_score = f64::NEG_INFINITY;
+            for (i, sched) in resets.iter().enumerate() {
+                let next = sched
+                    .iter()
+                    .find(|&&ph| ph > p)
+                    .map(|&ph| ph - p)
+                    .unwrap_or(100_000);
+                let reset_secs = next as f64 * PHASE_SECS;
+                let s = sim_score(new_policy, u7[i], reset_secs);
+                if s > best_score {
+                    best_score = s;
+                    best = i;
+                }
+            }
+            let remaining = (1.0 - u7[best]).max(0.0);
+            let served = d.min(RATE).min(remaining);
+            u7[best] += served;
+            dropped += d - served;
+        }
+        dropped
+    }
+
+    #[test]
+    fn perishability_policy_wastes_less_than_headroom_policy() {
+        // A resets at phase 3 (then never again in-horizon); B never resets.
+        // Low early demand, then a burst. The OLD policy load-balances onto B
+        // during the lull, leaving A's first-window budget half-unused — lost at
+        // A's phase-3 reset — and is then short for the burst. The NEW policy
+        // concentrates the lull on the soon-resetting A (fully harvesting it) and
+        // preserves B's reservoir, serving the whole burst.
+        let demand = [0.5, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5];
+        let resets = vec![vec![3usize], vec![]];
+        let new_dropped = simulate(true, &demand, &resets);
+        let old_dropped = simulate(false, &demand, &resets);
+        assert!(
+            new_dropped < 1e-9,
+            "perishability policy serves all demand (dropped {new_dropped})"
+        );
+        assert!(
+            old_dropped > new_dropped + 0.4,
+            "headroom policy wastes a soon-resetting account's budget: \
+             old dropped {old_dropped} vs new {new_dropped}"
         );
     }
 }
