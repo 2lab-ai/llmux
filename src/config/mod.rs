@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     AccountConfig, AccountCredential, CodexConfig, Config, ProxyConfig, RoutingConfig,
-    SchedulerConfig, Upsert,
+    SchedulerConfig, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
