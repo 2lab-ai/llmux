@@ -569,11 +569,9 @@ impl App {
             KeyCode::Backspace => {
                 self.add_input.pop();
             }
-            KeyCode::Char(c) => {
-                // Guard against accidental control chars; only printable input.
-                if !c.is_control() {
-                    self.add_input.push(c);
-                }
+            // Guard against accidental control chars; only printable input.
+            KeyCode::Char(c) if !c.is_control() => {
+                self.add_input.push(c);
             }
             _ => {}
         }
