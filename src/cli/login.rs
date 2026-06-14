@@ -52,12 +52,58 @@ async fn login_oauth() -> Result<(), CliError> {
     let client = reqwest::Client::new();
 
     println!("Starting OAuth login...");
-    let tokens = oauth::login_interactive(&client).await?;
+    let account = oauth_login_to_account(&client, &config.upstream).await?;
+
+    let mut final_name = account.name.clone();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        let mut account = account.clone();
+        // When the profile was unavailable the helper returns the placeholder
+        // `claude:account`; assign the next free `claude:account-N` against the
+        // fresh on-disk state so anonymous logins don't overwrite each other
+        // (matches the original CLI behavior).
+        if account.name == "claude:account" {
+            let n = config
+                .accounts
+                .iter()
+                .filter(|a| a.name.starts_with("claude:account-"))
+                .count()
+                + 1;
+            account.name = format!("claude:account-{n}");
+        }
+        final_name = account.name.clone();
+        outcome = config.upsert_account(account);
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added account {final_name:?}"),
+        Upsert::Updated => println!("Updated account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// Run the Anthropic PKCE browser flow and turn the result into a
+/// ready-to-upsert [`AccountConfig`] — the shared core of the CLI `login`
+/// command AND the dashboard's "new login from the switcher" path (issue #4),
+/// so both build the identical `claude:<email>` account from the same flow.
+///
+/// `upstream` is the base URL the profile fetch (`/api/oauth/profile`) hits.
+/// A profile-fetch failure degrades to an unenriched `claude:account-N` name
+/// rather than losing the freshly minted tokens. This function performs NO
+/// config write and NO logging of the token — the caller persists it (CLI:
+/// `config::update`; dashboard: `AppState::inject_account` /
+/// `POST /llmux/inject-account`).
+pub async fn oauth_login_to_account(
+    client: &reqwest::Client,
+    upstream: &str,
+) -> Result<AccountConfig, CliError> {
+    let tokens = oauth::login_interactive(client).await?;
 
     // Profile fetch enriches uuid/name/tier; a failure degrades to an
     // unenriched account rather than losing the freshly minted tokens.
-    let fetched = profile::fetch_profile(&client, &config.upstream, &tokens.access_token).await;
-    let (account_uuid, name, tier) = match fetched {
+    let fetched = profile::fetch_profile(client, upstream, &tokens.access_token).await;
+    let (account_uuid, email, tier) = match fetched {
         Ok(p) => {
             if let Some(tier) = &p.tier {
                 println!("Detected Claude {tier} account: {}", p.email);
@@ -70,47 +116,32 @@ async fn login_oauth() -> Result<(), CliError> {
         }
     };
 
-    let mut final_name = String::new();
-    let mut outcome = Upsert::Added;
-    crate::config::update(|config: &mut Config| {
-        // Encode the model group in the name (`claude:<email>`) so the same
-        // email can hold a Claude AND a Codex subscription without colliding —
-        // mirrors the `codex:<email>` convention the `--codex` flow uses (req5).
-        let resolved_name = if name.is_empty() {
-            let n = config
-                .accounts
-                .iter()
-                .filter(|a| a.name.starts_with("claude:account-"))
-                .count()
-                + 1;
-            format!("claude:account-{n}")
-        } else {
-            format!("claude:{name}")
-        };
-        final_name = resolved_name.clone();
-        outcome = config.upsert_account(AccountConfig {
-            name: resolved_name,
-            credential: AccountCredential::Oauth {
-                account_uuid: account_uuid.clone(),
-                access_token: tokens.access_token.clone(),
-                // A fresh code exchange always carries a refresh token;
-                // `None` (refresh-style response) degrades to empty.
-                refresh_token: tokens.refresh_token.clone().unwrap_or_default(),
-                expires_at_ms: tokens.expires_at_ms,
-                tier: tier.clone(),
-                // Login mints a brand-new token — that IS a refresh for
-                // the dashboard's "refreshed ago" display.
-                last_refresh_ms: Some(super::now_ms()),
-            },
-        });
-    })?;
+    // Encode the model group in the name (`claude:<email>`) so the same email
+    // can hold a Claude AND a Codex subscription without colliding — mirrors
+    // the `codex:<email>` convention the `--codex` flow uses (req5). When the
+    // profile is unknown the name carries an empty uuid; the daemon's upsert
+    // then dedups by name, so a re-login still updates rather than duplicates.
+    let name = if email.is_empty() {
+        "claude:account".to_string()
+    } else {
+        format!("claude:{email}")
+    };
 
-    match outcome {
-        Upsert::Added => println!("Added account {final_name:?}"),
-        Upsert::Updated => println!("Updated account {final_name:?}"),
-    }
-    println!("Saved to {}", crate::config::config_path()?.display());
-    Ok(())
+    Ok(AccountConfig {
+        name,
+        credential: AccountCredential::Oauth {
+            account_uuid,
+            access_token: tokens.access_token,
+            // A fresh code exchange always carries a refresh token; `None`
+            // (refresh-style response) degrades to empty.
+            refresh_token: tokens.refresh_token.unwrap_or_default(),
+            expires_at_ms: tokens.expires_at_ms,
+            tier,
+            // Login mints a brand-new token — that IS a refresh for the
+            // dashboard's "refreshed ago" display.
+            last_refresh_ms: Some(super::now_ms()),
+        },
+    })
 }
 
 /// `--codex`: run the ChatGPT OAuth browser flow and upsert a Codex account.

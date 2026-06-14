@@ -243,7 +243,8 @@ fn draw_accounts(
         Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
             Some(idx.min(ctx.order.len().saturating_sub(1)))
         }
-        Mode::Normal | Mode::AddKey => None,
+        // NewLogin is a provider picker, not an account-row cursor.
+        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
     };
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
@@ -805,7 +806,8 @@ fn draw_detail(
         Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
             idx.min(ctx.order.len().saturating_sub(1))
         }
-        Mode::Normal | Mode::AddKey => snapshot
+        // NewLogin keeps the detail pane on the current account.
+        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => snapshot
             .representative_current()
             .and_then(|cur| {
                 ctx.order
@@ -1643,6 +1645,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" switch  "),
                 key("a"),
                 Span::raw(" add  "),
+                key("n"),
+                Span::raw(" login  "),
                 key("r"),
                 Span::raw(" remove  "),
                 key("d"),
@@ -1667,6 +1671,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" models  "),
                 key("a"),
                 Span::raw(" add  "),
+                key("n"),
+                Span::raw(" login  "),
                 key("r"),
                 Span::raw(" remove  "),
                 key("R"),
@@ -1684,6 +1690,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 Span::raw(" move  "),
                 key("Enter"),
                 Span::raw(" switch  "),
+                key("n"),
+                Span::raw(" new login  "),
                 key("Esc"),
                 Span::raw(" cancel"),
             ]),
@@ -1711,6 +1719,31 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
                 key("Esc/n"),
                 Span::raw(" cancel"),
             ]),
+            Mode::NewLogin { idx } => {
+                // Provider picker: the cursor row is shown highlighted; Enter
+                // opens the browser for that provider.
+                let mut spans = vec![Span::raw(" new login — ")];
+                for (i, kind) in super::LoginKind::ALL.iter().enumerate() {
+                    let label = kind.label();
+                    if i == idx {
+                        spans.push(Span::styled(
+                            format!("[{label}]"),
+                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(format!(" {label} "), dim()));
+                    }
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::raw(" "));
+                spans.push(key("↑↓"));
+                spans.push(Span::raw(" pick  "));
+                spans.push(key("Enter"));
+                spans.push(Span::raw(" open  "));
+                spans.push(key("Esc"));
+                spans.push(Span::raw(" cancel"));
+                Line::from(spans)
+            }
         }
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);

@@ -1,8 +1,8 @@
 //! ratatui dashboard (FR6): per-account quota gauges (5h/7d) with reset
 //! countdowns, active/cooldown status, activity log, log console, totals.
 //! Keys: `q`uit, `R`eload config, `s`witch (select mode), `a`dd API-key
-//! account / `r`emove account (confirm-gated), `l` log-panel size, `d` detail
-//! toggle.
+//! account / `r`emove account (confirm-gated), `n`ew browser login (Claude /
+//! Codex OAuth, from the switcher), `l` log-panel size, `d` detail toggle.
 //!
 //! Two entry points, ONE renderer:
 //! - [`run_local`] — in-process mode (`llmux server` on a TTY): renders
@@ -41,6 +41,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
+use crate::config::AccountConfig;
 use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
 use crate::scheduler::select;
 use logs::LogPanelSize;
@@ -60,6 +61,47 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
         if c.fast { "on" } else { "off" },
         c.effort.as_deref().unwrap_or("default"),
     )
+}
+
+/// Can this client open a browser for an OAuth flow? The login dance (browser
+/// plus localhost callback) runs in the CLIENT, so this gates the `n`
+/// new-login key; when it returns false the picker is replaced by the `llmux
+/// login` fallback rather than starting a flow that would hang on the callback.
+///
+/// Mirrors how `auth::oauth::open_browser` actually launches a browser. macOS
+/// and Windows always have a GUI session reachable by `open` / `start`. Linux
+/// uses `xdg-open`, which needs a display server, so `DISPLAY` or
+/// `WAYLAND_DISPLAY` must be set. A pure SSH session (`SSH_CONNECTION` set)
+/// with no forwarded display is treated as headless on every platform, since
+/// the browser would otherwise open on the WRONG machine.
+fn can_open_browser() -> bool {
+    let has_display = cfg!(any(target_os = "macos", target_os = "windows"))
+        || std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    // Over SSH we still allow it IF there is a local display forwarded
+    // (DISPLAY/WAYLAND set) — that is the X11/Wayland-forwarding case; with no
+    // display it is headless.
+    if over_ssh {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    } else {
+        has_display
+    }
+}
+
+/// Fallback message for a headless client that cannot open a browser. Tells
+/// the user to run `llmux login` where the browser is; when attached, that is
+/// the daemon host, so name it.
+fn headless_login_hint(remote: bool) -> String {
+    if remote {
+        "new login needs a browser — run `llmux login` on the daemon host, or attach from a \
+         machine with a browser"
+            .to_string()
+    } else {
+        "new login needs a browser — run `llmux login` on this host from a desktop session"
+            .to_string()
+    }
 }
 
 /// Render cadence — also the cadence at which a fetched remote document is
@@ -95,8 +137,35 @@ pub(crate) struct PollHealth {
     pub next_at: SystemTime,
 }
 
+/// Which browser login flow the "new login" picker (`n`) kicks off. The flow
+/// runs in the CLIENT (this process) — `login_interactive` for Anthropic,
+/// `login_codex_interactive` for ChatGPT/Codex — then the minted credential is
+/// injected into the daemon (in-process locally, `POST /llmux/inject-account`
+/// when attached). One code path for local and attach (issue #4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginKind {
+    /// Anthropic Claude PKCE OAuth (`login_interactive`).
+    Anthropic,
+    /// ChatGPT / Codex OAuth (`login_codex_interactive`).
+    Codex,
+}
+
+impl LoginKind {
+    /// Quick-pick rows for `Mode::NewLogin`, in display order.
+    pub(crate) const ALL: [LoginKind; 2] = [LoginKind::Anthropic, LoginKind::Codex];
+
+    /// One-line label for the picker + status line.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LoginKind::Anthropic => "Claude (Anthropic OAuth)",
+            LoginKind::Codex => "Codex (ChatGPT OAuth)",
+        }
+    }
+}
+
 /// Input mode: normal keybar vs. account-selection (the `s` key) vs. the
-/// add-account key entry (`a`) vs. the remove confirmation (`r`).
+/// add-account key entry (`a`) vs. the remove confirmation (`r`) vs. the
+/// new-login provider picker (`n`).
 ///
 /// Deliberately `Copy` (no owned buffer inside): the add-account input text
 /// lives in [`App::add_input`] so the masked render never has to clone a
@@ -114,6 +183,12 @@ pub(crate) enum Mode {
     /// Confirming a destructive account removal (the `r` key). `idx` is the
     /// display row being removed; the name is resolved at confirm time.
     ConfirmRemove {
+        idx: usize,
+    },
+    /// Picking the provider for a new browser login (the `n` key). `idx` is the
+    /// cursor row into [`LoginKind::ALL`]. Enter starts the OAuth flow in this
+    /// client; the minted credential is injected into the daemon.
+    NewLogin {
         idx: usize,
     },
 }
@@ -223,6 +298,13 @@ struct App {
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
     add_input: String,
+    /// New browser login queued by the `n` picker, performed by the event loop
+    /// (the OAuth flow is async AND needs the raw terminal back — the loop
+    /// suspends the TUI, runs the flow, then re-inits). Held on `App` (not
+    /// `Remote`) because both local and attach mode use it; the only
+    /// difference is where the minted credential is injected. `None` on a
+    /// headless client (the picker shows the `llmux login` fallback instead).
+    pending_login: Option<LoginKind>,
 }
 
 impl App {
@@ -239,7 +321,15 @@ impl App {
             show_models: false,
             model_cursor: 0,
             add_input: String::new(),
+            pending_login: None,
         }
+    }
+
+    /// True when this dashboard is attached to a remote daemon (not the
+    /// in-process server). Reused to decide where a minted login credential is
+    /// injected (in-process vs. `POST /llmux/inject-account`).
+    fn is_remote(&self) -> bool {
+        matches!(self.backend, Backend::Remote(_))
     }
 
     /// Build the view-model for one frame. `None` only in remote mode before
@@ -320,6 +410,7 @@ impl App {
             Mode::Select { idx } => self.on_key_select(key.code, idx, view),
             Mode::AddKey => self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => self.on_key_confirm_remove(key.code, idx, view),
+            Mode::NewLogin { idx } => self.on_key_new_login(key.code, idx),
         }
     }
 
@@ -388,6 +479,11 @@ impl App {
                     self.mode = Mode::ConfirmRemove { idx: 0 };
                 }
             }
+            // Start a NEW browser login from the dashboard (issue #4): opens a
+            // provider picker (Claude / Codex). The OAuth flow runs in THIS
+            // client; the minted credential is injected into the daemon, so it
+            // works in both local and attach mode with no restart.
+            KeyCode::Char('n') => self.open_new_login(),
             KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
             // Detailed model-usage view (req13). No-op (with a hint) until at
@@ -549,9 +645,63 @@ impl App {
                 self.try_manual_switch(idx, view);
                 self.mode = Mode::Normal;
             }
+            // `n` from the switcher: start a brand-new login (issue #4's
+            // headline path — "start a new login from the account switcher").
+            KeyCode::Char('n') => self.open_new_login(),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
+    }
+
+    /// Open the new-login provider picker, OR — on a headless client that
+    /// cannot open a browser — refuse with the `llmux login` fallback instead
+    /// of starting a flow that would hang on the callback. "Headless" is
+    /// decided by [`Self::can_open_browser`].
+    fn open_new_login(&mut self) {
+        if can_open_browser() {
+            self.mode = Mode::NewLogin { idx: 0 };
+            self.set_status(
+                "new login: ↑↓ pick provider, Enter to open the browser, Esc to cancel".into(),
+            );
+        } else {
+            self.mode = Mode::Normal;
+            self.set_status(headless_login_hint(self.is_remote()));
+        }
+    }
+
+    /// Key handling for `Mode::NewLogin` — the provider picker. Up/down move
+    /// the cursor; Enter queues the chosen login for the event loop (which
+    /// suspends the TUI, runs the browser flow, then re-inits); Esc cancels.
+    fn on_key_new_login(&mut self, code: KeyCode, idx: usize) {
+        let len = LoginKind::ALL.len();
+        let idx = idx.min(len - 1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::NewLogin {
+                    idx: idx.saturating_sub(1),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::NewLogin {
+                    idx: (idx + 1).min(len - 1),
+                };
+            }
+            KeyCode::Enter => {
+                let kind = LoginKind::ALL[idx];
+                self.pending_login = Some(kind);
+                self.mode = Mode::Normal;
+                self.set_status(format!("opening browser for {}…", kind.label()));
+            }
+            // Any other key cancels.
+            _ => {
+                self.mode = Mode::Normal;
+                self.set_status("new login cancelled".into());
+            }
+        }
+    }
+
+    fn take_pending_login(&mut self) -> Option<LoginKind> {
+        self.pending_login.take()
     }
 
     /// Key handling for `Mode::AddKey` — typing the new account's API key.
@@ -729,6 +879,102 @@ impl App {
                 format!("remove {name} failed: {detail}")
             }
             Err(err) => format!("remove {name} failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Run a new browser login in THIS client and inject the resulting account
+    /// into the daemon (issue #4). The OAuth flow (`login_interactive` /
+    /// `login_codex_interactive`) opens the browser + binds a localhost
+    /// callback HERE; the minted credential is then injected — in-process when
+    /// local, via `POST /llmux/inject-account` when attached. ONE code path:
+    /// the only fork is where the credential lands.
+    ///
+    /// MUST run with the raw terminal SUSPENDED (the flow prints prompts and
+    /// may read a pasted code from stdin) — the event loop handles
+    /// suspend/resume around this call. No token is logged or rendered raw; the
+    /// status line shows only the resulting account name.
+    async fn perform_login(&mut self, kind: LoginKind) {
+        let client = reqwest::Client::new();
+        // Build the account by running the client-side login. The profile fetch
+        // (Anthropic only) hits the public upstream with the user's own token.
+        let account = match kind {
+            LoginKind::Anthropic => {
+                let upstream = match &self.backend {
+                    Backend::Local(state) => state.config.upstream.clone(),
+                    // The attached client has no copy of the daemon's config;
+                    // the profile endpoint is the public Anthropic API.
+                    Backend::Remote(_) => crate::config::DEFAULT_UPSTREAM.to_string(),
+                };
+                match crate::cli::login::oauth_login_to_account(&client, &upstream).await {
+                    Ok(account) => account,
+                    Err(err) => {
+                        self.set_status(format!("login failed: {err}"));
+                        return;
+                    }
+                }
+            }
+            LoginKind::Codex => {
+                let token_url = match &self.backend {
+                    Backend::Local(state) => state.config.codex.token_url.clone(),
+                    Backend::Remote(_) => crate::config::DEFAULT_CODEX_TOKEN_URL.to_string(),
+                };
+                match crate::auth::codex::login_codex_interactive(&client, &token_url).await {
+                    Ok(account) => account,
+                    Err(err) => {
+                        self.set_status(format!("codex login failed: {err}"));
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Inject: in-process locally, or relay to the daemon when attached.
+        match &mut self.backend {
+            Backend::Local(state) => match state.inject_account(account) {
+                Ok((name, _outcome)) => self.set_status(format!("logged in: added {name}")),
+                Err(err) => self.set_status(format!("login persist failed: {err}")),
+            },
+            Backend::Remote(_) => self.perform_remote_inject(account).await,
+        }
+    }
+
+    /// Relay a freshly-minted OAuth/Codex account to the daemon
+    /// (`POST /llmux/inject-account`). The credential travels in the JSON body
+    /// over the (loopback or api-key-gated) control channel; the response
+    /// echoes only a masked access token, so nothing here logs or displays the
+    /// raw token.
+    async fn perform_remote_inject(&mut self, account: AccountConfig) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/inject-account", remote.base_url);
+        // `AccountConfig` serializes to the `{name, type, …credential}` shape
+        // the inject endpoint deserializes (the flattened, type-tagged enum).
+        let mut request = remote.client.post(&url).json(&account);
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let name = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| account.name.clone());
+                format!("logged in: added {name}")
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let detail = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| status.to_string());
+                format!("login inject failed: {detail}")
+            }
+            Err(err) => format!("login inject failed: {err}"),
         };
         self.set_status(message);
     }
@@ -970,6 +1216,18 @@ async fn event_loop(
             app.perform_remote_remove(name).await;
             redraw = true;
         }
+        // A new browser login needs the RAW terminal back: the OAuth flow
+        // prints prompts and may read a pasted code from stdin, which would
+        // corrupt the alternate-screen TUI. Suspend (restore the terminal),
+        // run the flow, then re-init and force a full redraw. The fetch poller
+        // (remote mode) keeps running in the background meanwhile.
+        if let Some(kind) = app.take_pending_login() {
+            ratatui::restore();
+            app.perform_login(kind).await;
+            *terminal = ratatui::try_init()?;
+            let _ = terminal.clear();
+            redraw = true;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -1000,4 +1258,89 @@ fn drain_input(app: &mut App) -> std::io::Result<bool> {
         }
     }
     Ok(dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `App` on a remote backend — buildable without a terminal, so the
+    /// key-handling state machine (issue #4 new-login flow) is unit-testable.
+    fn remote_app() -> App {
+        let client = reqwest::Client::new();
+        App::new(Backend::Remote(Box::new(Remote {
+            client,
+            base_url: "http://localhost:3456".into(),
+            api_key: None,
+            pid: None,
+            doc: None,
+            connected: false,
+            pending_switch: None,
+            pending_codex: None,
+            pending_add: None,
+            pending_remove: None,
+        })))
+    }
+
+    #[test]
+    fn new_login_picker_moves_and_enter_queues_chosen_provider() {
+        let mut app = remote_app();
+        // Enter the picker (bypassing the env-dependent browser check).
+        app.mode = Mode::NewLogin { idx: 0 };
+
+        // Down moves to the Codex row.
+        app.on_key_new_login(KeyCode::Down, 0);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 1 });
+
+        // Enter queues that provider for the event loop and returns to Normal.
+        app.on_key_new_login(KeyCode::Enter, 1);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::Codex));
+        // Drained exactly once.
+        assert_eq!(app.take_pending_login(), None);
+    }
+
+    #[test]
+    fn new_login_picker_enter_on_first_row_picks_anthropic() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 0 };
+        app.on_key_new_login(KeyCode::Enter, 0);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::Anthropic));
+    }
+
+    #[test]
+    fn new_login_picker_esc_cancels_without_queueing() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 1 };
+        app.on_key_new_login(KeyCode::Esc, 1);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.take_pending_login(), None, "cancel queues nothing");
+    }
+
+    #[test]
+    fn new_login_picker_up_clamps_at_top() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 0 };
+        app.on_key_new_login(KeyCode::Up, 0);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 0 });
+    }
+
+    #[test]
+    fn headless_fallback_names_llmux_login_per_mode() {
+        // Attached: point the operator at the daemon host.
+        let remote = headless_login_hint(true);
+        assert!(remote.contains("llmux login"), "{remote}");
+        assert!(remote.contains("daemon host"), "{remote}");
+        // Local: this host.
+        let local = headless_login_hint(false);
+        assert!(local.contains("llmux login"), "{local}");
+        assert!(local.contains("this host"), "{local}");
+    }
+
+    #[test]
+    fn login_kind_labels_distinguish_providers() {
+        assert!(LoginKind::Anthropic.label().contains("Anthropic"));
+        assert!(LoginKind::Codex.label().contains("Codex"));
+        assert_eq!(LoginKind::ALL.len(), 2);
+    }
 }

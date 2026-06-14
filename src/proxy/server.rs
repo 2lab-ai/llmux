@@ -279,6 +279,44 @@ impl AppState {
         Ok(removed)
     }
 
+    /// Inject (upsert) a fully-formed OAuth/Codex account: read-merge-write
+    /// the config, then swap the merged roster into the live pool so the
+    /// running daemon serves it with no restart. The SINGLE in-process
+    /// implementation behind both the local TUI `n`-key path (login runs in
+    /// the client, the resulting credential is injected in-process) and the
+    /// `POST /llmux/inject-account` endpoint (attach mode: the client relays
+    /// the credential it minted to the daemon). Dedup is by `account_uuid` /
+    /// `account_id` then `name` (see [`Config::upsert_account`]), so a
+    /// re-login updates the existing entry rather than duplicating it.
+    ///
+    /// The caller hands over an already-built [`AccountConfig`] carrying an
+    /// `Oauth` or `Codex` credential; an `Apikey` credential is rejected (use
+    /// [`Self::add_apikey_account`] for those). No token is ever logged.
+    /// Returns `(resolved_name, outcome)`.
+    pub fn inject_account(
+        &self,
+        account: AccountConfig,
+    ) -> Result<(String, crate::config::Upsert), crate::config::ConfigError> {
+        if matches!(account.credential, AccountCredential::Apikey { .. }) {
+            return Err(crate::config::ConfigError::Invalid(
+                "inject_account accepts only oauth/codex credentials".into(),
+            ));
+        }
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let name = account.name.clone();
+        let kind = account.credential.kind();
+        let mut outcome = crate::config::Upsert::Added;
+        let merged = crate::config::update_path(path, |c| {
+            outcome = c.upsert_account(account.clone());
+        })?;
+        self.apply_roster(&merged);
+        // Names/kinds are not credentials; no token reaches a log line.
+        tracing::info!(account = %name, kind, action = ?outcome, "account injected");
+        Ok((name, outcome))
+    }
+
     /// Swap a freshly-merged config's roster into the live pool and re-select
     /// every backend group (a removed `current` is cleared by
     /// `reload_accounts`; the re-eval picks a replacement). Shared tail of
@@ -557,6 +595,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
         .route("/llmux/add-account", post(add_account_endpoint))
+        .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/shutdown", post(shutdown))
         .route("/v1/oauth/token", post(oauth_token_relay))
@@ -908,6 +947,77 @@ async fn add_account_endpoint(
         Err(crate::config::ConfigError::NoConfigDir) => relay_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "config persistence disabled; cannot add account",
+        ),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
+/// Request body for `POST /llmux/inject-account` (issue #4) — a fully-formed
+/// OAuth/Codex credential the CLIENT minted by running the browser login
+/// locally, relayed to the daemon so the new account joins the pool with no
+/// restart. The body deserializes straight into an [`AccountConfig`] (the
+/// `type`-tagged credential enum), so `{"name":"claude:me","type":"oauth",
+/// "account_uuid":"…","access_token":"…","refresh_token":"…",
+/// "expires_at_ms":…}` and the `type:"codex"` shape both parse. An
+/// `type:"apikey"` body is rejected by [`AppState::inject_account`] — api-key
+/// accounts use `/llmux/add-account`, which never needs a browser.
+#[derive(serde::Deserialize)]
+struct InjectAccountRequest {
+    #[serde(flatten)]
+    account: AccountConfig,
+}
+
+/// `POST /llmux/inject-account` — inject an OAuth/Codex account from the
+/// dashboard, in BOTH local and attach mode. This is the daemon side of the
+/// issue #4 architecture: the CLIENT runs the OAuth browser+callback flow
+/// (local = the daemon host; attach = the operator's machine) and POSTs the
+/// resulting token here, making local and attach ONE code path. Same loopback
+/// / proxy-api-key gate as every route (it sits on the shared `.route(...)`
+/// chain behind `client_auth`). The credential is written read-merge-write via
+/// [`crate::config::update_path`] and the live pool is reloaded so the daemon
+/// picks it up with no restart. NO token is ever logged; the response echoes
+/// only the account name, kind, and a MASKED access token
+/// (`crate::proxy::logging::mask_credentials`).
+async fn inject_account_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<InjectAccountRequest>,
+) -> Response {
+    let account = body.0.account;
+    if account.name.trim().is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "account name is required");
+    }
+    // Capture a masked echo of the access token BEFORE moving the account into
+    // the upsert — never the raw token (AGENTS.md credential rule).
+    let access_token_masked = match &account.credential {
+        AccountCredential::Oauth { access_token, .. }
+        | AccountCredential::Codex { access_token, .. } => {
+            Some(crate::proxy::logging::mask_credentials(access_token))
+        }
+        AccountCredential::Apikey { .. } => None,
+    };
+    let kind = account.credential.kind();
+
+    match state.inject_account(account) {
+        Ok((name, outcome)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "ok": true,
+                "name": name,
+                "type": kind,
+                "added": matches!(outcome, crate::config::Upsert::Added),
+                "access_token_masked": access_token_masked,
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(crate::config::ConfigError::Invalid(msg)) => relay_error(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot inject account",
         ),
         Err(err) => relay_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1577,5 +1687,198 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- issue #4: inject an OAuth/Codex account from the dashboard ---------
+
+    fn codex_account(name: &str, account_id: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            // A realistic single-token Bearer access token (no `:`/whitespace
+            // inside) so the mask span covers the whole secret.
+            credential: AccountCredential::Codex {
+                account_id: account_id.to_string(),
+                access_token: "Bearer eyJhbGciLONGSECRETACCESSTOKENPART".to_string(),
+                refresh_token: format!("crt-{name}"),
+                expires_at_ms: 0,
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    /// An oauth account whose access token looks like a real Anthropic OAuth
+    /// token so `mask_credentials` (which keys off `sk-ant-`) actually masks it.
+    fn oauth_account_realistic(name: &str, uuid: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Oauth {
+                account_uuid: uuid.to_string(),
+                access_token: "sk-ant-oat01-SUPERSECRETACCESSTOKENVALUE".to_string(),
+                refresh_token: "sk-ant-ort01-SECRETREFRESH".to_string(),
+                expires_at_ms: 1_700_000_000_000,
+                tier: Some("max".into()),
+                last_refresh_ms: Some(1_699_990_000_000),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_oauth_account_persists_masks_and_reloads_pool() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        // Seed an existing account that MUST survive the inject.
+        let state = endpoint_state(&path, vec![apikey_account("keep")]);
+
+        let injected = oauth_account_realistic("claude:me@example.com", "uuid-new");
+        let response = inject_account_endpoint(
+            State(state.clone()),
+            axum::extract::Json(InjectAccountRequest {
+                account: injected.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["name"], "claude:me@example.com");
+        assert_eq!(body["type"], "oauth");
+        assert_eq!(body["added"], true);
+        // The access token is echoed ONLY masked — never the raw secret.
+        let masked = body["access_token_masked"].as_str().expect("masked");
+        assert_eq!(masked, "sk-ant-oat01-SU...");
+        assert!(
+            !masked.contains("SUPERSECRETACCESSTOKENVALUE"),
+            "raw token leaked: {masked}"
+        );
+
+        // Read-merge-write: the seeded account is preserved and the oauth
+        // credential is on disk with its real (unmasked) tokens.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let names: Vec<&str> = on_disk.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["keep", "claude:me@example.com"]);
+        match &on_disk.accounts[1].credential {
+            AccountCredential::Oauth {
+                account_uuid,
+                access_token,
+                tier,
+                ..
+            } => {
+                assert_eq!(account_uuid, "uuid-new");
+                assert_eq!(access_token, "sk-ant-oat01-SUPERSECRETACCESSTOKENVALUE");
+                assert_eq!(tier.as_deref(), Some("max"));
+            }
+            other => panic!("expected oauth, got {other:?}"),
+        }
+
+        // Live pool reflects the inject with no restart.
+        let live: Vec<String> = state
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .map(|a| a.id.0.clone())
+            .collect();
+        assert!(
+            live.contains(&"claude:me@example.com".to_string()),
+            "live pool reloaded: {live:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_codex_account_persists_and_masks() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+
+        let response = inject_account_endpoint(
+            State(state.clone()),
+            axum::extract::Json(InjectAccountRequest {
+                account: codex_account("codex:me@example.com", "chatgpt-acct-1"),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["type"], "codex");
+        assert_eq!(body["name"], "codex:me@example.com");
+        // `Bearer …` is masked to the first 20 chars + `...`.
+        let masked = body["access_token_masked"].as_str().expect("masked");
+        assert_eq!(masked, "Bearer eyJhbGciLONGS...");
+        assert!(
+            !masked.contains("SECRETACCESSTOKENPART"),
+            "raw token leaked: {masked}"
+        );
+
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        // Other account preserved; codex added.
+        let names: Vec<&str> = on_disk.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "codex:me@example.com"]);
+        assert!(matches!(
+            on_disk.accounts[1].credential,
+            AccountCredential::Codex { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn inject_oauth_relogin_updates_by_uuid_not_duplicates() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        // Existing oauth account with the SAME uuid the re-login will carry.
+        let state = endpoint_state(&path, vec![oauth_account_realistic("claude:old", "uuid-x")]);
+
+        // Re-login: same uuid, new name (profile email changed) — must UPDATE
+        // the existing entry, not add a second one (dedup by account_uuid).
+        let mut relogin = oauth_account_realistic("claude:new", "uuid-x");
+        if let AccountCredential::Oauth { access_token, .. } = &mut relogin.credential {
+            *access_token = "sk-ant-oat01-ROTATEDTOKENVALUE".to_string();
+        }
+        let response = inject_account_endpoint(
+            State(state.clone()),
+            axum::extract::Json(InjectAccountRequest { account: relogin }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["added"], false, "re-login updates, never adds");
+
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.accounts.len(), 1, "no duplicate from re-login");
+        assert_eq!(on_disk.accounts[0].name, "claude:new");
+    }
+
+    #[tokio::test]
+    async fn inject_rejects_apikey_credential() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        // An apikey credential is the wrong endpoint (/add-account handles it,
+        // no browser needed) — inject must refuse with a 400 and write nothing.
+        let response = inject_account_endpoint(
+            State(state),
+            axum::extract::Json(InjectAccountRequest {
+                account: apikey_account("api-1"),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert!(on_disk.accounts.is_empty(), "nothing persisted");
+    }
+
+    #[tokio::test]
+    async fn inject_rejects_empty_name() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        let mut acct = oauth_account_realistic("", "uuid-z");
+        acct.name = "   ".into();
+        let response = inject_account_endpoint(
+            State(state),
+            axum::extract::Json(InjectAccountRequest { account: acct }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
