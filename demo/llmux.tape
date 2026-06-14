@@ -4,16 +4,16 @@
 #   LLMUX_DEMO_CONFIG=/tmp/llmux-demo.json vhs demo/llmux.tape
 #
 # Prerequisites (kept OUT of this tape because they touch real accounts):
-#   - `llmux` on PATH (a release build) and `claude` (real Claude Code) on PATH.
-#   - A demo config at $LLMUX_DEMO_CONFIG (default /tmp/llmux-demo.json): a copy of
-#     a real config with "proxy.port": 3457 so it never collides with a production
-#     daemon on 3456.
+#   - `llmux` (release build) and `claude` (real Claude Code) on PATH.
+#   - A demo config at $LLMUX_DEMO_CONFIG (default /tmp/llmux-demo.json): a copy
+#     of a real config with "proxy.port": 3457. A handful of accounts is plenty.
 #
-# Layout: a tmux split — left pane runs REAL Claude Code pointed at llmux, right
-# pane is the live llmux server TUI (scheduler + accounts + traffic). Keys are
-# scripted; the `claude` and `llmux` processes are real. The tmux uses a private
-# socket (`-L lxdemo`) with no config (`-f /dev/null`) so a host tmux-resurrect /
-# continuum setup can't restore an unrelated session into the frame.
+# Layout: a tmux split — right pane is the live llmux server TUI (scheduler,
+# accounts, traffic), left pane runs REAL Claude Code through the proxy. Keys are
+# scripted; the `claude` and `llmux` processes are real. `LLMUX_DEMO_MODE=1`
+# swaps account emails for stable fakes so nothing real is exposed. The tmux uses
+# a private socket (`-L lxdemo`, no config) so a host tmux-resurrect / continuum
+# setup can't restore an unrelated session into the frame.
 
 Output screenshots/llmux-demo.gif
 
@@ -28,9 +28,9 @@ Set Height 860
 Set Padding 14
 Set Framerate 24
 
-# --- setup (hidden): build the two-pane tmux, start both real processes ---
+# --- setup (hidden): two-pane tmux, llmux server on the right, claude env left ---
 Hide
-Type "export LLMUX_CONFIG=${LLMUX_DEMO_CONFIG:-/tmp/llmux-demo.json}; clear"
+Type "export LLMUX_CONFIG=${LLMUX_DEMO_CONFIG:-/tmp/llmux-demo.json} LLMUX_DEMO_MODE=1; clear"
 Enter
 Type "tmux -L lxdemo -f /dev/null new-session -d -s d -x 236 -y 56"
 Enter
@@ -40,25 +40,25 @@ Enter
 Type "tmux -L lxdemo send-keys -t d:0.1 'llmux server' Enter"
 Enter
 Sleep 4s
-# left pane: real Claude Code, pointed at the llmux proxy
+# left pane: point Claude Code at the proxy, keep the command line clean
+Type "tmux -L lxdemo send-keys -t d:0.0 'export ANTHROPIC_BASE_URL=http://localhost:3457 ANTHROPIC_MODEL=claude-sonnet-4-6; clear' Enter"
+Enter
 Type "tmux -L lxdemo select-pane -t d:0.0"
 Enter
-Type "tmux -L lxdemo send-keys -t d:0.0 'ANTHROPIC_BASE_URL=http://localhost:3457 ANTHROPIC_MODEL=claude-sonnet-4-6 claude --dangerously-skip-permissions' Enter"
-Enter
-Sleep 5s
 Type "tmux -L lxdemo attach -t d"
 Enter
 Show
 
-# --- the actual demo (kept light: a couple of small requests, not a big
-#     agentic burst, so it stays under the per-account short rate limit) ---
-Sleep 2s
-Type@45ms "In one sentence, what does a multi-account LLM proxy with quota-aware scheduling give a Claude Code user? Answer directly without using any tools."
-Sleep 700ms
+# --- the demo: one real Claude Code call through llmux ---
+Sleep 1500ms
+Type@55ms "claude --strict-mcp-config -p "
+Type `"`
+Type@55ms "In two sentences, what does llmux give a Claude Code user?"
+Type `"`
+Sleep 600ms
 Enter
 
-# Claude works through llmux: the right pane's request counter, active account,
-# and token totals move as real traffic flows.
-Sleep 24s
-# hold the final frame
+# Claude answers through llmux; the right pane shows the request land on a
+# scheduler-picked account, tokens count up, then settle.
+Sleep 16s
 Sleep 3s

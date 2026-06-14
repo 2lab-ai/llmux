@@ -154,6 +154,12 @@ Only one process can own port 3456 — normally the background daemon created by
 
 Both attach paths are read-only except manual switching through the gated loopback control endpoint.
 
+Recording a demo or sharing your screen? Set `LLMUX_DEMO_MODE=1` and the dashboard,
+status, and logs show **stable fake emails** in place of your real account names
+(and config writes are suppressed so the aliases never touch disk). The recipe
+behind `screenshots/llmux-demo.gif` is committed at [`demo/llmux.tape`](demo/llmux.tape)
+(vhs).
+
 ## Configuration
 
 Config lives at `~/.config/llmux.json` (respects `$XDG_CONFIG_HOME`; override with `$LLMUX_CONFIG`). File mode is 0600. Writes are atomic read-merge-write so the server and CLI can update concurrently.
