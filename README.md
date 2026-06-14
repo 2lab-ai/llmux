@@ -268,6 +268,30 @@ ANTHROPIC_MODEL=gpt-5.5 claude
 
 or set the model in Claude Code's own model setting (e.g. `/model gpt-5.5`). For account *selection*, the model string's only job is to choose the group — any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the codex group is routed there. The actual upstream model sent to Codex is `codex.default_model` (default `gpt-5.5`), set once in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` (and keeps a representative scalar `current` for back-compat).
 
+#### "Remaining context" is wrong for `gpt-5.5` — and why, and the workaround
+
+When you route to the codex group with a bare `gpt-5.5`, Claude Code's **"remaining context"**
+indicator is wrong (it reads far smaller than the real window). This is a **client-side limitation,
+not a proxy bug**, so llmux cannot fix the number directly:
+
+- Claude Code derives the context **window** from the **model-name string**, client-side, via its own
+  `model name → window` table. `gpt-5.5` is not in that table, so it falls back to **200,000**.
+- The real Codex `gpt-5.5` window is **400,000** (`gpt-5.5[1m]` → **1,000,000**).
+- No `/v1/messages` response field or endpoint lets the proxy set the client's window — the token
+  counts llmux streams are correct, but the client computes `remaining = window(model) − used`
+  against the wrong `window`.
+
+**Workaround (the only lever today):** append the `[1m]` suffix to the model string so Claude Code
+uses a 1M window:
+
+```bash
+/model gpt-5.5[1m]      # routes to codex (the gpt- prefix still matches); window reads 1,000,000
+```
+
+`gpt-5.5[1m]` still routes to the codex group (the `[1m]` suffix is display-only and is stripped for
+routing/usage attribution). Note this **over-reports** vs the true 400K, but it is closer to usable
+than the 200K under-report; pick whichever error you prefer until the client exposes a window field.
+
 ## Codex backend
 
 A ChatGPT/Codex subscription credential can be added with `llmux login --codex` (browser OAuth, falling back to importing `~/.codex/auth.json`) or imported directly:
