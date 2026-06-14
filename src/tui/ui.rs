@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::dashboard::ModelUsageDoc;
@@ -23,7 +23,7 @@ use crate::scheduler::{select, AccountSnapshot};
 use super::activity::{Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, Mode};
+use super::{anim, Chrome, Mode, Overlay};
 
 const GAUGE_BAR_WIDTH: usize = 8;
 /// Width at/above which the accounts table shows the wide column set
@@ -71,37 +71,57 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
         return;
     };
 
-    let snapshot = &view.snapshot;
     let now = SystemTime::now();
     let ctx = FrameCtx {
         now,
         tz_offset: format::local_offset_secs(now),
         order: view.display_order(now),
-        headers_only: select::headers_only_mode(snapshot, &view.select_params, None, now),
+        headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
         frame: chrome.frame,
     };
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
 
-    // Detailed model-usage view (req13): keep the header + account table for
-    // context, then give the rest of the screen to the full model table +
-    // drill-down. The account quota table stays the priority surface above it.
-    if chrome.show_models {
-        let [header_area, table_area, body_area, footer_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(table_height),
-            Constraint::Min(3),
-            Constraint::Length(2),
-        ])
-        .areas(frame.area());
-        draw_header(frame, header_area, view, chrome);
-        draw_accounts(frame, table_area, view, &ctx, chrome);
-        draw_models_full(frame, body_area, view, &ctx, chrome);
-        draw_footer(frame, footer_area, chrome);
-        return;
+    // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
+    // updating underneath any overlay (issue #5). Local and attach render from
+    // the same `DashboardView`, so this path is never forked.
+    draw_main(frame, view, &ctx, chrome, now);
+
+    // A summoned overlay (if any) is then drawn OVER MAIN. Each overlay clears
+    // its own rect with `Clear` so MAIN shows through only outside it; because
+    // MAIN was already drawn this frame, "MAIN keeps updating underneath" is
+    // automatic.
+    match chrome.overlay {
+        Overlay::None => {}
+        Overlay::Accounts => draw_accounts_overlay(frame, view, &ctx, chrome),
+        Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
+        Overlay::Logs => draw_logs_overlay(frame, view),
     }
 
-    // Log console sits at the bottom, between activity and the keybar.
-    let logs_height = chrome.log_panel.height();
+    // The footer keybar is part of the chrome and reflects the active overlay /
+    // mode; drawn last so it sits above everything.
+    let footer_area = Rect {
+        x: frame.area().x,
+        y: frame.area().bottom().saturating_sub(2),
+        width: frame.area().width,
+        height: 2,
+    };
+    frame.render_widget(Clear, footer_area);
+    draw_footer(frame, footer_area, chrome);
+}
+
+/// MAIN — the always-rendered wall-clock view (issue #5): header banner ·
+/// account quota table · scheduler/totals summary · compact per-model strip ·
+/// in-flight + activity. No navigation, no overlay surfaces. The selected-
+/// account detail pane and the full log console moved to the Accounts and Logs
+/// overlays respectively; the model strip stays here.
+fn draw_main(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    now: SystemTime,
+) {
+    let snapshot = &view.snapshot;
+    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     // Compact model strip (req12): only when model data exists. 0 height (no
     // pane) otherwise, so the idle layout is unchanged.
     let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
@@ -111,29 +131,93 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
     } else {
         0
     };
-    let [header_area, table_area, middle_area, strip_area, activity_area, logs_area, footer_area] =
+    let [header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
         Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(table_height),
             Constraint::Length(8),
             Constraint::Length(strip_height),
             Constraint::Min(3),
-            Constraint::Length(logs_height),
             Constraint::Length(2),
         ])
         .areas(frame.area());
 
     draw_header(frame, header_area, view, chrome);
-    draw_accounts(frame, table_area, view, &ctx, chrome);
-    draw_middle(frame, middle_area, view, &ctx, chrome);
+    draw_accounts(frame, table_area, view, ctx, chrome);
+    draw_middle(frame, middle_area, view, ctx, chrome);
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
     }
     draw_activity(frame, activity_area, view, chrome, now);
-    if logs_height > 0 {
-        draw_logs(frame, logs_area, view);
+    // Footer slot reserved in the layout; the real footer is drawn by `draw`
+    // last (over any overlay). Keep MAIN's bottom row clear here.
+    let _ = footer_area;
+}
+
+/// Accounts overlay (`a`): a near-full-screen surface giving the account quota
+/// table the priority slot plus the selected-account detail pane, over which
+/// the add/remove/switch/login interactions (issues #3/#4) run. Cleared so MAIN
+/// shows through only at the very edges.
+fn draw_accounts_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let snapshot = &view.snapshot;
+    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    let [header_area, table_area, detail_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(table_height),
+        Constraint::Min(3),
+    ])
+    .areas(area);
+    let title = Paragraph::new(Line::from(Span::styled(
+        " accounts ",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(title, header_area);
+    draw_accounts(frame, table_area, view, ctx, chrome);
+    if snapshot.accounts.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no accounts — press a to add an API key, n to start a browser login",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(Block::new().borders(Borders::TOP).title(" detail "));
+        frame.render_widget(empty, detail_area);
+    } else {
+        draw_detail(frame, detail_area, view, ctx, chrome);
     }
-    draw_footer(frame, footer_area, chrome);
+}
+
+/// Stats overlay (`g`): the detailed per-model usage table + drill-down (req13;
+/// was the `show_models` full view). Keeps the account quota table above it for
+/// context, matching the old layout.
+fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let snapshot = &view.snapshot;
+    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    let [table_area, body_area] =
+        Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
+    draw_accounts(frame, table_area, view, ctx, chrome);
+    draw_models_full(frame, body_area, view, ctx, chrome);
+}
+
+/// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
+fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    draw_logs(frame, area, view);
+}
+
+/// The rect a summoned overlay covers: the whole screen except the bottom two
+/// rows reserved for the footer keybar, so MAIN's footer slot is never double
+/// drawn and the keybar stays visible under the overlay.
+fn overlay_rect(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    }
 }
 
 /// Attach-mode pre-first-document screen: identity + a "connecting…" /
@@ -565,7 +649,9 @@ fn reset_label(
 }
 
 /// Middle row: scheduler/poller/totals summary, with the selected-account
-/// detail pane beside it when there is room (toggled by `d`).
+/// detail pane beside it when there is room. The old `d` toggle is gone (issue
+/// #5): on MAIN the detail rides alongside the summary whenever the width
+/// allows, and the Accounts overlay (`a`) gives detail the full-width slot.
 fn draw_middle(
     frame: &mut Frame,
     area: Rect,
@@ -573,16 +659,15 @@ fn draw_middle(
     ctx: &FrameCtx,
     chrome: &Chrome,
 ) {
-    let show_detail = chrome.show_detail && !view.snapshot.accounts.is_empty();
-    if show_detail && area.width >= SIDE_BY_SIDE_AT {
+    let has_accounts = !view.snapshot.accounts.is_empty();
+    if has_accounts && area.width >= SIDE_BY_SIDE_AT {
         let [summary_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(48)]).areas(area);
         draw_summary(frame, summary_area, view, ctx);
         draw_detail(frame, detail_area, view, ctx, chrome);
-    } else if show_detail && area.width < SIDE_BY_SIDE_AT {
-        // Too narrow for both: `d` flips between summary and detail.
-        draw_detail(frame, area, view, ctx, chrome);
     } else {
+        // Too narrow for both (or no accounts): MAIN shows the summary; the
+        // full detail is one keystroke away in the Accounts overlay.
         draw_summary(frame, area, view, ctx);
     }
 }
@@ -1617,133 +1702,137 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
     // Attach mode disables the config-mutation keys (a/r/R act on the server
     // host's config); the keybar shows what is actually available.
     let attached = chrome.attach.is_some();
-    let keybar = if chrome.show_models {
-        // Detailed model view: navigation + back, regardless of attach mode.
-        Line::from(vec![
-            Span::raw(" "),
-            key("g/Esc"),
-            Span::raw(" back  "),
-            key("↑/k ↓/j"),
-            Span::raw(" model  "),
-            key("PgUp/PgDn"),
-            Span::raw(" page  "),
-            key("l"),
-            Span::raw(" logs  "),
-            key("q"),
-            Span::raw(" quit"),
-        ])
-    } else {
-        match chrome.mode {
-            // a (add) and r (remove) now act on the DAEMON via the control
-            // endpoints, so they are live in attach mode too; only R (reload
-            // from the local config file) stays local-only.
-            Mode::Normal if attached => Line::from(vec![
-                Span::raw(" "),
-                key("q"),
-                Span::raw(" quit  "),
-                key("s"),
-                Span::raw(" switch  "),
-                key("a"),
-                Span::raw(" add  "),
-                key("n"),
-                Span::raw(" login  "),
-                key("r"),
-                Span::raw(" remove  "),
-                key("d"),
-                Span::raw(" detail  "),
-                key("g"),
-                Span::raw(" models  "),
-                key("l"),
-                Span::raw(" logs  "),
-                key("f/m/e"),
-                Span::raw(" codex  "),
-                Span::styled("R disabled (attached)", dim()),
-            ]),
-            Mode::Normal => Line::from(vec![
-                Span::raw(" "),
-                key("q"),
-                Span::raw(" quit  "),
-                key("s"),
-                Span::raw(" switch  "),
-                key("d"),
-                Span::raw(" detail  "),
-                key("g"),
-                Span::raw(" models  "),
-                key("a"),
-                Span::raw(" add  "),
-                key("n"),
-                Span::raw(" login  "),
-                key("r"),
-                Span::raw(" remove  "),
-                key("R"),
-                Span::raw(" reload  "),
-                key("l"),
-                Span::raw(" logs  "),
-                key("f/m/e"),
-                Span::raw(" codex  "),
-                key("↑↓"),
-                Span::raw(" scroll"),
-            ]),
-            Mode::Select { .. } => Line::from(vec![
-                Span::raw(" "),
-                key("↑/k ↓/j"),
-                Span::raw(" move  "),
-                key("Enter"),
-                Span::raw(" switch  "),
-                key("n"),
-                Span::raw(" new login  "),
-                key("Esc"),
-                Span::raw(" cancel"),
-            ]),
-            // The typed key is shown ONLY as a masked width — never the raw
-            // characters (AGENTS.md credential rule).
-            Mode::AddKey => Line::from(vec![
-                Span::raw(" add account — key: "),
-                Span::styled(
-                    "•".repeat(chrome.add_input_len),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-                key("Enter"),
-                Span::raw(" add  "),
-                key("Esc"),
-                Span::raw(" cancel"),
-            ]),
-            Mode::ConfirmRemove { .. } => Line::from(vec![
-                Span::raw(" "),
-                key("↑/k ↓/j"),
-                Span::raw(" pick  "),
-                Span::styled("remove selected? ", Style::new().fg(Color::Red)),
-                key("y"),
-                Span::raw(" confirm  "),
-                key("Esc/n"),
-                Span::raw(" cancel"),
-            ]),
-            Mode::NewLogin { idx } => {
-                // Provider picker: the cursor row is shown highlighted; Enter
-                // opens the browser for that provider.
-                let mut spans = vec![Span::raw(" new login — ")];
-                for (i, kind) in super::LoginKind::ALL.iter().enumerate() {
-                    let label = kind.label();
-                    if i == idx {
-                        spans.push(Span::styled(
-                            format!("[{label}]"),
-                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ));
-                    } else {
-                        spans.push(Span::styled(format!(" {label} "), dim()));
-                    }
-                    spans.push(Span::raw(" "));
+    let keybar = match chrome.mode {
+        // While a Mode interaction is pending it owns the keybar regardless of
+        // which overlay summoned it (the interactions run within Accounts).
+        Mode::Normal => match chrome.overlay {
+            // MAIN: summon overlays + codex + scroll. `a`/`g`/`l` open the
+            // Accounts/Stats/Logs overlays where the detail/model/log surfaces
+            // (and the add/remove/login affordances) now live (issue #5).
+            Overlay::None => {
+                let mut spans = vec![
+                    Span::raw(" "),
+                    key("q"),
+                    Span::raw(" quit  "),
+                    key("a"),
+                    Span::raw(" accounts  "),
+                    key("g"),
+                    Span::raw(" stats  "),
+                    key("l"),
+                    Span::raw(" logs  "),
+                ];
+                if attached {
+                    spans.push(Span::styled("R disabled (attached)  ", dim()));
+                } else {
+                    spans.push(key("R"));
+                    spans.push(Span::raw(" reload  "));
                 }
-                spans.push(Span::raw(" "));
-                spans.push(key("↑↓"));
-                spans.push(Span::raw(" pick  "));
-                spans.push(key("Enter"));
-                spans.push(Span::raw(" open  "));
-                spans.push(key("Esc"));
-                spans.push(Span::raw(" cancel"));
+                spans.extend([
+                    key("f/m/e"),
+                    Span::raw(" codex  "),
+                    key("↑↓"),
+                    Span::raw(" scroll"),
+                ]);
                 Line::from(spans)
             }
+            // Accounts overlay: the issue #3/#4 affordances. a (add) and r
+            // (remove) act on the DAEMON via the control endpoints, so they are
+            // live in attach mode too.
+            Overlay::Accounts => Line::from(vec![
+                Span::raw(" accounts — "),
+                key("s"),
+                Span::raw(" switch  "),
+                key("a"),
+                Span::raw(" add  "),
+                key("n"),
+                Span::raw(" login  "),
+                key("r"),
+                Span::raw(" remove  "),
+                key("Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            // Stats overlay: navigation + back, regardless of attach mode.
+            Overlay::Stats => Line::from(vec![
+                Span::raw(" stats — "),
+                key("g/Esc"),
+                Span::raw(" back  "),
+                key("↑/k ↓/j"),
+                Span::raw(" model  "),
+                key("PgUp/PgDn"),
+                Span::raw(" page  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            // Logs overlay: full-screen tail; l/Esc back.
+            Overlay::Logs => Line::from(vec![
+                Span::raw(" logs — "),
+                key("l/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+        },
+        Mode::Select { .. } => Line::from(vec![
+            Span::raw(" "),
+            key("↑/k ↓/j"),
+            Span::raw(" move  "),
+            key("Enter"),
+            Span::raw(" switch  "),
+            key("n"),
+            Span::raw(" new login  "),
+            key("Esc"),
+            Span::raw(" cancel"),
+        ]),
+        // The typed key is shown ONLY as a masked width — never the raw
+        // characters (AGENTS.md credential rule).
+        Mode::AddKey => Line::from(vec![
+            Span::raw(" add account — key: "),
+            Span::styled(
+                "•".repeat(chrome.add_input_len),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            key("Enter"),
+            Span::raw(" add  "),
+            key("Esc"),
+            Span::raw(" cancel"),
+        ]),
+        Mode::ConfirmRemove { .. } => Line::from(vec![
+            Span::raw(" "),
+            key("↑/k ↓/j"),
+            Span::raw(" pick  "),
+            Span::styled("remove selected? ", Style::new().fg(Color::Red)),
+            key("y"),
+            Span::raw(" confirm  "),
+            key("Esc/n"),
+            Span::raw(" cancel"),
+        ]),
+        Mode::NewLogin { idx } => {
+            // Provider picker: the cursor row is shown highlighted; Enter
+            // opens the browser for that provider.
+            let mut spans = vec![Span::raw(" new login — ")];
+            for (i, kind) in super::LoginKind::ALL.iter().enumerate() {
+                let label = kind.label();
+                if i == idx {
+                    spans.push(Span::styled(
+                        format!("[{label}]"),
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(format!(" {label} "), dim()));
+                }
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::raw(" "));
+            spans.push(key("↑↓"));
+            spans.push(Span::raw(" pick  "));
+            spans.push(key("Enter"));
+            spans.push(Span::raw(" open  "));
+            spans.push(key("Esc"));
+            spans.push(Span::raw(" cancel"));
+            Line::from(spans)
         }
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
@@ -1808,15 +1897,16 @@ mod tests {
         }
     }
 
-    fn chrome(show_models: bool) -> Chrome {
+    /// Chrome with a given overlay active and `Mode::Normal` (issue #5). The
+    /// old `chrome(show_models)` builder mapped `true`→Stats; tests now name the
+    /// overlay explicitly.
+    fn chrome_overlay(overlay: Overlay) -> Chrome {
         Chrome {
             frame: 0,
             mode: Mode::Normal,
-            show_detail: false,
-            log_panel: super::super::logs::LogPanelSize::Small,
+            overlay,
             status_line: None,
             activity_scroll: 0,
-            show_models,
             model_cursor: 0,
             add_input_len: 0,
             attach: None,
@@ -1840,9 +1930,13 @@ mod tests {
     #[test]
     fn compact_strip_shows_top_model_and_keybar_advertises_view() {
         let view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
-        let text = render(&view, &chrome(false), 160, 30);
-        // Discoverability (req30) + the compact strip's top-model label (req12).
-        assert!(text.contains("models"), "keybar/strip mentions models");
+        // MAIN (overlay=None): the compact strip is part of MAIN and the keybar
+        // advertises the stats overlay shortcut (req12/req30, adapted to #5).
+        let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        assert!(
+            text.contains("stats"),
+            "keybar advertises the stats overlay"
+        );
         assert!(text.contains("gpt-5.5"), "strip shows the top model");
     }
 
@@ -1852,13 +1946,73 @@ mod tests {
             model_row("codex", "gpt-5.5", 700, 300),
             model_row("claude", "claude-sonnet-4-5", 100, 50),
         ]);
-        let text = render(&view, &chrome(true), 160, 30);
+        // The Stats overlay (was the `show_models` full view) still lists all
+        // model rows + the drill-down (req13).
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 160, 30);
         assert!(text.contains("gpt-5.5"));
         assert!(
             text.contains("claude-sonnet-4-5"),
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    // --- issue #5: MAIN-always + summoned overlays -------------------------
+
+    /// MAIN (overlay=None) shows in-flight + account quota + the model strip,
+    /// with NO navigation/overlay surface drawn.
+    #[test]
+    fn main_shows_inflight_quota_and_strip_without_overlay() {
+        let mut view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 7,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        assert!(
+            text.contains("opus-4-8"),
+            "MAIN shows the in-flight session"
+        );
+        assert!(text.contains("gpt-5.5"), "MAIN shows the model strip");
+        // No overlay chrome on MAIN: the Stats drill-down panel is absent.
+        assert!(
+            !text.contains("model detail"),
+            "MAIN draws no overlay surface"
+        );
+    }
+
+    /// The Stats overlay still renders MAIN underneath (the model strip stays
+    /// visible), proving MAIN is drawn first every frame.
+    #[test]
+    fn stats_overlay_keeps_main_underneath() {
+        let view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 160, 30);
+        assert!(text.contains("model detail"), "stats overlay drawn on top");
+        assert!(
+            text.contains("gpt-5.5"),
+            "MAIN model data still visible underneath the overlay"
+        );
+    }
+
+    /// The Logs overlay shows the log tail.
+    #[test]
+    fn logs_overlay_shows_the_log_tail() {
+        let mut view = view_with(Vec::new());
+        view.logs = vec![crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: "proxy started on :3456".into(),
+        }];
+        let text = render(&view, &chrome_overlay(Overlay::Logs), 160, 30);
+        assert!(text.contains("logs"), "logs overlay titled");
+        assert!(
+            text.contains("proxy started on :3456"),
+            "logs overlay shows the tail"
+        );
     }
 
     #[test]
@@ -1899,7 +2053,7 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
-        let text = render(&view, &chrome(false), 160, 30);
+        let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         assert!(
             text.contains("opus-4-8"),
             "in-flight row shows the model name (2a)"

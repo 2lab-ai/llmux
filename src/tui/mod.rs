@@ -1,8 +1,14 @@
 //! ratatui dashboard (FR6): per-account quota gauges (5h/7d) with reset
-//! countdowns, active/cooldown status, activity log, log console, totals.
-//! Keys: `q`uit, `R`eload config, `s`witch (select mode), `a`dd API-key
-//! account / `r`emove account (confirm-gated), `n`ew browser login (Claude /
-//! Codex OAuth, from the switcher), `l` log-panel size, `d` detail toggle.
+//! countdowns, active/cooldown status, activity log, totals.
+//!
+//! IA (issue #5): a wall-clock MAIN view that is ALWAYS rendered (header ·
+//! account quota table · scheduler/totals summary · compact model strip ·
+//! in-flight/activity) plus three summoned [`Overlay`]s drawn OVER it —
+//! `a`ccounts (account detail + add/remove/login affordances), `g` stats (the
+//! detailed per-model table + drill-down), `l`ogs (full-screen tail). `Esc`
+//! closes any overlay back to MAIN. MAIN-level keys: `q`uit, `R`eload config,
+//! `f`/`m`/`e` codex, `↑↓` scroll. The account interactions (`s`witch, `a`dd,
+//! `r`emove, `n`ew browser login) run within the Accounts overlay as [`Mode`]s.
 //!
 //! Two entry points, ONE renderer:
 //! - [`run_local`] — in-process mode (`llmux server` on a TTY): renders
@@ -44,7 +50,6 @@ use tokio::sync::mpsc;
 use crate::config::AccountConfig;
 use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
 use crate::scheduler::select;
-use logs::LogPanelSize;
 use view::DashboardView;
 
 /// Codex models the dashboard cycles through with `m` (req8.1). Any model can
@@ -193,21 +198,39 @@ pub(crate) enum Mode {
     },
 }
 
+/// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
+/// keeps updating every frame underneath; an overlay only covers its own rect
+/// (cleared with [`ratatui::widgets::Clear`] in `ui.rs`). Direct shortcuts —
+/// `a`/`g`/`l` open, `Esc` returns to MAIN — with no ordered carousel.
+///
+/// `Copy` so it threads through `Chrome` without allocation. The in-overlay
+/// interactions (Select/AddKey/ConfirmRemove/NewLogin) still live in [`Mode`]
+/// and operate WITHIN the Accounts overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Overlay {
+    /// MAIN only — no overlay.
+    #[default]
+    None,
+    /// Account detail + the add/remove/login affordances (issues #3/#4).
+    Accounts,
+    /// The detailed per-model usage table + drill-down (req13; was `show_models`).
+    Stats,
+    /// Full-screen log tail (was the `l` log-panel size cycle).
+    Logs,
+}
+
 /// UI-local state the renderer needs besides the data view: cursor, panes,
 /// spinner frame, status line, attach banner.
 pub(crate) struct Chrome {
     pub frame: usize,
     pub mode: Mode,
-    pub show_detail: bool,
-    pub log_panel: LogPanelSize,
+    /// Which summoned surface (if any) is drawn over MAIN this frame (issue #5).
+    pub overlay: Overlay,
     pub status_line: Option<String>,
     /// Activity-log scroll offset: number of newest completed entries skipped
     /// (0 = live tail). Lets the panel page through the full history (req6).
     pub activity_scroll: usize,
-    /// Detailed model-usage view active (`g`) — replaces the middle/activity
-    /// region with the full model table + drill-down (req13).
-    pub show_models: bool,
-    /// Cursor row in the detailed model view.
+    /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
@@ -286,13 +309,12 @@ struct App {
     frame: usize,
     should_quit: bool,
     status: Option<(String, Instant)>,
-    /// Selected-account detail pane visibility (`d` toggles).
-    show_detail: bool,
-    log_panel: LogPanelSize,
+    /// Which summoned overlay is open over MAIN (issue #5): `a`→Accounts,
+    /// `g`→Stats, `l`→Logs, `Esc`→None. MAIN renders every frame regardless.
+    overlay: Overlay,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
-    /// Detailed model-usage view active (`g`), with its cursor row.
-    show_models: bool,
+    /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
@@ -315,10 +337,8 @@ impl App {
             frame: 0,
             should_quit: false,
             status: None,
-            show_detail: true,
-            log_panel: LogPanelSize::Small,
+            overlay: Overlay::None,
             activity_scroll: 0,
-            show_models: false,
             model_cursor: 0,
             add_input: String::new(),
             pending_login: None,
@@ -347,10 +367,8 @@ impl App {
         Chrome {
             frame: self.frame,
             mode: self.mode,
-            show_detail: self.show_detail,
-            log_panel: self.log_panel,
+            overlay: self.overlay,
             activity_scroll: self.activity_scroll,
-            show_models: self.show_models,
             model_cursor: self.model_cursor,
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
@@ -404,30 +422,49 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // A pending `Mode` interaction (account switch / key entry / remove
+        // confirm / login picker) always takes the key first — these run WITHIN
+        // the Accounts overlay (issues #3/#4) and must keep working unchanged.
         match self.mode {
-            Mode::Normal if self.show_models => self.on_key_models(key.code, view),
-            Mode::Normal => self.on_key_normal(key.code, view),
-            Mode::Select { idx } => self.on_key_select(key.code, idx, view),
-            Mode::AddKey => self.on_key_add(key.code),
-            Mode::ConfirmRemove { idx } => self.on_key_confirm_remove(key.code, idx, view),
-            Mode::NewLogin { idx } => self.on_key_new_login(key.code, idx),
+            Mode::Select { idx } => return self.on_key_select(key.code, idx, view),
+            Mode::AddKey => return self.on_key_add(key.code),
+            Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
+            Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
+            Mode::Normal => {}
+        }
+        // Otherwise (Mode::Normal): the active overlay, if any, gets the key;
+        // MAIN-only keys run when no overlay is open.
+        match self.overlay {
+            Overlay::None => self.on_key_main(key.code, view),
+            Overlay::Accounts => self.on_key_accounts(key.code, view),
+            Overlay::Stats => self.on_key_stats(key.code, view),
+            Overlay::Logs => self.on_key_logs(key.code),
         }
     }
 
-    /// Key handling for the detailed model-usage view (`g`). Arrows/`j`/`k`
-    /// move the cursor through model rows; `g`/`Esc` exits; `q` quits.
-    fn on_key_models(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+    /// Key handling for the Stats overlay (`g`). Arrows/`j`/`k` move the cursor
+    /// through model rows; `g`/`Esc` closes back to MAIN; `q` quits.
+    fn on_key_stats(&mut self, code: KeyCode, view: Option<&DashboardView>) {
         let len = view.map_or(0, |v| v.model_usage.len());
         match code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('g') | KeyCode::Esc => self.show_models = false,
+            KeyCode::Char('g') | KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
             KeyCode::PageUp => self.move_model_cursor(-10, len),
             KeyCode::PageDown => self.move_model_cursor(10, len),
             KeyCode::Home => self.model_cursor = 0,
             KeyCode::End => self.model_cursor = len.saturating_sub(1),
-            KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Logs overlay (`l`). `l`/`Esc` closes back to MAIN;
+    /// `q` quits. The tail is full-screen, so there is no size cycle anymore.
+    fn on_key_logs(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
             _ => {}
         }
     }
@@ -442,60 +479,18 @@ impl App {
         self.model_cursor = next.clamp(0, (len - 1) as i64) as usize;
     }
 
-    fn on_key_normal(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+    /// Key handling for MAIN (no overlay open). `a`/`g`/`l` summon the overlays;
+    /// `R` reloads, `f/m/e` drive codex, arrows scroll the activity log, `q`
+    /// quits. The account-mutation affordances (add/remove/login/switch) live in
+    /// the Accounts overlay, reached with `a`.
+    fn on_key_main(&mut self, code: KeyCode, view: Option<&DashboardView>) {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('R') => self.reload(),
-            KeyCode::Char('s') => {
-                let accounts = view.map_or(0, |v| v.snapshot.accounts.len());
-                if accounts == 0 {
-                    self.set_status("no accounts to switch between".into());
-                    return;
-                }
-                // Rows render in selection order, where the current account
-                // (when one exists) is always row 0 — start the cursor there.
-                self.mode = Mode::Select { idx: 0 };
-            }
-            // Add an API-key account from the dashboard (issue #3): works in
-            // BOTH local and attach mode (local: in-process config update +
-            // pool reload; remote: POST /llmux/add-account). OAuth/codex
-            // login-from-dashboard remains a CLI flow (issue #4).
-            KeyCode::Char('a') => {
-                self.add_input.clear();
-                self.mode = Mode::AddKey;
-                self.set_status(
-                    "add account: paste an Anthropic API key, Enter to add, Esc to cancel".into(),
-                );
-            }
-            // Remove the selected account (issue #3): a destructive delete, so
-            // it opens a confirm step (y/N) — never a silent delete. Works in
-            // both modes. Targets the cursor row when an account is highlighted,
-            // else the current/active account.
-            KeyCode::Char('r') => {
-                let len = view.map_or(0, |v| v.snapshot.accounts.len());
-                if len == 0 {
-                    self.set_status("no accounts to remove".into());
-                } else {
-                    self.mode = Mode::ConfirmRemove { idx: 0 };
-                }
-            }
-            // Start a NEW browser login from the dashboard (issue #4): opens a
-            // provider picker (Claude / Codex). The OAuth flow runs in THIS
-            // client; the minted credential is injected into the daemon, so it
-            // works in both local and attach mode with no restart.
-            KeyCode::Char('n') => self.open_new_login(),
-            KeyCode::Char('l') => self.log_panel = self.log_panel.cycle(),
-            KeyCode::Char('d') => self.show_detail = !self.show_detail,
-            // Detailed model-usage view (req13). No-op (with a hint) until at
-            // least one model row exists.
-            KeyCode::Char('g') => {
-                if view.is_some_and(|v| !v.model_usage.is_empty()) {
-                    self.show_models = true;
-                    self.model_cursor = 0;
-                } else {
-                    self.set_status("models: no model usage yet".into());
-                }
-            }
+            // Summon overlays (issue #5).
+            KeyCode::Char('a') => self.overlay = Overlay::Accounts,
+            KeyCode::Char('g') => self.open_stats(view),
+            KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -511,6 +506,65 @@ impl App {
             KeyCode::Char('m') => self.cycle_codex_model(view),
             KeyCode::Char('e') => self.cycle_codex_effort(view),
             _ => {}
+        }
+    }
+
+    /// Key handling for the Accounts overlay (`a`). Houses the issue #3/#4
+    /// affordances — switch (`s`), add an API key (`a`), remove (`r`), start a
+    /// new browser login (`n`) — each entering its own [`Mode`] which is handled
+    /// over this overlay. `Esc` closes back to MAIN; `q` quits.
+    fn on_key_accounts(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => self.overlay = Overlay::None,
+            // Switch the active account (the `s` switcher, now scoped to this
+            // overlay). Rows render in selection order; the current account
+            // (when one exists) is always row 0 — start the cursor there.
+            KeyCode::Char('s') => {
+                let accounts = view.map_or(0, |v| v.snapshot.accounts.len());
+                if accounts == 0 {
+                    self.set_status("no accounts to switch between".into());
+                } else {
+                    self.mode = Mode::Select { idx: 0 };
+                }
+            }
+            // Add an API-key account (issue #3): works in BOTH local and attach
+            // mode (local: in-process config update + pool reload; remote:
+            // POST /llmux/add-account).
+            KeyCode::Char('a') => {
+                self.add_input.clear();
+                self.mode = Mode::AddKey;
+                self.set_status(
+                    "add account: paste an Anthropic API key, Enter to add, Esc to cancel".into(),
+                );
+            }
+            // Remove the selected account (issue #3): a destructive delete, so
+            // it opens a confirm step (y/N) — never a silent delete.
+            KeyCode::Char('r') => {
+                let len = view.map_or(0, |v| v.snapshot.accounts.len());
+                if len == 0 {
+                    self.set_status("no accounts to remove".into());
+                } else {
+                    self.mode = Mode::ConfirmRemove { idx: 0 };
+                }
+            }
+            // Start a NEW browser login (issue #4): opens a provider picker
+            // (Claude / Codex). The OAuth flow runs in THIS client; the minted
+            // credential is injected into the daemon, so it works in both local
+            // and attach mode with no restart.
+            KeyCode::Char('n') => self.open_new_login(),
+            _ => {}
+        }
+    }
+
+    /// Open the Stats overlay (`g`). No-op (with a hint) until at least one
+    /// model row exists, matching the old detailed-view guard (req13).
+    fn open_stats(&mut self, view: Option<&DashboardView>) {
+        if view.is_some_and(|v| !v.model_usage.is_empty()) {
+            self.overlay = Overlay::Stats;
+            self.model_cursor = 0;
+        } else {
+            self.set_status("models: no model usage yet".into());
         }
     }
 
@@ -1342,5 +1396,169 @@ mod tests {
         assert!(LoginKind::Anthropic.label().contains("Anthropic"));
         assert!(LoginKind::Codex.label().contains("Codex"));
         assert_eq!(LoginKind::ALL.len(), 2);
+    }
+
+    // --- issue #5: overlay key routing -------------------------------------
+
+    /// `a` opens the Accounts overlay; `Esc` returns to MAIN.
+    #[test]
+    fn a_opens_accounts_overlay_and_esc_returns_to_main() {
+        let mut app = remote_app();
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key_main(KeyCode::Char('a'), None);
+        assert_eq!(app.overlay, Overlay::Accounts);
+        app.on_key_accounts(KeyCode::Esc, None);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// `l` opens the Logs overlay; `l`/`Esc` close it.
+    #[test]
+    fn l_opens_logs_overlay_and_esc_returns_to_main() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        assert_eq!(app.overlay, Overlay::Logs);
+        app.on_key_logs(KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        // `l` toggles back too.
+        app.on_key_main(KeyCode::Char('l'), None);
+        assert_eq!(app.overlay, Overlay::Logs);
+        app.on_key_logs(KeyCode::Char('l'));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// `g` opens the Stats overlay only when model usage exists; `g`/`Esc`
+    /// close it. The no-data guard keeps MAIN (matching the old `show_models`
+    /// behavior).
+    #[test]
+    fn g_opens_stats_overlay_only_with_model_data() {
+        let mut app = remote_app();
+        // No view → no model data → stays on MAIN with a hint.
+        app.on_key_main(KeyCode::Char('g'), None);
+        assert_eq!(app.overlay, Overlay::None);
+
+        let view = stats_view();
+        app.on_key_main(KeyCode::Char('g'), Some(&view));
+        assert_eq!(app.overlay, Overlay::Stats);
+        app.on_key_stats(KeyCode::Esc, Some(&view));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// The Accounts overlay houses the #3/#4 affordances: `a`→AddKey,
+    /// `r`→ConfirmRemove, `s`→Select, all entering their own `Mode` over the
+    /// overlay (which stays open).
+    #[test]
+    fn accounts_overlay_houses_add_remove_switch_modes() {
+        let view = stats_view_with_account();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+
+        app.on_key_accounts(KeyCode::Char('a'), Some(&view));
+        assert_eq!(app.mode, Mode::AddKey);
+        assert_eq!(
+            app.overlay,
+            Overlay::Accounts,
+            "overlay stays open over Mode"
+        );
+        app.on_key_add(KeyCode::Esc); // cancel back to Normal
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.on_key_accounts(KeyCode::Char('r'), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+        app.on_key_confirm_remove(KeyCode::Esc, 0, Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.on_key_accounts(KeyCode::Char('s'), Some(&view));
+        assert_eq!(app.mode, Mode::Select { idx: 0 });
+    }
+
+    /// A pending `Mode` interaction takes the key before the overlay handler,
+    /// so add/remove/login keep working while Accounts is open (issues #3/#4).
+    #[test]
+    fn pending_mode_takes_keys_over_the_overlay() {
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.mode = Mode::AddKey;
+        // A printable char goes to the key buffer, not the overlay handler.
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(app.mode, Mode::AddKey);
+        assert_eq!(app.add_input, "x");
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn stats_view() -> DashboardView {
+        let mut v = empty_view();
+        v.model_usage = vec![crate::dashboard::ModelUsageDoc {
+            group: "codex".into(),
+            model: "gpt-5.5".into(),
+            requests: 1,
+            ok: 1,
+            errors: 0,
+            tokens_in: 10,
+            tokens_out: 5,
+            cache_read: None,
+            cache_creation: None,
+            last_used_ms: 0,
+            in_flight: 0,
+            accounts: Vec::new(),
+            efforts: Vec::new(),
+            endpoints: Vec::new(),
+        }];
+        v
+    }
+
+    fn stats_view_with_account() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let mut v = stats_view();
+        v.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId("claude:me@example.com".into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }];
+        v
+    }
+
+    fn empty_view() -> DashboardView {
+        use crate::scheduler::PoolSnapshot;
+        DashboardView {
+            version: "llmux 0.0 (test)".into(),
+            pid: 1,
+            uptime: Duration::from_secs(1),
+            port: 3456,
+            upstream: None,
+            config_path: None,
+            select_params: select::SelectParams {
+                five_hour_max: 0.9,
+                seven_day_max: 0.99,
+                usage_max_age: Duration::from_secs(600),
+            },
+            refresh_ahead: Duration::from_secs(25_200),
+            evaluate_tick: Duration::from_secs(60),
+            snapshot: PoolSnapshot {
+                accounts: Vec::new(),
+                current: std::collections::BTreeMap::new(),
+            },
+            last_switch: None,
+            poll_health: std::collections::HashMap::new(),
+            session_totals: std::collections::HashMap::new(),
+            global_totals: activity::Totals::default(),
+            rpm_5m: 0.0,
+            in_flight: Vec::new(),
+            completed: Vec::new(),
+            logs: Vec::new(),
+            model_usage: Vec::new(),
+            codex: crate::dashboard::CodexSettingsDoc::default(),
+        }
     }
 }
