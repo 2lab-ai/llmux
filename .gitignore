@@ -1,4 +1,7 @@
 /target
 config.json
 *.log
-.claude/
+# Keep local logs out of git but version the operational runbook skills.
+.claude/*
+!.claude/skills/
+!.claude/skills/**
