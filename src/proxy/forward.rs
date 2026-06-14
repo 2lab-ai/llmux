@@ -278,6 +278,41 @@ fn body_excerpt(body: &[u8]) -> String {
     String::from_utf8_lossy(&body[..body.len().min(BODY_LOG_LIMIT)]).into_owned()
 }
 
+/// Read an upstream ERROR response body and condense it to a one-line detail
+/// for the activity log. Consumes the response — only call it on paths that
+/// would otherwise discard the body (429, 5xx). This is what lets the operator
+/// tell a real per-account `rate_limit_error` apart from Anthropic's own
+/// transient 429/5xx (`overloaded_error`, …), which the bare status hides.
+async fn upstream_error_detail(response: reqwest::Response) -> String {
+    match response.bytes().await {
+        Ok(body) => condense_error_body(&body),
+        Err(err) => format!("<error body unreadable: {err}>"),
+    }
+}
+
+/// Condense an error body to `type: message` (the Anthropic/codex error shape
+/// `{"error":{"type","message"}}`) or a trimmed raw excerpt. Pure + testable.
+fn condense_error_body(body: &[u8]) -> String {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(err) = v.get("error") {
+            let ty = err.get("type").and_then(|t| t.as_str()).unwrap_or("error");
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            return if msg.is_empty() {
+                ty.to_string()
+            } else {
+                format!("{ty}: {msg}")
+            };
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "<empty body>".to_string()
+    } else {
+        trimmed.chars().take(300).collect()
+    }
+}
+
 /// Anthropic-style JSON error response.
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = serde_json::json!({
@@ -659,11 +694,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 };
             }
             UpstreamSignal::RateLimited { retry_after } => {
+                let headers_log = format_headers(response.headers());
+                let detail = upstream_error_detail(response).await;
                 ctx.log(format!(
-                    "=== RESPONSE 429 (retry-after: {retry_after:?}) ===\n{}",
-                    format_headers(response.headers())
+                    "=== RESPONSE 429 (retry-after: {retry_after:?}) ===\n{headers_log}\n{detail}"
                 ));
-                drop(response); // discard the 429 body
+                let retry_note = match retry_after {
+                    Some(d) => format!(" · retry-after {}s", d.as_secs()),
+                    None => String::new(),
+                };
+                state.emit(ActivityEvent::Error {
+                    context: Some("upstream".into()),
+                    message: format!("429 from {account}: {detail}{retry_note}"),
+                });
                 match retry_after {
                     Some(wait)
                         if wait <= SAME_ACCOUNT_WAIT_MAX
@@ -734,11 +777,16 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
             UpstreamSignal::Transient => {
                 let status = response.status();
+                let headers_log = format_headers(response.headers());
+                let detail = upstream_error_detail(response).await;
                 tracing::warn!(account = %account, %status, "upstream 5xx; closing client connection");
                 ctx.log(format!(
-                    "=== RESPONSE {status} (transient) ===\n{}",
-                    format_headers(response.headers())
+                    "=== RESPONSE {status} (transient) ===\n{headers_log}\n{detail}"
                 ));
+                state.emit(ActivityEvent::Error {
+                    context: Some("upstream".into()),
+                    message: format!("{} from {account}: {detail}", status.as_u16()),
+                });
                 ctx.flush_log(state);
                 ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                 return transient_response(&format!("upstream returned {status}"));
@@ -1575,6 +1623,28 @@ mod tests {
 
         headers.insert("retry-after", HeaderValue::from_static("-3"));
         assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn condense_error_body_surfaces_the_real_upstream_reason() {
+        // Anthropic/codex error shape → "type: message".
+        assert_eq!(
+            condense_error_body(
+                br#"{"type":"error","error":{"type":"rate_limit_error","message":"overloaded"}}"#
+            ),
+            "rate_limit_error: overloaded"
+        );
+        // type-only (no message) → just the type (e.g. their own transient 429).
+        assert_eq!(
+            condense_error_body(br#"{"error":{"type":"overloaded_error"}}"#),
+            "overloaded_error"
+        );
+        // Non-JSON / empty bodies degrade to a trimmed excerpt, never panic.
+        assert_eq!(
+            condense_error_body(b"upstream proxy: 429 Too Many Requests"),
+            "upstream proxy: 429 Too Many Requests"
+        );
+        assert_eq!(condense_error_body(b"   \n  "), "<empty body>");
     }
 
     // ---- mock upstream + integration tests ----
