@@ -523,6 +523,13 @@ pub struct InFlightDoc {
     pub path: String,
     pub account: Option<String>,
     pub started_at_ms: u64,
+    /// Backend group / served model, filled at routing time so the in-flight
+    /// row can show the model badge while running (issue #2 2a). Additive:
+    /// absent in docs written before these fields existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -821,6 +828,8 @@ pub(crate) fn dashboard_doc(
                 path: r.path.clone(),
                 account: r.account.clone(),
                 started_at_ms: epoch_ms(r.started_at),
+                group: r.group.clone(),
+                model: r.model.clone(),
             })
             .collect(),
         completed: hub
