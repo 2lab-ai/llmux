@@ -69,30 +69,31 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
 }
 
 /// Can this client open a browser for an OAuth flow? The login dance (browser
-/// plus localhost callback) runs in the CLIENT, so this gates the `n`
-/// new-login key; when it returns false the picker is replaced by the `llmux
-/// login` fallback rather than starting a flow that would hang on the callback.
+/// plus localhost callback) runs in the CLIENT, so this gates the `n` new-login
+/// key; when it returns false the picker is replaced by the `llmux login`
+/// fallback rather than starting a flow that would hang on the callback.
 ///
-/// Mirrors how `auth::oauth::open_browser` actually launches a browser. macOS
-/// and Windows always have a GUI session reachable by `open` / `start`. Linux
-/// uses `xdg-open`, which needs a display server, so `DISPLAY` or
-/// `WAYLAND_DISPLAY` must be set. A pure SSH session (`SSH_CONNECTION` set)
-/// with no forwarded display is treated as headless on every platform, since
-/// the browser would otherwise open on the WRONG machine.
+/// macOS/Windows: `open`/`start` hand the URL to the windowing system, which
+/// launches the default browser on the HOST's GUI session. This works even when
+/// invoked from an SSH/tmux session (the browser opens on the host's console,
+/// where the daemon — and the localhost callback — live). Critically, `SSH_*`
+/// env vars routinely LEAK into long-lived tmux sessions, so gating macOS on
+/// `SSH_CONNECTION` produced false "headless" negatives for a user sitting at
+/// their Mac inside tmux (the bug this fixes). Only Linux's `xdg-open` genuinely
+/// needs a reachable display server, so that is the only platform we gate.
 fn can_open_browser() -> bool {
-    let has_display = cfg!(any(target_os = "macos", target_os = "windows"))
-        || std::env::var_os("DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let over_ssh =
-        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
-    // Over SSH we still allow it IF there is a local display forwarded
-    // (DISPLAY/WAYLAND set) — that is the X11/Wayland-forwarding case; with no
-    // display it is headless.
-    if over_ssh {
-        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-    } else {
-        has_display
-    }
+    let gui_platform = cfg!(any(target_os = "macos", target_os = "windows"));
+    let has_display =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    can_open_browser_decide(gui_platform, has_display)
+}
+
+/// Pure decision for [`can_open_browser`], split out so it is testable without
+/// mutating process env (which would race other tests). GUI platforms
+/// (macOS/Windows) always can; Linux needs a display server. SSH is
+/// deliberately NOT an input — it gave false negatives via tmux env leakage.
+fn can_open_browser_decide(gui_platform: bool, has_display: bool) -> bool {
+    gui_platform || has_display
 }
 
 /// Fallback message for a headless client that cannot open a browser. Tells
@@ -1482,6 +1483,29 @@ mod tests {
         app.on_key(press(KeyCode::Char('x')), None);
         assert_eq!(app.mode, Mode::AddKey);
         assert_eq!(app.add_input, "x");
+    }
+
+    #[test]
+    fn can_open_browser_gates_only_linux_display_not_ssh() {
+        // Regression for the `n` new-login false-"headless": a Mac user inside a
+        // tmux session that leaked SSH_* was wrongly blocked. GUI platforms must
+        // allow regardless of SSH/display; only Linux gates on a display server.
+        assert!(
+            can_open_browser_decide(true, false),
+            "macOS/Windows must allow the browser even with no DISPLAY / under SSH"
+        );
+        assert!(
+            can_open_browser_decide(true, true),
+            "GUI platform with a display still allows"
+        );
+        assert!(
+            can_open_browser_decide(false, true),
+            "Linux with a display server allows"
+        );
+        assert!(
+            !can_open_browser_decide(false, false),
+            "Linux with no display server is genuinely headless"
+        );
     }
 
     fn press(code: KeyCode) -> KeyEvent {
