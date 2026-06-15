@@ -166,11 +166,11 @@ impl DashboardView {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 account: r.account.clone(),
-                // Per-model in-flight counts are precomputed server-side into
-                // the model-usage rows, so the view's in-flight entries (used
-                // only for the activity spinner) don't carry group/model.
-                group: None,
-                model: None,
+                // group/model are filled at routing time and carried over the
+                // wire so the in-flight row shows the model badge while running
+                // (issue #2 2a).
+                group: r.group.clone(),
+                model: r.model.clone(),
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -408,6 +408,32 @@ mod tests {
             Some(&AccountId("c".into()))
         );
         assert!(view.snapshot.is_current(&AccountId("c".into())));
+    }
+
+    #[test]
+    fn from_doc_carries_in_flight_group_and_model_for_the_badge() {
+        // Regression (issue #2 2a): the in-flight model badge never rendered
+        // because InFlightDoc dropped group/model on the wire and from_doc
+        // hardcoded None. Assert they now survive the HubDoc→JSON→from_doc
+        // round-trip the real `dashboard` uses (the unit test that constructs
+        // InFlight directly bypassed exactly this hop).
+        let mut json = doc_json();
+        let infl = &mut json["activity"]["in_flight"][0];
+        infl["group"] = serde_json::json!("claude");
+        infl["model"] = serde_json::json!("claude-opus-4-8");
+
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+
+        assert_eq!(view.in_flight.len(), 1);
+        assert_eq!(view.in_flight[0].group.as_deref(), Some("claude"));
+        assert_eq!(view.in_flight[0].model.as_deref(), Some("claude-opus-4-8"));
+
+        // And a doc WITHOUT the fields still parses (back-compat → None).
+        let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        let view2 = DashboardView::from_doc(&doc2);
+        assert_eq!(view2.in_flight[0].group, None);
+        assert_eq!(view2.in_flight[0].model, None);
     }
 
     #[test]
