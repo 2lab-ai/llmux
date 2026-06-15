@@ -135,6 +135,24 @@ pub struct CodexConfig {
     /// the model's default. Display + request only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Codex's REAL input ceiling (gpt-5.5 ≈ 272000). Together with
+    /// `client_context_window` this drives the "Claude Code context-meter
+    /// compatibility adapter": Claude Code picks a context-window denominator by
+    /// a hardcoded per-model-name lookup, does not recognize the reported
+    /// `gpt-5.5` slug, and falls back to ~200000 — so its "context left %" bar
+    /// and auto-compaction trigger fire at ~200k while codex keeps working to
+    /// ~272k. We compensate by scaling the CLIENT-FACING `usage` numbers by
+    /// `client_context_window / context_window` so the bar lines up with the
+    /// real ceiling. The internal/dashboard/scheduler totals stay TRUE
+    /// (unscaled). Scaling is active only when both values are > 0 and differ;
+    /// setting them equal disables it.
+    #[serde(default = "default_codex_context_window")]
+    pub context_window: u64,
+    /// The denominator Claude Code assumes for the reported model (its
+    /// ~200000 fallback). See [`CodexConfig::context_window`] for the full
+    /// adapter rationale.
+    #[serde(default = "default_codex_client_context_window")]
+    pub client_context_window: u64,
 }
 
 impl Default for CodexConfig {
@@ -145,6 +163,8 @@ impl Default for CodexConfig {
             default_model: default_codex_model(),
             fast: false,
             reasoning_effort: None,
+            context_window: default_codex_context_window(),
+            client_context_window: default_codex_client_context_window(),
         }
     }
 }
@@ -414,6 +434,16 @@ fn default_codex_token_url() -> String {
 /// Default codex model slug (the value `CODEX_MODEL` used to hardcode).
 fn default_codex_model() -> String {
     "gpt-5.5".to_string()
+}
+
+/// Default REAL codex input ceiling (gpt-5.5 ≈ 272000 tokens).
+fn default_codex_context_window() -> u64 {
+    272_000
+}
+
+/// Default denominator Claude Code assumes for an unrecognized model (~200000).
+fn default_codex_client_context_window() -> u64 {
+    200_000
 }
 
 fn default_port() -> u16 {

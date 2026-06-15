@@ -41,6 +41,16 @@ pub struct CodexShape {
     /// `reasoning.effort` value (`none|minimal|low|medium|high|xhigh`), or
     /// `None` to omit the field and let the backend choose.
     pub effort: Option<String>,
+    /// Codex's REAL input ceiling, carried through to the converter so it can
+    /// run the Claude Code context-meter compatibility adapter. See
+    /// [`crate::config::schema::CodexConfig::context_window`]. Default 0
+    /// (scaling disabled) so bare `CodexShape::default()` and tests are
+    /// unaffected.
+    pub context_window: u64,
+    /// The denominator Claude Code assumes for the reported model. Default 0
+    /// (scaling disabled). See
+    /// [`crate::config::schema::CodexConfig::client_context_window`].
+    pub client_context_window: u64,
 }
 
 impl Default for CodexShape {
@@ -49,6 +59,10 @@ impl Default for CodexShape {
             model: CODEX_MODEL.to_string(),
             fast: false,
             effort: None,
+            // 0/0 → meter scaling disabled (identity); production fills these
+            // from config via `from_config`.
+            context_window: 0,
+            client_context_window: 0,
         }
     }
 }
@@ -60,6 +74,8 @@ impl CodexShape {
             model: codex.default_model.clone(),
             fast: codex.fast,
             effort: codex.reasoning_effort.clone(),
+            context_window: codex.context_window,
+            client_context_window: codex.client_context_window,
         }
     }
 }
@@ -179,9 +195,15 @@ impl CodexProvider {
     }
 
     /// Fresh per-request stream converter, stamping responses with this
-    /// provider's configured model slug.
+    /// provider's configured model slug and the context-window pair the
+    /// Claude Code context-meter compatibility adapter scales against.
     pub fn converter(&self) -> CodexSseConverter {
-        CodexSseConverter::with_model(self.shape().model)
+        let shape = self.shape();
+        CodexSseConverter::with_model_and_window(
+            shape.model,
+            shape.context_window,
+            shape.client_context_window,
+        )
     }
 }
 
@@ -500,6 +522,19 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
     (total / 4).max(1)
 }
 
+/// Claude Code context-meter compatibility adapter, applied to the
+/// `count_tokens` preflight estimate (the converter applies the identical math
+/// to streaming/aggregate usage via `CodexSseConverter::scale_for_client`).
+/// Scales `n` by `client_context_window / context_window` with saturating
+/// u128 intermediate math; identity when scaling is disabled (either window 0,
+/// or equal). See [`crate::config::schema::CodexConfig::context_window`].
+pub fn scale_count_for_client(n: u64, context_window: u64, client_context_window: u64) -> u64 {
+    if client_context_window == 0 || context_window == 0 || client_context_window == context_window {
+        return n;
+    }
+    ((n as u128 * client_context_window as u128) / context_window as u128) as u64
+}
+
 // ---------------------------------------------------------------------------
 // Response conversion: Responses SSE → Anthropic SSE
 // ---------------------------------------------------------------------------
@@ -529,6 +564,15 @@ pub struct CodexSseConverter {
     /// Model slug stamped into the Anthropic `message_start` / aggregate
     /// (what Claude Code sees as the response model).
     model: String,
+    /// Codex's REAL input ceiling (denominator of the meter scale). 0 disables
+    /// the Claude Code context-meter compatibility adapter.
+    context_window: u64,
+    /// The denominator Claude Code assumes for the reported model (numerator of
+    /// the meter scale). 0 disables the adapter. See
+    /// [`crate::config::schema::CodexConfig::context_window`] for the full
+    /// rationale: client-facing `usage` is scaled by
+    /// `client_context_window / context_window`; `self.usage` (internal) is not.
+    client_context_window: u64,
     started: bool,
     finished: bool,
     message_id: String,
@@ -564,9 +608,28 @@ impl CodexSseConverter {
     }
 
     /// Converter that stamps `model` into the synthesized Anthropic response.
+    /// Context-meter scaling is disabled (windows 0/0); use
+    /// [`CodexSseConverter::with_model_and_window`] to enable it.
     pub fn with_model(model: String) -> Self {
+        Self::with_model_and_window(model, 0, 0)
+    }
+
+    /// Converter that stamps `model` and carries the context-window pair the
+    /// Claude Code context-meter compatibility adapter scales the
+    /// CLIENT-FACING `usage` against. `context_window` is codex's real input
+    /// ceiling; `client_context_window` is the denominator Claude Code assumes
+    /// for the reported model. Scaling is identity unless both are > 0 and
+    /// differ. `self.usage` (internal/dashboard/scheduler total) is never
+    /// scaled.
+    pub fn with_model_and_window(
+        model: String,
+        context_window: u64,
+        client_context_window: u64,
+    ) -> Self {
         Self {
             model,
+            context_window,
+            client_context_window,
             started: false,
             finished: false,
             message_id: String::new(),
@@ -579,6 +642,15 @@ impl CodexSseConverter {
             stop_reason: None,
             error: None,
         }
+    }
+
+    /// Scale a TRUE token count into the CLIENT-FACING value the context-meter
+    /// compatibility adapter reports. Thin wrapper over
+    /// [`scale_count_for_client`] bound to this converter's windows; returns
+    /// `n` unchanged when the adapter is disabled. Only the wire `usage` is
+    /// scaled — `self.usage` stays TRUE.
+    fn scale_for_client(&self, n: u64) -> u64 {
+        scale_count_for_client(n, self.context_window, self.client_context_window)
     }
 
     fn emit(out: &mut Vec<u8>, event_type: &str, data: &Value) {
@@ -731,6 +803,23 @@ impl CodexSseConverter {
             "end_turn"
         };
         self.stop_reason = Some(stop_reason.to_string());
+        // Claude Code context-meter compatibility adapter: scale ONLY the
+        // client-facing usage so its "context left %" bar / auto-compaction
+        // trigger line up with codex's real ceiling. `self.usage` stays TRUE.
+        let scaled_input = self.scale_for_client(self.usage.input_tokens);
+        let scaled_cache_read = self.scale_for_client(self.cached_input_tokens);
+        let scaled_output = self.scale_for_client(self.usage.output_tokens);
+        tracing::debug!(
+            true_input = self.usage.input_tokens,
+            true_output = self.usage.output_tokens,
+            true_cache_read = self.cached_input_tokens,
+            scaled_input,
+            scaled_output,
+            scaled_cache_read,
+            client_context_window = self.client_context_window,
+            context_window = self.context_window,
+            "codex context-meter scale (client-facing usage)"
+        );
         Self::emit(
             out,
             "message_delta",
@@ -738,9 +827,9 @@ impl CodexSseConverter {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": null},
                 "usage": {
-                    "input_tokens": self.usage.input_tokens,
-                    "cache_read_input_tokens": self.cached_input_tokens,
-                    "output_tokens": self.usage.output_tokens,
+                    "input_tokens": scaled_input,
+                    "cache_read_input_tokens": scaled_cache_read,
+                    "output_tokens": scaled_output,
                 },
             }),
         );
@@ -791,10 +880,13 @@ impl CodexSseConverter {
             "content": content,
             "stop_reason": self.stop_reason.as_deref().unwrap_or("end_turn"),
             "stop_sequence": null,
+            // Same Claude Code context-meter compatibility adapter as the
+            // streaming path: client-facing usage scaled, `self.usage` (read by
+            // `usage()`) left TRUE.
             "usage": {
-                "input_tokens": self.usage.input_tokens,
-                "cache_read_input_tokens": self.cached_input_tokens,
-                "output_tokens": self.usage.output_tokens,
+                "input_tokens": self.scale_for_client(self.usage.input_tokens),
+                "cache_read_input_tokens": self.scale_for_client(self.cached_input_tokens),
+                "output_tokens": self.scale_for_client(self.usage.output_tokens),
             },
         }))
     }
@@ -1084,6 +1176,7 @@ mod tests {
             model: "gpt-5.5-codex".to_string(),
             fast: true,
             effort: Some("XHIGH".to_string()),
+            ..CodexShape::default()
         };
         let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
         assert_eq!(upstream["model"], "gpt-5.5-codex", "model is config-driven");
@@ -1114,6 +1207,7 @@ mod tests {
                 model: CODEX_MODEL.to_string(),
                 fast: false,
                 effort: Some(e.to_string()),
+                ..CodexShape::default()
             };
             let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
             assert!(
@@ -1396,7 +1490,30 @@ mod tests {
     /// Feed a scripted sequence and split the emitted bytes back into
     /// `(event_type, data_json)` pairs for assertion.
     fn run_converter(events: &[Value]) -> (CodexSseConverter, Vec<(String, Value)>) {
-        let mut converter = CodexSseConverter::new();
+        run_converter_with(CodexSseConverter::new(), events)
+    }
+
+    /// Like [`run_converter`] but with an explicit converter so a test can
+    /// enable the context-meter scaling adapter (windows != 0/equal).
+    fn run_converter_windowed(
+        context_window: u64,
+        client_context_window: u64,
+        events: &[Value],
+    ) -> (CodexSseConverter, Vec<(String, Value)>) {
+        run_converter_with(
+            CodexSseConverter::with_model_and_window(
+                CODEX_MODEL.to_string(),
+                context_window,
+                client_context_window,
+            ),
+            events,
+        )
+    }
+
+    fn run_converter_with(
+        mut converter: CodexSseConverter,
+        events: &[Value],
+    ) -> (CodexSseConverter, Vec<(String, Value)>) {
         let mut emitted = Vec::new();
         for e in events {
             emitted.extend_from_slice(&converter.on_event(&event(e.clone())));
@@ -1517,6 +1634,140 @@ mod tests {
                 cache_creation_input_tokens: None,
             }
         );
+    }
+
+    // ---- Claude Code context-meter compatibility adapter ----
+    // The wire (client-facing) usage is scaled by
+    // client_context_window/context_window so Claude Code's "context left %"
+    // bar lines up with codex's real 272k ceiling; the internal ledger
+    // (`usage()`) stays TRUE so the dashboard/scheduler/cost are unaffected.
+
+    /// Core proof, exercised through the real `complete()` path (a
+    /// `response.completed` event), NOT by constructing StreamUsage directly:
+    /// full-window input → wire is scaled to the client denominator, ledger is
+    /// the true count.
+    #[test]
+    fn context_meter_scales_wire_usage_but_not_internal_ledger() {
+        let (converter, events) = run_converter_windowed(
+            272_000,
+            200_000,
+            &[
+                json!({"type": "response.created", "response": {"id": "r"}}),
+                json!({"type": "response.output_item.added", "output_index": 0,
+                       "item": {"type": "message", "role": "assistant"}}),
+                json!({"type": "response.output_text.delta", "delta": "hi"}),
+                json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+                json!({"type": "response.completed", "response": {"usage": {
+                    "input_tokens": 272_000,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 0
+                }}}),
+            ],
+        );
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        // Wire: 272000 * 200000 / 272000 == 200000 (scaled to client ceiling).
+        assert_eq!(
+            message_delta["usage"]["input_tokens"], 200_000,
+            "client-facing input scaled to the 200k denominator"
+        );
+        // Ledger: TRUE, unscaled.
+        assert_eq!(
+            converter.usage().input_tokens,
+            272_000,
+            "internal usage() stays the true 272000"
+        );
+    }
+
+    /// Cache split: fresh = total − cached; each of the three wire numbers is
+    /// scaled by the same ratio; the ledger keeps the true 40000/60000/10000.
+    #[test]
+    fn context_meter_scales_cache_split_three_numbers() {
+        let scale = |n: u64| n * 200_000 / 272_000;
+        let (converter, events) = run_converter_windowed(
+            272_000,
+            200_000,
+            &[
+                json!({"type": "response.created", "response": {"id": "r"}}),
+                json!({"type": "response.output_item.added", "output_index": 0,
+                       "item": {"type": "message", "role": "assistant"}}),
+                json!({"type": "response.output_text.delta", "delta": "hi"}),
+                json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+                json!({"type": "response.completed", "response": {"usage": {
+                    "input_tokens": 100_000,
+                    "input_tokens_details": {"cached_tokens": 60_000},
+                    "output_tokens": 10_000
+                }}}),
+            ],
+        );
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        // fresh true input = 100000 - 60000 = 40000.
+        assert_eq!(message_delta["usage"]["input_tokens"], scale(40_000));
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], scale(60_000));
+        assert_eq!(message_delta["usage"]["output_tokens"], scale(10_000));
+        // Ledger keeps the TRUE counts.
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 40_000,
+                output_tokens: 10_000,
+                cache_read_input_tokens: Some(60_000),
+                cache_creation_input_tokens: None,
+            }
+        );
+    }
+
+    /// Disabled when the windows are equal (and likewise when either is 0):
+    /// the wire usage equals the true usage (scale is identity).
+    #[test]
+    fn context_meter_disabled_when_windows_equal_is_identity() {
+        for (real, client) in [(272_000u64, 272_000u64), (0, 200_000), (272_000, 0)] {
+            let (converter, events) = run_converter_windowed(
+                real,
+                client,
+                &[
+                    json!({"type": "response.created", "response": {"id": "r"}}),
+                    json!({"type": "response.output_item.added", "output_index": 0,
+                           "item": {"type": "message", "role": "assistant"}}),
+                    json!({"type": "response.output_text.delta", "delta": "hi"}),
+                    json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+                    json!({"type": "response.completed", "response": {"usage": {
+                        "input_tokens": 100_000,
+                        "input_tokens_details": {"cached_tokens": 60_000},
+                        "output_tokens": 10_000
+                    }}}),
+                ],
+            );
+            let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+            // Wire == ledger == true (fresh 40000 / cache 60000 / out 10000).
+            assert_eq!(
+                message_delta["usage"]["input_tokens"], 40_000,
+                "windows {real}/{client}: input identity"
+            );
+            assert_eq!(
+                message_delta["usage"]["cache_read_input_tokens"], 60_000,
+                "windows {real}/{client}: cache_read identity"
+            );
+            assert_eq!(
+                message_delta["usage"]["output_tokens"], 10_000,
+                "windows {real}/{client}: output identity"
+            );
+            assert_eq!(converter.usage().input_tokens, 40_000);
+        }
+    }
+
+    /// count_tokens preflight estimate is scaled by the same ratio (and is
+    /// identity when disabled).
+    #[test]
+    fn context_meter_scales_count_tokens_estimate() {
+        // Active: 40000 * 200000 / 272000.
+        assert_eq!(
+            scale_count_for_client(40_000, 272_000, 200_000),
+            40_000 * 200_000 / 272_000
+        );
+        // Disabled (equal / zero) → identity.
+        assert_eq!(scale_count_for_client(40_000, 272_000, 272_000), 40_000);
+        assert_eq!(scale_count_for_client(40_000, 0, 200_000), 40_000);
+        assert_eq!(scale_count_for_client(40_000, 272_000, 0), 40_000);
     }
 
     #[test]

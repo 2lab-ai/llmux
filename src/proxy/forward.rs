@@ -1273,11 +1273,21 @@ fn codex_count_tokens_response(
     ctx: &mut ForwardContext,
     account: &AccountId,
 ) -> Response {
-    let estimate = serde_json::from_slice::<serde_json::Value>(&ctx.body)
+    let raw_estimate = serde_json::from_slice::<serde_json::Value>(&ctx.body)
         .map(|v| crate::provider::codex::estimate_input_tokens(&v))
         .unwrap_or(1);
+    // Apply the same Claude Code context-meter compatibility adapter as the
+    // streaming/aggregate usage: scale the preflight estimate by
+    // `client_context_window / context_window` so Claude Code's "does this fit /
+    // preemptive compaction" check is consistent with the scaled bar. Identity
+    // when scaling is disabled (either window 0, or equal).
+    let estimate = crate::provider::codex::scale_count_for_client(
+        raw_estimate,
+        state.config.codex.context_window,
+        state.config.codex.client_context_window,
+    );
     ctx.log(format!(
-        "=== RESPONSE (codex count_tokens estimate: {estimate}) ==="
+        "=== RESPONSE (codex count_tokens estimate: {estimate}, raw: {raw_estimate}) ==="
     ));
     ctx.flush_log(state);
     ctx.emit_finished(state, Some(account), StatusCode::OK, None);

@@ -1037,8 +1037,13 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
     assert_eq!(events[4].1["index"], 1);
     assert_eq!(events[5].1["delta"]["partial_json"], "{\"city\":\"Seoul\"}");
     assert_eq!(events[7].1["delta"]["stop_reason"], "tool_use");
-    assert_eq!(events[7].1["usage"]["input_tokens"], 42);
-    assert_eq!(events[7].1["usage"]["output_tokens"], 11);
+    // Claude Code context-meter compatibility adapter (default config
+    // 272000/200000): the CLIENT-FACING wire usage is scaled by 200000/272000
+    // so its context bar lines up with codex's real ceiling. Upstream emitted
+    // 42/11 → wire 42*200000/272000=30, 11*200000/272000=8. The internal
+    // totals below stay TRUE (42/11).
+    assert_eq!(events[7].1["usage"]["input_tokens"], 30);
+    assert_eq!(events[7].1["usage"]["output_tokens"], 8);
 
     // The upstream saw a translated Responses request with codex headers.
     let seen = mock.seen();
@@ -1128,8 +1133,13 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["content"][0]["text"], "Let me check.");
     assert_eq!(message["content"][1]["type"], "tool_use");
     assert_eq!(message["content"][1]["input"]["city"], "Seoul");
-    assert_eq!(message["usage"]["input_tokens"], 42);
-    assert_eq!(message["usage"]["output_tokens"], 11);
+    // Claude Code context-meter compatibility adapter (default 272000/200000):
+    // the aggregate's CLIENT-FACING usage is scaled the same as the streaming
+    // path. Upstream 42/11 → wire 30/8. Internal totals (read via usage()) stay
+    // TRUE — see `codex_account_serves_anthropic_stream_with_tool_use` which
+    // asserts totals.input_tokens == 42.
+    assert_eq!(message["usage"]["input_tokens"], 30);
+    assert_eq!(message["usage"]["output_tokens"], 8);
 }
 
 /// C3: a codex 401 forces one token refresh (form-encoded grant against the

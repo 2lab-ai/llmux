@@ -619,10 +619,15 @@ impl App {
     fn set_codex(&mut self, new: CodexSettingsDoc) {
         match &mut self.backend {
             Backend::Local(state) => {
+                // Preserve the context-window pair (meter-scale adapter, not a
+                // dashboard-tunable) across a model/fast/effort change.
+                let current = state.codex.shape();
                 state.codex.set_shape(crate::provider::codex::CodexShape {
                     model: new.model.clone(),
                     fast: new.fast,
                     effort: new.effort.clone(),
+                    context_window: current.context_window,
+                    client_context_window: current.client_context_window,
                 });
                 if let Some(path) = &state.config_path {
                     let _ = crate::config::update_path(path, |c| {
