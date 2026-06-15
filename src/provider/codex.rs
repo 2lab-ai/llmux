@@ -529,7 +529,8 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
 /// u128 intermediate math; identity when scaling is disabled (either window 0,
 /// or equal). See [`crate::config::schema::CodexConfig::context_window`].
 pub fn scale_count_for_client(n: u64, context_window: u64, client_context_window: u64) -> u64 {
-    if client_context_window == 0 || context_window == 0 || client_context_window == context_window {
+    if client_context_window == 0 || context_window == 0 || client_context_window == context_window
+    {
         return n;
     }
     ((n as u128 * client_context_window as u128) / context_window as u128) as u64
@@ -1702,7 +1703,10 @@ mod tests {
         let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
         // fresh true input = 100000 - 60000 = 40000.
         assert_eq!(message_delta["usage"]["input_tokens"], scale(40_000));
-        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], scale(60_000));
+        assert_eq!(
+            message_delta["usage"]["cache_read_input_tokens"],
+            scale(60_000)
+        );
         assert_eq!(message_delta["usage"]["output_tokens"], scale(10_000));
         // Ledger keeps the TRUE counts.
         assert_eq!(
