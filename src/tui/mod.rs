@@ -627,8 +627,13 @@ impl App {
     fn set_codex(&mut self, new: CodexSettingsDoc) {
         match &mut self.backend {
             Backend::Local(state) => {
+                // Carry the live `client_model` override forward: it is a
+                // config-only opt-in the TUI settings panel doesn't manage, so
+                // a model/fast/effort change here must not silently clear it.
+                let client_model = state.codex.shape().client_model;
                 state.codex.set_shape(crate::provider::codex::CodexShape {
                     model: new.model.clone(),
+                    client_model,
                     fast: new.fast,
                     effort: new.effort.clone(),
                 });

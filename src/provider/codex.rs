@@ -36,6 +36,12 @@ pub const RESPONSES_PATH: &str = "/responses";
 pub struct CodexShape {
     /// Model slug requested upstream.
     pub model: String,
+    /// When `Some`, the model NAME reported to the client (Claude Code) in the
+    /// synthesized Anthropic response — independent of `model`, which is what
+    /// is actually requested upstream and what routing/dashboard/trace use.
+    /// `None` (default) → report the real `model`. See
+    /// [`crate::config::schema::CodexConfig::client_model`].
+    pub client_model: Option<String>,
     /// `true` → send `service_tier: "priority"` (codex "fast" mode).
     pub fast: bool,
     /// `reasoning.effort` value (`none|minimal|low|medium|high|xhigh`), or
@@ -47,6 +53,7 @@ impl Default for CodexShape {
     fn default() -> Self {
         Self {
             model: CODEX_MODEL.to_string(),
+            client_model: None,
             fast: false,
             effort: None,
         }
@@ -58,6 +65,7 @@ impl CodexShape {
     pub fn from_config(codex: &crate::config::schema::CodexConfig) -> Self {
         Self {
             model: codex.default_model.clone(),
+            client_model: codex.client_model.clone(),
             fast: codex.fast,
             effort: codex.reasoning_effort.clone(),
         }
@@ -179,9 +187,11 @@ impl CodexProvider {
     }
 
     /// Fresh per-request stream converter, stamping responses with this
-    /// provider's configured model slug.
+    /// provider's configured model slug — or the `client_model` override when
+    /// set (what Claude Code sees; routing/dashboard/trace keep the real model).
     pub fn converter(&self) -> CodexSseConverter {
-        CodexSseConverter::with_model(self.shape().model)
+        let shape = self.shape();
+        CodexSseConverter::with_model(shape.model).with_client_model(shape.client_model)
     }
 }
 
@@ -536,9 +546,15 @@ struct AggBlock {
 /// bytes out (`event: <type>\ndata: <json>\n\n`, indexes sequenced).
 #[derive(Debug)]
 pub struct CodexSseConverter {
-    /// Model slug stamped into the Anthropic `message_start` / aggregate
-    /// (what Claude Code sees as the response model).
+    /// Real codex model slug (the value requested upstream). Kept for internal
+    /// use; the client-facing stamp prefers `client_model` when set.
     model: String,
+    /// Optional override for the model NAME stamped into the client-facing
+    /// Anthropic `message_start` / aggregate. When `Some`, Claude Code sees
+    /// this instead of `model` (so its hardcoded context-window lookup picks a
+    /// 1M denominator); routing/dashboard/trace still use `model`. `None`
+    /// (default) → stamp the real `model`.
+    client_model: Option<String>,
     started: bool,
     finished: bool,
     message_id: String,
@@ -586,6 +602,7 @@ impl CodexSseConverter {
     pub fn with_model(model: String) -> Self {
         Self {
             model,
+            client_model: None,
             started: false,
             finished: false,
             message_id: String::new(),
@@ -600,6 +617,21 @@ impl CodexSseConverter {
             raw_usage: None,
             events_seen: 0,
         }
+    }
+
+    /// Set the optional client-facing model-name override (see
+    /// [`Self::client_model`]). Builder-style so the provider can chain it
+    /// after [`Self::with_model`].
+    pub fn with_client_model(mut self, client_model: Option<String>) -> Self {
+        self.client_model = client_model;
+        self
+    }
+
+    /// The model NAME to stamp into client-facing responses: the override when
+    /// set, else the real model. Only the two response stamps use this; every
+    /// internal path (routing, dashboard, trace, scheduler) reads `model`.
+    fn client_facing_model(&self) -> &str {
+        self.client_model.as_deref().unwrap_or(&self.model)
     }
 
     fn emit(out: &mut Vec<u8>, event_type: &str, data: &Value) {
@@ -623,7 +655,7 @@ impl CodexSseConverter {
                     "id": self.message_id,
                     "type": "message",
                     "role": "assistant",
-                    "model": self.model.clone(),
+                    "model": self.client_facing_model(),
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
@@ -811,7 +843,7 @@ impl CodexSseConverter {
             },
             "type": "message",
             "role": "assistant",
-            "model": self.model.clone(),
+            "model": self.client_facing_model(),
             "content": content,
             "stop_reason": self.stop_reason.as_deref().unwrap_or("end_turn"),
             "stop_sequence": null,
@@ -1122,6 +1154,7 @@ mod tests {
         let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });
         let shape = CodexShape {
             model: "gpt-5.5-codex".to_string(),
+            client_model: None,
             fast: true,
             effort: Some("XHIGH".to_string()),
         };
@@ -1152,6 +1185,7 @@ mod tests {
         for e in ["", "  ", "default", "DEFAULT"] {
             let shape = CodexShape {
                 model: CODEX_MODEL.to_string(),
+                client_model: None,
                 fast: false,
                 effort: Some(e.to_string()),
             };
@@ -1735,6 +1769,121 @@ mod tests {
     fn aggregate_of_failed_stream_is_none() {
         let (converter, _) = run_converter(&[json!({"type": "error", "message": "nope"})]);
         assert!(converter.into_message_json().is_none());
+    }
+
+    /// Like [`run_converter`] but drives a caller-supplied converter, so a
+    /// `client_model` override can be exercised through the same stream path.
+    fn drive_converter(
+        mut converter: CodexSseConverter,
+        events: &[Value],
+    ) -> (CodexSseConverter, Vec<(String, Value)>) {
+        let mut emitted = Vec::new();
+        for e in events {
+            emitted.extend_from_slice(&converter.on_event(&event(e.clone())));
+        }
+        emitted.extend_from_slice(&converter.on_end());
+        let text = String::from_utf8(emitted).expect("utf8");
+        let mut parsed = Vec::new();
+        for chunk in text.split("\n\n").filter(|c| !c.trim().is_empty()) {
+            let mut event_type = String::new();
+            let mut data = String::new();
+            for line in chunk.lines() {
+                if let Some(t) = line.strip_prefix("event: ") {
+                    event_type = t.to_string();
+                } else if let Some(d) = line.strip_prefix("data: ") {
+                    data = d.to_string();
+                }
+            }
+            let value: Value = serde_json::from_str(&data).expect("data is json");
+            parsed.push((event_type, value));
+        }
+        (converter, parsed)
+    }
+
+    /// A minimal text-only stream ending in `response.completed`, enough to
+    /// emit a `message_start` and build the non-stream aggregate.
+    fn minimal_completed_stream() -> Vec<Value> {
+        vec![
+            json!({"type": "response.created", "response": {"id": "resp_cm"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed",
+                   "response": {"usage": {"input_tokens": 9, "output_tokens": 2}}}),
+        ]
+    }
+
+    #[test]
+    fn client_model_override_restamps_the_response_model() {
+        // client_model = Some(...) must rewrite BOTH client-facing stamps: the
+        // streamed message_start and the non-stream aggregate.
+        let converter = CodexSseConverter::with_model("gpt-5.5".to_string())
+            .with_client_model(Some("claude-opus-4-8".to_string()));
+        let (converter, events) = drive_converter(converter, &minimal_completed_stream());
+
+        let (_, start) = events
+            .iter()
+            .find(|(t, _)| t == "message_start")
+            .expect("message_start emitted");
+        assert_eq!(
+            start["message"]["model"], "claude-opus-4-8",
+            "streamed message_start must carry the client_model override"
+        );
+
+        let message = converter.into_message_json().expect("message");
+        assert_eq!(
+            message["model"], "claude-opus-4-8",
+            "non-stream aggregate must carry the client_model override"
+        );
+    }
+
+    #[test]
+    fn client_model_none_keeps_real_model() {
+        // Default (no override) → both stamps report the real codex model.
+        let converter = CodexSseConverter::with_model("gpt-5.5".to_string());
+        let (converter, events) = drive_converter(converter, &minimal_completed_stream());
+
+        let (_, start) = events
+            .iter()
+            .find(|(t, _)| t == "message_start")
+            .expect("message_start emitted");
+        assert_eq!(
+            start["message"]["model"], "gpt-5.5",
+            "with no override, message_start reports the real codex model"
+        );
+
+        let message = converter.into_message_json().expect("message");
+        assert_eq!(message["model"], "gpt-5.5");
+    }
+
+    #[test]
+    fn client_model_override_does_not_change_the_provider_real_model() {
+        // The override is a RESPONSE-STAMP concern only. Routing, the dashboard
+        // (RequestRouted), the trace log, and the scheduler all read
+        // `CodexProvider::model()`, which must stay the real upstream model so
+        // a codex session is still attributed to codex — never to the spoofed
+        // claude name. This guards that the client_model knob can't leak into
+        // the provider's reported model.
+        let shape = CodexShape {
+            model: "gpt-5.5".to_string(),
+            client_model: Some("claude-opus-4-8".to_string()),
+            fast: false,
+            effort: None,
+        };
+        let provider = CodexProvider::with_shape("http://unused", shape);
+        assert_eq!(
+            provider.model(),
+            "gpt-5.5",
+            "provider.model() (routing/dashboard/trace source) must be the REAL model"
+        );
+        // The converter it hands out, however, stamps the override client-side.
+        let (_, events) = drive_converter(provider.converter(), &minimal_completed_stream());
+        let (_, start) = events
+            .iter()
+            .find(|(t, _)| t == "message_start")
+            .expect("message_start emitted");
+        assert_eq!(start["message"]["model"], "claude-opus-4-8");
     }
 
     #[test]
