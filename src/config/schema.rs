@@ -123,6 +123,17 @@ pub struct CodexConfig {
     /// Additive: configs written before this field load with the default.
     #[serde(default = "default_codex_model")]
     pub default_model: String,
+    /// When set, llmux reports THIS model name to the client (Claude Code) in
+    /// the response instead of the real codex model. Claude Code picks its
+    /// context-window denominator by a hardcoded model-name lookup
+    /// (unknown→200k, known 1M models→1,000,000) and offers no per-model
+    /// window override, so set this to a 1M-window model name (e.g.
+    /// `claude-opus-4-8`) to stop Claude Code cutting codex sessions off at
+    /// ~200k. Pair with the `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` env var on
+    /// the Claude Code side to make auto-compaction fire at codex's real limit.
+    /// None (default) = report the real codex model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_model: Option<String>,
     /// "Fast" service tier. When `true`, the Responses request carries
     /// `service_tier: "priority"` — the exact wire value the codex CLI sends
     /// for its fast mode (config stores "fast", wire sends "priority"). When
@@ -149,6 +160,7 @@ impl Default for CodexConfig {
             upstream: default_codex_upstream(),
             token_url: default_codex_token_url(),
             default_model: default_codex_model(),
+            client_model: None,
             fast: false,
             reasoning_effort: None,
             trace: true,
