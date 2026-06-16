@@ -29,7 +29,8 @@ const GAUGE_BAR_WIDTH: usize = 8;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
-/// Width at/above which the middle row fits summary + detail side by side.
+
+/// Width at/above which detail panes fit side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
 /// Rows shown in the always-visible compact model strip (req12). Width of its
 /// token-share mini-bar.
@@ -108,11 +109,10 @@ pub(crate) fn draw(frame: &mut Frame, view: Option<&DashboardView>, chrome: &Chr
     draw_footer(frame, footer_area, chrome);
 }
 
-/// MAIN — the always-rendered wall-clock view (issue #5): header banner ·
-/// account quota table · scheduler/totals summary · compact per-model strip ·
-/// in-flight + activity. No navigation, no overlay surfaces. The selected-
-/// account detail pane and the full log console moved to the Accounts and Logs
-/// overlays respectively; the model strip stays here.
+/// MAIN — L0 command center. The full account/model/log inventory still exists
+/// behind Accounts/Stats/Logs overlays, but the first screen now shows only the
+/// operator-critical rollups, ranked exceptions, L1 domain map, and evidence
+/// preview so it fits as a glanceable dashboard.
 fn draw_main(
     frame: &mut Frame,
     view: &DashboardView,
@@ -120,22 +120,18 @@ fn draw_main(
     chrome: &Chrome,
     now: SystemTime,
 ) {
-    let snapshot = &view.snapshot;
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
-    // Compact model strip (req12): only when model data exists. 0 height (no
-    // pane) otherwise, so the idle layout is unchanged.
+    let compact = frame.area().height < 30;
     let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
-    // +2 for the table's top border (title) and header row.
-    let strip_height = if strip_rows > 0 {
+    let strip_height = if !compact && strip_rows > 0 {
         strip_rows as u16 + 2
     } else {
         0
     };
-    let [header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
+    let [header_area, overview_area, domains_area, strip_area, activity_area, footer_area] =
         Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(table_height),
-            Constraint::Length(8),
+            Constraint::Length(if compact { 10 } else { 13 }),
+            Constraint::Length(if compact { 0 } else { 7 }),
             Constraint::Length(strip_height),
             Constraint::Min(3),
             Constraint::Length(2),
@@ -143,8 +139,10 @@ fn draw_main(
         .areas(frame.area());
 
     draw_header(frame, header_area, view, chrome);
-    draw_accounts(frame, table_area, view, ctx, chrome);
-    draw_middle(frame, middle_area, view, ctx, chrome);
+    draw_overview(frame, overview_area, view, ctx, chrome, now);
+    if domains_area.height > 0 {
+        draw_domain_map(frame, domains_area, view, ctx);
+    }
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
     }
@@ -152,6 +150,482 @@ fn draw_main(
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OverviewSeverity {
+    Ok = 0,
+    Stale = 1,
+    Warn = 2,
+    Crit = 3,
+}
+
+impl OverviewSeverity {
+    fn badge(self) -> &'static str {
+        match self {
+            OverviewSeverity::Ok => "OK",
+            OverviewSeverity::Stale => "STALE",
+            OverviewSeverity::Warn => "WARN",
+            OverviewSeverity::Crit => "CRIT",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            OverviewSeverity::Ok => Color::Green,
+            OverviewSeverity::Stale => Color::Blue,
+            OverviewSeverity::Warn => Color::Yellow,
+            OverviewSeverity::Crit => Color::Red,
+        }
+    }
+}
+
+struct OverviewRow {
+    severity: OverviewSeverity,
+    domain: &'static str,
+    entity: String,
+    impact: String,
+    age: String,
+    reason: String,
+    next: &'static str,
+}
+
+fn compact_age(now: SystemTime, at: SystemTime) -> String {
+    now.duration_since(at)
+        .map(select::compact_duration)
+        .unwrap_or_else(|_| "0s".to_string())
+}
+
+fn completed_is_error(entry: &Completed) -> bool {
+    match &entry.body {
+        CompletedBody::Request { status, .. } => *status >= 400,
+        CompletedBody::Note { error, .. } => *error,
+    }
+}
+
+fn completed_label(entry: &Completed) -> String {
+    match &entry.body {
+        CompletedBody::Request {
+            method,
+            path,
+            status,
+            ..
+        } => format!("{method} {path} → {status}"),
+        CompletedBody::Note { text, .. } => text.chars().take(48).collect(),
+    }
+}
+
+fn completed_impact(entry: &Completed) -> String {
+    match &entry.body {
+        CompletedBody::Request {
+            account,
+            group,
+            model,
+            ..
+        } => match (account, group, model) {
+            (Some(account), Some(group), Some(model)) => format!("{account} · {group}/{model}"),
+            (Some(account), _, _) => account.clone(),
+            _ => "unrouted".to_string(),
+        },
+        CompletedBody::Note { .. } => "dashboard note".to_string(),
+    }
+}
+
+fn overview_rows(view: &DashboardView, ctx: &FrameCtx, now: SystemTime) -> Vec<OverviewRow> {
+    let mut rows = Vec::new();
+    let accounts = &view.snapshot.accounts;
+    let healthy = accounts.iter().filter(|a| a.healthy).count();
+
+    if !accounts.is_empty() && healthy == 0 {
+        rows.push(OverviewRow {
+            severity: OverviewSeverity::Crit,
+            domain: "Accounts",
+            entity: "all accounts".to_string(),
+            impact: format!("0/{} healthy", accounts.len()),
+            age: "now".to_string(),
+            reason: "no usable upstream".to_string(),
+            next: "press a",
+        });
+    }
+
+    for account in accounts {
+        if !account.healthy {
+            rows.push(OverviewRow {
+                severity: OverviewSeverity::Warn,
+                domain: "Accounts",
+                entity: account.id.0.clone(),
+                impact: account.credential_kind.to_string(),
+                age: "now".to_string(),
+                reason: "unhealthy".to_string(),
+                next: "press a",
+            });
+        }
+        if let Some(until) = account.cooldown_until {
+            if until > now {
+                rows.push(OverviewRow {
+                    severity: OverviewSeverity::Warn,
+                    domain: "Accounts",
+                    entity: account.id.0.clone(),
+                    impact: "cooldown".to_string(),
+                    age: until
+                        .duration_since(now)
+                        .map(select::compact_duration)
+                        .unwrap_or_else(|_| "now".to_string()),
+                    reason: "rate limited".to_string(),
+                    next: "press a",
+                });
+            }
+        }
+    }
+
+    for (name, poll) in &view.poll_health {
+        if poll.consecutive_failures > 0 {
+            rows.push(OverviewRow {
+                severity: OverviewSeverity::Warn,
+                domain: "Accounts",
+                entity: name.clone(),
+                impact: format!("{} poll failures", poll.consecutive_failures),
+                age: poll
+                    .last_ok
+                    .map(|at| compact_age(now, at))
+                    .unwrap_or_else(|| "never ok".to_string()),
+                reason: "usage poll failing".to_string(),
+                next: "press l",
+            });
+        }
+    }
+
+    if ctx.headers_only {
+        rows.push(OverviewRow {
+            severity: OverviewSeverity::Stale,
+            domain: "Routing",
+            entity: "scheduler".to_string(),
+            impact: "headers-only".to_string(),
+            age: "now".to_string(),
+            reason: "limited usage evidence".to_string(),
+            next: "press g",
+        });
+    }
+
+    for request in view.in_flight.iter().rev().take(4) {
+        rows.push(OverviewRow {
+            severity: OverviewSeverity::Ok,
+            domain: "Traffic",
+            entity: format!("{} {}", request.method, request.path),
+            impact: request
+                .account
+                .clone()
+                .unwrap_or_else(|| "routing".to_string()),
+            age: compact_age(now, request.started_at),
+            reason: "in flight".to_string(),
+            next: "watch",
+        });
+    }
+
+    for entry in view
+        .completed
+        .iter()
+        .filter(|entry| completed_is_error(entry))
+        .take(5)
+    {
+        rows.push(OverviewRow {
+            severity: OverviewSeverity::Warn,
+            domain: "Incidents",
+            entity: completed_label(entry),
+            impact: completed_impact(entry),
+            age: compact_age(now, entry.at),
+            reason: "recent error".to_string(),
+            next: "press l",
+        });
+    }
+
+    if rows.is_empty() {
+        rows.push(OverviewRow {
+            severity: OverviewSeverity::Ok,
+            domain: "Overview",
+            entity: "no active exceptions".to_string(),
+            impact: format!(
+                "{} accounts · {} model rows",
+                accounts.len(),
+                view.model_usage.len()
+            ),
+            age: "live".to_string(),
+            reason: "healthy glance".to_string(),
+            next: "drill down",
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.domain.cmp(b.domain))
+            .then_with(|| a.entity.cmp(&b.entity))
+    });
+    rows
+}
+
+fn draw_overview(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    now: SystemTime,
+) {
+    let rows = overview_rows(view, ctx, now);
+    let crit = rows
+        .iter()
+        .filter(|row| row.severity == OverviewSeverity::Crit)
+        .count();
+    let warn = rows
+        .iter()
+        .filter(|row| row.severity == OverviewSeverity::Warn)
+        .count();
+    let stale = rows
+        .iter()
+        .filter(|row| row.severity == OverviewSeverity::Stale)
+        .count();
+    let ok = rows
+        .iter()
+        .filter(|row| row.severity == OverviewSeverity::Ok)
+        .count();
+    let healthy = view.snapshot.accounts.iter().filter(|a| a.healthy).count();
+    let [summary_area, body_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(area);
+
+    let summary = Line::from(vec![
+        Span::styled(
+            " L0 ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" command center  "),
+        Span::styled(
+            format!("CRIT {crit} "),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("WARN {warn} "),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("STALE {stale} "), Style::new().fg(Color::Blue)),
+        Span::styled(format!("OK {ok}"), Style::new().fg(Color::Green)),
+        Span::raw(format!(
+            "  │ accounts {}/{}",
+            healthy,
+            view.snapshot.accounts.len()
+        )),
+        Span::raw(format!("  in-flight {}", view.in_flight.len())),
+        Span::raw(format!("  rpm {:.1}", view.rpm_5m)),
+        Span::raw(format!(
+            "  err {}",
+            format::human_count(view.global_totals.errors)
+        )),
+        Span::raw(format!("  eval {}s", view.evaluate_tick.as_secs().max(1))),
+        Span::raw(format!("  models {}", view.model_usage.len())),
+    ]);
+    let subtitle = Line::from(vec![
+        Span::styled(" hierarchy ", dim()),
+        Span::raw("Overview > Domain > Entity > Evidence"),
+        Span::styled("   a accounts · g models · l logs · ↑↓ history", dim()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(vec![summary, subtitle]).block(Block::new().borders(Borders::BOTTOM)),
+        summary_area,
+    );
+
+    if body_area.width >= 140 {
+        let [list_area, preview_area] =
+            Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+                .areas(body_area);
+        draw_exception_table(frame, list_area, &rows, chrome);
+        draw_selected_preview(frame, preview_area, &rows, view);
+    } else {
+        let [list_area, preview_area] = Layout::vertical([
+            Constraint::Min(5),
+            Constraint::Length(if body_area.height > 8 { 4 } else { 0 }),
+        ])
+        .areas(body_area);
+        draw_exception_table(frame, list_area, &rows, chrome);
+        if preview_area.height > 0 {
+            draw_selected_preview(frame, preview_area, &rows, view);
+        }
+    }
+}
+
+fn draw_exception_table(frame: &mut Frame, area: Rect, rows: &[OverviewRow], chrome: &Chrome) {
+    let visible = area.height.saturating_sub(3) as usize;
+    let selected = chrome.activity_scroll.min(rows.len().saturating_sub(1));
+    let table_rows = rows
+        .iter()
+        .take(visible.max(1))
+        .enumerate()
+        .map(|(idx, item)| {
+            let style = if idx == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Row::new([
+                Cell::from(Span::styled(
+                    item.severity.badge(),
+                    Style::new()
+                        .fg(item.severity.color())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(item.domain.to_string()),
+                Cell::from(item.entity.clone()),
+                Cell::from(item.impact.clone()),
+                Cell::from(item.age.clone()),
+                Cell::from(item.reason.clone()),
+                Cell::from(item.next.to_string()),
+            ])
+            .style(style)
+        });
+    let hidden = rows.len().saturating_sub(visible);
+    let title = if hidden > 0 {
+        format!(" ranked exceptions (+{} hidden) ", hidden)
+    } else {
+        " ranked exceptions ".to_string()
+    };
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(11),
+            Constraint::Percentage(25),
+            Constraint::Percentage(18),
+            Constraint::Length(8),
+            Constraint::Percentage(22),
+            Constraint::Length(10),
+        ],
+    )
+    .header(Row::new(["sev", "domain", "entity", "impact", "age", "why", "next"]).style(dim()))
+    .block(Block::new().borders(Borders::ALL).title(title));
+    frame.render_widget(table, area);
+}
+
+fn draw_selected_preview(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[OverviewRow],
+    view: &DashboardView,
+) {
+    let mut lines = Vec::new();
+    if let Some(item) = rows.first() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                item.severity.badge(),
+                Style::new()
+                    .fg(item.severity.color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {} › {}", item.domain, item.entity)),
+        ]));
+        lines.push(Line::from(format!(
+            "why: {} · impact: {}",
+            item.reason, item.impact
+        )));
+        lines.push(Line::from(format!(
+            "age: {} · next: {}",
+            item.age, item.next
+        )));
+    }
+    lines.push(Line::from(format!(
+        "evidence: {} logs · {} completed · config {}",
+        view.logs.len(),
+        view.completed.len(),
+        view.config_path.as_deref().unwrap_or("unknown")
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" selected evidence preview "),
+        ),
+        area,
+    );
+}
+
+fn draw_domain_map(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
+    let [tiles_area, pool_area] =
+        Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).areas(area);
+    let domains = [
+        ("Traffic", "requests · streams · queue", "activity"),
+        ("Accounts", "quota · health · cooldown", "a"),
+        ("Models", "usage · tokens · cache", "g"),
+        ("Routing", "current · fallback · why", "summary"),
+        ("Config", "port · upstream · reload", "R"),
+        ("Incidents", "errors · poll failures", "l"),
+        ("Evidence", "logs · raw rows · detail", "Enter"),
+    ];
+    let tile_rows = domains.chunks(2).map(|chunk| {
+        let mut cells: Vec<Cell> = chunk
+            .iter()
+            .map(|(label, scope, key)| {
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        *label,
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {scope}")),
+                    Span::styled(format!("  [{key}]"), dim()),
+                ]))
+            })
+            .collect();
+        while cells.len() < 2 {
+            cells.push(Cell::from(""));
+        }
+        Row::new(cells)
+    });
+    let tiles = Table::new(
+        tile_rows,
+        [Constraint::Percentage(50), Constraint::Percentage(50)],
+    )
+    .block(Block::new().borders(Borders::ALL).title(" L1 domains "));
+    frame.render_widget(tiles, tiles_area);
+
+    let accounts = view.snapshot.accounts.len().max(1);
+    let healthy = view.snapshot.accounts.iter().filter(|a| a.healthy).count();
+    let filled = ((healthy * 10) / accounts).min(10);
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+    let mut lines = vec![
+        Line::from(format!("provider pool  {healthy}/{accounts} healthy")),
+        Line::from(Span::styled(
+            bar,
+            Style::new().fg(if healthy == accounts {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
+        )),
+        Line::from(format!(
+            "mode: {}",
+            if ctx.headers_only {
+                "headers-only"
+            } else {
+                "usage-aware"
+            }
+        )),
+        Line::from(format!(
+            "port: {} · upstream: {}",
+            view.port,
+            view.upstream.as_deref().unwrap_or("direct")
+        )),
+    ];
+    if let Some(last) = &view.last_switch {
+        lines.push(Line::from(format!(
+            "last switch: {} → {}",
+            last.from.as_deref().unwrap_or("none"),
+            last.to
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::new().borders(Borders::ALL).title(" L2 preview ")),
+        pool_area,
+    );
 }
 
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
@@ -646,235 +1120,6 @@ fn reset_label(
     } else {
         Some(countdown)
     }
-}
-
-/// Middle row: scheduler/poller/totals summary, with the selected-account
-/// detail pane beside it when there is room. The old `d` toggle is gone (issue
-/// #5): on MAIN the detail rides alongside the summary whenever the width
-/// allows, and the Accounts overlay (`a`) gives detail the full-width slot.
-fn draw_middle(
-    frame: &mut Frame,
-    area: Rect,
-    view: &DashboardView,
-    ctx: &FrameCtx,
-    chrome: &Chrome,
-) {
-    let has_accounts = !view.snapshot.accounts.is_empty();
-    if has_accounts && area.width >= SIDE_BY_SIDE_AT {
-        let [summary_area, detail_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(48)]).areas(area);
-        draw_summary(frame, summary_area, view, ctx);
-        draw_detail(frame, detail_area, view, ctx, chrome);
-    } else {
-        // Too narrow for both (or no accounts): MAIN shows the summary; the
-        // full detail is one keystroke away in the Accounts overlay.
-        draw_summary(frame, area, view, ctx);
-    }
-}
-
-/// Scheduler / poller / totals summary pane.
-fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
-    let snapshot = &view.snapshot;
-    let now = ctx.now;
-    let label = |text: &'static str| Span::styled(format!(" {text:<9}"), dim());
-    let mut lines: Vec<Line> = Vec::with_capacity(6);
-
-    // Per-group current subscription (req1): claude and codex pick their
-    // current account INDEPENDENTLY, so show one line per group present.
-    let groups_present: Vec<BackendGroup> = [BackendGroup::Claude, BackendGroup::Codex]
-        .into_iter()
-        .filter(|g| snapshot.accounts.iter().any(|a| a.group == *g))
-        .collect();
-    if groups_present.is_empty() {
-        lines.push(Line::from(vec![
-            label("current"),
-            Span::styled("(none)", Style::new().fg(Color::Red)),
-        ]));
-    }
-    for (i, g) in groups_present.iter().enumerate() {
-        let mut spans = vec![
-            label(if i == 0 { "current" } else { "" }),
-            Span::styled(
-                format!("{:<7}", g.as_str()),
-                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        match snapshot.current_for_group(*g) {
-            Some(current) => {
-                spans.push(Span::styled(
-                    current.to_string(),
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ));
-                if let Some(switch) = view.last_switch.as_ref().filter(|s| s.to == current.0) {
-                    let ago = now
-                        .duration_since(switch.at)
-                        .map(select::compact_duration)
-                        .unwrap_or_else(|_| "0s".into());
-                    let why = switch.reason.as_deref().unwrap_or("switch");
-                    let from = switch
-                        .from
-                        .as_deref()
-                        .map(|f| format!("{f} → "))
-                        .unwrap_or_default();
-                    spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
-                }
-            }
-            None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
-        }
-        lines.push(Line::from(spans));
-    }
-
-    // Per-group next-in-line (req1 symmetry with the current block) + the
-    // shared eval-tick countdown. One tick re-evaluates every group, so the
-    // "eval in ~Xs" is shown once, on the first row.
-    let tick = view.evaluate_tick.as_secs().max(1);
-    let to_next_eval = tick - (view.uptime.as_secs() % tick);
-    if groups_present.is_empty() {
-        lines.push(Line::from(vec![label("next"), Span::raw("—")]));
-    }
-    for (i, g) in groups_present.iter().enumerate() {
-        let next = select::next_in_line(snapshot, &view.select_params, now, Some(*g));
-        let mut spans = vec![
-            label(if i == 0 { "next" } else { "" }),
-            Span::styled(
-                format!("{:<7}", g.as_str()),
-                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(next.map(|n| n.to_string()).unwrap_or_else(|| "—".into())),
-        ];
-        if i == 0 {
-            spans.push(Span::styled(
-                format!(
-                    "  eval in ~{}",
-                    select::compact_duration(Duration::from_secs(to_next_eval))
-                ),
-                dim(),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines.push(Line::from(vec![
-        label("poller"),
-        Span::raw(poller_summary(view, now)),
-    ]));
-
-    let totals = view.global_totals;
-    lines.push(Line::from(vec![
-        label("totals"),
-        Span::raw(format!("{} req · ", format::human_count(totals.requests))),
-        Span::styled(
-            format!("{} ok", format::human_count(totals.ok)),
-            Style::new().fg(Color::Green),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            format!("{} err", format::human_count(totals.errors)),
-            if totals.errors > 0 {
-                Style::new().fg(Color::Red)
-            } else {
-                dim()
-            },
-        ),
-        Span::raw(format!(
-            " · in {} / out {} tok",
-            format::human_count(totals.tokens_in),
-            format::human_count(totals.tokens_out)
-        )),
-    ]));
-
-    let in_flight: u32 = snapshot.accounts.iter().map(|a| a.in_flight).sum();
-    lines.push(Line::from(vec![
-        label("load"),
-        Span::raw(format!(
-            "{:.1} req/min (5m) · {in_flight} in flight",
-            view.rpm_5m
-        )),
-    ]));
-
-    // Codex group settings (req8.1): model / fast tier / reasoning effort, with
-    // the keys that change them. Only when a codex account exists.
-    if view.codex.available {
-        let c = &view.codex;
-        let fast_style = if c.fast {
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
-        } else {
-            dim()
-        };
-        lines.push(Line::from(vec![
-            label("codex"),
-            Span::styled(
-                c.model.clone(),
-                group_color(Some("codex")).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" · fast "),
-            Span::styled(if c.fast { "on" } else { "off" }, fast_style),
-            Span::raw(" · effort "),
-            Span::raw(c.effort.clone().unwrap_or_else(|| "default".into())),
-            Span::styled("   [f fast · m model · e effort]", dim()),
-        ]));
-    }
-
-    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// One-line usage-poller health: oauth count, last-success age spread,
-/// backing-off accounts, soonest next poll.
-fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
-    let oauth: Vec<&AccountSnapshot> = view
-        .snapshot
-        .accounts
-        .iter()
-        .filter(|a| a.credential_kind == "oauth")
-        .collect();
-    if oauth.is_empty() {
-        return "no oauth accounts (header-driven only)".into();
-    }
-    let mut ok_ages: Vec<Duration> = Vec::new();
-    let mut next_in: Option<Duration> = None;
-    let mut backoff: Vec<String> = Vec::new();
-    for account in &oauth {
-        let Some(health) = view.poll_health(&account.id.0) else {
-            continue;
-        };
-        if let Some(age) = health.last_ok.and_then(|at| now.duration_since(at).ok()) {
-            ok_ages.push(age);
-        }
-        if let Ok(eta) = health.next_at.duration_since(now) {
-            next_in = Some(next_in.map_or(eta, |cur| cur.min(eta)));
-        }
-        if health.consecutive_failures > 0 {
-            backoff.push(format!("{}×{}", account.id, health.consecutive_failures));
-        }
-    }
-    if ok_ages.is_empty() && backoff.is_empty() {
-        return format!("{} oauth · warming up", oauth.len());
-    }
-    let mut out = format!("{} oauth", oauth.len());
-    if let (Some(min), Some(max)) = (ok_ages.iter().min(), ok_ages.iter().max()) {
-        if min == max {
-            out.push_str(&format!(
-                " · last ok {} ago",
-                select::compact_duration(*min)
-            ));
-        } else {
-            out.push_str(&format!(
-                " · last ok {}–{} ago",
-                select::compact_duration(*min),
-                select::compact_duration(*max)
-            ));
-        }
-    } else {
-        out.push_str(" · no successful poll yet");
-    }
-    if let Some(eta) = next_in {
-        out.push_str(&format!(" · next ~{}", select::compact_duration(eta)));
-    }
-    if !backoff.is_empty() {
-        out.push_str(&format!(" · backoff {}", backoff.join(" ")));
-    }
-    out
 }
 
 /// Selected-account detail pane: the cursor row in select mode, otherwise
