@@ -43,6 +43,20 @@ fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
+/// Format an API-equivalent USD cost for display next to tokens. Sub-dollar
+/// amounts get four decimals (`$0.0042`) so small per-request costs stay
+/// legible; `$1+` uses two (`$3.78`). Zero/unknown renders `$0.0000` rather
+/// than panicking. All TUI cost sites compute via [`crate::pricing`] with an
+/// empty overrides map (built-in default rate table, same as the server.log
+/// path) — see the call sites.
+fn format_cost(usd: f64) -> String {
+    if usd >= 1.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.4}")
+    }
+}
+
 fn level_color(level: GaugeLevel) -> Color {
     match level {
         GaugeLevel::Green => Color::Green,
@@ -425,6 +439,11 @@ fn draw_overview(
         )),
         Span::raw(format!("  eval {}s", view.evaluate_tick.as_secs().max(1))),
         Span::raw(format!("  models {}", view.model_usage.len())),
+        // Global API-equivalent $ across all model rows (built-in default rates).
+        Span::raw(format!(
+            "  cost {}",
+            format_cost(view.model_usage.iter().map(model_cost).sum())
+        )),
     ]);
     let subtitle = Line::from(vec![
         Span::styled(" hierarchy ", dim()),
@@ -1407,6 +1426,18 @@ fn completed_line(entry: &Completed) -> Line<'static> {
             let mut detail = format::elapsed_secs(*duration);
             if let Some(tokens) = tokens {
                 detail.push_str(&format!(", {} tok", format::human_count(tokens.total())));
+                // API-equivalent $ next to tokens, when the backend group+model
+                // are known. TUI render holds no config overrides → empty map =
+                // built-in default rate table (same as the server.log path).
+                if let (Some(group), Some(model)) = (group, model) {
+                    let cost = crate::pricing::cost_usd(
+                        group,
+                        model,
+                        tokens,
+                        &std::collections::HashMap::new(),
+                    );
+                    detail.push_str(&format!(", {}", format_cost(cost)));
+                }
             }
             let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
             // [group model·effort] badge, when known (req7).
@@ -1541,6 +1572,22 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
     m.tokens_in.saturating_add(m.tokens_out)
 }
 
+/// API-equivalent USD cost for one model row's accumulated tokens. Computed via
+/// [`crate::pricing`] with an empty overrides map — the TUI render path holds no
+/// config overrides, so this uses the built-in default rate table (same as the
+/// server.log path).
+fn model_cost(m: &ModelUsageDoc) -> f64 {
+    crate::pricing::cost_from_parts(
+        &m.group,
+        &m.model,
+        m.tokens_in,
+        m.tokens_out,
+        m.cache_read,
+        m.cache_creation,
+        &std::collections::HashMap::new(),
+    )
+}
+
 /// "—" when unavailable (the upstream never reported it), else a human count —
 /// so the UI never implies a precise zero it does not have (req9).
 fn opt_count(v: Option<u64>) -> String {
@@ -1635,6 +1682,7 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
         }
         cells.push(Cell::from(format::human_count(m.requests)));
         cells.push(Cell::from(format::human_count(model_total(m))));
+        cells.push(Cell::from(Span::styled(format_cost(model_cost(m)), dim())));
         let mut last = model_age_compact(m.last_used_ms, now);
         if m.in_flight > 0 {
             last = format!("{} in-flight", m.in_flight);
@@ -1645,7 +1693,7 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
 
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         (
-            vec!["", "group", "model", "share", "req", "tok", "last"],
+            vec!["", "group", "model", "share", "req", "tok", "$", "last"],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
@@ -1653,18 +1701,20 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
                 Constraint::Length(MODEL_BAR_WIDTH as u16 + 1),
                 Constraint::Length(7),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(12),
             ],
         )
     } else {
         (
-            vec!["", "group", "model", "req", "tok", "last"],
+            vec!["", "group", "model", "req", "tok", "$", "last"],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
                 Constraint::Fill(1),
                 Constraint::Length(7),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(12),
             ],
         )
@@ -1756,6 +1806,7 @@ fn draw_models_table(
                 Cell::from(ok_err),
                 Cell::from(format::human_count(m.tokens_in)),
                 Cell::from(format::human_count(m.tokens_out)),
+                Cell::from(Span::styled(format_cost(model_cost(m)), dim())),
             ];
             if wide {
                 cells.push(Cell::from(Span::styled(opt_count(m.cache_read), dim())));
@@ -1776,7 +1827,7 @@ fn draw_models_table(
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         (
             vec![
-                "", "group", "model", "req", "ok/err", "in", "out", "cache", "last", "if",
+                "", "group", "model", "req", "ok/err", "in", "out", "$", "cache", "last", "if",
             ],
             vec![
                 Constraint::Length(2),
@@ -1786,6 +1837,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(3),
@@ -1793,7 +1845,9 @@ fn draw_models_table(
         )
     } else {
         (
-            vec!["", "group", "model", "req", "ok/err", "in", "out", "if"],
+            vec![
+                "", "group", "model", "req", "ok/err", "in", "out", "$", "if",
+            ],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(7),
@@ -1802,6 +1856,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Length(3),
             ],
         )
@@ -2200,6 +2255,26 @@ mod tests {
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    #[test]
+    fn format_cost_scheme() {
+        // Sub-dollar: four decimals so small per-request costs stay legible.
+        assert_eq!(format_cost(0.0), "$0.0000");
+        assert_eq!(format_cost(0.004_25), "$0.0043"); // rounds to 4dp
+        assert_eq!(format_cost(0.5), "$0.5000");
+        // >= $1: two decimals.
+        assert_eq!(format_cost(1.0), "$1.00");
+        assert_eq!(format_cost(3.775), "$3.77"); // banker-agnostic: 2dp round
+        assert_eq!(format_cost(42.5), "$42.50");
+    }
+
+    #[test]
+    fn model_cost_uses_default_rates() {
+        // gpt-5.5: 1e6 out @ $30/1e6 = $30.00, cache_read 40k @ $0.5/1e6 = $0.02.
+        let m = model_row("codex", "gpt-5.5", 0, 1_000_000);
+        let cost = model_cost(&m);
+        assert!((cost - 30.02).abs() < 1e-6, "expected ~30.02, got {cost}");
     }
 
     // --- issue #5: MAIN-always + summoned overlays -------------------------
