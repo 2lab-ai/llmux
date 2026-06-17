@@ -53,10 +53,11 @@ pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 
 use crate::config::AccountConfig;
 use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
@@ -126,8 +127,6 @@ fn headless_login_hint(remote: bool) -> String {
 /// status/spinner animations (see `anim`) step smoothly rather than the choppy
 /// 4fps the original 250ms FR6 tick gave; still trivial CPU for a glance TUI.
 const RENDER_TICK: Duration = Duration::from_millis(120);
-/// Input drain cadence — faster than the render tick so keys feel immediate.
-const INPUT_TICK: Duration = Duration::from_millis(33);
 /// Remote poll cadence for `GET /llmux/dashboard`.
 const FETCH_TICK: Duration = Duration::from_secs(1);
 /// How long a transient status-line message stays on screen.
@@ -1340,8 +1339,11 @@ async fn event_loop(
 ) -> std::io::Result<()> {
     let mut render = tokio::time::interval(RENDER_TICK);
     render.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut input = tokio::time::interval(INPUT_TICK);
-    input.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Input is event-driven, not polled: `EventStream` parks on the terminal fd
+    // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
+    // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
+    // poll which fired ~30×/s reading nothing. See issue #14 (idle quiescence).
+    let mut events = EventStream::new();
 
     loop {
         let mut redraw = tokio::select! {
@@ -1349,7 +1351,10 @@ async fn event_loop(
                 app.frame = app.frame.wrapping_add(1);
                 true
             }
-            _ = input.tick() => drain_input(app)?,
+            // Wakes only when the terminal actually has an event. Handle the one
+            // the stream delivered, then drain any *already-ready* siblings (a
+            // multi-byte paste) without blocking, so a burst is one redraw.
+            Some(event) = events.next() => drain_input(app, event?)?,
             msg = async {
                 match fetch.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -1411,31 +1416,45 @@ async fn event_loop(
     }
 }
 
-/// Drain every pending terminal event without blocking the runtime
-/// (`poll(ZERO)` is a non-blocking readiness check). Returns whether
-/// anything happened that warrants a redraw.
-fn drain_input(app: &mut App) -> std::io::Result<bool> {
+/// Handle `first` (the event the `EventStream` just woke us with), then drain
+/// any *already-ready* terminal events without blocking (`poll(ZERO)` is a
+/// non-blocking readiness check), so a multi-byte paste is one redraw rather
+/// than one per byte. Returns whether anything warrants a redraw.
+fn drain_input(app: &mut App, first: Event) -> std::io::Result<bool> {
     let mut dirty = false;
     // Built once per drain: key handlers read the same frame the user saw.
     let mut view: Option<Option<DashboardView>> = None;
+    apply_event(app, first, &mut view, &mut dirty);
     while crossterm::event::poll(Duration::ZERO)? {
-        match crossterm::event::read()? {
-            Event::Key(key) => {
-                let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
-                app.on_key(key, view.as_ref());
-                dirty = true;
-            }
-            Event::Mouse(mouse) => {
-                let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
-                if app.on_mouse(mouse, view.as_ref()) {
-                    dirty = true;
-                }
-            }
-            Event::Resize(_, _) => dirty = true,
-            _ => {}
-        }
+        apply_event(app, crossterm::event::read()?, &mut view, &mut dirty);
     }
     Ok(dirty)
+}
+
+/// Dispatch one terminal event into the app, lazily building the per-drain view
+/// the first time a key/mouse handler needs it and flipping `dirty` when the
+/// event warrants a redraw.
+fn apply_event(
+    app: &mut App,
+    event: Event,
+    view: &mut Option<Option<DashboardView>>,
+    dirty: &mut bool,
+) {
+    match event {
+        Event::Key(key) => {
+            let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
+            app.on_key(key, view.as_ref());
+            *dirty = true;
+        }
+        Event::Mouse(mouse) => {
+            let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
+            if app.on_mouse(mouse, view.as_ref()) {
+                *dirty = true;
+            }
+        }
+        Event::Resize(_, _) => *dirty = true,
+        _ => {}
+    }
 }
 
 #[cfg(test)]
