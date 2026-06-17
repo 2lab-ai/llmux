@@ -15,8 +15,11 @@ never re-evaluates issues already marked `needs-*` / `not-in-repo` / `agent-bloc
 1. **Mode.** Default is **DRY-RUN**: run agent-triage's evaluation and print the resolve plan, change
    nothing. Act only if the user said "apply" / "실제로 해" / passed `--apply`.
 2. **Run `agent-triage` once.** (Labels issues, opens draft PRs for ready ones, skips already-labeled.)
-3. **Resolve loop.** Over `ready-to-agent` draft PRs, oldest first, run `agent-resolve` on **one per
-   iteration**. After each, verify the PR is genuinely green (`just check` + CI) before counting it done.
+3. **Resolve.** Over `ready-to-agent` draft PRs, oldest first, run `agent-resolve` — each in its **own
+   git worktree** (per that skill), so resolves are isolated and **may run in parallel**. Verify
+   **each** PR genuinely green (`just check` + CI) independently before counting it done. Parallelize
+   only across issues that touch **disjoint modules**; if their diffs would overlap, serialize them to
+   avoid merge conflicts.
 4. **Stop when ANY:**
    - no `ready-to-agent` draft PRs remain (the user's "no issues/PRs left" condition),
    - `--max-iterations` reached (**default 3**),
