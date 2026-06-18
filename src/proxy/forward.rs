@@ -924,14 +924,29 @@ fn acquire_lease(
     group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
 ) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
-    if let Ok(lease) = state.pool.lease_for(group) {
-        return Ok(lease);
-    }
-    match state.pool.evaluate(group, params, SystemTime::now()) {
-        Decision::Exhausted { retry_after } => Err(retry_after),
-        Decision::Stay | Decision::Switch { .. } => {
-            state.pool.lease_for(group).map_err(|err| err.retry_after)
+    let now = SystemTime::now();
+    // Heuristic-degraded selection MUST go through `pick`, not the sticky
+    // fast-path. `lease_for` deliberately ignores the 5h/7d ceilings for the
+    // sticky current; in degraded mode it also drops the Heuristic cooldown
+    // gate, so the sticky current could be re-leased even when it is over its
+    // real quota (5h/7d) — bypassing the ceiling `pick` enforces — and the
+    // soonest-freed ranking would never run. Routing through `evaluate`/`pick`
+    // gates quota AND picks the soonest-freed, fully-gated account.
+    let degraded = {
+        let snapshot = state.pool.snapshot();
+        select::heuristic_degraded_mode(&snapshot, params, group, now)
+    };
+    if !degraded {
+        if let Ok(lease) = state.pool.lease_for(group, params) {
+            return Ok(lease);
         }
+    }
+    match state.pool.evaluate(group, params, now) {
+        Decision::Exhausted { retry_after } => Err(retry_after),
+        Decision::Stay | Decision::Switch { .. } => state
+            .pool
+            .lease_for(group, params)
+            .map_err(|err| err.retry_after),
     }
 }
 
@@ -2595,6 +2610,105 @@ mod tests {
         let body = response_body(response).await;
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["error"]["type"], "rate_limit_error");
+    }
+
+    #[test]
+    fn heuristic_429_lockout_still_leases_an_account_not_a_hard_refuse() {
+        // The bug: a retry-after-less (Heuristic) 429 burst parks the WHOLE
+        // pool, after which every request used to get a hard local 429 for the
+        // full park (the lockout). With degraded-mode selection the next
+        // request must still acquire a lease — the soonest-freed account.
+        let upstream = "http://127.0.0.1:9"; // never reached by acquire_lease
+        let state = test_state(
+            upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        let params = state.select_params();
+        let now = SystemTime::now();
+        // Both accounts parked by retry-after-LESS 429s (Heuristic cooldowns).
+        state.pool.record_429(&AccountId("a".into()), None, now);
+        state.pool.record_429(&AccountId("b".into()), None, now);
+
+        // Degraded mode: a lease is still granted (no hard pool refuse).
+        let lease = acquire_lease(&state, None, &params)
+            .expect("degraded mode must still lease an account");
+        // It is one of the two parked accounts (the soonest-freed; here both
+        // were parked at the same instant so the stable id tiebreak picks "a").
+        assert_eq!(lease.account_id(), &AccountId("a".into()));
+        drop(lease);
+
+        // Contrast: a retry-after (RetryAfter) park on BOTH is a real quota
+        // signal — it must STILL hard-refuse, not degrade.
+        let state2 = test_state(
+            upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        state2
+            .pool
+            .record_429(&AccountId("a".into()), Some(Duration::from_secs(120)), now);
+        state2
+            .pool
+            .record_429(&AccountId("b".into()), Some(Duration::from_secs(120)), now);
+        assert!(
+            acquire_lease(&state2, None, &state2.select_params()).is_err(),
+            "RetryAfter parks are a real quota signal and must NOT be bypassed"
+        );
+    }
+
+    #[test]
+    fn degraded_mode_does_not_bypass_5h_ceiling_via_sticky_current() {
+        // Regression: in heuristic-degraded mode `acquire_lease` used to try the
+        // sticky fast-path FIRST. `lease_for` ignores the 5h/7d ceilings for the
+        // sticky current and, in degraded mode, also drops the Heuristic cooldown
+        // gate — so a current that is BOTH Heuristic-cooled AND over its 5h quota
+        // got re-leased, bypassing the ceiling `pick` enforces and never reaching
+        // the soonest-freed ranking. The fix routes degraded selection through
+        // `pick`, which gates 5h/7d and picks the quota-clean soonest-freed peer.
+        let upstream = "http://127.0.0.1:9"; // never reached by acquire_lease
+        let state = test_state(
+            upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        let params = state.select_params();
+        let now = SystemTime::now();
+
+        // `test_state` ran one evaluate over cold/healthy accounts → stable id
+        // order makes "a" the sticky current.
+        assert_eq!(
+            state.pool.snapshot().legacy_current(),
+            Some(&AccountId("a".into())),
+            "a is the sticky current"
+        );
+
+        // a: over its 5h ceiling (0.95 > 0.90), window live (resets in 1h) and
+        // fresh (record_headers stamps fetched_at = now, so not stale).
+        let over_5h = rl_headers::ParsedRateLimitHeaders {
+            five_hour: Some(rl_headers::WindowReading {
+                utilization: 0.95,
+                resets_at: now + Duration::from_secs(3600),
+            }),
+            ..Default::default()
+        };
+        state
+            .pool
+            .record_headers(&AccountId("a".into()), &over_5h, now);
+
+        // Both parked by retry-after-LESS 429s (Heuristic cooldowns), so the
+        // group is locked out. Only b is heuristic-ONLY-blocked (quota-clean),
+        // which is what arms degraded mode; a is also over real quota.
+        state.pool.record_429(&AccountId("a".into()), None, now);
+        state.pool.record_429(&AccountId("b".into()), None, now);
+
+        // Acquisition must NOT re-lease the over-quota sticky current "a"; it
+        // must serve the quota-clean, heuristic-only peer "b" that `pick` ranks.
+        let lease = acquire_lease(&state, None, &params)
+            .expect("degraded mode must lease the quota-clean soonest-freed account");
+        assert_eq!(
+            lease.account_id(),
+            &AccountId("b".into()),
+            "5h ceiling is NOT bypassed: the over-quota current 'a' is skipped, \
+             selection goes through pick and serves quota-clean 'b'"
+        );
     }
 
     #[tokio::test]
