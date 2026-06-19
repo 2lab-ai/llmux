@@ -47,6 +47,11 @@ pub enum ScriptedResponse {
         content_type: bool,
         extra_headers: Vec<(String, String)>,
     },
+    /// 200 SSE that emits `prefix` then STALLS: the connection stays open with
+    /// no further bytes, no error, and no close (a silent upstream). Models the
+    /// idle-timeout hang (issue #29) — the proxy must abort on its own idle
+    /// deadline rather than wait on this forever.
+    SseThenStall { prefix: String },
     /// 429 with this `retry-after` (seconds), when `Some`.
     RateLimited { retry_after: Option<u64> },
     /// 401 (expired/invalid token).
@@ -336,6 +341,27 @@ async fn catch_all(
             unified_headers(builder, five_hour, seven_day)
                 .body(axum::body::Body::from_stream(stream))
                 .expect("sse response")
+        }
+        ScriptedResponse::SseThenStall { prefix } => {
+            // Emit the prefix, then hold the channel open forever: the sender
+            // task keeps `tx` alive (a long sleep) so the body stream neither
+            // yields more bytes nor closes — a silent, hung upstream.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            tokio::spawn(async move {
+                if tx.send(Ok(Bytes::from(prefix.into_bytes()))).await.is_err() {
+                    return;
+                }
+                // Keep the connection open without sending anything more. The
+                // client side (the proxy) must time out on its own.
+                tokio::time::sleep(Duration::from_secs(3_600)).await;
+                drop(tx);
+            });
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(stream))
+                .expect("sse-then-stall response")
         }
         ScriptedResponse::RateLimited { retry_after } => {
             let mut builder = http::Response::builder()

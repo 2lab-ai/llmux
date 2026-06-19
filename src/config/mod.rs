@@ -405,6 +405,9 @@ mod tests {
         assert_eq!(config.version, 1);
         assert_eq!(config.proxy.port, 9999);
         assert_eq!(config.proxy.api_key, None);
+        // Additive: a proxy block without `forward_idle_timeout_secs` (every
+        // config written before issue #29) loads the 120s default.
+        assert_eq!(config.proxy.forward_idle_timeout_secs, 120);
         assert_eq!(config.upstream, schema::DEFAULT_UPSTREAM);
         assert!((config.scheduler.five_hour_max - 0.90).abs() < f64::EPSILON);
         assert!((config.scheduler.seven_day_max - 0.99).abs() < f64::EPSILON);
