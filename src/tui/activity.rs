@@ -13,6 +13,17 @@ use super::event::{ActivityEvent, TokenCounts};
 
 /// Completed-entry ring capacity (matches teamclaude's 200-line log).
 pub(crate) const LOG_CAPACITY: usize = 200;
+/// Distinct-client cap for per-client request attribution (issue #32). The
+/// `metadata.user_id` space is operator/agent controlled and small in practice,
+/// but a hostile or buggy client could send a fresh id per request; this bounds
+/// the in-memory map so it can never grow unbounded. When the cap is reached, a
+/// *new* client id is folded into the shared `unknown` bucket instead of
+/// allocating a new entry (existing ids keep accumulating). The `unknown`
+/// bucket itself never counts against the cap.
+pub(crate) const MAX_CLIENTS: usize = 1024;
+/// The bucket name for requests with no `metadata.user_id` (issue #32). These
+/// are attributed here, never dropped.
+pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
 /// In-flight rows are bounded too: if the proxy never sends a finish (bug or
 /// dropped event), the oldest in-flight entry is retired as an error note
 /// instead of leaking forever.
@@ -272,6 +283,11 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Keyless per-client metering identity (issue #32). Additive: lines
+    /// persisted before this field default to `None` and replay into the
+    /// `unknown` client bucket.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 impl PersistedRequest {
@@ -290,6 +306,7 @@ impl PersistedRequest {
             group,
             model,
             effort,
+            user_id,
         } = event
         else {
             return None;
@@ -311,6 +328,7 @@ impl PersistedRequest {
             group: group.clone(),
             model: model.clone(),
             effort: effort.clone(),
+            user_id: user_id.clone(),
         })
     }
 
@@ -329,6 +347,7 @@ impl PersistedRequest {
             group: self.group,
             model: self.model,
             effort: self.effort,
+            user_id: self.user_id,
         };
         (event, ts)
     }
@@ -375,6 +394,24 @@ pub(crate) struct ActivityLog {
     /// Per (group, served_model) usage rows (req1-20). Keyed by the normalized
     /// served model within its backend group.
     models: HashMap<(String, String), ModelStats>,
+    /// Per-client request attribution (issue #32), keyed by `metadata.user_id`
+    /// (the `unknown` bucket holds requests with no id). In-memory only —
+    /// runtime accounting, reset on restart, never persisted to disk. Bounded
+    /// by [`MAX_CLIENTS`] distinct ids (the `unknown` bucket excluded). This is
+    /// pure metering: counting requests/tokens per client, never gating.
+    clients: HashMap<String, Totals>,
+}
+
+/// A finished per-client attribution row (issue #32): one client identity
+/// (`metadata.user_id`, or `unknown`) and its lifetime request/token counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientUsage {
+    pub client: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 impl ActivityLog {
@@ -536,6 +573,69 @@ impl ActivityLog {
         }
     }
 
+    /// Fold one finished request into its per-client bucket (issue #32).
+    /// `user_id` is the `metadata.user_id` (or `None` → the `unknown` bucket).
+    /// Bounded by [`MAX_CLIENTS`]: once that many distinct ids are tracked, a
+    /// brand-new id is merged into `unknown` rather than allocating a new
+    /// entry (already-tracked ids and `unknown` always accumulate). This is
+    /// counting only — it never affects whether the request was served.
+    fn record_client(&mut self, user_id: Option<&str>, status: u16, tokens: Option<TokenCounts>) {
+        let key = match user_id {
+            Some(id) if !id.is_empty() => {
+                // Cap distinct named clients: an unseen id past the cap is
+                // folded into `unknown` so the map cannot grow unbounded.
+                if self.clients.contains_key(id) || self.clients.len() < MAX_CLIENTS {
+                    id.to_string()
+                } else {
+                    UNKNOWN_CLIENT.to_string()
+                }
+            }
+            _ => UNKNOWN_CLIENT.to_string(),
+        };
+        let bucket = self.clients.entry(key).or_default();
+        bucket.requests += 1;
+        if status < 400 {
+            bucket.ok += 1;
+        } else {
+            bucket.errors += 1;
+        }
+        if let Some(t) = tokens {
+            bucket.tokens_in = bucket.tokens_in.saturating_add(t.input);
+            bucket.tokens_out = bucket.tokens_out.saturating_add(t.output);
+        }
+    }
+
+    /// Per-client attribution lookup (issue #32), exercised by the tests.
+    #[cfg(test)]
+    pub(crate) fn client_totals(&self, client: &str) -> Totals {
+        self.clients.get(client).copied().unwrap_or_default()
+    }
+
+    /// Snapshot of every per-client attribution row (issue #32), sorted by
+    /// requests desc, then total tokens desc, then client name. The `unknown`
+    /// bucket sorts by the same key as any other (it is just another client).
+    pub(crate) fn client_usage(&self) -> Vec<ClientUsage> {
+        let mut rows: Vec<ClientUsage> = self
+            .clients
+            .iter()
+            .map(|(client, t)| ClientUsage {
+                client: client.clone(),
+                requests: t.requests,
+                ok: t.ok,
+                errors: t.errors,
+                tokens_in: t.tokens_in,
+                tokens_out: t.tokens_out,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then((b.tokens_in + b.tokens_out).cmp(&(a.tokens_in + a.tokens_out)))
+                .then(a.client.cmp(&b.client))
+        });
+        rows
+    }
+
     /// Snapshot of every model row, sorted by total tokens desc, then requests,
     /// then key (req14). The document builder overlays in-flight counts.
     pub(crate) fn model_usage(&self) -> Vec<ModelUsage> {
@@ -652,6 +752,7 @@ impl ActivityLog {
                 group,
                 model,
                 effort,
+                user_id,
             } => {
                 let routed = self
                     .in_flight
@@ -660,6 +761,11 @@ impl ActivityLog {
                     .map(|i| self.in_flight.remove(i))
                     .and_then(|r| r.account);
                 let account = account.or(routed);
+                // Per-client attribution (issue #32): every finished request is
+                // counted against its `metadata.user_id` client bucket (the
+                // `unknown` bucket when absent), independent of routing — so
+                // pre-routing failures are attributed too, never dropped.
+                self.record_client(user_id.as_deref(), status, tokens);
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -789,6 +895,7 @@ mod tests {
             group: None,
             model: None,
             effort: None,
+            user_id: None,
         }
     }
 
@@ -816,6 +923,34 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            user_id: None,
+        }
+    }
+
+    /// A finished request carrying a `metadata.user_id` (or `None`) for the
+    /// per-client attribution tests (issue #32). Minimal otherwise.
+    fn finished_client(
+        id: u64,
+        user_id: Option<&str>,
+        tokens: Option<(u64, u64)>,
+        status: u16,
+    ) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: None,
+            status,
+            duration: Duration::from_millis(1_400),
+            tokens: tokens.map(|(input, output)| TokenCounts {
+                input,
+                output,
+                ..Default::default()
+            }),
+            group: None,
+            model: None,
+            effort: None,
+            user_id: user_id.map(str::to_string),
         }
     }
 
@@ -1233,6 +1368,109 @@ mod tests {
         assert_eq!(log.totals_global().requests, 1);
     }
 
+    // ---- per-client attribution (issue #32) ----
+
+    #[test]
+    fn client_attribution_counts_requests_and_tokens_per_user_id() {
+        let mut log = ActivityLog::new(50);
+        // alice: 2 requests (one a 502 error), 300 in / 110 out total.
+        log.apply(
+            finished_client(1, Some("alice"), Some((100, 40)), 200),
+            at(1),
+        );
+        log.apply(
+            finished_client(2, Some("alice"), Some((200, 70)), 502),
+            at(2),
+        );
+        // bob: 1 ok request.
+        log.apply(finished_client(3, Some("bob"), Some((10, 5)), 200), at(3));
+        // Two requests with NO user_id land in the explicit `unknown` bucket
+        // (one carries no tokens), never dropped.
+        log.apply(finished_client(4, None, Some((7, 3)), 200), at(4));
+        log.apply(finished_client(5, None, None, 200), at(5));
+
+        assert_eq!(
+            log.client_totals("alice"),
+            Totals {
+                requests: 2,
+                ok: 1,
+                errors: 1,
+                tokens_in: 300,
+                tokens_out: 110,
+            }
+        );
+        assert_eq!(
+            log.client_totals("bob"),
+            Totals {
+                requests: 1,
+                ok: 1,
+                errors: 0,
+                tokens_in: 10,
+                tokens_out: 5,
+            }
+        );
+        // No-user_id requests attributed to `unknown`, not dropped.
+        assert_eq!(
+            log.client_totals(UNKNOWN_CLIENT),
+            Totals {
+                requests: 2,
+                ok: 2,
+                errors: 0,
+                tokens_in: 7,
+                tokens_out: 3,
+            }
+        );
+        // An empty-string user_id is treated as no id → `unknown`.
+        log.apply(finished_client(6, Some(""), Some((1, 1)), 200), at(6));
+        assert_eq!(log.client_totals(UNKNOWN_CLIENT).requests, 3);
+
+        // client_usage() snapshot: three rows, sorted by requests desc — the
+        // total across rows equals the number of finished requests (none lost).
+        let rows = log.client_usage();
+        assert_eq!(rows.len(), 3, "alice, bob, unknown");
+        let total_requests: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(total_requests, 6, "every finished request attributed");
+        // alice (2) and unknown (3) outrank bob (1); unknown leads on requests.
+        assert_eq!(rows[0].client, UNKNOWN_CLIENT);
+        assert_eq!(rows[0].requests, 3);
+    }
+
+    #[test]
+    fn client_attribution_is_bounded_overflow_folds_into_unknown() {
+        let mut log = ActivityLog::new(50);
+        // Fill the named-client cap exactly with distinct ids.
+        for i in 0..MAX_CLIENTS {
+            log.apply(
+                finished_client(i as u64, Some(&format!("c{i}")), None, 200),
+                at(i as u64),
+            );
+        }
+        assert_eq!(
+            log.client_usage().len(),
+            MAX_CLIENTS,
+            "every distinct id under the cap gets its own bucket"
+        );
+        // A brand-new id past the cap does NOT allocate a new entry; it is
+        // folded into `unknown` so the map cannot grow unbounded.
+        log.apply(
+            finished_client(9_000, Some("overflow"), None, 200),
+            at(9_000),
+        );
+        assert_eq!(
+            log.client_totals("overflow"),
+            Totals::default(),
+            "over-cap id is not tracked on its own"
+        );
+        assert_eq!(
+            log.client_totals(UNKNOWN_CLIENT).requests,
+            1,
+            "over-cap id folded into unknown"
+        );
+        // An ALREADY-tracked id keeps accumulating even past the cap.
+        log.apply(finished_client(9_001, Some("c0"), None, 200), at(9_001));
+        assert_eq!(log.client_totals("c0").requests, 2);
+    }
+
     // ---- persistence (req-persist A/C) ----
 
     use std::path::{Path, PathBuf};
@@ -1293,6 +1531,9 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            // A per-client id so the persistence round-trip also exercises the
+            // issue #32 client attribution (one client id per account here).
+            user_id: Some(format!("client-{account}")),
         }
     }
 
@@ -1329,6 +1570,11 @@ mod tests {
             a.totals_global(),
             b.totals_global(),
             "global totals must match after restore"
+        );
+        assert_eq!(
+            a.client_usage(),
+            b.client_usage(),
+            "per-client attribution must match after restore (issue #32)"
         );
         for acct in accounts {
             assert_eq!(

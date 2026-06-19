@@ -209,6 +209,22 @@ pub fn model_from_body(body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract `metadata.user_id` from an Anthropic Messages JSON body, if any.
+/// This is the keyless per-client attribution identity for proxy metering
+/// (issue #32): present in ~98.9% of real requests and stable per session,
+/// account-independent. A non-JSON body, a missing `metadata`/`user_id`, or a
+/// non-string `user_id` yields `None` — the metering layer then attributes the
+/// request to the explicit `unknown` bucket rather than dropping it. This is
+/// purely for *counting*: it never gates the request or issues a key.
+pub fn user_id_from_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("metadata")?
+        .get("user_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +455,31 @@ mod tests {
     fn model_from_body_tolerates_non_json() {
         assert_eq!(model_from_body(b"not json at all"), None);
         assert_eq!(model_from_body(b""), None);
+    }
+
+    // ---- user_id_from_body (issue #32 metering identity) ----
+
+    #[test]
+    fn user_id_from_body_extracts_metadata_user_id() {
+        assert_eq!(
+            user_id_from_body(br#"{"model":"x","metadata":{"user_id":"acct_abc"}}"#).as_deref(),
+            Some("acct_abc")
+        );
+    }
+
+    #[test]
+    fn user_id_from_body_tolerates_missing_metadata_or_user_id() {
+        // No metadata block at all.
+        assert_eq!(user_id_from_body(br#"{"model":"x"}"#), None);
+        // metadata present but no user_id.
+        assert_eq!(user_id_from_body(br#"{"metadata":{"foo":"bar"}}"#), None);
+        // user_id present but not a string.
+        assert_eq!(user_id_from_body(br#"{"metadata":{"user_id":42}}"#), None);
+    }
+
+    #[test]
+    fn user_id_from_body_tolerates_non_json() {
+        assert_eq!(user_id_from_body(b"not json at all"), None);
+        assert_eq!(user_id_from_body(b""), None);
     }
 }
