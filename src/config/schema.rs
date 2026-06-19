@@ -10,6 +10,12 @@ use crate::pricing::ModelPrice;
 /// Default proxy listen port (teamclaude-compatible).
 pub const DEFAULT_PORT: u16 = 3456;
 
+/// Default ingress request-body admission cap: 64 MiB. A client request body
+/// larger than this is rejected with 413 before it is buffered for forwarding,
+/// bounding the heap one oversized request can pin (see
+/// [`ProxyConfig::max_request_bytes`]).
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default upstream base URL.
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 
@@ -247,6 +253,20 @@ pub struct ProxyConfig {
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Hard cap, in bytes, on a client request body buffered on the ingress
+    /// forward path before it is relayed upstream. The body must be fully
+    /// buffered (it can be replayed across account retries), so an unbounded
+    /// read lets one oversized request pin arbitrary heap and OOM the daemon.
+    /// A request whose body exceeds this returns 413 Payload Too Large.
+    /// Default [`crate::config::DEFAULT_MAX_REQUEST_BYTES`] (64 MiB).
+    ///
+    /// This is the ingress admission limit and is DELIBERATELY distinct from
+    /// [`RawIoConfig::max_body_bytes`] (the observability-tee retention cap):
+    /// raw-io clips what is *retained* for inspection; this rejects what is
+    /// *accepted* for forwarding. Additive (`#[serde(default)]`) so configs
+    /// written before this field load with the 64 MiB default.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
 }
 
 impl Default for ProxyConfig {
@@ -254,6 +274,7 @@ impl Default for ProxyConfig {
         Self {
             port: default_port(),
             api_key: None,
+            max_request_bytes: default_max_request_bytes(),
         }
     }
 }
@@ -507,6 +528,13 @@ fn default_codex_model() -> String {
 
 fn default_port() -> u16 {
     DEFAULT_PORT
+}
+
+/// Default ingress request-body admission cap (64 MiB). Kept in sync with
+/// [`DEFAULT_MAX_REQUEST_BYTES`] so a config that omits the field caps exactly
+/// where the const-defined backstop does.
+fn default_max_request_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BYTES
 }
 
 fn default_upstream() -> String {
