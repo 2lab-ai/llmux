@@ -177,6 +177,10 @@ struct ForwardContext {
     started: std::time::Instant,
     /// The model named in the request body (for the routing log line).
     model: Option<String>,
+    /// The keyless per-client metering identity (`metadata.user_id`) parsed
+    /// from the request body once at entry (issue #32). `None` → the request is
+    /// attributed to the `unknown` bucket. Counting only; never gates routing.
+    user_id: Option<String>,
     /// The backend group this request routes to, OR `None` when routing is
     /// disabled (the legacy single-slot / cross-group-overflow path). When
     /// `Some`, the scheduler is filtered to that group and the leased
@@ -289,6 +293,7 @@ impl ForwardContext {
             group,
             model,
             effort,
+            user_id: self.user_id.clone(),
         });
     }
 }
@@ -439,6 +444,8 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 group: None,
                 model: None,
                 effort: None,
+                // Body never read → no metering identity; metered as unknown.
+                user_id: None,
             });
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -452,6 +459,9 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Routing disabled ⇒ group = None (legacy single-slot path); the
     // classifier is not consulted on the forward path in that case.
     let model = crate::routing::model_from_body(&body);
+    // Keyless per-client metering identity (issue #32): parsed once from the
+    // buffered body, same pattern as `model`. Counting only — never routes.
+    let user_id = crate::routing::user_id_from_body(&body);
     let group = if state.config.routing.enabled {
         Some(state.classifier.classify(model.as_deref()))
     } else {
@@ -472,6 +482,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         activity_id,
         started,
         model,
+        user_id,
         group,
         served_codex: None,
     };
@@ -1256,6 +1267,7 @@ async fn relay(
         let path = ctx.path_query.clone();
         let started = ctx.started;
         let (group, model, effort) = ctx.finished_meta(state);
+        let user_id = ctx.user_id.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
         // body + a tee of the bytes streamed to the client. The relay keeps TWO
         // observe-only buffers, both filled AFTER each chunk is forwarded (never
@@ -1319,6 +1331,7 @@ async fn relay(
                         group,
                         model,
                         effort,
+                        user_id,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -1473,6 +1486,7 @@ async fn relay_codex(
         let path = ctx.path_query.clone();
         let started = ctx.started;
         let (group, model, effort) = ctx.finished_meta(state);
+        let user_id = ctx.user_id.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
         // body + a tee of the Anthropic-SSE bytes EMITTED to the client. The
         // relay keeps TWO observe-only buffers, both filled after each chunk is
@@ -1552,6 +1566,7 @@ async fn relay_codex(
                         group,
                         model,
                         effort,
+                        user_id,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
