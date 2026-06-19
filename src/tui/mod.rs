@@ -1543,6 +1543,65 @@ mod tests {
 
     // --- issue #5: overlay key routing -------------------------------------
 
+    /// Issue #5 acceptance (state machine): every summoned overlay follows the
+    /// same open → `Esc` → closed cycle, and MAIN state held on `App` (the
+    /// activity scroll, the click-expanded row — the things that "keep updating
+    /// underneath") is preserved across the open and the close, never reset.
+    /// `Esc` always lands back on `Overlay::None` (MAIN), from any overlay.
+    #[test]
+    fn open_overlay_preserves_main_state_then_esc_returns_to_main() {
+        let view = stats_view_with_account();
+        // Seed MAIN-owned state so we can prove the overlay round-trip leaves it
+        // untouched (MAIN keeps its place / expansion underneath the overlay).
+        let expanded = activity::ActivityKey {
+            at_ms: 7,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+        };
+
+        // Each shortcut summons one overlay; `Esc` always closes it. The whole
+        // round-trip is driven through the unified `on_key` entry point, so the
+        // production overlay-aware routing (open via MAIN, close via the active
+        // overlay's `Esc`) is what's under test.
+        for open_key in [KeyCode::Char('a'), KeyCode::Char('g'), KeyCode::Char('l')] {
+            let mut app = remote_app();
+            app.activity_scroll = 3;
+            app.expanded_activity = Some(expanded.clone());
+            assert_eq!(app.overlay, Overlay::None, "starts on MAIN");
+
+            // Open: the active overlay is set; MAIN-owned state is untouched.
+            app.on_key(press(open_key), Some(&view));
+            assert_ne!(
+                app.overlay,
+                Overlay::None,
+                "{open_key:?} summons an overlay"
+            );
+            assert_eq!(
+                app.activity_scroll, 3,
+                "MAIN scroll preserved under overlay"
+            );
+            assert_eq!(
+                app.expanded_activity.as_ref(),
+                Some(&expanded),
+                "MAIN expansion preserved under overlay"
+            );
+
+            // Esc: back to MAIN, with MAIN state still intact.
+            app.on_key(press(KeyCode::Esc), Some(&view));
+            assert_eq!(app.overlay, Overlay::None, "Esc returns to MAIN");
+            assert_eq!(
+                app.activity_scroll, 3,
+                "MAIN scroll survives the round-trip"
+            );
+            assert_eq!(
+                app.expanded_activity.as_ref(),
+                Some(&expanded),
+                "MAIN expansion survives the round-trip"
+            );
+        }
+    }
+
     /// `a` opens the Accounts overlay; `Esc` returns to MAIN.
     #[test]
     fn a_opens_accounts_overlay_and_esc_returns_to_main() {
