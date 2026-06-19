@@ -247,6 +247,12 @@ pub struct ProxyConfig {
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// On-demand idle-account usage probe (issue #21). Additive
+    /// (`#[serde(default)]`), so a config written before this section existed
+    /// loads with the conservative defaults — and, critically, with probing
+    /// DISABLED (`enabled = false`).
+    #[serde(default)]
+    pub idle_probe: IdleProbeConfig,
 }
 
 impl Default for ProxyConfig {
@@ -254,6 +260,45 @@ impl Default for ProxyConfig {
         Self {
             port: default_port(),
             api_key: None,
+            idle_probe: IdleProbeConfig::default(),
+        }
+    }
+}
+
+/// On-demand idle-account usage probe (issue #21). An account with no known
+/// 5h/7d window produces no usage data for the scheduler's ranking/display.
+/// When this is enabled, such an account can be populated on demand by a
+/// single `max_tokens = 1` `POST /v1/messages` through its own credential: the
+/// response's `anthropic-ratelimit-*` headers feed the existing
+/// [`crate::scheduler::window::WindowSource::Headers`] path. This is strictly
+/// ON-DEMAND and per-account cooldown-gated — NEVER a background poll loop —
+/// because it spends real (if minimal) quota on an otherwise-idle account.
+///
+/// Two guards: a global kill-switch (`enabled = false` disables ALL probing)
+/// and a per-account cooldown so a single account is probed at most once per
+/// `per_account_cooldown_secs`. Defaults are conservative: probing OFF, and a
+/// 1-hour cooldown if it is turned on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleProbeConfig {
+    /// Master kill-switch. `false` (the default) disables all idle probing;
+    /// `true` allows a single gated probe per idle account. Conservative
+    /// default: a real (if minimal) request is only ever sent when the
+    /// operator opts in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum wall-clock gap between two probes of the SAME account, seconds.
+    /// Once an account is probed, a second probe is suppressed until this
+    /// elapses — so a hot ranking/display path that keeps asking about an idle
+    /// account never bursts a probe per request. Default 3600 (1 hour).
+    #[serde(default = "default_idle_probe_cooldown_secs")]
+    pub per_account_cooldown_secs: u64,
+}
+
+impl Default for IdleProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
         }
     }
 }
@@ -531,6 +576,12 @@ fn default_usage_max_age_secs() -> u64 {
 
 fn default_refresh_ahead_secs() -> u64 {
     7 * 3600
+}
+
+/// Default per-account idle-probe cooldown: 1 hour. Conservative — an idle
+/// account is probed at most once an hour even when probing is enabled.
+fn default_idle_probe_cooldown_secs() -> u64 {
+    3600
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).
