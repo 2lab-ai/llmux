@@ -228,6 +228,9 @@ pub(crate) enum Overlay {
     Stats,
     /// Full-screen log tail (was the `l` log-panel size cycle).
     Logs,
+    /// Session timeline (issue #34): persisted raw-io grouped by
+    /// `metadata.user_id` into confidence-labeled per-session aggregates.
+    Sessions,
 }
 
 /// UI-local state the renderer needs besides the data view: cursor, panes,
@@ -248,6 +251,11 @@ pub(crate) struct Chrome {
     pub expanded_activity: Option<activity::ActivityKey>,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
+    /// Folded session timeline for the Sessions overlay (issue #34), snapshotted
+    /// from the persisted raw-io log when the overlay was opened. Empty otherwise.
+    pub sessions: Vec<crate::session::Session>,
+    /// Cursor row in the Sessions overlay's session list.
+    pub session_cursor: usize,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -339,6 +347,12 @@ struct App {
     activity_chrome: ui::ActivityChrome,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
+    /// Folded session timeline (issue #34), loaded from the persisted raw-io log
+    /// when the Sessions overlay is opened (`s`) and held until it is reopened.
+    /// A point-in-time snapshot — re-opening re-reads the file. Empty otherwise.
+    sessions: Vec<crate::session::Session>,
+    /// Cursor row in the Sessions overlay's session list.
+    session_cursor: usize,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -365,6 +379,8 @@ impl App {
             expanded_activity: None,
             activity_chrome: ui::ActivityChrome::default(),
             model_cursor: 0,
+            sessions: Vec::new(),
+            session_cursor: 0,
             add_input: String::new(),
             pending_login: None,
         }
@@ -396,6 +412,8 @@ impl App {
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
             model_cursor: self.model_cursor,
+            sessions: self.sessions.clone(),
+            session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
@@ -465,6 +483,7 @@ impl App {
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
+            Overlay::Sessions => self.on_key_sessions(key.code),
         }
     }
 
@@ -556,6 +575,45 @@ impl App {
         self.model_cursor = next.clamp(0, (len - 1) as i64) as usize;
     }
 
+    /// Key handling for the Sessions overlay (`s`, issue #34). Arrows/`j`/`k`
+    /// move the cursor through session rows; `s`/`Esc` closes back to MAIN; `q`
+    /// quits. The folded sessions are a snapshot taken at open time.
+    fn on_key_sessions(&mut self, code: KeyCode) {
+        let len = self.sessions.len();
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('s') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => self.move_session_cursor(-1, len),
+            KeyCode::Down | KeyCode::Char('j') => self.move_session_cursor(1, len),
+            KeyCode::PageUp => self.move_session_cursor(-10, len),
+            KeyCode::PageDown => self.move_session_cursor(10, len),
+            KeyCode::Home => self.session_cursor = 0,
+            KeyCode::End => self.session_cursor = len.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    /// Move the session cursor by `delta` rows, clamped to `[0, len-1]`.
+    fn move_session_cursor(&mut self, delta: i64, len: usize) {
+        if len == 0 {
+            self.session_cursor = 0;
+            return;
+        }
+        let next = (self.session_cursor as i64).saturating_add(delta);
+        self.session_cursor = next.clamp(0, (len - 1) as i64) as usize;
+    }
+
+    /// Open the Sessions overlay (`s`, issue #34): read the persisted raw-io log
+    /// from `$XDG_STATE_HOME/llmux/raw-io.jsonl`, fold it into a confidence-
+    /// labeled session timeline, and open the overlay. A missing/unreadable file
+    /// folds to an empty timeline (the overlay shows an empty hint). The snapshot
+    /// is point-in-time — re-opening re-reads the file.
+    fn open_sessions(&mut self) {
+        self.sessions = load_sessions();
+        self.session_cursor = 0;
+        self.overlay = Overlay::Sessions;
+    }
+
     /// Key handling for MAIN (no overlay open). `a`/`g`/`l` summon the overlays;
     /// `R` reloads, `f/m/e` drive codex, arrows scroll the activity log, `q`
     /// quits. The account-mutation affordances (add/remove/login/switch) live in
@@ -568,6 +626,8 @@ impl App {
             KeyCode::Char('a') => self.overlay = Overlay::Accounts,
             KeyCode::Char('g') => self.open_stats(view),
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
+            // Session timeline (issue #34): read + fold the persisted raw-io log.
+            KeyCode::Char('s') => self.open_sessions(),
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -1457,6 +1517,28 @@ fn apply_event(
     }
 }
 
+/// Read the persisted raw-io log and fold it into a session timeline (issue #34).
+///
+/// The path is resolved exactly like the daemon's capture path
+/// (`$XDG_STATE_HOME/llmux/raw-io.jsonl`). A missing/unreadable file, or no state
+/// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
+/// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
+/// metadata each record carries is folded; no prompt content is retained.
+fn load_sessions() -> Vec<crate::session::Session> {
+    let Some(path) = crate::cli::daemon::raw_io_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let records: Vec<crate::proxy::raw_io::RawIoRecord> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    crate::session::fold_sessions(&records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,6 +1648,49 @@ mod tests {
         app.on_key_main(KeyCode::Char('l'), None);
         assert_eq!(app.overlay, Overlay::Logs);
         app.on_key_logs(KeyCode::Char('l'));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// `s` opens the Sessions overlay (issue #34); arrows move the cursor within
+    /// the loaded session list and `s`/`Esc` close back to MAIN. The session list
+    /// is injected directly (the real loader reads a file off disk, not under
+    /// test here — `fold_sessions` is unit-tested in `crate::session`).
+    #[test]
+    fn s_opens_sessions_overlay_navigates_and_esc_returns_to_main() {
+        use crate::session::{Confidence, Session};
+        let session = |uid: &str| Session {
+            user_id: Some(uid.into()),
+            requests: 1,
+            tokens_in: 0,
+            tokens_out: 0,
+            models: vec![],
+            accounts: vec![],
+            account_rotations: 0,
+            first_ms: 0,
+            last_ms: 0,
+            confidence: Confidence::High,
+        };
+        let mut app = remote_app();
+        app.sessions = vec![session("u-1"), session("u-2"), session("u-3")];
+        app.overlay = Overlay::Sessions;
+        assert_eq!(app.session_cursor, 0);
+
+        // Down/up move within bounds.
+        app.on_key_sessions(KeyCode::Down);
+        assert_eq!(app.session_cursor, 1);
+        app.on_key_sessions(KeyCode::Up);
+        assert_eq!(app.session_cursor, 0);
+        // Up clamps at the top.
+        app.on_key_sessions(KeyCode::Up);
+        assert_eq!(app.session_cursor, 0);
+        // End jumps to the last row; Down clamps there.
+        app.on_key_sessions(KeyCode::End);
+        assert_eq!(app.session_cursor, 2);
+        app.on_key_sessions(KeyCode::Down);
+        assert_eq!(app.session_cursor, 2);
+
+        // s/Esc close back to MAIN.
+        app.on_key_sessions(KeyCode::Char('s'));
         assert_eq!(app.overlay, Overlay::None);
     }
 
