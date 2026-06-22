@@ -169,8 +169,15 @@ impl AppState {
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
+        // `connect_timeout` bounds the connect phase; `read_timeout` bounds
+        // post-connect silence — a silent upstream that connects then stalls
+        // would otherwise hang the session and pin the account. This is an
+        // inactivity ceiling (it resets on every received byte), not a total
+        // deadline, so long legitimate LLM streams are unaffected. Defense in
+        // depth with the per-chunk timeout in `sse::passthrough_body`.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(config.proxy.forward_idle_timeout_secs))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let provider = Arc::new(AnthropicPassthrough::new(config.upstream.clone()));

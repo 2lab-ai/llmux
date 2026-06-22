@@ -276,6 +276,72 @@ async fn sse_stream_passes_through_byte_identical_under_fragmentation() {
     );
 }
 
+/// Issue #29: a silent upstream that connects, emits `message_start`, then
+/// stalls indefinitely (no further bytes, no error, no close) must NOT hang
+/// the session or pin the account. With a short forward idle timeout the proxy
+/// aborts the relay on its own deadline: the client stream terminates within
+/// the idle ceiling (broken/truncated body, not a hang) and the account lease
+/// is released (`in_flight` falls back to 0).
+#[tokio::test]
+async fn idle_upstream_stall_aborts_stream_and_releases_lease() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::SseThenStall {
+        // Emit just the first event, then go silent forever.
+        prefix: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stall\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n".to_string(),
+    });
+
+    // Test-only idle value (1s), NOT the real 120s default — the assertion
+    // ceiling below (5s) is well under the mock's 3600s stall, so a pass means
+    // the proxy aborted on its own deadline, not that the mock hung up.
+    let proxy = Proxy::spawn_config(Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account("a", "at-a")],
+        proxy: llmux::config::ProxyConfig {
+            forward_idle_timeout_secs: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"stream":true}"#).await;
+    // Headers (and the first event) arrive normally — the stall is post-connect.
+    assert_eq!(response.status(), 200);
+
+    // The body read must COMPLETE (the relay aborts with a broken body) within
+    // the ceiling rather than hang on the stalled upstream. Either an error or
+    // a truncated body is acceptable — the point is termination, not a hang.
+    let read = tokio::time::timeout(Duration::from_secs(5), response.bytes()).await;
+    assert!(
+        read.is_ok(),
+        "client stream must terminate within the idle ceiling, not hang on a silent upstream"
+    );
+
+    // The lease is dropped when the relay's pump task ends, so the account's
+    // in-flight count returns to 0. Poll briefly to avoid racing the drop.
+    let mut released = false;
+    for _ in 0..100 {
+        let in_flight = proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|acct| acct.id.0 == "a")
+            .expect("account a")
+            .in_flight;
+        if in_flight == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "the account lease must be released on idle timeout, not stay pinned"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Threshold crossing: next request switches, in-flight stays pinned
 // ---------------------------------------------------------------------------

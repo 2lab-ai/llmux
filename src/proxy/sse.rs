@@ -10,6 +10,8 @@
 //! usage stats and never rewrites the stream, so parse failures cannot
 //! corrupt the relay.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use tokio_stream::StreamExt as _;
 
@@ -317,10 +319,21 @@ impl RawCapture {
 /// Callers move the account lease into this closure so the account stays pinned
 /// for the stream's lifetime — errors after this point propagate to the client
 /// as a broken body, never as an account switch (never switch mid-stream).
+///
+/// `idle_timeout` bounds upstream silence: if the next chunk does not arrive
+/// within it, the relay aborts the stream the same way a transport error does
+/// (records an error string, forwards an `Err(io::Error)` on the body channel,
+/// then breaks) so the client sees a broken body rather than hanging forever.
+/// `finish` still runs exactly once on that path, dropping the moved-in lease —
+/// so the account is released, not pinned. This is an inactivity ceiling, reset
+/// on every received chunk; long legitimate LLM streams with quiet gaps below
+/// the ceiling pass through untouched. Defense in depth with the client's
+/// `read_timeout` ([`crate::proxy::server::AppState::new`]).
 pub fn passthrough_body<F>(
     upstream: reqwest::Response,
     capture_limit: usize,
     raw_capture_limit: usize,
+    idle_timeout: Duration,
     finish: F,
 ) -> axum::body::Body
 where
@@ -334,7 +347,23 @@ where
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
         let mut stream = Box::pin(upstream.bytes_stream());
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(Some(item)) => item,
+                // Upstream finished (stream exhausted).
+                Ok(None) => break,
+                // No byte for `idle_timeout`: abort like a transport error so
+                // the client stops waiting and `finish` releases the lease.
+                Err(_elapsed) => {
+                    let detail = format!(
+                        "upstream idle timeout: no bytes for {}s",
+                        idle_timeout.as_secs_f64()
+                    );
+                    error = Some(detail.clone());
+                    let _ = tx.send(Err(std::io::Error::other(detail))).await;
+                    break;
+                }
+            };
             match item {
                 Ok(chunk) => {
                     for event in events.push(&chunk) {
