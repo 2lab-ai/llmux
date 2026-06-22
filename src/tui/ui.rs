@@ -2653,6 +2653,35 @@ mod tests {
             .collect()
     }
 
+    /// Render to a vector of screen rows (one `String` per terminal line), so a
+    /// test can compare body rows while ignoring the rows that legitimately
+    /// differ between local and attach mode (the header attach banner + the
+    /// footer keybar). Used by the issue #5 local-vs-attach parity test.
+    fn render_rows(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Attach-mode chrome (issue #5 parity): same as [`chrome_overlay`] but with
+    /// an attach banner, so a test can prove the data render path is NOT forked
+    /// by where the document came from.
+    fn chrome_attach(overlay: Overlay) -> Chrome {
+        Chrome {
+            attach: Some(super::super::Attach {
+                pid: Some(61282),
+                connected: true,
+            }),
+            ..chrome_overlay(overlay)
+        }
+    }
+
     #[test]
     fn compact_strip_shows_top_model_and_keybar_advertises_view() {
         let view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
@@ -2831,6 +2860,146 @@ mod tests {
         let chrome = chrome_overlay(Overlay::Sessions);
         let text = render(&view, &chrome, 160, 30);
         assert!(text.contains("no sessions yet"), "empty hint shown");
+    }
+
+    /// Issue #5 acceptance: local and attach render IDENTICALLY from the same
+    /// `DashboardDoc`. The view-model both modes feed `draw` is built by the one
+    /// `DashboardView::from_doc` contract (local: from an in-process doc;
+    /// attach: from the fetched JSON), so the body — account table, model strip,
+    /// in-flight/activity, AND the summoned overlay drawn over MAIN — must match
+    /// byte-for-byte. Only the header attach banner and the footer keybar
+    /// legitimately differ (deliberate chrome, not a fork of the data render),
+    /// so those rows are excluded from the comparison.
+    ///
+    /// Asserting parity for BOTH `Overlay::None` and an open overlay proves the
+    /// overlay layer is also drawn from the shared view, not re-derived per
+    /// backend.
+    fn parity_doc() -> crate::dashboard::DashboardDoc {
+        serde_json::from_value(serde_json::json!({
+            "version": "llmux 0.1.0 (dev dev)",
+            "pid": 61282,
+            "uptime_secs": 7980,
+            "port": 3456,
+            "current": "a",
+            "upstream": "https://api.anthropic.com",
+            "config_path": "/home/u/.config/llmux/llmux.json",
+            "select_params": { "five_hour_max": 0.90, "seven_day_max": 0.99, "usage_max_age_secs": 600 },
+            "refresh_ahead_secs": 25200,
+            "evaluate_tick_secs": 60,
+            "accounts": [
+                {
+                    "name": "a", "type": "oauth", "status": "active", "order": 1,
+                    "blocked": null, "healthy": true,
+                    "five_hour": { "utilization": 0.42, "resets_at": 1_003_600u64,
+                                   "resets_in_secs": 3600, "fetched_at_ms": 1_000_000_000u64,
+                                   "source": "headers" },
+                    "seven_day": null,
+                    "cooldown_until": null, "cooldown_source": null,
+                    "in_flight": 0,
+                    "token_expires_at_ms": 1_003_600_000u64, "last_refresh_ms": 999_820_000u64,
+                    "totals": { "requests": 3, "input_tokens": 100, "output_tokens": 50 },
+                    "session": { "requests": 3, "ok": 2, "errors": 1, "tokens_in": 100, "tokens_out": 50 },
+                },
+            ],
+            "scheduler": {
+                "last_switch": { "from": null, "to": "a", "reason": "initial selection",
+                                 "at_ms": 999_910_000u64 },
+                "next_in_line": null,
+                "next_eval_in_secs": 42,
+            },
+            "poller": [],
+            "totals": { "requests": 3, "ok": 2, "errors": 1, "tokens_in": 100,
+                        "tokens_out": 50, "rpm_5m": 0.6, "in_flight": 0 },
+            "model_usage": [
+                { "group": "codex", "model": "gpt-5.5", "requests": 3,
+                  "ok": 3, "errors": 0, "tokens_in": 700, "tokens_out": 300,
+                  "cache_read": 4000, "last_used_ms": 999_940_000u64, "in_flight": 0,
+                  "accounts": [], "efforts": [], "endpoints": [] },
+            ],
+            "activity": {
+                "in_flight": [],
+                "completed": [
+                    { "kind": "note", "at_ms": 999_910_000u64,
+                      "text": "switch (none) → a (initial selection)", "error": false },
+                ],
+            },
+            "logs": [
+                { "level": "INFO", "text": "proxy: proxy listening" },
+            ],
+        }))
+        .expect("parse parity doc")
+    }
+
+    /// The rows that legitimately differ between local and attach: the header
+    /// (row 0, attach banner) and the two footer rows (keybar shows
+    /// `R disabled (attached)`). Everything else is the shared data render.
+    fn body_rows(rows: &[String], h: usize) -> &[String] {
+        &rows[1..h - 2]
+    }
+
+    #[test]
+    fn local_and_attach_render_identically_from_the_same_doc() {
+        const W: u16 = 160;
+        const H: u16 = 30;
+        let doc = parity_doc();
+        // BOTH backends build the view through the single from_doc contract.
+        let view = DashboardView::from_doc(&doc);
+
+        for overlay in [
+            Overlay::None,
+            Overlay::Stats,
+            Overlay::Logs,
+            Overlay::Accounts,
+        ] {
+            let local = render_rows(&view, &chrome_overlay(overlay), W, H);
+            let attach = render_rows(&view, &chrome_attach(overlay), W, H);
+            assert_eq!(
+                body_rows(&local, H as usize),
+                body_rows(&attach, H as usize),
+                "MAIN+overlay body must render identically for {overlay:?} \
+                 regardless of local vs attach (single DashboardDoc, unforked renderer)"
+            );
+        }
+    }
+
+    /// Issue #5 acceptance (render side): the every-frame compose is
+    /// MAIN-then-overlay-then-footer. MAIN's frame is built and its data drawn
+    /// every tick (so MAIN "keeps updating"); a summoned overlay then covers the
+    /// body rect (all but the footer) and the MAIN-frame footer keybar stays
+    /// drawn over everything. So MAIN-only shows the model strip; under an
+    /// overlay the body is the overlay's surface while the footer keybar — proof
+    /// the MAIN compose ran this frame — remains. The deterministic "MAIN state
+    /// keeps updating underneath" guarantee is in the `mod.rs` state-machine
+    /// test (`open_overlay_preserves_main_state_then_esc_returns_to_main`); this
+    /// pins the draw-order contract.
+    #[test]
+    fn main_is_composed_every_frame_then_the_overlay_is_drawn_over_it() {
+        const W: u16 = 160;
+        const H: u16 = 30;
+        let doc = parity_doc();
+        let view = DashboardView::from_doc(&doc);
+
+        // MAIN only: the compact model strip (part of MAIN) is visible.
+        let main_only = render(&view, &chrome_overlay(Overlay::None), W, H);
+        assert!(main_only.contains("gpt-5.5"), "MAIN shows the model strip");
+        assert!(
+            main_only.contains("logs"),
+            "MAIN footer keybar advertises the logs shortcut"
+        );
+
+        // Logs overlay: the overlay body covers MAIN's strip, but the footer
+        // keybar (drawn last, from the same MAIN compose) is still present,
+        // proving the overlay is layered ON the MAIN frame rather than replacing
+        // the render path.
+        let with_logs = render(&view, &chrome_overlay(Overlay::Logs), W, H);
+        assert!(
+            with_logs.contains("proxy: proxy listening"),
+            "Logs overlay drawn on top of MAIN"
+        );
+        assert!(
+            with_logs.contains("logs"),
+            "MAIN footer keybar still drawn over the overlay (MAIN compose ran)"
+        );
     }
 
     #[test]
