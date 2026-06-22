@@ -46,6 +46,9 @@ pub(crate) struct DashboardView {
     /// One representation — the serializable doc row — used by both the
     /// document and the renderer, so local and attach render identically.
     pub model_usage: Vec<crate::dashboard::ModelUsageDoc>,
+    /// Per-client request attribution rows (issue #32), already sorted by
+    /// requests desc. One representation used by both document and renderer.
+    pub client_usage: Vec<crate::dashboard::ClientUsageDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
 }
@@ -263,6 +266,7 @@ impl DashboardView {
             completed,
             logs,
             model_usage: doc.model_usage.clone(),
+            client_usage: doc.client_usage.clone(),
             codex: doc.codex.clone(),
         }
     }

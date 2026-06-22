@@ -1815,6 +1815,7 @@ mod tests {
             completed: Vec::new(),
             logs: Vec::new(),
             model_usage: Vec::new(),
+            client_usage: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
         }
     }
