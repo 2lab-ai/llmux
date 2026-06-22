@@ -88,6 +88,12 @@ pub enum ActivityEvent {
         /// Reasoning effort (codex: configured effort; claude: thinking
         /// budget like `"16k"`), when known.
         effort: Option<String>,
+        /// Keyless per-client attribution identity (issue #32): the
+        /// `metadata.user_id` parsed from the request body, when present
+        /// (~98.9% of real requests). `None` requests are metered into the
+        /// `unknown` bucket. This is purely for *counting* requests/tokens per
+        /// client — it never gates the request and is not a credential.
+        user_id: Option<String>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

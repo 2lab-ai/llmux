@@ -35,6 +35,9 @@ const SIDE_BY_SIDE_AT: u16 = 110;
 /// token-share mini-bar.
 const MODEL_STRIP_ROWS: usize = 3;
 const MODEL_BAR_WIDTH: usize = 10;
+/// Rows shown in the compact per-client attribution panel in the stats overlay
+/// (issue #32) — the top N clients by request count.
+const CLIENT_PANEL_ROWS: usize = 6;
 /// A model used within this window counts as "recently active" (req15).
 const MODEL_RECENT_WINDOW: Duration = Duration::from_secs(60);
 
@@ -220,7 +223,69 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     let [table_area, body_area] =
         Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
     draw_accounts(frame, table_area, view, ctx, chrome);
-    draw_models_full(frame, body_area, view, ctx, chrome);
+    // Reserve a compact per-client attribution panel (issue #32) at the bottom
+    // of the stats body when there is client usage to show; otherwise the
+    // models view keeps the whole body.
+    if view.client_usage.is_empty() {
+        draw_models_full(frame, body_area, view, ctx, chrome);
+    } else {
+        let clients_height = (view.client_usage.len().min(CLIENT_PANEL_ROWS) as u16)
+            .saturating_add(2)
+            .min(body_area.height.saturating_sub(3).max(2));
+        let [models_area, clients_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(clients_height)])
+                .areas(body_area);
+        draw_models_full(frame, models_area, view, ctx, chrome);
+        draw_clients_compact(frame, clients_area, view);
+    }
+}
+
+/// Compact per-client request-attribution table (issue #32): top
+/// [`CLIENT_PANEL_ROWS`] clients by request count, keyed by `metadata.user_id`
+/// (the `unknown` bucket holds requests with no id). In-memory metering only —
+/// not a credential, never gates a request.
+fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
+    let total = view.client_usage.len();
+    let header = ["client", "req", "ok/err", "in", "out"];
+    let rows = view
+        .client_usage
+        .iter()
+        .take(CLIENT_PANEL_ROWS)
+        .map(|c| {
+            let ok_err = Line::from(vec![
+                Span::styled(format::human_count(c.ok), Style::new().fg(Color::Green)),
+                Span::raw("/"),
+                Span::styled(
+                    format::human_count(c.errors),
+                    if c.errors > 0 {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        dim()
+                    },
+                ),
+            ]);
+            Row::new(vec![
+                Cell::from(c.client.clone()),
+                Cell::from(format::human_count(c.requests)),
+                Cell::from(ok_err),
+                Cell::from(format::human_count(c.tokens_in)),
+                Cell::from(format::human_count(c.tokens_out)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let constraints = [
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
+    ];
+    let shown = total.min(CLIENT_PANEL_ROWS);
+    let title = format!(" clients — top {shown} of {total} by requests (metadata.user_id) ");
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
@@ -2143,6 +2208,7 @@ mod tests {
             completed: Vec::new(),
             logs: Vec::new(),
             model_usage,
+            client_usage: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
         }
     }

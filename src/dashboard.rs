@@ -22,7 +22,8 @@ use crate::proxy::server::{AppState, UsageTotals, EVALUATE_TICK};
 use crate::scheduler::select::{self, SelectParams};
 use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::tui::activity::{
-    normalize_model, ActivityLog, Completed, CompletedBody, InFlight, ModelUsage, Totals,
+    normalize_model, ActivityLog, ClientUsage, Completed, CompletedBody, InFlight, ModelUsage,
+    Totals,
 };
 use crate::tui::logs::LogConsole;
 use crate::tui::{ActivityEvent, LastSwitch, PollHealth, TokenCounts};
@@ -178,6 +179,7 @@ impl DashboardHub {
             global_totals: state.log.totals_global(),
             rpm_5m: state.log.requests_per_minute(now, RPM_WINDOW),
             model_usage: state.log.model_usage(),
+            client_usage: state.log.client_usage(),
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
         }
     }
@@ -195,6 +197,8 @@ pub(crate) struct HubView {
     pub rpm_5m: f64,
     /// Aggregated per-(group, model) usage rows, sorted by total tokens desc.
     pub model_usage: Vec<ModelUsage>,
+    /// Per-client request attribution rows (issue #32), sorted by requests desc.
+    pub client_usage: Vec<ClientUsage>,
     /// Oldest→newest (console renders the tail at the bottom).
     pub logs: Vec<LogLine>,
 }
@@ -272,6 +276,7 @@ fn trace_event(event: &ActivityEvent) {
             group,
             model,
             effort,
+            user_id,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -293,6 +298,7 @@ fn trace_event(event: &ActivityEvent) {
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
                 effort = effort.as_deref().unwrap_or("-"),
+                client = user_id.as_deref().unwrap_or("unknown"),
                 "request finished"
             );
         }
@@ -370,6 +376,14 @@ pub struct DashboardDoc {
     /// upgraded client attaching to an older daemon renders no model panel.
     #[serde(default)]
     pub model_usage: Vec<ModelUsageDoc>,
+    /// Per-client request attribution (issue #32): in-memory request/token
+    /// counts keyed by `metadata.user_id` (the `unknown` bucket holds
+    /// requests with no id). Pure metering — no key issuance, no auth change.
+    /// Additive: absent in docs written before this existed → an older client
+    /// parses it as empty and an upgraded client attaching to an older daemon
+    /// renders no client panel.
+    #[serde(default)]
+    pub client_usage: Vec<ClientUsageDoc>,
     pub activity: ActivityDoc,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
@@ -567,6 +581,19 @@ pub struct ModelAccountDoc {
 pub struct ModelCountDoc {
     pub label: String,
     pub requests: u64,
+}
+
+/// One per-client attribution row (issue #32): a client identity
+/// (`metadata.user_id`, or `unknown`) and its in-memory request/token counts.
+/// Counting only — never a credential, never gates a request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientUsageDoc {
+    pub client: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -984,6 +1011,21 @@ pub(crate) fn dashboard_doc(
     // sum of each completed row's per-model cost (Feature D).
     let (model_usage, total_cost_usd) = model_usage_docs(hub, now, &meta.pricing_overrides);
 
+    // Per-client attribution rows (issue #32): already sorted (requests desc)
+    // by the activity log; a direct projection to the wire type.
+    let client_usage: Vec<ClientUsageDoc> = hub
+        .client_usage
+        .iter()
+        .map(|c| ClientUsageDoc {
+            client: c.client.clone(),
+            requests: c.requests,
+            ok: c.ok,
+            errors: c.errors,
+            tokens_in: c.tokens_in,
+            tokens_out: c.tokens_out,
+        })
+        .collect();
+
     DashboardDoc {
         version: crate::build_info::version_string(),
         pid: meta.pid,
@@ -1014,6 +1056,7 @@ pub(crate) fn dashboard_doc(
             cost_usd: total_cost_usd,
         },
         model_usage,
+        client_usage,
         activity,
         logs: hub
             .logs
@@ -1162,6 +1205,7 @@ mod tests {
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
                 effort: Some("high".into()),
+                user_id: Some("acct_seed".into()),
             },
             now() - Duration::from_secs(58),
         );
@@ -1596,6 +1640,7 @@ mod tests {
                     group: None,
                     model: None,
                     effort: None,
+                    user_id: None,
                 },
                 now() - Duration::from_secs(seeded - i),
             );
