@@ -548,6 +548,8 @@ fn default_port() -> u16 {
 /// separately by the client's 10s `connect_timeout`.
 fn default_forward_idle_timeout_secs() -> u64 {
     120
+}
+
 /// Default ingress request-body admission cap (64 MiB). Kept in sync with
 /// [`DEFAULT_MAX_REQUEST_BYTES`] so a config that omits the field caps exactly
 /// where the const-defined backstop does.
