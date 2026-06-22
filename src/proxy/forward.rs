@@ -1276,6 +1276,7 @@ async fn relay(
             response,
             BODY_LOG_LIMIT,
             raw_io_max_body,
+            std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
             move |usage, captured, raw_captured, error| {
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee

@@ -247,6 +247,18 @@ pub struct ProxyConfig {
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Forward-path idle (inactivity) timeout, seconds: how long the proxy
+    /// waits for the NEXT byte from upstream after the connection is
+    /// established before aborting the stream. This is an inactivity ceiling,
+    /// NOT a total-request deadline — legitimate LLM streams run for minutes
+    /// with long inter-token gaps, so the clock resets on every chunk. A
+    /// silent upstream that connects and then stalls would otherwise hang the
+    /// session and pin the account; this bounds the silence. Default 120.
+    /// Applied two ways (defense in depth): `reqwest`'s `read_timeout` on the
+    /// serving client and a per-chunk `tokio::time::timeout` around the SSE
+    /// pump (see [`crate::proxy::sse::passthrough_body`]).
+    #[serde(default = "default_forward_idle_timeout_secs")]
+    pub forward_idle_timeout_secs: u64,
 }
 
 impl Default for ProxyConfig {
@@ -254,6 +266,7 @@ impl Default for ProxyConfig {
         Self {
             port: default_port(),
             api_key: None,
+            forward_idle_timeout_secs: default_forward_idle_timeout_secs(),
         }
     }
 }
@@ -507,6 +520,13 @@ fn default_codex_model() -> String {
 
 fn default_port() -> u16 {
     DEFAULT_PORT
+}
+
+/// Default forward-path idle timeout: 120 seconds of upstream silence
+/// (post-connect) before the stream is aborted. The connect phase is covered
+/// separately by the client's 10s `connect_timeout`.
+fn default_forward_idle_timeout_secs() -> u64 {
+    120
 }
 
 fn default_upstream() -> String {
