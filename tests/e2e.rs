@@ -2353,3 +2353,57 @@ async fn idle_probe_kill_switch_disables_probing() {
 async fn brew_installed_binary_runs() {
     unreachable!("run manually: brew install 2lab-ai/tap/llmux-preview && llmux --version")
 }
+
+// ---------------------------------------------------------------------------
+// 13. OAuth token relay (PROXY-09)
+// ---------------------------------------------------------------------------
+
+/// FR1: `POST /v1/oauth/token` is relayed RAW to the upstream — the client's
+/// own token refresh passes through with NO injected account credential and
+/// WITHOUT taking a scheduler lease (it never enters the forward path).
+#[tokio::test]
+async fn oauth_token_endpoint_is_relayed_raw_without_credential_injection_or_lease() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "tok-a")]).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/oauth/token"))
+        .header("content-type", "application/json")
+        // The client's OWN auth — the relay must strip it and inject nothing.
+        .header("authorization", "Bearer client-secret")
+        .header("x-api-key", "sk-client")
+        .body(r#"{"grant_type":"refresh_token","refresh_token":"rt-client"}"#)
+        .send()
+        .await
+        .expect("token relay");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("access_token"),
+        "raw upstream token body relayed: {body}"
+    );
+
+    // It hit the dedicated token route exactly once...
+    let seen = mock.token_seen();
+    assert_eq!(seen.len(), 1, "exactly one token relay");
+    let req = &seen[0];
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/v1/oauth/token");
+    // ...with NO account credential injected and the client's own auth stripped.
+    assert!(
+        req.authorization.is_none(),
+        "no Authorization forwarded/injected: {:?}",
+        req.authorization
+    );
+    assert!(
+        req.x_api_key.is_none(),
+        "no x-api-key forwarded: {:?}",
+        req.x_api_key
+    );
+    // ...and it never went through the forward/lease path (catch_all stays empty).
+    assert!(
+        mock.seen().is_empty(),
+        "token relay must bypass the forward/lease path"
+    );
+}

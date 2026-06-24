@@ -127,6 +127,9 @@ pub struct SeenRequest {
 struct Shared {
     script: Mutex<VecDeque<ScriptedResponse>>,
     seen: Mutex<Vec<SeenRequest>>,
+    /// Requests to `/v1/oauth/token` (the raw-relay path), captured separately
+    /// from `seen` so the forward-path tests' `seen()` assertions stay intact.
+    token_seen: Mutex<Vec<SeenRequest>>,
     /// `access_token` → raw JSON body for `GET /api/oauth/usage`.
     usage: Mutex<HashMap<String, String>>,
     token_hits: AtomicUsize,
@@ -223,6 +226,16 @@ impl MockUpstream {
     /// How many times the token endpoint was hit (refresh coalescing).
     pub fn token_hits(&self) -> usize {
         self.shared.token_hits.load(Ordering::SeqCst)
+    }
+
+    /// Requests received on `/v1/oauth/token` (the raw-relay path), in order —
+    /// the assertion surface for "relayed raw, no injected credential, no lease".
+    pub fn token_seen(&self) -> Vec<SeenRequest> {
+        self.shared
+            .token_seen
+            .lock()
+            .expect("token_seen lock")
+            .clone()
     }
 }
 
@@ -388,7 +401,32 @@ async fn catch_all(
 
 async fn token_endpoint(
     axum::extract::State(shared): axum::extract::State<Arc<Shared>>,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    let (parts, body) = req.into_parts();
+    let header = |name: &str| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    shared
+        .token_seen
+        .lock()
+        .expect("token_seen lock")
+        .push(SeenRequest {
+            method: parts.method.to_string(),
+            path: parts.uri.path().to_string(),
+            authorization: header("authorization"),
+            x_api_key: header("x-api-key"),
+            chatgpt_account_id: header("chatgpt-account-id"),
+            originator: header("originator"),
+            body: body.to_vec(),
+        });
     shared.token_hits.fetch_add(1, Ordering::SeqCst);
     let delay = *shared.token_delay.lock().expect("delay lock");
     if !delay.is_zero() {

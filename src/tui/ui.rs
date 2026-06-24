@@ -2653,6 +2653,39 @@ mod tests {
         }
     }
 
+    /// attach_spans (TUI-14): connected -> "attached → pid N"; disconnected ->
+    /// "reconnecting → pid N…"; unknown pid -> "pid ?"; local mode -> no spans.
+    #[test]
+    fn attach_spans_render_connected_reconnecting_and_unknown_pid() {
+        use super::super::Attach;
+        let with_attach = |attach| Chrome {
+            attach: Some(attach),
+            ..chrome_overlay(Overlay::None)
+        };
+        let text = |c: &Chrome| -> String {
+            super::attach_spans(c)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let t = text(&with_attach(Attach {
+            pid: Some(42),
+            connected: true,
+        }));
+        assert!(t.contains("attached") && t.contains("42"), "{t}");
+        let t = text(&with_attach(Attach {
+            pid: Some(42),
+            connected: false,
+        }));
+        assert!(t.contains("reconnecting") && t.contains("42"), "{t}");
+        let t = text(&with_attach(Attach {
+            pid: None,
+            connected: true,
+        }));
+        assert!(t.contains("pid ?"), "{t}");
+        assert!(super::attach_spans(&chrome_overlay(Overlay::None)).is_empty());
+    }
+
     fn render(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         let mut hits = None;
