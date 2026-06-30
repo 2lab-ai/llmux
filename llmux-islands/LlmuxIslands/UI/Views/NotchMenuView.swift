@@ -25,14 +25,11 @@ struct NotchMenuView: View {
     }
 
     var body: some View {
+        ScrollView(.vertical, showsIndicators: false) {
         VStack(spacing: 4) {
             // Navigation
             MenuRow(icon: "gauge.with.dots.needle.67percent", label: "Usage") {
                 viewModel.showUsage()
-            }
-
-            MenuRow(icon: "gearshape", label: "Settings…") {
-                AppDelegate.shared?.openSettings()
             }
 
             Divider()
@@ -42,6 +39,7 @@ struct NotchMenuView: View {
             // Appearance settings
             ScreenPickerRow(screenSelector: screenSelector)
             SoundPickerRow(soundSelector: soundSelector)
+            LlmuxConnectionSection()
 
             Divider()
                 .background(Color.white.opacity(0.08))
@@ -111,6 +109,8 @@ struct NotchMenuView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 8)
+        }
+        .scrollBounceBehavior(.basedOnSize)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear {
             refreshStates()
@@ -287,5 +287,100 @@ struct MenuToggleRow: View {
 
     private var textColor: Color {
         .white.opacity(isHovered ? 1.0 : 0.7)
+    }
+}
+
+// MARK: - llmux Connection Section
+
+/// Collapsible llmux daemon connection editor, living inside the ☰ menu (the
+/// app has no separate Settings window). Writes `LlmuxSettings` and reconnects.
+private struct LlmuxConnectionSection: View {
+    @State private var host: String = LlmuxSettings.host
+    @State private var port: String = String(LlmuxSettings.port)
+    @State private var apiKey: String = LlmuxSettings.apiKey
+    @State private var expanded = false
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "network")
+                        .font(.system(size: 13))
+                        .foregroundColor(.white.opacity(0.7))
+                        .frame(width: 18)
+                    Text("llmux connection")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.7))
+                    Spacer()
+                    Text("\(host):\(port)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.4))
+                        .lineLimit(1)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(isHovered ? 0.06 : 0))
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { isHovered = $0 }
+
+            if expanded {
+                VStack(spacing: 6) {
+                    field(placeholder: "Host", text: $host)
+                    HStack(spacing: 6) {
+                        field(placeholder: "Port", text: $port)
+                            .frame(width: 86)
+                        field(placeholder: "API key (optional)", text: $apiKey, secure: true)
+                    }
+                    Button { apply() } label: {
+                        Text("Apply & reconnect")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
+                            .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func field(placeholder: String, text: Binding<String>, secure: Bool = false) -> some View {
+        Group {
+            if secure {
+                SecureField(placeholder, text: text)
+            } else {
+                TextField(placeholder, text: text)
+            }
+        }
+        .textFieldStyle(.plain)
+        .font(.system(size: 11, design: .monospaced))
+        .foregroundColor(.white)
+        .padding(7)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
+    }
+
+    private func apply() {
+        let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        LlmuxSettings.host = h.isEmpty ? "127.0.0.1" : h
+        LlmuxSettings.port = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 3456
+        LlmuxSettings.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        host = LlmuxSettings.host
+        port = String(LlmuxSettings.port)
+        Task { await IslandUsageModel.shared.refresh() }
     }
 }
