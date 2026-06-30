@@ -2,6 +2,8 @@
 LlmuxIslands.xcodeproj/
 # Build output.
 build/
+build-release/
+dist/
 DerivedData/
 *.xcuserstate
 .DS_Store
