@@ -1,0 +1,7 @@
+# XcodeGen generates the project from project.yml — don't commit it.
+LlmuxIslands.xcodeproj/
+# Build output.
+build/
+DerivedData/
+*.xcuserstate
+.DS_Store
