@@ -839,6 +839,10 @@ pub fn status_json(
                 serde_json::json!({
                     "name": account.id.0,
                     "type": account.credential_kind,
+                    // Backend group ("claude" / "codex") — the dashboard's
+                    // group column; also the key space of `current_by_group`.
+                    // Additive: absent in docs written before this existed.
+                    "group": account.group.as_str(),
                     "status": status,
                     "order": order + 1,
                     "blocked": blocked,
@@ -1445,6 +1449,7 @@ mod tests {
         let a = &accounts[0];
         assert_eq!(a["name"], "a");
         assert_eq!(a["type"], "oauth");
+        assert_eq!(a["group"], "claude");
         assert_eq!(a["status"], "active");
         assert_eq!(a["order"], 1);
         assert_eq!(a["blocked"], serde_json::Value::Null);
@@ -1459,6 +1464,7 @@ mod tests {
 
         let k = &accounts[1];
         assert_eq!(k["type"], "apikey");
+        assert_eq!(k["group"], "claude");
         assert_eq!(k["status"], "cooldown");
         assert_eq!(k["order"], 2);
         assert_eq!(k["blocked"], "cooldown 2m00s");
@@ -1469,6 +1475,32 @@ mod tests {
             "cold window is null"
         );
         assert_eq!(k["totals"]["requests"], 0);
+    }
+
+    #[test]
+    fn status_json_tags_codex_accounts_with_codex_group() {
+        // A codex credential lands in the "codex" backend group; oauth/apikey
+        // land in "claude" (covered by the shape test). The group field is what
+        // `accounts --json` renders as the dashboard's group column.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let pool = AccountPool::new(&[codex_account("c", "acct-1")]);
+        pool.evaluate(None, &params(), now);
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 3456,
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        let accounts = doc["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts[0]["name"], "c");
+        assert_eq!(accounts[0]["type"], "codex");
+        assert_eq!(accounts[0]["group"], "codex");
     }
 
     #[test]
