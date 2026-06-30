@@ -1,14 +1,21 @@
-//! `llmux accounts [-v]` and `llmux remove <name>` — account
-//! roster management. Both work purely from the config file (no network,
-//! no running server required).
+//! `llmux accounts [-v|--json]` and `llmux remove <name>` — account
+//! roster management. The default listing and `remove` work purely from the
+//! config file (no network, no running server required); `--json` is the one
+//! exception — it pulls the live usage dashboard from the running server.
 
 use crate::config::{AccountCredential, Config};
 
+use super::daemon::{self, ServerProbe};
 use super::{now_ms, prompt_line, AccountsArgs, CliError, RemoveArgs};
 
 /// List configured accounts: name, type, tier when stored, masked
-/// credential; `-v` adds token expiry detail.
+/// credential; `-v` adds token expiry detail. `--json` instead emits the live
+/// dashboard document (see [`list_json`]).
 pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
+    if args.json {
+        return list_json().await;
+    }
+
     let config = crate::config::load_or_init()?;
 
     if config.accounts.is_empty() {
@@ -62,6 +69,41 @@ pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// `llmux accounts --json` — print the live account dashboard as JSON.
+///
+/// The usage windows the user wants (5h/7d utilization + resets, in-flight,
+/// token health) live only in the running server, so this mirrors
+/// `llmux status --json`'s probe + exit-code contract (0 = server running,
+/// 1 = not running) rather than the offline config path. The body is the
+/// `/llmux/status` document — the account-centric slice the dashboard is built
+/// from: top-level `current` / `current_by_group` (the selected subscription,
+/// per backend group) plus a per-account array carrying `group`, `status`,
+/// `order`, `five_hour` / `seven_day` (`utilization` + `resets_at` /
+/// `resets_in_secs`), `in_flight`, and `token_expires_at_ms` /
+/// `last_refresh_ms`. Pretty-printed (`{:#}`) so it is readable as well as
+/// machine-parseable.
+async fn list_json() -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let port = config.proxy.port;
+
+    match daemon::probe_server(port, config.proxy.api_key.as_deref()).await? {
+        ServerProbe::Running { status } => {
+            println!("{status:#}");
+            Ok(())
+        }
+        ServerProbe::NotRunning => {
+            println!(
+                "{:#}",
+                serde_json::json!({ "server": "not running", "port": port })
+            );
+            std::process::exit(1);
+        }
+        ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
+            "port {port} answers but is not llmux: {detail}"
+        ))),
+    }
 }
 
 /// Remove one account by name via read-merge-write (`config::update`) so a
