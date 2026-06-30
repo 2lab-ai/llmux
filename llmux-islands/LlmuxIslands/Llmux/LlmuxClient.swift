@@ -14,6 +14,15 @@ struct LlmuxClient: Sendable {
         self.apiKey = apiKey
     }
 
+    /// Build a client from the user's saved connection settings (Settings window).
+    static func current() -> LlmuxClient {
+        LlmuxClient(
+            host: LlmuxSettings.host,
+            port: LlmuxSettings.port,
+            apiKey: LlmuxSettings.apiKey.isEmpty ? nil : LlmuxSettings.apiKey
+        )
+    }
+
     private func makeRequest(_ path: String, method: String = "GET", json: [String: Any]? = nil) -> URLRequest {
         var req = URLRequest(url: URL(string: baseURL + path)!)
         req.httpMethod = method
