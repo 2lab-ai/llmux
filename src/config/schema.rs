@@ -311,10 +311,11 @@ impl Default for ProxyConfig {
 /// - **On demand** (#21): the forward path probes idle accounts so the next
 ///   ranking/display has real data.
 /// - **Timer sweep** (#45): when `sweep_secs > 0`, a background task fires the
-///   same probe for cold **Codex** accounts on a timer, so their windows stay
-///   populated with ZERO client traffic (a cold Codex account is otherwise
-///   never probed — the background usage poller covers oauth accounts only,
-///   and `/responses` is the only path that returns Codex windows).
+///   same probe for EVERY cold account (any provider) on a timer, so their
+///   windows stay populated with ZERO client traffic. The usage poller already
+///   covers cold oauth accounts, so in practice the sweep is what keeps cold
+///   Codex and api-key accounts (which have no poller) visible; an oauth account
+///   the poller already warmed is skipped because it already has a window.
 ///
 /// Both modes share a global kill-switch (`enabled = false` disables ALL
 /// probing) and a per-account cooldown so a single account is probed at most
@@ -334,15 +335,16 @@ pub struct IdleProbeConfig {
     /// account never bursts a probe per request. Default 3600 (1 hour).
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
-    /// Timer-sweep cadence for keeping cold **Codex** accounts warm (issue
-    /// #45), seconds. `0` (the default) disables the sweep entirely; the probe
-    /// then stays purely on-demand. When `> 0` and `enabled = true`, a
-    /// background task calls the existing Codex-scoped probe trigger every
-    /// `sweep_secs` seconds, reusing the same kill-switch + per-account
-    /// cooldown (so the cooldown — not this cadence — bounds cost: at most one
-    /// probe per account per `per_account_cooldown_secs` regardless of how
-    /// often the sweep ticks). Additive (`#[serde(default)]`) so a config
-    /// written before this field loads with the sweep OFF.
+    /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
+    /// (issue #45), seconds. `0` (the default) disables the sweep entirely; the
+    /// probe then stays purely on-demand. When `> 0` and `enabled = true`, a
+    /// background task probes every cold account every `sweep_secs` seconds,
+    /// reusing the same kill-switch + per-account cooldown (so the cooldown —
+    /// not this cadence — bounds cost: at most one probe per account per
+    /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
+    /// A sensible operating value is one tick per cooldown (e.g. `3600`).
+    /// Additive (`#[serde(default)]`) so a config written before this field
+    /// loads with the sweep OFF.
     #[serde(default = "default_idle_probe_sweep_secs")]
     pub sweep_secs: u64,
 }
