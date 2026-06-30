@@ -8,6 +8,12 @@ description: Use when the user says "릴리즈", "릴리즈해줘", "release", "
 Cut a formal **stable** release: version bump → tag `v*` → CI stable release → brew
 `llmux` → local deploy → `llmux status` (client AND server).
 
+A `v*` release ships **both** the CLI binaries and the macOS app
+(`LlmuxIslands-<version>.zip`, built by the `islands` job in `release.yml`), and the tap
+`bump.yml` then refreshes **both** the `llmux` formula and the `llmux-islands` cask — so
+`brew install llmux` (CLI only) and `brew install llmux-islands` (app + CLI via `depends_on`)
+track the same version. After step 6, also confirm `brew info --cask llmux-islands` == `<new>`.
+
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
 procedure B = publish+verify brew).
 

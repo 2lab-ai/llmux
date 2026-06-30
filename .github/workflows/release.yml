@@ -88,8 +88,53 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
 
+  islands:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve version from tag
+        shell: bash
+        run: echo "ISLANDS_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build the app (ad-hoc signed; no Developer ID in CI)
+        working-directory: llmux-islands
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -project LlmuxIslands.xcodeproj -scheme LlmuxIslands \
+            -configuration Release -derivedDataPath build \
+            MARKETING_VERSION="$ISLANDS_VERSION" \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+            build
+
+      - name: Package .app
+        working-directory: llmux-islands
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/LlmuxIslands.app"
+          ZIP="LlmuxIslands-${ISLANDS_VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LlmuxIslands
+          path: |
+            llmux-islands/LlmuxIslands-*.zip
+            llmux-islands/LlmuxIslands-*.zip.sha256
+
   release:
-    needs: build
+    needs: [build, islands]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -111,7 +156,9 @@ jobs:
           for asset in llmux-macos-aarch64 llmux-macos-x86_64 llmux-linux-x86_64 llmux-linux-aarch64; do
             cp "artifacts/$asset/$asset" "release/$asset"
           done
-          (cd release && sha256sum llmux-* > SHA256SUMS)
+          # the islands app rides the same v* release (built by the `islands` job)
+          cp artifacts/LlmuxIslands/LlmuxIslands-*.zip release/
+          (cd release && sha256sum llmux-* LlmuxIslands-*.zip > SHA256SUMS)
           cat release/SHA256SUMS
 
       - name: Create release
@@ -123,4 +170,5 @@ jobs:
             release/llmux-macos-x86_64
             release/llmux-linux-x86_64
             release/llmux-linux-aarch64
+            release/LlmuxIslands-*.zip
             release/SHA256SUMS
