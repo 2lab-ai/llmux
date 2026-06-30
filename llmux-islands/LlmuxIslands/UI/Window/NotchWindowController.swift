@@ -9,6 +9,7 @@ import AppKit
 import Combine
 import SwiftUI
 
+@MainActor
 class NotchWindowController: NSWindowController {
     let viewModel: NotchViewModel
     private let screen: NSScreen

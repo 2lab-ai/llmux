@@ -12,11 +12,12 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
-    # Lifted agent-island UI code assumes module-wide main-actor isolation
-    # (Xcode 26 "Default Actor Isolation = MainActor").
-    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
-    # The Release `-O` SIL inliner crashes swift-frontend on the lifted SwiftUI
-    # views (Xcode 26); a menu-bar app needs no optimization, so disable it.
+    # NOTE: do NOT use SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor — that is an
+    # Xcode 26 setting and CI (macos-latest) runs Xcode 16.4, where it is ignored
+    # and the lifted UI fails to compile. Portability comes from explicit
+    # `@MainActor` on the AppKit-bridge classes instead.
+    # The Release `-O` SIL inliner can crash swift-frontend on the lifted SwiftUI
+    # views; a menu-bar app needs no optimization, so disable it.
     SWIFT_OPTIMIZATION_LEVEL: "-Onone"
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Manual

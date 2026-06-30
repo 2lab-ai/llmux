@@ -5,6 +5,7 @@ import SwiftUI
 /// Owns the floating-island window and starts the accounts model. Stripped of
 /// agent-island's Sparkle / Mixpanel / session-monitor / hook machinery — only
 /// the island shell remains, driven by the llmux HTTP API.
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     static var shared: AppDelegate?
 
