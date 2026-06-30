@@ -15,6 +15,9 @@ settings:
     # Lifted agent-island UI code assumes module-wide main-actor isolation
     # (Xcode 26 "Default Actor Isolation = MainActor").
     SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    # The Release `-O` SIL inliner crashes swift-frontend on the lifted SwiftUI
+    # views (Xcode 26); a menu-bar app needs no optimization, so disable it.
+    SWIFT_OPTIMIZATION_LEVEL: "-Onone"
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "-"
