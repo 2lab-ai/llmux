@@ -11,6 +11,10 @@ settings:
     MARKETING_VERSION: "0.2.3"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    # Lifted agent-island UI code assumes module-wide main-actor isolation
+    # (Xcode 26 "Default Actor Isolation = MainActor").
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "-"

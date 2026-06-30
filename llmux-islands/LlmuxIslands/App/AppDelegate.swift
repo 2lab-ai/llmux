@@ -1,69 +1,53 @@
 import AppKit
+import Darwin
 import SwiftUI
 
-/// Owns the menu-bar item and the borderless island panel, and starts the
-/// accounts poller. Opening is via the menu-bar item (the panel renders as a
-/// notch-styled island pinned to the top-center of the built-in display).
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let model = AccountsViewModel()
-    private var statusItem: NSStatusItem?
-    private var panel: NotchPanel?
+/// Owns the floating-island window and starts the accounts model. Stripped of
+/// agent-island's Sparkle / Mixpanel / session-monitor / hook machinery — only
+/// the island shell remains, driven by the llmux HTTP API.
+class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate?
 
-    private let panelSize = NSSize(width: 560, height: 480)
+    private var windowManager: WindowManager?
+    private var screenObserver: ScreenObserver?
+
+    var windowController: NotchWindowController? {
+        windowManager?.windowController
+    }
+
+    override init() {
+        super.init()
+        AppDelegate.shared = self
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        setupStatusItem()
-        setupPanel()
-        model.start()
-    }
+        NSApplication.shared.setActivationPolicy(.accessory)
 
-    private func setupStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = item.button {
-            button.image = NSImage(
-                systemSymbolName: "gauge.with.dots.needle.67percent",
-                accessibilityDescription: "llmux islands"
-            )
-            button.image?.isTemplate = true
-            button.action = #selector(togglePanel)
-            button.target = self
+        windowManager = WindowManager()
+        _ = windowManager?.setupNotchWindow()
+
+        screenObserver = ScreenObserver { [weak self] in
+            _ = self?.windowManager?.setupNotchWindow()
         }
-        statusItem = item
-    }
 
-    private func setupPanel() {
-        let root = RootView(onClose: { [weak self] in self?.hidePanel() })
-            .environmentObject(model)
-        let panel = NotchPanel(size: panelSize)
-        panel.contentView = NSHostingView(rootView: root)
-        self.panel = panel
-    }
-
-    private func positionPanel() {
-        guard let panel, let screen = NSScreen.builtin ?? NSScreen.main else { return }
-        let frame = screen.frame
-        panel.setFrameOrigin(NSPoint(
-            x: frame.midX - panelSize.width / 2,
-            y: frame.maxY - panelSize.height
-        ))
-    }
-
-    @objc private func togglePanel() {
-        guard let panel else { return }
-        if panel.isVisible {
-            hidePanel()
-        } else {
-            positionPanel()
-            panel.orderFrontRegardless()
-            panel.makeKey()
-            NSApp.activate(ignoringOtherApps: true)
-            Task { await model.refresh() }
+        Task { @MainActor in
+            IslandUsageModel.shared.start()
         }
     }
 
-    private func hidePanel() {
-        panel?.orderOut(nil)
+    func applicationWillTerminate(_ notification: Notification) {
+        screenObserver = nil
+    }
+
+    @MainActor
+    func requestTerminateFromMenu() {
+        NSApplication.shared.terminate(nil)
+        // Some non-activating panel states can swallow the regular terminate
+        // flow; keep a short fallback so "Quit" always exits.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if NSApplication.shared.isRunning {
+                Darwin.exit(0)
+            }
+        }
     }
 }
