@@ -136,28 +136,50 @@ final class IslandUsageModel: ObservableObject {
             let started = try await client.startLogin(provider: provider)
             login?.state = started.state
             login?.phase = "pending"
+            var consecutiveErrors = 0
             for _ in 0..<150 {                       // ~5 min at 2s
                 if Task.isCancelled { return }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let state = login?.state else { return }
-                let result = try await client.loginStatus(state: state)
-                login?.phase = result.phase
-                if result.phase == "done" {
-                    login?.message = result.account
-                    await refresh()
-                    return
-                }
-                if result.phase == "error" {
-                    login?.message = result.error ?? "login failed"
-                    return
+                do {
+                    let result = try await client.loginStatus(state: state)
+                    consecutiveErrors = 0
+                    login?.phase = result.phase
+                    if result.phase == "done" {
+                        login?.message = result.account
+                        await refresh()
+                        return
+                    }
+                    if result.phase == "error" {
+                        login?.message = result.error ?? "login failed"
+                        return
+                    }
+                } catch {
+                    // Tolerate transient poll failures (daemon restart, brief
+                    // network blip) — only give up after several in a row.
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 5 {
+                        login?.phase = "error"
+                        login?.message = Self.friendlyError(error)
+                        return
+                    }
                 }
             }
             login?.phase = "error"
             login?.message = "timed out"
         } catch {
             login?.phase = "error"
-            login?.message = error.localizedDescription
+            login?.message = Self.friendlyError(error)
         }
+    }
+
+    /// Turn a raw HTTP error into an actionable message. A 404 on the login
+    /// endpoints means the daemon predates them (added in llmux 0.2.4).
+    static func friendlyError(_ error: Error) -> String {
+        if case let LlmuxError.http(code, _) = error, code == 404 {
+            return "This llmux daemon doesn't support adding accounts over OAuth. Update it (brew upgrade llmux) and restart (llmux restart) — needs 0.2.4+."
+        }
+        return error.localizedDescription
     }
 
     func cancelLogin() async {
