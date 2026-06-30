@@ -2413,6 +2413,54 @@ async fn timer_sweep_warms_cold_codex_account_without_traffic() {
     );
 }
 
+/// Acceptance (#45, generalized): the sweep warms ANY cold account, not just
+/// Codex. A cold OAuth (Claude) account with ZERO client traffic gains its
+/// windows from a background `max_tokens=1` probe — proving the sweep covers
+/// all backend groups (`trigger_idle_probes(None)`), not the Codex group alone.
+#[tokio::test]
+async fn timer_sweep_warms_cold_oauth_account_without_traffic() {
+    let mock = MockUpstream::spawn().await;
+    // Probe responses carry unified ratelimit headers (5h util 0.10 from ok()).
+    for _ in 0..8 {
+        mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    }
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account("a", "at-a")],
+        ..Default::default()
+    };
+    config.proxy.idle_probe.enabled = true;
+    config.proxy.idle_probe.per_account_cooldown_secs = 3600;
+    config.proxy.idle_probe.sweep_secs = 1; // tight cadence so the test is quick
+    let proxy = Proxy::spawn_config(config).await;
+
+    // `a` starts cold: its /api/oauth/usage poll 404s and there is no traffic.
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|x| x.id.0 == "a")
+            .and_then(|x| x.five_hour)
+            .is_none(),
+        "a is cold before any sweep"
+    );
+
+    // The all-groups sweep probes the cold oauth account with zero client traffic.
+    let util = await_five_hour(&proxy, "a")
+        .await
+        .expect("the timer sweep populated the cold oauth account's 5h window");
+    assert!(
+        (util - 0.10).abs() < 1e-9,
+        "window came from the sweep probe headers"
+    );
+    assert!(
+        probe_count(&mock, "Bearer at-a") >= 1,
+        "the sweep sent a max_tokens=1 probe to the cold oauth account"
+    );
+}
+
 /// Acceptance (#45): the master kill-switch (`enabled = false`) disables the
 /// timer sweep — a cold Codex account is never probed even with `sweep_secs`
 /// set, so its windows stay empty with no traffic.

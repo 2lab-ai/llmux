@@ -534,16 +534,19 @@ pub async fn serve(
         }
     });
 
-    // Background: keep cold Codex accounts warm (issue #45). A cold Codex
-    // account with NO client traffic is never probed by the request path and
-    // never polled by the oauth-only usage poller, so its 5h/7d windows stay
-    // empty forever. When the idle probe is enabled AND a positive sweep cadence
-    // is configured, fire the EXISTING Codex-scoped probe trigger on a timer.
-    // `trigger_idle_probes` is fully self-gated (kill-switch + has-no-window +
-    // per-account cooldown inside `probe_if_idle`), so the per-account cooldown
-    // — not this cadence — bounds cost: at most one probe per account per
-    // `per_account_cooldown_secs`. No second cost guard is added here. Mirrors
-    // the usage poller's `tick` + `sleep` loop; aborted on shutdown.
+    // Background: keep ALL cold accounts warm (issue #45, generalized). A cold
+    // account with NO client traffic is never probed by the request path. The
+    // oauth-only usage poller covers cold *oauth* accounts, but cold Codex AND
+    // cold api-key accounts have no other window source, so their 5h/7d windows
+    // stay empty forever (and show no usage in `status`/dashboard/llmux-islands).
+    // When the idle probe is enabled AND a positive sweep cadence is configured,
+    // fire the probe trigger for EVERY backend group on a timer (`None` = all
+    // groups). `trigger_idle_probes` is fully self-gated (kill-switch +
+    // has-no-window + per-account cooldown inside `probe_if_idle`), so an oauth
+    // account the poller already warmed is skipped (it has a window), and the
+    // per-account cooldown — not this cadence — bounds cost: at most one probe
+    // per account per `per_account_cooldown_secs`. Mirrors the usage poller's
+    // `tick` + `sleep` loop; aborted on shutdown.
     let sweep_task = (state.config.proxy.idle_probe.enabled
         && state.config.proxy.idle_probe.sweep_secs > 0)
         .then(|| {
@@ -551,7 +554,7 @@ pub async fn serve(
             let sweep_period = Duration::from_secs(state.config.proxy.idle_probe.sweep_secs);
             tokio::spawn(async move {
                 loop {
-                    sweep_state.trigger_idle_probes(Some(crate::routing::BackendGroup::Codex));
+                    sweep_state.trigger_idle_probes(None);
                     tokio::time::sleep(sweep_period).await;
                 }
             })
