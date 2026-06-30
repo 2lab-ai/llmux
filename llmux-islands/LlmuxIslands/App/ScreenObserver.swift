@@ -7,6 +7,7 @@
 
 import AppKit
 
+@MainActor
 class ScreenObserver {
     private var observer: Any?
     private let onScreenChange: () -> Void
@@ -17,7 +18,11 @@ class ScreenObserver {
     }
 
     deinit {
-        stopObserving()
+        // deinit is nonisolated; remove the observer inline rather than calling
+        // the @MainActor stopObserving().
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     private func startObserving() {
@@ -30,9 +35,4 @@ class ScreenObserver {
         }
     }
 
-    private func stopObserving() {
-        if let observer = observer {
-            NotificationCenter.default.removeObserver(observer)
-        }
-    }
 }

@@ -22,6 +22,7 @@ class PassThroughHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
+@MainActor
 class NotchViewController: NSViewController {
     private let viewModel: NotchViewModel
     private var hostingView: PassThroughHostingView<NotchView>!
