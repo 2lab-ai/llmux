@@ -10,9 +10,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var windowManager: WindowManager?
     private var screenObserver: ScreenObserver?
+    private var settingsController: SettingsWindowController?
 
     var windowController: NotchWindowController? {
         windowManager?.windowController
+    }
+
+    /// Open (or focus) the standalone Settings window.
+    @MainActor
+    func openSettings() {
+        if settingsController == nil {
+            settingsController = SettingsWindowController(model: IslandUsageModel.shared)
+        }
+        settingsController?.show()
     }
 
     override init() {
@@ -32,6 +42,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task { @MainActor in
             IslandUsageModel.shared.start()
+        }
+
+        // Launch with `--open-settings` to open the Settings window directly
+        // (useful when there is no notch to hover, and for verification).
+        if CommandLine.arguments.contains("--open-settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.openSettings()
+            }
         }
     }
 

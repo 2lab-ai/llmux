@@ -29,7 +29,9 @@ final class IslandUsageModel: ObservableObject {
         var state: String?
     }
 
-    private let client = LlmuxClient()
+    // Rebuilt from the saved settings on each use so the Settings window's
+    // host/port/api-key changes take effect on the next call.
+    private var client: LlmuxClient { LlmuxClient.current() }
     private var pollTask: Task<Void, Never>?
 
     func start() {

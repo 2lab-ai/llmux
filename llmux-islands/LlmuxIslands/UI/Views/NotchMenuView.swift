@@ -31,6 +31,10 @@ struct NotchMenuView: View {
                 viewModel.showUsage()
             }
 
+            MenuRow(icon: "gearshape", label: "Settings…") {
+                AppDelegate.shared?.openSettings()
+            }
+
             Divider()
                 .background(Color.white.opacity(0.08))
                 .padding(.vertical, 4)
