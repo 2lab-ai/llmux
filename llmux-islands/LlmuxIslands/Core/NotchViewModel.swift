@@ -81,11 +81,22 @@ class NotchViewModel: ObservableObject {
         }
     }
 
+    /// Height of the usage panel, sized to the number of account tiles.
+    /// The grid is two columns, so rows = ceil(count / 2); 1–2 accounts fit a
+    /// single row (no tall empty void), 3–4 take two rows, 5+ keep growing and
+    /// then scroll once they hit the screen limit — instead of a fixed 640 that
+    /// left most of the panel black. `perRow`/`chrome` are tuned to the rendered
+    /// tile height (token footer removed, usage rows enlarged).
     private var usageOpenedHeight: CGFloat {
-        let minHeightForTwoDashboardRows: CGFloat = 640
-        let adaptiveHeight = screenRect.height * 0.72
-        let screenLimitedHeight = max(420, screenRect.height - 72)
-        return min(max(adaptiveHeight, minHeightForTwoDashboardRows), screenLimitedHeight)
+        let count = IslandUsageModel.shared.tiles.count
+        let chrome: CGFloat = 96          // notch header + "Usage" toolbar + paddings
+        let perRow: CGFloat = 186         // one grid row of enlarged tiles (measured ≈180)
+        let rowSpacing: CGFloat = 10
+        let rows = max(1, Int(ceil(Double(max(count, 1)) / 2.0)))
+        let desired = chrome + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
+        let minHeight: CGFloat = 240
+        let maxHeight = max(minHeight, screenRect.height - 72)
+        return min(max(desired, minHeight), maxHeight)
     }
 
     // MARK: - Animation
@@ -123,6 +134,14 @@ class NotchViewModel: ObservableObject {
             .store(in: &cancellables)
 
         soundSelector.$isPickerExpanded
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        // Re-evaluate `openedSize` whenever the account count changes so the
+        // usage panel grows/shrinks with the number of tiles (see usageOpenedHeight).
+        IslandUsageModel.shared.$tiles
+            .map(\.count)
+            .removeDuplicates()
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }

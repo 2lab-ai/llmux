@@ -461,14 +461,12 @@ private struct UsageProviderColumn: View {
     let onSetClaudeCodeTokenEnabled: ((String, Bool) -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             header
 
             UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
-
-            claudeCodeTokenFooter
         }
         .contextMenu {
             if provider == .claude, let accountId = normalizedAccountId {
@@ -488,52 +486,10 @@ private struct UsageProviderColumn: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private var claudeCodeTokenFooter: some View {
-        if provider == .claude, let accountId = normalizedAccountId {
-            VStack(spacing: 8) {
-                Rectangle()
-                    .fill(Color.white.opacity(0.06))
-                    .frame(height: 1)
-
-                HStack(spacing: 8) {
-                    Image(systemName: "key.horizontal")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(Color.white.opacity(0.28))
-
-                    Text("Claude Code Token")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(Color.white.opacity(0.35))
-                        .lineLimit(1)
-
-                    Spacer(minLength: 6)
-
-                    if claudeCodeTokenStatus?.isSet == true, let onSetClaudeCodeTokenEnabled {
-                        Toggle(
-                            "",
-                            isOn: Binding(
-                                get: { claudeCodeTokenStatus?.isEnabled ?? false },
-                                set: { onSetClaudeCodeTokenEnabled(accountId, $0) }
-                            )
-                        )
-                        .labelsHidden()
-                        .toggleStyle(SwitchToggleStyle(tint: TerminalColors.red.opacity(0.85)))
-                        .scaleEffect(0.8)
-                    } else {
-                        Text("Not set")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                            .foregroundColor(Color.white.opacity(0.22))
-                            .lineLimit(1)
-                    }
-                }
-            }
-        }
-    }
-
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                UsageProviderIcon(provider: provider, size: 14)
+                UsageProviderIcon(provider: provider, size: 16)
 
                 Spacer(minLength: 0)
 
@@ -584,10 +540,10 @@ private struct UsageProviderColumn: View {
     private var headerTitleFontSize: CGFloat {
         let count = headerTitle.count
         switch count {
-        case 0...16: return 12
-        case 17...26: return 11.5
-        case 27...38: return 11
-        default: return 10.5
+        case 0...16: return 14
+        case 17...26: return 13
+        case 27...38: return 12
+        default: return 11
         }
     }
 
@@ -800,29 +756,26 @@ private struct TierBadge: View {
 private struct UsageTokenRefreshRow: View {
     let tokenRefresh: TokenRefreshInfo?
     let now: Date
-    private let resetColumnWidth: CGFloat = 60
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(alignment: .center, spacing: 12) {
             Image(systemName: "key.fill")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(iconColor)
-                .frame(width: 18, alignment: .leading)
+                .frame(width: 26, alignment: .leading)
 
             MiniSegmentBar(
                 fraction: remainingFraction,
                 fillColor: barFillColor,
                 emptyColor: Color.white.opacity(0.08)
             )
-            .frame(height: 6)
-            .frame(width: resetColumnWidth)
+            .frame(height: 10)
+            .frame(maxWidth: .infinity)
 
             timeRemainingText
-                .frame(width: resetColumnWidth, alignment: .center)
                 .lineLimit(1)
-                .minimumScaleFactor(0.85)
-
-            Spacer(minLength: 0)
+                .minimumScaleFactor(0.7)
+                .frame(minWidth: 84, alignment: .trailing)
         }
         .opacity(tokenRefresh == nil ? 0.65 : 1)
     }
@@ -847,14 +800,16 @@ private struct UsageTokenRefreshRow: View {
     }
 
     private var timeRemainingText: Text {
-        let baseColor = Color.white.opacity(0.28)
-        guard let tokenRefresh else { return Text("--").foregroundColor(baseColor) }
+        let baseColor = Color.white.opacity(0.32)
+        let font = Font.system(size: 14, weight: .semibold, design: .monospaced)
+        guard let tokenRefresh else { return Text("--").font(font).foregroundColor(baseColor) }
         if tokenRefresh.expiresAt <= now {
             return Text("Expired!")
+                .font(font)
                 .foregroundColor(TerminalColors.amber.opacity(0.9))
         }
         let seconds = max(0, Int(tokenRefresh.expiresAt.timeIntervalSince(now)))
-        return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
+        return UsageDurationText.make(seconds: seconds, digitColor: baseColor, scale: 1.3)
     }
 }
 
@@ -929,54 +884,46 @@ private struct UsageWindowRow: View {
     let percentUsed: Double?
     let resetAt: Date?
     let now: Date
-    private let usageColumnWidth: CGFloat = 46
-    private let resetColumnWidth: CGFloat = 60
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(window.label)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.35))
-                    .frame(width: 18, alignment: .leading)
+        HStack(alignment: .top, spacing: 12) {
+            Text(window.label)
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.45))
+                .frame(width: 26, alignment: .leading)
+                .padding(.top, 2)
 
+            // Usage-remaining column (bar over percent), stretches to fill width.
+            VStack(spacing: 6) {
                 MiniSegmentBar(
                     fraction: usageRemainingFraction,
                     fillColor: usageFillColor,
                     emptyColor: Color.white.opacity(0.08)
                 )
-                .frame(height: 6)
-                .frame(width: usageColumnWidth)
+                .frame(height: 10)
 
+                Text(remainingPercentString)
+                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                    .foregroundColor(usageTextColor)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .frame(maxWidth: .infinity)
+
+            // Reset-countdown column (bar over remaining time), stretches to fill width.
+            VStack(spacing: 6) {
                 MiniSegmentBar(
                     fraction: resetRemainingFraction,
                     fillColor: TerminalColors.blue.opacity(0.85),
                     emptyColor: Color.white.opacity(0.08)
                 )
-                .frame(height: 6)
-                .frame(width: resetColumnWidth)
-
-                Spacer(minLength: 0)
-            }
-
-            HStack(spacing: 6) {
-                Color.clear
-                    .frame(width: 18, height: 1)
-
-                Text(remainingPercentString)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(usageTextColor)
-                    .frame(width: usageColumnWidth, alignment: .center)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                .frame(height: 10)
 
                 timeRemainingText
-                    .frame(width: resetColumnWidth, alignment: .center)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-
-                Spacer(minLength: 0)
+                    .minimumScaleFactor(0.7)
             }
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -1011,10 +958,12 @@ private struct UsageWindowRow: View {
     }
 
     private var timeRemainingText: Text {
-        let baseColor = Color.white.opacity(0.28)
-        guard let resetAt else { return Text("--").foregroundColor(baseColor) }
+        let baseColor = Color.white.opacity(0.32)
+        guard let resetAt else {
+            return Text("--").font(.system(size: 14, weight: .semibold, design: .monospaced)).foregroundColor(baseColor)
+        }
         let seconds = max(0, Int(resetAt.timeIntervalSince(now)))
-        return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
+        return UsageDurationText.make(seconds: seconds, digitColor: baseColor, scale: 1.3)
     }
 
     private var windowDurationSeconds: TimeInterval? {

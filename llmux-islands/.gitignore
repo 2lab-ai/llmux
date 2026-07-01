@@ -2,6 +2,7 @@
 LlmuxIslands.xcodeproj/
 # Build output.
 build/
+build-rel/
 build-release/
 dist/
 DerivedData/
