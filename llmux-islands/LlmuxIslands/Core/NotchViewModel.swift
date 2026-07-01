@@ -249,9 +249,19 @@ class NotchViewModel: ObservableObject {
     }
 
     func notchClose() {
+        // In demo/recording mode the island must stay open for the screen
+        // recorder — swallow every close request.
+        guard !DemoMode.isActive else { return }
         status = .closed
         lastNonMenuContentType = .usage
         contentType = .usage
+    }
+
+    /// Open the island and keep it open for screen recording (demo mode). With
+    /// `notchClose()` neutered above, this simply pins the usage panel visible.
+    func enterDemoHold() {
+        contentType = .usage
+        notchOpen(reason: .boot)
     }
 
     func notchPop() {

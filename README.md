@@ -4,7 +4,7 @@
 
 llmux lets you build your agent workflow once on a single canonical harness — [Claude Code](https://www.anthropic.com/claude-code) — and swap the *model* behind it freely. Wherever the next frontier model ships, you don't re-port your setup.
 
-![llmux demo](screenshots/llmux-demo.gif)
+![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
 
 ## The problem
 
@@ -156,9 +156,21 @@ Both attach paths are read-only except manual switching through the gated loopba
 
 Recording a demo or sharing your screen? Set `LLMUX_DEMO_MODE=1` and the dashboard,
 status, and logs show **stable fake emails** in place of your real account names
-(and config writes are suppressed so the aliases never touch disk). The recipe
-behind `screenshots/llmux-demo.gif` is committed at [`demo/llmux.tape`](demo/llmux.tape)
-(vhs).
+(and config writes are suppressed so the aliases never touch disk). The islands app
+has the same masking via `--demo` (or `LLMUX_ISLANDS_DEMO=1`), which also opens and
+holds the notch panel open so it can be recorded.
+
+Two demo GIFs are (re)generated at deploy time and attached to each release:
+
+- **CLI / TUI** — [`demo/llmux.tape`](demo/llmux.tape) (vhs) →
+  [`llmux-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
+- **Islands app** — `--demo` capture →
+  [`llmux-islands-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-islands-demo.gif)
+
+Recorders live in [`demo/`](demo/): `record-cli.sh`, `record-islands.sh`, and
+`record-all.sh` (records both + `gh release upload`). The app capture needs a
+one-time macOS **Screen Recording** grant for the terminal you run it from
+(that's why it runs locally, not in CI).
 
 ## Configuration
 

@@ -48,11 +48,33 @@ final class IslandUsageModel: ObservableObject {
         do {
             let status = try await client.status()
             current = status.current
-            tiles = status.accounts.map(Self.tile(from:))
+            tiles = status.accounts.enumerated().map { index, account in
+                let tile = Self.tile(from: account)
+                return DemoMode.isActive ? Self.demoMasked(tile, index: index) : tile
+            }
             connection = .online
         } catch {
             connection = .offline(error.localizedDescription)
         }
+    }
+
+    /// Replace an account's real email/label with a stable fake so a public demo
+    /// recording never leaks account names. Usage numbers stay real (not PII).
+    static func demoMasked(_ tile: UsageAccountTile, index: Int) -> UsageAccountTile {
+        let fake = DemoMode.fakeEmail(index: index)
+        return UsageAccountTile(
+            id: fake,
+            provider: tile.provider,
+            accountId: fake,
+            label: fake,
+            email: fake,
+            tier: tile.tier,
+            claudeIsTeam: tile.claudeIsTeam,
+            tokenRefresh: tile.tokenRefresh,
+            info: tile.info,
+            errorMessage: tile.errorMessage,
+            issue: tile.issue
+        )
     }
 
     /// Map one llmux account record onto the agent-island tile model.
