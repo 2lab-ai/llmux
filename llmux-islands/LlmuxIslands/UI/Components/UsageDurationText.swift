@@ -10,12 +10,13 @@ enum UsageDurationText {
         dayUnitColor: Color = TerminalColors.amber.opacity(0.95),
         hourUnitColor: Color = TerminalColors.blue.opacity(0.85),
         minuteUnitColor: Color = TerminalColors.cyan.opacity(0.55),
-        secondUnitColor: Color = Color.white.opacity(0.35)
+        secondUnitColor: Color = Color.white.opacity(0.35),
+        scale: CGFloat = 1
     ) -> Text {
         let clamped = max(0, seconds)
-        let largestDigitSize: CGFloat = 13
-        let mediumDigitSize: CGFloat = 11
-        let baseDigitSize: CGFloat = 10
+        let largestDigitSize: CGFloat = 13 * scale
+        let mediumDigitSize: CGFloat = 11 * scale
+        let baseDigitSize: CGFloat = 10 * scale
 
         func piece(_ value: String, size: CGFloat, color: Color) -> Text {
             Text(value)
