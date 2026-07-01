@@ -87,9 +87,15 @@ class NotchWindowController: NSWindowController {
         // Start with ignoring mouse events (closed state)
         notchWindow.ignoresMouseEvents = true
 
-        // Perform boot animation after a brief delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.viewModel.performBootAnimation()
+        // In demo/recording mode, open the island and hold it open so a screen
+        // recorder can capture the usage panel without a human hovering the notch.
+        // Otherwise perform the usual brief boot animation.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (DemoMode.isActive ? 0.4 : 0.3)) { [weak self] in
+            if DemoMode.isActive {
+                self?.viewModel.enterDemoHold()
+            } else {
+                self?.viewModel.performBootAnimation()
+            }
         }
     }
 
