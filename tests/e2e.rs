@@ -105,8 +105,16 @@ impl Proxy {
 
     /// [`Self::spawn`] over a fully custom config (codex tests point
     /// `config.codex` at the mock).
-    async fn spawn_config(mut config: Config) -> Self {
+    async fn spawn_config(config: Config) -> Self {
+        Self::spawn_prepared(config, |_| {}).await
+    }
+
+    /// [`Self::spawn_config`] with a hook that runs against the tempdir BEFORE
+    /// the server starts — the seam for pre-seeding persisted state (e.g. an
+    /// `activity.jsonl` from a "previous run") that startup must hydrate.
+    async fn spawn_prepared(mut config: Config, prepare: impl FnOnce(&std::path::Path)) -> Self {
         let tmp = TempDir::new();
+        prepare(tmp.path());
         let config_path = tmp.path().join("llmux.json");
         config.proxy.port = 0; // OS-assigned; `serve` reports it via `ready`
         config::save_path(&config_path, &config).expect("seed config");
@@ -2668,4 +2676,93 @@ async fn settings_flip_email_anonymous_live_and_persisted() {
     let on_disk = config::load_path(&proxy.config_path).expect("reload config");
     assert!(on_disk.email_anonymous, "flag persisted");
     assert_eq!(on_disk.accounts.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Lazy history hydration: serve first, hydrate later
+// ---------------------------------------------------------------------------
+
+/// One pre-boot persisted activity line (the stable v1 on-disk schema), as a
+/// previous daemon run would have appended it.
+fn persisted_line(id: u64, ts_ms: u64, account: &str) -> String {
+    format!(
+        r#"{{"v":1,"ts_ms":{ts_ms},"id":{id},"method":"POST","path":"/v1/messages","account":"{account}","status":200,"duration_ms":12,"tokens":{{"input":10,"output":5,"cache_read":null,"cache_creation":null}},"group":"claude","model":"claude-sonnet-4-5","effort":null,"user_id":null}}"#
+    )
+}
+
+/// Startup no longer waits on the persisted history (the lazy-load fix):
+/// `ready` fires and `/llmux/status` + proxy traffic answer with hydration
+/// still pending, the historical totals stream in BEHIND live traffic
+/// afterwards, and a request served during hydration is counted exactly once
+/// (the cut excludes live appends from the replay).
+#[tokio::test]
+async fn readiness_precedes_history_hydration_and_live_requests_survive_it() {
+    const HISTORY: u64 = 250;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(
+        r#"{"id":"msg_1","type":"message","usage":{"input_tokens":7,"output_tokens":3}}"#,
+    ));
+
+    // Seed a "previous run": 250 persisted requests for account a.
+    let proxy = Proxy::spawn_prepared(
+        Config {
+            upstream: mock.base_url(),
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        },
+        |dir| {
+            let lines: String = (0..HISTORY)
+                .map(|i| persisted_line(i, 1_000 + i, "a") + "\n")
+                .collect();
+            std::fs::write(dir.join("activity.jsonl"), lines).expect("seed history");
+        },
+    )
+    .await;
+
+    // (a) Readiness: `ready` has fired (spawn_prepared awaited it) and status
+    // answers regardless of hydration progress.
+    let client = reqwest::Client::new();
+    let status = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable immediately after ready");
+    assert_eq!(status.status(), 200, "status serves before hydration");
+
+    // (b) Live traffic during/after hydration is served and counted.
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 200, "proxy serves during hydration");
+
+    // (c) History lands behind live: totals converge to history + live,
+    // exactly once each (no double count of the live append past the cut).
+    let expected = HISTORY + 1;
+    let mut last = 0;
+    for _ in 0..200 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        last = doc["totals"]["requests"].as_u64().expect("totals");
+        if last >= expected {
+            assert_eq!(
+                last, expected,
+                "every request counted exactly once (history {HISTORY} + 1 live)"
+            );
+            // The hydration completion note surfaced in the activity feed.
+            let noted = doc["activity"]["completed"]
+                .as_array()
+                .expect("completed array")
+                .iter()
+                .any(|row| {
+                    row["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("history loaded: 250"))
+                });
+            assert!(noted, "hydration completion note visible: {doc}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("history never hydrated: totals stuck at {last}, expected {expected}");
 }
