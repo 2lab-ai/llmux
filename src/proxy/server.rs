@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,14 @@ pub struct AppState {
     /// Actually bound port (config port until `serve` binds; the OS-assigned
     /// port afterwards — matters for `proxy.port = 0` test servers).
     pub bound_port: Arc<AtomicU16>,
+    /// LIVE value of the `email_anonymous` display setting: seeded from
+    /// `config.email_anonymous`, flipped at runtime by `POST /llmux/settings`
+    /// (which also persists it read-merge-write), read by `/llmux/status`,
+    /// the dashboard document, and the local TUI each frame — so a flip
+    /// reflects everywhere without a restart. Atomic (not `config`) because
+    /// `AppState.config` is a per-clone snapshot; shared mutable state must
+    /// ride an `Arc`.
+    pub email_anonymous: Arc<AtomicBool>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
@@ -242,6 +250,7 @@ impl AppState {
             activity_log_path: crate::cli::daemon::activity_log_path(),
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
+            email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
             config,
             events: Some(events_tx),
             hub: Arc::new(DashboardHub::default()),
@@ -728,6 +737,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/dashboard", get(dashboard_endpoint))
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
+        .route("/llmux/settings", post(settings_endpoint))
         .route("/llmux/add-account", post(add_account_endpoint))
         .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
@@ -796,6 +806,8 @@ pub struct ServerMeta {
     pub pid: u32,
     pub uptime_secs: u64,
     pub port: u16,
+    /// Live `email_anonymous` display setting (see [`AppState::email_anonymous`]).
+    pub email_anonymous: bool,
 }
 
 /// Serializable `/llmux/status` document — pure function of a pool
@@ -887,6 +899,11 @@ pub fn status_json(
         "pid": meta.pid,
         "uptime_secs": meta.uptime_secs,
         "port": meta.port,
+        // Live display setting (additive). Account names above stay REAL —
+        // masking is a per-display-surface concern (the TUI render layer,
+        // islands' pixelization); masking the API data would break clients'
+        // OFF state.
+        "email_anonymous": meta.email_anonymous,
         "current": snapshot.representative_current().map(|c| c.0.clone()),
         "current_by_group": current_by_group,
         "accounts": accounts,
@@ -900,6 +917,7 @@ async fn status(State(state): State<AppState>) -> Response {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(Ordering::Relaxed),
+        email_anonymous: state.email_anonymous.load(Ordering::Relaxed),
     };
     let body = status_json(
         &state.pool.snapshot(),
@@ -1031,6 +1049,54 @@ async fn codex_config_endpoint(
             "fast": shape.fast,
             "default_model": shape.model,
             "reasoning_effort": shape.effort,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// Partial update for `POST /llmux/settings` — daemon-wide display settings.
+/// Every field is optional; an omitted field keeps its current value (same
+/// contract as `POST /llmux/codex`), so the endpoint stays additive as more
+/// settings join it.
+#[derive(serde::Deserialize)]
+struct SettingsRequest {
+    /// Mask account emails on display surfaces (TUI render layer; islands
+    /// mirrors it into its pixelization). See `Config::email_anonymous`.
+    email_anonymous: Option<bool>,
+}
+
+/// `POST /llmux/settings` `{"email_anonymous":true|false}` — flip the
+/// email-anonymous display setting remotely (SSOT E3). Same loopback /
+/// proxy-api-key gate as every route (it sits on the shared `.route(...)`
+/// chain behind `client_auth`). Persist-then-apply: the value is written
+/// read-merge-write via [`crate::config::update_path`] FIRST (so a failed
+/// write never leaves live state diverged from disk), then swapped into the
+/// live [`AppState::email_anonymous`] atomic so status/dashboard/TUI reflect
+/// it with no restart. The response echoes the effective value; an empty body
+/// `{}` is a read-back no-op.
+async fn settings_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<SettingsRequest>,
+) -> Response {
+    if let Some(enabled) = body.email_anonymous {
+        if let Some(path) = &state.config_path {
+            if let Err(err) = crate::config::update_path(path, |c| c.email_anonymous = enabled) {
+                return relay_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("config write failed: {err}"),
+                );
+            }
+        }
+        state.email_anonymous.store(enabled, Ordering::Relaxed);
+        tracing::info!(email_anonymous = enabled, "settings updated");
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "ok": true,
+            "email_anonymous": state.email_anonymous.load(Ordering::Relaxed),
         })
         .to_string(),
     )
@@ -1596,6 +1662,7 @@ mod tests {
             pid: 4321,
             uptime_secs: 7980,
             port: 3456,
+            email_anonymous: false,
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
 
@@ -1607,6 +1674,7 @@ mod tests {
         assert_eq!(doc["pid"], 4321);
         assert_eq!(doc["uptime_secs"], 7980);
         assert_eq!(doc["port"], 3456);
+        assert_eq!(doc["email_anonymous"], false, "live setting surfaced (E2)");
         let accounts = doc["accounts"].as_array().expect("accounts array");
         assert_eq!(accounts.len(), 2);
 
@@ -1653,6 +1721,7 @@ mod tests {
             pid: 1,
             uptime_secs: 0,
             port: 3456,
+            email_anonymous: false,
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -1686,6 +1755,7 @@ mod tests {
             pid: 1,
             uptime_secs: 0,
             port: 0,
+            email_anonymous: false,
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -1716,6 +1786,7 @@ mod tests {
             pid: 1,
             uptime_secs: 0,
             port: 0,
+            email_anonymous: false,
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -1780,6 +1851,7 @@ mod tests {
                 pid: 1,
                 uptime_secs: 0,
                 port: 0,
+                email_anonymous: false,
             },
         );
         let names: Vec<&str> = doc["accounts"]
@@ -2229,5 +2301,123 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- email_anonymous: status surface + settings endpoint ----------------
+
+    #[test]
+    fn status_json_reports_email_anonymous_but_keeps_names_real() {
+        // T1 (SSOT): the flag is surfaced, but the API data itself is NEVER
+        // masked — islands' OFF state and its mosaic both need real names.
+        let now = SystemTime::now();
+        let pool = AccountPool::new(&[oauth_account("me@real-domain.com")]);
+        pool.evaluate(None, &params(), now);
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &ServerMeta {
+                pid: 1,
+                uptime_secs: 0,
+                port: 0,
+                email_anonymous: true,
+            },
+        );
+        assert_eq!(doc["email_anonymous"], true);
+        assert_eq!(
+            doc["accounts"][0]["name"], "me@real-domain.com",
+            "API names stay real; masking is a display concern"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_flips_live_state_and_persists() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        assert!(!state.email_anonymous.load(Ordering::Relaxed), "seed off");
+
+        let response = settings_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SettingsRequest {
+                email_anonymous: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["email_anonymous"], true, "ack echoes the new value");
+
+        // Live effect, no restart (E3).
+        assert!(state.email_anonymous.load(Ordering::Relaxed));
+        // Persisted read-merge-write: the flag is on disk AND the seeded
+        // account survived the write.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert!(on_disk.email_anonymous);
+        assert_eq!(on_disk.accounts.len(), 1);
+
+        // Flip back off through the same endpoint.
+        let response = settings_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SettingsRequest {
+                email_anonymous: Some(false),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.email_anonymous.load(Ordering::Relaxed));
+        assert!(
+            !crate::config::load_path(&path)
+                .expect("reload")
+                .email_anonymous
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_empty_body_is_a_readback_noop() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+        state.email_anonymous.store(true, Ordering::Relaxed);
+
+        let response = settings_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SettingsRequest {
+                email_anonymous: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["email_anonymous"], true, "reads back current value");
+        // Nothing written: the on-disk config still says false.
+        assert!(
+            !crate::config::load_path(&path)
+                .expect("reload")
+                .email_anonymous
+        );
+    }
+
+    /// The settings route sits on the shared `.route(...)` chain behind the
+    /// `client_auth` middleware, so the auth semantics are exactly
+    /// [`client_auth_ok`] (unit-covered above): non-loopback peers must
+    /// present the proxy api key, loopback is exempt. This test pins the
+    /// decision for the settings mutation specifically.
+    #[test]
+    fn settings_mutation_auth_follows_shared_gate() {
+        let remote = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(
+            !client_auth_ok(Some("lm-secret"), Some(remote), None),
+            "non-loopback without key is rejected before the handler runs"
+        );
+        assert!(client_auth_ok(
+            Some("lm-secret"),
+            Some(remote),
+            Some("lm-secret")
+        ));
+        assert!(client_auth_ok(Some("lm-secret"), Some(loopback), None));
     }
 }

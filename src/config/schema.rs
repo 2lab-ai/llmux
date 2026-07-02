@@ -62,6 +62,19 @@ pub struct Config {
     /// with the defaults (capture on, 90-day retention).
     #[serde(default)]
     pub raw_io: RawIoConfig,
+    /// Render account emails masked on DISPLAY surfaces (the TUI and
+    /// llmux-islands' pixelization), reusing the deterministic
+    /// [`crate::demo::alias_always`] mapping at the render layer. This is a
+    /// display-only concern: API responses (`/llmux/status`,
+    /// `/llmux/dashboard`) keep REAL account names — clients that mask do so
+    /// themselves per surface (islands needs the real data for its OFF state).
+    /// Settable at runtime via `POST /llmux/settings` (persisted
+    /// read-merge-write + applied live, no restart). Independent of
+    /// `LLMUX_DEMO_MODE`, which keeps its load-time aliasing and therefore
+    /// takes precedence when both are on. Additive (`#[serde(default)]`): a
+    /// config written before this field loads with masking OFF.
+    #[serde(default)]
+    pub email_anonymous: bool,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -77,6 +90,7 @@ impl Default for Config {
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),
             raw_io: RawIoConfig::default(),
+            email_anonymous: false,
             accounts: Vec::new(),
         }
     }

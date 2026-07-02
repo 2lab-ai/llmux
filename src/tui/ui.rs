@@ -82,6 +82,33 @@ struct FrameCtx {
     headers_only: bool,
     /// Monotonic animation frame counter (drives `anim` glyphs).
     frame: usize,
+    /// Live `email_anonymous` display setting (SSOT E4) — carried here so
+    /// surfaces that render from `chrome` only (sessions overlay, footer
+    /// status) can mask without a `view` handle.
+    mask: bool,
+}
+
+/// Display form of an account name under the `email_anonymous` setting:
+/// masked through the deterministic demo alias when on, raw otherwise. Render
+/// layer ONLY — the view snapshot keeps real ids so switch/remove still
+/// address the pool correctly.
+fn masked_name(name: &str, mask: bool) -> String {
+    if mask {
+        crate::demo::alias_always(name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Display form of free text that may EMBED emails (activity notes, tracing
+/// lines, footer status): every email-looking token is aliased when masking
+/// is on, the rest passes through untouched.
+fn masked_text(text: &str, mask: bool) -> String {
+    if mask {
+        crate::demo::mask_email_text(text)
+    } else {
+        text.to_string()
+    }
 }
 
 /// Top-level draw entry. `view` is `None` only in attach mode before the
@@ -108,6 +135,7 @@ pub(crate) fn draw(
         order: view.display_order(now),
         headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
         frame: chrome.frame,
+        mask: view.email_anonymous,
     };
 
     // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
@@ -136,7 +164,7 @@ pub(crate) fn draw(
         height: 2,
     };
     frame.render_widget(Clear, footer_area);
-    draw_footer(frame, footer_area, chrome);
+    draw_footer(frame, footer_area, chrome, ctx.mask);
 }
 
 /// MAIN — the always-rendered wall-clock view (issue #5): header banner ·
@@ -452,7 +480,13 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
     let accounts = if s.accounts.is_empty() {
         "—".to_string()
     } else {
-        s.accounts.join(", ")
+        // Session accounts are emails from the raw-io log — same
+        // email-anonymous masking as every other account surface.
+        s.accounts
+            .iter()
+            .map(|a| masked_name(a, ctx.mask))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let first = format::absolute_label(ms_to_systemtime(s.first_ms), ctx.now, ctx.tz_offset);
     let last = format::absolute_label(ms_to_systemtime(s.last_ms), ctx.now, ctx.tz_offset);
@@ -576,7 +610,8 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
         ))),
         body_area,
     );
-    draw_footer(frame, footer_area, chrome);
+    // No document yet → no live setting to honor; nothing here shows emails.
+    draw_footer(frame, footer_area, chrome, false);
 }
 
 /// Attach-mode header markers: `attached → pid N` (or `pid ?`), turning into a
@@ -742,11 +777,11 @@ fn account_row<'a>(
     };
     let name = if is_current {
         Span::styled(
-            account.id.to_string(),
+            masked_name(&account.id.0, ctx.mask),
             Style::new().add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::raw(account.id.to_string())
+        Span::raw(masked_name(&account.id.0, ctx.mask))
     };
     let parked = matches!(gate, Some(IneligibleReason::CoolingDown));
     // Poller-health overlay (issue #33): a failing usage poll makes every
@@ -1060,7 +1095,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
         match snapshot.current_for_group(*g) {
             Some(current) => {
                 spans.push(Span::styled(
-                    current.to_string(),
+                    masked_name(&current.0, ctx.mask),
                     Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ));
                 if let Some(switch) = view.last_switch.as_ref().filter(|s| s.to == current.0) {
@@ -1072,7 +1107,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
                     let from = switch
                         .from
                         .as_deref()
-                        .map(|f| format!("{f} → "))
+                        .map(|f| format!("{} → ", masked_name(f, ctx.mask)))
                         .unwrap_or_default();
                     spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
                 }
@@ -1098,7 +1133,10 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
                 format!("{:<7}", g.as_str()),
                 group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(next.map(|n| n.to_string()).unwrap_or_else(|| "—".into())),
+            Span::raw(
+                next.map(|n| masked_name(&n.0, ctx.mask))
+                    .unwrap_or_else(|| "—".into()),
+            ),
         ];
         if i == 0 {
             spans.push(Span::styled(
@@ -1203,7 +1241,11 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
             next_in = Some(next_in.map_or(eta, |cur| cur.min(eta)));
         }
         if health.consecutive_failures > 0 {
-            backoff.push(format!("{}×{}", account.id, health.consecutive_failures));
+            backoff.push(format!(
+                "{}×{}",
+                masked_name(&account.id.0, view.email_anonymous),
+                health.consecutive_failures
+            ));
         }
     }
     if ok_ages.is_empty() && backoff.is_empty() {
@@ -1270,7 +1312,7 @@ fn draw_detail(
     let mut lines: Vec<Line> = Vec::with_capacity(7);
     lines.push(Line::from(vec![
         Span::styled(
-            format!(" {}", account.id),
+            format!(" {}", masked_name(&account.id.0, ctx.mask)),
             Style::new().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" · {}", account.credential_kind), dim()),
@@ -1530,7 +1572,10 @@ fn draw_activity(
                 spans.push(Span::styled(meta, group_color(request.group.as_deref())));
             }
             if let Some(account) = &request.account {
-                spans.push(Span::raw(format!(" → {account}")));
+                spans.push(Span::raw(format!(
+                    " → {}",
+                    masked_name(account, view.email_anonymous)
+                )));
             }
             spans.push(Span::styled(
                 format!(" ({}…)", format::elapsed_secs(elapsed)),
@@ -1557,10 +1602,10 @@ fn draw_activity(
             .activity_key()
             .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
         let row_y = body_top.saturating_add(lines.len() as u16);
-        lines.push(completed_line(entry, expanded));
+        lines.push(completed_line(entry, expanded, view.email_anonymous));
         let mut height = 1u16;
         if expanded {
-            for detail in completed_detail_lines(entry) {
+            for detail in completed_detail_lines(entry, view.email_anonymous) {
                 if lines.len() >= capacity {
                     break;
                 }
@@ -1600,7 +1645,9 @@ fn draw_activity(
 
 /// The one-line activity row. For request entries a leading marker shows the
 /// expand state (`▸` collapsed / `▾` expanded); notes keep the plain indent.
-fn completed_line(entry: &Completed, expanded: bool) -> Line<'static> {
+/// `mask` applies the email-anonymous display setting: the account name and
+/// any email embedded in a note ("switch a@x → b@y") render aliased.
+fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
             method,
@@ -1618,7 +1665,10 @@ fn completed_line(entry: &Completed, expanded: bool) -> Line<'static> {
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
                 dim(),
             );
-            let account = account.as_deref().unwrap_or("?");
+            let account = account
+                .as_deref()
+                .map(|a| masked_name(a, mask))
+                .unwrap_or_else(|| "?".to_string());
             let status_style = if *status < 400 {
                 Style::new().fg(Color::Green)
             } else {
@@ -1663,7 +1713,7 @@ fn completed_line(entry: &Completed, expanded: bool) -> Line<'static> {
             } else {
                 Style::new()
             };
-            Line::from(vec![stamp, Span::styled(text.clone(), style)])
+            Line::from(vec![stamp, Span::styled(masked_text(text, mask), style)])
         }
     }
 }
@@ -1671,8 +1721,9 @@ fn completed_line(entry: &Completed, expanded: bool) -> Line<'static> {
 /// Indented detail lines for an expanded request row (Feature B): full
 /// method+path, account, status, duration, group/model/effort, the token
 /// breakdown, and the per-component + total API-equivalent cost via
-/// [`crate::pricing`]. Empty for notes (never expandable).
-fn completed_detail_lines(entry: &Completed) -> Vec<Line<'static>> {
+/// [`crate::pricing`]. Empty for notes (never expandable). `mask` = the
+/// email-anonymous display setting (the account line renders aliased).
+fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
     let CompletedBody::Request {
         method,
         path,
@@ -1697,7 +1748,10 @@ fn completed_detail_lines(entry: &Completed) -> Vec<Line<'static>> {
     lines.push(indent("request", format!("{method} {path}")));
     lines.push(indent(
         "account",
-        account.clone().unwrap_or_else(|| "?".to_string()),
+        account
+            .as_deref()
+            .map(|a| masked_name(a, mask))
+            .unwrap_or_else(|| "?".to_string()),
     ));
     let status_color = if *status < 400 {
         Color::Green
@@ -1841,7 +1895,10 @@ fn draw_logs(frame: &mut Frame, area: Rect, view: &DashboardView) {
     let capacity = area.height.saturating_sub(1) as usize; // top border
                                                            // `view.logs` is oldest→newest; take the newest `capacity` lines.
     let start = view.logs.len().saturating_sub(capacity);
-    let lines: Vec<Line> = view.logs[start..].iter().map(log_line).collect();
+    let lines: Vec<Line> = view.logs[start..]
+        .iter()
+        .map(|line| log_line(line, view.email_anonymous))
+        .collect();
     // Bottom-align: pad above so the newest line hugs the bottom edge.
     let mut padded: Vec<Line> = Vec::with_capacity(capacity);
     padded.resize_with(capacity.saturating_sub(lines.len()), Line::default);
@@ -1849,7 +1906,7 @@ fn draw_logs(frame: &mut Frame, area: Rect, view: &DashboardView) {
     frame.render_widget(Paragraph::new(padded).block(block), area);
 }
 
-fn log_line(line: &LogLine) -> Line<'_> {
+fn log_line(line: &LogLine, mask: bool) -> Line<'_> {
     use tracing::Level;
 
     let (label, style) = if line.level == Level::ERROR {
@@ -1865,7 +1922,9 @@ fn log_line(line: &LogLine) -> Line<'_> {
     };
     Line::from(vec![
         Span::styled(format!(" {label} "), style),
-        Span::raw(line.text.as_str()),
+        // Tracing lines carry account emails (switch/refresh messages) — the
+        // email-anonymous setting masks them at render time.
+        Span::raw(masked_text(&line.text, mask)),
     ])
 }
 
@@ -2281,7 +2340,7 @@ fn draw_model_detail(
     } else {
         for a in &m.accounts {
             lines.push(Line::from(vec![
-                Span::raw(format!("   {} ", a.name)),
+                Span::raw(format!("   {} ", masked_name(&a.name, ctx.mask))),
                 Span::styled(
                     format!(
                         "{} req · in {}/out {}",
@@ -2377,7 +2436,13 @@ fn draw_heatmap(
                 group_color(Some(c.group.as_str())),
             ),
             Span::raw(format!(" {:<20}", trunc(&c.model, 20))),
-            Span::styled(format!(" {:<14}", trunc(&c.account, 14)), dim()),
+            Span::styled(
+                format!(
+                    " {:<14}",
+                    trunc(&masked_name(&c.account, view.email_anonymous), 14)
+                ),
+                dim(),
+            ),
             Span::raw(format!(" {:>6}", format::human_count(c.requests))),
             Span::raw(format!(" {:>8}", format::human_count(c.tokens))),
             Span::raw("  "),
@@ -2407,9 +2472,14 @@ fn trunc(s: &str, width: usize) -> String {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome) {
+fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+    // Status messages quote account names ("switched to a@x.com") — mask any
+    // embedded email under the email-anonymous setting.
     let status = Line::from(Span::styled(
-        format!(" {}", chrome.status_line.as_deref().unwrap_or("")),
+        format!(
+            " {}",
+            masked_text(chrome.status_line.as_deref().unwrap_or(""), mask)
+        ),
         Style::new().fg(Color::Yellow),
     ));
     let key = |k: &'static str| {
@@ -2629,6 +2699,7 @@ mod tests {
             client_usage: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
+            email_anonymous: false,
         }
     }
 
@@ -3290,5 +3361,197 @@ mod tests {
             layout.hits.is_empty(),
             "a note line is not a clickable hit target"
         );
+    }
+
+    // --- email_anonymous: render-layer masking (SSOT E4) --------------------
+
+    /// The email that must never survive an anonymous render, planted on every
+    /// email-bearing surface: table, detail, current/next, poller backoff,
+    /// in-flight + completed + note activity lines, logs, model accounts,
+    /// heatmap cells, sessions, footer status.
+    const LEAK: &str = "me@leak-domain.com";
+
+    fn email_everywhere_view() -> DashboardView {
+        use super::super::activity::{Completed, CompletedBody, InFlight, Totals};
+        use super::super::{LastSwitch, PollHealth};
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let mut view = view_with(vec![crate::dashboard::ModelUsageDoc {
+            group: "claude".into(),
+            model: "claude-opus-4-8".into(),
+            requests: 1,
+            ok: 1,
+            errors: 0,
+            tokens_in: 10,
+            tokens_out: 5,
+            cache_read: None,
+            cache_creation: None,
+            last_used_ms: 1,
+            in_flight: 0,
+            accounts: vec![crate::dashboard::ModelAccountDoc {
+                name: LEAK.into(),
+                requests: 1,
+                ok: 1,
+                errors: 0,
+                tokens_in: 10,
+                tokens_out: 5,
+            }],
+            efforts: Vec::new(),
+            endpoints: Vec::new(),
+        }]);
+        view.email_anonymous = true;
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId(LEAK.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 1,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }];
+        view.snapshot
+            .current
+            .insert(BackendGroup::Claude, AccountId(LEAK.into()));
+        view.last_switch = Some(LastSwitch {
+            from: Some(LEAK.into()),
+            to: LEAK.into(),
+            reason: Some("manual".into()),
+            at: UNIX_EPOCH,
+        });
+        view.poll_health.insert(
+            LEAK.into(),
+            PollHealth {
+                last_ok: Some(UNIX_EPOCH),
+                consecutive_failures: 2,
+                next_at: UNIX_EPOCH,
+            },
+        );
+        view.session_totals.insert(LEAK.into(), Totals::default());
+        view.in_flight = vec![InFlight {
+            id: 7,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some(LEAK.into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            started_at: UNIX_EPOCH,
+        }];
+        view.completed = vec![
+            Completed {
+                at: UNIX_EPOCH + Duration::from_millis(2),
+                body: CompletedBody::Request {
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    account: Some(LEAK.into()),
+                    status: 200,
+                    duration: Duration::from_millis(10),
+                    tokens: None,
+                    group: Some("claude".into()),
+                    model: Some("claude-opus-4-8".into()),
+                    effort: None,
+                },
+            },
+            Completed {
+                at: UNIX_EPOCH + Duration::from_millis(1),
+                body: CompletedBody::Note {
+                    text: format!("switch {LEAK} → {LEAK} (manual)"),
+                    error: false,
+                },
+            },
+        ];
+        view.logs = vec![LogLine {
+            level: tracing::Level::INFO,
+            text: format!("proxy: account {LEAK} refreshed"),
+        }];
+        view.windowed = vec![crate::dashboard::WindowedStatsDoc {
+            window: "24h".into(),
+            window_secs: 86_400,
+            cells: vec![crate::dashboard::WindowedCellDoc {
+                group: "claude".into(),
+                model: "claude-opus-4-8".into(),
+                account: LEAK.into(),
+                requests: 1,
+                ok: 1,
+                errors: 0,
+                tokens_in: 10,
+                tokens_out: 5,
+                cache_read: 0,
+                cache_creation: 0,
+                tokens: 15,
+            }],
+        }];
+        view
+    }
+
+    fn email_everywhere_chrome(overlay: Overlay) -> Chrome {
+        let mut chrome = chrome_overlay(overlay);
+        chrome.status_line = Some(format!("switched to {LEAK} (manual)"));
+        chrome.sessions = vec![crate::session::Session {
+            user_id: Some("acct_x".into()),
+            requests: 1,
+            tokens_in: 10,
+            tokens_out: 5,
+            models: vec!["claude-opus-4-8".into()],
+            accounts: vec![LEAK.into()],
+            account_rotations: 0,
+            first_ms: 1,
+            last_ms: 2,
+            confidence: crate::session::Confidence::High,
+        }];
+        chrome
+    }
+
+    /// E4: with the setting ON, no surface (MAIN or any overlay) renders the
+    /// raw email; the deterministic alias appears instead. The control render
+    /// (setting OFF) proves the raw email WOULD be visible at this size, so
+    /// the masked assertion can't pass vacuously through truncation.
+    #[test]
+    fn email_anonymous_masks_every_render_surface() {
+        for overlay in [
+            Overlay::None,
+            Overlay::Accounts,
+            Overlay::Stats,
+            Overlay::Logs,
+            Overlay::Sessions,
+        ] {
+            let mut view = email_everywhere_view();
+            let chrome = email_everywhere_chrome(overlay);
+
+            view.email_anonymous = false;
+            let control = render(&view, &chrome, 220, 50);
+            assert!(
+                control.contains("leak-domain"),
+                "control ({overlay:?}): raw email must be visible when masking is off"
+            );
+
+            view.email_anonymous = true;
+            let masked = render(&view, &chrome, 220, 50);
+            assert!(
+                !masked.contains("leak-domain"),
+                "masked ({overlay:?}): raw email leaked:\n{masked}"
+            );
+            assert!(
+                masked.contains(&crate::demo::alias_always(LEAK)),
+                "masked ({overlay:?}): alias not rendered"
+            );
+        }
+    }
+
+    /// Both ON: demo mode aliases at config load (names arrive pre-aliased in
+    /// the doc), and render-layer masking aliases again — the result is still
+    /// a pool alias, never a real email (SSOT T2).
+    #[test]
+    fn email_anonymous_composes_with_demo_aliases() {
+        let alias_of_alias = crate::demo::alias_always(&crate::demo::alias_always(LEAK));
+        assert!(
+            alias_of_alias.ends_with("@example.com"),
+            "still a fake-pool email: {alias_of_alias}"
+        );
+        assert!(!alias_of_alias.contains("leak-domain"));
     }
 }

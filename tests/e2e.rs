@@ -2605,3 +2605,67 @@ async fn login_endpoints_validate_input_without_a_browser() {
     let body: serde_json::Value = resp.json().await.expect("cancel json");
     assert_eq!(body["cancelled"], serde_json::Value::Bool(false));
 }
+
+// ---------------------------------------------------------------------------
+// email_anonymous: status surface + remote flip + persistence (SSOT E1–E3)
+// ---------------------------------------------------------------------------
+
+/// Over a real socket: `/llmux/status` starts with `email_anonymous:false`,
+/// `POST /llmux/settings` flips it live (no restart), status reflects the new
+/// value, and the tempdir config now persists it — while account names in the
+/// status document stay REAL (T1). Loopback requests are api-key-exempt; the
+/// non-loopback key requirement is unit-covered in `proxy::server::tests`.
+#[tokio::test]
+async fn settings_flip_email_anonymous_live_and_persisted() {
+    let proxy = Proxy::spawn(
+        "http://127.0.0.1:1",
+        vec![oauth_account("me@real-mail.com", "at-real")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // (a) Initially off.
+    let status: serde_json::Value = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable")
+        .json()
+        .await
+        .expect("status json");
+    assert_eq!(status["email_anonymous"], serde_json::Value::Bool(false));
+
+    // (b) Flip on remotely.
+    let resp = client
+        .post(proxy.url("/llmux/settings"))
+        .header("content-type", "application/json")
+        .body(r#"{"email_anonymous":true}"#)
+        .send()
+        .await
+        .expect("settings reachable");
+    assert_eq!(resp.status().as_u16(), 200);
+    let ack: serde_json::Value = resp.json().await.expect("ack json");
+    assert_eq!(ack["ok"], serde_json::Value::Bool(true));
+    assert_eq!(ack["email_anonymous"], serde_json::Value::Bool(true));
+
+    // (c) Status reflects the flip with no restart — and names stay real.
+    let status: serde_json::Value = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable")
+        .json()
+        .await
+        .expect("status json");
+    assert_eq!(status["email_anonymous"], serde_json::Value::Bool(true));
+    assert_eq!(
+        status["accounts"][0]["name"], "me@real-mail.com",
+        "API data is never masked (T1)"
+    );
+
+    // (d) Persisted read-merge-write into the tempdir config; the account
+    // roster survived the write.
+    let on_disk = config::load_path(&proxy.config_path).expect("reload config");
+    assert!(on_disk.email_anonymous, "flag persisted");
+    assert_eq!(on_disk.accounts.len(), 1);
+}
