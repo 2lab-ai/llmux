@@ -2,7 +2,7 @@
 
 **Models change every month. Your harness shouldn't.**
 
-llmux lets you build your agent workflow once on a single canonical harness — [Claude Code](https://www.anthropic.com/claude-code) — and swap the *model* behind it freely. Wherever the next frontier model ships, you don't re-port your setup.
+llmux lets you keep one agent workflow — [Claude Code](https://www.anthropic.com/claude-code) — and swap the model/account layer behind it. Your subagents, slash commands, MCP servers, hooks, `CLAUDE.md` conventions, permissions, and muscle memory stay in one place while frontier models and subscription limits keep moving.
 
 ![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
 
@@ -14,73 +14,39 @@ llmux lets you build your agent workflow once on a single canonical harness — 
 
 [Original llmux Islands screen recording](screenshots/llmux-islands-demo.mov)
 
-## The problem
+## Why llmux exists
 
-Frontier models keep coming out of the big labs, and "current best" moves often. But each vendor's CLI agent **harness** — the operating layer around the model: file edits, shell execution, tool calls, context management, permissions — evolves independently and is mutually incompatible. That creates four layers of pain:
+The model is a consumable. The harness is capital.
 
-1. **Can't port.** A workflow built in Claude Code (subagents, slash commands, MCP servers, `CLAUDE.md` conventions, hooks) does not transfer to Codex CLI or Gemini CLI as-is.
-2. **Can't sync.** Even after a painful port, each harness keeps improving separately — there's no way to keep two environments in the same state. The gap only widens.
-3. **Model lock-in.** Moving to a better model means moving your *entire harness*. Your tooling investment holds your model choice hostage.
-4. **Subscription lock-in.** Flat-rate subscriptions are bound to each vendor's first-party client — you can't drive a Claude subscription from a third-party tool.
+Claude Code is not just a chat box. It is the operating environment around the model: file edits, shell execution, subagents, tool calls, context management, permissions, hooks, local conventions, and project memory. Rebuilding that environment every time a new frontier model appears is the expensive part.
 
-**Root cause:** the valuable asset (your workflow) is bound to the harness, and the harness is bound to the model and vendor. llmux breaks that chain by standardizing on **one** harness and making the model a swappable part behind it.
+llmux makes a different bet:
 
-## The thesis
+- **Keep Claude Code as the canonical harness.** Do not port your workflow to every vendor CLI.
+- **Move the model boundary behind a local proxy.** Claude Code talks to `http://localhost:3456`; llmux decides which account/backend serves the request.
+- **Use every account deliberately.** Multiple Claude subscription/API-key accounts and optional Codex accounts live in one cockpit, with quota-aware routing instead of manual juggling.
+- **Treat model choice as a setting, not a migration.** `opus`, `sonnet`, `gpt-5.5`, and future model names become routing signals, not reasons to rebuild your agent stack.
 
-What you actually want to preserve isn't a specific *model* — it's the *harness environment* you built. The model is a consumable; the harness is capital.
+The result: your workflow stays still while the model market moves.
 
-So llmux adopts Claude Code as **the one canonical harness** and turns the model into a part you swap behind it. Model-switch cost drops from "rebuild your harness" to "one setting." You keep your subagents, your slash commands, your `CLAUDE.md` — and point them at whichever model is best this month.
+## The problem llmux removes
+
+1. **Harness lock-in.** A Claude Code workflow does not transfer cleanly to Codex CLI or Gemini CLI.
+2. **Sync drift.** Even if you port once, every harness evolves separately. Keeping them equivalent becomes its own job.
+3. **Model lock-in.** Trying a better model often means abandoning the harness you already invested in.
+4. **Subscription friction.** Flat-rate accounts are useful only if you can route work to the right account before the quota window disappears.
+
+llmux breaks the chain by standardizing on one harness and making the account/model layer swappable behind it.
 
 ## What ships today
 
-A local proxy that sits behind Claude Code (`ANTHROPIC_BASE_URL=http://localhost:3456` is the whole integration contract) and routes requests to a backend you control:
-
-- **One Rust binary, `llmux`** — `server`, `run`, `stop`, `restart`, `login`, `import`, `env`, `dashboard`, `status`, `accounts`, `remove`, `api`.
-- **Claude Code stays unmodified.** `llmux run` starts (or reuses) the local daemon and launches `claude` pointed at the proxy.
-- **Multiple accounts, one cockpit.** Manage several Claude subscription/API-key accounts plus optional OpenAI Codex accounts, and switch between them without leaving Claude Code.
-- **Perishability-aware scheduling.** Each Claude account tracks its 5-hour and 7-day quota windows from upstream headers + OAuth usage polling. Eligible accounts are scored by *usable burst now × weekly-quota perishability*, so quota that resets soon (and would otherwise evaporate unused) is burned first while long-runway accounts are preserved as a reservoir. Sticky per session, never per request — it only switches when another account is clearly worth more.
-- **Model selects the backend.** Out of the box the request's `model` chooses the backend group: `claude-*`/`opus`/`sonnet` land on a Claude account, `gpt-*`/`codex` land on an OpenAI Codex account. The Codex provider translates the Anthropic Messages API into the Codex Responses backend and streams it back as Anthropic SSE — so Claude Code talks to GPT without knowing it.
-- **Daemon-first + attach-mode dashboard.** A detached daemon keeps polling and refreshing tokens; `llmux dashboard` renders the live ratatui view from it.
-- **llmux Islands.** A native macOS menu-bar/notch companion shows the same account usage at a glance, including animated floating-island activity and an email-anonymous mode for safe screen sharing. See [the Islands guide](docs/llmux-islands.md).
-
-This is **Tier 1 + a working slice of Tier 2** (see below): multi-account Claude plus model→backend routing already ship; the endgame is per-subagent cross-provider routing inside one Claude Code session.
-
-## Two tiers: where we bet, what's convenience
-
-llmux draws a hard line between what it stakes its identity on and what is a best-effort convenience that depends on vendor policy.
-
-| | **Tier 1 — durable (the identity)** | **Tier 2 — convenience (bonus)** |
-|---|---|---|
-| What | Claude Code as the single harness. Claude via subscription (through Claude Code), other models via **API key**. | Routing non-Anthropic models through *their* flat-rate subscription, where the vendor currently allows it. |
-| Compliance | Fully compliant, stable. | Vendor-policy-dependent, gray, mutable. |
-| Value | Solves painpoints 1–4. ~90% of the value. | Flat-rate savings. Can break without notice. |
-
-We put the product's identity in Tier 1. Tier 2 is offered opt-in, with an explicit "works now, no guarantee" warning — so the product's lifespan isn't hostage to the next vendor policy change.
-
-## Roadmap
-
-```
-[shipping] Model-level routing
-        You pick a MODEL; llmux maps model -> subscription/key transparently.
-        claude-* -> a Claude account, gpt-* -> a Codex account. On by default.
-        Plus multi-account quota scheduling within each backend group.
-          |
-          v
-[next]  Per-subagent cross-provider
-        In one Claude Code session:
-          main agent  = a Claude model   (Anthropic subscription, native to Claude Code)
-          subagents   = gpt-5.5          (OpenAI backend, via the router)
-        Wire Claude Code's subagent `model` field to a backend mapping.
-        "GPT subagents inside the Claude Code harness, naturally" — the endgame.
-```
-
-Claude Code already supports in-session model switching and per-task routing, and subagents already carry a `model` field (`.claude/agents/*.md`). The endgame composes those existing mechanisms — the router just maps the model string to a different backend. (Model names move fast; `fable-5` / `gpt-5.5` are illustrative of the *shape*, replaced by whatever is current.)
-
-## Non-goals
-
-- **Not a new harness.** llmux attaches above/below Claude Code; it does not replace it. (Competing on harness features is a losing game — Claude Code is overwhelmingly harness code, and that's the moat.)
-- **Not model laundering.** Route to a weaker model and you get that model's quality. llmux unifies the UX; it cannot raise intelligence.
-- **Not a policy-circumvention product.** Vendor-policy gray zones live in Tier 2, opt-in and clearly marked — never the identity.
+- **Local Anthropic-compatible proxy** for Claude Code: `ANTHROPIC_BASE_URL=http://localhost:3456` is the integration contract.
+- **One Rust binary, `llmux`**, with daemon, login/import, dashboard, status, account management, and Claude Code launch commands.
+- **Multi-account Claude scheduling** across subscription and API-key accounts.
+- **Model-to-backend routing**: Claude-like model names route to Claude accounts; `gpt-*` / `codex` model names can route to Codex accounts.
+- **Codex backend adapter** that translates Claude Code Messages requests into the Codex Responses backend and streams Anthropic-style SSE back to Claude Code.
+- **Detached daemon + live TUI dashboard** for quota windows, account health, routing, and manual switching.
+- **llmux Islands**, a native macOS menu-bar/notch companion for glanceable usage and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md).
 
 ## Install
 
@@ -88,7 +54,7 @@ Claude Code already supports in-session model switching and per-task routing, an
 brew install 2lab-ai/tap/llmux
 ```
 
-Native macOS Islands companion:
+Optional native macOS companion:
 
 ```bash
 brew install 2lab-ai/tap/llmux-islands
@@ -100,7 +66,7 @@ Rolling preview channel:
 brew install 2lab-ai/tap/llmux-preview
 ```
 
-Or build from source:
+Build from source:
 
 ```bash
 git clone https://github.com/2lab-ai/llmux && cd llmux
@@ -109,24 +75,38 @@ just build    # cargo build --release --locked
 
 ## Quick start
 
+Add accounts:
+
 ```bash
-# Add accounts — browser OAuth, one login per account
+# Claude subscription OAuth; repeat once per account
 llmux login
 llmux login
 
-# Or import existing credentials from supported local stores
+# Optional: Anthropic API key
+llmux login --api
+
+# Optional: Codex / ChatGPT subscription account
+llmux login --codex
+
+# Or import supported local credential stores
 llmux import
+```
 
-# Start the proxy with the foreground TUI when attached to a TTY
+Start the dashboard explicitly if you want the foreground TUI:
+
+```bash
 llmux server
+```
 
-# In another terminal, run Claude Code through the proxy
+Or run Claude Code directly through llmux:
+
+```bash
 llmux run
 ```
 
-`llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon (stderr at `~/.local/state/llmux/server.log`, respecting `$XDG_STATE_HOME`) and waits until it is ready. A port occupied by a foreign process is an error, never spawned over.
+`llmux run` starts or reuses the daemon, then launches `claude` with `ANTHROPIC_BASE_URL` pointed at the local proxy. Arguments after `--` are passed through to Claude Code.
 
-A convenient alias, so launching Claude Code through llmux is one word:
+A convenient alias:
 
 ```bash
 alias lx='llmux run'
@@ -140,35 +120,52 @@ eval "$(llmux env)"
 claude
 ```
 
-For the native macOS usage companion, build and launch `llmux-islands` after the daemon is running. The full setup, privacy, and recording guide is in [docs/llmux-islands.md](docs/llmux-islands.md).
+## Switching models
+
+Claude Code's model name becomes the routing signal:
+
+```text
+/model opus
+/model sonnet
+/model gpt-5.5
+/model gpt-5.5[1m]
+```
+
+With default routing, Claude-like names use the Claude account group and `gpt-*` / `codex` names use the Codex group. The full routing rules, config keys, and override syntax are in [docs/configuration.md](docs/configuration.md) and [docs/operational-reference.md](docs/operational-reference.md).
+
+## FAQ
+
+### `gpt-5.5` stops around 265k context. What should I do?
+
+If Claude Code blocks a `gpt-5.5` session around ~265k tokens even after selecting `gpt-5.5[1m]`, switch temporarily to a Claude model with a 1M context window, compact there, then switch back:
+
+```text
+/model opus[1m]      # or /model sonnet[1m]
+/compact
+/model gpt-5.5[1m]
+```
+
+This is a practical Claude Code context-management workaround: use the 1M Claude model for the compaction step, then continue routing work to `gpt-5.5[1m]` through llmux. More context-window notes live in [docs/faq.md](docs/faq.md).
 
 ## Documentation
 
-The operational reference — the full command table & TUI keys, daemon/dashboard model, configuration reference, the scheduling policy, model routing (including the gpt-5.5 context-window workaround), and the Codex backend — lives in **[README.detail.md](README.detail.md)**.
-
-- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion, floating activity label, email-anonymous mode, and demo recording.
-- [Configuration](docs/configuration.md) — config file, proxy, scheduler knobs, model routing, Codex request shaping, and account types.
+- [Docs index](docs/README.md) — the map for detailed guides.
+- [Operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard behavior, scheduling policy, model routing details, and Codex backend behavior.
+- [Configuration](docs/configuration.md) — config file location, proxy keys, scheduler knobs, routing options, Codex settings, and account types.
+- [FAQ](docs/faq.md) — context-window workarounds and common usage questions.
+- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, and recording setup.
 - [Contributor guide](AGENTS.md) — architecture rules and development conventions.
 
 ## Compliance & caveats
 
 llmux is for **one human using their own accounts** — no credential pooling, no resale.
 
-- **Tier 1 is the safe path.** Claude via subscription through Claude Code, everything else via API key. This is fully compliant and stable.
-- **Tier 2 is gray.** Driving a vendor's flat-rate subscription from outside its official client depends on that vendor's current policy and can break or trigger account action without notice. The Codex backend uses ChatGPT subscription tokens outside the official client; OpenAI does not endorse it. Anthropic restricts using Claude subscription tokens outside Claude Code / Claude.ai. Use Tier 2 opt-in, at your own risk, with your own accounts only — and keep an API-key fallback configured.
-- Anthropic's unified quota headers are undocumented and may change; the OAuth usage endpoint and 429 + `retry-after` are the fallback evidence chain.
-- Not affiliated with Anthropic or OpenAI.
+- **Durable path:** Claude Code as the harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
+- **Convenience path:** routing third-party flat-rate subscription tokens through Claude Code depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
+- Anthropic quota headers and vendor subscription-token behavior may change.
+- llmux is not affiliated with Anthropic or OpenAI.
 
 The product intent — what llmux is, what it bets on, and what it refuses — is fixed in [`.prd/`](.prd/) as the source of truth.
-
-## Development
-
-```bash
-just check    # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
-just build    # cargo build --release --locked
-```
-
-Contributor conventions are in [`AGENTS.md`](AGENTS.md).
 
 ## License
 
