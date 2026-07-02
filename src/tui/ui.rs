@@ -1932,8 +1932,17 @@ fn log_line(line: &LogLine, mask: bool) -> Line<'_> {
 // Model usage (req1-20): compact strip + detailed table/drill-down.
 // ---------------------------------------------------------------------------
 
+/// Total tokens processed for one model row: fresh input + output + cache
+/// reads + cache writes. The cached classes must be counted for the same
+/// reason as [`crate::tui::TokenCounts::total`] — `tokens_in` is the FRESH
+/// prompt only, so cache-heavy traffic (Claude Code) would otherwise show a
+/// tiny `tok` while the `$` column ([`model_cost`]) still prices all four
+/// classes. `None` cache counters (upstream never reported them) count 0.
 fn model_total(m: &ModelUsageDoc) -> u64 {
-    m.tokens_in.saturating_add(m.tokens_out)
+    m.tokens_in
+        .saturating_add(m.tokens_out)
+        .saturating_add(m.cache_read.unwrap_or(0))
+        .saturating_add(m.cache_creation.unwrap_or(0))
 }
 
 /// API-equivalent USD cost for one model row (item #4), computed inline at
@@ -3178,6 +3187,20 @@ mod tests {
         let cost = model_cost(&m);
         assert!((cost - (1.0 + 2.5 + 0.02)).abs() < 1e-9, "got {cost}");
         assert_eq!(format_cost(cost), "$3.52");
+    }
+
+    #[test]
+    fn model_total_counts_all_four_token_classes() {
+        // Distinct per-class values so a dropped class is caught: the strip's
+        // `tok` must use the same denominators as its `$` (`model_cost`).
+        let mut m = model_row("claude", "claude-opus-4-8", 1_000, 20_000);
+        m.cache_read = Some(300_000);
+        m.cache_creation = Some(4_000_000);
+        assert_eq!(model_total(&m), 1_000 + 20_000 + 300_000 + 4_000_000);
+        // Absent cache counters (upstream never reported them) count 0.
+        m.cache_read = None;
+        m.cache_creation = None;
+        assert_eq!(model_total(&m), 21_000);
     }
 
     fn completed_request(
