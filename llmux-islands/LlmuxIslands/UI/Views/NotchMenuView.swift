@@ -42,12 +42,17 @@ struct NotchMenuView: View {
             SoundPickerRow(soundSelector: soundSelector)
 
             // Pixelize emails in the Usage area (todo item 3: "email anonymous").
+            // The setting is SERVER-owned when the connected daemon supports it
+            // (llmux 0.2.10+): the toggle POSTs `/llmux/settings` and the row
+            // reflects the daemon's ack (mirrored into the @AppStorage key by
+            // IslandUsageModel, so this row and every mosaic re-render). On an
+            // older daemon the toggle stays local-only, exactly as before.
             MenuToggleRow(
                 icon: "eye.slash",
                 label: "Email anonymous",
                 isOn: emailAnonymousEnabled
             ) {
-                emailAnonymousEnabled.toggle()
+                Task { await IslandUsageModel.shared.toggleEmailAnonymous() }
             }
 
             LlmuxConnectionSection()

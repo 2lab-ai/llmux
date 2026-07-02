@@ -23,6 +23,15 @@ final class IslandUsageModel: ObservableObject {
     @Published var claudeInFlight: Int = DemoMode.forcedInFlight?.claude ?? 0
     @Published var codexInFlight: Int = DemoMode.forcedInFlight?.codex ?? 0
 
+    /// The daemon's `email_anonymous` setting from the last successful
+    /// `/llmux/status` poll. `nil` = the daemon predates the setting (or we
+    /// never connected) → the "Email anonymous" toggle stays local-only (E7).
+    /// Non-nil = the server owns the setting: it is mirrored into
+    /// `AppSettings.emailAnonymousEnabled` (the @AppStorage key every
+    /// EmailPixelized surface renders from) so the mosaic follows the server,
+    /// and the menu toggle POSTs the flip instead of writing locally (E5/E6).
+    @Published var serverEmailAnonymous: Bool?
+
     enum Connection: Equatable {
         case connecting
         case online
@@ -62,9 +71,40 @@ final class IslandUsageModel: ObservableObject {
             let counts = Self.inFlightCounts(status.accounts)
             claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
             codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
+            applyServerEmailAnonymous(status.emailAnonymous)
             connection = .online
         } catch {
             connection = .offline(error.localizedDescription)
+        }
+    }
+
+    /// Fold the daemon's `email_anonymous` (if it reports one) into local
+    /// state: the server value WINS and is mirrored into the @AppStorage key
+    /// as a cache, so every EmailPixelized surface re-renders from it and an
+    /// out-of-band flip (TUI, curl) propagates on the next poll. An old
+    /// daemon (`nil`) leaves the local key untouched — today's local-only
+    /// behavior (E7).
+    private func applyServerEmailAnonymous(_ server: Bool?) {
+        serverEmailAnonymous = server
+        if let server, AppSettings.emailAnonymousEnabled != server {
+            AppSettings.emailAnonymousEnabled = server
+        }
+    }
+
+    /// The menu's "Email anonymous" toggle action. New daemon: POST the flip
+    /// to `/llmux/settings` and reflect the ack (the daemon persists it, and
+    /// every other client/TUI follows). Old daemon or never connected: flip
+    /// the local key only, exactly as before the setting became server-owned.
+    func toggleEmailAnonymous() async {
+        guard let current = serverEmailAnonymous else {
+            AppSettings.emailAnonymousEnabled.toggle()
+            return
+        }
+        do {
+            let acked = try await client.setEmailAnonymous(!current)
+            applyServerEmailAnonymous(acked)
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 

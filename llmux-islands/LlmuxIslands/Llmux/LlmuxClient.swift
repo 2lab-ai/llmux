@@ -63,6 +63,18 @@ struct LlmuxClient: Sendable {
         _ = try await send(makeRequest("/llmux/remove-account", method: "POST", json: ["name": name, "confirm": true]))
     }
 
+    /// `POST /llmux/settings` — flip the server-owned email-anonymous display
+    /// setting. The daemon persists it (read-merge-write) and applies it live;
+    /// returns the acknowledged effective value.
+    func setEmailAnonymous(_ enabled: Bool) async throws -> Bool {
+        let data = try await send(makeRequest("/llmux/settings", method: "POST", json: ["email_anonymous": enabled]))
+        struct Ack: Decodable {
+            let emailAnonymous: Bool
+            enum CodingKeys: String, CodingKey { case emailAnonymous = "email_anonymous" }
+        }
+        return try JSONDecoder().decode(Ack.self, from: data).emailAnonymous
+    }
+
     /// `POST /llmux/login/start` — begin a daemon-run OAuth login (FR4).
     func startLogin(provider: String) async throws -> LoginStartResponse {
         let data = try await send(makeRequest("/llmux/login/start", method: "POST", json: ["provider": provider]))
