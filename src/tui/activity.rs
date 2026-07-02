@@ -170,6 +170,36 @@ struct ModelStats {
     endpoints: HashMap<String, u64>,
 }
 
+impl ModelStats {
+    /// Fold another row's counters into this one (background history
+    /// hydration): every counter sums; `last_used` keeps the later of the two
+    /// (history is older, so a live row's timestamp survives the merge).
+    fn absorb(&mut self, other: ModelStats) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.ok = self.ok.saturating_add(other.ok);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
+        self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
+        self.last_used = match (self.last_used, other.last_used) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        for (name, totals) in other.accounts {
+            self.accounts.entry(name).or_default().add(&totals);
+        }
+        for (label, count) in other.efforts {
+            let entry = self.efforts.entry(label).or_default();
+            *entry = entry.saturating_add(count);
+        }
+        for (label, count) in other.endpoints {
+            let entry = self.endpoints.entry(label).or_default();
+            *entry = entry.saturating_add(count);
+        }
+    }
+}
+
 /// A finished aggregated model row (snapshot of [`ModelStats`]). Timestamps are
 /// kept as `SystemTime`; the document builder converts to epoch ms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +469,39 @@ impl WindowedBuckets {
         }
     }
 
+    /// Merge another ring's buckets into this one BY EPOCH HOUR (background
+    /// history hydration). Each historical bucket lands in the hour it
+    /// originally covered — never the current hour — so the 24h/72h heatmaps
+    /// read the same as if history had been replayed before live traffic.
+    /// Rebuilds the deque hour-ascending, pruned to the retained range of the
+    /// newest hour present and capped at [`BUCKET_COUNT`], exactly the
+    /// invariant [`Self::roll_to`] maintains.
+    fn merge_behind(&mut self, other: WindowedBuckets) {
+        if other.buckets.is_empty() {
+            return;
+        }
+        let mut by_hour: std::collections::BTreeMap<u64, HashMap<WindowKey, WindowCounts>> =
+            std::collections::BTreeMap::new();
+        for bucket in self.buckets.drain(..).chain(other.buckets) {
+            let merged = by_hour.entry(bucket.hour).or_default();
+            for (key, counts) in bucket.counts {
+                merged.entry(key).or_default().add(&counts);
+            }
+        }
+        let Some(&newest) = by_hour.keys().next_back() else {
+            return;
+        };
+        let oldest_kept = newest.saturating_sub(BUCKET_COUNT as u64 - 1);
+        self.buckets = by_hour
+            .into_iter()
+            .filter(|&(hour, _)| hour >= oldest_kept)
+            .map(|(hour, counts)| Bucket { hour, counts })
+            .collect();
+        while self.buckets.len() > BUCKET_COUNT {
+            self.buckets.pop_front();
+        }
+    }
+
     /// Aggregate every key over the trailing `window` ending at `now`, summing
     /// the buckets whose hour falls inside it. Returns one [`WindowedRow`] per
     /// `(group, model, account)` with any activity in the window.
@@ -685,14 +748,43 @@ impl ActivityLog {
     /// `completed` view — replaying a huge log keeps the totals but only the
     /// newest `capacity` request lines stay visible (req C keeps the FILE
     /// complete; the ring is the display window).
+    /// Production hydration goes through [`Self::load_persisted_prefix`] (the
+    /// cut-bounded reader); this unbounded convenience wrapper remains for the
+    /// replay round-trip tests.
+    #[cfg(test)]
     pub(crate) fn load_persisted(&mut self, path: Option<&Path>) {
         let Some(path) = path else {
             return;
         };
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            // Missing file (or unreadable) = nothing to resume from.
-            return;
+        // Best-effort: a missing/unreadable file = nothing to resume from.
+        let _ = self.load_persisted_prefix(path, u64::MAX);
+    }
+
+    /// [`Self::load_persisted`] bounded to the FIRST `up_to` bytes of the file.
+    ///
+    /// This is the double-count guard for background hydration: the daemon arms
+    /// persistence and starts appending LIVE finished requests to the same file
+    /// while history is still loading, so the loader must only replay what
+    /// existed BEFORE arming — the byte length captured at arm time. Appends
+    /// are whole lines, so the cut falls on a line boundary (a torn crash
+    /// artifact straddling it parses as corrupt and is skipped, same as on the
+    /// unbounded path).
+    ///
+    /// A missing file is `Ok` (first boot); any other IO error is returned so
+    /// the caller can surface the degraded (empty-history) start.
+    pub(crate) fn load_persisted_prefix(
+        &mut self,
+        path: &Path,
+        up_to: u64,
+    ) -> Result<(), std::io::Error> {
+        use std::io::Read as _;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
         };
+        let mut contents = String::new();
+        file.take(up_to).read_to_string(&mut contents)?;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -707,6 +799,57 @@ impl ActivityLog {
             let (event, ts) = record.into_event();
             self.apply(event, ts);
         }
+        Ok(())
+    }
+
+    /// Merge a replayed HISTORY log behind this LIVE log (background hydration).
+    ///
+    /// The live log has been folding real traffic since boot; `history` is a
+    /// fresh log that replayed the persisted records from before boot (strictly
+    /// older than every live entry). Merge order is "history behind live":
+    ///
+    /// - `completed` ring: live rows stay in front, history extends behind
+    ///   (both are newest-first and history is uniformly older), truncated to
+    ///   this ring's capacity.
+    /// - cumulative totals / model rows / client rows: summed — addition
+    ///   commutes, so the result equals the old blocking replay-then-live fold.
+    /// - windowed hourly buckets: merged by epoch hour, so history lands in its
+    ///   ORIGINAL hours. (Folding old events through `apply` after live traffic
+    ///   would instead dump them into the CURRENT hour — `roll_to` never
+    ///   rewinds — inflating the heatmap; this by-hour merge is why hydration
+    ///   must not simply replay into the live log.)
+    /// - `in_flight` is untouched: history contains only finished requests, and
+    ///   a live in-flight row whose id collides with a historical id must not
+    ///   be swallowed by the replay's finish-matching.
+    ///
+    /// Returns how many historical requests were merged (for the operator note).
+    pub(crate) fn merge_history_behind(&mut self, history: ActivityLog) -> u64 {
+        let merged = history.totals_global().requests;
+        // Ring: live in front, history behind, capacity kept.
+        self.completed.extend(history.completed);
+        self.completed.truncate(self.capacity);
+        for (account, totals) in history.totals {
+            self.totals.entry(account).or_default().add(&totals);
+        }
+        self.unrouted.add(&history.unrouted);
+        for (key, stats) in history.models {
+            self.models.entry(key).or_default().absorb(stats);
+        }
+        // Per-client rows respect the same MAX_CLIENTS bound as the live fold:
+        // an unseen client past the cap folds into `unknown`.
+        for (client, totals) in history.clients {
+            let key = if client == UNKNOWN_CLIENT
+                || self.clients.contains_key(&client)
+                || self.clients.len() < MAX_CLIENTS
+            {
+                client
+            } else {
+                UNKNOWN_CLIENT.to_string()
+            };
+            self.clients.entry(key).or_default().add(&totals);
+        }
+        self.windowed.merge_behind(history.windowed);
+        merged
     }
 
     pub(crate) fn in_flight(&self) -> &[InFlight] {
@@ -2422,6 +2565,225 @@ mod tests {
             log2.totals_global().requests,
             0,
             "unwritable path wrote nothing"
+        );
+    }
+
+    /// Background hydration must equal the old blocking replay: a live log
+    /// that folded traffic FIRST and merged history BEHIND it afterwards
+    /// carries the same aggregates, ring order, and windowed buckets as a log
+    /// that replayed history before the live events (the pre-lazy behavior).
+    /// History sits 30h before live so the 24h window would EXPOSE misplaced
+    /// buckets: folding old events through `apply` after live traffic would
+    /// dump them into the current hour (`roll_to` never rewinds) and
+    /// contaminate the 24h heatmap.
+    #[test]
+    fn merge_history_behind_matches_blocking_replay_and_keeps_hours() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        let history_events = vec![
+            (
+                finished_full(
+                    1,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    Some("16k"),
+                    200,
+                    100,
+                    40,
+                    Some(10),
+                    "/v1/messages",
+                ),
+                at(10),
+            ),
+            (
+                finished_full(
+                    2,
+                    "b",
+                    "codex",
+                    "gpt-5.5",
+                    None,
+                    529,
+                    0,
+                    0,
+                    None,
+                    "/v1/messages/count_tokens",
+                ),
+                at(20),
+            ),
+        ];
+        let now = at(30 * 3600); // live traffic 30h later
+        let live_events = vec![
+            (
+                finished_full(
+                    3,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    300,
+                    90,
+                    None,
+                    "/v1/messages",
+                ),
+                now,
+            ),
+            (
+                finished_full(
+                    4,
+                    "c",
+                    "claude",
+                    "opus",
+                    None,
+                    200,
+                    5,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                now,
+            ),
+        ];
+
+        // Oracle: the old blocking order — history replayed first, live after.
+        let mut all = history_events.clone();
+        all.extend(live_events.clone());
+        let oracle = live_log(&all);
+
+        // Lazy path: live folds first; history replays from disk into a fresh
+        // log and merges behind.
+        let merged = {
+            let mut live = live_log(&live_events);
+            let history = persisted_then_loaded(&path, &history_events);
+            let n = live.merge_history_behind(history);
+            assert_eq!(n, 2, "reports the number of merged historical requests");
+            live
+        };
+
+        assert_same_aggregates(&oracle, &merged, &["a", "b", "c"]);
+        assert_eq!(
+            oracle.completed().cloned().collect::<Vec<_>>(),
+            merged.completed().cloned().collect::<Vec<_>>(),
+            "ring order: live rows in front, history behind"
+        );
+        for window in StatsWindow::ALL {
+            assert_eq!(
+                oracle.windowed_rows(window, now),
+                merged.windowed_rows(window, now),
+                "{} heatmap: history lands in its ORIGINAL hours",
+                window.label()
+            );
+        }
+        // The guard the equality above encodes: 30h-old history is visible in
+        // the 72h window but absent from the 24h one.
+        assert!(
+            !merged
+                .windowed_rows(StatsWindow::Day, now)
+                .iter()
+                .any(|r| r.account == "b"),
+            "24h window excludes 30h-old history"
+        );
+        assert!(
+            merged
+                .windowed_rows(StatsWindow::ThreeDay, now)
+                .iter()
+                .any(|r| r.account == "b"),
+            "72h window includes it"
+        );
+    }
+
+    /// A live in-flight request whose id collides with a historical record
+    /// (activity ids restart at boot) must survive hydration: the merge never
+    /// routes history through `apply`, so the replayed finish can't swallow
+    /// the live row.
+    #[test]
+    fn merge_history_behind_never_touches_live_in_flight() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        let history = persisted_then_loaded(
+            &path,
+            &[(
+                finished_full(
+                    7,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    10,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(10),
+            )],
+        );
+
+        let now = at(1000);
+        let mut live = ActivityLog::new(LOG_CAPACITY);
+        live.apply(started(7), now); // same id as the historical record
+        live.merge_history_behind(history);
+
+        assert_eq!(live.in_flight().len(), 1, "live in-flight row survives");
+        assert_eq!(live.in_flight()[0].id, 7);
+        assert_eq!(
+            live.totals_global().requests,
+            1,
+            "history still counted exactly once"
+        );
+    }
+
+    /// The hydration cut: only bytes before `up_to` are replayed, so a live
+    /// request appended to the same file DURING hydration (it is past the cut
+    /// and already folded live) is never double-counted.
+    #[test]
+    fn load_persisted_prefix_stops_at_the_cut() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        persist_request(
+            Some(&path),
+            &finished_full(
+                1,
+                "a",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                10,
+                5,
+                None,
+                "/v1/messages",
+            ),
+            at(10),
+        );
+        let cut = std::fs::metadata(&path).expect("metadata").len();
+        // A live append lands past the cut while "hydration" is in flight.
+        persist_request(
+            Some(&path),
+            &finished_full(
+                2,
+                "b",
+                "codex",
+                "gpt-5.5",
+                None,
+                200,
+                20,
+                8,
+                None,
+                "/v1/messages",
+            ),
+            at(20),
+        );
+
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted_prefix(&path, cut).expect("readable");
+        assert_eq!(log.totals_global().requests, 1, "only pre-cut history");
+        assert_eq!(log.totals_for("a").requests, 1);
+        assert_eq!(
+            log.totals_for("b").requests,
+            0,
+            "post-cut line not replayed"
         );
     }
 }
