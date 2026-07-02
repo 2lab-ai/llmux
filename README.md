@@ -84,6 +84,12 @@ Claude Code already supports in-session model switching and per-task routing, an
 brew install 2lab-ai/tap/llmux
 ```
 
+Native macOS Islands companion:
+
+```bash
+brew install 2lab-ai/tap/llmux-islands
+```
+
 Rolling preview channel:
 
 ```bash

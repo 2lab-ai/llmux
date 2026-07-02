@@ -35,6 +35,14 @@ or, if you only want the daemon/TUI:
 llmux server
 ```
 
+## Install
+
+```bash
+brew install 2lab-ai/tap/llmux-islands
+```
+
+Then launch `LlmuxIslands.app` from Applications, Spotlight, or Finder.
+
 ## Build and run from source
 
 ```bash
