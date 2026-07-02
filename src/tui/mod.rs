@@ -2111,6 +2111,7 @@ mod tests {
             client_usage: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
+            email_anonymous: false,
         }
     }
 }

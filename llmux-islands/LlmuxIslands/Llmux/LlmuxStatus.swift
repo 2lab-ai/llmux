@@ -7,6 +7,15 @@ struct LlmuxStatus: Decodable {
     let current: String?
     let port: Int?
     let version: String?
+    /// Server-owned "Email anonymous" display setting (llmux 0.2.10+).
+    /// Optional on purpose: an older daemon omits the field, and the app then
+    /// falls back to its local-only toggle behavior (SSOT E7).
+    let emailAnonymous: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case accounts, current, port, version
+        case emailAnonymous = "email_anonymous"
+    }
 }
 
 struct LlmuxAccountRecord: Decodable {

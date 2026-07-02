@@ -407,6 +407,13 @@ pub struct DashboardDoc {
     /// Additive: absent in docs written before this existed.
     #[serde(default)]
     pub codex: CodexSettingsDoc,
+    /// Live `email_anonymous` display setting. Account names in THIS document
+    /// stay real (SSOT T1); the renderer masks at draw time when this is on,
+    /// so an API flip reflects on the next frame/poll without restart — in
+    /// BOTH TUI backends (local builds the doc in-process; attach receives it
+    /// here). Additive: absent in docs from an older daemon → false.
+    #[serde(default)]
+    pub email_anonymous: bool,
 }
 
 /// Live codex provider settings, surfaced so the dashboard can show and toggle
@@ -728,6 +735,9 @@ pub struct DocMeta {
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
     pub codex: CodexSettingsDoc,
+    /// Live `email_anonymous` display setting (see
+    /// [`DashboardDoc::email_anonymous`]).
+    pub email_anonymous: bool,
     /// API-equivalent pricing overrides from `[pricing]` in the live config
     /// (Feature D). Empty = use the built-in default rate table. Threaded here
     /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
@@ -1148,6 +1158,7 @@ pub(crate) fn dashboard_doc(
             })
             .collect(),
         codex: meta.codex.clone(),
+        email_anonymous: meta.email_anonymous,
     }
 }
 
@@ -1178,6 +1189,11 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // Pricing overrides from the live config's `[pricing]` section
         // (Feature D); empty → built-in default rate table.
         pricing_overrides: state.config.pricing.clone(),
+        // Live atomic, not the config snapshot: a `POST /llmux/settings` flip
+        // must reflect on the very next frame/poll without restart.
+        email_anonymous: state
+            .email_anonymous
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -1219,6 +1235,7 @@ mod tests {
                 effort: None,
             },
             pricing_overrides: HashMap::new(),
+            email_anonymous: false,
         }
     }
 
@@ -1708,6 +1725,24 @@ mod tests {
         value.as_object_mut().unwrap().remove("model_usage");
         let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
         assert!(parsed.model_usage.is_empty());
+    }
+
+    #[test]
+    fn doc_carries_email_anonymous_and_defaults_false_for_old_docs() {
+        // The doc surfaces the live setting (from DocMeta), keeps names REAL
+        // (T1), and an older daemon's doc (no field) parses to false so the
+        // attach client falls back to no masking.
+        let mut m = meta();
+        m.email_anonymous = true;
+        let doc = seeded_doc_with_meta(&m);
+        assert!(doc.email_anonymous);
+        assert_eq!(doc.accounts[0].name, "a", "doc names stay real");
+
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        assert_eq!(value["email_anonymous"], true, "carried on the wire");
+        value.as_object_mut().unwrap().remove("email_anonymous");
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert!(!parsed.email_anonymous, "older daemon → false");
     }
 
     #[test]
