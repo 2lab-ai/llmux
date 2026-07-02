@@ -470,6 +470,7 @@ mod tests {
         config.proxy.api_key = Some("lm-test".into());
         config.upstream = "https://example.test".into();
         config.scheduler.five_hour_max = 0.5;
+        config.email_anonymous = true;
         config.accounts.push(oauth_account("a@x.com", "uuid-a"));
         config.accounts.push(apikey_account("api-1"));
         config.accounts.push(codex_account("cx@x.com", "acct-cx"));
@@ -581,6 +582,31 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("re-parse");
         assert_eq!(reparsed.pricing, config.pricing);
+    }
+
+    #[test]
+    fn email_anonymous_is_additive_and_round_trips() {
+        // A config written before the field existed (no `email_anonymous` key)
+        // loads with masking OFF — old configs load unchanged (SSOT E1).
+        let config: Config =
+            serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert!(!config.email_anonymous, "defaults to false");
+
+        // An explicit value round-trips through save→load.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let config = Config {
+            email_anonymous: true,
+            ..Default::default()
+        };
+        save_path(&path, &config).expect("save");
+        let loaded = load_path(&path).expect("load");
+        assert!(loaded.email_anonymous, "explicit true persists");
+
+        // The setter's read-merge-write shape: update() flips ONLY this field
+        // and preserves the rest of the fresh on-disk state.
+        update_path(&path, |c| c.email_anonymous = false).expect("update");
+        assert!(!load_path(&path).expect("reload").email_anonymous);
     }
 
     #[test]

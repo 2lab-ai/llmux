@@ -55,6 +55,13 @@ pub(crate) struct DashboardView {
     pub windowed: Vec<crate::dashboard::WindowedStatsDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
+    /// Live `email_anonymous` display setting (SSOT E4): when on, every
+    /// draw-time surface that shows an account email renders it through
+    /// [`crate::demo::alias_always`] / [`crate::demo::mask_email_text`]
+    /// instead of raw. The view's `snapshot` keeps REAL ids so interactive
+    /// paths (switch/remove target names) still address the pool correctly —
+    /// masking happens strictly at the render sites in `ui.rs`.
+    pub email_anonymous: bool,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -273,6 +280,7 @@ impl DashboardView {
             client_usage: doc.client_usage.clone(),
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
+            email_anonymous: doc.email_anonymous,
         }
     }
 
@@ -620,6 +628,24 @@ mod tests {
         let doc: DashboardDoc = serde_json::from_value(value).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert!(view.windowed.is_empty());
+    }
+
+    #[test]
+    fn email_anonymous_flag_survives_doc_to_view_and_defaults_off() {
+        // A doc from an older daemon (no field) → masking off (E7 server-side
+        // analogue); a current daemon's flag reaches the renderer input.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert!(!view.email_anonymous, "absent field defaults off");
+
+        let mut json = doc_json();
+        json["email_anonymous"] = serde_json::json!(true);
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert!(view.email_anonymous);
+        // The view snapshot keeps REAL ids — interactions (switch/remove)
+        // address the pool by real name; masking is draw-time only.
+        assert_eq!(view.snapshot.accounts[0].id.0, "a");
     }
 
     #[test]
