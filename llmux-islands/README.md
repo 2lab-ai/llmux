@@ -7,6 +7,7 @@ credentials; llmux is the single source of truth.
 
 Design: [`.prd/11-llmux-islands-spec.md`](../.prd/11-llmux-islands-spec.md) (what),
 [`.prd/12-llmux-islands-architecture.md`](../.prd/12-llmux-islands-architecture.md) (how).
+User guide: [`../docs/llmux-islands.md`](../docs/llmux-islands.md).
 
 ## Build & run
 
