@@ -87,23 +87,77 @@ impl DashboardHub {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Arm persistence at `path` and resume from it (req-persist A/C): record
-    /// the append target so subsequent `apply_event`s persist finished requests,
-    /// then replay the existing log to resume cumulative model/account stats + a
-    /// seeded activity ring. Replay folds each persisted request through the SAME
-    /// `apply` as the live path, so the restored aggregates are identical (no
-    /// double-counting).
+    /// Arm persistence at `path` (req-persist A/C): record the append target so
+    /// subsequent `apply_event`s persist finished requests. Deliberately does
+    /// NOT read the file — resuming the persisted history is a separate,
+    /// post-readiness step ([`Self::hydrate_persisted`]), so a large log can
+    /// never delay the listener coming up.
+    ///
+    /// Returns the file's CURRENT byte length (0 when missing/`None`): the
+    /// hydration cut. Everything before it is pre-boot history to replay;
+    /// everything after it is live appends from this process — reading only up
+    /// to the cut is what prevents double-counting a request that finished
+    /// while history was still loading.
     ///
     /// `path` is `state.activity_log_path`: the state-dir `activity.jsonl` for a
-    /// real daemon, a tempdir for e2e, `None` to disable. Best-effort: a missing
-    /// file leaves the log empty; `None` leaves persistence off. Called once
-    /// from `serve` — never from `Default`, so unit tests that build the hub via
+    /// real daemon, a tempdir for e2e, `None` to disable. Called once from
+    /// `serve` — never from `Default`, so unit tests that build the hub via
     /// `default()` and fold events stay isolated (their `persist_path` is
     /// `None`).
-    pub fn arm_persistence(&self, path: Option<std::path::PathBuf>) {
+    pub fn arm_persistence(&self, path: Option<std::path::PathBuf>) -> u64 {
+        let cut = path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.lock().persist_path = path;
+        cut
+    }
+
+    /// Resume the persisted activity history (req-persist A/C), background
+    /// edition: replay the first `up_to` bytes of `path` (the cut returned by
+    /// [`Self::arm_persistence`]) into a FRESH log OFF the hub lock, then merge
+    /// it BEHIND whatever live traffic has already folded
+    /// ([`ActivityLog::merge_history_behind`] — live rows stay in front, sums
+    /// commute, windowed buckets land in their original hours, live in-flight
+    /// rows are never touched).
+    ///
+    /// Blocking (file IO + parse) — call from `spawn_blocking`. The hub lock is
+    /// held only for the in-memory merge. Degrades gracefully: a missing file
+    /// or `up_to == 0` is a silent no-op (first boot); a read error starts with
+    /// empty history and leaves a warning + an error note in the activity log,
+    /// never a crash.
+    pub fn hydrate_persisted(&self, path: Option<&std::path::Path>, up_to: u64) {
+        let Some(path) = path else {
+            return;
+        };
+        if up_to == 0 {
+            return; // nothing persisted before this boot
+        }
+        let mut history = ActivityLog::new(crate::tui::activity::LOG_CAPACITY);
+        let loaded = history.load_persisted_prefix(path, up_to);
+        let now = SystemTime::now();
         let mut state = self.lock();
-        state.log.load_persisted(path.as_deref());
-        state.persist_path = path;
+        match loaded {
+            Ok(()) => {
+                let merged = state.log.merge_history_behind(history);
+                if merged > 0 {
+                    state.log.push_note(
+                        format!("history loaded: {merged} persisted requests resumed"),
+                        false,
+                        now,
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "activity history load failed");
+                state.log.push_note(
+                    format!("history load failed ({err}) — starting with empty history"),
+                    true,
+                    now,
+                );
+            }
+        }
     }
 
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
@@ -1810,5 +1864,143 @@ mod tests {
             }
             other => panic!("expected request, got {other:?}"),
         }
+    }
+
+    /// Throwaway on-disk activity log for the hydration tests.
+    fn hydrate_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmux-hub-hydrate-{}-{}-{tag}.jsonl",
+            std::process::id(),
+            ulid::Ulid::new()
+        ))
+    }
+
+    fn finished_for(id: u64, account: &str) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some(account.into()),
+            status: 200,
+            duration: Duration::from_millis(10),
+            tokens: Some(TokenCounts {
+                input: 10,
+                output: 5,
+                cache_read: None,
+                cache_creation: None,
+            }),
+            group: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: None,
+            user_id: None,
+        }
+    }
+
+    /// The full lazy-hydration sequence a real serve runs: arm (cut captured),
+    /// live traffic folds AND appends past the cut, then background hydration
+    /// merges history behind it — every request counted exactly once, live
+    /// rows in front, completion note on top.
+    #[test]
+    fn hydrate_persisted_merges_history_behind_live_without_double_count() {
+        let path = hydrate_tmp("merge");
+        // Two pre-boot historical records on disk.
+        for (id, ts) in [(1, 100), (2, 200)] {
+            crate::tui::activity::persist_request(
+                Some(&path),
+                &finished_for(id, "hist"),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(ts),
+            );
+        }
+
+        let hub = DashboardHub::default();
+        let cut = hub.arm_persistence(Some(path.clone()));
+        assert!(cut > 0, "cut = pre-boot file length");
+        // Live request while history is "still loading": folds into the hub
+        // AND appends to the same file past the cut.
+        hub.apply_event(finished_for(3, "live"), now());
+
+        hub.hydrate_persisted(Some(&path), cut);
+
+        let view = hub.view(now());
+        assert_eq!(
+            view.global_totals.requests, 3,
+            "2 history + 1 live; the live append past the cut is not re-replayed"
+        );
+        assert_eq!(view.account_totals.get("hist").map(|t| t.requests), Some(2));
+        assert_eq!(view.account_totals.get("live").map(|t| t.requests), Some(1));
+        // Ring: completion note on top (it is the newest entry), then the live
+        // request, then history behind it.
+        match &view.completed[0].body {
+            CompletedBody::Note { text, error } => {
+                assert!(
+                    text.contains("history loaded: 2"),
+                    "completion note names the merged count: {text}"
+                );
+                assert!(!error);
+            }
+            other => panic!("expected the hydration note first, got {other:?}"),
+        }
+        let accounts: Vec<Option<String>> = view.completed[1..]
+            .iter()
+            .map(|c| match &c.body {
+                CompletedBody::Request { account, .. } => account.clone(),
+                other => panic!("expected requests behind the note, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            accounts,
+            vec![
+                Some("live".into()),
+                Some("hist".into()),
+                Some("hist".into())
+            ],
+            "live row stays in front, history behind"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failed history read degrades to an empty history + a visible warning
+    /// note — never a crash, and live state is untouched.
+    #[test]
+    fn hydrate_persisted_read_failure_warns_and_keeps_live_state() {
+        let path = hydrate_tmp("bad-parent");
+        std::fs::write(&path, b"x").expect("seed blocker file");
+        let bad = path.join("activity.jsonl"); // parent is a FILE → open fails
+
+        let hub = DashboardHub::default();
+        hub.apply_event(finished_for(1, "live"), now());
+        hub.hydrate_persisted(Some(&bad), 999);
+
+        let view = hub.view(now());
+        assert_eq!(view.global_totals.requests, 1, "live state untouched");
+        match &view.completed[0].body {
+            CompletedBody::Note { text, error } => {
+                assert!(
+                    text.contains("history load failed"),
+                    "warning note surfaced: {text}"
+                );
+                assert!(error, "the note is an error note");
+            }
+            other => panic!("expected a warning note, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// First boot (no file yet → cut 0) and a vanished file are silent no-ops.
+    #[test]
+    fn hydrate_persisted_missing_file_and_zero_cut_are_noops() {
+        let missing = hydrate_tmp("missing"); // never created
+        let hub = DashboardHub::default();
+        assert_eq!(
+            hub.arm_persistence(Some(missing.clone())),
+            0,
+            "missing file → cut 0"
+        );
+        hub.hydrate_persisted(Some(&missing), 0); // zero cut: skip
+        hub.hydrate_persisted(Some(&missing), 42); // vanished file: Ok, empty
+        hub.hydrate_persisted(None, 42); // disabled: no-op
+        let view = hub.view(now());
+        assert_eq!(view.global_totals.requests, 0);
+        assert!(view.completed.is_empty(), "no notes, no rows");
     }
 }

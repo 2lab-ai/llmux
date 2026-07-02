@@ -457,28 +457,16 @@ pub async fn serve(
 ) -> Result<(), ProxyError> {
     let params = state.select_params();
 
-    // Arm activity persistence + resume cumulative model/account stats from the
-    // persisted log (req-persist A/C). Done once here — the single production
-    // serve chokepoint — before the fold task starts appending new finished
-    // requests, so a restarted daemon continues the totals instead of resetting
-    // them. The path comes from `state` (state dir for a real daemon, a tempdir
-    // for e2e), so this never touches the user's real log under test.
-    // Best-effort: a missing log leaves an empty hub; `None` disables it.
-    state.hub.arm_persistence(state.activity_log_path.clone());
-
-    // Prune the raw-io payload log (Feature B) to its retention window, once at
-    // startup, alongside activity persistence. Guarded by config: `enabled =
-    // false` skips it, `retention_days = 0` keeps everything (prune is a no-op).
-    // Best-effort and total — a missing/corrupt log never fails startup (see
-    // `proxy::raw_io::prune`). The path is `None` under unit/e2e callers with no
-    // state dir, which is itself a no-op.
-    if state.config.raw_io.enabled {
-        crate::proxy::raw_io::prune(
-            state.raw_io_path.as_deref(),
-            state.config.raw_io.retention_days,
-            crate::proxy::raw_io::now_ms(),
-        );
-    }
+    // Arm activity persistence (req-persist A/C) — append target only, NO file
+    // read. Done once here — the single production serve chokepoint — before
+    // the fold task starts appending new finished requests. The returned cut
+    // (the log's byte length right now, before any live append) bounds the
+    // post-readiness hydration below so a request that finishes while history
+    // is still loading is never double-counted. Resuming the cumulative stats
+    // from the (possibly large) log is deliberately NOT done here: it moved to
+    // a background task spawned after the listener is ready, so a big history
+    // can no longer delay startup ("serve first, hydrate later").
+    let hydrate_cut = state.hub.arm_persistence(state.activity_log_path.clone());
 
     // Dashboard fold: the single consumer of the activity-event channel (and,
     // in TUI mode, the tracing-bridge channel) into the hub. Spawned once —
@@ -616,6 +604,41 @@ pub async fn serve(
         "proxy listening (ANTHROPIC_BASE_URL=http://localhost:{})",
         local_addr.port()
     );
+
+    // Post-readiness background hydration ("serve first, hydrate later"): the
+    // listener is bound and `/llmux/status` + proxy traffic are already being
+    // served — only NOW resume the persisted history. Both tasks are
+    // best-effort file work on the blocking pool; neither can fail or delay
+    // startup, and both are crash-safe mid-flight (hydration only reads;
+    // prune renames atomically at the very end).
+    //
+    // 1. Activity history (req-persist A/C): replay `activity.jsonl` up to the
+    //    pre-bind cut into a fresh log, then merge it BEHIND live traffic
+    //    (`DashboardHub::hydrate_persisted` — live rows stay in front, sums
+    //    commute, no double-count past the cut). Dashboards fill in as it
+    //    lands; a "history loaded" note marks completion.
+    let hydrate_task = {
+        let hub = state.hub.clone();
+        let path = state.activity_log_path.clone();
+        tokio::task::spawn_blocking(move || hub.hydrate_persisted(path.as_deref(), hydrate_cut))
+    };
+    // 2. Raw-io retention prune (Feature B): guarded by config (`enabled =
+    //    false` skips it; `retention_days = 0` keeps everything). The scan is
+    //    streaming and the commit preserves records appended while it ran (see
+    //    `proxy::raw_io::prune`), so it is safe next to live traffic — and the
+    //    multi-GB payload log no longer stands between restart and readiness.
+    let prune_task = state.config.raw_io.enabled.then(|| {
+        let path = state.raw_io_path.clone();
+        let retention_days = state.config.raw_io.retention_days;
+        tokio::task::spawn_blocking(move || {
+            crate::proxy::raw_io::prune(
+                path.as_deref(),
+                retention_days,
+                crate::proxy::raw_io::now_ms(),
+            )
+        })
+    });
+
     let shutdown = state.shutdown.clone();
     let result = axum::serve(
         listener,
@@ -631,6 +654,14 @@ pub async fn serve(
     }
     if let Some(fold_task) = fold_task {
         fold_task.abort();
+    }
+    // Blocking-pool tasks cannot be interrupted once running; `abort` here only
+    // cancels them if they have not started. Both are safe to leave finishing
+    // (read-only hydration; atomic-rename prune) — the runtime waits for them
+    // on shutdown.
+    hydrate_task.abort();
+    if let Some(prune_task) = prune_task {
+        prune_task.abort();
     }
     result.map_err(ProxyError::Io)
 }
