@@ -33,6 +33,7 @@ A local proxy that sits behind Claude Code (`ANTHROPIC_BASE_URL=http://localhost
 - **Perishability-aware scheduling.** Each Claude account tracks its 5-hour and 7-day quota windows from upstream headers + OAuth usage polling. Eligible accounts are scored by *usable burst now × weekly-quota perishability*, so quota that resets soon (and would otherwise evaporate unused) is burned first while long-runway accounts are preserved as a reservoir. Sticky per session, never per request — it only switches when another account is clearly worth more.
 - **Model selects the backend.** Out of the box the request's `model` chooses the backend group: `claude-*`/`opus`/`sonnet` land on a Claude account, `gpt-*`/`codex` land on an OpenAI Codex account. The Codex provider translates the Anthropic Messages API into the Codex Responses backend and streams it back as Anthropic SSE — so Claude Code talks to GPT without knowing it.
 - **Daemon-first + attach-mode dashboard.** A detached daemon keeps polling and refreshing tokens; `llmux dashboard` renders the live ratatui view from it.
+- **llmux Islands.** A native macOS menu-bar/notch companion shows the same account usage at a glance, including animated floating-island activity and an email-anonymous mode for safe screen sharing. See [the Islands guide](docs/llmux-islands.md).
 
 This is **Tier 1 + a working slice of Tier 2** (see below): multi-account Claude plus model→backend routing already ship; the endgame is per-subagent cross-provider routing inside one Claude Code session.
 
@@ -125,6 +126,14 @@ eval "$(llmux env)"
 claude
 ```
 
+For the native macOS usage companion, build and launch `llmux-islands` after the daemon is running. The full setup, privacy, and recording guide is in [docs/llmux-islands.md](docs/llmux-islands.md).
+
+## Documentation
+
+- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion, floating activity label, email-anonymous mode, and demo recording.
+- [Configuration](docs/configuration.md) — config file, proxy, scheduler knobs, model routing, Codex request shaping, and account types.
+- [Contributor guide](AGENTS.md) — architecture rules and development conventions.
+
 ## Commands
 
 | Command | Description |
@@ -174,7 +183,7 @@ one-time macOS **Screen Recording** grant for the terminal you run it from
 
 ## Configuration
 
-Config lives at `~/.config/llmux.json` (respects `$XDG_CONFIG_HOME`; override with `$LLMUX_CONFIG`). File mode is 0600. Writes are atomic read-merge-write so the server and CLI can update concurrently.
+Config lives at `~/.config/llmux.json` (respects `$XDG_CONFIG_HOME`; override with `$LLMUX_CONFIG`). File mode is 0600. Writes are atomic read-merge-write so the server and CLI can update concurrently. See [docs/configuration.md](docs/configuration.md) for the full config reference.
 
 ```json
 {
