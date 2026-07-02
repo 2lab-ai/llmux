@@ -107,6 +107,16 @@ Codex settings are configurable in the config file and adjustable live from the 
 | `codex.fast` | Sends `service_tier: "priority"` when true. |
 | `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 
+For Claude Code model-selection details, including `gpt-5.5[1m]` and the long-context compaction workaround, see [operational-reference.md](operational-reference.md#selecting-the-codex-model-from-claude-code) and [faq.md](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
+
+## Email anonymous mode
+
+`email_anonymous` masks account emails on every display surface while preserving live usage state. The TUI render layer uses stable fake-email mapping, and llmux Islands pixelizes emails in its Usage panel.
+
+The setting is included in `GET /llmux/status` and can be changed live through `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ menu.
+
+This differs from demo mode: demo mode uses stable fake identities and suppresses config writes for recording; email anonymous mode preserves the real daemon state and only masks rendered identities.
+
 ## Account types
 
 | Type | Added by | Meaning |

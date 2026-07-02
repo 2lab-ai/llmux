@@ -1,0 +1,238 @@
+# llmux operational reference
+
+This is the detailed, operational half of the docs: every command, the daemon/dashboard model, the configuration reference, the scheduling policy, model routing details, and the Codex backend. The conceptual overview — what llmux is and why — lives in [the root README](../README.md).
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `server [--port N] [--no-tui] [--log-to DIR]` | Start the proxy. `--log-to` writes one file per request with credentials masked. If a llmux daemon already owns the port, attach to it instead. |
+| `run [--force] [-- args]` | Ensure the daemon is running, then spawn `claude` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
+| `stop` | Stop a running server gracefully via `POST /llmux/shutdown`. |
+| `restart` | Cooperatively drain a running daemon, then respawn it from this binary after an upgrade. |
+| `login [--api \| --codex]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account. |
+| `import [--from PATH \| --json JSON]` | Import credentials from a teamclaude config, `~/.claude/.credentials.json`, a Codex `~/.codex/auth.json`, or inline JSON. |
+| `dashboard` | Attach to a running daemon and render its dashboard over HTTP. Read-only except manual account switch. |
+| `env` | Print shell exports for pointing Claude Code at the proxy. |
+| `status [--json]` | Show client/server/update sections plus per-account quota; exits 1 when no server is running. |
+| `accounts [-v]` | List configured accounts; `-v` adds quota/cooldown detail. |
+| `remove <name> [--yes]` | Remove an account by name. |
+| `api <path>` | Debug: GET an upstream path with the current account's credentials. |
+
+In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`.
+
+## Install and launch details
+
+### Homebrew channels
+
+```bash
+brew install 2lab-ai/tap/llmux
+brew install 2lab-ai/tap/llmux-islands
+brew install 2lab-ai/tap/llmux-preview
+```
+
+Use `llmux-preview` for the rolling preview channel. Use the stable `llmux` formula for normal daily work.
+
+### Source build
+
+```bash
+git clone https://github.com/2lab-ai/llmux && cd llmux
+just build
+```
+
+`just build` runs `cargo build --release --locked`.
+
+### Running Claude Code through llmux
+
+`llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
+
+Daemon stderr is written to `~/.local/state/llmux/server.log`, respecting `$XDG_STATE_HOME`. A port occupied by a foreign process is an error; llmux never overwrites it.
+
+Manual shell wiring:
+
+```bash
+eval "$(llmux env)"
+claude
+```
+
+## Daemon and dashboard
+
+Only one process can own port 3456 — normally the background daemon created by `llmux run`. To inspect it:
+
+- `llmux dashboard` polls `GET /llmux/dashboard` once a second and renders the same view model the in-process TUI uses. Dropped connections show a reconnecting banner and keep retrying.
+- `llmux server`, when a llmux daemon already owns the port, prints `daemon already running (pid N) — attaching…` and enters attach mode instead of failing with `Address already in use`.
+- A foreign process on the port remains a clean error and is never overwritten.
+
+Both attach paths are read-only except manual switching through the gated loopback control endpoint.
+
+## Demo, recording, and privacy modes
+
+Recording a demo or sharing your screen? Set `LLMUX_DEMO_MODE=1` and the dashboard, status, and logs show **stable fake emails** in place of your real account names. Config writes are suppressed so the aliases never touch disk.
+
+The Islands app has the same masking via `--demo` or `LLMUX_ISLANDS_DEMO=1`; it also opens and holds the notch panel open for recording.
+
+For persistent masking, `email_anonymous` in the config masks every email surface — TUI render and Islands mosaic — and can be flipped live from the Islands ☰ menu or `POST /llmux/settings`.
+
+Two demo GIFs are regenerated at deploy time and attached to each release:
+
+- **CLI / TUI** — [`demo/llmux.tape`](../demo/llmux.tape) (vhs) → [`llmux-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
+- **Islands app** — `--demo` capture → [`llmux-islands-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-islands-demo.gif)
+
+Recorders live in [`demo/`](../demo/): `record-cli.sh`, `record-islands.sh`, and `record-all.sh` (records both + `gh release upload`). The app capture needs a one-time macOS **Screen Recording** grant for the terminal you run it from.
+
+## Configuration
+
+Config lives at `~/.config/llmux.json` by default, respects `$XDG_CONFIG_HOME`, and can be overridden with `$LLMUX_CONFIG`. File mode is `0600`. Writes are atomic read-merge-write so the server and CLI can update concurrently.
+
+See [configuration.md](configuration.md) for the full config reference.
+
+```json
+{
+  "version": 1,
+  "proxy": { "port": 3456, "api_key": "lm-..." },
+  "upstream": "https://api.anthropic.com",
+  "scheduler": {
+    "five_hour_max": 0.90,
+    "seven_day_max": 0.99,
+    "usage_poll_secs": 300,
+    "usage_max_age_secs": 600,
+    "refresh_ahead_secs": 25200
+  },
+  "routing": {
+    "enabled": true,
+    "claude_models": [],
+    "codex_models": [],
+    "default_group": "claude",
+    "on_empty_group": "error"
+  },
+  "codex": {
+    "default_model": "gpt-5.5",
+    "fast": false
+  },
+  "accounts": [
+    {
+      "name": "user@example.com",
+      "type": "oauth",
+      "account_uuid": "...",
+      "access_token": "<oauth-access-token>",
+      "refresh_token": "<oauth-refresh-token>",
+      "expires_at_ms": 1774384968427
+    }
+  ]
+}
+```
+
+Scheduler knobs:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `five_hour_max` | `0.90` | Max 5-hour utilization before an account is ineligible. |
+| `seven_day_max` | `0.99` | Max 7-day utilization before an account is ineligible. |
+| `usage_poll_secs` | `300` | Per-account OAuth usage poll interval. |
+| `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
+| `refresh_ahead_secs` | `25200` | Background refresh threshold; default 7 hours before token expiry. |
+
+Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.5`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`; omitted by default).
+
+Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), or `codex` (ChatGPT/Codex subscription token). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
+
+`email_anonymous` (default `false`) masks account emails on every display surface. The TUI render layer uses the same stable fake-email mapping as demo mode, and llmux Islands pixelizes emails in its Usage panel. The value is served in `GET /llmux/status` and can be flipped live via `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ toggle.
+
+## Scheduling model
+
+Each account tracks two quota windows: 5-hour session and 7-day weekly. Anthropic accounts get passive data from upstream response headers plus active OAuth usage polling; Codex accounts ingest `x-codex-*` headers when present. Selection is pure and deterministic over a snapshot, re-evaluated when the current account becomes ineligible and on a 60-second tick — never per request.
+
+1. **Eligibility gate.** Keep accounts with healthy auth, no active 429 park, both windows under their thresholds, and fresh-enough usage data. A degraded headers-only mode kicks in if every account's usage is stale.
+2. **Score = usable burst now × perishability.** `servable_now = min(5h headroom, 7d headroom)` is what an account can serve before it next gates on either limit. `urgency` ramps up the closer an account is to its 7-day reset, linearly across the week and capped at 4×. So `score = servable_now × urgency` prefers quota that is **about to reset and would otherwise evaporate unused**, but only while it is still usable.
+3. **Sticky, with a perishability override.** Stay on the current account while it is eligible — unless another account is clearly worth more, currently 25% above the current score. This protects upstream prompt-cache locality while still burning soon-to-reset quota.
+4. **Backend grouping.** With routing on by default, only same-group accounts compete and each group keeps its own sticky pick. With routing off, Codex accounts rank last as a cross-group overflow pool.
+5. **Exhaustion.** Honor `retry-after` on 429. If every account is exhausted, return 429 with the soonest window reset as `retry-after`.
+
+The full derivation, edge cases, and the wasted-quota simulation that validates this policy live in [`.prd/09-scheduler-perishability.md`](../.prd/09-scheduler-perishability.md).
+
+## Model routing
+
+By default (`routing.enabled = true`) the request's `model` selects the backend **group**:
+
+- **claude group** — `oauth` + `apikey` accounts; models `claude-*`, `opus`, `sonnet`, `haiku`, `fable-5`.
+- **codex group** — `codex` accounts; models `gpt-*`, `gpt-5.5`, `codex`, `o1`/`o3`/`o4`.
+
+Within the matched group the scheduler picks the best eligible account, sticky **per group**. The Claude pick and the Codex pick advance independently. An unrecognized or absent model falls back to `default_group`.
+
+Turn routing **off** (`routing.enabled = false`) for the older behavior: the `model` is ignored for selection and Codex accounts become a cross-group overflow pool. A request lands on the best Claude/API account and only spills to Codex when every Claude account is exhausted.
+
+```json
+"routing": {
+  "enabled": true,
+  "claude_models": [],
+  "codex_models": [],
+  "default_group": "claude",
+  "on_empty_group": "error"
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | On = model→group routing; off = Codex-as-overflow behavior. |
+| `claude_models` | `[]` | Models routed to the Claude group. Empty keeps the builtin rules; a non-empty list replaces them. |
+| `codex_models` | `[]` | Models routed to the Codex group with the same semantics. |
+| `default_group` | `"claude"` | Group for an unmatched or model-less request. |
+| `on_empty_group` | `"error"` | When the matched group has no configured account: `"error"` returns a 404 `not_found_error`; `"fallback"` falls back to the other group. |
+
+Override tokens in `claude_models` / `codex_models` are matched in order, first-match-wins, case-insensitively. A bare token is a **prefix** (`"gpt-"`); prefix it with `~` for a **substring** (`"~codex"`) or `=` for an **exact** match (`"=gpt-5.5"`).
+
+### Selecting the Codex model from Claude Code
+
+The inbound `model` string **is** the selector — point Claude Code's model at a Codex-group model and the proxy routes the request to a Codex account:
+
+```bash
+# Per-session: route this Claude Code session's requests to the Codex group
+ANTHROPIC_MODEL=gpt-5.5 claude
+```
+
+or set the model in Claude Code's own model setting:
+
+```text
+/model gpt-5.5
+/model gpt-5.5[1m]
+```
+
+For account *selection*, the model string's only job is to choose the group. Any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the Codex group is routed there. The actual upstream model sent to Codex is `codex.default_model` (default `gpt-5.5`), set in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` and keeps a representative scalar `current` for back-compat.
+
+### Context-window display for `gpt-5.5`
+
+When you route to the Codex group with a bare `gpt-5.5`, Claude Code's **remaining context** indicator is wrong because the client computes the window from the **model-name string**. llmux can route and stream the request, but it cannot set Claude Code's local context-window table:
+
+- Claude Code derives the context **window** from the model name, client-side.
+- Bare `gpt-5.5` can fall back to a **200,000** token window in Claude Code.
+- The Codex `gpt-5.5` backend window is larger, and `gpt-5.5[1m]` makes Claude Code display a **1,000,000** token window.
+- No `/v1/messages` response field or endpoint lets the proxy set the client's context window.
+
+Use the `[1m]` suffix when you want Claude Code to display a 1M window:
+
+```text
+/model gpt-5.5[1m]
+```
+
+`gpt-5.5[1m]` still routes to the Codex group: the `gpt-` prefix still matches, and the suffix is stripped for routing/usage attribution. The tradeoff is that the 1M display can **over-report** the real usable Codex window; it is a client-side display workaround, not a promise that every long transcript will be accepted unchanged.
+
+If a long session still blocks near the mid-200k range, use the empirical compaction workaround in [FAQ: gpt-5.5 context stops around 265k](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
+
+## Codex backend
+
+A ChatGPT/Codex subscription credential can be added with `llmux login --codex` (browser OAuth, falling back to importing `~/.codex/auth.json`) or imported directly:
+
+```bash
+llmux import --from ~/.codex/auth.json
+```
+
+The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE. The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, thinking summaries, and tool calls are supported. Images are dropped with a warning for now. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+
+## Development
+
+```bash
+just check    # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
+just build    # cargo build --release --locked
+```
+
+Contributor conventions are in [`../AGENTS.md`](../AGENTS.md).
