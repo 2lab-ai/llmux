@@ -892,8 +892,11 @@ impl ActivityLog {
         rows
     }
 
-    /// Snapshot of every model row, sorted by total tokens desc, then requests,
-    /// then key (req14). The document builder overlays in-flight counts.
+    /// Snapshot of every model row, sorted by total tokens (fresh input +
+    /// output + cache read + cache write) desc, then requests, then key
+    /// (req14). Cache tokens count so the ranking matches the strip's `tok`
+    /// column (`ui::model_total`), which includes them. The document builder
+    /// overlays in-flight counts.
     pub(crate) fn model_usage(&self) -> Vec<ModelUsage> {
         let mut rows: Vec<ModelUsage> = self
             .models
@@ -929,9 +932,15 @@ impl ActivityLog {
                 }
             })
             .collect();
+        let total = |r: &ModelUsage| {
+            r.tokens_in
+                .saturating_add(r.tokens_out)
+                .saturating_add(r.cache_read.unwrap_or(0))
+                .saturating_add(r.cache_creation.unwrap_or(0))
+        };
         rows.sort_by(|a, b| {
-            (b.tokens_in + b.tokens_out)
-                .cmp(&(a.tokens_in + a.tokens_out))
+            total(b)
+                .cmp(&total(a))
                 .then(b.requests.cmp(&a.requests))
                 .then(a.group.cmp(&b.group))
                 .then(a.model.cmp(&b.model))
@@ -1535,6 +1544,46 @@ mod tests {
             (rows[1].group.as_str(), rows[1].model.as_str()),
             ("claude", "shared")
         );
+    }
+
+    #[test]
+    fn model_rows_sort_counts_cache_tokens() {
+        let mut log = ActivityLog::new(50);
+        // codex: 100 fresh in + 50 out = 150, no cache.
+        log.apply(
+            finished_model(
+                1,
+                Some("c"),
+                "codex",
+                "gpt-5.5",
+                None,
+                200,
+                tokens(100, 50, None),
+                "/v1/messages",
+            ),
+            at(1),
+        );
+        // claude: only 10 fresh in + 5 out, but 1_000 cache-read tokens →
+        // 1_015 total. Cache tokens count toward the "by tokens" ranking
+        // (they are what the `tok` column shows and the `$` column prices),
+        // so the cache-heavy row ranks FIRST despite the smaller fresh sum.
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "claude",
+                "claude-opus-4-8",
+                None,
+                200,
+                tokens(10, 5, Some(1_000)),
+                "/v1/messages",
+            ),
+            at(2),
+        );
+        let rows = log.model_usage();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].group.as_str(), "claude");
+        assert_eq!(rows[1].group.as_str(), "codex");
     }
 
     #[test]
