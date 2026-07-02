@@ -6,6 +6,10 @@ llmux lets you build your agent workflow once on a single canonical harness — 
 
 ![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
 
+![llmux Islands demo](screenshots/llmux-islands-demo.gif)
+
+[Original llmux Islands screen recording](screenshots/llmux-islands-demo.mov)
+
 ## The problem
 
 Frontier models keep coming out of the big labs, and "current best" moves often. But each vendor's CLI agent **harness** — the operating layer around the model: file edits, shell execution, tool calls, context management, permissions — evolves independently and is mutually incompatible. That creates four layers of pain:
