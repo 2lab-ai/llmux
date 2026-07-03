@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime};
 use crate::config::{AccountConfig, AccountCredential};
 use crate::routing::BackendGroup;
 use headers::{ParsedRateLimitHeaders, WindowReading};
-use usage::UsageSnapshot;
-use window::{QuotaWindow, WindowSource};
+use usage::{ScopedLimitReading, UsageSnapshot};
+use window::{QuotaWindow, ScopedQuotaWindow, WindowSource};
 
 /// The group slot used for the legacy (routing-disabled) selection path:
 /// when callers pass `group = None`, a SINGLE shared current slot is used so
@@ -84,6 +84,12 @@ pub struct AccountState {
     pub health: AccountHealth,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
+    /// Model-scoped weekly limits from the usage poll's `limits[]` (e.g. the
+    /// "Fable" weekly gauge) — generic, keyed by scope label; empty until a
+    /// poll reports one. Entries persist until overwritten by fresher data;
+    /// an entry whose window has reset reads as unconstrained via
+    /// [`QuotaWindow::effective_utilization`], same as the account windows.
+    pub scoped_limits: Vec<ScopedQuotaWindow>,
     pub cooldown_until: Option<SystemTime>,
     pub cooldown_source: Option<CooldownSource>,
     /// When the active cooldown was set. Self-healing requires evidence
@@ -102,6 +108,7 @@ impl AccountState {
             health: AccountHealth::Healthy,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             cooldown_set_at: None,
@@ -126,6 +133,41 @@ impl AccountState {
             fetched_at,
             source,
         });
+        true
+    }
+
+    /// Merge one scoped-limit observation into the account's scoped list,
+    /// keyed by scope label (case-insensitive), freshest `fetched_at` wins —
+    /// same policy as [`Self::merge_window`].
+    fn merge_scoped(
+        slots: &mut Vec<ScopedQuotaWindow>,
+        reading: &ScopedLimitReading,
+        fetched_at: SystemTime,
+        source: WindowSource,
+    ) -> bool {
+        let merged = ScopedQuotaWindow {
+            scope_label: reading.scope_label.clone(),
+            window: QuotaWindow {
+                utilization: reading.reading.utilization,
+                resets_at: reading.reading.resets_at,
+                fetched_at,
+                source,
+            },
+            severity: reading.severity,
+            is_active: reading.is_active,
+        };
+        match slots
+            .iter_mut()
+            .find(|s| s.scope_label.eq_ignore_ascii_case(&reading.scope_label))
+        {
+            Some(existing) => {
+                if existing.window.fetched_at > fetched_at {
+                    return false;
+                }
+                *existing = merged;
+            }
+            None => slots.push(merged),
+        }
         true
     }
 
@@ -248,6 +290,9 @@ impl PoolState {
 
     /// Record a `/api/oauth/usage` poll result. Same freshness merge as
     /// headers; fresh data showing capacity clears `Heuristic` cooldowns.
+    /// Scoped (`limits[]`) readings merge into the account's scoped list but
+    /// deliberately do NOT feed the self-heal gate: cooldown behavior stays
+    /// keyed to the account-wide windows only (scope-aware cooldown is W2).
     pub fn record_usage(&mut self, account: &AccountId, usage: &UsageSnapshot, now: SystemTime) {
         let Some(acct) = self.account_mut(account) else {
             return;
@@ -264,6 +309,14 @@ impl PoolState {
         if let Some(reading) = usage.seven_day {
             recorded |= AccountState::merge_window(
                 &mut acct.seven_day,
+                reading,
+                now,
+                WindowSource::UsagePoll,
+            );
+        }
+        for reading in &usage.scoped {
+            AccountState::merge_scoped(
+                &mut acct.scoped_limits,
                 reading,
                 now,
                 WindowSource::UsagePoll,
@@ -374,6 +427,7 @@ impl PoolState {
                     group: BackendGroup::from_kind(a.credential.kind()),
                     five_hour: a.five_hour,
                     seven_day: a.seven_day,
+                    scoped_limits: a.scoped_limits.clone(),
                     cooldown_until: a.cooldown_until,
                     cooldown_source: a.cooldown_source,
                     in_flight: a.in_flight,
@@ -435,6 +489,9 @@ pub struct AccountSnapshot {
     pub group: BackendGroup,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
+    /// Model-scoped weekly limits (`limits[]` weekly_scoped rows from the
+    /// usage poll), e.g. the "Fable" weekly gauge. Empty when never seen.
+    pub scoped_limits: Vec<ScopedQuotaWindow>,
     pub cooldown_until: Option<SystemTime>,
     pub cooldown_source: Option<CooldownSource>,
     pub in_flight: u32,
@@ -446,6 +503,19 @@ pub struct AccountSnapshot {
     /// `None` for API-key accounts and never-refreshed oauth accounts —
     /// rendered as "never" in the dashboard.
     pub last_refresh_ms: Option<u64>,
+}
+
+impl AccountSnapshot {
+    /// The "Fable" weekly scoped window, if this account carries one — the
+    /// entry in [`Self::scoped_limits`] whose `scope_label` matches "Fable"
+    /// case-insensitively. Convenience surface for the dashboard doc /
+    /// `/llmux/status` JSON; the full scoped list stays available for other
+    /// (future) scoped models without another lookup helper.
+    pub fn fable_weekly(&self) -> Option<&ScopedQuotaWindow> {
+        self.scoped_limits
+            .iter()
+            .find(|s| s.scope_label.eq_ignore_ascii_case("Fable"))
+    }
 }
 
 /// Read-only projection of the whole pool. `select::pick` takes this plus an
@@ -792,6 +862,7 @@ mod tests {
         UsageSnapshot {
             five_hour: five,
             seven_day: seven,
+            scoped: Vec::new(),
         }
     }
 

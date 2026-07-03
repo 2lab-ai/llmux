@@ -108,6 +108,14 @@ impl DashboardView {
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
                 seven_day: window_from_doc(&a.seven_day),
+                // Scoped (`limits[]`) windows are surfaced end-to-end in the
+                // document / `/llmux/status` JSON (W1 data plane), but are NOT
+                // round-tripped back into the reconstructed pool snapshot here:
+                // the doc's scoped shape deliberately omits `fetched_at`/`source`,
+                // so a faithful `ScopedQuotaWindow` can't be rebuilt. The attach
+                // renderer consumes the scoped fields off the document directly
+                // when the Fbl gauge lands (W3); until then this stays empty.
+                scoped_limits: Vec::new(),
                 cooldown_until: a.cooldown_until.map(secs_time),
                 cooldown_source: a.cooldown_source.as_deref().map(|s| match s {
                     "retry_after" => CooldownSource::RetryAfter,
