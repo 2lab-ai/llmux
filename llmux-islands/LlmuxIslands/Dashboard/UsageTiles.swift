@@ -26,7 +26,7 @@ enum UsageWindow: CaseIterable {
         case .fiveHour: "5h"
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
-        case .fableWeekly: "Fable"
+        case .fableWeekly: "Fab"
         }
     }
 }
@@ -923,6 +923,8 @@ private struct UsageWindowRow: View {
             Text(window.label)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 .foregroundColor(labelColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .frame(width: 26, alignment: .leading)
                 .padding(.top, 2)
 
