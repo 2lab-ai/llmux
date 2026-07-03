@@ -463,8 +463,8 @@ mod tests {
     #[test]
     fn codex_account_name_prefixes_group() {
         assert_eq!(
-            codex_account_name(Some("icedac@gmail.com"), "acct-uuid"),
-            "codex:icedac@gmail.com"
+            codex_account_name(Some("user@example.com"), "acct-uuid"),
+            "codex:user@example.com"
         );
         // No email → codex:{account_id-prefix} (first 8 chars).
         assert_eq!(codex_account_name(None, "abcdefghIJKL"), "codex:abcdefgh");
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn account_from_exchange_builds_codex_account() {
         let id_token = fake_jwt(&serde_json::json!({
-            "email": "icedac@gmail.com",
+            "email": "user@example.com",
             "https://api.openai.com/auth": {"chatgpt_account_id": "acct-abc"}
         }));
         let exchange = CodexCodeExchange {
@@ -506,7 +506,7 @@ mod tests {
             id_token: Some(id_token),
         };
         let account = account_from_exchange(exchange).expect("account");
-        assert_eq!(account.name, "codex:icedac@gmail.com");
+        assert_eq!(account.name, "codex:user@example.com");
         match account.credential {
             AccountCredential::Codex {
                 account_id,

@@ -2968,7 +2968,7 @@ mod tests {
                 cells: vec![crate::dashboard::WindowedCellDoc {
                     group: "codex".into(),
                     model: "gpt-5.5".into(),
-                    account: "z@2lab.ai".into(),
+                    account: "user@example.com".into(),
                     requests: 12,
                     ok: 11,
                     errors: 1,
@@ -2991,7 +2991,10 @@ mod tests {
             text.contains("best-effort"),
             "accuracy contract: best-effort qualifier visible"
         );
-        assert!(text.contains("z@2lab.ai"), "per-account axis rendered");
+        // The account column is truncated via `trunc(&c.account, 14)`, so the
+        // 16-char `user@example.com` renders as `user@example.…`; assert on the
+        // visible prefix rather than the full address.
+        assert!(text.contains("user@example"), "per-account axis rendered");
         // The keybar advertises the window-cycle key.
         assert!(text.contains("window"), "footer advertises w window cycle");
     }
