@@ -140,7 +140,7 @@ fn scoped_limit_row(row: &Value) -> Option<ScopedLimitReading> {
 }
 
 /// The VERBATIM `GET /api/oauth/usage` body captured live on
-/// `claude:dev1@insightquest.io`, 2026-07-03 (`.prd/13-usage-raw-sources.md`
+/// `claude:dev1@example.com`, 2026-07-03 (`.prd/13-usage-raw-sources.md`
 /// §Carrier 1) — the ground-truth fixture for `limits[]` parsing, shared with
 /// the `/llmux/status` end-to-end test.
 #[cfg(test)]
