@@ -26,7 +26,9 @@ enum UsageWindow: CaseIterable {
         case .fiveHour: "5h"
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
-        case .fableWeekly: "Fab"
+        // Fable weekly is a 7-day window scoped to the Fable model — stack the
+        // duration over the scope so the row reads "7d / Fab" (two lines).
+        case .fableWeekly: "7d\nFab"
         }
     }
 }
@@ -923,7 +925,7 @@ private struct UsageWindowRow: View {
             Text(window.label)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 .foregroundColor(labelColor)
-                .lineLimit(1)
+                .lineLimit(2)
                 .minimumScaleFactor(0.8)
                 .frame(width: 26, alignment: .leading)
                 .padding(.top, 2)
