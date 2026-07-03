@@ -110,8 +110,69 @@ jobs:
             ${{ matrix.name }}
             ${{ matrix.name }}.sha256
 
+  # The islands menu-bar app rides the SAME preview prerelease (mirrors the
+  # stable `release.yml`, where LlmuxIslands-<v>.zip ships on the v* release).
+  # Version = the preview build_id restamped dotted (YYYY.MM.DD.HHMM) so the
+  # tap's llmux-islands-preview cask derives `LlmuxIslands-<version>.zip`.
+  islands:
+    needs: preflight
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      LLMUX_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+
+      - name: Resolve preview version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build_id = YYYY-MM-DD-HHMM-<sha12>  ->  version YYYY.MM.DD.HHMM
+          if [[ "$LLMUX_BUILD_ID" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{4})- ]]; then
+            echo "ISLANDS_VERSION=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}" >> "$GITHUB_ENV"
+          else
+            echo "unexpected build id: $LLMUX_BUILD_ID" >&2
+            exit 1
+          fi
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build the app (ad-hoc signed; no Developer ID in CI)
+        working-directory: llmux-islands
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -project LlmuxIslands.xcodeproj -scheme LlmuxIslands \
+            -configuration Release -derivedDataPath build \
+            MARKETING_VERSION="$ISLANDS_VERSION" \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+            build
+
+      - name: Package .app
+        working-directory: llmux-islands
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/LlmuxIslands.app"
+          ZIP="LlmuxIslands-${ISLANDS_VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LlmuxIslands
+          path: |
+            llmux-islands/LlmuxIslands-*.zip
+            llmux-islands/LlmuxIslands-*.zip.sha256
+
   publish:
-    needs: [preflight, build]
+    needs: [preflight, build, islands]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -133,12 +194,15 @@ jobs:
           for asset in llmux-macos-aarch64 llmux-macos-x86_64 llmux-linux-x86_64 llmux-linux-aarch64; do
             cp "artifacts/$asset/$asset" "release/$asset"
           done
-          (cd release && sha256sum llmux-* > SHA256SUMS)
+          # islands app rides the same preview prerelease (from the `islands` job)
+          cp artifacts/LlmuxIslands/LlmuxIslands-*.zip release/
+          (cd release && sha256sum llmux-* LlmuxIslands-*.zip > SHA256SUMS)
           cat release/SHA256SUMS
           {
             echo "Preview build \`${{ needs.preflight.outputs.build_id }}\` from ${{ needs.preflight.outputs.commit }}."
             echo
-            echo "Install: \`brew install 2lab-ai/tap/llmux-preview\`"
+            echo "Install (daemon): \`brew install 2lab-ai/tap/llmux-preview\`"
+            echo "Install (menu-bar app): \`brew install 2lab-ai/tap/llmux-islands-preview\`"
             echo
             echo '```'
             cat release/SHA256SUMS
@@ -159,6 +223,7 @@ jobs:
             release/llmux-macos-x86_64
             release/llmux-linux-x86_64
             release/llmux-linux-aarch64
+            release/LlmuxIslands-*.zip
             release/SHA256SUMS
 
       - name: Prune old preview prereleases (keep 15)
