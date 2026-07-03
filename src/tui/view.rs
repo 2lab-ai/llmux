@@ -116,6 +116,10 @@ impl DashboardView {
                 // renderer consumes the scoped fields off the document directly
                 // when the Fbl gauge lands (W3); until then this stays empty.
                 scoped_limits: Vec::new(),
+                // Scoped cooldowns are a live daemon-side concept (fable-usage
+                // W2); the reconstructed-from-doc snapshot never gates requests,
+                // so it carries none.
+                scoped_cooldowns: Vec::new(),
                 cooldown_until: a.cooldown_until.map(secs_time),
                 cooldown_source: a.cooldown_source.as_deref().map(|s| match s {
                     "retry_after" => CooldownSource::RetryAfter,

@@ -546,6 +546,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         Err(response) => return *response,
     };
 
+    // Fable-scope classification of this request (fable-usage W2): a Fable
+    // request is additionally gated by an account's Fable-scoped cooldown /
+    // preemptive Fable-critical exclusion, so a Fable-exhausted account is
+    // skipped for Fable while it keeps serving non-Fable traffic. Non-Fable
+    // requests ignore all Fable-scoped state (unchanged behavior).
+    let scope = if crate::routing::is_fable_model(ctx.model.as_deref()) {
+        select::RequestScope::Fable
+    } else {
+        select::RequestScope::NonFable
+    };
+
     // On-demand idle probe (issue #21): real traffic to this group is the
     // trigger to populate any windowless sibling account's 5h/7d data, so the
     // scheduler ranks/displays them accurately. Fully gated (kill-switch +
@@ -556,7 +567,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     loop {
         // 1. Lease the current account for the group (evaluate on demand when
         // none).
-        let lease = match acquire_lease(state, group, &params) {
+        let lease = match acquire_lease(state, group, &params, scope) {
             Ok(lease) => lease,
             Err(retry_after) => {
                 ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
@@ -823,10 +834,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     Some(wait) => {
                         // Real rate limit with explicit timing: park exactly
                         // that long, switch. Exhaustion here is a genuine "no
-                        // quota" 429 → tell the client when to come back.
-                        state
-                            .pool
-                            .record_429(&account, Some(wait), SystemTime::now());
+                        // quota" 429 → tell the client when to come back. A
+                        // retry-after 429 still parks account-wide (W2), whether
+                        // or not the request was Fable.
+                        state.pool.record_429_classified(
+                            &account,
+                            Some(wait),
+                            ctx.model.as_deref(),
+                            SystemTime::now(),
+                        );
                         drop(lease);
                         switches += 1;
                         if switches > max_switches {
@@ -844,12 +860,27 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         continue;
                     }
                     None => {
-                        // No retry-after = transient, server-side limit (not the
-                        // account's quota). Brief self-healing park, switch. If
-                        // EVERY account is momentarily limited, return a
-                        // transient 502 so the client retries promptly — never a
-                        // long "quota exhausted" park on a server-side blip.
-                        state.pool.record_429(&account, None, SystemTime::now());
+                        // No retry-after = transient/scope-blind limit (not
+                        // necessarily the account's whole quota). Scope-aware
+                        // classification (W2): a Fable request parks ONLY the
+                        // Fable scope (account keeps serving non-Fable) unless
+                        // the 5h/7d windows corroborate; a non-Fable request
+                        // parks account-wide as before. If EVERY account is
+                        // momentarily limited, return a transient 502 so the
+                        // client retries promptly — never a long "quota
+                        // exhausted" park on a server-side blip.
+                        let reason = state.pool.record_429_classified(
+                            &account,
+                            None,
+                            ctx.model.as_deref(),
+                            SystemTime::now(),
+                        );
+                        tracing::debug!(
+                            account = %account,
+                            model = ctx.model.as_deref().unwrap_or("<none>"),
+                            ?reason,
+                            "recorded scope-aware 429 cooldown"
+                        );
                         drop(lease);
                         switches += 1;
                         if switches > max_switches {
@@ -974,6 +1005,7 @@ fn acquire_lease(
     state: &AppState,
     group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
+    scope: select::RequestScope,
 ) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
     let now = SystemTime::now();
     // Heuristic-degraded selection MUST go through `pick`, not the sticky
@@ -988,15 +1020,18 @@ fn acquire_lease(
         select::heuristic_degraded_mode(&snapshot, params, group, now)
     };
     if !degraded {
-        if let Ok(lease) = state.pool.lease_for(group, params) {
+        // Scope-aware lease: a Fable request refuses a Fable-dead sticky current
+        // (Fable cooldown / preemptive exclusion) and falls through to a
+        // scope-aware selection pass below; non-Fable is the sticky fast-path.
+        if let Ok(lease) = state.pool.lease_for_scoped(group, params, scope) {
             return Ok(lease);
         }
     }
-    match state.pool.evaluate(group, params, now) {
+    match state.pool.evaluate_scoped(group, params, now, scope) {
         Decision::Exhausted { retry_after } => Err(retry_after),
         Decision::Stay | Decision::Switch { .. } => state
             .pool
-            .lease_for(group, params)
+            .lease_for_scoped(group, params, scope)
             .map_err(|err| err.retry_after),
     }
 }
@@ -2686,7 +2721,7 @@ mod tests {
         state.pool.record_429(&AccountId("b".into()), None, now);
 
         // Degraded mode: a lease is still granted (no hard pool refuse).
-        let lease = acquire_lease(&state, None, &params)
+        let lease = acquire_lease(&state, None, &params, select::RequestScope::NonFable)
             .expect("degraded mode must still lease an account");
         // It is one of the two parked accounts (the soonest-freed; here both
         // were parked at the same instant so the stable id tiebreak picks "a").
@@ -2706,7 +2741,13 @@ mod tests {
             .pool
             .record_429(&AccountId("b".into()), Some(Duration::from_secs(120)), now);
         assert!(
-            acquire_lease(&state2, None, &state2.select_params()).is_err(),
+            acquire_lease(
+                &state2,
+                None,
+                &state2.select_params(),
+                select::RequestScope::NonFable
+            )
+            .is_err(),
             "RetryAfter parks are a real quota signal and must NOT be bypassed"
         );
     }
@@ -2757,7 +2798,7 @@ mod tests {
 
         // Acquisition must NOT re-lease the over-quota sticky current "a"; it
         // must serve the quota-clean, heuristic-only peer "b" that `pick` ranks.
-        let lease = acquire_lease(&state, None, &params)
+        let lease = acquire_lease(&state, None, &params, select::RequestScope::NonFable)
             .expect("degraded mode must lease the quota-clean soonest-freed account");
         assert_eq!(
             lease.account_id(),
