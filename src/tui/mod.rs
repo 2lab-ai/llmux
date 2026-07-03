@@ -2114,6 +2114,7 @@ mod tests {
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
+            show_fable_weekly: true,
         }
     }
 }

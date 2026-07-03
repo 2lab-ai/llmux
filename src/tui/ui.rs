@@ -17,7 +17,9 @@ use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
 use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
-use crate::scheduler::window::{classify_window_display, QuotaWindow, WindowDisplayState};
+use crate::scheduler::window::{
+    classify_window_display, LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
+};
 use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody};
@@ -704,49 +706,65 @@ fn draw_accounts(
     // "group" (claude/codex — the model group, colored + prominent) leads the
     // data columns; "auth" (oauth/api) is the credential type, separated out
     // (req5). Both appear in narrow mode too — group is load-bearing.
+    //
+    // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge+reset
+    // pair, and ONLY when `show_fable_weekly` is on — off renders the table
+    // exactly as before W3 (no column, no width taken). Wide gets a full gauge
+    // column; narrow gets a compact marker column (no third reset pair — the
+    // width budget is tight there).
+    let show_fable = view.show_fable_weekly;
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
-        (
-            vec![
-                "", "group", "#", "account", "auth", "status", "5h", "reset", "7d", "reset",
-                "token", "if", "req", "tok",
-            ],
-            vec![
-                Constraint::Length(2),
-                Constraint::Length(7),
-                Constraint::Length(2),
-                Constraint::Fill(1),
-                Constraint::Length(6),
-                Constraint::Length(20),
-                Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-                Constraint::Length(19),
-                Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-                Constraint::Length(19),
-                // "23h59m ↻59m" / "expired ↻12h" — expiry + refreshed-ago.
-                Constraint::Length(13),
-                Constraint::Length(3),
-                Constraint::Length(6),
-                Constraint::Length(7),
-            ],
-        )
+        let mut header = vec![
+            "", "group", "#", "account", "auth", "status", "5h", "reset", "7d", "reset",
+        ];
+        let mut constraints = vec![
+            Constraint::Length(2),
+            Constraint::Length(7),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(6),
+            Constraint::Length(20),
+            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(19),
+            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(19),
+        ];
+        if show_fable {
+            header.push("Fbl");
+            constraints.push(Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16));
+        }
+        header.extend(["token", "if", "req", "tok"]);
+        constraints.extend([
+            // "23h59m ↻59m" / "expired ↻12h" — expiry + refreshed-ago.
+            Constraint::Length(13),
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Length(7),
+        ]);
+        (header, constraints)
     } else {
-        (
-            vec![
-                "", "group", "#", "account", "status", "5h", "reset", "7d", "reset", "token", "if",
-            ],
-            vec![
-                Constraint::Length(2),
-                Constraint::Length(7),
-                Constraint::Length(2),
-                Constraint::Fill(1),
-                Constraint::Length(20),
-                Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-                Constraint::Length(7),
-                Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-                Constraint::Length(7),
-                Constraint::Length(8),
-                Constraint::Length(3),
-            ],
-        )
+        let mut header = vec![
+            "", "group", "#", "account", "status", "5h", "reset", "7d", "reset",
+        ];
+        let mut constraints = vec![
+            Constraint::Length(2),
+            Constraint::Length(7),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(20),
+            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(7),
+            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(7),
+        ];
+        if show_fable {
+            header.push("Fbl");
+            // Compact marker column ("F 100%!" fits in 7): no bar, no reset.
+            constraints.push(Constraint::Length(7));
+        }
+        header.extend(["token", "if"]);
+        constraints.extend([Constraint::Length(8), Constraint::Length(3)]);
+        (header, constraints)
     };
 
     let table = Table::new(rows, constraints)
@@ -834,11 +852,20 @@ fn account_row<'a>(
     cells.push(Cell::from(status_span(
         account, gate, is_current, params, now, ctx.frame,
     )));
+    cells.extend([five_gauge, five_reset, seven_gauge, seven_reset]);
+    // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
+    // same slot (after 7d) as the header/constraints reserve above, so the
+    // cells stay column-aligned. Absent-window → the same cold state 5h/7d use.
+    if view.show_fable_weekly {
+        cells.push(fable_gauge_cell(
+            account.fable_weekly(),
+            now,
+            wide,
+            max_age,
+            consecutive_failures,
+        ));
+    }
     cells.extend([
-        five_gauge,
-        five_reset,
-        seven_gauge,
-        seven_reset,
         Cell::from(token_health_line(account, view.refresh_ahead, now, wide)),
         Cell::from(in_flight_span(account.in_flight)),
     ]);
@@ -1019,6 +1046,82 @@ fn window_cells(
         None => Span::styled("—", dim()),
     });
     (gauge, reset_cell)
+}
+
+/// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
+/// following the same pattern as [`window_cells`] but as a single cell (no
+/// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
+/// critical coloring:
+///
+/// - Present window: bar + `%` in wide mode, a compact `F 97%` marker in
+///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
+///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
+///   an `is_active` or `severity == Critical` Fable limit reads red regardless
+///   of the raw percent (the limit is engaged upstream even if the number looks
+///   calm). A trailing `!` flags that red-critical state, mirroring the
+///   over-threshold marker on the account windows.
+/// - Absent window (no Fable scope on this account): the same cold/stale/
+///   poll-degraded state 5h/7d show for an absent window, via
+///   [`classify_window_display`] — never a crash or blank.
+fn fable_gauge_cell(
+    scoped: Option<&ScopedQuotaWindow>,
+    now: SystemTime,
+    wide: bool,
+    max_age: Duration,
+    consecutive_failures: u32,
+) -> Cell<'static> {
+    let window = scoped.map(|s| s.window);
+    let display = classify_window_display(&window, now, max_age, consecutive_failures);
+    let Some(scoped) = scoped else {
+        // Cold / absent: mirror the `window_cells` absent branch — the glyph +
+        // label in wide mode, a compact `F ○`-style marker in narrow mode — so
+        // a never-seen Fable window reads distinctly from an honest 0%.
+        return if wide {
+            Cell::from(Span::styled(
+                format!("{} {}", display.glyph(), display.label()),
+                dim(),
+            ))
+        } else {
+            Cell::from(Span::styled(format!("F {}", display.glyph()), dim()))
+        };
+    };
+    let utilization = scoped.window.effective_utilization(now);
+    // Scope signal wins: an engaged (`is_active`) or upstream-critical Fable
+    // limit is red no matter the percent; otherwise fall to the fill-level band.
+    let critical = scoped.is_active || scoped.severity == LimitSeverity::Critical;
+    let level = if critical {
+        GaugeLevel::Red
+    } else {
+        format::gauge_level(utilization)
+    };
+    let color = level_color(level);
+    // `!` on the red-critical read, same signal window_cells carries with its
+    // over-threshold `!`.
+    let over = matches!(level, GaugeLevel::Red);
+    let label = if over {
+        format!("{}!", format::percent(utilization))
+    } else {
+        format::percent(utilization)
+    };
+    if wide {
+        let mut spans = vec![
+            Span::styled(
+                format::gauge_bar(utilization, GAUGE_BAR_WIDTH),
+                Style::new().fg(color),
+            ),
+            Span::raw(" "),
+            Span::styled(label, Style::new().fg(color)),
+        ];
+        // Stale / poll-degraded still flag distinctly (issue #33 parity).
+        if !matches!(display, WindowDisplayState::Populated) {
+            spans.push(Span::styled(format!(" {}", display.glyph()), dim()));
+        }
+        Cell::from(Line::from(spans))
+    } else {
+        // Compact narrow marker (W0 example `F 97!`): `F` + percent + critical
+        // `!`, colored. No bar — the narrow width budget has no room for one.
+        Cell::from(Span::styled(format!("F {label}"), Style::new().fg(color)))
+    }
 }
 
 /// Reset column text: compact countdown, plus the absolute local time in
@@ -2712,6 +2815,7 @@ mod tests {
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
+            show_fable_weekly: true,
         }
     }
 
@@ -3386,6 +3490,184 @@ mod tests {
         assert!(
             layout.hits.is_empty(),
             "a note line is not a clickable hit target"
+        );
+    }
+
+    // --- fable-usage U9a: Fbl gauge column, opt-in toggle (default ON) -------
+
+    /// An account carrying a Fable weekly window (critical/active) plus a 5h
+    /// window, used to prove the Fbl gauge appears with the toggle ON and is
+    /// fully absent (columns unchanged) with it OFF.
+    fn fable_account() -> crate::scheduler::AccountSnapshot {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{
+            LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource,
+        };
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let now = SystemTime::now();
+        AccountSnapshot {
+            id: AccountId("claude:me@example.com".into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(QuotaWindow {
+                utilization: 0.42,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now,
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: None,
+            // Test helpers default `scoped_limits` empty; this one carries a
+            // live, engaged Fable weekly bucket at 97%.
+            scoped_limits: vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: QuotaWindow {
+                    utilization: 0.97,
+                    resets_at: now + Duration::from_secs(80_000),
+                    fetched_at: now,
+                    source: WindowSource::UsagePoll,
+                },
+                severity: LimitSeverity::Critical,
+                is_active: true,
+            }],
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }
+    }
+
+    /// U9a acceptance: with the toggle ON the wide accounts table renders the
+    /// `Fbl` gauge column + the Fable percent; with it OFF neither appears and
+    /// the pre-W3 5h column is unchanged. One view, both toggle states, so the
+    /// OFF assertions can't pass vacuously (the ON render proves the data is
+    /// present at this width).
+    #[test]
+    fn fable_gauge_renders_when_enabled_and_vanishes_when_disabled() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::AccountId;
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:me@example.com".into()),
+        );
+
+        // Toggle ON (wide layout, width ≥ WIDE_TABLE_AT): Fbl header + 97% gauge.
+        view.show_fable_weekly = true;
+        let on = render(&view, &chrome_overlay(Overlay::None), 200, 20);
+        assert!(
+            on.contains("Fbl"),
+            "toggle ON: wide table shows the Fbl gauge column header:\n{on}"
+        );
+        assert!(
+            on.contains("97%"),
+            "toggle ON: Fable weekly percent rendered:\n{on}"
+        );
+        // The pre-W3 5h gauge is still present and unchanged alongside it.
+        assert!(on.contains("42%"), "toggle ON: 5h gauge still rendered");
+
+        // Toggle OFF: no Fbl column, no Fable percent, 5h column unchanged.
+        view.show_fable_weekly = false;
+        let off = render(&view, &chrome_overlay(Overlay::None), 200, 20);
+        assert!(
+            !off.contains("Fbl"),
+            "toggle OFF: no Fbl column header:\n{off}"
+        );
+        assert!(
+            !off.contains("97%"),
+            "toggle OFF: no Fable weekly percent:\n{off}"
+        );
+        assert!(
+            off.contains("42%"),
+            "toggle OFF: pre-W3 5h gauge unchanged:\n{off}"
+        );
+    }
+
+    /// The narrow layout compresses the gauge to an inline `F 97%` marker
+    /// (no third gauge+reset pair) when the toggle is ON, and drops it when OFF.
+    #[test]
+    fn fable_gauge_narrow_uses_compact_marker_gated_by_toggle() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::AccountId;
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:me@example.com".into()),
+        );
+
+        // Width < WIDE_TABLE_AT → narrow layout.
+        view.show_fable_weekly = true;
+        let on = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        assert!(
+            on.contains("F 97%"),
+            "narrow toggle ON: compact `F 97%` marker rendered:\n{on}"
+        );
+
+        view.show_fable_weekly = false;
+        let off = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        assert!(
+            !off.contains("F 97%"),
+            "narrow toggle OFF: no Fable marker:\n{off}"
+        );
+    }
+
+    /// An account with NO Fable scope renders the neutral cold state in the Fbl
+    /// slot (never a crash/blank), and does not disturb the 5h/7d columns.
+    #[test]
+    fn fable_gauge_cold_state_for_account_without_fable_scope() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId("claude:cold@example.com".into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            // Both 5h and 7d populated, so the only cold cell in the row is the
+            // absent Fable one — the assertion below is then attributable to it.
+            five_hour: Some(QuotaWindow {
+                utilization: 0.10,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now,
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: Some(QuotaWindow {
+                utilization: 0.20,
+                resets_at: now + Duration::from_secs(600_000),
+                fetched_at: now,
+                source: WindowSource::UsagePoll,
+            }),
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:cold@example.com".into()),
+        );
+        view.show_fable_weekly = true;
+        // Renders without panicking and the Fbl column header is still present.
+        let text = render(&view, &chrome_overlay(Overlay::None), 200, 20);
+        assert!(
+            text.contains("Fbl"),
+            "cold account still gets the Fbl column"
+        );
+        assert!(
+            text.contains("cold"),
+            "absent Fable scope reads as cold state"
         );
     }
 

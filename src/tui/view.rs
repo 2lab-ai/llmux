@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::dashboard::{CompletedDoc, DashboardDoc, WindowDoc};
 use crate::logging::LogLine;
 use crate::scheduler::select::{self, SelectParams};
-use crate::scheduler::window::{QuotaWindow, WindowSource};
+use crate::scheduler::window::{LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource};
 use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 
 use super::activity::{Completed, CompletedBody, InFlight, Totals};
@@ -62,6 +62,13 @@ pub(crate) struct DashboardView {
     /// paths (switch/remove target names) still address the pool correctly —
     /// masking happens strictly at the render sites in `ui.rs`.
     pub email_anonymous: bool,
+    /// Whether the accounts table renders the model-scoped "Fable" weekly gauge
+    /// (fable-usage U9a — config `show_fable_weekly`, default ON). Carried on
+    /// the view so the one shared renderer honors it in both TUI backends;
+    /// when off the table renders exactly as before W3. The scoped data itself
+    /// always reaches the view (see [`AccountSnapshot::scoped_limits`] rebuilt
+    /// below) — this flag only gates the render.
+    pub show_fable_weekly: bool,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -98,6 +105,14 @@ fn window_from_doc(doc: &Option<WindowDoc>) -> Option<QuotaWindow> {
 
 impl DashboardView {
     pub(crate) fn from_doc(doc: &DashboardDoc) -> Self {
+        // Reconstruction timestamp for scoped windows: the document's scoped
+        // shape ([`crate::dashboard::ScopedWindowDoc`]) deliberately omits
+        // `fetched_at`/`source` (it is a convenience read-surface, not a
+        // scheduler-reconstruction input), so a rebuilt `ScopedQuotaWindow`
+        // carries no upstream fetch instant. Stamp it with "received now": the
+        // Fbl gauge's freshness reads as populated (it never gates scheduling),
+        // and its poll-degraded state still surfaces from the poller health.
+        let received_at = SystemTime::now();
         let accounts: Vec<AccountSnapshot> = doc
             .accounts
             .iter()
@@ -108,14 +123,28 @@ impl DashboardView {
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
                 seven_day: window_from_doc(&a.seven_day),
-                // Scoped (`limits[]`) windows are surfaced end-to-end in the
-                // document / `/llmux/status` JSON (W1 data plane), but are NOT
-                // round-tripped back into the reconstructed pool snapshot here:
-                // the doc's scoped shape deliberately omits `fetched_at`/`source`,
-                // so a faithful `ScopedQuotaWindow` can't be rebuilt. The attach
-                // renderer consumes the scoped fields off the document directly
-                // when the Fbl gauge lands (W3); until then this stays empty.
-                scoped_limits: Vec::new(),
+                // Scoped (`limits[]`) windows are rebuilt from the document so
+                // the shared renderer's `account.fable_weekly()` resolves in
+                // BOTH backends (local + attach) — the Fbl gauge (W3) reads it.
+                // The doc's scoped shape omits `fetched_at`/`source` (see
+                // `received_at` above), so those are synthesized; utilization /
+                // reset / severity / is_active — everything the gauge shows —
+                // round-trip faithfully.
+                scoped_limits: a
+                    .scoped_limits
+                    .iter()
+                    .map(|s| ScopedQuotaWindow {
+                        scope_label: s.scope_label.clone(),
+                        window: QuotaWindow {
+                            utilization: s.window.utilization,
+                            resets_at: secs_time(s.window.resets_at),
+                            fetched_at: received_at,
+                            source: WindowSource::UsagePoll,
+                        },
+                        severity: LimitSeverity::from_label(&s.window.severity),
+                        is_active: s.window.is_active,
+                    })
+                    .collect(),
                 // Scoped cooldowns are a live daemon-side concept (fable-usage
                 // W2); the reconstructed-from-doc snapshot never gates requests,
                 // so it carries none.
@@ -293,6 +322,7 @@ impl DashboardView {
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
+            show_fable_weekly: doc.show_fable_weekly,
         }
     }
 
@@ -658,6 +688,43 @@ mod tests {
         // The view snapshot keeps REAL ids — interactions (switch/remove)
         // address the pool by real name; masking is draw-time only.
         assert_eq!(view.snapshot.accounts[0].id.0, "a");
+    }
+
+    #[test]
+    fn fable_weekly_survives_doc_to_view_and_toggle_defaults_on() {
+        // A daemon that emits the scoped Fable window must reach the renderer
+        // input intact through from_doc — `account.fable_weekly()` is what the
+        // Fbl gauge (W3) reads, in BOTH backends. And an older daemon's doc with
+        // no `show_fable_weekly` field defaults the gauge ON.
+        let mut json = doc_json();
+        json["accounts"][0]["fable_weekly"] = serde_json::json!({
+            "utilization": 0.97, "resets_at": 1_600_000u64, "resets_in_secs": 600_000u64,
+            "severity": "critical", "is_active": true,
+        });
+        json["accounts"][0]["scoped_limits"] = serde_json::json!([{
+            "scope_label": "Fable", "utilization": 0.97, "resets_at": 1_600_000u64,
+            "resets_in_secs": 600_000u64, "severity": "critical", "is_active": true,
+        }]);
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        // Absent field → default ON.
+        assert!(doc.show_fable_weekly, "absent wire field defaults ON");
+        let view = DashboardView::from_doc(&doc);
+        assert!(view.show_fable_weekly);
+        let fable = view.snapshot.accounts[0]
+            .fable_weekly()
+            .expect("Fable scope rebuilt from doc");
+        assert!((fable.window.utilization - 0.97).abs() < 1e-9);
+        assert_eq!(fable.severity, LimitSeverity::Critical);
+        assert!(fable.is_active);
+
+        // An explicit `false` on the wire threads through to the view.
+        let mut json = doc_json();
+        json["show_fable_weekly"] = serde_json::json!(false);
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert!(!view.show_fable_weekly);
+        // No scoped rows in this doc → empty, not a crash.
+        assert!(view.snapshot.accounts[0].fable_weekly().is_none());
     }
 
     #[test]

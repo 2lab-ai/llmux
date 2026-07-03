@@ -468,6 +468,20 @@ pub struct DashboardDoc {
     /// here). Additive: absent in docs from an older daemon → false.
     #[serde(default)]
     pub email_anonymous: bool,
+    /// Whether the TUI should render the model-scoped "Fable" weekly gauge in
+    /// the accounts table (fable-usage U9a — config `show_fable_weekly`,
+    /// default ON). The scoped data itself is ALWAYS emitted (`fable_weekly` /
+    /// `scoped_limits` on each account below); this flag only gates the render,
+    /// carried here so BOTH TUI backends honor the config setting (local builds
+    /// the doc in-process; attach receives it here). Additive: absent in docs
+    /// from an older daemon → the client defaults the gauge ON.
+    #[serde(default = "default_true")]
+    pub show_fable_weekly: bool,
+}
+
+/// Serde default for additive `bool` fields that default ON.
+fn default_true() -> bool {
+    true
 }
 
 /// Live codex provider settings, surfaced so the dashboard can show and toggle
@@ -831,6 +845,9 @@ pub struct DocMeta {
     /// Live `email_anonymous` display setting (see
     /// [`DashboardDoc::email_anonymous`]).
     pub email_anonymous: bool,
+    /// Config `show_fable_weekly` (fable-usage U9a): whether the TUI renders
+    /// the Fable weekly gauge. See [`DashboardDoc::show_fable_weekly`].
+    pub show_fable_weekly: bool,
     /// API-equivalent pricing overrides from `[pricing]` in the live config
     /// (Feature D). Empty = use the built-in default rate table. Threaded here
     /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
@@ -1283,6 +1300,7 @@ pub(crate) fn dashboard_doc(
             .collect(),
         codex: meta.codex.clone(),
         email_anonymous: meta.email_anonymous,
+        show_fable_weekly: meta.show_fable_weekly,
     }
 }
 
@@ -1318,6 +1336,10 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         email_anonymous: state
             .email_anonymous
             .load(std::sync::atomic::Ordering::Relaxed),
+        // Config-file gate (fable-usage U9a). No runtime toggle / endpoint by
+        // design — a default-ON config field is the whole TUI-side ask — so
+        // this reads the loaded config snapshot directly.
+        show_fable_weekly: state.config.show_fable_weekly,
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -1360,6 +1382,7 @@ mod tests {
             },
             pricing_overrides: HashMap::new(),
             email_anonymous: false,
+            show_fable_weekly: true,
         }
     }
 
