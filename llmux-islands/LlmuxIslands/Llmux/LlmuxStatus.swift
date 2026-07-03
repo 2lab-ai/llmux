@@ -25,6 +25,12 @@ struct LlmuxAccountRecord: Decodable {
     let status: String?         // "active" | "ok" | "cooldown" | "auth_failed"
     let fiveHour: LlmuxWindow?
     let sevenDay: LlmuxWindow?
+    /// The Fable weekly (7d) usage window. Optional on purpose: an OLD daemon
+    /// omits `fable_weekly` entirely, and the daemon reports `null` for an
+    /// account with no Fable weekly limit — both decode to `nil`. This window
+    /// is temporary (the upstream limit is expected to disappear) so it carries
+    /// its own severity/is_active rather than reusing `LlmuxWindow`.
+    let fableWeekly: LlmuxScopedWindow?
     let inFlight: Int?
     let tokenExpiresAtMs: UInt64?
 
@@ -32,6 +38,7 @@ struct LlmuxAccountRecord: Decodable {
         case name, type, group, status
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
+        case fableWeekly = "fable_weekly"
         case inFlight = "in_flight"
         case tokenExpiresAtMs = "token_expires_at_ms"
     }
@@ -44,6 +51,25 @@ struct LlmuxWindow: Decodable {
     enum CodingKeys: String, CodingKey {
         case utilization
         case resetsInSecs = "resets_in_secs"
+    }
+}
+
+/// A usage window that also reports a server-computed `severity` and whether it
+/// is the currently binding limit (`is_active`). Used by `fable_weekly`, which
+/// the tile emphasizes in red when critical/active.
+struct LlmuxScopedWindow: Decodable {
+    let utilization: Double      // 0...1
+    let resetsInSecs: Int?
+    let resetsAt: Int?           // epoch seconds; informational
+    let severity: String?        // e.g. "ok" | "warning" | "critical"
+    let isActive: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case utilization
+        case resetsInSecs = "resets_in_secs"
+        case resetsAt = "resets_at"
+        case severity
+        case isActive = "is_active"
     }
 }
 
