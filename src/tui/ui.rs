@@ -1056,10 +1056,13 @@ fn window_cells(
 /// - Present window: bar + `%` in wide mode, a compact `F 97%` marker in
 ///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
 ///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
-///   an `is_active` or `severity == Critical` Fable limit reads red regardless
-///   of the raw percent (the limit is engaged upstream even if the number looks
-///   calm). A trailing `!` flags that red-critical state, mirroring the
-///   over-threshold marker on the account windows.
+///   a `severity == Critical` Fable limit reads red regardless of the raw
+///   percent (the limit is engaged upstream even if the number looks calm).
+///   `is_active` alone does NOT force red: it marks the representative/governing
+///   limit, NOT an exhausted one, so a 76%/warning/is_active row keeps its
+///   normal utilization-based hue (mirrors [`ScopedQuotaWindow::is_constraining`]).
+///   A trailing `!` flags the red state, mirroring the over-threshold marker on
+///   the account windows.
 /// - Absent window (no Fable scope on this account): the same cold/stale/
 ///   poll-degraded state 5h/7d show for an absent window, via
 ///   [`classify_window_display`] — never a crash or blank.
@@ -1086,9 +1089,11 @@ fn fable_gauge_cell(
         };
     };
     let utilization = scoped.window.effective_utilization(now);
-    // Scope signal wins: an engaged (`is_active`) or upstream-critical Fable
-    // limit is red no matter the percent; otherwise fall to the fill-level band.
-    let critical = scoped.is_active || scoped.severity == LimitSeverity::Critical;
+    // Scope signal wins: an upstream-critical Fable limit is red no matter the
+    // percent. `is_active` is NOT a red trigger — it marks the representative
+    // limit, not an exhausted one (a 76%/warning/is_active bucket has headroom),
+    // so it keeps its utilization-based hue. Otherwise fall to the fill band.
+    let critical = scoped.severity == LimitSeverity::Critical;
     let level = if critical {
         GaugeLevel::Red
     } else {
@@ -3671,6 +3676,72 @@ mod tests {
         assert!(
             text.contains("cold"),
             "absent Fable scope reads as cold state"
+        );
+    }
+
+    /// Regression (W2 `is_active` misread): a Fable weekly at 76% /
+    /// `warning` / `is_active: true` has real headroom — `is_active` marks the
+    /// representative limit, NOT exhaustion — so the gauge must render its normal
+    /// utilization hue with NO forced-red `!` marker (contrast `fable_account`'s
+    /// 97%/critical row, which legitimately gets the `!`).
+    #[test]
+    fn fable_gauge_with_headroom_is_not_forced_red() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{
+            LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource,
+        };
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId("claude:icedac@example.com".into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(QuotaWindow {
+                utilization: 0.42,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now,
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: None,
+            // 76% util, warning severity, is_active=true → the real headroom
+            // case that must NOT read red.
+            scoped_limits: vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: QuotaWindow {
+                    utilization: 0.76,
+                    resets_at: now + Duration::from_secs(80_000),
+                    fetched_at: now,
+                    source: WindowSource::UsagePoll,
+                },
+                severity: LimitSeverity::Warning,
+                is_active: true,
+            }],
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:icedac@example.com".into()),
+        );
+        view.show_fable_weekly = true;
+
+        // Narrow marker: `F 76%` with no critical `!` (is_active must not force
+        // the over-threshold marker at 76%).
+        let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        assert!(
+            narrow.contains("F 76%"),
+            "76%/warning/is_active renders its normal percent:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("76%!"),
+            "is_active alone must NOT force the red-critical `!` marker:\n{narrow}"
         );
     }
 

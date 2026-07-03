@@ -2094,6 +2094,47 @@ mod tests {
         );
     }
 
+    /// An account whose Fable weekly bucket is at 76% / `warning` /
+    /// `is_active: true` — the live-evidence regression shape: `is_active` marks
+    /// the representative limit, NOT an exhausted one, so ~24% headroom remains.
+    fn fable_headroom(id_: &str) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.76, 24 * HOUR),
+            severity: LimitSeverity::Warning,
+            is_active: true,
+        }];
+        a
+    }
+
+    #[test]
+    fn fable_request_is_allowed_to_an_account_with_fable_headroom() {
+        // Regression (W2 `is_active` misread): a Fable weekly at
+        // 76%/warning/is_active=true is NOT exhausted — `is_active` means "the
+        // governing limit", not "rejecting". The account keeps ~24% headroom, so
+        // a Fable request must be ALLOWED (gate returns None).
+        let ok = fable_headroom("ok");
+        assert!(
+            !ok.fable_weekly_exhausted(now()),
+            "76%/warning/is_active is NOT exhausted — it still has headroom"
+        );
+        assert_eq!(
+            gate_scoped(&ok, &params(), now(), false, false, RequestScope::Fable),
+            None,
+            "a Fable request to a 76% (is_active, warning) account is eligible"
+        );
+        // Contrast: a genuinely exhausted Fable account (100%/Critical/is_active)
+        // IS still excluded from Fable routing.
+        let dead = fable_critical("dead");
+        assert!(dead.fable_weekly_exhausted(now()));
+        assert_eq!(
+            gate_scoped(&dead, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableWeeklyExhausted),
+            "a util=1.0/Critical/is_active Fable account stays excluded"
+        );
+    }
+
     #[test]
     fn pick_scoped_fable_avoids_a_fable_dead_current_non_fable_stays() {
         // a is the sticky current and Fable-dead (scoped cooldown) but

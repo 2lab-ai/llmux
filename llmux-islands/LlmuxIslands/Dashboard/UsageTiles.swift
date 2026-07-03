@@ -700,11 +700,15 @@ private struct UsageProviderColumn: View {
         }
     }
 
-    /// The Fable weekly row is emphasized (red) when the daemon marks it the
-    /// binding limit (`is_active`) or its severity is critical.
+    /// The Fable weekly row is emphasized (red) only when its severity is
+    /// critical. `is_active` is deliberately NOT a trigger: on the daemon's
+    /// `/api/oauth/usage` it marks the representative/governing limit, NOT an
+    /// exhausted one — it is true even at low utilization (a 76%/warning row is
+    /// `is_active: true` with ~24% headroom), so keying red off it wrongly
+    /// paints a healthy account red.
     private func emphasizeCritical(for window: UsageWindow) -> Bool {
         guard window == .fableWeekly, let info else { return false }
-        return info.fableWeeklySeverity?.lowercased() == "critical" || info.fableWeeklyIsActive == true
+        return info.fableWeeklySeverity?.lowercased() == "critical"
     }
 
     private func normalizeCodexTier(_ plan: String?) -> String? {
@@ -916,8 +920,10 @@ private struct UsageWindowRow: View {
     let percentUsed: Double?
     let resetAt: Date?
     let now: Date
-    /// When true (Fable weekly at critical/active), the usage bar + percent are
-    /// forced red regardless of the usage-fraction hue ramp.
+    /// When true (Fable weekly at `severity == critical`), the usage bar +
+    /// percent are forced red regardless of the usage-fraction hue ramp.
+    /// `is_active` alone does NOT set this — it marks the representative limit,
+    /// not an exhausted one, so a 76%/warning/is_active row keeps its normal hue.
     var emphasizeCritical: Bool = false
 
     var body: some View {
