@@ -40,6 +40,7 @@ enum AppSettings {
         static let notificationSound = "notificationSound"
         static let usageResetAlertsEnabled = "usageResetAlertsEnabled"
         static let emailAnonymousEnabled = "emailAnonymousEnabled"
+        static let showFableWeekly = "showFableWeekly"
     }
 
     // MARK: - Notification Sound
@@ -87,6 +88,28 @@ enum AppSettings {
         }
         set {
             defaults.set(newValue, forKey: Keys.emailAnonymousEnabled)
+        }
+    }
+
+    // MARK: - Fable Weekly (7d)
+
+    /// UserDefaults key for the "show Fable weekly (7d)" setting, exposed so
+    /// SwiftUI views can observe it live via `@AppStorage`.
+    static let showFableWeeklyKey = Keys.showFableWeekly
+
+    /// Whether the usage tiles show the temporary Fable weekly (7d) row.
+    /// Defaults to ON (opt-out): the feature is short-lived — the upstream Fable
+    /// weekly limit is expected to disappear — so it ships visible but the user
+    /// can turn it off. Absent key (first launch) reads as `true`.
+    static var showFableWeekly: Bool {
+        get {
+            if defaults.object(forKey: Keys.showFableWeekly) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.showFableWeekly)
+        }
+        set {
+            defaults.set(newValue, forKey: Keys.showFableWeekly)
         }
     }
 }
