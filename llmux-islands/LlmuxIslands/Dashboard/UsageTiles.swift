@@ -19,12 +19,14 @@ enum UsageWindow: CaseIterable {
     case fiveHour
     case twentyFourHour
     case sevenDay
+    case fableWeekly
 
     var label: String {
         switch self {
         case .fiveHour: "5h"
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
+        case .fableWeekly: "Fable"
         }
     }
 }
@@ -461,6 +463,7 @@ private struct UsageProviderColumn: View {
     let onSetClaudeCodeTokenEnabled: ((String, Bool) -> Void)?
 
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
+    @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -655,7 +658,8 @@ private struct UsageProviderColumn: View {
                     window: window,
                     percentUsed: percentUsed(for: window),
                     resetAt: resetAt(for: window),
-                    now: now
+                    now: now,
+                    emphasizeCritical: emphasizeCritical(for: window)
                 )
             }
         }
@@ -663,8 +667,16 @@ private struct UsageProviderColumn: View {
 
     private var providerWindows: [UsageWindow] {
         switch provider {
-        case .gemini: return []
-        case .claude, .codex: return [.fiveHour, .sevenDay]
+        case .gemini:
+            return []
+        case .claude, .codex:
+            var windows: [UsageWindow] = [.fiveHour, .sevenDay]
+            // The Fable weekly row is opt-out (default on) and only appears when
+            // the daemon actually reports a Fable weekly window for this account.
+            if showFableWeekly, info?.fableWeeklyPercent != nil {
+                windows.append(.fableWeekly)
+            }
+            return windows
         }
     }
 
@@ -673,6 +685,7 @@ private struct UsageProviderColumn: View {
         switch window {
         case .fiveHour, .twentyFourHour: return info.fiveHourPercent
         case .sevenDay: return info.sevenDayPercent
+        case .fableWeekly: return info.fableWeeklyPercent
         }
     }
 
@@ -681,7 +694,15 @@ private struct UsageProviderColumn: View {
         switch window {
         case .fiveHour, .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
+        case .fableWeekly: return info.fableWeeklyReset
         }
+    }
+
+    /// The Fable weekly row is emphasized (red) when the daemon marks it the
+    /// binding limit (`is_active`) or its severity is critical.
+    private func emphasizeCritical(for window: UsageWindow) -> Bool {
+        guard window == .fableWeekly, let info else { return false }
+        return info.fableWeeklySeverity?.lowercased() == "critical" || info.fableWeeklyIsActive == true
     }
 
     private func normalizeCodexTier(_ plan: String?) -> String? {
@@ -893,12 +914,15 @@ private struct UsageWindowRow: View {
     let percentUsed: Double?
     let resetAt: Date?
     let now: Date
+    /// When true (Fable weekly at critical/active), the usage bar + percent are
+    /// forced red regardless of the usage-fraction hue ramp.
+    var emphasizeCritical: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Text(window.label)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.45))
+                .foregroundColor(labelColor)
                 .frame(width: 26, alignment: .leading)
                 .padding(.top, 2)
 
@@ -949,7 +973,12 @@ private struct UsageWindowRow: View {
         return "\(Int(remaining.rounded()))%"
     }
 
+    private var labelColor: Color {
+        emphasizeCritical ? TerminalColors.red : .white.opacity(0.45)
+    }
+
     private var usageFillColor: Color {
+        if emphasizeCritical { return TerminalColors.red }
         let fraction = max(0, min(1, usageRemainingFraction))
         let hue = 0.33 * fraction
         return Color(hue: hue, saturation: 0.85, brightness: 0.95)
@@ -957,6 +986,7 @@ private struct UsageWindowRow: View {
 
     private var usageTextColor: Color {
         guard percentUsed != nil else { return TerminalColors.dim }
+        if emphasizeCritical { return TerminalColors.red }
         return usageFillColor.opacity(0.9)
     }
 
@@ -981,7 +1011,7 @@ private struct UsageWindowRow: View {
             return 5 * 60 * 60
         case .twentyFourHour:
             return 24 * 60 * 60
-        case .sevenDay:
+        case .sevenDay, .fableWeekly:
             return 7 * 24 * 60 * 60
         }
     }
