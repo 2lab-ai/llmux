@@ -2071,6 +2071,7 @@ mod tests {
             five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 0,

@@ -891,10 +891,13 @@ fn status_span(
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => {
             (anim::shade_breathe(frame), Style::new().fg(Color::Red))
         }
-        IneligibleReason::CoolingDown => (
+        IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
             anim::half_block_clock(frame),
             Style::new().fg(Color::Yellow),
         ),
+        IneligibleReason::FableWeeklyExhausted => {
+            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
+        }
         IneligibleReason::UsageStale => (anim::idle_drift(frame), dim()),
     };
     Span::styled(format!("{glyph} {text}"), style)
@@ -3432,6 +3435,7 @@ mod tests {
             five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 1,

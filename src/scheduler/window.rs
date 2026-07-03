@@ -111,6 +111,24 @@ pub struct ScopedQuotaWindow {
     pub is_active: bool,
 }
 
+impl ScopedQuotaWindow {
+    /// Whether this scoped limit is currently constraining (fable-usage W2
+    /// preemptive avoidance): engaged upstream (`is_active`), upstream-critical
+    /// severity, or utilization at/above `critical_util`. Reset-aware — a
+    /// window past its `resets_at` carries no constraint (its
+    /// `effective_utilization` reads 0) and this returns `false`, so a Fable
+    /// bucket whose weekly window has rolled over no longer excludes the
+    /// account from Fable routing.
+    pub fn is_constraining(&self, now: SystemTime, critical_util: f64) -> bool {
+        if self.window.is_expired(now) {
+            return false;
+        }
+        self.is_active
+            || self.severity == LimitSeverity::Critical
+            || self.window.effective_utilization(now) >= critical_util
+    }
+}
+
 /// How one usage window should be *displayed*, distinct from the silent
 /// `—`/`0%` collapse the dashboard used to show for every non-populated case
 /// (issue #33). This is a pure, render-only classification: it spends no
@@ -249,6 +267,51 @@ mod tests {
     fn future_fetched_at_is_not_stale() {
         let w = window(0.5, 10_000, 5000);
         assert!(!w.is_stale(at(1000), Duration::from_secs(1)));
+    }
+
+    // ---- ScopedQuotaWindow::is_constraining (fable-usage W2) ----
+
+    fn scoped(
+        util: f64,
+        resets_at: u64,
+        active: bool,
+        severity: LimitSeverity,
+    ) -> ScopedQuotaWindow {
+        ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(util, resets_at, 900),
+            severity,
+            is_active: active,
+        }
+    }
+
+    #[test]
+    fn is_constraining_on_active_critical_or_high_util() {
+        // is_active alone constrains.
+        assert!(scoped(0.10, 10_000, true, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
+        // Critical severity alone constrains.
+        assert!(
+            scoped(0.10, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95)
+        );
+        // Utilization at/above the critical bar constrains.
+        assert!(scoped(0.95, 10_000, false, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
+        // Healthy, low-util, non-critical does NOT constrain.
+        assert!(
+            !scoped(0.60, 10_000, false, LimitSeverity::Warning).is_constraining(at(1000), 0.95)
+        );
+    }
+
+    #[test]
+    fn is_constraining_is_reset_aware() {
+        // Active + critical, but the weekly window has already reset → no
+        // constraint (effective_utilization reads 0 past resets_at).
+        let w = scoped(1.0, 2000, true, LimitSeverity::Critical);
+        assert!(!w.is_constraining(at(2000), 0.95));
+        assert!(!w.is_constraining(at(5000), 0.95));
+        assert!(
+            w.is_constraining(at(1999), 0.95),
+            "still constrains before reset"
+        );
     }
 
     // ---- WindowDisplayState (issue #33: distinct render states) ----
