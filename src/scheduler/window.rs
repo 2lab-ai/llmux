@@ -56,6 +56,61 @@ impl QuotaWindow {
     }
 }
 
+/// Severity of one upstream limit row (`limits[].severity` on
+/// `GET /api/oauth/usage`): `normal` | `warning` | `critical`. Unknown labels
+/// degrade to [`Self::Normal`] — tolerant parsing, same policy as the rest of
+/// the usage body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitSeverity {
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl LimitSeverity {
+    /// The upstream's own lowercase label, used verbatim in serialized docs.
+    pub fn label(self) -> &'static str {
+        match self {
+            LimitSeverity::Normal => "normal",
+            LimitSeverity::Warning => "warning",
+            LimitSeverity::Critical => "critical",
+        }
+    }
+
+    /// Parse an upstream/doc label; anything unrecognized reads as `Normal`.
+    pub fn from_label(label: &str) -> Self {
+        if label.eq_ignore_ascii_case("critical") {
+            LimitSeverity::Critical
+        } else if label.eq_ignore_ascii_case("warning") {
+            LimitSeverity::Warning
+        } else {
+            LimitSeverity::Normal
+        }
+    }
+}
+
+/// One model-scoped quota limit (`limits[].kind == "weekly_scoped"` from the
+/// usage poll) — e.g. the separate "Fable" weekly gauge on claude.ai. Generic
+/// on purpose: the scoped list is model-extensible and Fable is just today's
+/// occupant, so nothing here hardcodes a model name.
+///
+/// `severity`/`is_active` live on THIS wrapper, not inside [`QuotaWindow`]:
+/// the window stays a pure number window shared by header/poll sources, and
+/// scope metadata rides alongside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedQuotaWindow {
+    /// The scope key — `limits[].scope.model.display_name` (e.g. "Fable").
+    /// Matched case-insensitively when merging and looking up.
+    pub scope_label: String,
+    /// The scoped window itself (utilization fraction + resets + freshness).
+    pub window: QuotaWindow,
+    /// Upstream's severity for this limit row.
+    pub severity: LimitSeverity,
+    /// True when the limit is currently engaged (requests governed by it are
+    /// being rejected upstream).
+    pub is_active: bool,
+}
+
 /// How one usage window should be *displayed*, distinct from the silent
 /// `—`/`0%` collapse the dashboard used to show for every non-populated case
 /// (issue #33). This is a pure, render-only classification: it spends no

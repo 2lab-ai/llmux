@@ -527,6 +527,15 @@ pub struct AccountDoc {
     pub healthy: bool,
     pub five_hour: Option<WindowDoc>,
     pub seven_day: Option<WindowDoc>,
+    /// The "Fable" model-scoped weekly window surfaced for convenient reads;
+    /// `null` when this account carries no Fable scope. Additive — absent in
+    /// docs written before scoped windows existed.
+    #[serde(default)]
+    pub fable_weekly: Option<ScopedWindowDoc>,
+    /// The full generic list of model-scoped weekly windows (`fable_weekly` is
+    /// just the "Fable" entry surfaced above). Empty when none seen. Additive.
+    #[serde(default)]
+    pub scoped_limits: Vec<ScopedLimitDoc>,
     /// Epoch seconds (status parity); only present while cooling.
     pub cooldown_until: Option<u64>,
     pub cooldown_source: Option<String>,
@@ -549,6 +558,36 @@ pub struct WindowDoc {
     pub fetched_at_ms: u64,
     /// "headers" | "poll".
     pub source: String,
+}
+
+/// One model-scoped weekly window (`limits[]` `weekly_scoped`, e.g. the
+/// "Fable" gauge) in document form. Shares the `utilization`/`resets_at`/
+/// `resets_in_secs` shape with [`WindowDoc`] (built by the same helper) and
+/// adds the scope row's `severity` + `is_active`. Deliberately omits
+/// `fetched_at_ms`/`source`: the scoped list is a convenience read-surface,
+/// not a scheduler-reconstruction input (the reconstructable account windows
+/// stay [`WindowDoc`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedWindowDoc {
+    pub utilization: f64,
+    /// Epoch seconds (status parity).
+    pub resets_at: u64,
+    pub resets_in_secs: u64,
+    /// Lowercase upstream severity label ("normal" | "warning" | "critical").
+    pub severity: String,
+    pub is_active: bool,
+}
+
+/// One entry of the generic `scoped_limits` list: a [`ScopedWindowDoc`] tagged
+/// with its scope label (`scope.model.display_name`). Flattened so the entry
+/// serializes as a flat `{ scope_label, utilization, resets_at,
+/// resets_in_secs, severity, is_active }` object — future scoped models appear
+/// here without another schema change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedLimitDoc {
+    pub scope_label: String,
+    #[serde(flatten)]
+    pub window: ScopedWindowDoc,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -856,6 +895,28 @@ fn window_doc(
     })
 }
 
+/// Document form of one model-scoped window. Utilization is the RAW window
+/// value (same convention as [`window_doc`], which keeps the raw number so the
+/// client can compute its own expiry from the reconstruction fields); the
+/// account-window docs and this one stay consistent within the dashboard doc.
+fn scoped_window_doc(
+    scoped: &crate::scheduler::window::ScopedQuotaWindow,
+    now: SystemTime,
+) -> ScopedWindowDoc {
+    ScopedWindowDoc {
+        utilization: scoped.window.utilization,
+        resets_at: epoch_secs(scoped.window.resets_at),
+        resets_in_secs: scoped
+            .window
+            .resets_at
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        severity: scoped.severity.label().to_string(),
+        is_active: scoped.is_active,
+    }
+}
+
 /// Build the model-usage rows for the document: the finished aggregation from
 /// the hub, with in-flight requests overlaid per model (req11). A model seen
 /// only in-flight (no completed request yet) still gets a row so a long active
@@ -1034,6 +1095,15 @@ pub(crate) fn dashboard_doc(
                 healthy: account.healthy,
                 five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
+                fable_weekly: account.fable_weekly().map(|s| scoped_window_doc(s, now)),
+                scoped_limits: account
+                    .scoped_limits
+                    .iter()
+                    .map(|s| ScopedLimitDoc {
+                        scope_label: s.scope_label.clone(),
+                        window: scoped_window_doc(s, now),
+                    })
+                    .collect(),
                 cooldown_until: account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                 cooldown_source: account.cooldown_source.map(|s| match s {
                     CooldownSource::RetryAfter => "retry_after".to_string(),
@@ -1470,6 +1540,76 @@ mod tests {
         assert_eq!(doc.accounts[0].session.requests, 1);
         assert_eq!(doc.accounts[0].session.ok, 1);
         assert_eq!(doc.accounts[0].session.tokens_out, 300);
+    }
+
+    #[test]
+    fn doc_surfaces_fable_weekly_and_scoped_limits_and_round_trips() {
+        // A Fable (`limits[]` weekly_scoped) window recorded via the usage path
+        // reaches the AccountDoc as `fable_weekly` + a generic `scoped_limits`
+        // entry, and the whole doc survives a JSON round-trip (guards the
+        // flattened `scoped_limits` shape). Account "b", never polled, proves the
+        // null / empty case.
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        let usage = crate::scheduler::usage::parse_usage_body(
+            crate::scheduler::usage::DEV1_USAGE_FIXTURE.as_bytes(),
+        )
+        .expect("fixture parses");
+        pool.record_usage(&AccountId("a".into()), &usage, now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &seeded_hub().view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+
+        let a = doc
+            .accounts
+            .iter()
+            .find(|acc| acc.name == "a")
+            .expect("account a");
+        let b = doc
+            .accounts
+            .iter()
+            .find(|acc| acc.name == "b")
+            .expect("account b");
+
+        let fable = a.fable_weekly.as_ref().expect("fable_weekly present");
+        assert!((fable.utilization - 1.0).abs() < 1e-9);
+        assert_eq!(fable.severity, "critical");
+        assert!(fable.is_active);
+        assert_eq!(fable.resets_at, 1_783_115_999);
+        assert_eq!(a.scoped_limits.len(), 1);
+        assert_eq!(a.scoped_limits[0].scope_label, "Fable");
+        assert_eq!(a.scoped_limits[0].window.severity, "critical");
+
+        assert!(b.fable_weekly.is_none(), "no poll → no Fable window");
+        assert!(b.scoped_limits.is_empty());
+
+        // JSON round-trip: fable_weekly is a flat object without scope_label;
+        // each scoped_limits entry flattens scope_label alongside the window
+        // fields; and a re-parsed doc keeps the same values.
+        let json: serde_json::Value = serde_json::to_value(&doc).expect("doc serializes");
+        let a_json = json["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .find(|acc| acc["name"] == "a")
+            .expect("a json");
+        assert!(a_json["fable_weekly"].get("scope_label").is_none());
+        assert_eq!(a_json["fable_weekly"]["is_active"], true);
+        assert_eq!(a_json["scoped_limits"][0]["scope_label"], "Fable");
+        assert_eq!(a_json["scoped_limits"][0]["is_active"], true);
+        let reparsed: DashboardDoc = serde_json::from_value(json).expect("doc deserializes");
+        let a2 = reparsed
+            .accounts
+            .iter()
+            .find(|acc| acc.name == "a")
+            .expect("reparsed a");
+        assert_eq!(a2.scoped_limits[0].scope_label, "Fable");
+        assert!(a2.fable_weekly.as_ref().expect("fable").is_active);
     }
 
     #[test]

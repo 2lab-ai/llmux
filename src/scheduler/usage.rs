@@ -13,15 +13,33 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::headers::{parse_epoch_seconds, parse_rfc3339, WindowReading};
+use super::window::LimitSeverity;
 use super::{AccountId, AccountPool};
 use crate::config::{AccountCredential, SchedulerConfig};
 
 /// Parsed body of `GET /api/oauth/usage` (Bearer auth): per-window
 /// utilization + resets_at, same shape soma-work polls every 5 minutes.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// `scoped` carries the model-scoped rows of the body's `limits[]` array
+/// (`kind == "weekly_scoped"`, e.g. the "Fable" weekly gauge) — empty when
+/// the response has no `limits[]` (older shape) or no scoped rows.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsageSnapshot {
     pub five_hour: Option<WindowReading>,
     pub seven_day: Option<WindowReading>,
+    pub scoped: Vec<ScopedLimitReading>,
+}
+
+/// One model-scoped limit reading from `limits[]`: the scope label
+/// (`scope.model.display_name`, e.g. "Fable" — NOT hardcoded here; the list
+/// is model-extensible), the percentage-normalized window reading, and the
+/// row's `severity`/`is_active` flags.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedLimitReading {
+    pub scope_label: String,
+    pub reading: WindowReading,
+    pub severity: LimitSeverity,
+    pub is_active: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,8 +78,101 @@ pub fn parse_usage_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
     Ok(UsageSnapshot {
         five_hour: raw_window(value.get("five_hour")).map(|(u, at)| percent_reading(u, at)),
         seven_day: raw_window(value.get("seven_day")).map(|(u, at)| percent_reading(u, at)),
+        scoped: scoped_limits(&value),
     })
 }
+
+/// Extract the model-scoped rows of `limits[]` (evidence:
+/// `.prd/13-usage-raw-sources.md` §Carrier 1, captured 2026-07-03).
+///
+/// Only `kind == "weekly_scoped"` rows become scoped readings, keyed by
+/// `scope.model.display_name`. The `session`/`weekly_all` rows duplicate the
+/// legacy top-level `five_hour`/`seven_day` fields (which stay the canonical
+/// parse for those windows, and the fallback when `limits[]` is absent), so
+/// they are deliberately skipped here. `percent` is a 0..=100 int and is
+/// normalized to a 0..1 fraction like every other reading from this endpoint.
+/// Tolerant by design: a missing/invalid row is dropped, never an error.
+fn scoped_limits(value: &Value) -> Vec<ScopedLimitReading> {
+    let Some(limits) = value.get("limits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    limits.iter().filter_map(scoped_limit_row).collect()
+}
+
+/// Parse one `limits[]` row into a scoped reading, or `None` for non-scoped
+/// kinds and malformed rows.
+fn scoped_limit_row(row: &Value) -> Option<ScopedLimitReading> {
+    if row.get("kind")?.as_str()? != "weekly_scoped" {
+        return None;
+    }
+    let label = row
+        .get("scope")?
+        .get("model")?
+        .get("display_name")?
+        .as_str()?;
+    if label.is_empty() {
+        return None;
+    }
+    let percent = row.get("percent")?.as_f64()?;
+    if !percent.is_finite() || percent < 0.0 {
+        return None;
+    }
+    let resets_at = match row.get("resets_at")? {
+        Value::Number(n) => parse_epoch_seconds(&n.to_string())?,
+        Value::String(s) => parse_rfc3339(s).or_else(|| parse_epoch_seconds(s))?,
+        _ => return None,
+    };
+    let severity = row
+        .get("severity")
+        .and_then(Value::as_str)
+        .map(LimitSeverity::from_label)
+        .unwrap_or(LimitSeverity::Normal);
+    let is_active = row
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(ScopedLimitReading {
+        scope_label: label.to_string(),
+        reading: percent_reading(percent, resets_at),
+        severity,
+        is_active,
+    })
+}
+
+/// The VERBATIM `GET /api/oauth/usage` body captured live on
+/// `claude:dev1@insightquest.io`, 2026-07-03 (`.prd/13-usage-raw-sources.md`
+/// §Carrier 1) — the ground-truth fixture for `limits[]` parsing, shared with
+/// the `/llmux/status` end-to-end test.
+#[cfg(test)]
+pub(crate) const DEV1_USAGE_FIXTURE: &str = r#"{
+ "five_hour":  { "utilization": 0.0,  "resets_at": "2026-07-03T07:29:59.682460+00:00",
+                 "limit_dollars": null, "used_dollars": null, "remaining_dollars": null },
+ "seven_day":  { "utilization": 58.0, "resets_at": "2026-07-03T21:59:59.682491+00:00",
+                 "limit_dollars": null, "used_dollars": null, "remaining_dollars": null },
+ "seven_day_oauth_apps": null, "seven_day_opus": null, "seven_day_sonnet": null,
+ "seven_day_cowork": null, "seven_day_omelette": null,
+ "tangelo": null, "iguana_necktie": null, "omelette_promotional": null,
+ "nimbus_quill": null, "cinder_cove": null, "amber_ladder": null,
+ "extra_usage": { "is_enabled": false, "monthly_limit": null, "used_credits": null,
+                  "utilization": null, "currency": null, "decimal_places": null,
+                  "disabled_reason": null, "daily": null, "weekly": null },
+ "limits": [
+  { "kind": "session",       "group": "session", "percent": 0,   "severity": "normal",
+    "resets_at": "2026-07-03T07:29:59.682460+00:00", "scope": null, "is_active": false },
+  { "kind": "weekly_all",    "group": "weekly",  "percent": 58,  "severity": "normal",
+    "resets_at": "2026-07-03T21:59:59.682491+00:00", "scope": null, "is_active": false },
+  { "kind": "weekly_scoped", "group": "weekly",  "percent": 100, "severity": "critical",
+    "resets_at": "2026-07-03T21:59:59.682835+00:00",
+    "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+    "is_active": true }
+ ],
+ "spend": { "used": {"amount_minor": 0, "currency": "USD", "exponent": 2}, "limit": null,
+            "percent": 0, "severity": "normal", "enabled": false, "disabled_reason": null,
+            "cap": null, "balance": null, "auto_reload": null,
+            "disclaimer": "Usage credits cover you when you hit your plan limits. …",
+            "can_purchase_credits": false, "can_toggle": false },
+ "member_dashboard_available": false
+}"#;
 
 /// Parse one window's RAW (still-percentage) utilization + reset, or `None`
 /// when either is missing/invalid. The caller divides by 100 via
@@ -471,6 +582,7 @@ mod tests {
                 resets_at: at(NOW_SECS + 3600),
             }),
             seven_day: None,
+            scoped: Vec::new(),
         }
     }
 
@@ -583,6 +695,88 @@ mod tests {
             parse_usage_body(b"not json"),
             Err(UsageError::Parse(_))
         ));
+    }
+
+    // ---- limits[] scoped rows (fable-usage W1) ----
+
+    #[test]
+    fn dev1_fixture_yields_legacy_windows_and_a_fable_scoped_reading() {
+        // The verbatim live capture (.prd/13-usage-raw-sources.md §Carrier 1):
+        // legacy five_hour/seven_day parse exactly as before, AND the
+        // limits[] weekly_scoped row becomes a "Fable" scoped reading at
+        // 100% / critical / active. session + weekly_all rows are skipped
+        // (they duplicate the legacy fields).
+        let snapshot = parse_usage_body(DEV1_USAGE_FIXTURE.as_bytes()).unwrap();
+
+        let five = snapshot.five_hour.unwrap();
+        assert_eq!(five.utilization, 0.0);
+        assert_eq!(epoch_of(five.resets_at), 1_783_063_799); // 2026-07-03T07:29:59Z
+        let seven = snapshot.seven_day.unwrap();
+        assert!((seven.utilization - 0.58).abs() < 1e-9);
+        assert_eq!(epoch_of(seven.resets_at), 1_783_115_999); // 2026-07-03T21:59:59Z
+
+        assert_eq!(snapshot.scoped.len(), 1, "only the weekly_scoped row");
+        let fable = &snapshot.scoped[0];
+        assert_eq!(fable.scope_label, "Fable");
+        assert_eq!(fable.reading.utilization, 1.0, "percent 100 → fraction 1.0");
+        assert_eq!(epoch_of(fable.reading.resets_at), 1_783_115_999);
+        assert_eq!(fable.severity, LimitSeverity::Critical);
+        assert!(fable.is_active);
+    }
+
+    fn epoch_of(at: SystemTime) -> u64 {
+        at.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn legacy_only_response_has_empty_scoped_and_unchanged_legacy_windows() {
+        // A response WITHOUT limits[] (older shape) must behave exactly as
+        // before: legacy windows parse, scoped list is empty.
+        let body = br#"{
+            "five_hour": {"utilization": 42.0, "resets_at": 1781222400},
+            "seven_day": {"utilization": 90.0, "resets_at": 1781308800}
+        }"#;
+        let snapshot = parse_usage_body(body).unwrap();
+        assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
+        assert!((snapshot.seven_day.unwrap().utilization - 0.90).abs() < 1e-9);
+        assert!(snapshot.scoped.is_empty(), "no limits[] → no scoped rows");
+    }
+
+    #[test]
+    fn malformed_scoped_rows_are_dropped_not_errors() {
+        // Rows missing the scope label / percent / resets_at, non-array
+        // limits, and unknown severities degrade gracefully.
+        let body = br#"{
+            "limits": [
+                { "kind": "weekly_scoped", "percent": 50, "severity": "critical",
+                  "resets_at": 1781222400, "scope": null, "is_active": true },
+                { "kind": "weekly_scoped", "percent": 50,
+                  "resets_at": 1781222400,
+                  "scope": { "model": { "id": null, "display_name": "" } } },
+                { "kind": "weekly_scoped", "resets_at": 1781222400,
+                  "scope": { "model": { "display_name": "Fable" } } },
+                { "kind": "weekly_scoped", "percent": 61, "severity": "sev-from-the-future",
+                  "resets_at": 1781222400,
+                  "scope": { "model": { "display_name": "Opus" } } }
+            ]
+        }"#;
+        let snapshot = parse_usage_body(body).unwrap();
+        assert_eq!(snapshot.scoped.len(), 1, "only the well-formed row");
+        let opus = &snapshot.scoped[0];
+        assert_eq!(opus.scope_label, "Opus");
+        assert!((opus.reading.utilization - 0.61).abs() < 1e-9);
+        assert_eq!(
+            opus.severity,
+            LimitSeverity::Normal,
+            "unknown severity degrades to normal"
+        );
+        assert!(!opus.is_active, "missing is_active defaults to false");
+    }
+
+    #[test]
+    fn non_array_limits_is_tolerated() {
+        let body = br#"{"limits": {"kind": "weekly_scoped"}}"#;
+        assert!(parse_usage_body(body).unwrap().scoped.is_empty());
     }
 
     // ---- backoff ladder ----

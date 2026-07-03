@@ -2070,6 +2070,7 @@ mod tests {
             group: BackendGroup::Claude,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 0,
