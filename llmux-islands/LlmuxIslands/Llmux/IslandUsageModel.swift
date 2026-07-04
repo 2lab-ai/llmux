@@ -36,6 +36,11 @@ final class IslandUsageModel: ObservableObject {
     @Published var windowed: [LlmuxDashboardWindowed] = []
     @Published var activity: LlmuxDashboardActivity?
 
+    /// U11/U13 health flag: any `auth_failed` account or quota > 90%
+    /// (`DashboardHealth`). Drives the banner AND the closed-island warning
+    /// color; computed on BOTH poll paths so old daemons get the color too.
+    @Published var healthWarning: Bool = false
+
     /// The daemon's `email_anonymous` setting from the last successful
     /// `/llmux/status` poll. `nil` = the daemon predates the setting (or we
     /// never connected) → the "Email anonymous" toggle stays local-only (E7).
@@ -99,6 +104,7 @@ final class IslandUsageModel: ObservableObject {
         claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
         codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
         applyServerEmailAnonymous(dash.emailAnonymous)
+        healthWarning = DashboardHealth.summary(dash.accounts).isWarning
         dashboard = dash
         totals = dash.totals
         modelUsage = dash.modelUsage
@@ -123,6 +129,7 @@ final class IslandUsageModel: ObservableObject {
             claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
             codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
             applyServerEmailAnonymous(status.emailAnonymous)
+            healthWarning = DashboardHealth.summary(records: status.accounts).isWarning
             connection = .online
             dashboard = nil
             totals = nil
