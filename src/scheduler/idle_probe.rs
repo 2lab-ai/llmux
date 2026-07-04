@@ -416,6 +416,7 @@ mod tests {
                     resets_at: at(NOW_SECS + 3600),
                 }),
                 seven_day: None,
+                scoped: Vec::new(),
             },
             now(),
         );

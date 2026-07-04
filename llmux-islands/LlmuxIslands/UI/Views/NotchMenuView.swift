@@ -19,6 +19,7 @@ struct NotchMenuView: View {
     @ObservedObject private var soundSelector = SoundSelector.shared
     @State private var launchAtLogin: Bool = false
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
+    @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
 
     static var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
@@ -53,6 +54,18 @@ struct NotchMenuView: View {
                 isOn: emailAnonymousEnabled
             ) {
                 Task { await IslandUsageModel.shared.toggleEmailAnonymous() }
+            }
+
+            // Show the temporary Fable weekly (7d) usage row on each tile.
+            // Local-only, default on (the upstream limit is short-lived, so the
+            // row is opt-out rather than opt-in). Toggling flips the @AppStorage
+            // key every UsageProviderColumn observes — no daemon round-trip.
+            MenuToggleRow(
+                icon: "calendar",
+                label: "Show Fable weekly (7d)",
+                isOn: showFableWeekly
+            ) {
+                showFableWeekly.toggle()
             }
 
             LlmuxConnectionSection()

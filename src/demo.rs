@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn alias_is_stable_for_the_same_input() {
         assert_eq!(
-            alias_always("info@insightquest.io"),
-            alias_always("info@insightquest.io"),
+            alias_always("info@example.com"),
+            alias_always("info@example.com"),
             "same real name must always map to the same fake one"
         );
     }
@@ -167,10 +167,10 @@ mod tests {
     fn distinct_typical_accounts_get_distinct_aliases() {
         // The four demo accounts must read as four different people.
         let names = [
-            "ai2@insightquest.io",
-            "notify@insightquest.io",
-            "codex:ai@insightquest.io",
-            "codex:icedac@gmail.com",
+            "ai2@example.com",
+            "notify@example.com",
+            "codex:ai@example.com",
+            "codex:user@example.com",
         ];
         let aliased: Vec<String> = names.iter().map(|n| alias_always(n)).collect();
         let unique: std::collections::HashSet<&String> = aliased.iter().collect();

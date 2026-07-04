@@ -831,6 +831,46 @@ fn epoch_secs(at: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// One model-scoped window (`limits[]` `weekly_scoped`, e.g. "Fable") as a
+/// `/llmux/status` JSON object. Utilization uses `effective_utilization` — the
+/// same expiry-collapsing convention this endpoint applies to `five_hour` /
+/// `seven_day` (an already-reset window reads 0). `scope_label` is included
+/// only for the generic `scoped_limits` list; `fable_weekly` surfaces the same
+/// fields without it (`with_label = false`).
+fn scoped_window_json(
+    scoped: &crate::scheduler::window::ScopedQuotaWindow,
+    now: SystemTime,
+    with_label: bool,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if with_label {
+        obj.insert("scope_label".into(), serde_json::json!(scoped.scope_label));
+    }
+    obj.insert(
+        "utilization".into(),
+        serde_json::json!(scoped.window.effective_utilization(now)),
+    );
+    obj.insert(
+        "resets_at".into(),
+        serde_json::json!(epoch_secs(scoped.window.resets_at)),
+    );
+    obj.insert(
+        "resets_in_secs".into(),
+        serde_json::json!(scoped
+            .window
+            .resets_at
+            .duration_since(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)),
+    );
+    obj.insert(
+        "severity".into(),
+        serde_json::json!(scoped.severity.label()),
+    );
+    obj.insert("is_active".into(), serde_json::json!(scoped.is_active));
+    serde_json::Value::Object(obj)
+}
+
 /// Server-process facts for `/llmux/status` that are not pool state.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerMeta {
@@ -902,6 +942,18 @@ pub fn status_json(
                     "blocked": blocked,
                     "five_hour": window(&account.five_hour),
                     "seven_day": window(&account.seven_day),
+                    // Model-scoped weekly windows (additive; null / empty when
+                    // none seen). `fable_weekly` is the "Fable" entry surfaced
+                    // for convenient reads; `scoped_limits` is the full generic
+                    // list so future scoped models appear without a schema change.
+                    "fable_weekly": account
+                        .fable_weekly()
+                        .map(|s| scoped_window_json(s, now, false)),
+                    "scoped_limits": account
+                        .scoped_limits
+                        .iter()
+                        .map(|s| scoped_window_json(s, now, true))
+                        .collect::<Vec<_>>(),
                     "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                     "in_flight": account.in_flight,
                     // Token health (additive): expiry + last refresh, epoch
@@ -1738,6 +1790,84 @@ mod tests {
             "cold window is null"
         );
         assert_eq!(k["totals"]["requests"], 0);
+    }
+
+    #[test]
+    fn status_json_surfaces_fable_weekly_and_scoped_limits() {
+        // End-to-end proof that a model-scoped (`limits[]` weekly_scoped) window
+        // reaches the `/llmux/status` JSON: parse the verbatim live DEV1 usage
+        // body, record it, and assert `fable_weekly` + `scoped_limits` are
+        // present with the fixture's 100% / critical / active Fable reading —
+        // while `five_hour`/`seven_day` stay exactly as before. A second account
+        // with no scoped rows proves the null/empty shape.
+        //
+        // `now` sits BEFORE the fixture's Fable reset (2026-07-03T21:59:59Z =
+        // epoch 1_783_115_999) so `effective_utilization` keeps the 100% value.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_783_000_000);
+        let pool = AccountPool::new(&[oauth_account("dev1"), oauth_account("plain")]);
+        pool.evaluate(None, &params(), now);
+        let usage = crate::scheduler::usage::parse_usage_body(
+            crate::scheduler::usage::DEV1_USAGE_FIXTURE.as_bytes(),
+        )
+        .expect("fixture parses");
+        pool.record_usage(&AccountId("dev1".into()), &usage, now);
+
+        let totals = UsageTotals::default();
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 1,
+            port: 3456,
+            email_anonymous: false,
+        };
+        let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
+        let accounts = doc["accounts"].as_array().expect("accounts array");
+        let dev1 = accounts
+            .iter()
+            .find(|a| a["name"] == "dev1")
+            .expect("dev1 account");
+        let plain = accounts
+            .iter()
+            .find(|a| a["name"] == "plain")
+            .expect("plain account");
+
+        // fable_weekly: the "Fable" scoped window, surfaced without scope_label.
+        let fable = &dev1["fable_weekly"];
+        assert!(
+            (fable["utilization"].as_f64().expect("util") - 1.0).abs() < 1e-9,
+            "Fable at percent 100 → fraction 1.0"
+        );
+        assert_eq!(fable["severity"], "critical");
+        assert_eq!(fable["is_active"], true);
+        assert_eq!(fable["resets_at"], 1_783_115_999u64);
+        assert_eq!(fable["resets_in_secs"], 115_999u64);
+        assert!(
+            fable.get("scope_label").is_none(),
+            "fable_weekly omits scope_label (it IS the Fable entry)"
+        );
+
+        // scoped_limits: the generic list carries the same entry WITH its label.
+        let scoped = dev1["scoped_limits"]
+            .as_array()
+            .expect("scoped_limits array");
+        assert_eq!(scoped.len(), 1, "only the one weekly_scoped row");
+        assert_eq!(scoped[0]["scope_label"], "Fable");
+        assert!((scoped[0]["utilization"].as_f64().expect("util") - 1.0).abs() < 1e-9);
+        assert_eq!(scoped[0]["severity"], "critical");
+        assert_eq!(scoped[0]["is_active"], true);
+
+        // Legacy windows stay EXACTLY as today: five_hour 0%, seven_day 58%.
+        assert_eq!(dev1["five_hour"]["utilization"], 0.0);
+        assert!(
+            (dev1["seven_day"]["utilization"].as_f64().expect("util") - 0.58).abs() < 1e-9,
+            "seven_day legacy parse unchanged"
+        );
+
+        // Account with no scoped rows → fable_weekly null, scoped_limits empty.
+        assert_eq!(plain["fable_weekly"], serde_json::Value::Null);
+        assert!(plain["scoped_limits"]
+            .as_array()
+            .expect("empty scoped array")
+            .is_empty());
     }
 
     #[test]

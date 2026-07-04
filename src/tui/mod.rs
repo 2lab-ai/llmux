@@ -2070,6 +2070,8 @@ mod tests {
             group: BackendGroup::Claude,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 0,
@@ -2098,6 +2100,7 @@ mod tests {
             snapshot: PoolSnapshot {
                 accounts: Vec::new(),
                 current: std::collections::BTreeMap::new(),
+                fable_current: std::collections::BTreeMap::new(),
             },
             last_switch: None,
             poll_health: std::collections::HashMap::new(),
@@ -2112,6 +2115,7 @@ mod tests {
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
+            show_fable_weekly: true,
         }
     }
 }

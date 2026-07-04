@@ -75,6 +75,17 @@ pub struct Config {
     /// config written before this field loads with masking OFF.
     #[serde(default)]
     pub email_anonymous: bool,
+    /// Render the model-scoped "Fable" weekly gauge in the dashboard accounts
+    /// table (fable-usage U9a). Display-only, default ON. This feature is
+    /// TEMPORARY — the upstream Fable weekly limit is expected to disappear
+    /// within ~a week — so it is opt-OUT: set `false` to render the accounts
+    /// table exactly as before (no `Fbl` column / marker, no width taken). The
+    /// daemon always COLLECTS and emits the scoped data (`/llmux/status`,
+    /// `/llmux/dashboard`); this flag only gates the TUI's rendering of it.
+    /// Additive (`#[serde(default = "default_true")]`): a config written before
+    /// this field loads with the gauge ON.
+    #[serde(default = "default_true")]
+    pub show_fable_weekly: bool,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -91,6 +102,7 @@ impl Default for Config {
             pricing: HashMap::new(),
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
+            show_fable_weekly: true,
             accounts: Vec::new(),
         }
     }
