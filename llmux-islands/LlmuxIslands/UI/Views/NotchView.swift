@@ -193,6 +193,8 @@ struct NotchView: View {
                 NotchClosedLabelView(
                     claudeCount: usageModel.claudeInFlight,
                     codexCount: usageModel.codexInFlight,
+                    sessionCost: usageModel.totals?.costUsd,
+                    warning: usageModel.healthWarning,
                     active: isVisible
                 )
                 .frame(minWidth: closedNotchSize.width - 20)
