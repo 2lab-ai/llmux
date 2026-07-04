@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime};
 use crate::config::{AccountConfig, AccountCredential};
 use crate::routing::BackendGroup;
 use headers::{ParsedRateLimitHeaders, WindowReading};
-use usage::UsageSnapshot;
-use window::{QuotaWindow, WindowSource};
+use usage::{ScopedLimitReading, UsageSnapshot};
+use window::{QuotaWindow, ScopedQuotaWindow, WindowSource};
 
 /// The group slot used for the legacy (routing-disabled) selection path:
 /// when callers pass `group = None`, a SINGLE shared current slot is used so
@@ -44,6 +44,13 @@ const LEGACY_GROUP: BackendGroup = BackendGroup::Claude;
 /// when an in-flight burst parks the whole group this way — so even this short
 /// park no longer hard-locks the pool.
 pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(8);
+
+/// Utilization at/above which a window is treated as "critical" for Fable
+/// scope decisions (fable-usage W2): the preemptive Fable-routing exclusion
+/// (`AccountSnapshot::fable_weekly_exhausted`) and the account-wide escalation
+/// of a Fable 429 (`AccountState::account_wide_critical`). Matches the ≥95%
+/// bar the W0 design fixed for Fable avoidance.
+pub const CRITICAL_UTILIZATION: f64 = 0.95;
 
 /// Stable account identifier — the config `name`. Newtype so ids don't get
 /// mixed up with credentials or display strings.
@@ -76,6 +83,81 @@ pub enum CooldownSource {
     Heuristic,
 }
 
+/// The scope a cooldown applies to (fable-usage W2). The cooldown KEY is
+/// `Account × CooldownScope`: an account can hold an [`Self::AccountWide`]
+/// cooldown AND one-or-more [`Self::ModelScoped`] cooldowns at the same time,
+/// independently. `AccountWide` is realized by the account's existing
+/// `cooldown_until`/`cooldown_source` fields (unchanged behavior); `ModelScoped`
+/// entries live in [`AccountState::scoped_cooldowns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CooldownScope {
+    /// The whole account is parked (RetryAfter park, whole-account exhaustion,
+    /// or a scope-blind / non-Fable 429).
+    AccountWide,
+    /// Only requests for a given model scope are parked (the String is the
+    /// scope label, e.g. "Fable"), matched case-insensitively via
+    /// [`Self::matches_label`]. Other scopes on the same account stay eligible.
+    ModelScoped(String),
+}
+
+impl CooldownScope {
+    /// The scope label for a [`Self::ModelScoped`], else `None`.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            CooldownScope::AccountWide => None,
+            CooldownScope::ModelScoped(label) => Some(label),
+        }
+    }
+
+    /// Whether this scope is the model scope `label` (case-insensitive). The
+    /// CENTRAL matcher — callers never compare scope strings by hand.
+    pub fn matches_label(&self, label: &str) -> bool {
+        matches!(self, CooldownScope::ModelScoped(l) if l.eq_ignore_ascii_case(label))
+    }
+}
+
+/// Classification of a 429 that drives cooldown scoping (fable-usage W2). A
+/// scope-blind 429 carries no model info, so this records WHY a given scope was
+/// chosen — the guard both strategists demanded against collapsing scope back
+/// into a single bool. Kept on the recorded [`ModelScopedCooldown`] and returned
+/// by [`PoolState::record_429_classified`] for logging / status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cooldown429Reason {
+    /// `retry-after` header present → account-wide RetryAfter park (unchanged).
+    HeaderRetryAfter,
+    /// Fable-family request 429'd AND the account's `fable_weekly` snapshot
+    /// corroborates (is_active / critical / ≥95%). Fable-scoped cooldown set.
+    FableObservedCritical,
+    /// Fable-family request 429'd but the snapshot shows Fable healthy — the
+    /// observed anomaly (`.prd/13` §2c: Fable 429 while snapshot says Fable OK).
+    /// Fable-scoped cooldown set ANYWAY (same-account non-Fable 200 proves the
+    /// account isn't dead); flagged for a usage-poll refresh. Non-Fable stays
+    /// eligible. Never escalated to account-wide on the mismatch alone.
+    FableSuspectSnapshotMismatch,
+    /// Non-Fable (scope-blind) 429 → account-wide heuristic park. A non-Fable
+    /// request failing IS whole-account corroboration (unchanged behavior).
+    AccountAllObserved,
+    /// The account vanished between selection and recording — nothing applied.
+    Unknown,
+}
+
+/// One model-scoped cooldown entry on an account (fable-usage W2) — the
+/// `ModelScoped` half of the `Account × CooldownScope` key. Fable-scoped
+/// cooldowns are always heuristic in nature (a `retry-after` 429 parks
+/// account-wide instead), so no `CooldownSource` is stored; the `reason`
+/// records the classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelScopedCooldown {
+    /// The scope this cooldown parks (always [`CooldownScope::ModelScoped`]).
+    pub scope: CooldownScope,
+    /// When the scoped park expires.
+    pub until: SystemTime,
+    /// When it was set (parity with the account-wide `cooldown_set_at`).
+    pub set_at: SystemTime,
+    /// Why this scoped park was chosen — the scope-provenance guard.
+    pub reason: Cooldown429Reason,
+}
+
 /// Full per-account scheduler state.
 #[derive(Debug, Clone)]
 pub struct AccountState {
@@ -84,6 +166,17 @@ pub struct AccountState {
     pub health: AccountHealth,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
+    /// Model-scoped weekly limits from the usage poll's `limits[]` (e.g. the
+    /// "Fable" weekly gauge) — generic, keyed by scope label; empty until a
+    /// poll reports one. Entries persist until overwritten by fresher data;
+    /// an entry whose window has reset reads as unconstrained via
+    /// [`QuotaWindow::effective_utilization`], same as the account windows.
+    pub scoped_limits: Vec<ScopedQuotaWindow>,
+    /// Model-scoped cooldowns (fable-usage W2), keyed by scope label — the
+    /// `ModelScoped` half of `Account × CooldownScope`. Independent of the
+    /// account-wide `cooldown_until` below: a Fable-scoped park here benches
+    /// ONLY Fable requests while the account keeps serving non-Fable traffic.
+    pub scoped_cooldowns: Vec<ModelScopedCooldown>,
     pub cooldown_until: Option<SystemTime>,
     pub cooldown_source: Option<CooldownSource>,
     /// When the active cooldown was set. Self-healing requires evidence
@@ -102,6 +195,8 @@ impl AccountState {
             health: AccountHealth::Healthy,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             cooldown_set_at: None,
@@ -129,6 +224,41 @@ impl AccountState {
         true
     }
 
+    /// Merge one scoped-limit observation into the account's scoped list,
+    /// keyed by scope label (case-insensitive), freshest `fetched_at` wins —
+    /// same policy as [`Self::merge_window`].
+    fn merge_scoped(
+        slots: &mut Vec<ScopedQuotaWindow>,
+        reading: &ScopedLimitReading,
+        fetched_at: SystemTime,
+        source: WindowSource,
+    ) -> bool {
+        let merged = ScopedQuotaWindow {
+            scope_label: reading.scope_label.clone(),
+            window: QuotaWindow {
+                utilization: reading.reading.utilization,
+                resets_at: reading.reading.resets_at,
+                fetched_at,
+                source,
+            },
+            severity: reading.severity,
+            is_active: reading.is_active,
+        };
+        match slots
+            .iter_mut()
+            .find(|s| s.scope_label.eq_ignore_ascii_case(&reading.scope_label))
+        {
+            Some(existing) => {
+                if existing.window.fetched_at > fetched_at {
+                    return false;
+                }
+                *existing = merged;
+            }
+            None => slots.push(merged),
+        }
+        true
+    }
+
     /// Cooldown self-healing: fresh data (strictly newer than the cooldown)
     /// showing capacity (< 100% on every present window) clears a `Heuristic`
     /// cooldown. `RetryAfter` parks are explicit upstream instructions and
@@ -153,6 +283,60 @@ impl AccountState {
             self.cooldown_set_at = None;
         }
     }
+
+    /// Set (or refresh, keyed by scope label) one model-scoped cooldown
+    /// (fable-usage W2). Never touches the account-wide cooldown — that is a
+    /// separate, explicit step — so recording a Fable-scoped park here leaves
+    /// non-Fable traffic eligible. A `None` `until` (clock overflow) or an
+    /// `AccountWide` scope is a no-op.
+    fn set_scoped_cooldown(
+        &mut self,
+        scope: CooldownScope,
+        until: Option<SystemTime>,
+        set_at: SystemTime,
+        reason: Cooldown429Reason,
+    ) {
+        let (Some(until), Some(label)) = (until, scope.label().map(str::to_string)) else {
+            return;
+        };
+        let entry = ModelScopedCooldown {
+            scope,
+            until,
+            set_at,
+            reason,
+        };
+        match self
+            .scoped_cooldowns
+            .iter_mut()
+            .find(|c| c.scope.matches_label(&label))
+        {
+            Some(existing) => *existing = entry,
+            None => self.scoped_cooldowns.push(entry),
+        }
+    }
+
+    /// Whether this account's Fable weekly bucket is currently constraining —
+    /// the corroboration test for classifying a Fable 429 (observed-critical vs
+    /// suspect-snapshot-mismatch). Reset-aware.
+    fn fable_weekly_constraining(&self, now: SystemTime) -> bool {
+        self.scoped_limits
+            .iter()
+            .find(|s| {
+                s.scope_label
+                    .eq_ignore_ascii_case(crate::routing::FABLE_SCOPE_LABEL)
+            })
+            .is_some_and(|s| s.is_constraining(now, CRITICAL_UTILIZATION))
+    }
+
+    /// Whether the account-wide (5h/7d) windows THEMSELVES read critical
+    /// (≥ [`CRITICAL_UTILIZATION`], reset-aware) — the only corroboration that
+    /// escalates a Fable 429 to an account-wide park.
+    fn account_wide_critical(&self, now: SystemTime) -> bool {
+        [self.five_hour, self.seven_day]
+            .into_iter()
+            .flatten()
+            .any(|w| w.effective_utilization(now) >= CRITICAL_UTILIZATION)
+    }
 }
 
 /// The pool's mutable state. All mutations re-validate preconditions before
@@ -165,7 +349,18 @@ pub struct PoolState {
     /// and removed when its accounts are all exhausted. With routing
     /// disabled only the [`LEGACY_GROUP`] slot is ever populated, so the map
     /// degenerates to the single-current-slot behavior of before.
+    ///
+    /// This is the NonFable / representative slot: every display, status, and
+    /// legacy reader keys off it, and it is what a non-Fable request pins.
     pub current: BTreeMap<BackendGroup, AccountId>,
+    /// Separate sticky current PER backend group for [`select::RequestScope::
+    /// Fable`] requests (fable-usage: fable-head isolation). A Fable request
+    /// pins and moves ONLY this slot, so its account rotation never disturbs
+    /// the non-Fable `current` above (and vice versa). Same lifecycle: a group
+    /// is absent until its first Fable selection, removed when Fable is
+    /// exhausted for that group. Draws from the same account pool as `current`
+    /// — this isolates stickiness, not inventory.
+    pub fable_current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Switch failed; nothing was mutated.
@@ -191,6 +386,7 @@ impl PoolState {
         Self {
             accounts: accounts.iter().map(AccountState::fresh).collect(),
             current: BTreeMap::new(),
+            fable_current: BTreeMap::new(),
         }
     }
 
@@ -248,6 +444,9 @@ impl PoolState {
 
     /// Record a `/api/oauth/usage` poll result. Same freshness merge as
     /// headers; fresh data showing capacity clears `Heuristic` cooldowns.
+    /// Scoped (`limits[]`) readings merge into the account's scoped list but
+    /// deliberately do NOT feed the self-heal gate: cooldown behavior stays
+    /// keyed to the account-wide windows only (scope-aware cooldown is W2).
     pub fn record_usage(&mut self, account: &AccountId, usage: &UsageSnapshot, now: SystemTime) {
         let Some(acct) = self.account_mut(account) else {
             return;
@@ -264,6 +463,14 @@ impl PoolState {
         if let Some(reading) = usage.seven_day {
             recorded |= AccountState::merge_window(
                 &mut acct.seven_day,
+                reading,
+                now,
+                WindowSource::UsagePoll,
+            );
+        }
+        for reading in &usage.scoped {
+            AccountState::merge_scoped(
+                &mut acct.scoped_limits,
                 reading,
                 now,
                 WindowSource::UsagePoll,
@@ -293,6 +500,64 @@ impl PoolState {
         acct.cooldown_until = now.checked_add(duration);
         acct.cooldown_source = Some(source);
         acct.cooldown_set_at = Some(now);
+    }
+
+    /// Record an upstream 429 with SCOPE-AWARE classification (fable-usage W2,
+    /// the core U8 requirement). A scope-blind 429 carries no model info, so the
+    /// requested `model` decides the cooldown scope:
+    ///
+    /// - `retry_after` present → account-wide RetryAfter park, exactly as today
+    ///   ([`Self::record_429`]).
+    /// - Non-Fable request (no retry-after) → account-wide heuristic park, as
+    ///   today: a non-Fable failure IS whole-account corroboration.
+    /// - **Fable-family request (no retry-after) → a `ModelScoped("Fable")`
+    ///   cooldown FIRST, ALWAYS** — even when the snapshot says Fable looks
+    ///   healthy (the `.prd/13` §2c anomaly), because a same-account non-Fable
+    ///   200 proves the account isn't dead. The account-wide cooldown is left
+    ///   untouched, so non-Fable traffic stays eligible. It escalates to an
+    ///   account-wide park ONLY when the 5h/7d windows THEMSELVES read critical.
+    ///
+    /// Returns the [`Cooldown429Reason`] chosen, for logging / status. NB: on
+    /// [`Cooldown429Reason::FableSuspectSnapshotMismatch`] the design also wants
+    /// an immediate usage-poll refresh; that refresh wiring is deferred (the
+    /// recorded reason is the flag) — the load-bearing invariant here is that
+    /// non-Fable stays eligible, which holds regardless.
+    pub fn record_429_classified(
+        &mut self,
+        account: &AccountId,
+        retry_after: Option<Duration>,
+        model: Option<&str>,
+        now: SystemTime,
+    ) -> Cooldown429Reason {
+        if retry_after.is_some() {
+            self.record_429(account, retry_after, now);
+            return Cooldown429Reason::HeaderRetryAfter;
+        }
+        if !crate::routing::is_fable_model(model) {
+            self.record_429(account, None, now);
+            return Cooldown429Reason::AccountAllObserved;
+        }
+        let Some(acct) = self.account_mut(account) else {
+            return Cooldown429Reason::Unknown;
+        };
+        let reason = if acct.fable_weekly_constraining(now) {
+            Cooldown429Reason::FableObservedCritical
+        } else {
+            Cooldown429Reason::FableSuspectSnapshotMismatch
+        };
+        acct.set_scoped_cooldown(
+            CooldownScope::ModelScoped(crate::routing::FABLE_SCOPE_LABEL.to_string()),
+            now.checked_add(DEFAULT_HEURISTIC_COOLDOWN),
+            now,
+            reason,
+        );
+        // Escalate to an account-wide park ONLY on genuine corroboration: the
+        // 5h/7d windows themselves read critical. `acct`'s borrow ends here.
+        let escalate = acct.account_wide_critical(now);
+        if escalate {
+            self.record_429(account, None, now);
+        }
+        reason
     }
 
     /// Record an auth failure (second 401 after a forced refresh, or a
@@ -327,10 +592,42 @@ impl PoolState {
         params: &select::SelectParams,
         now: SystemTime,
     ) -> Result<(), SwitchError> {
+        self.commit_switch_scoped(
+            group,
+            expected_current,
+            target,
+            params,
+            now,
+            select::RequestScope::NonFable,
+        )
+    }
+
+    /// Scope-aware [`Self::commit_switch`] (fable-usage W2): re-validates the
+    /// target through the SAME scope-aware gate the scope-aware selector used,
+    /// so a Fable request never commits an account its Fable-scoped cooldown /
+    /// preemptive exclusion would refuse. `RequestScope::NonFable` is exactly
+    /// the pre-W2 behavior.
+    pub fn commit_switch_scoped(
+        &mut self,
+        group: Option<BackendGroup>,
+        expected_current: Option<&AccountId>,
+        target: &AccountId,
+        params: &select::SelectParams,
+        now: SystemTime,
+        scope: select::RequestScope,
+    ) -> Result<(), SwitchError> {
         let slot = group.unwrap_or(LEGACY_GROUP);
-        if self.current.get(&slot) != expected_current {
+        // CAS against the scope's OWN slot: a Fable commit compares/writes
+        // `fable_current`, a non-Fable commit `current` — so the two scopes'
+        // sticky currents never clobber each other. `observed`'s borrow ends
+        // before `self.snapshot()` below re-borrows `self`.
+        let observed = match scope {
+            select::RequestScope::Fable => self.fable_current.get(&slot),
+            _ => self.current.get(&slot),
+        };
+        if observed != expected_current {
             return Err(SwitchError::CurrentChanged {
-                actual: self.current.get(&slot).cloned(),
+                actual: observed.cloned(),
             });
         }
         let snapshot = self.snapshot();
@@ -345,19 +642,23 @@ impl PoolState {
         // heuristic-degraded mode (transient-429 lockout recovery); the commit
         // re-validation must use the SAME gate so it does not reject what
         // `pick` just chose.
-        if let Some(reason) = select::gate(
+        if let Some(reason) = select::gate_scoped(
             target_snapshot,
             params,
             now,
             headers_only,
             heuristic_degraded,
+            scope,
         ) {
             return Err(SwitchError::TargetIneligible {
                 account: target.clone(),
                 reason,
             });
         }
-        self.current.insert(slot, target.clone());
+        match scope {
+            select::RequestScope::Fable => self.fable_current.insert(slot, target.clone()),
+            _ => self.current.insert(slot, target.clone()),
+        };
         Ok(())
     }
 
@@ -374,6 +675,8 @@ impl PoolState {
                     group: BackendGroup::from_kind(a.credential.kind()),
                     five_hour: a.five_hour,
                     seven_day: a.seven_day,
+                    scoped_limits: a.scoped_limits.clone(),
+                    scoped_cooldowns: a.scoped_cooldowns.clone(),
                     cooldown_until: a.cooldown_until,
                     cooldown_source: a.cooldown_source,
                     in_flight: a.in_flight,
@@ -390,6 +693,7 @@ impl PoolState {
                 })
                 .collect(),
             current: self.current.clone(),
+            fable_current: self.fable_current.clone(),
         }
     }
 }
@@ -416,10 +720,37 @@ impl PoolSnapshot {
             .or_else(|| self.current.get(&BackendGroup::Codex))
     }
 
-    /// Whether `id` is the current account in ANY group — the predicate the
-    /// display layer uses to mark the active row(s).
+    /// Whether `id` is the current account in ANY group, in EITHER scope
+    /// (non-Fable or Fable) — the predicate the display layer uses to mark the
+    /// active row(s). A Fable-head account is marked active even when it is not
+    /// the non-Fable current.
     pub fn is_current(&self, id: &AccountId) -> bool {
-        self.current.values().any(|c| c == id)
+        self.current.values().any(|c| c == id) || self.fable_current.values().any(|c| c == id)
+    }
+
+    /// The current account for one backend group in a given request scope: the
+    /// `fable_current` slot for [`select::RequestScope::Fable`], the non-Fable
+    /// `current` slot otherwise. This is the scope-correct read the selector /
+    /// commit path key off; the group-only [`Self::current_for_group`] stays
+    /// the non-Fable/representative reader for display.
+    pub fn current_for_scope(
+        &self,
+        group: BackendGroup,
+        scope: select::RequestScope,
+    ) -> Option<&AccountId> {
+        match scope {
+            select::RequestScope::Fable => self.fable_current.get(&group),
+            _ => self.current.get(&group),
+        }
+    }
+
+    /// Scope-aware [`Self::legacy_current`]: the [`LEGACY_GROUP`] slot in the
+    /// scope's own map (routing-disabled path).
+    pub fn legacy_current_scoped(&self, scope: select::RequestScope) -> Option<&AccountId> {
+        match scope {
+            select::RequestScope::Fable => self.fable_current.get(&LEGACY_GROUP),
+            _ => self.current.get(&LEGACY_GROUP),
+        }
     }
 }
 
@@ -435,6 +766,14 @@ pub struct AccountSnapshot {
     pub group: BackendGroup,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
+    /// Model-scoped weekly limits (`limits[]` weekly_scoped rows from the
+    /// usage poll), e.g. the "Fable" weekly gauge. Empty when never seen.
+    pub scoped_limits: Vec<ScopedQuotaWindow>,
+    /// Active model-scoped cooldowns (fable-usage W2) — the `ModelScoped` half
+    /// of `Account × CooldownScope`, projected for the scope-aware selector and
+    /// for status/display to show "fable cooldown" distinct from a whole-account
+    /// cooldown. Empty when no scoped park is set.
+    pub scoped_cooldowns: Vec<ModelScopedCooldown>,
     pub cooldown_until: Option<SystemTime>,
     pub cooldown_source: Option<CooldownSource>,
     pub in_flight: u32,
@@ -448,6 +787,53 @@ pub struct AccountSnapshot {
     pub last_refresh_ms: Option<u64>,
 }
 
+impl AccountSnapshot {
+    /// The "Fable" weekly scoped window, if this account carries one — the
+    /// entry in [`Self::scoped_limits`] whose `scope_label` matches "Fable"
+    /// case-insensitively. Convenience surface for the dashboard doc /
+    /// `/llmux/status` JSON; the full scoped list stays available for other
+    /// (future) scoped models without another lookup helper.
+    pub fn fable_weekly(&self) -> Option<&ScopedQuotaWindow> {
+        self.scoped_limits.iter().find(|s| {
+            s.scope_label
+                .eq_ignore_ascii_case(crate::routing::FABLE_SCOPE_LABEL)
+        })
+    }
+
+    /// Whether a model-scoped cooldown for `label` is currently parked
+    /// (case-insensitive, wall-clock live). The central scoped-cooldown query.
+    pub fn scoped_cooldown_active(&self, label: &str, now: SystemTime) -> bool {
+        self.scoped_cooldowns
+            .iter()
+            .any(|c| c.scope.matches_label(label) && c.until > now)
+    }
+
+    /// The live Fable-scoped cooldown's expiry, if any — for the blocking
+    /// reason / status readout.
+    pub fn fable_cooldown_until(&self, now: SystemTime) -> Option<SystemTime> {
+        self.scoped_cooldowns
+            .iter()
+            .find(|c| c.scope.matches_label(crate::routing::FABLE_SCOPE_LABEL) && c.until > now)
+            .map(|c| c.until)
+    }
+
+    /// Whether a Fable request must avoid this account right now (fable-usage
+    /// W2): a live Fable-scoped cooldown OR the preemptive Fable-critical
+    /// exclusion. Non-Fable requests IGNORE this entirely.
+    pub fn fable_cooldown_active(&self, now: SystemTime) -> bool {
+        self.scoped_cooldown_active(crate::routing::FABLE_SCOPE_LABEL, now)
+    }
+
+    /// Preemptive Fable-routing exclusion (W2 point 4): this account's Fable
+    /// weekly bucket is currently constraining (`is_active` / critical / ≥95%,
+    /// reset-aware), so Fable requests should avoid it while non-Fable traffic
+    /// stays eligible.
+    pub fn fable_weekly_exhausted(&self, now: SystemTime) -> bool {
+        self.fable_weekly()
+            .is_some_and(|s| s.is_constraining(now, CRITICAL_UTILIZATION))
+    }
+}
+
 /// Read-only projection of the whole pool. `select::pick` takes this plus an
 /// explicit `now` — it must never read the clock or any shared state itself.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -455,6 +841,8 @@ pub struct PoolSnapshot {
     pub accounts: Vec<AccountSnapshot>,
     /// Current account per backend group (see [`PoolState::current`]).
     pub current: BTreeMap<BackendGroup, AccountId>,
+    /// Fable-scope current per backend group (see [`PoolState::fable_current`]).
+    pub fable_current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Shared handle around `PoolState`. Cheap to clone; every method takes the
@@ -517,13 +905,34 @@ impl AccountPool {
         group: Option<BackendGroup>,
         params: &select::SelectParams,
     ) -> Result<AccountLease, NoAccountAvailable> {
+        self.lease_for_scoped(group, params, select::RequestScope::NonFable)
+    }
+
+    /// Scope-aware [`Self::lease_for`] (fable-usage W2): a Fable request also
+    /// refuses the sticky current when that account holds a live Fable-scoped
+    /// cooldown or is preemptively Fable-excluded — so it rotates to a
+    /// Fable-eligible account instead of re-hitting the exhausted one.
+    /// `RequestScope::NonFable` is exactly the pre-W2 behavior (Fable state
+    /// ignored).
+    pub fn lease_for_scoped(
+        &self,
+        group: Option<BackendGroup>,
+        params: &select::SelectParams,
+        scope: select::RequestScope,
+    ) -> Result<AccountLease, NoAccountAvailable> {
         let slot = group.unwrap_or(LEGACY_GROUP);
         let now = SystemTime::now();
         let mut state = self.write();
         let no_account = |state: &PoolState| NoAccountAvailable {
             retry_after: select::soonest_reset(&state.snapshot(), now),
         };
-        let Some(current) = state.current.get(&slot).cloned() else {
+        // Lease the sticky current of the request's OWN scope: a Fable request
+        // reads `fable_current`, a non-Fable request `current`.
+        let scope_current = match scope {
+            select::RequestScope::Fable => state.fable_current.get(&slot),
+            _ => state.current.get(&slot),
+        };
+        let Some(current) = scope_current.cloned() else {
             return Err(no_account(&state));
         };
         let snapshot = state.snapshot();
@@ -536,11 +945,15 @@ impl AccountPool {
             // 5h/7d/staleness gates are evaluation-tick concerns, not a reason
             // to refuse a request already routed to the sticky current — so
             // ignore those reasons here, matching the prior behavior (which
-            // refused only on health + active cooldown).
+            // refused only on health + active cooldown). A Fable request ALSO
+            // refuses on its scope-specific gates (Fable cooldown / Fable
+            // preemptive exclusion), so it never leases a Fable-dead current.
             Some(acct) => matches!(
-                select::gate(acct, params, now, headers_only, heuristic_degraded),
+                select::gate_scoped(acct, params, now, headers_only, heuristic_degraded, scope),
                 Some(select::IneligibleReason::AuthUnhealthy)
                     | Some(select::IneligibleReason::CoolingDown)
+                    | Some(select::IneligibleReason::FableCoolingDown)
+                    | Some(select::IneligibleReason::FableWeeklyExhausted)
             ),
             None => true,
         };
@@ -573,15 +986,29 @@ impl AccountPool {
         params: &select::SelectParams,
         now: SystemTime,
     ) -> select::Decision {
+        self.evaluate_scoped(group, params, now, select::RequestScope::NonFable)
+    }
+
+    /// Scope-aware [`Self::evaluate`] (fable-usage W2): runs the scope-aware
+    /// selector and commits with the SAME scope, so a Fable request selects and
+    /// pins a Fable-eligible account (avoiding Fable-cooling / Fable-critical
+    /// accounts) while non-Fable selection is unchanged.
+    pub fn evaluate_scoped(
+        &self,
+        group: Option<BackendGroup>,
+        params: &select::SelectParams,
+        now: SystemTime,
+        scope: select::RequestScope,
+    ) -> select::Decision {
         let slot = group.unwrap_or(LEGACY_GROUP);
         let mut state = self.write();
         let snapshot = state.snapshot();
-        let decision = select::pick(&snapshot, params, group, now);
+        let decision = select::pick_scoped(&snapshot, params, group, now, scope);
         match &decision {
             select::Decision::Stay => decision,
             select::Decision::Switch { to } => {
-                let expected = snapshot.current.get(&slot);
-                match state.commit_switch(group, expected, to, params, now) {
+                let expected = snapshot.current_for_scope(slot, scope);
+                match state.commit_switch_scoped(group, expected, to, params, now, scope) {
                     Ok(()) => decision,
                     // Unreachable while the write lock is held (pick and
                     // commit see the same state) — degrade honestly anyway.
@@ -594,9 +1021,14 @@ impl AccountPool {
                 }
             }
             select::Decision::Exhausted { .. } => {
-                // Nothing usable in this group: clear its slot so lease_for
-                // refuses until a later evaluation finds capacity again.
-                state.current.remove(&slot);
+                // Nothing usable in this group FOR THIS SCOPE: clear the scope's
+                // own slot so lease_for refuses until a later evaluation finds
+                // capacity again. A Fable exhaustion never clears the non-Fable
+                // current (and vice versa).
+                match scope {
+                    select::RequestScope::Fable => state.fable_current.remove(&slot),
+                    _ => state.current.remove(&slot),
+                };
                 decision
             }
         }
@@ -646,6 +1078,20 @@ impl AccountPool {
 
     pub fn record_429(&self, account: &AccountId, retry_after: Option<Duration>, now: SystemTime) {
         self.write().record_429(account, retry_after, now);
+    }
+
+    /// Scope-aware 429 recording (fable-usage W2). See
+    /// [`PoolState::record_429_classified`]; returns the classification reason
+    /// for logging / status.
+    pub fn record_429_classified(
+        &self,
+        account: &AccountId,
+        retry_after: Option<Duration>,
+        model: Option<&str>,
+        now: SystemTime,
+    ) -> Cooldown429Reason {
+        self.write()
+            .record_429_classified(account, retry_after, model, now)
     }
 
     pub fn record_auth_failure(&self, account: &AccountId) {
@@ -792,6 +1238,7 @@ mod tests {
         UsageSnapshot {
             five_hour: five,
             seven_day: seven,
+            scoped: Vec::new(),
         }
     }
 
@@ -949,6 +1396,203 @@ mod tests {
         );
     }
 
+    // ---- scope-aware 429 classification + Fable cooldown separation (W2) ----
+
+    /// A Fable weekly `limits[]` reading for the account's scoped list.
+    fn fable_reading(util: f64, active: bool, critical: bool) -> ScopedLimitReading {
+        ScopedLimitReading {
+            scope_label: "Fable".into(),
+            reading: reading(util, NOW_SECS + 86_400),
+            severity: if critical {
+                window::LimitSeverity::Critical
+            } else {
+                window::LimitSeverity::Normal
+            },
+            is_active: active,
+        }
+    }
+
+    fn usage_with_fable(
+        five: Option<WindowReading>,
+        seven: Option<WindowReading>,
+        fable: ScopedLimitReading,
+    ) -> UsageSnapshot {
+        UsageSnapshot {
+            five_hour: five,
+            seven_day: seven,
+            scoped: vec![fable],
+        }
+    }
+
+    /// THE mandatory W0 regression test: a Fable 429 (no Retry-After, no unified
+    /// headers) while all-models weekly is NOT critical must bench ONLY the
+    /// Fable scope — the account stays eligible for a non-Fable (haiku) request
+    /// and is excluded ONLY for a Fable request, by the Fable-scoped cooldown.
+    #[test]
+    fn fable_429_benches_only_fable_scope_leaving_the_account_eligible_for_non_fable() {
+        use select::{gate_scoped, IneligibleReason, RequestScope};
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        // All-models weekly well under threshold; no Fable snapshot at all.
+        state.record_usage(
+            &id("a"),
+            &usage(
+                Some(reading(0.0, NOW_SECS + 3600)),
+                Some(reading(0.40, NOW_SECS + 86_400)),
+            ),
+            now(),
+        );
+
+        // Fable-family 429, no retry-after, no headers.
+        let recorded = state.record_429_classified(&id("a"), None, Some("fable-5"), now());
+        // Snapshot said Fable OK → suspect mismatch, but the Fable-scoped
+        // cooldown is set REGARDLESS (never defaulted to account-wide).
+        assert_eq!(recorded, Cooldown429Reason::FableSuspectSnapshotMismatch);
+        assert!(
+            state.accounts[0].cooldown_until.is_none(),
+            "a Fable 429 must NOT park the whole account"
+        );
+        assert_eq!(state.accounts[0].scoped_cooldowns.len(), 1);
+
+        let snapshot = state.snapshot();
+        let a = &snapshot.accounts[0];
+        let p = params();
+        // Non-Fable (haiku) request: A stays eligible.
+        assert_eq!(
+            gate_scoped(a, &p, now(), false, false, RequestScope::NonFable),
+            None,
+            "non-Fable request stays eligible despite the Fable-only 429"
+        );
+        // Fable request: A is excluded by the Fable-scoped cooldown.
+        assert_eq!(
+            gate_scoped(a, &p, now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableCoolingDown),
+            "Fable request is benched by the Fable-scoped cooldown"
+        );
+        // The scoped park is transient (self-limits by DEFAULT_HEURISTIC_COOLDOWN).
+        let after = at(NOW_SECS + DEFAULT_HEURISTIC_COOLDOWN.as_secs());
+        assert_eq!(
+            gate_scoped(a, &p, after, false, false, RequestScope::Fable),
+            None,
+            "Fable-scoped cooldown lifts once its park expires"
+        );
+    }
+
+    #[test]
+    fn non_fable_429_without_retry_after_still_parks_the_whole_account() {
+        // Regression preservation: the pre-W2 whole-account heuristic park is
+        // unchanged for non-Fable (scope-blind corroboration) 429s.
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        let recorded = state.record_429_classified(&id("a"), None, Some("claude-haiku-4-5"), now());
+        assert_eq!(recorded, Cooldown429Reason::AccountAllObserved);
+        assert_eq!(
+            state.accounts[0].cooldown_until,
+            Some(at(NOW_SECS + DEFAULT_HEURISTIC_COOLDOWN.as_secs()))
+        );
+        assert_eq!(
+            state.accounts[0].cooldown_source,
+            Some(CooldownSource::Heuristic)
+        );
+        assert!(state.accounts[0].scoped_cooldowns.is_empty());
+    }
+
+    #[test]
+    fn retry_after_fable_429_parks_account_wide_not_scoped() {
+        // A retry-after 429 is an explicit upstream instruction → account-wide
+        // RetryAfter park as today, even for a Fable request.
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        let recorded = state.record_429_classified(
+            &id("a"),
+            Some(Duration::from_secs(60)),
+            Some("fable-5"),
+            now(),
+        );
+        assert_eq!(recorded, Cooldown429Reason::HeaderRetryAfter);
+        assert_eq!(
+            state.accounts[0].cooldown_source,
+            Some(CooldownSource::RetryAfter)
+        );
+        assert!(
+            state.accounts[0].scoped_cooldowns.is_empty(),
+            "retry-after Fable 429 parks account-wide, not scoped"
+        );
+    }
+
+    #[test]
+    fn fable_429_with_corroborating_snapshot_reasons_observed_critical() {
+        // The dev1 evidence shape: Fable weekly 100% active/critical, all-models
+        // 7d only 58% → Fable-scoped cooldown + reason ObservedCritical, and NO
+        // account-wide escalation (7d not critical) — non-Fable stays eligible.
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        state.record_usage(
+            &id("a"),
+            &usage_with_fable(
+                Some(reading(0.0, NOW_SECS + 3600)),
+                Some(reading(0.58, NOW_SECS + 86_400)),
+                fable_reading(1.0, true, true),
+            ),
+            now(),
+        );
+        let recorded = state.record_429_classified(&id("a"), None, Some("fable-5"), now());
+        assert_eq!(recorded, Cooldown429Reason::FableObservedCritical);
+        assert!(
+            state.accounts[0].cooldown_until.is_none(),
+            "7d not critical → no account-wide escalation"
+        );
+        let snapshot = state.snapshot();
+        let a = &snapshot.accounts[0];
+        assert!(a.fable_cooldown_active(now()), "Fable-scoped cooldown set");
+        assert!(
+            a.fable_weekly_exhausted(now()),
+            "preemptive Fable exclusion also engaged"
+        );
+    }
+
+    #[test]
+    fn fable_429_escalates_account_wide_when_account_windows_corroborate() {
+        // 7d itself reads critical (≥95%): genuine whole-account exhaustion, so
+        // the Fable 429 ALSO parks account-wide (belt-and-suspenders over the
+        // ceiling gate) — the corroboration escalation path.
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        state.record_usage(
+            &id("a"),
+            &usage(
+                Some(reading(0.0, NOW_SECS + 3600)),
+                Some(reading(0.97, NOW_SECS + 86_400)),
+            ),
+            now(),
+        );
+        let recorded = state.record_429_classified(&id("a"), None, Some("fable-5"), now());
+        // No Fable snapshot → mismatch reason, but escalation is orthogonal.
+        assert_eq!(recorded, Cooldown429Reason::FableSuspectSnapshotMismatch);
+        assert!(!state.accounts[0].scoped_cooldowns.is_empty());
+        assert!(
+            state.accounts[0].cooldown_until.is_some(),
+            "critical 5h/7d corroborates → account-wide escalation"
+        );
+        assert_eq!(
+            state.accounts[0].cooldown_source,
+            Some(CooldownSource::Heuristic)
+        );
+    }
+
+    #[test]
+    fn record_429_classified_on_missing_account_is_unknown_noop() {
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        let recorded = state.record_429_classified(&id("ghost"), None, Some("fable-5"), now());
+        assert_eq!(recorded, Cooldown429Reason::Unknown);
+    }
+
+    #[test]
+    fn cooldown_scope_matches_label_is_case_insensitive() {
+        let fable = CooldownScope::ModelScoped("Fable".into());
+        assert!(fable.matches_label("fable"));
+        assert!(fable.matches_label("FABLE"));
+        assert!(!fable.matches_label("Opus"));
+        assert_eq!(fable.label(), Some("Fable"));
+        assert_eq!(CooldownScope::AccountWide.label(), None);
+        assert!(!CooldownScope::AccountWide.matches_label("Fable"));
+    }
+
     #[test]
     fn auth_failure_marks_and_credential_update_heals() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
@@ -1034,6 +1678,58 @@ mod tests {
             .commit_switch(None, current.as_ref(), &id("b"), &params(), now())
             .unwrap();
         assert_eq!(legacy(&state), Some(id("b")));
+    }
+
+    #[test]
+    fn fable_pick_does_not_move_nonfable_current() {
+        // The whole point of the fable-head split: a Fable request that switches
+        // accounts pins ONLY the fable_current slot and never disturbs the
+        // non-Fable current. Non-Fable current is "a"; a Fable commit switches
+        // to "b" — "a" must stay put while the fable slot becomes "b".
+        let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
+        state.current.insert(LEGACY_GROUP, id("a"));
+        // The fable slot starts empty, so the Fable CAS expects None (NOT "a") —
+        // the non-Fable current does not block a first Fable pick.
+        state
+            .commit_switch_scoped(
+                None,
+                None,
+                &id("b"),
+                &params(),
+                now(),
+                select::RequestScope::Fable,
+            )
+            .expect("fable commit succeeds against the empty fable slot");
+        assert_eq!(
+            legacy(&state),
+            Some(id("a")),
+            "non-Fable current is untouched by a Fable switch"
+        );
+        assert_eq!(
+            state.fable_current.get(&LEGACY_GROUP),
+            Some(&id("b")),
+            "the Fable switch pinned its own slot"
+        );
+    }
+
+    #[test]
+    fn nonfable_commit_does_not_move_fable_current() {
+        // The mirror invariant: a non-Fable switch never disturbs the fable slot.
+        let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
+        state.fable_current.insert(LEGACY_GROUP, id("a"));
+        state
+            .commit_switch(None, None, &id("b"), &params(), now())
+            .expect("non-Fable commit succeeds against the empty non-Fable slot");
+        assert_eq!(
+            legacy(&state),
+            Some(id("b")),
+            "non-Fable switch pinned the non-Fable slot"
+        );
+        assert_eq!(
+            state.fable_current.get(&LEGACY_GROUP),
+            Some(&id("a")),
+            "fable current is untouched by a non-Fable switch"
+        );
     }
 
     #[test]

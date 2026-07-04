@@ -170,7 +170,7 @@ mod tests {
             "ai2@example.com",
             "notify@example.com",
             "codex:ai@example.com",
-            "codex:icedac@gmail.com",
+            "codex:user@example.com",
         ];
         let aliased: Vec<String> = names.iter().map(|n| alias_always(n)).collect();
         let unique: std::collections::HashSet<&String> = aliased.iter().collect();

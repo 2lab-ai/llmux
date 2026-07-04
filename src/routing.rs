@@ -209,6 +209,40 @@ pub fn model_from_body(body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The scope label the Anthropic usage poll uses for the per-model weekly
+/// bucket that governs Fable requests (`limits[].scope.model.display_name`,
+/// verbatim "Fable" — `.prd/13-usage-raw-sources.md` §Carrier 1). Single source
+/// of the label that keys Fable-scoped cooldowns and the `fable_weekly`
+/// accessor; matched case-insensitively everywhere it is used.
+pub const FABLE_SCOPE_LABEL: &str = "Fable";
+
+/// Model families that route to the Fable weekly bucket. CENTRAL registry —
+/// the ONLY place a model string is decided to be Fable-scoped, so the
+/// scheduler never grows ad-hoc `contains("fable")` checks. Extend here when a
+/// new Fable-family id appears.
+const FABLE_FAMILIES: &[&str] = &["fable"];
+
+/// Whether a requested model is Fable-family (case-insensitive). `None` (no
+/// model in the body) is NOT Fable — such a request routes by the default group
+/// and must never be treated as Fable-scoped. The scheduler uses this to decide
+/// whether a request is additionally gated by an account's Fable-scoped
+/// cooldown / preemptive Fable-critical exclusion; non-Fable requests ignore
+/// that state entirely.
+///
+/// Uses `contains` (not `starts_with`) deliberately: the only observed id is
+/// `fable-5` but a vendor-prefixed variant (`claude-fable-…`) must still be
+/// caught, and "fable" is distinctive enough that a false positive is
+/// negligible. Being conservative here would wrongly park a Fable-exhausted
+/// account's whole capacity — the exact bug W2 fixes — so the classifier errs
+/// toward recognizing Fable.
+pub fn is_fable_model(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let lower = model.to_ascii_lowercase();
+    FABLE_FAMILIES.iter().any(|fam| lower.contains(fam))
+}
+
 /// Extract `metadata.user_id` from an Anthropic Messages JSON body, if any.
 /// This is the keyless per-client attribution identity for proxy metering
 /// (issue #32): present in ~98.9% of real requests and stable per session,
@@ -455,6 +489,34 @@ mod tests {
     fn model_from_body_tolerates_non_json() {
         assert_eq!(model_from_body(b"not json at all"), None);
         assert_eq!(model_from_body(b""), None);
+    }
+
+    // ---- is_fable_model (central Fable classifier, fable-usage W2) ----
+
+    #[test]
+    fn is_fable_model_matches_fable_family_case_insensitively() {
+        assert!(is_fable_model(Some("fable-5")));
+        assert!(is_fable_model(Some("Fable")));
+        assert!(is_fable_model(Some("FABLE-5-20251001")));
+        // Vendor-prefixed variant is still recognized (contains, not prefix).
+        assert!(is_fable_model(Some("claude-fable-5")));
+    }
+
+    #[test]
+    fn is_fable_model_rejects_non_fable_and_absent_models() {
+        assert!(!is_fable_model(Some("claude-haiku-4-5-20251001")));
+        assert!(!is_fable_model(Some("claude-sonnet-4-5")));
+        assert!(!is_fable_model(Some("gpt-5.5")));
+        assert!(!is_fable_model(Some("")));
+        // No model in the body must NOT be treated as Fable-scoped.
+        assert!(!is_fable_model(None));
+    }
+
+    #[test]
+    fn fable_scope_label_is_the_upstream_display_name() {
+        // The label used to key Fable-scoped cooldowns must equal the usage
+        // poll's `scope.model.display_name` (`.prd/13` §Carrier 1).
+        assert_eq!(FABLE_SCOPE_LABEL, "Fable");
     }
 
     // ---- user_id_from_body (issue #32 metering identity) ----

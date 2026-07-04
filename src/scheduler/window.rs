@@ -56,6 +56,89 @@ impl QuotaWindow {
     }
 }
 
+/// Severity of one upstream limit row (`limits[].severity` on
+/// `GET /api/oauth/usage`): `normal` | `warning` | `critical`. Unknown labels
+/// degrade to [`Self::Normal`] — tolerant parsing, same policy as the rest of
+/// the usage body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitSeverity {
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl LimitSeverity {
+    /// The upstream's own lowercase label, used verbatim in serialized docs.
+    pub fn label(self) -> &'static str {
+        match self {
+            LimitSeverity::Normal => "normal",
+            LimitSeverity::Warning => "warning",
+            LimitSeverity::Critical => "critical",
+        }
+    }
+
+    /// Parse an upstream/doc label; anything unrecognized reads as `Normal`.
+    pub fn from_label(label: &str) -> Self {
+        if label.eq_ignore_ascii_case("critical") {
+            LimitSeverity::Critical
+        } else if label.eq_ignore_ascii_case("warning") {
+            LimitSeverity::Warning
+        } else {
+            LimitSeverity::Normal
+        }
+    }
+}
+
+/// One model-scoped quota limit (`limits[].kind == "weekly_scoped"` from the
+/// usage poll) — e.g. the separate "Fable" weekly gauge on claude.ai. Generic
+/// on purpose: the scoped list is model-extensible and Fable is just today's
+/// occupant, so nothing here hardcodes a model name.
+///
+/// `severity`/`is_active` live on THIS wrapper, not inside [`QuotaWindow`]:
+/// the window stays a pure number window shared by header/poll sources, and
+/// scope metadata rides alongside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedQuotaWindow {
+    /// The scope key — `limits[].scope.model.display_name` (e.g. "Fable").
+    /// Matched case-insensitively when merging and looking up.
+    pub scope_label: String,
+    /// The scoped window itself (utilization fraction + resets + freshness).
+    pub window: QuotaWindow,
+    /// Upstream's severity for this limit row.
+    pub severity: LimitSeverity,
+    /// True when the limit is currently engaged (requests governed by it are
+    /// being rejected upstream).
+    pub is_active: bool,
+}
+
+impl ScopedQuotaWindow {
+    /// Whether this scoped limit is currently constraining (fable-usage W2
+    /// preemptive avoidance): real utilization at/above `critical_util`.
+    /// Reset-aware — a window past its `resets_at` carries no constraint (its
+    /// `effective_utilization` reads 0) and this returns `false`, so a Fable
+    /// bucket whose weekly window has rolled over no longer excludes the
+    /// account from Fable routing.
+    ///
+    /// Neither `is_active` NOR `severity` is a term here — both are upstream
+    /// *labels*, not "cannot serve" facts. On the OAuth `/api/oauth/usage`
+    /// `limits[]`, `is_active: true` marks the representative/governing limit
+    /// (true even at 76% util / `warning` with ~24% headroom), and
+    /// `severity: "critical"` fires while the account is STILL serving —
+    /// observed live at 90% util where the Fable bucket answered every request
+    /// `200` and never `429`. Gating exclusion on either wrongly benches an
+    /// account that still has Fable quota (wasting ~10% at the 90%/critical
+    /// case), the exact overreach W2's `is_active` fix already removed once.
+    /// So ONLY real utilization gates preemptive exclusion; a genuinely
+    /// rejecting account is caught by its Fable-scoped `429` → cooldown (a real
+    /// signal), not by a poll-time severity label.
+    pub fn is_constraining(&self, now: SystemTime, critical_util: f64) -> bool {
+        if self.window.is_expired(now) {
+            return false;
+        }
+        self.window.effective_utilization(now) >= critical_util
+    }
+}
+
 /// How one usage window should be *displayed*, distinct from the silent
 /// `—`/`0%` collapse the dashboard used to show for every non-populated case
 /// (issue #33). This is a pure, render-only classification: it spends no
@@ -194,6 +277,64 @@ mod tests {
     fn future_fetched_at_is_not_stale() {
         let w = window(0.5, 10_000, 5000);
         assert!(!w.is_stale(at(1000), Duration::from_secs(1)));
+    }
+
+    // ---- ScopedQuotaWindow::is_constraining (fable-usage W2) ----
+
+    fn scoped(
+        util: f64,
+        resets_at: u64,
+        active: bool,
+        severity: LimitSeverity,
+    ) -> ScopedQuotaWindow {
+        ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(util, resets_at, 900),
+            severity,
+            is_active: active,
+        }
+    }
+
+    #[test]
+    fn is_constraining_keys_on_utilization_not_upstream_labels() {
+        // Neither is_active NOR severity benches an account with headroom —
+        // both are upstream labels, not "cannot serve" facts.
+        // is_active alone does NOT constrain (marks the governing limit, true
+        // even at low util with ~24% headroom).
+        assert!(!scoped(0.10, 10_000, true, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
+        // severity==Critical alone does NOT constrain: it fires while the
+        // account is still serving. Benching here wastes real Fable quota — a
+        // genuinely rejecting account is caught by its Fable-scoped 429.
+        assert!(
+            !scoped(0.10, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95)
+        );
+        // The icedac case (2026-07-04): 90% util + upstream `critical`, but 10%
+        // headroom and every request answered 200 (never 429) → must NOT bench.
+        assert!(
+            !scoped(0.90, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95),
+            "90% + upstream-critical still has headroom (served 200s, never 429) — not constraining"
+        );
+        // Only real utilization at/above the critical bar constrains …
+        assert!(scoped(0.95, 10_000, false, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
+        // … and a genuinely exhausted 100% bucket still constrains.
+        assert!(scoped(1.0, 10_000, true, LimitSeverity::Critical).is_constraining(at(1000), 0.95));
+        // Healthy, mid-util, non-critical does NOT constrain.
+        assert!(
+            !scoped(0.60, 10_000, false, LimitSeverity::Warning).is_constraining(at(1000), 0.95)
+        );
+    }
+
+    #[test]
+    fn is_constraining_is_reset_aware() {
+        // Critical + 100% util, but the weekly window has already reset → no
+        // constraint (effective_utilization reads 0 past resets_at).
+        let w = scoped(1.0, 2000, true, LimitSeverity::Critical);
+        assert!(!w.is_constraining(at(2000), 0.95));
+        assert!(!w.is_constraining(at(5000), 0.95));
+        assert!(
+            w.is_constraining(at(1999), 0.95),
+            "still constrains before reset"
+        );
     }
 
     // ---- WindowDisplayState (issue #33: distinct render states) ----
