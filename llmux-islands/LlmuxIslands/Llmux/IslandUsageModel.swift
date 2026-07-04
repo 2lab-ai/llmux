@@ -177,7 +177,8 @@ final class IslandUsageModel: ObservableObject {
             fableWeeklyPercent: a.fableWeekly.map { $0.utilization * 100 },
             fableWeeklyReset: a.fableWeekly.flatMap { $0.resetsInSecs }.map { Date(timeIntervalSinceNow: TimeInterval($0)) },
             fableWeeklySeverity: a.fableWeekly?.severity,
-            fableWeeklyIsActive: a.fableWeekly?.isActive
+            fableWeeklyIsActive: a.fableWeekly?.isActive,
+            fableWeeklyConstraining: a.fableWeekly?.constraining
         )
 
         let tokenRefresh: TokenRefreshInfo? = a.tokenExpiresAtMs.map {

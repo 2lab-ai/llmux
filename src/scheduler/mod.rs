@@ -349,7 +349,18 @@ pub struct PoolState {
     /// and removed when its accounts are all exhausted. With routing
     /// disabled only the [`LEGACY_GROUP`] slot is ever populated, so the map
     /// degenerates to the single-current-slot behavior of before.
+    ///
+    /// This is the NonFable / representative slot: every display, status, and
+    /// legacy reader keys off it, and it is what a non-Fable request pins.
     pub current: BTreeMap<BackendGroup, AccountId>,
+    /// Separate sticky current PER backend group for [`select::RequestScope::
+    /// Fable`] requests (fable-usage: fable-head isolation). A Fable request
+    /// pins and moves ONLY this slot, so its account rotation never disturbs
+    /// the non-Fable `current` above (and vice versa). Same lifecycle: a group
+    /// is absent until its first Fable selection, removed when Fable is
+    /// exhausted for that group. Draws from the same account pool as `current`
+    /// — this isolates stickiness, not inventory.
+    pub fable_current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Switch failed; nothing was mutated.
@@ -375,6 +386,7 @@ impl PoolState {
         Self {
             accounts: accounts.iter().map(AccountState::fresh).collect(),
             current: BTreeMap::new(),
+            fable_current: BTreeMap::new(),
         }
     }
 
@@ -605,9 +617,17 @@ impl PoolState {
         scope: select::RequestScope,
     ) -> Result<(), SwitchError> {
         let slot = group.unwrap_or(LEGACY_GROUP);
-        if self.current.get(&slot) != expected_current {
+        // CAS against the scope's OWN slot: a Fable commit compares/writes
+        // `fable_current`, a non-Fable commit `current` — so the two scopes'
+        // sticky currents never clobber each other. `observed`'s borrow ends
+        // before `self.snapshot()` below re-borrows `self`.
+        let observed = match scope {
+            select::RequestScope::Fable => self.fable_current.get(&slot),
+            _ => self.current.get(&slot),
+        };
+        if observed != expected_current {
             return Err(SwitchError::CurrentChanged {
-                actual: self.current.get(&slot).cloned(),
+                actual: observed.cloned(),
             });
         }
         let snapshot = self.snapshot();
@@ -635,7 +655,10 @@ impl PoolState {
                 reason,
             });
         }
-        self.current.insert(slot, target.clone());
+        match scope {
+            select::RequestScope::Fable => self.fable_current.insert(slot, target.clone()),
+            _ => self.current.insert(slot, target.clone()),
+        };
         Ok(())
     }
 
@@ -670,6 +693,7 @@ impl PoolState {
                 })
                 .collect(),
             current: self.current.clone(),
+            fable_current: self.fable_current.clone(),
         }
     }
 }
@@ -696,10 +720,37 @@ impl PoolSnapshot {
             .or_else(|| self.current.get(&BackendGroup::Codex))
     }
 
-    /// Whether `id` is the current account in ANY group — the predicate the
-    /// display layer uses to mark the active row(s).
+    /// Whether `id` is the current account in ANY group, in EITHER scope
+    /// (non-Fable or Fable) — the predicate the display layer uses to mark the
+    /// active row(s). A Fable-head account is marked active even when it is not
+    /// the non-Fable current.
     pub fn is_current(&self, id: &AccountId) -> bool {
-        self.current.values().any(|c| c == id)
+        self.current.values().any(|c| c == id) || self.fable_current.values().any(|c| c == id)
+    }
+
+    /// The current account for one backend group in a given request scope: the
+    /// `fable_current` slot for [`select::RequestScope::Fable`], the non-Fable
+    /// `current` slot otherwise. This is the scope-correct read the selector /
+    /// commit path key off; the group-only [`Self::current_for_group`] stays
+    /// the non-Fable/representative reader for display.
+    pub fn current_for_scope(
+        &self,
+        group: BackendGroup,
+        scope: select::RequestScope,
+    ) -> Option<&AccountId> {
+        match scope {
+            select::RequestScope::Fable => self.fable_current.get(&group),
+            _ => self.current.get(&group),
+        }
+    }
+
+    /// Scope-aware [`Self::legacy_current`]: the [`LEGACY_GROUP`] slot in the
+    /// scope's own map (routing-disabled path).
+    pub fn legacy_current_scoped(&self, scope: select::RequestScope) -> Option<&AccountId> {
+        match scope {
+            select::RequestScope::Fable => self.fable_current.get(&LEGACY_GROUP),
+            _ => self.current.get(&LEGACY_GROUP),
+        }
     }
 }
 
@@ -790,6 +841,8 @@ pub struct PoolSnapshot {
     pub accounts: Vec<AccountSnapshot>,
     /// Current account per backend group (see [`PoolState::current`]).
     pub current: BTreeMap<BackendGroup, AccountId>,
+    /// Fable-scope current per backend group (see [`PoolState::fable_current`]).
+    pub fable_current: BTreeMap<BackendGroup, AccountId>,
 }
 
 /// Shared handle around `PoolState`. Cheap to clone; every method takes the
@@ -873,7 +926,13 @@ impl AccountPool {
         let no_account = |state: &PoolState| NoAccountAvailable {
             retry_after: select::soonest_reset(&state.snapshot(), now),
         };
-        let Some(current) = state.current.get(&slot).cloned() else {
+        // Lease the sticky current of the request's OWN scope: a Fable request
+        // reads `fable_current`, a non-Fable request `current`.
+        let scope_current = match scope {
+            select::RequestScope::Fable => state.fable_current.get(&slot),
+            _ => state.current.get(&slot),
+        };
+        let Some(current) = scope_current.cloned() else {
             return Err(no_account(&state));
         };
         let snapshot = state.snapshot();
@@ -948,7 +1007,7 @@ impl AccountPool {
         match &decision {
             select::Decision::Stay => decision,
             select::Decision::Switch { to } => {
-                let expected = snapshot.current.get(&slot);
+                let expected = snapshot.current_for_scope(slot, scope);
                 match state.commit_switch_scoped(group, expected, to, params, now, scope) {
                     Ok(()) => decision,
                     // Unreachable while the write lock is held (pick and
@@ -962,9 +1021,14 @@ impl AccountPool {
                 }
             }
             select::Decision::Exhausted { .. } => {
-                // Nothing usable in this group: clear its slot so lease_for
-                // refuses until a later evaluation finds capacity again.
-                state.current.remove(&slot);
+                // Nothing usable in this group FOR THIS SCOPE: clear the scope's
+                // own slot so lease_for refuses until a later evaluation finds
+                // capacity again. A Fable exhaustion never clears the non-Fable
+                // current (and vice versa).
+                match scope {
+                    select::RequestScope::Fable => state.fable_current.remove(&slot),
+                    _ => state.current.remove(&slot),
+                };
                 decision
             }
         }
@@ -1614,6 +1678,58 @@ mod tests {
             .commit_switch(None, current.as_ref(), &id("b"), &params(), now())
             .unwrap();
         assert_eq!(legacy(&state), Some(id("b")));
+    }
+
+    #[test]
+    fn fable_pick_does_not_move_nonfable_current() {
+        // The whole point of the fable-head split: a Fable request that switches
+        // accounts pins ONLY the fable_current slot and never disturbs the
+        // non-Fable current. Non-Fable current is "a"; a Fable commit switches
+        // to "b" — "a" must stay put while the fable slot becomes "b".
+        let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
+        state.current.insert(LEGACY_GROUP, id("a"));
+        // The fable slot starts empty, so the Fable CAS expects None (NOT "a") —
+        // the non-Fable current does not block a first Fable pick.
+        state
+            .commit_switch_scoped(
+                None,
+                None,
+                &id("b"),
+                &params(),
+                now(),
+                select::RequestScope::Fable,
+            )
+            .expect("fable commit succeeds against the empty fable slot");
+        assert_eq!(
+            legacy(&state),
+            Some(id("a")),
+            "non-Fable current is untouched by a Fable switch"
+        );
+        assert_eq!(
+            state.fable_current.get(&LEGACY_GROUP),
+            Some(&id("b")),
+            "the Fable switch pinned its own slot"
+        );
+    }
+
+    #[test]
+    fn nonfable_commit_does_not_move_fable_current() {
+        // The mirror invariant: a non-Fable switch never disturbs the fable slot.
+        let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
+        state.fable_current.insert(LEGACY_GROUP, id("a"));
+        state
+            .commit_switch(None, None, &id("b"), &params(), now())
+            .expect("non-Fable commit succeeds against the empty non-Fable slot");
+        assert_eq!(
+            legacy(&state),
+            Some(id("b")),
+            "non-Fable switch pinned the non-Fable slot"
+        );
+        assert_eq!(
+            state.fable_current.get(&LEGACY_GROUP),
+            Some(&id("a")),
+            "fable current is untouched by a non-Fable switch"
+        );
     }
 
     #[test]

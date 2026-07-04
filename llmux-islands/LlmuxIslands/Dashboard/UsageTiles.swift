@@ -700,15 +700,18 @@ private struct UsageProviderColumn: View {
         }
     }
 
-    /// The Fable weekly row is emphasized (red) only when its severity is
-    /// critical. `is_active` is deliberately NOT a trigger: on the daemon's
-    /// `/api/oauth/usage` it marks the representative/governing limit, NOT an
-    /// exhausted one — it is true even at low utilization (a 76%/warning row is
-    /// `is_active: true` with ~24% headroom), so keying red off it wrongly
-    /// paints a healthy account red.
+    /// The Fable weekly row is emphasized (red) only when the daemon's
+    /// reset-aware `constraining` bool is true. This keys off `constraining`
+    /// (from `ScopedQuotaWindow::is_constraining`), NOT the raw `severity`
+    /// string: `severity` is not reset-aware, so a just-reset window can still
+    /// carry a stale `critical` while its utilization is 0 — keying red off it
+    /// would flash `F 0%!` right after a weekly reset. `is_active` is likewise
+    /// NOT a trigger: it marks the representative/governing limit, NOT an
+    /// exhausted one (a 76%/warning row is `is_active: true` with ~24%
+    /// headroom). `constraining` folds both concerns in on the daemon side.
     private func emphasizeCritical(for window: UsageWindow) -> Bool {
         guard window == .fableWeekly, let info else { return false }
-        return info.fableWeeklySeverity?.lowercased() == "critical"
+        return info.fableWeeklyConstraining == true
     }
 
     private func normalizeCodexTier(_ plan: String?) -> String? {

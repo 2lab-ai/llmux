@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::logging::LogLine;
 use crate::proxy::server::{AppState, UsageTotals, EVALUATE_TICK};
 use crate::scheduler::select::{self, SelectParams};
-use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
+use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot, CRITICAL_UTILIZATION};
 use crate::tui::activity::{
     normalize_model, ActivityLog, ClientUsage, Completed, CompletedBody, InFlight, ModelUsage,
     StatsWindow, Totals, WindowedRow,
@@ -590,13 +590,26 @@ pub struct ScopedWindowDoc {
     /// Lowercase upstream severity label ("normal" | "warning" | "critical").
     pub severity: String,
     pub is_active: bool,
+    /// Reset-aware "this limit is actually constraining right now" bool, from
+    /// [`ScopedQuotaWindow::is_constraining`]. Unlike `severity`, this
+    /// short-circuits on an expired/just-reset window, so a client (e.g. the
+    /// Swift islands app, which can't call `is_constraining`) can paint the red
+    /// state without re-flashing red on a post-reset 0% window whose `severity`
+    /// field is still a stale `Critical`. `#[serde(default)]` (→ `false`) so a
+    /// newer client parsing an older daemon's doc that predates the field
+    /// degrades to "not constraining" instead of failing the whole parse —
+    /// mirrors the wire-compat convention of `show_fable_weekly` /
+    /// `email_anonymous` and the Swift decode's optional `constraining`.
+    #[serde(default)]
+    pub constraining: bool,
 }
 
 /// One entry of the generic `scoped_limits` list: a [`ScopedWindowDoc`] tagged
 /// with its scope label (`scope.model.display_name`). Flattened so the entry
 /// serializes as a flat `{ scope_label, utilization, resets_at,
 /// resets_in_secs, severity, is_active }` object — future scoped models appear
-/// here without another schema change.
+/// here without another schema change. The flattened object gained a
+/// `constraining` bool alongside `severity`/`is_active`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopedLimitDoc {
     pub scope_label: String,
@@ -931,6 +944,7 @@ fn scoped_window_doc(
             .unwrap_or(0),
         severity: scoped.severity.label().to_string(),
         is_active: scoped.is_active,
+        constraining: scoped.is_constraining(now, CRITICAL_UTILIZATION),
     }
 }
 
@@ -1604,9 +1618,18 @@ mod tests {
         assert_eq!(fable.severity, "critical");
         assert!(fable.is_active);
         assert_eq!(fable.resets_at, 1_783_115_999);
+        // Reset-aware `constraining`: this fixture window is critical AND live
+        // (resets_at 1_783_115_999 ≫ now 1_000_000, so NOT expired), so
+        // `is_constraining` returns true — unambiguously distinct from the
+        // stale-severity/expired case the field exists to disambiguate.
+        assert!(
+            fable.constraining,
+            "critical + non-expired window is constraining"
+        );
         assert_eq!(a.scoped_limits.len(), 1);
         assert_eq!(a.scoped_limits[0].scope_label, "Fable");
         assert_eq!(a.scoped_limits[0].window.severity, "critical");
+        assert!(a.scoped_limits[0].window.constraining);
 
         assert!(b.fable_weekly.is_none(), "no poll → no Fable window");
         assert!(b.scoped_limits.is_empty());
@@ -1623,8 +1646,11 @@ mod tests {
             .expect("a json");
         assert!(a_json["fable_weekly"].get("scope_label").is_none());
         assert_eq!(a_json["fable_weekly"]["is_active"], true);
+        // The reset-aware `constraining` bool serializes under its own JSON key.
+        assert_eq!(a_json["fable_weekly"]["constraining"], true);
         assert_eq!(a_json["scoped_limits"][0]["scope_label"], "Fable");
         assert_eq!(a_json["scoped_limits"][0]["is_active"], true);
+        assert_eq!(a_json["scoped_limits"][0]["constraining"], true);
         let reparsed: DashboardDoc = serde_json::from_value(json).expect("doc deserializes");
         let a2 = reparsed
             .accounts
@@ -1633,6 +1659,9 @@ mod tests {
             .expect("reparsed a");
         assert_eq!(a2.scoped_limits[0].scope_label, "Fable");
         assert!(a2.fable_weekly.as_ref().expect("fable").is_active);
+        // `constraining` survives the serialize → deserialize round-trip.
+        assert!(a2.fable_weekly.as_ref().expect("fable").constraining);
+        assert!(a2.scoped_limits[0].window.constraining);
     }
 
     #[test]

@@ -2100,6 +2100,7 @@ mod tests {
             snapshot: PoolSnapshot {
                 accounts: Vec::new(),
                 current: std::collections::BTreeMap::new(),
+                fable_current: std::collections::BTreeMap::new(),
             },
             last_switch: None,
             poll_health: std::collections::HashMap::new(),
