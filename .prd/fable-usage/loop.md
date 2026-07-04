@@ -14,7 +14,9 @@ Status legend: 🔴 not met · 🟡 partial · ✅ met (evidence) · 🚪 user-g
 | G2-impl | Fable requests don't churn non-fable claude current | After impl: a fable request that switches accounts leaves the non-fable `current` unmoved (unit test) + live: fable traffic on designated head, non-fable claude current stable | ✅ | (b) separate `fable_current` map: PoolState/PoolSnapshot + scope-aware commit/lease/evaluate (mod.rs) + group_current threads scope (select.rs). Tests RUN BY ORCHESTRATOR: `fable_pick_does_not_move_nonfable_current` ok, `nonfable_commit_does_not_move_fable_current` ok. lib 604 pass, 0 clippy. Live routing confirmed at QA post-deploy |
 | REL | Preview → QA → release v0.2.14 | preview prerelease built; live QA of both goals; stable tag + tap bump (user-gated) | 🚪 | Preview `preview-2026-07-04-0127-8992a354873a` built GREEN (all jobs, run 28690747186). Stable `v0.2.14` tag push BLOCKED by auto-mode classifier (Production Deploy = user-gated) → user runs the tag push + tap bump PR + daemon activation. Commands in round log. |
 
-Accounting: total 6 · ✅ 5 (G1-tui, G1-srv, G1-islands, G2-design, G2-impl) · 🔴 0 · 🟡 0 · 🚪 1 (REL) · ⚫ 0.
+| G3 | Don't bench a fable account on upstream severity=critical (user-flagged mid-loop) | A fable window at 90% util + severity=critical with real headroom (served 200s, no 429) is NOT excluded from fable routing | ✅ | `is_constraining` (window.rs:130) drops the `severity==Critical` disjunct → keys on util≥0.95 only. Evidence: icedac 90%/critical served EVERY fable req 200 (log 01:57–02:01), never 429, yet benched → traffic all on ai5. Same class as is_active (2d5f80b). Test `is_constraining_keys_on_utilization_not_upstream_labels` RUN BY ORCHESTRATOR: ok. Commit 02944d8. |
+
+Accounting: total 7 · ✅ 6 (G1-tui, G1-srv, G1-islands, G2-design, G2-impl, G3) · 🔴 0 · 🟡 0 · 🚪 1 (REL) · ⚫ 0.
 **All rows ✅/🚪 → loop closes.** Both code goals done+verified+green+committed+pushed+preview-built;
 stable release is the user's gated step.
 
