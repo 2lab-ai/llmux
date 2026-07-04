@@ -358,7 +358,7 @@ pub fn pick_scoped(
     // soonest-`cooldown_until` choice instead of camping the (also-parked)
     // current.
     if !heuristic_degraded {
-        if let Some(current_id) = group_current(snapshot, group) {
+        if let Some(current_id) = group_current(snapshot, group, scope) {
             if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
                 let clearly_better = match best {
                     Some(best) if &best.id != current_id => {
@@ -386,10 +386,14 @@ pub fn pick_scoped(
 
 /// The current account for the active selection scope: the group's slot when
 /// `Some`, the legacy slot when `None`.
-fn group_current(snapshot: &PoolSnapshot, group: Option<BackendGroup>) -> Option<&AccountId> {
+fn group_current(
+    snapshot: &PoolSnapshot,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+) -> Option<&AccountId> {
     match group {
-        Some(g) => snapshot.current_for_group(g),
-        None => snapshot.legacy_current(),
+        Some(g) => snapshot.current_for_scope(g, scope),
+        None => snapshot.legacy_current_scoped(scope),
     }
 }
 
@@ -406,7 +410,8 @@ pub fn next_in_line(
     group: Option<BackendGroup>,
 ) -> Option<AccountId> {
     let headers_only = headers_only_mode(snapshot, params, group, now);
-    let current = group_current(snapshot, group);
+    // The per-group "next" line is a display reader over the non-Fable current.
+    let current = group_current(snapshot, group, RequestScope::NonFable);
     snapshot
         .accounts
         .iter()
@@ -779,6 +784,7 @@ mod tests {
         PoolSnapshot {
             accounts,
             current: map,
+            fable_current: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1049,6 +1055,7 @@ mod tests {
         PoolSnapshot {
             accounts,
             current: map,
+            fable_current: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1151,7 +1158,11 @@ mod tests {
         for (g, c) in slots {
             current.insert(*g, AccountId(c.to_string()));
         }
-        PoolSnapshot { accounts, current }
+        PoolSnapshot {
+            accounts,
+            current,
+            fable_current: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]

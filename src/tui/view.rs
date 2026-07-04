@@ -181,7 +181,15 @@ impl DashboardView {
                 .unwrap_or(crate::routing::BackendGroup::Claude);
             current.insert(group, id);
         }
-        let snapshot = PoolSnapshot { accounts, current };
+        let snapshot = PoolSnapshot {
+            accounts,
+            current,
+            // The TUI reconstructs the snapshot from the status doc for
+            // rendering; the fable-scope current is a daemon-side scheduling
+            // slot not carried in the doc, so it is empty here (display marks
+            // the non-Fable current; the churn fix lives in the daemon).
+            fable_current: std::collections::BTreeMap::new(),
+        };
         let session_totals: HashMap<String, Totals> = doc
             .accounts
             .iter()

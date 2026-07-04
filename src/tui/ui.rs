@@ -18,9 +18,9 @@ use crate::logging::LogLine;
 use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
 use crate::scheduler::window::{
-    classify_window_display, LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
+    classify_window_display, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
 };
-use crate::scheduler::{select, AccountSnapshot};
+use crate::scheduler::{select, AccountSnapshot, CRITICAL_UTILIZATION};
 
 use super::activity::{ActivityKey, Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
@@ -1056,11 +1056,17 @@ fn window_cells(
 /// - Present window: bar + `%` in wide mode, a compact `F 97%` marker in
 ///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
 ///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
-///   a `severity == Critical` Fable limit reads red regardless of the raw
-///   percent (the limit is engaged upstream even if the number looks calm).
+///   a *constraining* Fable limit reads red regardless of the raw percent (the
+///   limit is engaged upstream even if the number looks calm). "Constraining"
+///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
+///   an expired / just-reset window is NOT red even when its `severity` field
+///   is still a stale `Critical`, because `is_constraining` short-circuits on
+///   `is_expired` before it ever inspects `severity`. (Previously the cell
+///   keyed on the raw `severity == Critical`, which is not reset-aware, so a
+///   post-reset window flashed red `F 0%!` until the next usage poll.)
 ///   `is_active` alone does NOT force red: it marks the representative/governing
 ///   limit, NOT an exhausted one, so a 76%/warning/is_active row keeps its
-///   normal utilization-based hue (mirrors [`ScopedQuotaWindow::is_constraining`]).
+///   normal utilization-based hue (also via `is_constraining`).
 ///   A trailing `!` flags the red state, mirroring the over-threshold marker on
 ///   the account windows.
 /// - Absent window (no Fable scope on this account): the same cold/stale/
@@ -1089,11 +1095,13 @@ fn fable_gauge_cell(
         };
     };
     let utilization = scoped.window.effective_utilization(now);
-    // Scope signal wins: an upstream-critical Fable limit is red no matter the
-    // percent. `is_active` is NOT a red trigger — it marks the representative
-    // limit, not an exhausted one (a 76%/warning/is_active bucket has headroom),
-    // so it keeps its utilization-based hue. Otherwise fall to the fill band.
-    let critical = scoped.severity == LimitSeverity::Critical;
+    // Scope signal wins: a *constraining* Fable limit is red no matter the
+    // percent — but `is_constraining` is reset-aware (it short-circuits on an
+    // expired/reset window), so a stale-`Critical` severity no longer paints a
+    // just-reset 0% window red. `is_active` is NOT a red trigger either — it
+    // marks the representative limit, not an exhausted one. Otherwise fall to
+    // the fill band.
+    let critical = scoped.is_constraining(now, CRITICAL_UTILIZATION);
     let level = if critical {
         GaugeLevel::Red
     } else {
@@ -2806,6 +2814,7 @@ mod tests {
             snapshot: PoolSnapshot {
                 accounts: Vec::new(),
                 current: BTreeMap::new(),
+                fable_current: BTreeMap::new(),
             },
             last_switch: None,
             poll_health: HashMap::new(),
@@ -3742,6 +3751,75 @@ mod tests {
         assert!(
             !narrow.contains("76%!"),
             "is_active alone must NOT force the red-critical `!` marker:\n{narrow}"
+        );
+    }
+
+    /// Regression (fable-usage reset race): right after a weekly reset the
+    /// window is expired (util → 0) but its `severity` field can still be a
+    /// stale `Critical` until the next usage poll. The gauge must key off the
+    /// reset-aware `is_constraining` (which short-circuits on `is_expired`), so
+    /// a just-reset window renders its honest `F 0%` with NO forced-red `!` —
+    /// not the old red `F 0%!`.
+    #[test]
+    fn fable_gauge_reset_window_is_not_forced_red() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{
+            LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource,
+        };
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId("claude:icedac@example.com".into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(QuotaWindow {
+                utilization: 0.42,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now,
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: None,
+            // EXPIRED Fable weekly (resets_at in the past) whose `severity` is
+            // still a stale `Critical`: util is 0 after reset but severity has
+            // not been refreshed by a poll yet. Must NOT read red.
+            scoped_limits: vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: QuotaWindow {
+                    utilization: 0.97,
+                    resets_at: now - Duration::from_secs(60),
+                    fetched_at: now,
+                    source: WindowSource::UsagePoll,
+                },
+                severity: LimitSeverity::Critical,
+                is_active: true,
+            }],
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+        }];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:icedac@example.com".into()),
+        );
+        view.show_fable_weekly = true;
+
+        // Expired → effective utilization 0 → `F 0%`, and because
+        // `is_constraining` short-circuits on the expired window the stale
+        // `Critical` severity does NOT force the red-critical `!` marker.
+        let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        assert!(
+            narrow.contains("F 0%"),
+            "expired/reset Fable window renders its honest 0%:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("0%!"),
+            "stale-critical severity on an expired window must NOT force the red `!`:\n{narrow}"
         );
     }
 
