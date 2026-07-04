@@ -51,6 +51,15 @@ struct LlmuxClient: Sendable {
         return try JSONDecoder().decode(LlmuxStatus.self, from: data)
     }
 
+    /// `GET /llmux/dashboard` — the full dashboard document: the same
+    /// `accounts[]` as `/llmux/status` plus totals / model / client / windowed
+    /// / activity analytics (issue #62). Throws on transport, HTTP, or decode
+    /// failure — the caller falls back to `status()` for older daemons.
+    func dashboard() async throws -> LlmuxDashboard {
+        let data = try await send(makeRequest("/llmux/dashboard"))
+        return try JSONDecoder().decode(LlmuxDashboard.self, from: data)
+    }
+
     /// `POST /llmux/add-account` — add an Anthropic API-key account (FR2).
     func addApiKey(name: String?, apiKey: String) async throws {
         var body: [String: Any] = ["api_key": apiKey]
