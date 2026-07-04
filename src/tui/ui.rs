@@ -2064,12 +2064,21 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
         .saturating_add(m.cache_creation.unwrap_or(0))
 }
 
-/// API-equivalent USD cost for one model row (item #4), computed inline at
-/// render time from the row's accumulated token parts (input/output + the
-/// optional cache split) via [`crate::pricing`]. The render path holds no
-/// config overrides, so an empty map = the built-in default rate table. An
-/// unknown/zero-rate `(group, model)` yields `0.0`.
+/// API-equivalent USD cost for one model row (item #4): the server-computed
+/// [`ModelUsageDoc::cost_usd`] (issue #62 S1), which already reflects the
+/// daemon's pricing overrides. Docs from daemons that predate the field carry
+/// the serde default `0.0` — for those, when the row has tokens, fall back to
+/// pricing the token parts locally so the `$` column stays useful during a
+/// rolling upgrade. The fallback holds no config overrides (empty map = the
+/// built-in default rate table); an unknown/zero-rate `(group, model)` still
+/// yields `0.0`.
 fn model_cost(m: &ModelUsageDoc) -> f64 {
+    if m.cost_usd > 0.0 {
+        return m.cost_usd;
+    }
+    if m.tokens_in.saturating_add(m.tokens_out) == 0 {
+        return 0.0;
+    }
     crate::pricing::cost_from_parts(
         &m.group,
         &m.model,
@@ -2793,6 +2802,8 @@ mod tests {
             accounts: Vec::new(),
             efforts: Vec::new(),
             endpoints: Vec::new(),
+            // Old-daemon default: tests exercise the local pricing fallback.
+            cost_usd: 0.0,
         }
     }
 
@@ -3311,6 +3322,24 @@ mod tests {
         let cost = model_cost(&m);
         assert!((cost - (1.0 + 2.5 + 0.02)).abs() < 1e-9, "got {cost}");
         assert_eq!(format_cost(cost), "$3.52");
+    }
+
+    #[test]
+    fn model_cost_prefers_server_value_and_falls_back_for_old_docs() {
+        // Server-computed cost (issue #62 S1) wins — it already reflects the
+        // daemon's pricing overrides, which the render path cannot see.
+        let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
+        m.cache_read = Some(40_000);
+        m.cost_usd = 9.99;
+        assert!((model_cost(&m) - 9.99).abs() < 1e-12);
+        // Old-daemon doc (serde default 0.0) with tokens → local pricing
+        // fallback (same math as `model_cost_matches_pricing_table`).
+        m.cost_usd = 0.0;
+        assert!((model_cost(&m) - 3.52).abs() < 1e-9);
+        // No tokens at all (e.g. an in-flight-only row) → $0, no lookup.
+        let mut idle = model_row("claude", "claude-opus-4-8", 0, 0);
+        idle.cache_read = None;
+        assert!(model_cost(&idle).abs() < 1e-12);
     }
 
     #[test]
@@ -3859,6 +3888,7 @@ mod tests {
             }],
             efforts: Vec::new(),
             endpoints: Vec::new(),
+            cost_usd: 0.0,
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {

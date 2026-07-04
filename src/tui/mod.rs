@@ -2055,6 +2055,7 @@ mod tests {
             accounts: Vec::new(),
             efforts: Vec::new(),
             endpoints: Vec::new(),
+            cost_usd: 0.0,
         }];
         v
     }
