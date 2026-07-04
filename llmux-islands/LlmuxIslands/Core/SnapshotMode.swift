@@ -157,13 +157,19 @@ enum SnapshotMode {
         let claude = DemoMode.forcedInFlight?.claude ?? 0
         let codex = DemoMode.forcedInFlight?.codex ?? 0
 
+        // Fixture cost so the closed-island v1 format (`C:n X:m $0.42`,
+        // gist §4.4) is visible in the frames; matches the spec's example.
+        let fixtureCost = 0.42
+
         if let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_T"], !raw.isEmpty {
             guard let t = TimeInterval(raw), t >= 0, t.isFinite else {
                 throw SnapshotError.invalidWallClock(raw)
             }
             let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
             let url = dir.appendingPathComponent(name)
-            let view = ClosedIslandSnapshotView(claudeCount: claude, codexCount: codex, clock: .wallClock(t))
+            let view = ClosedIslandSnapshotView(
+                claudeCount: claude, codexCount: codex, clock: .wallClock(t), sessionCost: fixtureCost
+            )
             try renderLabel(view, to: url)
             return [url.path]
         }
@@ -171,10 +177,22 @@ enum SnapshotMode {
         var written: [String] = []
         for (index, phase) in phases.enumerated() {
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
-            let view = ClosedIslandSnapshotView(claudeCount: claude, codexCount: codex, clock: .phase(phase))
+            let view = ClosedIslandSnapshotView(
+                claudeCount: claude, codexCount: codex, clock: .phase(phase), sessionCost: fixtureCost
+            )
             try renderLabel(view, to: url)
             written.append(url.path)
         }
+
+        // One warning-state frame (auth_failed / quota > 90% color rule).
+        let warningURL = dir.appendingPathComponent("label-c\(claude)x\(codex)-warning.png")
+        try renderLabel(
+            ClosedIslandSnapshotView(
+                claudeCount: claude, codexCount: codex, clock: .phase(0), sessionCost: fixtureCost, warning: true
+            ),
+            to: warningURL
+        )
+        written.append(warningURL.path)
         return written
     }
 
@@ -200,8 +218,8 @@ enum SnapshotMode {
         return [url.path]
     }
 
-    /// The Usage panel (account tile grid), named after the effective
-    /// email-anonymous state.
+    /// The Usage panel (tile grid + #62 S4 analytics Overview), named after
+    /// the effective email-anonymous state, plus one PNG per analytics tab.
     @MainActor
     private static func renderUsage(into dir: URL) throws -> [String] {
         // Deterministic fixture accounts with demo fake emails — no daemon
@@ -210,12 +228,120 @@ enum SnapshotMode {
         model.tiles = fixtureTiles()
         model.connection = .online
 
+        // Install a deterministic dashboard document (issue #62 S4) so the
+        // analytics UI renders: fallback data-quality labels (no
+        // `data_quality` key), an auth_failed account (banner), same-named
+        // models in both groups ((group, model) keying), and zero/absent
+        // cache + client cost fields (`—` rendering).
+        let dashboard = try fixtureDashboard()
+        model.dashboard = dashboard
+        model.totals = dashboard.totals
+        model.modelUsage = dashboard.modelUsage
+        model.clientUsage = dashboard.clientUsage
+        model.windowed = dashboard.windowed
+        model.activity = dashboard.activity
+        model.healthWarning = DashboardHealth.summary(dashboard.accounts).isWarning
+
         let viewModel = makeViewModel()
         viewModel.contentType = .usage
         let anonOn = AppSettings.emailAnonymousEnabled
         let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
         try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
-        return [url.path]
+        var written = [url.path]
+
+        // Each analytics tab, rendered directly (the live view owns its tab
+        // state internally). Overview here omits the tile grid — the full
+        // panel PNG above already shows it — so cards/models/heat/activity
+        // all fit one frame.
+        let tabs: [(UsageAnalyticsSection<EmptyView>.Tab, String, CGFloat)] = [
+            (.overview, "usage-tab-overview.png", 560),
+            (.models, "usage-tab-models.png", 420),
+            (.clients, "usage-tab-clients.png", 420),
+            (.health, "usage-tab-health.png", 420),
+        ]
+        for (tab, name, height) in tabs {
+            let tabURL = dir.appendingPathComponent(name)
+            let section = UsageAnalyticsSection(model: model, dashboard: dashboard, now: Date(), initialTab: tab) {
+                EmptyView()
+            }
+            try writeHosted(view: section.padding(12), size: CGSize(width: 560, height: height), to: tabURL)
+            written.append(tabURL.path)
+        }
+        return written
+    }
+
+    /// Compact dashboard document in the daemon's wire shape (see
+    /// `DashboardFixtures` in the test target for the full captured form).
+    /// Timestamps are computed off `Date()` so "ago" columns render sanely.
+    private static func fixtureDashboard() throws -> LlmuxDashboard {
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let json = """
+        {
+          "version": "llmux snapshot-fixture", "port": 3456, "uptime_secs": 935,
+          "current": "claude:demo-1@example.com",
+          "accounts": [
+            {"name": "claude:demo-1@example.com", "type": "oauth", "status": "active",
+             "five_hour": {"utilization": 0.34}, "seven_day": {"utilization": 0.61}, "in_flight": 2,
+             "token_expires_at_ms": \(nowMs + 18_000_000), "last_refresh_ms": \(nowMs - 10_800_000)},
+            {"name": "codex:demo-3@example.com", "type": "codex", "status": "auth_failed",
+             "five_hour": {"utilization": 0.12}, "seven_day": {"utilization": 0.27}, "in_flight": 0}
+          ],
+          "totals": {"requests": 36633, "ok": 35621, "errors": 1012, "tokens_in": 79943758,
+                     "tokens_out": 29670001, "rpm_5m": 16.0, "in_flight": 3, "cost_usd": 8689.71},
+          "model_usage": [
+            {"group": "claude", "model": "claude-opus-4-8", "requests": 30226, "ok": 29720, "errors": 506,
+             "tokens_in": 11366225, "tokens_out": 25550294, "cache_read": 4889342877, "cache_creation": 486121851,
+             "last_used_ms": \(nowMs - 42_000), "in_flight": 2, "cost_usd": 7123.45,
+             "accounts": [{"name": "demo-1@example.com", "requests": 6949, "ok": 6862, "errors": 87,
+                           "tokens_in": 3578850, "tokens_out": 6733525}]},
+            {"group": "codex", "model": "gpt-5.5", "requests": 1354, "ok": 1324, "errors": 30,
+             "tokens_in": 65402313, "tokens_out": 636050, "last_used_ms": \(nowMs - 9_800_000)},
+            {"group": "claude", "model": "gpt-5.5", "requests": 12, "ok": 12, "errors": 0,
+             "tokens_in": 5000, "tokens_out": 900, "last_used_ms": \(nowMs - 86_400_000)}
+          ],
+          "client_usage": [
+            {"client": "client-2", "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
+             "tokens_out": 1357119, "cost_usd": 0.0, "last_seen_ms": 0},
+            {"client": "unknown", "requests": 11839, "ok": 11216, "errors": 623,
+             "tokens_in": 62996939, "tokens_out": 7053653}
+          ],
+          "windowed": [
+            {"window": "24h", "window_secs": 86400, "cells": [
+              {"group": "claude", "model": "claude-opus-4-8", "account": "demo-1", "requests": 2259, "ok": 2256,
+               "errors": 3, "tokens_in": 352514, "tokens_out": 705761, "tokens": 211044827},
+              {"group": "claude", "model": "claude-fable-5", "account": "demo-2", "requests": 702, "ok": 702,
+               "errors": 0, "tokens_in": 291878, "tokens_out": 567516, "tokens": 145311671},
+              {"group": "codex", "model": "gpt-5.5", "account": "demo-3", "requests": 88, "ok": 86,
+               "errors": 2, "tokens_in": 120000, "tokens_out": 9000, "tokens": 3200000}
+            ]},
+            {"window": "72h", "window_secs": 259200, "cells": [
+              {"group": "claude", "model": "claude-fable-5", "account": "demo-1", "requests": 1488, "ok": 1483,
+               "errors": 5, "tokens_in": 472278, "tokens_out": 1091437, "tokens": 416909032},
+              {"group": "claude", "model": "claude-opus-4-8", "account": "demo-1", "requests": 3348, "ok": 3340,
+               "errors": 8, "tokens_in": 618010, "tokens_out": 1268189, "tokens": 330050079}
+            ]}
+          ],
+          "activity": {
+            "in_flight": [
+              {"id": 201, "method": "POST", "path": "/v1/messages?beta=true",
+               "account": "claude:demo-1@example.com", "started_at_ms": \(nowMs - 4_000),
+               "group": "claude", "model": "claude-opus-4-8"}
+            ],
+            "completed": [
+              {"kind": "request", "at_ms": \(nowMs - 12_000), "method": "POST", "path": "/v1/messages",
+               "account": "claude:demo-1@example.com", "status": 200, "duration_ms": 1463,
+               "tokens": {"input": 106, "output": 7}, "cost_usd": 0.025631,
+               "group": "claude", "model": "claude-opus-4-8"},
+              {"kind": "request", "at_ms": \(nowMs - 95_000), "method": "POST", "path": "/v1/messages",
+               "account": "codex:demo-3@example.com", "status": 502, "duration_ms": 320,
+               "group": "codex", "model": "gpt-5.5"},
+              {"kind": "note", "at_ms": \(nowMs - 300_000),
+               "text": "token refreshed: claude:demo-2@example.com (expires 7h59m)", "error": false}
+            ]
+          }
+        }
+        """
+        return try JSONDecoder().decode(LlmuxDashboard.self, from: Data(json.utf8))
     }
 
     /// Plausible 16" laptop geometry so `openedSize` matches the app.
@@ -356,6 +482,9 @@ struct ClosedIslandSnapshotView: View {
     let claudeCount: Int
     let codexCount: Int
     let clock: Clock
+    /// Fixture session cost / warning state (issue #62 S4 closed-island v1).
+    var sessionCost: Double?
+    var warning: Bool = false
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
@@ -382,6 +511,8 @@ struct ClosedIslandSnapshotView: View {
         NotchClosedLabelContent(
             claudeCount: claudeCount,
             codexCount: codexCount,
+            sessionCost: sessionCost,
+            warning: warning,
             jumpOffset: jumpOffset,
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)

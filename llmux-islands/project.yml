@@ -47,6 +47,9 @@ targets:
       - path: LlmuxIslandsTests
       - path: LlmuxIslands/Llmux/LlmuxStatus.swift
       - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
+      # Foundation-only analytics logic (issue #62 S4): formatting, the
+      # health-warning rule, data-quality fallbacks, (group, model) keying.
+      - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests
