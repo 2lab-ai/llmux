@@ -12,9 +12,25 @@ Status legend: 🔴 not met · 🟡 partial · ✅ met (evidence) · 🚪 user-g
 | G1-islands | islands tile not red on reset | `emphasizeCritical` keys off daemon bool; xcodebuild green; app shows reset fable non-red | ✅ | UsageTiles.swift:714 `info.fableWeeklyConstraining == true`; bool threaded LlmuxStatus→IslandUsageModel→UsageModels→UsageTiles; xcodebuild `BUILD SUCCEEDED` (coder evidence). App render confirmed at QA post-deploy |
 | G2-design | Fable head routing architecture decided | W0 strategist debate (gpt55 zhuge+elon) → recorded decision (b/c/hybrid) + user sign-off if it flips direction | ✅ | W0 below: both converged (b) now + (c) optional; decision recorded |
 | G2-impl | Fable requests don't churn non-fable claude current | After impl: a fable request that switches accounts leaves the non-fable `current` unmoved (unit test) + live: fable traffic on designated head, non-fable claude current stable | ✅ | (b) separate `fable_current` map: PoolState/PoolSnapshot + scope-aware commit/lease/evaluate (mod.rs) + group_current threads scope (select.rs). Tests RUN BY ORCHESTRATOR: `fable_pick_does_not_move_nonfable_current` ok, `nonfable_commit_does_not_move_fable_current` ok. lib 604 pass, 0 clippy. Live routing confirmed at QA post-deploy |
-| REL | Preview → QA → release v0.2.14 | preview prerelease built; live QA of both goals; stable tag + tap bump (user-gated) | 🔴 | — |
+| REL | Preview → QA → release v0.2.14 | preview prerelease built; live QA of both goals; stable tag + tap bump (user-gated) | 🚪 | Preview `preview-2026-07-04-0127-8992a354873a` built GREEN (all jobs, run 28690747186). Stable `v0.2.14` tag push BLOCKED by auto-mode classifier (Production Deploy = user-gated) → user runs the tag push + tap bump PR + daemon activation. Commands in round log. |
 
-Accounting: total 6 · ✅ 5 (G1-tui, G1-srv, G1-islands, G2-design, G2-impl) · 🔴 1 (REL) · 🟡 0 · 🚪 0 · ⚫ 0.
+Accounting: total 6 · ✅ 5 (G1-tui, G1-srv, G1-islands, G2-design, G2-impl) · 🔴 0 · 🟡 0 · 🚪 1 (REL) · ⚫ 0.
+**All rows ✅/🚪 → loop closes.** Both code goals done+verified+green+committed+pushed+preview-built;
+stable release is the user's gated step.
+
+### Round 2 close — 2026-07-04
+- Goal 1 (reset-aware red) + Goal 2 (fable-head current slot) both shipped to `feat/fable-usage`
+  (commits e99c5c4 code, 7dcf900 docs, 8992a35 v0.2.14 bump), preview prerelease GREEN.
+- **User-gated remainder (classifier-confirmed):**
+  1. Stable release: `cd <worktree> && git tag -a v0.2.14 -m "..." && git push origin v0.2.14`
+     (release.yml verifies tag==Cargo.toml 0.2.14 ✓, publishes make_latest).
+  2. Tap bump: `gh workflow run bump.yml --repo 2lab-ai/homebrew-tap` then merge the resulting
+     PR (auto-mode classifier blocks self-merge/direct push to tap master).
+  3. Daemon activation (self-kill, user's): `brew upgrade 2lab-ai/tap/llmux && brew unlink
+     llmux-preview; brew link --overwrite llmux && llmux restart`, then poll
+     `curl -s -o /dev/null -w "%{http_code}" localhost:3456/` until 404/200, then `llmux --version`.
+- **Open user decision (non-blocking):** ship (b) as-is (stickiness isolation) vs add (c)
+  `fable_heads` dedicated-account quota isolation as a follow-up. Default shipped = (b).
 
 ## Round log
 
