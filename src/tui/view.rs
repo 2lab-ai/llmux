@@ -69,6 +69,11 @@ pub(crate) struct DashboardView {
     /// always reaches the view (see [`AccountSnapshot::scoped_limits`] rebuilt
     /// below) — this flag only gates the render.
     pub show_fable_weekly: bool,
+    /// Data-quality label wording (issue #62 S2), carried verbatim from the
+    /// document — the server owns the wording, `ui.rs` renders the cost /
+    /// model-usage-scope qualifiers from these strings. A doc from an older
+    /// daemon fills the byte-identical canonical defaults via serde.
+    pub data_quality: crate::dashboard::DataQualityDoc,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -331,6 +336,7 @@ impl DashboardView {
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
             show_fable_weekly: doc.show_fable_weekly,
+            data_quality: doc.data_quality.clone(),
         }
     }
 
@@ -641,6 +647,17 @@ mod tests {
         let doc: DashboardDoc = serde_json::from_value(value).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert!(view.model_usage.is_empty());
+    }
+
+    #[test]
+    fn data_quality_labels_reach_the_view_with_canonical_defaults() {
+        // doc_json() predates `data_quality` (issue #62 S2): the serde default
+        // fills the canonical wording and from_doc carries it verbatim, so the
+        // renderer shows identical labels for old and new daemons.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.data_quality.model_usage, "hydrated activity/runtime");
+        assert_eq!(view.data_quality.cost, "API-equivalent estimate");
     }
 
     #[test]
