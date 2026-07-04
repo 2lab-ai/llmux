@@ -2,10 +2,13 @@ import Foundation
 import SwiftUI
 
 /// The accounts/usage model that feeds the island's `.usage` content. Polls
-/// `GET /llmux/status` and maps each llmux account onto the agent-island
-/// `UsageAccountTile` so the lifted tile grid renders unchanged. Also owns the
-/// add / remove / OAuth-login actions. Replaces agent-island's
-/// `UsageDashboardViewModel` + the whole cauth/credential pipeline.
+/// `GET /llmux/dashboard` (issue #62) — the same `accounts[]` as
+/// `/llmux/status` plus analytics — and maps each llmux account onto the
+/// agent-island `UsageAccountTile` so the lifted tile grid renders unchanged.
+/// Any dashboard fetch/decode failure falls back to the `/llmux/status` path,
+/// so older daemons keep today's behavior exactly. Also owns the add / remove
+/// / OAuth-login actions. Replaces agent-island's `UsageDashboardViewModel` +
+/// the whole cauth/credential pipeline.
 @MainActor
 final class IslandUsageModel: ObservableObject {
     static let shared = IslandUsageModel()
@@ -22,6 +25,16 @@ final class IslandUsageModel: ObservableObject {
     /// first poll completes (and even when the daemon is unreachable).
     @Published var claudeInFlight: Int = DemoMode.forcedInFlight?.claude ?? 0
     @Published var codexInFlight: Int = DemoMode.forcedInFlight?.codex ?? 0
+
+    // Dashboard analytics (issue #62 S3): published for the analytics UI
+    // (Phase 2). Empty/nil when the daemon predates `/llmux/dashboard` (the
+    // status fallback carries no analytics) or when never connected.
+    @Published var dashboard: LlmuxDashboard?
+    @Published var totals: LlmuxDashboardTotals?
+    @Published var modelUsage: [LlmuxDashboardModelUsage] = []
+    @Published var clientUsage: [LlmuxDashboardClientUsage] = []
+    @Published var windowed: [LlmuxDashboardWindowed] = []
+    @Published var activity: LlmuxDashboardActivity?
 
     /// The daemon's `email_anonymous` setting from the last successful
     /// `/llmux/status` poll. `nil` = the daemon predates the setting (or we
@@ -62,6 +75,44 @@ final class IslandUsageModel: ObservableObject {
 
     func refresh() async {
         do {
+            apply(try await client.dashboard())
+            connection = .online
+        } catch {
+            // ANY dashboard failure — 404 from an older daemon, transport
+            // error, or a doc this build can't decode — falls back to the
+            // status path so the tiles keep today's behavior (gist-02 L33).
+            await refreshFromStatus()
+        }
+    }
+
+    /// Fold one dashboard document into the published state. The account
+    /// tiles go through `statusRecord` + the SAME `tile(from:)` mapping as
+    /// the status path, so tile behavior is identical on both paths.
+    private func apply(_ dash: LlmuxDashboard) {
+        current = dash.current
+        let records = dash.accounts.map(\.statusRecord)
+        tiles = records.enumerated().map { index, record in
+            let tile = Self.tile(from: record)
+            return DemoMode.isActive ? Self.demoMasked(tile, index: index) : tile
+        }
+        let counts = Self.inFlightCounts(records)
+        claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
+        codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
+        applyServerEmailAnonymous(dash.emailAnonymous)
+        dashboard = dash
+        totals = dash.totals
+        modelUsage = dash.modelUsage
+        clientUsage = dash.clientUsage
+        windowed = dash.windowed
+        activity = dash.activity
+    }
+
+    /// The pre-#62 poll path, kept verbatim as the fallback for daemons
+    /// without `/llmux/dashboard`. Clears the analytics state on success —
+    /// this daemon provides none, and stale analytics from a previous daemon
+    /// must not outlive it.
+    private func refreshFromStatus() async {
+        do {
             let status = try await client.status()
             current = status.current
             tiles = status.accounts.enumerated().map { index, account in
@@ -73,6 +124,12 @@ final class IslandUsageModel: ObservableObject {
             codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
             applyServerEmailAnonymous(status.emailAnonymous)
             connection = .online
+            dashboard = nil
+            totals = nil
+            modelUsage = []
+            clientUsage = []
+            windowed = []
+            activity = nil
         } catch {
             connection = .offline(error.localizedDescription)
         }
