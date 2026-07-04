@@ -113,26 +113,29 @@ pub struct ScopedQuotaWindow {
 
 impl ScopedQuotaWindow {
     /// Whether this scoped limit is currently constraining (fable-usage W2
-    /// preemptive avoidance): upstream-critical severity, or utilization
-    /// at/above `critical_util`. Reset-aware — a window past its `resets_at`
-    /// carries no constraint (its `effective_utilization` reads 0) and this
-    /// returns `false`, so a Fable bucket whose weekly window has rolled over
-    /// no longer excludes the account from Fable routing.
+    /// preemptive avoidance): real utilization at/above `critical_util`.
+    /// Reset-aware — a window past its `resets_at` carries no constraint (its
+    /// `effective_utilization` reads 0) and this returns `false`, so a Fable
+    /// bucket whose weekly window has rolled over no longer excludes the
+    /// account from Fable routing.
     ///
-    /// `is_active` is deliberately NOT a term here. On the OAuth
-    /// `/api/oauth/usage` `limits[]`, `is_active: true` means "this is the
-    /// representative/governing limit", NOT "exhausted/rejecting" — it is true
-    /// even at low utilization (evidence: a real Fable weekly at 76% util /
-    /// `warning` severity / `is_active: true` still has ~24% headroom). Gating
-    /// exclusion on `is_active` alone wrongly benches accounts that still have
-    /// plenty of Fable quota, so only severity==Critical or high utilization
-    /// count as a constraint.
+    /// Neither `is_active` NOR `severity` is a term here — both are upstream
+    /// *labels*, not "cannot serve" facts. On the OAuth `/api/oauth/usage`
+    /// `limits[]`, `is_active: true` marks the representative/governing limit
+    /// (true even at 76% util / `warning` with ~24% headroom), and
+    /// `severity: "critical"` fires while the account is STILL serving —
+    /// observed live at 90% util where the Fable bucket answered every request
+    /// `200` and never `429`. Gating exclusion on either wrongly benches an
+    /// account that still has Fable quota (wasting ~10% at the 90%/critical
+    /// case), the exact overreach W2's `is_active` fix already removed once.
+    /// So ONLY real utilization gates preemptive exclusion; a genuinely
+    /// rejecting account is caught by its Fable-scoped `429` → cooldown (a real
+    /// signal), not by a poll-time severity label.
     pub fn is_constraining(&self, now: SystemTime, critical_util: f64) -> bool {
         if self.window.is_expired(now) {
             return false;
         }
-        self.severity == LimitSeverity::Critical
-            || self.window.effective_utilization(now) >= critical_util
+        self.window.effective_utilization(now) >= critical_util
     }
 }
 
@@ -293,20 +296,29 @@ mod tests {
     }
 
     #[test]
-    fn is_constraining_on_active_critical_or_high_util() {
-        // is_active alone does NOT constrain: `is_active: true` marks the
-        // representative/governing limit, not an exhausted one — it is true even
-        // at low utilization, so it must not bench an account that still has
-        // headroom (evidence: real Fable 76%/warning/is_active=true has ~24%
-        // left). Only severity==Critical or high utilization gate exclusion.
+    fn is_constraining_keys_on_utilization_not_upstream_labels() {
+        // Neither is_active NOR severity benches an account with headroom —
+        // both are upstream labels, not "cannot serve" facts.
+        // is_active alone does NOT constrain (marks the governing limit, true
+        // even at low util with ~24% headroom).
         assert!(!scoped(0.10, 10_000, true, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
-        // Critical severity alone constrains.
+        // severity==Critical alone does NOT constrain: it fires while the
+        // account is still serving. Benching here wastes real Fable quota — a
+        // genuinely rejecting account is caught by its Fable-scoped 429.
         assert!(
-            scoped(0.10, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95)
+            !scoped(0.10, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95)
         );
-        // Utilization at/above the critical bar constrains.
+        // The icedac case (2026-07-04): 90% util + upstream `critical`, but 10%
+        // headroom and every request answered 200 (never 429) → must NOT bench.
+        assert!(
+            !scoped(0.90, 10_000, false, LimitSeverity::Critical).is_constraining(at(1000), 0.95),
+            "90% + upstream-critical still has headroom (served 200s, never 429) — not constraining"
+        );
+        // Only real utilization at/above the critical bar constrains …
         assert!(scoped(0.95, 10_000, false, LimitSeverity::Normal).is_constraining(at(1000), 0.95));
-        // Healthy, low-util, non-critical does NOT constrain.
+        // … and a genuinely exhausted 100% bucket still constrains.
+        assert!(scoped(1.0, 10_000, true, LimitSeverity::Critical).is_constraining(at(1000), 0.95));
+        // Healthy, mid-util, non-critical does NOT constrain.
         assert!(
             !scoped(0.60, 10_000, false, LimitSeverity::Warning).is_constraining(at(1000), 0.95)
         );
