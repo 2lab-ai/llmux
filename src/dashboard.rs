@@ -707,6 +707,13 @@ pub struct ModelUsageDoc {
     /// Endpoint-class distribution (req20).
     #[serde(default)]
     pub endpoints: Vec<ModelCountDoc>,
+    /// API-equivalent USD cost estimate for this model row (issue #62 S1):
+    /// the row's accumulated token parts priced via [`crate::pricing`] with
+    /// the daemon's pricing overrides, so clients need not duplicate the rate
+    /// table. Additive: absent in docs from older daemons → `0.0` (a client
+    /// may recompute from the row's tokens as a fallback).
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,6 +744,17 @@ pub struct ClientUsageDoc {
     pub errors: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// API-equivalent USD cost attributed to this client (issue #62 S1).
+    /// Wire-ready additive field: the hub's per-client tracking keeps only
+    /// request/token totals today (no per-model attribution to price
+    /// against), so the daemon emits `0.0` until that tracking exists.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// Epoch ms of this client's most recent request (issue #62 S1).
+    /// Wire-ready additive field: the hub does not track per-client
+    /// last-seen today, so the daemon emits `0` until it does.
+    #[serde(default)]
+    pub last_seen_ms: u64,
 }
 
 /// One trailing-window slice of the per-account/per-model heatmap (issue #23):
@@ -952,36 +970,18 @@ fn scoped_window_doc(
 /// the hub, with in-flight requests overlaid per model (req11). A model seen
 /// only in-flight (no completed request yet) still gets a row so a long active
 /// request is visible before it finishes.
-/// Build the model-usage rows AND the total API-equivalent USD cost across all
-/// completed model rows (Feature D). The total is the **sum of each completed
-/// row's per-model cost** — the only correct aggregation, since each model
-/// carries its own rate. In-flight-only rows have no completed tokens and
-/// contribute `0`. The per-model cost is computed here but NOT stored on
-/// [`ModelUsageDoc`]: the TUI's `ui.rs` constructs that struct with an
-/// exhaustive literal and is frozen for a parallel rewrite, so adding a field
-/// to it is impossible from here. Per-model cost is recoverable by the client
-/// from the row's tokens + the same pricing table; the global total and the
-/// per-request `CompletedDoc::Request::cost_usd` carry the cost end to end.
+///
+/// Each completed row carries its own API-equivalent USD cost
+/// ([`ModelUsageDoc::cost_usd`], issue #62 S1), computed once here from the
+/// row's token parts + the daemon's pricing overrides. The returned total
+/// (Feature D) is the **sum of those per-row costs** — the only correct
+/// aggregation, since each model carries its own rate. In-flight-only rows
+/// have no completed tokens and contribute `0`.
 fn model_usage_docs(
     hub: &HubView,
     now: SystemTime,
     pricing_overrides: &HashMap<String, crate::pricing::ModelPrice>,
 ) -> (Vec<ModelUsageDoc>, f64) {
-    let total_cost: f64 = hub
-        .model_usage
-        .iter()
-        .map(|m| {
-            crate::pricing::cost_from_parts(
-                &m.group,
-                &m.model,
-                m.tokens_in,
-                m.tokens_out,
-                m.cache_read,
-                m.cache_creation,
-                pricing_overrides,
-            )
-        })
-        .sum();
     let row = |m: &ModelUsage| ModelUsageDoc {
         group: m.group.clone(),
         model: m.model.clone(),
@@ -994,6 +994,15 @@ fn model_usage_docs(
         cache_creation: m.cache_creation,
         last_used_ms: epoch_ms(m.last_used),
         in_flight: 0,
+        cost_usd: crate::pricing::cost_from_parts(
+            &m.group,
+            &m.model,
+            m.tokens_in,
+            m.tokens_out,
+            m.cache_read,
+            m.cache_creation,
+            pricing_overrides,
+        ),
         accounts: m
             .accounts
             .iter()
@@ -1057,8 +1066,14 @@ fn model_usage_docs(
             accounts: Vec::new(),
             efforts: Vec::new(),
             endpoints: Vec::new(),
+            // No completed request yet → no accumulated tokens to price.
+            // The per-request cost lands on the row once the request finishes.
+            cost_usd: 0.0,
         });
     }
+    // Global total = Σ per-row costs, by construction (in-flight-only rows
+    // are 0.0) — the invariant the doc tests pin down.
+    let total_cost: f64 = docs.iter().map(|d| d.cost_usd).sum();
     (docs, total_cost)
 }
 
@@ -1268,6 +1283,11 @@ pub(crate) fn dashboard_doc(
             errors: c.errors,
             tokens_in: c.tokens_in,
             tokens_out: c.tokens_out,
+            // Wire-ready (issue #62 S1): the hub tracks per-client totals
+            // only — no per-model attribution to price, no last-seen stamp.
+            // Emit the serde defaults until that tracking exists.
+            cost_usd: 0.0,
+            last_seen_ms: 0,
         })
         .collect();
 
@@ -1989,6 +2009,84 @@ mod tests {
         value.as_object_mut().unwrap().remove("email_anonymous");
         let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
         assert!(!parsed.email_anonymous, "older daemon → false");
+    }
+
+    #[test]
+    fn doc_without_cost_fields_parses_to_zero_defaults() {
+        // An older daemon's doc predates `ModelUsageDoc::cost_usd` and the
+        // `ClientUsageDoc` cost_usd/last_seen_ms fields (issue #62 S1) —
+        // additive `#[serde(default)]` keeps it parseable, all three read 0.
+        let doc = seeded_doc();
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        for row in value["model_usage"].as_array_mut().expect("model rows") {
+            row.as_object_mut().unwrap().remove("cost_usd");
+        }
+        for row in value["client_usage"].as_array_mut().expect("client rows") {
+            let obj = row.as_object_mut().unwrap();
+            obj.remove("cost_usd");
+            obj.remove("last_seen_ms");
+        }
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        // Non-vacuous: the seeded doc has rows on both surfaces.
+        assert!(!parsed.model_usage.is_empty());
+        assert!(!parsed.client_usage.is_empty());
+        assert!(parsed.model_usage.iter().all(|m| m.cost_usd.abs() < 1e-12));
+        assert!(parsed
+            .client_usage
+            .iter()
+            .all(|c| c.cost_usd.abs() < 1e-12 && c.last_seen_ms == 0));
+    }
+
+    #[test]
+    fn doc_round_trips_cost_fields() {
+        // The new additive fields survive serialize→parse (issue #62 S1) and
+        // are PRESENT on the wire (no skip_serializing), so a newer client
+        // can rely on the keys existing in a fresh daemon's doc.
+        let doc = seeded_doc();
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let parsed: DashboardDoc = serde_json::from_str(&json).expect("parse");
+        assert!(doc.model_usage[0].cost_usd > 0.0, "seeded row is priced");
+        assert!((parsed.model_usage[0].cost_usd - doc.model_usage[0].cost_usd).abs() < 1e-12);
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("value");
+        let client = &value["client_usage"][0];
+        assert!(client.get("cost_usd").is_some(), "on the wire");
+        assert!(client.get("last_seen_ms").is_some(), "on the wire");
+        // Wire-ready defaults until the hub tracks per-client cost/last-seen.
+        assert!(parsed.client_usage[0].cost_usd.abs() < 1e-12);
+        assert_eq!(parsed.client_usage[0].last_seen_ms, 0);
+    }
+
+    #[test]
+    fn totals_cost_is_sum_of_model_row_costs() {
+        // Feature D invariant: the global cost is the sum of the per-row
+        // costs — each model prices its own tokens, so no other aggregation
+        // is correct.
+        let doc = seeded_doc();
+        let sum: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        assert!(sum > 0.0, "non-vacuous: seeded rows carry cost");
+        assert!((doc.totals.cost_usd - sum).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_row_cost_matches_pricing_from_parts() {
+        // The seeded row is codex/gpt-5.5 with 700 in / 300 out / 120
+        // cache-read: 700*5/1e6 + 300*30/1e6 + 120*0.5/1e6 = 0.01256
+        // (meta() carries no pricing overrides).
+        let doc = seeded_doc();
+        let m = &doc.model_usage[0];
+        assert_eq!(m.model, "gpt-5.5");
+        let expected = crate::pricing::cost_from_parts(
+            &m.group,
+            &m.model,
+            m.tokens_in,
+            m.tokens_out,
+            m.cache_read,
+            m.cache_creation,
+            &HashMap::new(),
+        );
+        assert!((m.cost_usd - expected).abs() < 1e-12);
+        assert!((m.cost_usd - 0.012_56).abs() < 1e-9, "got {}", m.cost_usd);
     }
 
     #[test]
