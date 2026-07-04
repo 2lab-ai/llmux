@@ -36,3 +36,32 @@ targets:
         CODE_SIGN_ENTITLEMENTS: LlmuxIslands/Resources/LlmuxIslands.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_HARDENED_RUNTIME: "NO"
+  # Logic tests for the llmux HTTP DTO contract (issue #62 U27). Deliberately
+  # NOT hosted in the app (no TEST_HOST): the DTO sources are compiled directly
+  # into the bundle, so `xcodebuild test` never has to launch the menu-bar app
+  # headless. Add app-behavior tests as a hosted target later if needed.
+  LlmuxIslandsTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: LlmuxIslandsTests
+      - path: LlmuxIslands/Llmux/LlmuxStatus.swift
+      - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests
+        GENERATE_INFOPLIST_FILE: YES
+# Explicit schemes so headless `xcodebuild -scheme … build|test` works right
+# after `xcodegen generate` (no reliance on Xcode's auto-created schemes).
+schemes:
+  LlmuxIslands:
+    build:
+      targets:
+        LlmuxIslands: all
+        LlmuxIslandsTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - LlmuxIslandsTests
