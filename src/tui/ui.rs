@@ -2225,9 +2225,14 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
             ],
         )
     };
+    // Scope qualifier (issue #62 S2, U22): wording comes from the document's
+    // `data_quality` field (server-owned; canonical serde default for old
+    // daemons) — same visible-qualifier contract as the heatmap's
+    // "(best-effort)" title.
     let title = format!(
-        " models — top {} by tokens (g: all) ",
-        view.model_usage.len()
+        " models — top {} by tokens — {} (g: all) ",
+        view.model_usage.len(),
+        view.data_quality.model_usage
     );
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
@@ -2371,7 +2376,17 @@ fn draw_models_table(
             ],
         )
     };
-    let title = format!(" models — {} of {total} ", cursor + 1);
+    // Data-quality qualifiers (issue #62 S2) on the panel that owns the full
+    // `$` column: the model-usage scope label (U22) and the cost qualifier
+    // `$ ≈ …` (U20), both worded by the document's `data_quality` field
+    // (server-owned; canonical serde default for old daemons) — same
+    // visible-qualifier contract as the heatmap's "(best-effort)" title.
+    let title = format!(
+        " models — {} of {total} — {} — $ ≈ {} ",
+        cursor + 1,
+        view.data_quality.model_usage,
+        view.data_quality.cost
+    );
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
@@ -2841,6 +2856,7 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            data_quality: crate::dashboard::DataQualityDoc::default(),
         }
     }
 
@@ -3022,6 +3038,33 @@ mod tests {
         assert!(text.contains("user@example"), "per-account axis rendered");
         // The keybar advertises the window-cycle key.
         assert!(text.contains("window"), "footer advertises w window cycle");
+    }
+
+    /// The models surfaces render the data-quality qualifiers from the doc's
+    /// `data_quality` field (issue #62 S2): the model-usage scope label on
+    /// the strip and full-table titles (U22) and the `$ ≈ …` cost qualifier
+    /// on the panel owning the full `$` column (U20) — the same
+    /// visible-qualifier contract as the heatmap's best-effort title above.
+    #[test]
+    fn models_surfaces_render_data_quality_scope_and_cost_labels() {
+        let view = view_with(vec![model_row("codex", "gpt-5.5", 700, 300)]);
+        // MAIN (overlay=None): the always-visible strip title carries the
+        // scope label.
+        let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        assert!(
+            text.contains("hydrated activity/runtime"),
+            "strip title carries the model-usage scope label (U22)"
+        );
+        // Stats overlay: the full models table title carries scope + cost.
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 160, 40);
+        assert!(
+            text.contains("hydrated activity/runtime"),
+            "models table title carries the scope label (U22)"
+        );
+        assert!(
+            text.contains("$ ≈ API-equivalent estimate"),
+            "cost qualifier rendered on the $-column panel title (U20)"
+        );
     }
 
     /// The Logs overlay shows the log tail.

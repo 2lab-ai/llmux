@@ -2117,6 +2117,7 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            data_quality: crate::dashboard::DataQualityDoc::default(),
         }
     }
 }

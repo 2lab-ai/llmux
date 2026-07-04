@@ -477,11 +477,74 @@ pub struct DashboardDoc {
     /// from an older daemon → the client defaults the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// Data-quality qualifiers for the derived statistics (issue #62 S2).
+    /// The server is the SSOT for the label wording — the TUI and the Islands
+    /// app render these strings verbatim instead of hardcoding copies that
+    /// could drift. Additive: absent in docs from an older daemon → the serde
+    /// default, which is byte-identical to the canonical wording by
+    /// construction (see [`DataQualityDoc`]).
+    #[serde(default)]
+    pub data_quality: DataQualityDoc,
 }
 
 /// Serde default for additive `bool` fields that default ON.
 fn default_true() -> bool {
     true
+}
+
+/// Data-quality label wording for the dashboard's derived statistics
+/// (issue #62 S2, gist-01 §Phase 4). One string per qualified surface:
+///
+/// - `model_usage` — scope of the per-model rows (persisted history hydrated
+///   at startup + the live runtime's activity, not an upstream ledger),
+/// - `windowed` — accuracy of the 24h/72h heatmap (lossy channel sample),
+/// - `cost` — nature of every `$` figure (API-equivalent estimate, not a bill),
+/// - `cache` — cache-counter semantics (absent upstream fields render as
+///   unavailable, never as zero).
+///
+/// The SERVER owns this wording; the TUI and the Islands app render the
+/// strings verbatim. `Default` returns exactly the canonical strings, and
+/// each field also carries a per-field serde default, so a document from an
+/// older daemon (field absent) — or a partial object from a skewed one —
+/// parses into byte-identical labels. That IS the old-daemon fallback: no
+/// client-side fallback constant can drift from the server wording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataQualityDoc {
+    #[serde(default = "dq_model_usage")]
+    pub model_usage: String,
+    #[serde(default = "dq_windowed")]
+    pub windowed: String,
+    #[serde(default = "dq_cost")]
+    pub cost: String,
+    #[serde(default = "dq_cache")]
+    pub cache: String,
+}
+
+fn dq_model_usage() -> String {
+    "hydrated activity/runtime".to_string()
+}
+
+fn dq_windowed() -> String {
+    "best effort".to_string()
+}
+
+fn dq_cost() -> String {
+    "API-equivalent estimate".to_string()
+}
+
+fn dq_cache() -> String {
+    "missing fields shown as unavailable".to_string()
+}
+
+impl Default for DataQualityDoc {
+    fn default() -> Self {
+        Self {
+            model_usage: dq_model_usage(),
+            windowed: dq_windowed(),
+            cost: dq_cost(),
+            cache: dq_cache(),
+        }
+    }
 }
 
 /// Live codex provider settings, surfaced so the dashboard can show and toggle
@@ -1335,6 +1398,9 @@ pub(crate) fn dashboard_doc(
         codex: meta.codex.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
+        // Canonical label wording (issue #62 S2) — constant per build, not
+        // state-derived; `Default` IS the canonical set.
+        data_quality: DataQualityDoc::default(),
     }
 }
 
@@ -2055,6 +2121,46 @@ mod tests {
         // Wire-ready defaults until the hub tracks per-client cost/last-seen.
         assert!(parsed.client_usage[0].cost_usd.abs() < 1e-12);
         assert_eq!(parsed.client_usage[0].last_seen_ms, 0);
+    }
+
+    #[test]
+    fn doc_without_data_quality_field_parses_to_canonical_labels() {
+        // An older daemon's doc predates `data_quality` (issue #62 S2) — the
+        // additive serde default fills the EXACT canonical wording, so a
+        // client renders the same bytes whether or not the field was on the
+        // wire (the old-daemon fallback IS the default, by construction).
+        let doc = seeded_doc();
+        let mut value = serde_json::to_value(&doc).expect("serialize");
+        value.as_object_mut().unwrap().remove("data_quality");
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed.data_quality.model_usage, "hydrated activity/runtime");
+        assert_eq!(parsed.data_quality.windowed, "best effort");
+        assert_eq!(parsed.data_quality.cost, "API-equivalent estimate");
+        assert_eq!(
+            parsed.data_quality.cache,
+            "missing fields shown as unavailable"
+        );
+    }
+
+    #[test]
+    fn doc_round_trips_data_quality_labels() {
+        // A fresh daemon puts the canonical labels ON the wire (no
+        // skip_serializing — clients may rely on the keys existing) and they
+        // survive serialize→parse unchanged.
+        let doc = seeded_doc();
+        let value = serde_json::to_value(&doc).expect("serialize");
+        assert_eq!(
+            value["data_quality"]["model_usage"],
+            "hydrated activity/runtime"
+        );
+        assert_eq!(value["data_quality"]["windowed"], "best effort");
+        assert_eq!(value["data_quality"]["cost"], "API-equivalent estimate");
+        assert_eq!(
+            value["data_quality"]["cache"],
+            "missing fields shown as unavailable"
+        );
+        let parsed: DashboardDoc = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed.data_quality, doc.data_quality);
     }
 
     #[test]
