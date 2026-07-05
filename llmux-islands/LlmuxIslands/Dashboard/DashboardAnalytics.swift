@@ -115,6 +115,27 @@ enum DashFormat {
     }
 }
 
+/// The Statistics panel's section set (issue #68 v2). The four #62 analytics
+/// surfaces live behind the ☰ menu's "Statistics" entry — pure (Foundation
+/// only) so the logic tests pin the contract: four sections, this order,
+/// these titles.
+enum StatsSection: String, CaseIterable {
+    case overview
+    case models
+    case clients
+    case health
+
+    /// Segment label; English, matching the app's menu-item language.
+    var title: String {
+        switch self {
+        case .overview: return "Overview"
+        case .models: return "Models"
+        case .clients: return "Clients"
+        case .health: return "Health"
+        }
+    }
+}
+
 /// The U11/U13 health-warning rule — ONE source for the banner and the
 /// closed-island warning color: any account `status == "auth_failed"` OR any
 /// quota > 90%. "Quota" = the account-wide 5h/7d windows; the scoped Fable

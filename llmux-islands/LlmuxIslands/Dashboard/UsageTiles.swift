@@ -850,12 +850,12 @@ private extension String {
     }
 }
 
-// MARK: - Compact account rows (issue #68 — Overview tab)
+// MARK: - Compact account rows (issue #68 — Statistics overview)
 
-/// The Overview tab's per-account rows at TUI-accounts-table density: 1–2
-/// lines per account instead of the 6–8-row segmented-gauge cards. Replaces
-/// `UsageAccountTileGrid` ONLY inside the analytics Overview; the
-/// `/llmux/status` fallback path (old daemons) keeps the plain tile grid.
+/// Per-account rows at TUI-accounts-table density: 1–2 lines per account.
+/// Used ONLY by the Statistics panel's Overview section (issue #68 v2) as the
+/// account summary between the totals cards and the top models; the default
+/// Usage panel keeps the v0.2.14 `UsageAccountTileGrid`.
 struct UsageAccountCompactList: View {
     let tiles: [UsageAccountTile]
     var onRemove: ((String) -> Void)? = nil
