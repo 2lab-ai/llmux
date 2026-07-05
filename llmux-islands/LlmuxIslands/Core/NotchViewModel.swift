@@ -92,12 +92,8 @@ class NotchViewModel: ObservableObject {
         let chrome: CGFloat = 96          // notch header + "Usage" toolbar + paddings
         let perRow: CGFloat = 186         // one grid row of enlarged tiles (measured ≈180)
         let rowSpacing: CGFloat = 10
-        // Analytics allowance (issue #62 S4): the dashboard path adds tabs +
-        // summary cards + top models + heat strip + activity above/below the
-        // tile grid; the status fallback (dashboard == nil) keeps the old size.
-        let analytics: CGFloat = IslandUsageModel.shared.dashboard == nil ? 0 : 330
         let rows = max(1, Int(ceil(Double(max(count, 1)) / 2.0)))
-        let desired = chrome + analytics + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
+        let desired = chrome + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
         let minHeight: CGFloat = 240
         let maxHeight = max(minHeight, screenRect.height - 72)
         return min(max(desired, minHeight), maxHeight)
@@ -145,14 +141,6 @@ class NotchViewModel: ObservableObject {
         // usage panel grows/shrinks with the number of tiles (see usageOpenedHeight).
         IslandUsageModel.shared.$tiles
             .map(\.count)
-            .removeDuplicates()
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
-
-        // Same for the analytics allowance: it flips with dashboard presence
-        // (dashboard path ↔ status fallback), not with the tile count.
-        IslandUsageModel.shared.$dashboard
-            .map { $0 != nil }
             .removeDuplicates()
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
