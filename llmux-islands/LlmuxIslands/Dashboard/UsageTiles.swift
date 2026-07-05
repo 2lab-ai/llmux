@@ -850,6 +850,151 @@ private extension String {
     }
 }
 
+// MARK: - Compact account rows (issue #68 — Overview tab)
+
+/// The Overview tab's per-account rows at TUI-accounts-table density: 1–2
+/// lines per account instead of the 6–8-row segmented-gauge cards. Replaces
+/// `UsageAccountTileGrid` ONLY inside the analytics Overview; the
+/// `/llmux/status` fallback path (old daemons) keeps the plain tile grid.
+struct UsageAccountCompactList: View {
+    let tiles: [UsageAccountTile]
+    var onRemove: ((String) -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(tiles) { tile in
+                UsageAccountCompactRow(tile: tile)
+                    .contextMenu {
+                        if let onRemove {
+                            Button("Remove \(tile.label)", role: .destructive) {
+                                onRemove(tile.accountId)
+                            }
+                        }
+                    }
+            }
+        }
+    }
+}
+
+/// One account: status dot + provider mark + masked name, then a thin
+/// CONTINUOUS capsule bar per REPORTED window (5h / 7d / Fable-only-when-the-
+/// daemon-reports-it) with a small used-% label. Cold/absent windows are
+/// omitted entirely — no dashes, no empty gauges. One color semantic: neutral
+/// fill for normal utilization, warning red only at ≥ 90% (Fable additionally
+/// requires the daemon's reset-aware `constraining` — same rule as
+/// `DashboardHealth`).
+struct UsageAccountCompactRow: View {
+    let tile: UsageAccountTile
+
+    @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
+    @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
+
+    private struct Gauge: Identifiable {
+        let id: String
+        let usedFraction: Double
+        let warning: Bool
+    }
+
+    private var displayName: String { tile.email ?? tile.label }
+
+    private var isBroken: Bool { tile.info?.error == true || tile.info?.available == false }
+
+    private var gauges: [Gauge] {
+        guard let info = tile.info, info.available, !info.error else { return [] }
+        var result: [Gauge] = []
+        if let five = info.fiveHourPercent {
+            result.append(gauge("5h", usedPercent: five))
+        }
+        if let seven = info.sevenDayPercent {
+            result.append(gauge("7d", usedPercent: seven))
+        }
+        if showFableWeekly, let fable = info.fableWeeklyPercent {
+            // Fable is scoped: red only while the daemon marks it constraining.
+            result.append(gauge("Fab", usedPercent: fable, warningOverride: info.fableWeeklyConstraining == true))
+        }
+        return result
+    }
+
+    private func gauge(_ id: String, usedPercent: Double, warningOverride: Bool? = nil) -> Gauge {
+        let fraction = max(0, min(1, usedPercent / 100))
+        return Gauge(
+            id: id,
+            usedFraction: fraction,
+            warning: warningOverride ?? (fraction >= DashboardHealth.quotaThreshold)
+        )
+    }
+
+    private var dotColor: Color {
+        if isBroken { return TerminalColors.red }
+        if gauges.contains(where: \.warning) { return TerminalColors.amber }
+        return TerminalColors.green
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 6, height: 6)
+                UsageProviderIcon(provider: tile.provider, size: 11)
+                EmailPixelized(
+                    isActive: emailAnonymousEnabled && displayName.contains("@"),
+                    cacheKey: displayName
+                ) {
+                    Text(displayName)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 8)
+                ForEach(gauges) { gauge in
+                    gaugeView(gauge)
+                }
+            }
+            // Second line only when there is something to say — never a
+            // blank placeholder row.
+            if let message = tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !message.isEmpty {
+                Text(message)
+                    .font(.system(size: 9))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(1)
+                    .padding(.leading, 14)
+            } else if let issue = tile.issue {
+                Text(issue.message)
+                    .font(.system(size: 9))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(1)
+                    .padding(.leading, 14)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+    }
+
+    private func gaugeView(_ gauge: Gauge) -> some View {
+        HStack(spacing: 4) {
+            Text(gauge.id)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.4))
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.1))
+                .frame(width: 44, height: 3)
+                .overlay(alignment: .leading) {
+                    Capsule(style: .continuous)
+                        .fill(gauge.warning ? TerminalColors.red : Color.white.opacity(0.55))
+                        .frame(width: 44 * gauge.usedFraction)
+                }
+            Text("\(Int((gauge.usedFraction * 100).rounded()))%")
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundColor(gauge.warning ? TerminalColors.red : .white.opacity(0.6))
+                .frame(width: 28, alignment: .trailing)
+        }
+    }
+}
+
 private struct MiniSegmentBar: View {
     let fraction: Double
     let fillColor: Color

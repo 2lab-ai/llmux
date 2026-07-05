@@ -74,7 +74,11 @@ struct IslandUsageView: View {
                 // present; the /llmux/status fallback keeps the plain grid.
                 if let dashboard = model.dashboard {
                     UsageAnalyticsSection(model: model, dashboard: dashboard, now: now) {
-                        tileGrid
+                        // Compact 1–2 line account rows (issue #68) — the big
+                        // segmented-gauge cards were rejected as bar spam.
+                        UsageAccountCompactList(tiles: model.tiles) { name in
+                            Task { await model.remove(name) }
+                        }
                     }
                     .padding(.bottom, 4)
                 } else {
