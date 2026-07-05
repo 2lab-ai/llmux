@@ -114,7 +114,9 @@ struct UsageAnalyticsSection<AccountTiles: View>: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(dashboard.clientUsage) { client in
                 HStack(spacing: 8) {
-                    Text(client.client)
+                    // Raw wire id (may be a metadata.user_id JSON blob) →
+                    // short human label; non-JSON ids render as-is (#68).
+                    Text(ClientIDLabel.display(client.client))
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundColor(.white.opacity(0.85))
                         .lineLimit(1)
@@ -123,10 +125,15 @@ struct UsageAnalyticsSection<AccountTiles: View>: View {
                     MetricText("\(DashFormat.count(client.requests)) req")
                     MetricText("\(DashFormat.count(client.tokensIn &+ client.tokensOut)) tok")
                     MetricText("\(DashFormat.count(client.errors)) err")
-                    // #32 out of scope: 0/absent cost + last-seen render `—`,
-                    // never "$0.00" / a 1970 date.
-                    MetricText(DashFormat.clientCost(client.costUsd))
-                    MetricText(DashFormat.clientLastSeen(client.lastSeenMs, now: now))
+                    // #32 out of scope: cost + last-seen are wire-ready zeros
+                    // today — absent data is an omitted element, never a `—`
+                    // placeholder column (#68).
+                    if let cost = DashFormat.clientCost(client.costUsd) {
+                        MetricText(cost)
+                    }
+                    if let seen = DashFormat.clientLastSeen(client.lastSeenMs, now: now) {
+                        MetricText(seen)
+                    }
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
@@ -255,7 +262,10 @@ struct UsageModelRow: View {
             Spacer()
             MetricText("\(DashFormat.count(row.totalTokens)) tok")
             MetricText("\(DashFormat.count(row.requests)) req")
-            MetricText(DashFormat.cost(row.costUsd))
+            // Absent cost (old daemon / no pricing) = omitted, not `—` (#68).
+            if let costUsd = row.costUsd {
+                MetricText(DashFormat.cost(costUsd))
+            }
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.system(size: 8, weight: .semibold))
                 .foregroundColor(.white.opacity(0.35))
@@ -270,10 +280,17 @@ struct UsageModelRow: View {
                 StatText(label: "in-flight", value: "\(row.inFlight)")
                 StatText(label: "last", value: DashFormat.ago(ms: row.lastUsedMs, now: now))
             }
-            HStack(spacing: 14) {
-                // nil cache counters → `—`, NEVER 0 (U21).
-                StatText(label: "cache read", value: DashFormat.count(row.cacheRead))
-                StatText(label: "cache create", value: DashFormat.count(row.cacheCreation))
+            // nil cache counters are NEVER shown as a fabricated 0 (U21); a
+            // fully absent pair omits the row instead of dashes (#68).
+            if row.cacheRead != nil || row.cacheCreation != nil {
+                HStack(spacing: 14) {
+                    if let cacheRead = row.cacheRead {
+                        StatText(label: "cache read", value: DashFormat.count(cacheRead))
+                    }
+                    if let cacheCreation = row.cacheCreation {
+                        StatText(label: "cache create", value: DashFormat.count(cacheCreation))
+                    }
+                }
             }
             ForEach(row.accounts.prefix(3), id: \.name) { account in
                 HStack(spacing: 8) {
@@ -470,7 +487,10 @@ struct UsageAccountHealthRow: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            MetricText(quotaSummary)
+            // Cold account (no windows reported) omits the summary — no `—`.
+            if let quotaSummary {
+                MetricText(quotaSummary)
+            }
             if let inFlight = account.inFlight, inFlight > 0 {
                 MetricText("▶\(inFlight)")
             }
@@ -480,18 +500,21 @@ struct UsageAccountHealthRow: View {
         }
     }
 
-    private var quotaSummary: String {
+    /// nil (cold account, no windows reported) omits the element entirely (#68).
+    private var quotaSummary: String? {
         var parts: [String] = []
         if let five = account.fiveHour { parts.append("5h \(Int((five.utilization * 100).rounded()))%") }
         if let seven = account.sevenDay { parts.append("7d \(Int((seven.utilization * 100).rounded()))%") }
         if let fable = account.fableWeekly { parts.append("Fab \(Int((fable.utilization * 100).rounded()))%") }
-        return parts.isEmpty ? DashFormat.unavailable : parts.joined(separator: " · ")
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private var detail: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 14) {
-                StatText(label: "status", value: account.status ?? DashFormat.unavailable)
+                if let status = account.status {
+                    StatText(label: "status", value: status)
+                }
                 StatText(label: "type", value: account.type)
                 if let cooldownSource = account.cooldownSource {
                     StatText(label: "cooldown", value: cooldownSource)
@@ -500,15 +523,16 @@ struct UsageAccountHealthRow: View {
             if let blocked = account.blocked {
                 StatText(label: "blocked", value: blocked)
             }
-            HStack(spacing: 14) {
-                StatText(
-                    label: "token",
-                    value: account.tokenExpiresAtMs.map { DashFormat.until(ms: $0, now: now) } ?? DashFormat.unavailable
-                )
-                StatText(
-                    label: "refreshed",
-                    value: account.lastRefreshMs.map { DashFormat.ago(ms: $0, now: now) } ?? DashFormat.unavailable
-                )
+            // Absent instants are omitted — never a `—` stat (#68).
+            if account.tokenExpiresAtMs != nil || account.lastRefreshMs != nil {
+                HStack(spacing: 14) {
+                    if let expires = account.tokenExpiresAtMs {
+                        StatText(label: "token", value: DashFormat.until(ms: expires, now: now))
+                    }
+                    if let refreshed = account.lastRefreshMs {
+                        StatText(label: "refreshed", value: DashFormat.ago(ms: refreshed, now: now))
+                    }
+                }
             }
         }
         .padding(.top, 2)
