@@ -162,6 +162,16 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(top.map(\.id), ["claude/gpt-5.5", "codex/gpt-5.5"])
     }
 
+    // MARK: - Statistics sections (#68 v2)
+
+    func testStatsSectionContract() {
+        // The Statistics panel serves the four #62 analytics surfaces in this
+        // exact order with these segment titles — dropping or reordering a
+        // section is a regression, not a style choice.
+        XCTAssertEqual(StatsSection.allCases.map(\.rawValue), ["overview", "models", "clients", "health"])
+        XCTAssertEqual(StatsSection.allCases.map(\.title), ["Overview", "Models", "Clients", "Health"])
+    }
+
     // MARK: - Data-quality labels (U19–U22)
 
     func testDataQualityFallbacksAreByteIdenticalToRustDefaults() {

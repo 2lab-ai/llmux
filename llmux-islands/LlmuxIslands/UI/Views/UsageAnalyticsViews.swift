@@ -1,93 +1,146 @@
 import SwiftUI
 
-// Islands analytics UI over the `/llmux/dashboard` contract (issue #62 S4,
-// gist §4.5/§4.6): summary cards, top models, heat strip, recent activity,
-// health banner, and the Overview / Models / Clients / Health tab structure.
-// Rendered ONLY when a dashboard document is present — the `/llmux/status`
-// fallback path (old daemons) keeps the plain tile grid.
+// Statistics-panel building blocks (issue #68 v2) over the `/llmux/dashboard`
+// contract (#62): summary cards, model rows, client rows, heat strip, recent
+// activity and account health. All four sections live behind the ☰ menu's
+// "Statistics" entry (`IslandStatsView`) — the default Usage panel is the
+// v0.2.14 account-tile view and renders none of this.
+//
+// Design language (extracted from the v0.2.14 pill/tiles/menu):
+// - near-black panel, cards = `Color.white.opacity(0.05)` rounded 8 — the ONE
+//   card fill every row/card here shares;
+// - amber accent (`TerminalColors.amber`, the pill's warning/accent hue) for
+//   selection + claude group marks; codex keeps the tiles' blue;
+// - monospaced digits, numeric columns right-aligned on a fixed grid;
+// - small-caps monospaced secondary section labels (`StatsSectionLabel`);
+// - red ONLY for genuine warn states (≥ 90% quota, auth_failed, 5xx);
+// - absent data is an OMITTED element — never a `—` placeholder (#68).
 //
 // Detail views are in-panel expansions, not sheets: sheets are unreliable in
 // the borderless island (see the AddAccountInline note in IslandUsageView).
 
-/// The tabbed analytics section embedded in `IslandUsageView`. `accountTiles`
-/// injects the existing tile grid into the Overview tab so tile behavior is
-/// preserved verbatim (U4).
-struct UsageAnalyticsSection<AccountTiles: View>: View {
-    @ObservedObject var model: IslandUsageModel
-    let dashboard: LlmuxDashboard
-    let now: Date
-    @ViewBuilder let accountTiles: () -> AccountTiles
+// MARK: - Section switcher (neutral + amber, never system blue)
 
-    @State private var tab: Tab
+/// Capsule segmented control in the app's own scheme: monospaced small-caps
+/// labels, amber tint on the selected segment. Replaces the system
+/// `.segmented` picker whose bright blue selection pill was a tone violation.
+struct StatsSegmentedControl: View {
+    @Binding var selection: StatsSection
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(StatsSection.allCases, id: \.self) { section in
+                segment(section)
+            }
+        }
+        .padding(3)
+        .background(Capsule(style: .continuous).fill(Color.white.opacity(0.05)))
+    }
+
+    private func segment(_ section: StatsSection) -> some View {
+        let selected = selection == section
+        return Button {
+            withAnimation(.easeInOut(duration: 0.15)) { selection = section }
+        } label: {
+            Text(section.title.uppercased())
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .tracking(0.6)
+                .foregroundColor(selected ? TerminalColors.amber : .white.opacity(0.5))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(selected ? TerminalColors.amber.opacity(0.16) : Color.clear)
+                )
+                .contentShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Small-caps monospaced section header — same grammar as the summary-card
+/// titles, used above every block so the whole panel shares one hierarchy.
+struct StatsSectionLabel: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text.uppercased())
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .tracking(0.8)
+            .foregroundColor(.white.opacity(0.4))
+    }
+}
+
+// MARK: - Section content
+
+/// One Statistics section, dispatched by `StatsSection`. Shared by the live
+/// panel (`IslandStatsView`) and snapshot mode, so the PNGs show exactly what
+/// the app renders.
+struct StatsSectionContent: View {
+    let section: StatsSection
+    let dashboard: LlmuxDashboard
+    /// `/llmux/status`-shaped account tiles — the Overview's compact account
+    /// rows read the same source as the Usage panel's tile grid.
+    let tiles: [UsageAccountTile]
+    let now: Date
+    var onRemoveAccount: ((String) -> Void)? = nil
+
     @State private var expandedModelID: String?
     @State private var expandedAccount: String?
-
-    enum Tab: String, CaseIterable {
-        case overview = "Overview"
-        case models = "Models"
-        case clients = "Clients"
-        case health = "Health"
-    }
-
-    init(
-        model: IslandUsageModel,
-        dashboard: LlmuxDashboard,
-        now: Date,
-        initialTab: Tab = .overview,
-        @ViewBuilder accountTiles: @escaping () -> AccountTiles
-    ) {
-        self.model = model
-        self.dashboard = dashboard
-        self.now = now
-        self.accountTiles = accountTiles
-        _tab = State(initialValue: initialTab)
-    }
 
     private var labels: DataQualityLabels { DataQualityLabels(dashboard.dataQuality) }
     private var health: DashboardHealth.Summary { DashboardHealth.summary(dashboard.accounts) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if health.isWarning {
-                UsageHealthBanner(summary: health)   // U11 — same rule as the closed-island color
-            }
-
-            Picker("", selection: $tab) {
-                ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            switch tab {
+            switch section {
             case .overview: overview
-            case .models: modelList(rows: dashboard.modelUsage, caption: labels.modelUsage)
-            case .clients: clientsTab
-            case .health: healthTab
+            case .models: models
+            case .clients: clients
+            case .health: healthSection
             }
         }
     }
 
-    // MARK: - Overview (gist §4.5: cards, tiles, top models, heat, activity)
+    // MARK: Overview — totals, accounts, top models, heat, activity
 
     @ViewBuilder private var overview: some View {
-        UsageSummaryCards(totals: dashboard.totals, costCaption: labels.cost)   // U7
-        accountTiles()                                                          // U4
-        if !dashboard.modelUsage.isEmpty {                                      // U8
-            modelList(
-                rows: LlmuxDashboardModelUsage.top(dashboard.modelUsage),
-                caption: "top models — \(labels.modelUsage)"
-            )
+        if health.isWarning {
+            UsageHealthBanner(summary: health)   // U11 — same rule as the closed pill
         }
-        if !dashboard.windowed.isEmpty {                                        // U9
-            UsageHeatStrip(windowed: dashboard.windowed, caption: labels.windowed)
+        UsageSummaryCards(totals: dashboard.totals, costCaption: labels.cost)
+        if !tiles.isEmpty {
+            block("accounts") {
+                UsageAccountCompactList(tiles: tiles, onRemove: onRemoveAccount)
+            }
         }
-        UsageActivityList(activity: dashboard.activity, now: now)               // U10
+        if !dashboard.modelUsage.isEmpty {
+            block("top models") {
+                modelList(rows: LlmuxDashboardModelUsage.top(dashboard.modelUsage), caption: labels.modelUsage)
+            }
+        }
+        if !dashboard.windowed.isEmpty {
+            block("token heat") {
+                UsageHeatStrip(windowed: dashboard.windowed, caption: labels.windowed)
+            }
+        }
+        block("recent activity") {
+            UsageActivityList(activity: dashboard.activity, now: now)
+        }
     }
 
-    // MARK: - Models
+    // MARK: Models
+
+    @ViewBuilder private var models: some View {
+        block("models") {
+            modelList(rows: dashboard.modelUsage, caption: labels.modelUsage)
+        }
+    }
 
     private func modelList(rows: [LlmuxDashboardModelUsage], caption: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             // ForEach keys off `row.id` = (group, model) — never the model text.
             ForEach(rows) { row in
                 UsageModelRow(
@@ -108,57 +161,45 @@ struct UsageAnalyticsSection<AccountTiles: View>: View {
         }
     }
 
-    // MARK: - Clients
+    // MARK: Clients
 
-    @ViewBuilder private var clientsTab: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(dashboard.clientUsage) { client in
-                HStack(spacing: 8) {
-                    // Raw wire id (may be a metadata.user_id JSON blob) →
-                    // short human label; non-JSON ids render as-is (#68).
-                    Text(ClientIDLabel.display(client.client))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.85))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    MetricText("\(DashFormat.count(client.requests)) req")
-                    MetricText("\(DashFormat.count(client.tokensIn &+ client.tokensOut)) tok")
-                    MetricText("\(DashFormat.count(client.errors)) err")
-                    // #32 out of scope: cost + last-seen are wire-ready zeros
-                    // today — absent data is an omitted element, never a `—`
-                    // placeholder column (#68).
-                    if let cost = DashFormat.clientCost(client.costUsd) {
-                        MetricText(cost)
-                    }
-                    if let seen = DashFormat.clientLastSeen(client.lastSeenMs, now: now) {
-                        MetricText(seen)
-                    }
+    @ViewBuilder private var clients: some View {
+        block("clients") {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(dashboard.clientUsage) { client in
+                    UsageClientRow(client: client, now: now)
                 }
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
-            }
-            if dashboard.clientUsage.isEmpty {
-                AnalyticsCaption(text: "no client data")
+                if dashboard.clientUsage.isEmpty {
+                    AnalyticsCaption(text: "no client data")
+                }
             }
         }
     }
 
-    // MARK: - Health (account detail = in-panel expansion, U12)
+    // MARK: Health (account detail = in-panel expansion, U12)
 
-    @ViewBuilder private var healthTab: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(dashboard.accounts, id: \.name) { account in
-                UsageAccountHealthRow(
-                    account: account,
-                    isExpanded: expandedAccount == account.name,
-                    now: now
-                ) {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        expandedAccount = expandedAccount == account.name ? nil : account.name
+    @ViewBuilder private var healthSection: some View {
+        block("account health") {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(dashboard.accounts, id: \.name) { account in
+                    UsageAccountHealthRow(
+                        account: account,
+                        isExpanded: expandedAccount == account.name,
+                        now: now
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            expandedAccount = expandedAccount == account.name ? nil : account.name
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private func block(_ label: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            StatsSectionLabel(label)
+            content()
         }
     }
 }
@@ -188,6 +229,7 @@ struct UsageSummaryCards: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased())
                 .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .tracking(0.6)
                 .foregroundColor(.white.opacity(0.4))
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .monospaced))
@@ -260,11 +302,11 @@ struct UsageModelRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
-            MetricText("\(DashFormat.count(row.totalTokens)) tok")
-            MetricText("\(DashFormat.count(row.requests)) req")
+            MetricText("\(DashFormat.count(row.totalTokens)) tok", width: 58)
+            MetricText("\(DashFormat.count(row.requests)) req", width: 54)
             // Absent cost (old daemon / no pricing) = omitted, not `—` (#68).
             if let costUsd = row.costUsd {
-                MetricText(DashFormat.cost(costUsd))
+                MetricText(DashFormat.cost(costUsd), width: 44)
             }
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.system(size: 8, weight: .semibold))
@@ -300,13 +342,50 @@ struct UsageModelRow: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
-                    MetricText("\(DashFormat.count(account.requests)) req")
-                    MetricText("\(DashFormat.count(account.tokensIn &+ account.tokensOut)) tok")
+                    MetricText("\(DashFormat.count(account.requests)) req", width: 54)
+                    MetricText("\(DashFormat.count(account.tokensIn &+ account.tokensOut)) tok", width: 58)
                 }
             }
             AnalyticsCaption(text: cacheCaption)
         }
         .padding(.top, 2)
+    }
+}
+
+// MARK: - Client row (#68: parsed labels, zero-suppressed columns)
+
+struct UsageClientRow: View {
+    let client: LlmuxDashboardClientUsage
+    let now: Date
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Raw wire id (may be a metadata.user_id JSON blob) → short human
+            // label; non-JSON ids render as-is (#68).
+            Text(ClientIDLabel.display(client.client))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.85))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            MetricText("\(DashFormat.count(client.requests)) req", width: 54)
+            MetricText("\(DashFormat.count(client.tokensIn &+ client.tokensOut)) tok", width: 58)
+            MetricText(
+                "\(DashFormat.count(client.errors)) err",
+                width: 44,
+                color: client.errors > 0 ? TerminalColors.red.opacity(0.8) : nil
+            )
+            // #32 out of scope: cost + last-seen are wire-ready zeros today —
+            // absent data is an omitted element, never a `—` column (#68).
+            if let cost = DashFormat.clientCost(client.costUsd) {
+                MetricText(cost)
+            }
+            if let seen = DashFormat.clientLastSeen(client.lastSeenMs, now: now) {
+                MetricText(seen)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
     }
 }
 
@@ -342,8 +421,12 @@ struct UsageHeatStrip: View {
             }
             AnalyticsCaption(text: caption)
         }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
     }
 
+    /// Group hue = the app's provider palette (claude amber / codex blue, same
+    /// as `GroupBadge` and the v0.2.14 tiles) scaled by intensity — no rainbow.
     private func color(for cell: LlmuxDashboardWindowedCell, peak: UInt64) -> Color {
         let base = cell.group == "codex" ? TerminalColors.blue : TerminalColors.amber
         let intensity = peak > 0 ? Double(cell.tokens) / Double(peak) : 0
@@ -377,6 +460,8 @@ struct UsageActivityList: View {
                 AnalyticsCaption(text: "no recent activity")
             }
         }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
     }
 
     @ViewBuilder private func completedRow(_ entry: LlmuxDashboardCompleted) -> some View {
@@ -433,8 +518,10 @@ struct UsageActivityList: View {
             .frame(width: 30, alignment: .trailing)
     }
 
+    /// A missing status is an omitted element (blank column), never `—` (#68);
+    /// green/amber/red map to 2xx–3xx / 4xx / 5xx — genuine states only.
     private func statusText(_ status: Int?) -> Text {
-        guard let status else { return Text("—").foregroundColor(.white.opacity(0.35)) }
+        guard let status else { return Text("") }
         let color: Color =
             status < 400 ? TerminalColors.green : status < 500 ? TerminalColors.amber : TerminalColors.red
         return Text("\(status)").foregroundColor(color)
@@ -557,16 +644,26 @@ struct GroupBadge: View {
     }
 }
 
+/// Right-aligned monospaced numeric cell. A non-nil `width` pins the cell so
+/// the numeric columns line up across rows (one spacing grid); `color`
+/// overrides only for genuine warn states (errors > 0).
 struct MetricText: View {
     let value: String
+    var width: CGFloat?
+    var color: Color?
 
-    init(_ value: String) { self.value = value }
+    init(_ value: String, width: CGFloat? = nil, color: Color? = nil) {
+        self.value = value
+        self.width = width
+        self.color = color
+    }
 
     var body: some View {
         Text(value)
             .font(.system(size: 9, weight: .semibold, design: .monospaced))
-            .foregroundColor(.white.opacity(0.5))
+            .foregroundColor(color ?? .white.opacity(0.5))
             .lineLimit(1)
+            .frame(width: width, alignment: .trailing)
     }
 }
 

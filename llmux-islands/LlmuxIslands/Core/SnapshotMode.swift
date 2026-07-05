@@ -11,10 +11,10 @@
 //  normally.
 //
 //  Dispatch rule (one gate, two artifact families):
-//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage` selects explicitly.
+//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage|stats` selects explicitly.
 //  - When KIND is unset: the **label** family renders if a label-ish env is
 //    present (`LLMUX_ISLANDS_DEMO_INFLIGHT` or `LLMUX_ISLANDS_SNAPSHOT_T`);
-//    otherwise the **menu + usage** family renders.
+//    otherwise the **menu + usage + stats** family renders.
 //
 //  Label family — the closed-island pill (NotchClosedLabelContent) at 4 fixed
 //  animation phases. Session counts come from `LLMUX_ISLANDS_DEMO_INFLIGHT`
@@ -26,12 +26,14 @@
 //  time instead of the 4 normalized phases (`rainbowHue(time:)`). Output:
 //  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).
 //
-//  Menu + usage family — the ☰ menu (`menu.png`) and the Usage panel with
-//  fixture accounts carrying demo fake emails (`usage-anon-on.png` /
-//  `usage-anon-off.png`, named after the effective email-anonymous state).
-//  Force the state per-process WITHOUT touching the shared defaults domain by
-//  launching with `-emailAnonymousEnabled YES` / `NO` (volatile argument
-//  domain); run the binary twice to get both usage states.
+//  Menu + usage + stats family — the ☰ menu (`menu.png`), the DEFAULT Usage
+//  panel (the restored v0.2.14 tile grid, issue #68 v2) with fixture accounts
+//  carrying demo fake emails (`usage-anon-on.png` / `usage-anon-off.png`,
+//  named after the effective email-anonymous state), and the Statistics panel
+//  (`stats.png` full panel + `stats-{overview,models,clients,health}.png`
+//  per section). Force the anon state per-process WITHOUT touching the shared
+//  defaults domain by launching with `-emailAnonymousEnabled YES` / `NO`
+//  (volatile argument domain); run the binary twice to get both usage states.
 //
 
 import AppKit
@@ -62,6 +64,7 @@ enum SnapshotMode {
         case label
         case menu
         case usage
+        case stats
     }
 
     enum SnapshotError: Error, CustomStringConvertible {
@@ -79,7 +82,7 @@ enum SnapshotMode {
             case .invalidWallClock(let raw):
                 return "LLMUX_ISLANDS_SNAPSHOT_T must be a non-negative number of seconds, got \"\(raw)\""
             case .invalidKind(let raw):
-                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage, got \"\(raw)\""
+                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats, got \"\(raw)\""
             }
         }
     }
@@ -111,7 +114,7 @@ enum SnapshotMode {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let kinds = try requestedKinds()
-        if kinds.contains(.menu) || kinds.contains(.usage) {
+        if kinds.contains(where: { $0 != .label }) {
             normalizeEmailAnonymousLaunchArgument()
         }
 
@@ -121,13 +124,14 @@ enum SnapshotMode {
             case .label: written += try renderLabelFrames(into: dir)
             case .menu: written += try renderMenu(into: dir)
             case .usage: written += try renderUsage(into: dir)
+            case .stats: written += try renderStats(into: dir)
             }
         }
         return written
     }
 
     /// The dispatch rule: explicit KIND wins; otherwise label-ish envs select
-    /// the label family, and the menu + usage family is the default.
+    /// the label family, and the menu + usage + stats family is the default.
     static func requestedKinds(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> [Kind] {
@@ -141,7 +145,7 @@ enum SnapshotMode {
         if labelish.contains(where: { environment[$0]?.isEmpty == false }) {
             return [.label]
         }
-        return [.menu, .usage]
+        return [.menu, .usage, .stats]
     }
 
     // MARK: - Label family (closed-island pill)
@@ -216,21 +220,40 @@ enum SnapshotMode {
         return [url.path]
     }
 
-    /// The Usage panel (tile grid + #62 S4 analytics Overview), named after
-    /// the effective email-anonymous state, plus one PNG per analytics tab.
+    /// The DEFAULT Usage panel — the restored v0.2.14 account tile grid
+    /// (issue #68 v2: no tabs, no analytics), named after the effective
+    /// email-anonymous state.
     @MainActor
     private static func renderUsage(into dir: URL) throws -> [String] {
         // Deterministic fixture accounts with demo fake emails — no daemon
-        // dependency, and the production daemon is never queried.
+        // dependency, and the production daemon is never queried. Dashboard
+        // stays nil: the default panel never renders analytics anymore.
         let model = IslandUsageModel.shared
         model.tiles = fixtureTiles()
         model.connection = .online
+        model.dashboard = nil
 
-        // Install a deterministic dashboard document (issue #62 S4) so the
-        // analytics UI renders: fallback data-quality labels (no
-        // `data_quality` key), an auth_failed account (banner), same-named
-        // models in both groups ((group, model) keying), and zero/absent
-        // cache + client cost fields (`—` rendering).
+        let viewModel = makeViewModel()
+        viewModel.contentType = .usage
+        let anonOn = AppSettings.emailAnonymousEnabled
+        let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
+        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        return [url.path]
+    }
+
+    /// The Statistics panel (issue #68 v2): the full panel as opened from the
+    /// ☰ menu (`stats.png`, Overview selected) plus each section rendered
+    /// standalone (`stats-{overview,models,clients,health}.png`).
+    @MainActor
+    private static func renderStats(into dir: URL) throws -> [String] {
+        // Deterministic dashboard document (issue #62 S4): fallback
+        // data-quality labels (no `data_quality` key), an auth_failed account
+        // (banner + health dot), same-named models in both groups ((group,
+        // model) keying), and zero/absent cache + client cost fields
+        // (omitted, never `—`).
+        let model = IslandUsageModel.shared
+        model.tiles = fixtureTiles()
+        model.connection = .online
         let dashboard = try fixtureDashboard()
         model.dashboard = dashboard
         model.totals = dashboard.totals
@@ -241,29 +264,32 @@ enum SnapshotMode {
         model.healthWarningCount = DashboardHealth.summary(dashboard.accounts).total
 
         let viewModel = makeViewModel()
-        viewModel.contentType = .usage
-        let anonOn = AppSettings.emailAnonymousEnabled
-        let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
-        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        viewModel.contentType = .stats
+        let url = dir.appendingPathComponent("stats.png")
+        try writeHosted(view: IslandStatsView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
         var written = [url.path]
 
-        // Each analytics tab, rendered directly (the live view owns its tab
-        // state internally). Overview here omits the tile grid — the full
-        // panel PNG above already shows it — so cards/models/heat/activity
-        // all fit one frame.
-        let tabs: [(UsageAnalyticsSection<EmptyView>.Tab, String, CGFloat)] = [
-            (.overview, "usage-tab-overview.png", 560),
-            (.models, "usage-tab-models.png", 420),
-            (.clients, "usage-tab-clients.png", 420),
-            (.health, "usage-tab-health.png", 420),
+        // Each section rendered directly at its content height so every block
+        // (cards, accounts, models, heat, activity, health) is fully visible.
+        let sections: [(StatsSection, String, CGFloat)] = [
+            (.overview, "stats-overview.png", 760),
+            (.models, "stats-models.png", 420),
+            (.clients, "stats-clients.png", 420),
+            (.health, "stats-health.png", 420),
         ]
-        for (tab, name, height) in tabs {
-            let tabURL = dir.appendingPathComponent(name)
-            let section = UsageAnalyticsSection(model: model, dashboard: dashboard, now: Date(), initialTab: tab) {
-                EmptyView()
-            }
-            try writeHosted(view: section.padding(12), size: CGSize(width: 560, height: height), to: tabURL)
-            written.append(tabURL.path)
+        for (section, name, height) in sections {
+            let sectionURL = dir.appendingPathComponent(name)
+            let view = StatsSectionContent(
+                section: section, dashboard: dashboard, tiles: model.tiles, now: Date()
+            )
+            try writeHosted(
+                view: view
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading),
+                size: CGSize(width: 560, height: height),
+                to: sectionURL
+            )
+            written.append(sectionURL.path)
         }
         return written
     }

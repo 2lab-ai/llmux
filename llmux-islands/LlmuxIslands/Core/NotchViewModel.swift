@@ -26,11 +26,13 @@ enum NotchOpenReason {
 
 enum NotchContentType: Equatable {
     case usage
+    case stats
     case menu
 
     var id: String {
         switch self {
         case .usage: return "usage"
+        case .stats: return "stats"
         case .menu: return "menu"
         }
     }
@@ -67,6 +69,14 @@ class NotchViewModel: ObservableObject {
             return CGSize(
                 width: min(screenRect.width * 0.5, 600),
                 height: usageOpenedHeight
+            )
+        case .stats:
+            // Statistics (issue #68 v2): the sections scroll, so the panel
+            // takes a fixed height tuned to the overview card stack instead
+            // of growing with the account count like the usage tile grid.
+            return CGSize(
+                width: min(screenRect.width * 0.5, 600),
+                height: max(420, min(640, screenRect.height - 72))
             )
         case .menu:
             // Menu has many fixed-height rows; 420 can push bottom actions outside
@@ -287,6 +297,14 @@ class NotchViewModel: ObservableObject {
     func showUsage() {
         lastNonMenuContentType = .usage
         contentType = .usage
+    }
+
+    /// Open the Statistics panel (issue #68 v2) — reached only through the
+    /// ☰ menu's "Statistics" entry; the island always REOPENS on `.usage`
+    /// (`notchClose()` resets the content type).
+    func showStats() {
+        lastNonMenuContentType = .stats
+        contentType = .stats
     }
 
     /// Perform boot animation: expand briefly then collapse

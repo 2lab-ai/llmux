@@ -34,6 +34,13 @@ struct NotchMenuView: View {
                 viewModel.showUsage()
             }
 
+            // Statistics (issue #68 v2): the #62 analytics — overview totals,
+            // models, clients, health — live here, NOT in the default Usage
+            // panel (which stays the v0.2.14 account tile view).
+            MenuRow(icon: "chart.bar.xaxis", label: "Statistics") {
+                viewModel.showStats()
+            }
+
             Divider()
                 .background(Color.white.opacity(0.08))
                 .padding(.vertical, 4)

@@ -249,6 +249,8 @@ struct NotchView: View {
             switch viewModel.contentType {
             case .usage:
                 IslandUsageView(model: IslandUsageModel.shared, viewModel: viewModel)
+            case .stats:
+                IslandStatsView(model: IslandUsageModel.shared, viewModel: viewModel)
             case .menu:
                 NotchMenuView(viewModel: viewModel)
             }
