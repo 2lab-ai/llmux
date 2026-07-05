@@ -20,13 +20,10 @@
 //  animation phases. Session counts come from `LLMUX_ISLANDS_DEMO_INFLIGHT`
 //  (DemoMode); relaunch once per counts-state. Output:
 //  `label-c{claude}x{codex}-p{0..3}.png` where p0..p3 = phase 0 / 0.25 / 0.5 /
-//  0.75 of the jump cycle (the rainbow hue advances with the same phases).
-//  Wall-clock mode: setting `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` renders ONE
-//  frame at that absolute time instead of the 4 normalized phases, mapped
-//  through the app's real count→period function (`jumpOffset(time:)` /
-//  `rainbowHue(time:)` — the phase is computed inside jumpPeriod, never
-//  precomputed here), so jump SPEED scaling across counts is exercisable:
-//  the same t lands on different cycle phases for different counts. Output:
+//  0.75 of the rainbow hue loop (issue #68 removed the mascot jump — the
+//  phases now vary only the counter hues). Wall-clock mode: setting
+//  `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` renders ONE frame at that absolute
+//  time instead of the 4 normalized phases (`rainbowHue(time:)`). Output:
 //  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).
 //
 //  Menu + usage family — the ☰ menu (`menu.png`) and the Usage panel with
@@ -184,11 +181,12 @@ enum SnapshotMode {
             written.append(url.path)
         }
 
-        // One warning-state frame (auth_failed / quota > 90% color rule).
+        // One warning-state frame (auth_failed / quota > 90% color rule) —
+        // the `⚠5` count matches the issue #68 idle example.
         let warningURL = dir.appendingPathComponent("label-c\(claude)x\(codex)-warning.png")
         try renderLabel(
             ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(0), sessionCost: fixtureCost, warning: true
+                claudeCount: claude, codexCount: codex, clock: .phase(0), sessionCost: fixtureCost, warningCount: 5
             ),
             to: warningURL
         )
@@ -240,7 +238,7 @@ enum SnapshotMode {
         model.clientUsage = dashboard.clientUsage
         model.windowed = dashboard.windowed
         model.activity = dashboard.activity
-        model.healthWarning = DashboardHealth.summary(dashboard.accounts).isWarning
+        model.healthWarningCount = DashboardHealth.summary(dashboard.accounts).total
 
         let viewModel = makeViewModel()
         viewModel.contentType = .usage
@@ -300,7 +298,8 @@ enum SnapshotMode {
              "tokens_in": 5000, "tokens_out": 900, "last_used_ms": \(nowMs - 86_400_000)}
           ],
           "client_usage": [
-            {"client": "client-2", "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
+            {"client": "{\\"device_id\\":\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\",\\"account_uuid\\":\\"00000000-0000-4000-8000-000000000000\\",\\"session_id\\":\\"468acafe-0000-4000-8000-0000c0ffee00\\"}",
+             "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
              "tokens_out": 1357119, "cost_usd": 0.0, "last_seen_ms": 0},
             {"client": "unknown", "requests": 11839, "ok": 11216, "errors": 623,
              "tokens_in": 62996939, "tokens_out": 7053653}
@@ -458,7 +457,8 @@ enum SnapshotMode {
             tile(index: 0, provider: .claude, tier: "max20", fiveHour: 34, sevenDay: 61),
             tile(index: 1, provider: .claude, tier: "max5", fiveHour: 78, sevenDay: 42),
             tile(index: 2, provider: .codex, tier: nil, fiveHour: 12, sevenDay: 27),
-            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 88),
+            // 7d ≥ 90% — exercises the compact rows' warning color (#68).
+            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 96),
         ]
     }
 }
@@ -472,31 +472,21 @@ enum SnapshotMode {
 struct ClosedIslandSnapshotView: View {
     /// How the animation instant is specified.
     enum Clock {
-        /// Fixed 0..<1 position within the jump cycle (hue uses the same phase).
+        /// Fixed 0..<1 position within the rainbow hue loop.
         case phase(Double)
-        /// Absolute wall-clock seconds, mapped through the app's real
-        /// count→period function — exercises jumpPeriod's speed scaling/clamp.
+        /// Absolute wall-clock seconds (`rainbowHue(time:)`).
         case wallClock(TimeInterval)
     }
 
     let claudeCount: Int
     let codexCount: Int
     let clock: Clock
-    /// Fixture session cost / warning state (issue #62 S4 closed-island v1).
+    /// Fixture session cost / warning count (issue #68 pill format).
     var sessionCost: Double?
-    var warning: Bool = false
+    var warningCount: Int = 0
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
-
-    private var jumpOffset: CGFloat {
-        switch clock {
-        case .phase(let phase):
-            return NotchClosedLabelView.jumpOffset(phase: phase, claudeSessions: claudeCount)
-        case .wallClock(let t):
-            return NotchClosedLabelView.jumpOffset(time: t, claudeSessions: claudeCount)
-        }
-    }
 
     private func hue(seed: Double) -> Double {
         switch clock {
@@ -512,8 +502,7 @@ struct ClosedIslandSnapshotView: View {
             claudeCount: claudeCount,
             codexCount: codexCount,
             sessionCost: sessionCost,
-            warning: warning,
-            jumpOffset: jumpOffset,
+            warningCount: warningCount,
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)
         )

@@ -2,18 +2,18 @@
 //  NotchClosedLabelView.swift
 //  LlmuxIslands
 //
-//  Closed-island label (todo.md items 1–2). Replaces the plain black box with
+//  Closed-island pill (issue #68 cleanup of todo.md items 1–2):
 //
-//      Llmux Islands [mascot] [claude]{n} [codex]{m}
+//      llmux [⚠N] [C{n}] [X{m}] [· $cost]
 //
-//  - `[mascot]` is the existing pixel-art ClaudeCrabIcon (the app's top-left
-//    element), looping a small vertical jump whose speed scales with the Claude
-//    session count: 1 = normal, faster from 2, very fast at 10, clamped past 10.
-//  - A provider group `[icon]{count}` is hidden entirely while its count is 0;
-//    at ≥1 it cycles through rainbow hues in a continuous loop.
+//  Segment rules live in `ClosedPillSegments` (DashboardAnalytics.swift — the
+//  testable single source): zero in-flight counters are HIDDEN (no `C:0 X:0`
+//  noise), the warning badge carries the affected-account count, the cost
+//  segment is omitted when the daemon reports none, and the old decorative
+//  icons (mascot, provider glyphs) are gone. Idle example: `llmux ⚠5 · $9.1k`.
 //
-//  Layout/colors live in `NotchClosedLabelContent`, a pure function of counts
-//  and animation phases — the live view drives it from a TimelineView clock;
+//  While sessions are in flight the counters cycle through rainbow hues in a
+//  continuous loop — the live view drives the hue from a TimelineView clock;
 //  offscreen snapshot mode (SnapshotMode.swift) renders it at fixed phases.
 //
 
@@ -21,17 +21,17 @@ import Foundation
 import SwiftUI
 
 struct NotchClosedLabelView: View {
-    /// Σ in-flight sessions over Claude accounts — drives `C:{n}` and the jump.
+    /// Σ in-flight sessions over Claude accounts — drives the `C{n}` segment.
     let claudeCount: Int
-    /// Σ in-flight sessions over Codex accounts — drives `X:{m}`.
+    /// Σ in-flight sessions over Codex accounts — drives the `X{m}` segment.
     let codexCount: Int
-    /// `totals.cost_usd` from the dashboard doc (gist §4.4 closed-island v1:
-    /// `llmux C:2 X:1 $0.42`). nil (old daemon / status fallback) omits the
-    /// segment — never renders a fabricated $0.00.
+    /// `totals.cost_usd` from the dashboard doc. nil (old daemon / status
+    /// fallback) omits the segment — never renders a fabricated $0.00.
     let sessionCost: Double?
-    /// U13 hard rule: warning color when any account is `auth_failed` or any
-    /// quota > 90% — the SAME `DashboardHealth` source as the banner.
-    let warning: Bool
+    /// U13 hard rule: number of accounts that are `auth_failed` or over 90%
+    /// quota — the SAME `DashboardHealth` source as the banner. 0 hides the
+    /// `⚠N` badge.
+    let warningCount: Int
     /// Whether the island is actually on screen (NotchView's `isVisible`). On
     /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
     /// 30fps timeline paused then instead of animating an invisible view.
@@ -39,14 +39,6 @@ struct NotchClosedLabelView: View {
 
     /// Full rainbow revolution takes this long.
     private static let rainbowLoopSeconds: Double = 3.0
-    /// Jump cycle duration at 1 Claude session (normal speed).
-    private static let slowestJumpPeriod: Double = 1.2
-    /// Jump cycle duration at ≥10 Claude sessions (very fast, clamped).
-    private static let fastestJumpPeriod: Double = 0.25
-    /// Leading fraction of the jump cycle spent airborne (rest = on the ground).
-    private static let airborneFraction: Double = 0.6
-    /// How high the mascot hops, in points ("살짝").
-    private static let jumpHeight: CGFloat = 3
 
     /// Hue offsets so the two providers don't share the exact same color.
     static let claudeHueSeed: Double = 0
@@ -61,8 +53,7 @@ struct NotchClosedLabelView: View {
                 claudeCount: claudeCount,
                 codexCount: codexCount,
                 sessionCost: sessionCost,
-                warning: warning,
-                jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
+                warningCount: warningCount,
                 claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
                 codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed)
             )
@@ -81,79 +72,68 @@ struct NotchClosedLabelView: View {
         let hue = (phase + seed).truncatingRemainder(dividingBy: 1)
         return hue < 0 ? hue + 1 : hue
     }
-
-    // MARK: - Jump
-
-    /// Vertical offset for the mascot's hop at `time`. 0 (grounded) when no
-    /// Claude sessions are running.
-    static func jumpOffset(time: TimeInterval, claudeSessions: Int) -> CGFloat {
-        guard let period = jumpPeriod(claudeSessions: claudeSessions) else { return 0 }
-        let phase = time.truncatingRemainder(dividingBy: period) / period
-        return jumpOffset(phase: phase, claudeSessions: claudeSessions)
-    }
-
-    /// Vertical offset at a fixed 0..<1 position within the jump cycle
-    /// (snapshot mode renders these directly).
-    static func jumpOffset(phase: Double, claudeSessions: Int) -> CGFloat {
-        guard claudeSessions >= 1 else { return 0 }
-        let normalized = phase - floor(phase)
-        guard normalized < airborneFraction else { return 0 }
-        return -jumpHeight * CGFloat(sin(.pi * normalized / airborneFraction))
-    }
-
-    /// Jump cycle duration for a Claude session count: nil (idle) at 0, normal
-    /// speed at 1, linearly faster up to 10, clamped for anything past 10.
-    static func jumpPeriod(claudeSessions: Int) -> TimeInterval? {
-        guard claudeSessions >= 1 else { return nil }
-        let clamped = Double(min(claudeSessions, 10))
-        return slowestJumpPeriod - (slowestJumpPeriod - fastestJumpPeriod) * (clamped - 1) / 9.0
-    }
 }
 
-/// The label row itself — a pure function of counts + animation phases, shared
-/// by the live TimelineView wrapper above and offscreen snapshot rendering.
+/// The pill row itself — a pure function of the segment struct + hue phases,
+/// shared by the live TimelineView wrapper above and offscreen snapshots.
 struct NotchClosedLabelContent: View {
     let claudeCount: Int
     let codexCount: Int
     /// Session cost segment (`$0.42`); nil = daemon reports none → omitted.
     let sessionCost: Double?
-    /// Warning state (auth_failed / quota > 90%): everything renders in the
-    /// warning color and the rainbow is suppressed — the color IS the signal.
-    let warning: Bool
-    /// Mascot vertical offset in points (≤ 0 while airborne).
-    let jumpOffset: CGFloat
-    /// 0..<1 rainbow hue for the claude `C:{n}` group.
+    /// Warning-state account count: > 0 renders `⚠N` and paints the pill in
+    /// the warning color (the rainbow is suppressed — the color IS the signal).
+    let warningCount: Int
+    /// 0..<1 rainbow hue for the `C{n}` segment.
     let claudeHue: Double
-    /// 0..<1 rainbow hue for the codex `X:{m}` group.
+    /// 0..<1 rainbow hue for the `X{m}` segment.
     let codexHue: Double
 
+    private var segments: ClosedPillSegments {
+        ClosedPillSegments(
+            claude: claudeCount, codex: codexCount,
+            warningCount: warningCount, costUsd: sessionCost
+        )
+    }
+
+    private var warning: Bool { segments.warningCount != nil }
+
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 7) {
             // Prefix text. If space ever gets tight, shrink/truncate this
             // (never the counts) — see minimumScaleFactor + tail truncation.
-            Text("Llmux Islands")
+            Text(ClosedPillSegments.prefix)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundColor(warning ? TerminalColors.amber : .white.opacity(0.85))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .minimumScaleFactor(0.6)
 
-            if warning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(TerminalColors.amber)
+            if let count = segments.warningCount {
+                HStack(spacing: 2) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text("\(count)")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                }
+                .foregroundColor(TerminalColors.amber)
             }
 
-            ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
-                .offset(y: jumpOffset)
+            // In-flight counters — hidden entirely at 0 (#68), rainbow while
+            // active and healthy.
+            if let claude = segments.claude {
+                counter("C\(claude)", hue: claudeHue)
+            }
+            if let codex = segments.codex {
+                counter("X\(codex)", hue: codexHue)
+            }
 
-            // Gist §4.4 info content: `C:{n} X:{m} $cost` — counts always
-            // visible (dimmed at 0), rainbow only while active and healthy.
-            providerGroup(.claude, prefix: "C", count: claudeCount, hue: claudeHue)
-            providerGroup(.codex, prefix: "X", count: codexCount, hue: codexHue)
-
-            if let sessionCost {
-                Text(DashFormat.cost(sessionCost))
+            if let cost = segments.cost {
+                Text("·")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.35))
+                Text(cost)
                     .font(.system(size: 11, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .foregroundColor(warning ? TerminalColors.amber : .white.opacity(0.7))
@@ -161,21 +141,14 @@ struct NotchClosedLabelContent: View {
         }
     }
 
-    @ViewBuilder
-    private func providerGroup(_ provider: UsageProvider, prefix: String, count: Int, hue: Double) -> some View {
-        HStack(spacing: 3) {
-            UsageProviderIcon(provider: provider, size: 12)
-                .hueRotation(.degrees(count > 0 && !warning ? hue * 360 : 0))
-            Text("\(prefix):\(count)")
-                .font(.system(size: 11, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(countColor(count: count, hue: hue))
-        }
-    }
-
-    private func countColor(count: Int, hue: Double) -> Color {
-        if warning { return TerminalColors.amber }
-        guard count > 0 else { return .white.opacity(0.35) }
-        return Color(hue: hue, saturation: 0.85, brightness: 1.0)
+    private func counter(_ text: String, hue: Double) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .monospacedDigit()
+            .foregroundColor(
+                warning
+                    ? TerminalColors.amber
+                    : Color(hue: hue, saturation: 0.85, brightness: 1.0)
+            )
     }
 }
