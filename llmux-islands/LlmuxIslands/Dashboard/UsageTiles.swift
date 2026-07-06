@@ -311,6 +311,22 @@ private struct UsageProviderColumn: View {
             HStack(spacing: 8) {
                 UsageProviderIcon(provider: provider, size: 16)
 
+                // The header title is the account email whenever one is known —
+                // mosaic it when "Email anonymous" is on (todo item 3). It rides
+                // the icon row: a separate title line wasted a row per tile.
+                EmailPixelized(
+                    isActive: emailAnonymousEnabled && normalizedEmail != nil,
+                    cacheKey: headerTitle
+                ) {
+                    Text(headerTitle)
+                        .font(.system(size: headerTitleFontSize, weight: .semibold, design: .monospaced))
+                        .foregroundColor(headerTitleColor)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .minimumScaleFactor(0.35)
+                        .allowsTightening(true)
+                }
+
                 Spacer(minLength: 0)
 
                 if let tier = tierBadgeTier {
@@ -344,22 +360,6 @@ private struct UsageProviderColumn: View {
                                 .fill(badge.background)
                         )
                 }
-            }
-
-            // The header title is the account email whenever one is known —
-            // mosaic it when "Email anonymous" is on (todo item 3).
-            EmailPixelized(
-                isActive: emailAnonymousEnabled && normalizedEmail != nil,
-                cacheKey: headerTitle
-            ) {
-                Text(headerTitle)
-                    .font(.system(size: headerTitleFontSize, weight: .semibold, design: .monospaced))
-                    .foregroundColor(headerTitleColor)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .minimumScaleFactor(0.35)
-                    .allowsTightening(true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }

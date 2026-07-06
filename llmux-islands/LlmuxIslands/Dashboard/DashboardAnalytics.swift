@@ -251,43 +251,6 @@ enum ClientIDLabel {
     }
 }
 
-/// Closed-island pill content (issue #68): `llmux [⚠N] [C{n}] [X{m}] [· $x]`.
-/// ONE source for the pill text: the live view styles these segments and the
-/// tests assert `text`. Zero in-flight counters, a zero warning count and an
-/// absent cost are OMITTED — never rendered as `C:0`/`X:0` noise. Idle
-/// example: `llmux ⚠5 · $9.1k`.
-struct ClosedPillSegments: Equatable {
-    static let prefix = "llmux"
-
-    /// `⚠N` badge count; nil (healthy) hides the badge.
-    let warningCount: Int?
-    /// `C{n}` in-flight Claude sessions; nil (zero) hides the segment.
-    let claude: Int?
-    /// `X{m}` in-flight Codex sessions; nil (zero) hides the segment.
-    let codex: Int?
-    /// Formatted `totals.cost_usd`; nil (old daemon) omits the segment —
-    /// never a fabricated $0.00. A REAL server 0 still renders ($0.00).
-    let cost: String?
-
-    init(claude: Int, codex: Int, warningCount: Int, costUsd: Double?) {
-        self.warningCount = warningCount > 0 ? warningCount : nil
-        self.claude = claude > 0 ? claude : nil
-        self.codex = codex > 0 ? codex : nil
-        cost = costUsd.map { DashFormat.cost($0) }
-    }
-
-    /// Plain-string form of the whole pill (tests + accessibility).
-    var text: String {
-        var parts = [Self.prefix]
-        if let warningCount { parts.append("⚠\(warningCount)") }
-        if let claude { parts.append("C\(claude)") }
-        if let codex { parts.append("X\(codex)") }
-        var joined = parts.joined(separator: " ")
-        if let cost { joined += " · \(cost)" }
-        return joined
-    }
-}
-
 /// Row identity = `(group, model)` — the U13 hard rule. Claude and Codex rows
 /// with the same model text stay separate; every ForEach over model rows MUST
 /// key off this id, never `model` alone.
