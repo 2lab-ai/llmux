@@ -858,12 +858,19 @@ impl std::fmt::Debug for AccountPool {
     }
 }
 
-/// No account is currently usable; carries the soonest reset so the proxy
-/// can answer 429 + `retry-after`.
+/// No account is currently usable. Carries WHY (issue #71): a transient
+/// cooldown park answers with its own seconds-scale expiry, a genuine
+/// window/health exhaustion answers with the soonest window reset — so the
+/// proxy never advertises a window-reset-scale `retry-after` for an 8s park.
 #[derive(Debug, thiserror::Error)]
 #[error("no account available (retry after {retry_after:?})")]
 pub struct NoAccountAvailable {
     pub retry_after: Option<Duration>,
+    /// Transient cooldown park vs real quota/health exhaustion.
+    pub kind: select::ExhaustionKind,
+    /// How many accounts the answer speaks for (in-scope count, not the
+    /// whole multi-group pool).
+    pub eligible: usize,
 }
 
 impl AccountPool {
@@ -923,8 +930,19 @@ impl AccountPool {
         let slot = group.unwrap_or(LEGACY_GROUP);
         let now = SystemTime::now();
         let mut state = self.write();
-        let no_account = |state: &PoolState| NoAccountAvailable {
-            retry_after: select::soonest_reset(&state.snapshot(), now),
+        let no_account = |state: &PoolState| {
+            let snapshot = state.snapshot();
+            let (kind, eligible) =
+                select::classify_exhaustion(&snapshot, params, group, scope, now);
+            let retry_after = match kind {
+                select::ExhaustionKind::CooldownBlocked { min_expiry, .. } => Some(min_expiry),
+                select::ExhaustionKind::WindowBlocked => select::soonest_reset(&snapshot, now),
+            };
+            NoAccountAvailable {
+                retry_after,
+                kind,
+                eligible,
+            }
         };
         // Lease the sticky current of the request's OWN scope: a Fable request
         // reads `fable_current`, a non-Fable request `current`.
@@ -962,7 +980,11 @@ impl AccountPool {
         }
         // Re-borrow mutably now that the immutable checks are done.
         let Some(acct) = state.account_mut(&current) else {
-            return Err(NoAccountAvailable { retry_after: None });
+            return Err(NoAccountAvailable {
+                retry_after: None,
+                kind: select::ExhaustionKind::WindowBlocked,
+                eligible: 0,
+            });
         };
         acct.in_flight = acct.in_flight.saturating_add(1);
         let lease = AccountLease {
