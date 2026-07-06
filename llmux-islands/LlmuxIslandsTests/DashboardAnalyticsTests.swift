@@ -77,30 +77,6 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(DashFormat.duration(ms: 9752), "9.8s")
     }
 
-    // MARK: - Closed pill (#68: `llmux [⚠N] [C{n}] [X{m}] [· $x]`)
-
-    func testClosedPillActiveFormat() {
-        let pill = ClosedPillSegments(claude: 2, codex: 1, warningCount: 0, costUsd: 0.42)
-        XCTAssertEqual(pill.text, "llmux C2 X1 · $0.42")
-        XCTAssertNil(pill.warningCount)
-    }
-
-    func testClosedPillIdleHidesZeroCounters() {
-        // The issue #68 idle example: zero in-flight counters are HIDDEN
-        // (no `C:0 X:0` noise); the warning badge carries the account count.
-        let pill = ClosedPillSegments(claude: 0, codex: 0, warningCount: 5, costUsd: 9100)
-        XCTAssertEqual(pill.text, "llmux ⚠5 · $9.1k")
-        XCTAssertNil(pill.claude)
-        XCTAssertNil(pill.codex)
-    }
-
-    func testClosedPillOmitsAbsentCost() {
-        // nil cost (old daemon) → segment omitted, never "$0.00"…
-        XCTAssertEqual(ClosedPillSegments(claude: 0, codex: 0, warningCount: 0, costUsd: nil).text, "llmux")
-        // …but a REAL server 0 still renders.
-        XCTAssertEqual(ClosedPillSegments(claude: 1, codex: 0, warningCount: 0, costUsd: 0).text, "llmux C1 · $0.00")
-    }
-
     // MARK: - Health warning (U11/U13): auth_failed OR quota > 90%
 
     func testQuotaRule() {

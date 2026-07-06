@@ -158,10 +158,6 @@ enum SnapshotMode {
         let claude = DemoMode.forcedInFlight?.claude ?? 0
         let codex = DemoMode.forcedInFlight?.codex ?? 0
 
-        // Fixture cost so the closed-island v1 format (`C:n X:m $0.42`,
-        // gist §4.4) is visible in the frames; matches the spec's example.
-        let fixtureCost = 0.42
-
         if let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_T"], !raw.isEmpty {
             guard let t = TimeInterval(raw), t >= 0, t.isFinite else {
                 throw SnapshotError.invalidWallClock(raw)
@@ -169,7 +165,7 @@ enum SnapshotMode {
             let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
             let url = dir.appendingPathComponent(name)
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .wallClock(t), sessionCost: fixtureCost
+                claudeCount: claude, codexCount: codex, clock: .wallClock(t)
             )
             try renderLabel(view, to: url)
             return [url.path]
@@ -179,22 +175,12 @@ enum SnapshotMode {
         for (index, phase) in phases.enumerated() {
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(phase), sessionCost: fixtureCost
+                claudeCount: claude, codexCount: codex, clock: .phase(phase)
             )
             try renderLabel(view, to: url)
             written.append(url.path)
         }
 
-        // One warning-state frame (auth_failed / quota > 90% color rule) —
-        // the `⚠5` count matches the issue #68 idle example.
-        let warningURL = dir.appendingPathComponent("label-c\(claude)x\(codex)-warning.png")
-        try renderLabel(
-            ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(0), sessionCost: fixtureCost, warningCount: 5
-            ),
-            to: warningURL
-        )
-        written.append(warningURL.path)
         return written
     }
 
@@ -507,9 +493,6 @@ struct ClosedIslandSnapshotView: View {
     let claudeCount: Int
     let codexCount: Int
     let clock: Clock
-    /// Fixture session cost / warning count (issue #68 pill format).
-    var sessionCost: Double?
-    var warningCount: Int = 0
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
@@ -527,8 +510,8 @@ struct ClosedIslandSnapshotView: View {
         NotchClosedLabelContent(
             claudeCount: claudeCount,
             codexCount: codexCount,
-            sessionCost: sessionCost,
-            warningCount: warningCount,
+            // Deterministic frames render the mascot grounded.
+            jumpOffset: 0,
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)
         )
