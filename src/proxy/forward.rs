@@ -64,6 +64,11 @@ const REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 /// reset is known (Node default).
 const DEFAULT_CLIENT_RETRY_AFTER_SECS: u64 = 60;
 
+/// When the pool is only cooldown-blocked and the soonest park expires within
+/// this bound, wait it out once inside the request instead of failing
+/// (issue #71 F5).
+const MAX_EXHAUST_PARK: Duration = Duration::from_secs(3);
+
 /// Classification of an upstream response/failure, driving the retry
 /// decision table in the architecture doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,15 +397,16 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     response
 }
 
-/// Pool exhausted: 429 + `retry-after` = soonest reset (FR3.5).
-fn exhausted_response(retry_after: Option<Duration>, accounts: usize) -> Response {
+/// Pool exhausted: 429 + `retry-after` = soonest reset (FR3.5). `eligible` is
+/// the in-scope account count — never the whole multi-group pool (issue #71).
+fn exhausted_response(retry_after: Option<Duration>, eligible: usize) -> Response {
     let secs = retry_after
         .map(|d| d.as_secs().max(1))
         .unwrap_or(DEFAULT_CLIENT_RETRY_AFTER_SECS);
     let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
-        &format!("All {accounts} accounts are rate-limited right now; retry in {secs}s."),
+        &format!("All {eligible} eligible accounts are rate-limited right now; retry in {secs}s."),
     );
     if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -536,6 +542,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     let max_switches = accounts.max(1);
     let mut switches = 0usize;
     let mut same_account_waits = 0u32;
+    // One in-request grace park when the pool is only cooldown-blocked and
+    // recovery is imminent (issue #71 F5) — strictly once per request.
+    let mut parked_exhausted = false;
     // Accounts already granted their one forced post-401 refresh.
     let mut force_refreshed: HashSet<AccountId> = HashSet::new();
 
@@ -569,16 +578,55 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // none).
         let lease = match acquire_lease(state, group, &params, scope) {
             Ok(lease) => lease,
-            Err(retry_after) => {
-                ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
-                ctx.flush_log(state);
-                state.emit(ActivityEvent::Error {
-                    context: Some("scheduler".into()),
-                    message: format!("all {accounts} accounts exhausted"),
-                });
-                ctx.emit_finished(state, None, StatusCode::TOO_MANY_REQUESTS, None);
-                return exhausted_response(retry_after, accounts);
-            }
+            Err(info) => match info.kind {
+                select::ExhaustionKind::CooldownBlocked {
+                    min_expiry,
+                    upstream_mandated: false,
+                } => {
+                    // Transient park, NOT quota exhaustion: the pool recovers
+                    // in seconds. If recovery is imminent, wait it out once
+                    // in-request (the 01:27:54 200 two seconds after the
+                    // burst proves this wins); otherwise answer the same
+                    // transient 502 as the switch-cap exit below so the
+                    // client retries promptly instead of honoring a bogus
+                    // half-hour retry-after.
+                    if !parked_exhausted && min_expiry <= MAX_EXHAUST_PARK {
+                        parked_exhausted = true;
+                        tokio::time::sleep(min_expiry).await;
+                        continue;
+                    }
+                    ctx.log(
+                        "=== ERROR ===\nall eligible accounts transiently rate-limited".to_string(),
+                    );
+                    ctx.flush_log(state);
+                    state.emit(ActivityEvent::Error {
+                        context: Some("scheduler".into()),
+                        message: format!(
+                            "{} eligible account(s) transiently rate-limited; recovers in ~{}s",
+                            info.eligible,
+                            min_expiry.as_secs().max(1)
+                        ),
+                    });
+                    ctx.emit_finished(state, None, StatusCode::BAD_GATEWAY, None);
+                    return transient_response(
+                        "upstream is temporarily rate-limiting (not a usage limit)",
+                    );
+                }
+                _ => {
+                    // Real exhaustion (quota windows) or upstream-mandated
+                    // retry-after parks: a 429 carrying the honest wait —
+                    // `info.retry_after` is the min park expiry for mandated
+                    // parks, the soonest window reset otherwise.
+                    ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
+                    ctx.flush_log(state);
+                    state.emit(ActivityEvent::Error {
+                        context: Some("scheduler".into()),
+                        message: format!("all {} in-scope account(s) exhausted", info.eligible),
+                    });
+                    ctx.emit_finished(state, None, StatusCode::TOO_MANY_REQUESTS, None);
+                    return exhausted_response(info.retry_after, info.eligible);
+                }
+            },
         };
         let account = lease.account_id().clone();
         let mut credential = lease.credential().clone();
@@ -846,8 +894,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         drop(lease);
                         switches += 1;
                         if switches > max_switches {
-                            let retry =
-                                select::soonest_reset(&state.pool.snapshot(), SystemTime::now());
+                            let snapshot = state.pool.snapshot();
+                            let now = SystemTime::now();
+                            let retry = select::soonest_reset(&snapshot, now);
+                            // Honest count: these parks are upstream-mandated
+                            // (retry-after present), so the 429 stands — but
+                            // the message speaks for the in-scope accounts,
+                            // not the whole multi-group pool.
+                            let (_, eligible) =
+                                select::classify_exhaustion(&snapshot, &params, group, scope, now);
                             ctx.flush_log(state);
                             ctx.emit_finished(
                                 state,
@@ -855,7 +910,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                                 StatusCode::TOO_MANY_REQUESTS,
                                 None,
                             );
-                            return exhausted_response(retry, accounts);
+                            return exhausted_response(retry, eligible.max(1));
                         }
                         continue;
                     }
@@ -998,15 +1053,26 @@ fn reevaluate_if_current_ineligible(
     }
 }
 
+/// Why `acquire_lease` failed, for the client-facing failure mode (issue
+/// #71): a transient cooldown park must never be answered with a
+/// window-reset-scale `retry-after`.
+#[derive(Debug)]
+struct ExhaustInfo {
+    retry_after: Option<Duration>,
+    kind: select::ExhaustionKind,
+    eligible: usize,
+}
+
 /// Lease the current account for `group`; when that fails, run one selection
-/// pass and try once more. `Err` carries the soonest-reset hint for the
-/// client 429.
+/// pass and try once more. `Err` carries why the pool is exhausted plus the
+/// honest recovery hint (seconds for a cooldown park, window reset for real
+/// exhaustion).
 fn acquire_lease(
     state: &AppState,
     group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
     scope: select::RequestScope,
-) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
+) -> Result<crate::scheduler::AccountLease, ExhaustInfo> {
     let now = SystemTime::now();
     // Heuristic-degraded selection MUST go through `pick`, not the sticky
     // fast-path. `lease_for` deliberately ignores the 5h/7d ceilings for the
@@ -1028,11 +1094,30 @@ fn acquire_lease(
         }
     }
     match state.pool.evaluate_scoped(group, params, now, scope) {
-        Decision::Exhausted { retry_after } => Err(retry_after),
+        Decision::Exhausted { retry_after } => {
+            // `Decision::Exhausted` predates the reason split; classify on a
+            // fresh snapshot so a cooldown park answers with its own expiry.
+            let snapshot = state.pool.snapshot();
+            let (kind, eligible) =
+                select::classify_exhaustion(&snapshot, params, group, scope, SystemTime::now());
+            let retry_after = match kind {
+                select::ExhaustionKind::CooldownBlocked { min_expiry, .. } => Some(min_expiry),
+                select::ExhaustionKind::WindowBlocked => retry_after,
+            };
+            Err(ExhaustInfo {
+                retry_after,
+                kind,
+                eligible,
+            })
+        }
         Decision::Stay | Decision::Switch { .. } => state
             .pool
             .lease_for_scoped(group, params, scope)
-            .map_err(|err| err.retry_after),
+            .map_err(|err| ExhaustInfo {
+                retry_after: err.retry_after,
+                kind: err.kind,
+                eligible: err.eligible,
+            }),
     }
 }
 
@@ -2701,6 +2786,46 @@ mod tests {
         let body = response_body(response).await;
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["error"]["type"], "rate_limit_error");
+    }
+
+    #[tokio::test]
+    async fn headerless_fable_429_burst_returns_transient_502_not_window_retry() {
+        // Issue #71 regression: one Fable request walks every eligible
+        // account, each answering a header-LESS 429 (transient burst). The
+        // scoped parks last 8s — the client must get the prompt-retry
+        // transient 502, NEVER a 429 whose retry-after points at a quota
+        // window reset (the observed 2160s/1251s aborts).
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::Rate { retry_after: None });
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-fable-5","max_tokens":1}"#),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "cooldown-blocked pool must answer the transient 502, not 429"
+        );
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "no fabricated window-scale retry-after"
+        );
+        let body = response_body(response).await;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("temporarily rate-limiting"),
+            "transient wording expected, got: {text}"
+        );
     }
 
     #[test]

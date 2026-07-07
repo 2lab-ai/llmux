@@ -717,6 +717,108 @@ pub fn soonest_reset(snapshot: &PoolSnapshot, now: SystemTime) -> Option<Duratio
         .min()
 }
 
+/// Why a (group, scope) pool has no eligible account (issue #71). Every
+/// blocker being a cooldown means the pool recovers in seconds — the proxy
+/// must answer with a prompt-retry signal, never a window-reset-scale
+/// `retry-after`. Anything else is a genuine quota/health exhaustion for
+/// which the window-reset answer is honest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExhaustionKind {
+    /// Every otherwise-usable in-group account is parked ONLY by an
+    /// account-wide or requested-scope cooldown; `min_expiry` is the soonest
+    /// recovery across those parks. `upstream_mandated` is true when that
+    /// soonest park came from an upstream `retry-after`
+    /// ([`CooldownSource::RetryAfter`]) — a wait upstream itself dictated, so
+    /// a 429 carrying it is honest. False means the soonest park is our own
+    /// heuristic guess on a header-less 429 (or a model-scoped park), i.e. a
+    /// transient the client should just retry through.
+    CooldownBlocked {
+        min_expiry: Duration,
+        upstream_mandated: bool,
+    },
+    /// At least part of the pool is gated by quota windows / auth health /
+    /// staleness — not a transient park.
+    WindowBlocked,
+}
+
+/// Classify WHY the (group, scope) pool is exhausted right now, plus how many
+/// accounts the answer speaks for (the honest count for the client-facing
+/// message — never the whole multi-group pool size).
+///
+/// - Any account blocked only by `CoolingDown`/`FableCoolingDown` counts as
+///   transiently parked; if at least one such account exists the pool is
+///   [`ExhaustionKind::CooldownBlocked`] (it recovers when the soonest park
+///   lapses, regardless of how the rest is gated).
+/// - Otherwise [`ExhaustionKind::WindowBlocked`], counting every in-group
+///   account.
+pub fn classify_exhaustion(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+    now: SystemTime,
+) -> (ExhaustionKind, usize) {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    let heuristic_degraded = heuristic_degraded_mode(snapshot, params, group, now);
+    let mut in_group_total = 0usize;
+    let mut cooldown_blocked = 0usize;
+    // (expiry, came-from-upstream-retry-after) of the soonest park seen.
+    let mut min_park: Option<(Duration, bool)> = None;
+    for a in snapshot.accounts.iter().filter(|a| in_group(a, group)) {
+        in_group_total += 1;
+        match gate_scoped(a, params, now, headers_only, heuristic_degraded, scope) {
+            Some(IneligibleReason::CoolingDown) | Some(IneligibleReason::FableCoolingDown) => {
+                cooldown_blocked += 1;
+                let mandated = matches!(
+                    a.cooldown_source,
+                    Some(crate::scheduler::CooldownSource::RetryAfter)
+                );
+                let account_wide = a
+                    .cooldown_until
+                    .and_then(|t| t.duration_since(now).ok())
+                    .map(|d| (d, mandated));
+                // Model-scoped parks are always our own header-less-429
+                // heuristic — never upstream-mandated.
+                let scoped = a
+                    .scoped_cooldowns
+                    .iter()
+                    .filter(|c| match scope {
+                        RequestScope::Fable => {
+                            c.scope.matches_label(crate::routing::FABLE_SCOPE_LABEL)
+                        }
+                        _ => false,
+                    })
+                    .filter_map(|c| c.until.duration_since(now).ok())
+                    .min()
+                    .map(|d| (d, false));
+                for cand in account_wide.into_iter().chain(scoped) {
+                    min_park = Some(match min_park {
+                        Some(cur) if cur.0 <= cand.0 => cur,
+                        _ => cand,
+                    });
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    if cooldown_blocked > 0 {
+        // A gate can say CoolingDown while the snapshot's timestamps have
+        // already lapsed mid-race; fall back to the heuristic park length so
+        // the caller still answers seconds, not window resets.
+        let (min_expiry, upstream_mandated) =
+            min_park.unwrap_or((crate::scheduler::DEFAULT_HEURISTIC_COOLDOWN, false));
+        (
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            },
+            cooldown_blocked,
+        )
+    } else {
+        (ExhaustionKind::WindowBlocked, in_group_total)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2205,5 +2307,94 @@ mod tests {
             ),
             "fable 100% critical"
         );
+    }
+
+    // ---- exhaustion classification (issue #71): transient park ≠ quota ----
+
+    #[test]
+    fn burst_fable_cooldowns_classify_as_cooldown_blocked_with_seconds_expiry() {
+        // Two fable-parked accounts (8s + 5s) with 5h/7d resets HOURS away:
+        // the answer must be the 5s park, never a window-reset-scale value.
+        let mut a = fable_cooling("a", 8);
+        a.five_hour = Some(window(0.10, 2 * HOUR));
+        let mut b = fable_cooling("b", 5);
+        b.five_hour = Some(window(0.10, 2 * HOUR));
+        let snap = pool(vec![a, b], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::Fable, now());
+        assert_eq!(eligible, 2);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(5));
+                assert!(!upstream_mandated, "scoped parks are our own heuristic");
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_capped_pool_classifies_as_window_blocked() {
+        let mut a = account("a");
+        a.seven_day = Some(window(1.0, 24 * HOUR));
+        let mut b = account("b");
+        b.seven_day = Some(window(1.0, 24 * HOUR));
+        let snap = pool(vec![a, b], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::NonFable, now());
+        assert_eq!(kind, ExhaustionKind::WindowBlocked);
+        assert_eq!(
+            eligible, 2,
+            "window-blocked speaks for the whole in-group pool"
+        );
+    }
+
+    #[test]
+    fn mixed_pool_recovers_when_the_park_lapses_so_cooldown_wins() {
+        // One account fable-parked 8s out, one fable-weekly-capped for days:
+        // the pool is usable again in 8s — CooldownBlocked, counting only the
+        // parked account.
+        let cooled = fable_cooling("a", 8);
+        let capped = fable_critical("b");
+        let snap = pool(vec![cooled, capped], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::Fable, now());
+        assert_eq!(eligible, 1);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(8));
+                assert!(!upstream_mandated);
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_retry_after_park_classifies_as_mandated_cooldown() {
+        // An upstream-mandated park (retry-after header) is still
+        // CooldownBlocked, but flagged mandated: the proxy answers 429 with
+        // exactly that wait — upstream's own number is honest.
+        let mut a = account("a");
+        a.cooldown_until = Some(at(NOW_SECS + 1800));
+        a.cooldown_source = Some(CooldownSource::RetryAfter);
+        let snap = pool(vec![a], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::NonFable, now());
+        assert_eq!(eligible, 1);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(1800));
+                assert!(upstream_mandated);
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
     }
 }
