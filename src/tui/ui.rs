@@ -704,48 +704,42 @@ fn draw_accounts(
     });
 
     // "group" (claude/codex — the model group, colored + prominent) leads the
-    // data columns; "auth" (oauth/api) is the credential type, separated out
-    // (req5). Both appear in narrow mode too — group is load-bearing.
+    // data columns. Issue #70: the default row is the COMPRESSED set — group,
+    // #, account, status, the three gauges, if (+ lifetime req/tok in wide).
+    // The `auth` type, the per-window reset times, and the token expiry/refresh
+    // cluster moved to the selected-account detail pane (`draw_detail`, on MAIN
+    // beside the summary and full-width in the Accounts overlay) — relocated,
+    // not dropped.
     //
-    // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge+reset
-    // pair, and ONLY when `show_fable_weekly` is on — off renders the table
-    // exactly as before W3 (no column, no width taken). Wide gets a full gauge
-    // column; narrow gets a compact marker column (no third reset pair — the
-    // width budget is tight there).
+    // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge, and
+    // ONLY when `show_fable_weekly` is on — off renders the table with no
+    // column, no width taken. Wide gets a full gauge column; narrow gets a
+    // compact marker column (the width budget is tight there).
     let show_fable = view.show_fable_weekly;
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
-        let mut header = vec![
-            "", "group", "#", "account", "auth", "status", "5h", "reset", "7d", "reset",
-        ];
+        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
             Constraint::Fill(1),
-            Constraint::Length(6),
             Constraint::Length(20),
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length(19),
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length(19),
         ];
         if show_fable {
             header.push("Fbl");
             constraints.push(Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16));
         }
-        header.extend(["token", "if", "req", "tok"]);
+        header.extend(["if", "req", "tok"]);
         constraints.extend([
-            // "23h59m ↻59m" / "expired ↻12h" — expiry + refreshed-ago.
-            Constraint::Length(13),
             Constraint::Length(3),
             Constraint::Length(6),
             Constraint::Length(7),
         ]);
         (header, constraints)
     } else {
-        let mut header = vec![
-            "", "group", "#", "account", "status", "5h", "reset", "7d", "reset",
-        ];
+        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
@@ -753,17 +747,15 @@ fn draw_accounts(
             Constraint::Fill(1),
             Constraint::Length(20),
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length(7),
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length(7),
         ];
         if show_fable {
             header.push("Fbl");
-            // Compact marker column ("F 100%!" fits in 7): no bar, no reset.
+            // Compact marker column ("F 100%!" fits in 7): no bar.
             constraints.push(Constraint::Length(7));
         }
-        header.extend(["token", "if"]);
-        constraints.extend([Constraint::Length(8), Constraint::Length(3)]);
+        header.extend(["if"]);
+        constraints.extend([Constraint::Length(3)]);
         (header, constraints)
     };
 
@@ -811,23 +803,19 @@ fn account_row<'a>(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let (five_gauge, five_reset) = window_cells(
+    let five_gauge = window_gauge_cell(
         &account.five_hour,
         params.five_hour_max,
         parked,
         now,
-        ctx.tz_offset,
-        wide,
         max_age,
         consecutive_failures,
     );
-    let (seven_gauge, seven_reset) = window_cells(
+    let seven_gauge = window_gauge_cell(
         &account.seven_day,
         params.seven_day_max,
         parked,
         now,
-        ctx.tz_offset,
-        wide,
         max_age,
         consecutive_failures,
     );
@@ -843,16 +831,10 @@ fn account_row<'a>(
         Cell::from(Span::styled(format!("{}", pos + 1), dim())),
         Cell::from(name),
     ];
-    if wide {
-        cells.push(Cell::from(Span::styled(
-            auth_type(account.credential_kind),
-            dim(),
-        )));
-    }
     cells.push(Cell::from(status_span(
         account, gate, is_current, params, now, ctx.frame,
     )));
-    cells.extend([five_gauge, five_reset, seven_gauge, seven_reset]);
+    cells.extend([five_gauge, seven_gauge]);
     // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
     // same slot (after 7d) as the header/constraints reserve above, so the
     // cells stay column-aligned. Absent-window → the same cold state 5h/7d use.
@@ -865,10 +847,7 @@ fn account_row<'a>(
             consecutive_failures,
         ));
     }
-    cells.extend([
-        Cell::from(token_health_line(account, view.refresh_ahead, now, wide)),
-        Cell::from(in_flight_span(account.in_flight)),
-    ]);
+    cells.push(Cell::from(in_flight_span(account.in_flight)));
     if wide {
         cells.push(Cell::from(format::human_count(totals.requests)));
         cells.push(Cell::from(format::human_count(totals.tokens())));
@@ -930,49 +909,6 @@ fn status_span(
     Span::styled(format!("{glyph} {text}"), style)
 }
 
-/// Full token cell: expiry countdown (with due/expired coloring) plus, in
-/// wide mode, the dim "refreshed N ago" marker — "6h52m ↻3m". Narrow mode
-/// keeps just the expiry countdown.
-fn token_health_line(
-    account: &AccountSnapshot,
-    refresh_ahead: Duration,
-    now: SystemTime,
-    wide: bool,
-) -> Line<'static> {
-    let mut spans = vec![token_health_span(account, refresh_ahead, now)];
-    if wide && account.token_expires_at_ms.is_some() {
-        if let Some(marker) = format::refreshed_marker(account.last_refresh_ms, now) {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(marker, dim()));
-        }
-    }
-    Line::from(spans)
-}
-
-/// OAuth token health: expires-in countdown, yellow + `↻` once the
-/// background refresher is due, red when already expired. API-key accounts
-/// have no token to expire.
-fn token_health_span(
-    account: &AccountSnapshot,
-    refresh_ahead: Duration,
-    now: SystemTime,
-) -> Span<'static> {
-    let Some(expires_ms) = account.token_expires_at_ms else {
-        return Span::styled("—", dim());
-    };
-    let expires_at = UNIX_EPOCH + Duration::from_millis(expires_ms);
-    match expires_at.duration_since(now) {
-        Ok(left) if left > refresh_ahead => Span::raw(select::compact_duration(left)),
-        // Refresh window reached: the background refresher should rotate it
-        // on its next tick — flag it instead of silently counting down.
-        Ok(left) => Span::styled(
-            format!("{}↻", select::compact_duration(left)),
-            Style::new().fg(Color::Yellow),
-        ),
-        Err(_) => Span::styled("expired", Style::new().fg(Color::Red)),
-    }
-}
-
 fn in_flight_span(in_flight: u32) -> Span<'static> {
     if in_flight == 0 {
         Span::styled("0", dim())
@@ -984,37 +920,32 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// One quota window → (gauge cell, reset cell). The gauge label is ALWAYS the
+/// One quota window → its gauge cell. The gauge label is ALWAYS the
 /// percentage (req4: it used to flip to the reset countdown when parked / over
-/// threshold, which put a duration where a percent belongs and duplicated the
-/// reset column — confusing). Over-threshold is already signaled by the red
-/// color and a `!` marker; the countdown lives only in the reset column.
+/// threshold, which put a duration where a percent belongs — confusing).
+/// Over-threshold is already signaled by the red color and a `!` marker; the
+/// reset countdown lives in the selected-account detail pane (issue #70 — the
+/// per-row reset columns were relocated there, not dropped).
 ///
 /// Issue #33: the gauge cell also carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct from
 /// an honest `0%` — render-only, derived from already-recorded state.
-#[allow(clippy::too_many_arguments)]
-fn window_cells(
+fn window_gauge_cell(
     window: &Option<QuotaWindow>,
     threshold: f64,
     parked: bool,
     now: SystemTime,
-    tz_offset: i64,
-    wide: bool,
     max_age: Duration,
     consecutive_failures: u32,
-) -> (Cell<'static>, Cell<'static>) {
+) -> Cell<'static> {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
         // Cold (or poll-degraded with no window yet): show the state, not a bare
         // — that reads the same as "0% used".
-        return (
-            Cell::from(Span::styled(
-                format!("{} {}", display.glyph(), display.label()),
-                dim(),
-            )),
-            Cell::from(Span::styled("—", dim())),
-        );
+        return Cell::from(Span::styled(
+            format!("{} {}", display.glyph(), display.label()),
+            dim(),
+        ));
     };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
@@ -1040,12 +971,7 @@ fn window_cells(
     if !matches!(display, WindowDisplayState::Populated) {
         spans.push(Span::styled(format!(" {}", display.glyph()), dim()));
     }
-    let gauge = Cell::from(Line::from(spans));
-    let reset_cell = Cell::from(match reset_label(window, now, tz_offset, wide) {
-        Some(label) => Span::raw(label),
-        None => Span::styled("—", dim()),
-    });
-    (gauge, reset_cell)
+    Cell::from(Line::from(spans))
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
@@ -1137,27 +1063,19 @@ fn fable_gauge_cell(
     }
 }
 
-/// Reset column text: compact countdown, plus the absolute local time in
-/// wide mode — "1h02m (14:30)", "2d4h (06-15 09:00)".
-fn reset_label(
-    window: &QuotaWindow,
-    now: SystemTime,
-    tz_offset: i64,
-    wide: bool,
-) -> Option<String> {
+/// Reset text for the detail pane: compact countdown plus the absolute local
+/// time — "1h02m (14:30)", "2d4h (06-15 09:00)". (Issue #70: this used to
+/// feed the per-row reset columns too; those moved into the detail pane.)
+fn reset_label(window: &QuotaWindow, now: SystemTime, tz_offset: i64) -> Option<String> {
     let remaining = window.resets_at.duration_since(now).ok()?;
     if remaining.is_zero() {
         return None;
     }
-    let countdown = select::compact_duration(remaining);
-    if wide {
-        Some(format!(
-            "{countdown} ({})",
-            format::absolute_label(window.resets_at, now, tz_offset)
-        ))
-    } else {
-        Some(countdown)
-    }
+    Some(format!(
+        "{} ({})",
+        select::compact_duration(remaining),
+        format::absolute_label(window.resets_at, now, tz_offset)
+    ))
 }
 
 /// Middle row: scheduler/poller/totals summary, with the selected-account
@@ -1589,7 +1507,7 @@ fn window_detail_line(
     };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
-    let reset = reset_label(window, now, ctx.tz_offset, true).unwrap_or_else(|| "expired".into());
+    let reset = reset_label(window, now, ctx.tz_offset).unwrap_or_else(|| "expired".into());
     let source = match window.source {
         crate::scheduler::window::WindowSource::Headers => "headers",
         crate::scheduler::window::WindowSource::UsagePoll => "poll",
@@ -1938,16 +1856,6 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
         None => lines.push(indent("tokens", "—".to_string())),
     }
     lines
-}
-
-/// The credential's auth TYPE (oauth/api), orthogonal to its model group.
-/// Codex accounts authenticate via ChatGPT OAuth, so they are `oauth` too —
-/// the only `api` credential is a plain Anthropic API key (req5).
-fn auth_type(credential_kind: &str) -> &'static str {
-    match credential_kind {
-        "apikey" => "api",
-        _ => "oauth",
-    }
 }
 
 /// Backend group of the account named `account` in the current snapshot, for
@@ -4088,5 +3996,80 @@ mod tests {
             "still a fake-pool email: {alias_of_alias}"
         );
         assert!(!alias_of_alias.contains("leak-domain"));
+    }
+
+    // ---- issue #70: compressed accounts row, info relocated to detail ----
+
+    /// The wide accounts row keeps ≤8 clusters (gauges + traffic); `auth`,
+    /// the two `reset` columns, and the token cluster left the row — they
+    /// live in the always-on detail pane instead, so nothing is unreachable.
+    #[test]
+    fn accounts_row_drops_auth_reset_token_and_detail_carries_them() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::AccountId;
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:me@example.com".into()),
+        );
+        view.show_fable_weekly = true;
+
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
+        let header = rows
+            .iter()
+            .find(|r| r.contains(" account ") && r.contains("status"))
+            .expect("accounts header row");
+        for kept in [
+            "group", "account", "status", "5h", "7d", "Fbl", "if", "req", "tok",
+        ] {
+            assert!(header.contains(kept), "header keeps `{kept}`:\n{header}");
+        }
+        for gone in ["auth", "reset", "token"] {
+            assert!(
+                !header.contains(gone),
+                "header must not carry `{gone}` anymore:\n{header}"
+            );
+        }
+        let text = rows.join("\n");
+        assert!(
+            text.contains(" token "),
+            "detail pane still surfaces the token line:\n{text}"
+        );
+        assert!(
+            text.contains("resets"),
+            "detail pane still surfaces window resets:\n{text}"
+        );
+        assert!(
+            text.contains("oauth"),
+            "detail pane still surfaces the auth kind:\n{text}"
+        );
+    }
+
+    /// Narrow (<80col) keeps the same reduced column set and renders without
+    /// panic — the compressed mode may clip, never crash (issue #70).
+    #[test]
+    fn accounts_row_narrow_uses_reduced_columns_without_panic() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::AccountId;
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.snapshot.current.insert(
+            BackendGroup::Claude,
+            AccountId("claude:me@example.com".into()),
+        );
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 70, 30);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("5h") && r.contains("7d"))
+            .expect("narrow accounts header row");
+        for gone in ["auth", "reset", "token"] {
+            assert!(
+                !header.contains(gone),
+                "narrow header must not carry `{gone}`:\n{header}"
+            );
+        }
     }
 }
