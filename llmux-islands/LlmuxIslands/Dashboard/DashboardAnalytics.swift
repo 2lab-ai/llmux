@@ -60,16 +60,16 @@ enum DashFormat {
     }
 
     /// Client-usage cost: S1 emits wire-ready ZEROS until per-client
-    /// attribution lands (#32) — 0 means "not attributed", not "free", so it
-    /// renders `—` (never "$0.00").
-    static func clientCost(_ value: Double?) -> String {
-        guard let value, value > 0 else { return unavailable }
+    /// attribution lands (#32) — 0 means "not attributed", not "free". Issue
+    /// #68: absent data is an OMITTED element (nil), never a `—` column.
+    static func clientCost(_ value: Double?) -> String? {
+        guard let value, value > 0 else { return nil }
         return cost(value)
     }
 
-    /// Client-usage last-seen: 0/absent → `—` (never a 1970 date).
-    static func clientLastSeen(_ ms: UInt64?, now: Date) -> String {
-        guard let ms, ms > 0 else { return unavailable }
+    /// Client-usage last-seen: 0/absent → omitted (nil), never a 1970 date.
+    static func clientLastSeen(_ ms: UInt64?, now: Date) -> String? {
+        guard let ms, ms > 0 else { return nil }
         return ago(ms: ms, now: now)
     }
 
@@ -92,10 +92,11 @@ enum DashFormat {
         return "\(seconds / 86_400)d"
     }
 
-    /// Time until an epoch-ms instant (token expiry): "in 5m" / `—` if past.
+    /// Time until an epoch-ms instant (token expiry): "in 5m", or "expired"
+    /// once past — a real state, not a `—` placeholder (#68).
     static func until(ms: UInt64, now: Date) -> String {
         let seconds = Int(Double(ms) / 1000 - now.timeIntervalSince1970)
-        guard seconds > 0 else { return unavailable }
+        guard seconds > 0 else { return "expired" }
         if seconds < 60 { return "in \(seconds)s" }
         if seconds < 3_600 { return "in \(seconds / 60)m" }
         if seconds < 86_400 { return "in \(seconds / 3_600)h" }
@@ -107,18 +108,31 @@ enum DashFormat {
         ms < 1_000 ? "\(ms)ms" : String(format: "%.1fs", Double(ms) / 1000)
     }
 
-    /// Closed-island info content (gist §4.4): `C:2 X:1 $0.42`. The cost
-    /// segment is omitted (not "$0.00") when the daemon reports none.
-    static func closedIslandSummary(claude: Int, codex: Int, costUsd: Double?) -> String {
-        var parts = ["C:\(claude)", "X:\(codex)"]
-        if let costUsd { parts.append(cost(costUsd)) }
-        return parts.joined(separator: " ")
-    }
-
     private static func scaled(_ value: Double, _ suffix: String) -> String {
         value >= 100
             ? String(format: "%.0f%@", value, suffix)
             : String(format: "%.1f%@", value, suffix)
+    }
+}
+
+/// The Statistics panel's section set (issue #68 v2). The four #62 analytics
+/// surfaces live behind the ☰ menu's "Statistics" entry — pure (Foundation
+/// only) so the logic tests pin the contract: four sections, this order,
+/// these titles.
+enum StatsSection: String, CaseIterable {
+    case overview
+    case models
+    case clients
+    case health
+
+    /// Segment label; English, matching the app's menu-item language.
+    var title: String {
+        switch self {
+        case .overview: return "Overview"
+        case .models: return "Models"
+        case .clients: return "Clients"
+        case .health: return "Health"
+        }
     }
 }
 
@@ -136,6 +150,8 @@ enum DashboardHealth {
         var authFailed = 0
         var overQuota = 0
         var isWarning: Bool { authFailed > 0 || overQuota > 0 }
+        /// Accounts in ANY warning state — the closed pill's `⚠N` count.
+        var total: Int { authFailed + overQuota }
     }
 
     static func isOverQuota(
@@ -197,6 +213,41 @@ enum DashboardHealth {
             parts.append("\(summary.overQuota) account\(summary.overQuota == 1 ? "" : "s") over 90% quota")
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// Human display label for a `client_usage[].client` id (issue #68).
+///
+/// Claude Code sends `metadata.user_id` as a JSON blob
+/// `{"device_id":"<64 hex>","account_uuid":"<uuid>","session_id":"<uuid>"}`
+/// (shape verified against a live daemon's `/llmux/dashboard`, 2026-07-05);
+/// rendering it raw put braces, quotes and truncated JSON in the Clients tab.
+/// That shape parses into `<first8>…<last4> · sess <first4>` — e.g.
+/// `eb5df6d4…8aea · sess 468a`. Anything that is NOT a JSON object carrying a
+/// string `device_id` (plain `unknown`, API-key client names, future formats,
+/// garbage) renders verbatim.
+enum ClientIDLabel {
+    static func display(_ raw: String) -> String {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let deviceID = (object["device_id"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !deviceID.isEmpty
+        else { return raw }
+
+        var label = shortHash(deviceID)
+        if let sessionID = (object["session_id"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !sessionID.isEmpty {
+            label += " · sess \(String(sessionID.prefix(4)))"
+        }
+        return label
+    }
+
+    /// `eb5df6d4…8aea` — first 8 + last 4. Ids too short to compress (≤ 12
+    /// chars, where the shortening would not shorten) render whole.
+    private static func shortHash(_ id: String) -> String {
+        guard id.count > 12 else { return id }
+        return "\(id.prefix(8))…\(id.suffix(4))"
     }
 }
 

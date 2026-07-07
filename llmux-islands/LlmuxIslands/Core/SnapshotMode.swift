@@ -11,30 +11,29 @@
 //  normally.
 //
 //  Dispatch rule (one gate, two artifact families):
-//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage` selects explicitly.
+//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage|stats` selects explicitly.
 //  - When KIND is unset: the **label** family renders if a label-ish env is
 //    present (`LLMUX_ISLANDS_DEMO_INFLIGHT` or `LLMUX_ISLANDS_SNAPSHOT_T`);
-//    otherwise the **menu + usage** family renders.
+//    otherwise the **menu + usage + stats** family renders.
 //
 //  Label family — the closed-island pill (NotchClosedLabelContent) at 4 fixed
 //  animation phases. Session counts come from `LLMUX_ISLANDS_DEMO_INFLIGHT`
 //  (DemoMode); relaunch once per counts-state. Output:
 //  `label-c{claude}x{codex}-p{0..3}.png` where p0..p3 = phase 0 / 0.25 / 0.5 /
-//  0.75 of the jump cycle (the rainbow hue advances with the same phases).
-//  Wall-clock mode: setting `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` renders ONE
-//  frame at that absolute time instead of the 4 normalized phases, mapped
-//  through the app's real count→period function (`jumpOffset(time:)` /
-//  `rainbowHue(time:)` — the phase is computed inside jumpPeriod, never
-//  precomputed here), so jump SPEED scaling across counts is exercisable:
-//  the same t lands on different cycle phases for different counts. Output:
+//  0.75 of the rainbow hue loop (issue #68 removed the mascot jump — the
+//  phases now vary only the counter hues). Wall-clock mode: setting
+//  `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` renders ONE frame at that absolute
+//  time instead of the 4 normalized phases (`rainbowHue(time:)`). Output:
 //  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).
 //
-//  Menu + usage family — the ☰ menu (`menu.png`) and the Usage panel with
-//  fixture accounts carrying demo fake emails (`usage-anon-on.png` /
-//  `usage-anon-off.png`, named after the effective email-anonymous state).
-//  Force the state per-process WITHOUT touching the shared defaults domain by
-//  launching with `-emailAnonymousEnabled YES` / `NO` (volatile argument
-//  domain); run the binary twice to get both usage states.
+//  Menu + usage + stats family — the ☰ menu (`menu.png`), the DEFAULT Usage
+//  panel (the restored v0.2.14 tile grid, issue #68 v2) with fixture accounts
+//  carrying demo fake emails (`usage-anon-on.png` / `usage-anon-off.png`,
+//  named after the effective email-anonymous state), and the Statistics panel
+//  (`stats.png` full panel + `stats-{overview,models,clients,health}.png`
+//  per section). Force the anon state per-process WITHOUT touching the shared
+//  defaults domain by launching with `-emailAnonymousEnabled YES` / `NO`
+//  (volatile argument domain); run the binary twice to get both usage states.
 //
 
 import AppKit
@@ -65,6 +64,7 @@ enum SnapshotMode {
         case label
         case menu
         case usage
+        case stats
     }
 
     enum SnapshotError: Error, CustomStringConvertible {
@@ -82,7 +82,7 @@ enum SnapshotMode {
             case .invalidWallClock(let raw):
                 return "LLMUX_ISLANDS_SNAPSHOT_T must be a non-negative number of seconds, got \"\(raw)\""
             case .invalidKind(let raw):
-                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage, got \"\(raw)\""
+                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats, got \"\(raw)\""
             }
         }
     }
@@ -114,7 +114,7 @@ enum SnapshotMode {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let kinds = try requestedKinds()
-        if kinds.contains(.menu) || kinds.contains(.usage) {
+        if kinds.contains(where: { $0 != .label }) {
             normalizeEmailAnonymousLaunchArgument()
         }
 
@@ -124,13 +124,14 @@ enum SnapshotMode {
             case .label: written += try renderLabelFrames(into: dir)
             case .menu: written += try renderMenu(into: dir)
             case .usage: written += try renderUsage(into: dir)
+            case .stats: written += try renderStats(into: dir)
             }
         }
         return written
     }
 
     /// The dispatch rule: explicit KIND wins; otherwise label-ish envs select
-    /// the label family, and the menu + usage family is the default.
+    /// the label family, and the menu + usage + stats family is the default.
     static func requestedKinds(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> [Kind] {
@@ -144,7 +145,7 @@ enum SnapshotMode {
         if labelish.contains(where: { environment[$0]?.isEmpty == false }) {
             return [.label]
         }
-        return [.menu, .usage]
+        return [.menu, .usage, .stats]
     }
 
     // MARK: - Label family (closed-island pill)
@@ -157,10 +158,6 @@ enum SnapshotMode {
         let claude = DemoMode.forcedInFlight?.claude ?? 0
         let codex = DemoMode.forcedInFlight?.codex ?? 0
 
-        // Fixture cost so the closed-island v1 format (`C:n X:m $0.42`,
-        // gist §4.4) is visible in the frames; matches the spec's example.
-        let fixtureCost = 0.42
-
         if let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_T"], !raw.isEmpty {
             guard let t = TimeInterval(raw), t >= 0, t.isFinite else {
                 throw SnapshotError.invalidWallClock(raw)
@@ -168,7 +165,7 @@ enum SnapshotMode {
             let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
             let url = dir.appendingPathComponent(name)
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .wallClock(t), sessionCost: fixtureCost
+                claudeCount: claude, codexCount: codex, clock: .wallClock(t)
             )
             try renderLabel(view, to: url)
             return [url.path]
@@ -178,21 +175,12 @@ enum SnapshotMode {
         for (index, phase) in phases.enumerated() {
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(phase), sessionCost: fixtureCost
+                claudeCount: claude, codexCount: codex, clock: .phase(phase)
             )
             try renderLabel(view, to: url)
             written.append(url.path)
         }
 
-        // One warning-state frame (auth_failed / quota > 90% color rule).
-        let warningURL = dir.appendingPathComponent("label-c\(claude)x\(codex)-warning.png")
-        try renderLabel(
-            ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(0), sessionCost: fixtureCost, warning: true
-            ),
-            to: warningURL
-        )
-        written.append(warningURL.path)
         return written
     }
 
@@ -218,21 +206,40 @@ enum SnapshotMode {
         return [url.path]
     }
 
-    /// The Usage panel (tile grid + #62 S4 analytics Overview), named after
-    /// the effective email-anonymous state, plus one PNG per analytics tab.
+    /// The DEFAULT Usage panel — the restored v0.2.14 account tile grid
+    /// (issue #68 v2: no tabs, no analytics), named after the effective
+    /// email-anonymous state.
     @MainActor
     private static func renderUsage(into dir: URL) throws -> [String] {
         // Deterministic fixture accounts with demo fake emails — no daemon
-        // dependency, and the production daemon is never queried.
+        // dependency, and the production daemon is never queried. Dashboard
+        // stays nil: the default panel never renders analytics anymore.
         let model = IslandUsageModel.shared
         model.tiles = fixtureTiles()
         model.connection = .online
+        model.dashboard = nil
 
-        // Install a deterministic dashboard document (issue #62 S4) so the
-        // analytics UI renders: fallback data-quality labels (no
-        // `data_quality` key), an auth_failed account (banner), same-named
-        // models in both groups ((group, model) keying), and zero/absent
-        // cache + client cost fields (`—` rendering).
+        let viewModel = makeViewModel()
+        viewModel.contentType = .usage
+        let anonOn = AppSettings.emailAnonymousEnabled
+        let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
+        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        return [url.path]
+    }
+
+    /// The Statistics panel (issue #68 v2): the full panel as opened from the
+    /// ☰ menu (`stats.png`, Overview selected) plus each section rendered
+    /// standalone (`stats-{overview,models,clients,health}.png`).
+    @MainActor
+    private static func renderStats(into dir: URL) throws -> [String] {
+        // Deterministic dashboard document (issue #62 S4): fallback
+        // data-quality labels (no `data_quality` key), an auth_failed account
+        // (banner + health dot), same-named models in both groups ((group,
+        // model) keying), and zero/absent cache + client cost fields
+        // (omitted, never `—`).
+        let model = IslandUsageModel.shared
+        model.tiles = fixtureTiles()
+        model.connection = .online
         let dashboard = try fixtureDashboard()
         model.dashboard = dashboard
         model.totals = dashboard.totals
@@ -240,32 +247,35 @@ enum SnapshotMode {
         model.clientUsage = dashboard.clientUsage
         model.windowed = dashboard.windowed
         model.activity = dashboard.activity
-        model.healthWarning = DashboardHealth.summary(dashboard.accounts).isWarning
+        model.healthWarningCount = DashboardHealth.summary(dashboard.accounts).total
 
         let viewModel = makeViewModel()
-        viewModel.contentType = .usage
-        let anonOn = AppSettings.emailAnonymousEnabled
-        let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
-        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        viewModel.contentType = .stats
+        let url = dir.appendingPathComponent("stats.png")
+        try writeHosted(view: IslandStatsView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
         var written = [url.path]
 
-        // Each analytics tab, rendered directly (the live view owns its tab
-        // state internally). Overview here omits the tile grid — the full
-        // panel PNG above already shows it — so cards/models/heat/activity
-        // all fit one frame.
-        let tabs: [(UsageAnalyticsSection<EmptyView>.Tab, String, CGFloat)] = [
-            (.overview, "usage-tab-overview.png", 560),
-            (.models, "usage-tab-models.png", 420),
-            (.clients, "usage-tab-clients.png", 420),
-            (.health, "usage-tab-health.png", 420),
+        // Each section rendered directly at its content height so every block
+        // (cards, accounts, models, heat, activity, health) is fully visible.
+        let sections: [(StatsSection, String, CGFloat)] = [
+            (.overview, "stats-overview.png", 760),
+            (.models, "stats-models.png", 420),
+            (.clients, "stats-clients.png", 420),
+            (.health, "stats-health.png", 420),
         ]
-        for (tab, name, height) in tabs {
-            let tabURL = dir.appendingPathComponent(name)
-            let section = UsageAnalyticsSection(model: model, dashboard: dashboard, now: Date(), initialTab: tab) {
-                EmptyView()
-            }
-            try writeHosted(view: section.padding(12), size: CGSize(width: 560, height: height), to: tabURL)
-            written.append(tabURL.path)
+        for (section, name, height) in sections {
+            let sectionURL = dir.appendingPathComponent(name)
+            let view = StatsSectionContent(
+                section: section, dashboard: dashboard, tiles: model.tiles, now: Date()
+            )
+            try writeHosted(
+                view: view
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading),
+                size: CGSize(width: 560, height: height),
+                to: sectionURL
+            )
+            written.append(sectionURL.path)
         }
         return written
     }
@@ -300,7 +310,8 @@ enum SnapshotMode {
              "tokens_in": 5000, "tokens_out": 900, "last_used_ms": \(nowMs - 86_400_000)}
           ],
           "client_usage": [
-            {"client": "client-2", "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
+            {"client": "{\\"device_id\\":\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\",\\"account_uuid\\":\\"00000000-0000-4000-8000-000000000000\\",\\"session_id\\":\\"468acafe-0000-4000-8000-0000c0ffee00\\"}",
+             "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
              "tokens_out": 1357119, "cost_usd": 0.0, "last_seen_ms": 0},
             {"client": "unknown", "requests": 11839, "ok": 11216, "errors": 623,
              "tokens_in": 62996939, "tokens_out": 7053653}
@@ -458,7 +469,8 @@ enum SnapshotMode {
             tile(index: 0, provider: .claude, tier: "max20", fiveHour: 34, sevenDay: 61),
             tile(index: 1, provider: .claude, tier: "max5", fiveHour: 78, sevenDay: 42),
             tile(index: 2, provider: .codex, tier: nil, fiveHour: 12, sevenDay: 27),
-            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 88),
+            // 7d ≥ 90% — exercises the compact rows' warning color (#68).
+            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 96),
         ]
     }
 }
@@ -472,31 +484,18 @@ enum SnapshotMode {
 struct ClosedIslandSnapshotView: View {
     /// How the animation instant is specified.
     enum Clock {
-        /// Fixed 0..<1 position within the jump cycle (hue uses the same phase).
+        /// Fixed 0..<1 position within the rainbow hue loop.
         case phase(Double)
-        /// Absolute wall-clock seconds, mapped through the app's real
-        /// count→period function — exercises jumpPeriod's speed scaling/clamp.
+        /// Absolute wall-clock seconds (`rainbowHue(time:)`).
         case wallClock(TimeInterval)
     }
 
     let claudeCount: Int
     let codexCount: Int
     let clock: Clock
-    /// Fixture session cost / warning state (issue #62 S4 closed-island v1).
-    var sessionCost: Double?
-    var warning: Bool = false
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
-
-    private var jumpOffset: CGFloat {
-        switch clock {
-        case .phase(let phase):
-            return NotchClosedLabelView.jumpOffset(phase: phase, claudeSessions: claudeCount)
-        case .wallClock(let t):
-            return NotchClosedLabelView.jumpOffset(time: t, claudeSessions: claudeCount)
-        }
-    }
 
     private func hue(seed: Double) -> Double {
         switch clock {
@@ -511,9 +510,8 @@ struct ClosedIslandSnapshotView: View {
         NotchClosedLabelContent(
             claudeCount: claudeCount,
             codexCount: codexCount,
-            sessionCost: sessionCost,
-            warning: warning,
-            jumpOffset: jumpOffset,
+            // Deterministic frames render the mascot grounded.
+            jumpOffset: 0,
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)
         )

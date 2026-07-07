@@ -23,17 +23,47 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(DashFormat.count(UInt64(0)), "0")   // a REAL server 0 stays 0
     }
 
-    func testClientZerosRenderUnavailable() {
+    func testClientZerosAreOmitted() {
         // S1 ships wire-ready ZEROS for client cost/last-seen (#32 pending):
-        // 0 means "not attributed", never "$0.00" / a 1970 date.
-        XCTAssertEqual(DashFormat.clientCost(0), "—")
-        XCTAssertEqual(DashFormat.clientCost(nil), "—")
+        // 0 means "not attributed" — the element is OMITTED (nil, issue #68),
+        // never "$0.00" / a 1970 date / a `—` placeholder column.
+        XCTAssertNil(DashFormat.clientCost(0))
+        XCTAssertNil(DashFormat.clientCost(nil))
         XCTAssertEqual(DashFormat.clientCost(0.5), "$0.50")
         let now = Date()
-        XCTAssertEqual(DashFormat.clientLastSeen(0, now: now), "—")
-        XCTAssertEqual(DashFormat.clientLastSeen(nil, now: now), "—")
+        XCTAssertNil(DashFormat.clientLastSeen(0, now: now))
+        XCTAssertNil(DashFormat.clientLastSeen(nil, now: now))
         let fiveMinAgo = UInt64((now.timeIntervalSince1970 - 300) * 1000)
         XCTAssertEqual(DashFormat.clientLastSeen(fiveMinAgo, now: now), "5m")
+    }
+
+    // MARK: - Client id labels (#68): raw metadata.user_id JSON → short label
+
+    func testClientIDLabelParsesUserIdJSON() {
+        // The wire shape Claude Code sends (64-hex device_id + UUIDs; fixture
+        // values are synthetic — the device hash is sha256("")).
+        let raw = #"{"device_id":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","account_uuid":"00000000-0000-4000-8000-000000000000","session_id":"468acafe-0000-4000-8000-0000c0ffee00"}"#
+        XCTAssertEqual(ClientIDLabel.display(raw), "e3b0c442…b855 · sess 468a")
+
+        // No session id → device hash only, no dangling separator.
+        let deviceOnly = #"{"device_id":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#
+        XCTAssertEqual(ClientIDLabel.display(deviceOnly), "e3b0c442…b855")
+
+        // A device id too short to compress renders whole.
+        XCTAssertEqual(ClientIDLabel.display(#"{"device_id":"abc123"}"#), "abc123")
+    }
+
+    func testClientIDLabelGarbageInVerbatimOut() {
+        // Non-JSON ids and `unknown` render as-is — never mangled.
+        XCTAssertEqual(ClientIDLabel.display("unknown"), "unknown")
+        XCTAssertEqual(ClientIDLabel.display("client-2"), "client-2")
+        XCTAssertEqual(ClientIDLabel.display("{not json"), "{not json")
+        XCTAssertEqual(ClientIDLabel.display(""), "")
+        // JSON but not the user_id shape (no string device_id) → verbatim.
+        XCTAssertEqual(ClientIDLabel.display(#"{"session_id":"468acafe"}"#), #"{"session_id":"468acafe"}"#)
+        XCTAssertEqual(ClientIDLabel.display(#"{"device_id":42}"#), #"{"device_id":42}"#)
+        XCTAssertEqual(ClientIDLabel.display(#"{"device_id":""}"#), #"{"device_id":""}"#)
+        XCTAssertEqual(ClientIDLabel.display(#"["device_id"]"#), #"["device_id"]"#)
     }
 
     func testCountAndCostFormatting() {
@@ -45,14 +75,6 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(DashFormat.cost(8689.71), "$8.7k")
         XCTAssertEqual(DashFormat.duration(ms: 320), "320ms")
         XCTAssertEqual(DashFormat.duration(ms: 9752), "9.8s")
-    }
-
-    // MARK: - Closed-island summary (U13: `C:2 X:1 $0.42`)
-
-    func testClosedIslandSummaryFormat() {
-        XCTAssertEqual(DashFormat.closedIslandSummary(claude: 2, codex: 1, costUsd: 0.42), "C:2 X:1 $0.42")
-        // nil cost → segment omitted, never "$0.00".
-        XCTAssertEqual(DashFormat.closedIslandSummary(claude: 0, codex: 0, costUsd: nil), "C:0 X:0")
     }
 
     // MARK: - Health warning (U11/U13): auth_failed OR quota > 90%
@@ -76,6 +98,7 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(summary.authFailed, 0)
         XCTAssertEqual(summary.overQuota, 1)
         XCTAssertTrue(summary.isWarning)
+        XCTAssertEqual(summary.total, 1)   // the closed pill's ⚠N count
         XCTAssertEqual(DashboardHealth.bannerText(summary), "1 account over 90% quota")
     }
 
@@ -91,6 +114,7 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(summary.authFailed, 1)
         XCTAssertEqual(summary.overQuota, 0)
         XCTAssertTrue(summary.isWarning)
+        XCTAssertEqual(summary.total, 1)
         XCTAssertEqual(DashboardHealth.bannerText(summary), "1 account auth failed")
     }
 
@@ -112,6 +136,16 @@ final class DashboardAnalyticsTests: XCTestCase {
         // top() sorts by total tokens without merging the two rows.
         let top = LlmuxDashboardModelUsage.top(rows, limit: 3)
         XCTAssertEqual(top.map(\.id), ["claude/gpt-5.5", "codex/gpt-5.5"])
+    }
+
+    // MARK: - Statistics sections (#68 v2)
+
+    func testStatsSectionContract() {
+        // The Statistics panel serves the four #62 analytics surfaces in this
+        // exact order with these segment titles — dropping or reordering a
+        // section is a regression, not a style choice.
+        XCTAssertEqual(StatsSection.allCases.map(\.rawValue), ["overview", "models", "clients", "health"])
+        XCTAssertEqual(StatsSection.allCases.map(\.title), ["Overview", "Models", "Clients", "Health"])
     }
 
     // MARK: - Data-quality labels (U19–U22)
