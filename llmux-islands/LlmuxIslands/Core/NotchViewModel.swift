@@ -26,11 +26,13 @@ enum NotchOpenReason {
 
 enum NotchContentType: Equatable {
     case usage
+    case stats
     case menu
 
     var id: String {
         switch self {
         case .usage: return "usage"
+        case .stats: return "stats"
         case .menu: return "menu"
         }
     }
@@ -68,6 +70,14 @@ class NotchViewModel: ObservableObject {
                 width: min(screenRect.width * 0.5, 600),
                 height: usageOpenedHeight
             )
+        case .stats:
+            // Statistics (issue #68 v2): the sections scroll, so the panel
+            // takes a fixed height tuned to the overview card stack instead
+            // of growing with the account count like the usage tile grid.
+            return CGSize(
+                width: min(screenRect.width * 0.5, 600),
+                height: max(420, min(640, screenRect.height - 72))
+            )
         case .menu:
             // Menu has many fixed-height rows; 420 can push bottom actions outside
             // the interactive panel hit area. Keep a larger base height.
@@ -92,12 +102,8 @@ class NotchViewModel: ObservableObject {
         let chrome: CGFloat = 96          // notch header + "Usage" toolbar + paddings
         let perRow: CGFloat = 186         // one grid row of enlarged tiles (measured ≈180)
         let rowSpacing: CGFloat = 10
-        // Analytics allowance (issue #62 S4): the dashboard path adds tabs +
-        // summary cards + top models + heat strip + activity above/below the
-        // tile grid; the status fallback (dashboard == nil) keeps the old size.
-        let analytics: CGFloat = IslandUsageModel.shared.dashboard == nil ? 0 : 330
         let rows = max(1, Int(ceil(Double(max(count, 1)) / 2.0)))
-        let desired = chrome + analytics + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
+        let desired = chrome + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
         let minHeight: CGFloat = 240
         let maxHeight = max(minHeight, screenRect.height - 72)
         return min(max(desired, minHeight), maxHeight)
@@ -145,14 +151,6 @@ class NotchViewModel: ObservableObject {
         // usage panel grows/shrinks with the number of tiles (see usageOpenedHeight).
         IslandUsageModel.shared.$tiles
             .map(\.count)
-            .removeDuplicates()
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
-
-        // Same for the analytics allowance: it flips with dashboard presence
-        // (dashboard path ↔ status fallback), not with the tile count.
-        IslandUsageModel.shared.$dashboard
-            .map { $0 != nil }
             .removeDuplicates()
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -299,6 +297,14 @@ class NotchViewModel: ObservableObject {
     func showUsage() {
         lastNonMenuContentType = .usage
         contentType = .usage
+    }
+
+    /// Open the Statistics panel (issue #68 v2) — reached only through the
+    /// ☰ menu's "Statistics" entry; the island always REOPENS on `.usage`
+    /// (`notchClose()` resets the content type).
+    func showStats() {
+        lastNonMenuContentType = .stats
+        contentType = .stats
     }
 
     /// Perform boot animation: expand briefly then collapse

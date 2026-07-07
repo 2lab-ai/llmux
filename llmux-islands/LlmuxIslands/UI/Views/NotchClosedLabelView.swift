@@ -21,17 +21,10 @@ import Foundation
 import SwiftUI
 
 struct NotchClosedLabelView: View {
-    /// Σ in-flight sessions over Claude accounts — drives `C:{n}` and the jump.
+    /// Σ in-flight sessions over Claude accounts — drives `{n}` and the jump.
     let claudeCount: Int
-    /// Σ in-flight sessions over Codex accounts — drives `X:{m}`.
+    /// Σ in-flight sessions over Codex accounts — drives `{m}`.
     let codexCount: Int
-    /// `totals.cost_usd` from the dashboard doc (gist §4.4 closed-island v1:
-    /// `llmux C:2 X:1 $0.42`). nil (old daemon / status fallback) omits the
-    /// segment — never renders a fabricated $0.00.
-    let sessionCost: Double?
-    /// U13 hard rule: warning color when any account is `auth_failed` or any
-    /// quota > 90% — the SAME `DashboardHealth` source as the banner.
-    let warning: Bool
     /// Whether the island is actually on screen (NotchView's `isVisible`). On
     /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
     /// 30fps timeline paused then instead of animating an invisible view.
@@ -60,8 +53,6 @@ struct NotchClosedLabelView: View {
             NotchClosedLabelContent(
                 claudeCount: claudeCount,
                 codexCount: codexCount,
-                sessionCost: sessionCost,
-                warning: warning,
                 jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
                 claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
                 codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed)
@@ -115,16 +106,11 @@ struct NotchClosedLabelView: View {
 struct NotchClosedLabelContent: View {
     let claudeCount: Int
     let codexCount: Int
-    /// Session cost segment (`$0.42`); nil = daemon reports none → omitted.
-    let sessionCost: Double?
-    /// Warning state (auth_failed / quota > 90%): everything renders in the
-    /// warning color and the rainbow is suppressed — the color IS the signal.
-    let warning: Bool
     /// Mascot vertical offset in points (≤ 0 while airborne).
     let jumpOffset: CGFloat
-    /// 0..<1 rainbow hue for the claude `C:{n}` group.
+    /// 0..<1 rainbow hue for the claude `[icon]{n}` group.
     let claudeHue: Double
-    /// 0..<1 rainbow hue for the codex `X:{m}` group.
+    /// 0..<1 rainbow hue for the codex `[icon]{m}` group.
     let codexHue: Double
 
     var body: some View {
@@ -133,49 +119,32 @@ struct NotchClosedLabelContent: View {
             // (never the counts) — see minimumScaleFactor + tail truncation.
             Text("Llmux Islands")
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundColor(warning ? TerminalColors.amber : .white.opacity(0.85))
+                .foregroundColor(.white.opacity(0.85))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .minimumScaleFactor(0.6)
 
-            if warning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(TerminalColors.amber)
-            }
-
             ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
                 .offset(y: jumpOffset)
 
-            // Gist §4.4 info content: `C:{n} X:{m} $cost` — counts always
-            // visible (dimmed at 0), rainbow only while active and healthy.
-            providerGroup(.claude, prefix: "C", count: claudeCount, hue: claudeHue)
-            providerGroup(.codex, prefix: "X", count: codexCount, hue: codexHue)
-
-            if let sessionCost {
-                Text(DashFormat.cost(sessionCost))
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundColor(warning ? TerminalColors.amber : .white.opacity(0.7))
+            if claudeCount > 0 {
+                providerGroup(.claude, count: claudeCount, hue: claudeHue)
+            }
+            if codexCount > 0 {
+                providerGroup(.codex, count: codexCount, hue: codexHue)
             }
         }
     }
 
     @ViewBuilder
-    private func providerGroup(_ provider: UsageProvider, prefix: String, count: Int, hue: Double) -> some View {
+    private func providerGroup(_ provider: UsageProvider, count: Int, hue: Double) -> some View {
         HStack(spacing: 3) {
             UsageProviderIcon(provider: provider, size: 12)
-                .hueRotation(.degrees(count > 0 && !warning ? hue * 360 : 0))
-            Text("\(prefix):\(count)")
+                .hueRotation(.degrees(hue * 360))
+            Text("\(count)")
                 .font(.system(size: 11, weight: .bold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(countColor(count: count, hue: hue))
+                .foregroundStyle(Color(hue: hue, saturation: 0.85, brightness: 1.0))
         }
-    }
-
-    private func countColor(count: Int, hue: Double) -> Color {
-        if warning { return TerminalColors.amber }
-        guard count > 0 else { return .white.opacity(0.35) }
-        return Color(hue: hue, saturation: 0.85, brightness: 1.0)
     }
 }

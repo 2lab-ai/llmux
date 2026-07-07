@@ -193,8 +193,6 @@ struct NotchView: View {
                 NotchClosedLabelView(
                     claudeCount: usageModel.claudeInFlight,
                     codexCount: usageModel.codexInFlight,
-                    sessionCost: usageModel.totals?.costUsd,
-                    warning: usageModel.healthWarning,
                     active: isVisible
                 )
                 .frame(minWidth: closedNotchSize.width - 20)
@@ -249,6 +247,8 @@ struct NotchView: View {
             switch viewModel.contentType {
             case .usage:
                 IslandUsageView(model: IslandUsageModel.shared, viewModel: viewModel)
+            case .stats:
+                IslandStatsView(model: IslandUsageModel.shared, viewModel: viewModel)
             case .menu:
                 NotchMenuView(viewModel: viewModel)
             }

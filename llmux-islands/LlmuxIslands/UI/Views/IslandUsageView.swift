@@ -70,29 +70,16 @@ struct IslandUsageView: View {
             stateMessage(icon: "tray", title: "No accounts yet", detail: "add one with the + button", tint: .white.opacity(0.35))
         } else {
             ScrollView(.vertical, showsIndicators: false) {
-                // Analytics (issue #62 S4) render only when a dashboard doc is
-                // present; the /llmux/status fallback keeps the plain grid.
-                if let dashboard = model.dashboard {
-                    UsageAnalyticsSection(model: model, dashboard: dashboard, now: now) {
-                        tileGrid
-                    }
-                    .padding(.bottom, 4)
-                } else {
-                    tileGrid
-                        .padding(.bottom, 4)
-                }
+                UsageAccountTileGrid(
+                    tiles: model.tiles,
+                    columns: columns,
+                    now: now,
+                    onRemove: { name in Task { await model.remove(name) } }
+                )
+                .padding(.bottom, 4)
             }
             .scrollBounceBehavior(.basedOnSize)
         }
-    }
-
-    private var tileGrid: some View {
-        UsageAccountTileGrid(
-            tiles: model.tiles,
-            columns: columns,
-            now: now,
-            onRemove: { name in Task { await model.remove(name) } }
-        )
     }
 
     private func stateMessage(icon: String, title: String, detail: String, tint: Color) -> some View {
