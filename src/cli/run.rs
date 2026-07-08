@@ -69,16 +69,13 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
     if let Some(key) = &claude_api_key {
         command.env("ANTHROPIC_API_KEY", key);
     }
-    let status = command
-        .status()
-        .await
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CliError::Message("claude not found in PATH — install Claude Code first".into())
-            } else {
-                CliError::Message(format!("failed to start claude: {err}"))
-            }
-        })?;
+    let status = command.status().await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CliError::Message("claude not found in PATH — install Claude Code first".into())
+        } else {
+            CliError::Message(format!("failed to start claude: {err}"))
+        }
+    })?;
 
     std::process::exit(exit_code(&status));
 }

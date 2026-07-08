@@ -377,7 +377,11 @@ async fn dashboard_endpoint(endpoint: Endpoint, use_tui: bool) -> Result<(), Cli
 /// polls `GET /llmux/dashboard` and renders the identical layout. No
 /// tracing subscriber is installed (ratatui owns the terminal; the client has
 /// no logs of its own to show).
-async fn attach(base_url: String, api_key: Option<String>, pid: Option<u32>) -> Result<(), CliError> {
+async fn attach(
+    base_url: String,
+    api_key: Option<String>,
+    pid: Option<u32>,
+) -> Result<(), CliError> {
     let opts = crate::tui::RemoteOptions {
         base_url,
         api_key,
@@ -469,7 +473,9 @@ fn parse_remote_spec(spec: &str, default_port: Option<u16>) -> Result<(String, u
     let (host, port) = match spec.rsplit_once(':') {
         Some((host, port_str)) => {
             let port = port_str.parse::<u16>().map_err(|_| {
-                CliError::Message(format!("invalid --remote port in '{spec}' (expected a number)"))
+                CliError::Message(format!(
+                    "invalid --remote port in '{spec}' (expected a number)"
+                ))
             })?;
             (host, port)
         }

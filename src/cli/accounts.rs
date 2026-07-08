@@ -88,7 +88,12 @@ async fn list_json() -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let port = config.proxy.port;
 
-    match daemon::probe_server(&super::proxy_base_url(port), config.proxy.api_key.as_deref()).await? {
+    match daemon::probe_server(
+        &super::proxy_base_url(port),
+        config.proxy.api_key.as_deref(),
+    )
+    .await?
+    {
         ServerProbe::Running { status } => {
             println!("{status:#}");
             Ok(())

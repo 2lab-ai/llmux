@@ -494,7 +494,9 @@ mod tests {
     #[tokio::test]
     async fn probe_detects_running_llmux() {
         let port = spawn_status_mock(llmux_status_body()).await;
-        let probe = probe_server(&proxy_base_url(port), Some("lm-key")).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), Some("lm-key"))
+            .await
+            .unwrap();
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
     }
 
