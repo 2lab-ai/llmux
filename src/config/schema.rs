@@ -86,8 +86,39 @@ pub struct Config {
     /// this field loads with the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// Point the CLI *client* commands at a remote llmux daemon instead of a
+    /// local one (issue: remote proxy support). When `remote.host` is set,
+    /// `llmux run` exports `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` for the
+    /// remote and does NOT auto-start a local daemon; `llmux server`,
+    /// `llmux dashboard`, `llmux status`, and `llmux env` attach to / describe
+    /// the remote. This is the CLI analogue of what llmux-islands already does
+    /// (host/port + `x-api-key`). The `--remote host[:port]` global flag
+    /// overrides it per-invocation. Additive (`#[serde(default)]`): a config
+    /// written before this field loads with remote OFF (all-local behavior).
+    #[serde(default)]
+    pub remote: RemoteConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// Remote-daemon target for the CLI client commands. All fields optional:
+/// `host` unset (the default) means "operate against the local daemon" and the
+/// whole section is inert. When `host` is set, off-loopback access requires the
+/// remote's proxy `api_key` presented as `x-api-key` — so `api_key` is
+/// effectively mandatory unless the remote runs with no key configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Remote daemon host (e.g. `oudwood-512` or `100.98.240.111`). Unset →
+    /// remote mode OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Remote daemon port. Unset → [`DEFAULT_PORT`] (3456).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Proxy `api_key` presented to the remote as `x-api-key`. Required
+    /// off-loopback unless the remote has no api_key configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 impl Default for Config {
@@ -103,6 +134,7 @@ impl Default for Config {
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            remote: RemoteConfig::default(),
             accounts: Vec::new(),
         }
     }

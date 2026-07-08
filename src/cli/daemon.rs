@@ -53,14 +53,15 @@ pub enum EnsureOutcome {
     Restarted { pid: u32 },
 }
 
-/// Probe the configured port for a running llmux server.
-pub async fn probe_server(port: u16, api_key: Option<&str>) -> Result<ServerProbe, CliError> {
+/// Probe `base_url` (e.g. `http://localhost:3456` or a remote host) for a
+/// running llmux server.
+pub async fn probe_server(base_url: &str, api_key: Option<&str>) -> Result<ServerProbe, CliError> {
     let client = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .build()
         .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
-    let url = format!("{}/llmux/status", proxy_base_url(port));
+    let url = format!("{base_url}/llmux/status");
     let mut request = client.get(&url);
     if let Some(api_key) = api_key {
         // Localhost is exempt, but sending it is harmless and keeps this
@@ -145,7 +146,7 @@ pub async fn ensure_server_running(
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
     let mut restarting = false;
-    match probe_server(port, api_key).await? {
+    match probe_server(&proxy_base_url(port), api_key).await? {
         ServerProbe::Running { status } => {
             let current = crate::build_info::version_string();
             let running = status.get("version").and_then(serde_json::Value::as_str);
@@ -296,7 +297,7 @@ async fn wait_until_ready(
 ) -> Result<(), CliError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let ServerProbe::Running { .. } = probe_server(port, api_key).await? {
+        if let ServerProbe::Running { .. } = probe_server(&proxy_base_url(port), api_key).await? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -343,7 +344,7 @@ async fn shutdown_and_wait(
 
     let deadline = Instant::now() + timeout;
     loop {
-        if let ServerProbe::NotRunning = probe_server(port, api_key).await? {
+        if let ServerProbe::NotRunning = probe_server(&proxy_base_url(port), api_key).await? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -364,7 +365,7 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
 
-    match probe_server(port, api_key).await? {
+    match probe_server(&proxy_base_url(port), api_key).await? {
         ServerProbe::NotRunning => {
             println!("server not running on port {port}");
             return Ok(());
@@ -493,14 +494,14 @@ mod tests {
     #[tokio::test]
     async fn probe_detects_running_llmux() {
         let port = spawn_status_mock(llmux_status_body()).await;
-        let probe = probe_server(port, Some("lm-key")).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), Some("lm-key")).await.unwrap();
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
     }
 
     #[tokio::test]
     async fn probe_flags_foreign_listener() {
         let port = spawn_status_mock("welcome to my blog".into()).await;
-        let probe = probe_server(port, None).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), None).await.unwrap();
         assert!(matches!(probe, ServerProbe::Foreign { .. }), "{probe:?}");
     }
 
@@ -510,7 +511,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let probe = probe_server(port, None).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), None).await.unwrap();
         assert!(matches!(probe, ServerProbe::NotRunning), "{probe:?}");
     }
 

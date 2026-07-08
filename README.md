@@ -120,6 +120,45 @@ eval "$(llmux env)"
 claude
 ```
 
+## Using a remote daemon
+
+By default the CLI talks to a local daemon. To drive one running on another
+host (the CLI analogue of what llmux Islands already does), point it at that
+host and present its proxy `x-api-key`.
+
+One-off, via the global flag:
+
+```bash
+llmux --remote oudwood-512:3456 run     # claude → remote proxy
+llmux --remote oudwood-512:3456 server  # attach to the remote dashboard
+```
+
+Persistently, in `~/.config/llmux.json` (the `x-api-key` is the remote's
+`proxy.api_key`, read from the remote host's config):
+
+```jsonc
+{
+  "remote": {
+    "host": "oudwood-512",
+    "port": 3456,
+    "api_key": "lm-…"      // the REMOTE daemon's proxy.api_key
+  }
+}
+```
+
+With `remote.host` set, the client commands target the remote:
+
+- `llmux run` points `claude` at the remote proxy and exports
+  `ANTHROPIC_API_KEY` (the remote's key) so the off-loopback client-auth gate
+  passes — no local daemon is started. The proxy still swaps in the real
+  upstream account, so subscription mode is preserved at the account layer.
+- `llmux server`, `llmux dashboard`, `llmux status`, and `llmux env` attach to
+  or describe the remote.
+
+Lifecycle commands (`llmux stop`, `llmux restart`, `llmux login`) always act on
+the LOCAL daemon/config. The `--remote host[:port]` flag overrides `remote.host`
+for a single invocation; `:port` defaults to `remote.port`, else 3456.
+
 ## Switching models
 
 Claude Code's model name becomes the routing signal:

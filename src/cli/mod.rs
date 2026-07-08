@@ -36,6 +36,14 @@ pub enum CliError {
     about = "Multi-account LLM proxy for Claude Code with quota-maximizing scheduling"
 )]
 pub struct Cli {
+    /// Target a remote llmux daemon (`host` or `host:port`) instead of the
+    /// local one, for this invocation. Overrides `remote.host` in the config.
+    /// Affects the client commands (`run`, `server`, `dashboard`, `status`,
+    /// `env`); the remote's `x-api-key` is taken from `remote.api_key` in the
+    /// config. Lifecycle commands (`stop`, `restart`, `login`, …) always act
+    /// on the local daemon/config.
+    #[arg(long, global = true, value_name = "HOST[:PORT]")]
+    pub remote: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -181,16 +189,17 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
     if !matches!(cli.command, Command::Server(_) | Command::Dashboard(_)) {
         crate::logging::init_plain();
     }
+    let remote = cli.remote;
     match cli.command {
-        Command::Server(args) => server(args).await,
-        Command::Run(args) => run::run(args).await,
+        Command::Server(args) => server(args, remote).await,
+        Command::Run(args) => run::run(args, remote).await,
         Command::Stop(args) => daemon::stop(args).await,
         Command::Restart(_) => daemon::restart().await,
         Command::Login(args) => login::run(args).await,
         Command::Import(args) => import::run(args).await,
-        Command::Env(args) => env::run(args).await,
-        Command::Dashboard(args) => dashboard(args).await,
-        Command::Status(args) => status::run(args).await,
+        Command::Env(args) => env::run(args, remote).await,
+        Command::Dashboard(args) => dashboard(args, remote).await,
+        Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::list(args).await,
         Command::Remove(args) => accounts::remove(args).await,
         Command::Api(args) => api::run(args).await,
@@ -208,7 +217,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
 /// - Nothing is listening → bind FIRST (via `serve`'s readiness signal), and
 ///   only after the bind succeeds initialize the TUI, so a bind error can
 ///   never paint over a half-initialized frame again.
-async fn server(args: ServerArgs) -> Result<(), CliError> {
+async fn server(args: ServerArgs, remote: Option<String>) -> Result<(), CliError> {
     use std::io::IsTerminal as _;
 
     let mut config = crate::config::load_or_init()?;
@@ -217,11 +226,19 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
     }
     let use_tui = !args.no_tui && std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
+    // Remote mode: `llmux server` never binds a local proxy — it attaches to
+    // the configured remote daemon and renders its dashboard (the CLI twin of
+    // llmux-islands). This is the whole point of `--remote` / `remote.host`.
+    let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
+    if endpoint.remote {
+        return dashboard_endpoint(endpoint, use_tui).await;
+    }
+
     // herdr: is someone already on the port? (Cheap HTTP probe — no terminal
     // touched yet, so a foreign-process error stays a clean stderr line.)
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.clone();
-    match daemon::probe_server(port, api_key.as_deref()).await? {
+    match daemon::probe_server(&proxy_base_url(port), api_key.as_deref()).await? {
         daemon::ServerProbe::Running { status } => {
             let pid = daemon::status_pid(&status);
             let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
@@ -234,7 +251,7 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
                 );
                 return Ok(());
             }
-            return attach(port, api_key, pid).await;
+            return attach(proxy_base_url(port), api_key, pid).await;
         }
         daemon::ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
@@ -317,22 +334,41 @@ async fn server(args: ServerArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `llmux dashboard` — attach to a running daemon and render its
-/// dashboard. Refuses cleanly when no daemon (or a foreign process) is on the
-/// port — there is nothing local to fall back to here.
-async fn dashboard(_args: DashboardArgs) -> Result<(), CliError> {
+/// `llmux dashboard` — attach to a running daemon (local, or the configured
+/// `--remote` / `remote.host`) and render its dashboard. Refuses cleanly when
+/// no daemon (or a foreign process) is on the endpoint — there is nothing
+/// local to fall back to here.
+async fn dashboard(_args: DashboardArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
-    let port = config.proxy.port;
-    let api_key = config.proxy.api_key.clone();
-    match daemon::probe_server(port, api_key.as_deref()).await? {
+    let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
+    let use_tui = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    dashboard_endpoint(endpoint, use_tui).await
+}
+
+/// Probe an already-resolved endpoint and attach to it (shared by
+/// `llmux dashboard` and `llmux server` in remote mode). `use_tui` gates the
+/// interactive attach: without a TTY we print a one-liner instead of hanging.
+async fn dashboard_endpoint(endpoint: Endpoint, use_tui: bool) -> Result<(), CliError> {
+    let Endpoint {
+        base_url,
+        api_key,
+        host,
+        port,
+        ..
+    } = endpoint;
+    match daemon::probe_server(&base_url, api_key.as_deref()).await? {
         daemon::ServerProbe::Running { status } => {
-            attach(port, api_key, daemon::status_pid(&status)).await
+            if !use_tui {
+                eprintln!("llmux daemon reachable at {host}:{port}; run `llmux dashboard` on a TTY to attach");
+                return Ok(());
+            }
+            attach(base_url, api_key, daemon::status_pid(&status)).await
         }
         daemon::ServerProbe::NotRunning => Err(CliError::Message(format!(
-            "no llmux daemon on port {port} — start one with `llmux server` or `llmux run`"
+            "no llmux daemon at {host}:{port} — check the host/port and that the remote server is up"
         ))),
         daemon::ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
-            "port {port} is in use by something that is not llmux ({detail})"
+            "{host}:{port} is in use by something that is not llmux ({detail})"
         ))),
     }
 }
@@ -341,9 +377,9 @@ async fn dashboard(_args: DashboardArgs) -> Result<(), CliError> {
 /// polls `GET /llmux/dashboard` and renders the identical layout. No
 /// tracing subscriber is installed (ratatui owns the terminal; the client has
 /// no logs of its own to show).
-async fn attach(port: u16, api_key: Option<String>, pid: Option<u32>) -> Result<(), CliError> {
+async fn attach(base_url: String, api_key: Option<String>, pid: Option<u32>) -> Result<(), CliError> {
     let opts = crate::tui::RemoteOptions {
-        base_url: proxy_base_url(port),
+        base_url,
         api_key,
         pid,
     };
@@ -351,9 +387,100 @@ async fn attach(port: u16, api_key: Option<String>, pid: Option<u32>) -> Result<
     Ok(())
 }
 
-/// `http://localhost:<port>` — the whole Claude Code integration contract.
+/// `http://localhost:<port>` — the whole Claude Code integration contract for
+/// the LOCAL daemon.
 pub(crate) fn proxy_base_url(port: u16) -> String {
     format!("http://localhost:{port}")
+}
+
+/// `http://<host>:<port>` — base URL for an arbitrary (local or remote) daemon.
+pub(crate) fn base_url(host: &str, port: u16) -> String {
+    format!("http://{host}:{port}")
+}
+
+/// A resolved client endpoint: where to reach the proxy, the key to present,
+/// and whether it is the LOCAL loopback daemon (which the CLI may auto-start /
+/// stop) or a REMOTE one (which the CLI only talks to over HTTP and never
+/// manages).
+pub(crate) struct Endpoint {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub remote: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Resolve the effective client endpoint from the `--remote` flag and the
+/// config, in that precedence:
+///
+/// 1. `--remote host[:port]` flag → remote (port defaults to the config's
+///    `remote.port`, else 3456; api_key from `remote.api_key`).
+/// 2. `remote.host` set in the config → remote (port/api_key from `remote`).
+/// 3. neither → LOCAL loopback on `proxy.port` (api_key from `proxy.api_key`).
+///
+/// A `--remote` value with an empty host is rejected. This is the single
+/// chokepoint every client command routes through, so local and remote share
+/// one code path.
+pub(crate) fn resolve_endpoint(
+    remote_flag: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<Endpoint, CliError> {
+    if let Some(spec) = remote_flag {
+        let (host, port) = parse_remote_spec(spec, config.remote.port)?;
+        return Ok(Endpoint {
+            base_url: base_url(&host, port),
+            api_key: config.remote.api_key.clone(),
+            remote: true,
+            host,
+            port,
+        });
+    }
+    if let Some(host) = config.remote.host.clone() {
+        if host.trim().is_empty() {
+            return Err(CliError::Message(
+                "remote.host in the config is empty — set a host or remove the remote section"
+                    .into(),
+            ));
+        }
+        let port = config.remote.port.unwrap_or(crate::config::DEFAULT_PORT);
+        return Ok(Endpoint {
+            base_url: base_url(&host, port),
+            api_key: config.remote.api_key.clone(),
+            remote: true,
+            host,
+            port,
+        });
+    }
+    Ok(Endpoint {
+        base_url: proxy_base_url(config.proxy.port),
+        api_key: config.proxy.api_key.clone(),
+        remote: false,
+        host: "localhost".into(),
+        port: config.proxy.port,
+    })
+}
+
+/// Parse `host` or `host:port` from a `--remote` value. `default_port` (the
+/// config's `remote.port`) is used when no `:port` is given, falling back to
+/// 3456.
+fn parse_remote_spec(spec: &str, default_port: Option<u16>) -> Result<(String, u16), CliError> {
+    let spec = spec.trim();
+    let fallback = default_port.unwrap_or(crate::config::DEFAULT_PORT);
+    let (host, port) = match spec.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse::<u16>().map_err(|_| {
+                CliError::Message(format!("invalid --remote port in '{spec}' (expected a number)"))
+            })?;
+            (host, port)
+        }
+        None => (spec, fallback),
+    };
+    if host.is_empty() {
+        return Err(CliError::Message(format!(
+            "invalid --remote '{spec}' — expected host or host:port"
+        )));
+    }
+    Ok((host.to_string(), port))
 }
 
 /// Print `prompt` on stderr and read one trimmed line from stdin.
@@ -374,4 +501,103 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, RemoteConfig};
+
+    #[test]
+    fn parse_remote_spec_host_only_uses_default_port() {
+        assert_eq!(
+            parse_remote_spec("oudwood-512", Some(4000)).unwrap(),
+            ("oudwood-512".to_string(), 4000)
+        );
+        // No configured remote.port → 3456.
+        assert_eq!(
+            parse_remote_spec("oudwood-512", None).unwrap(),
+            ("oudwood-512".to_string(), crate::config::DEFAULT_PORT)
+        );
+    }
+
+    #[test]
+    fn parse_remote_spec_host_and_port() {
+        assert_eq!(
+            parse_remote_spec("oudwood-512:3456", None).unwrap(),
+            ("oudwood-512".to_string(), 3456)
+        );
+        assert_eq!(
+            parse_remote_spec("100.98.240.111:9000", None).unwrap(),
+            ("100.98.240.111".to_string(), 9000)
+        );
+    }
+
+    #[test]
+    fn parse_remote_spec_rejects_bad_input() {
+        assert!(parse_remote_spec("oudwood-512:notaport", None).is_err());
+        assert!(parse_remote_spec(":3456", None).is_err());
+        assert!(parse_remote_spec("", None).is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_defaults_to_local() {
+        let mut config = Config::default();
+        config.proxy.port = 7777;
+        config.proxy.api_key = Some("lm-local".into());
+        let ep = resolve_endpoint(None, &config).unwrap();
+        assert!(!ep.remote);
+        assert_eq!(ep.base_url, "http://localhost:7777");
+        assert_eq!(ep.api_key.as_deref(), Some("lm-local"));
+    }
+
+    #[test]
+    fn resolve_endpoint_flag_overrides_config() {
+        let config = Config {
+            remote: RemoteConfig {
+                host: Some("configured-host".into()),
+                port: Some(1111),
+                api_key: Some("lm-remote".into()),
+            },
+            ..Config::default()
+        };
+        // Flag host wins; port from flag; api_key still from remote config.
+        let ep = resolve_endpoint(Some("oudwood-512:3456"), &config).unwrap();
+        assert!(ep.remote);
+        assert_eq!(ep.base_url, "http://oudwood-512:3456");
+        assert_eq!(ep.api_key.as_deref(), Some("lm-remote"));
+    }
+
+    #[test]
+    fn resolve_endpoint_flag_host_only_uses_remote_port() {
+        let config = Config {
+            remote: RemoteConfig {
+                port: Some(2222),
+                ..RemoteConfig::default()
+            },
+            ..Config::default()
+        };
+        let ep = resolve_endpoint(Some("oudwood-512"), &config).unwrap();
+        assert_eq!(ep.base_url, "http://oudwood-512:2222");
+    }
+
+    #[test]
+    fn resolve_endpoint_config_remote_host() {
+        let config = Config {
+            remote: RemoteConfig {
+                host: Some("oudwood-512".into()),
+                port: None,
+                api_key: Some("lm-remote".into()),
+            },
+            ..Config::default()
+        };
+        let ep = resolve_endpoint(None, &config).unwrap();
+        assert!(ep.remote);
+        // No remote.port → DEFAULT_PORT.
+        assert_eq!(
+            ep.base_url,
+            format!("http://oudwood-512:{}", crate::config::DEFAULT_PORT)
+        );
+        assert_eq!(ep.api_key.as_deref(), Some("lm-remote"));
+    }
 }
