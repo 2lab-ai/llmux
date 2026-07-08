@@ -37,6 +37,11 @@ pub enum ServerProbe {
     Running { status: serde_json::Value },
     /// Connection refused / timed out — nothing is listening.
     NotRunning,
+    /// A llmux daemon answered but rejected the credential (HTTP 401): the
+    /// endpoint requires an `x-api-key` we did not present (or presented
+    /// wrong). Distinct from `Foreign` so remote commands can point at
+    /// `remote.api_key` instead of claiming the port is not llmux.
+    Unauthorized,
     /// Something answered, but it is not llmux — never spawn over it.
     Foreign { detail: String },
 }
@@ -96,6 +101,11 @@ pub fn status_pid(status: &serde_json::Value) -> Option<u32> {
 /// Classify a status-endpoint response: only a 2xx carrying a
 /// llmux-shaped document counts as a running server.
 fn classify_probe(status: http::StatusCode, body: &str) -> ServerProbe {
+    if status == http::StatusCode::UNAUTHORIZED {
+        // llmux's own client-auth gate (FR1) — the endpoint IS llmux, it just
+        // wants the api key. Off-loopback that means `remote.api_key`.
+        return ServerProbe::Unauthorized;
+    }
     if !status.is_success() {
         return ServerProbe::Foreign {
             detail: format!("status endpoint returned {status}"),
@@ -157,6 +167,12 @@ pub async fn ensure_server_running(
             } else {
                 return Ok(EnsureOutcome::AlreadyRunning);
             }
+        }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "a llmux daemon on port {port} rejected the local api key (401) — \
+                 check proxy.api_key in the config"
+            )));
         }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
@@ -370,6 +386,12 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
             println!("server not running on port {port}");
             return Ok(());
         }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "a llmux daemon on port {port} rejected the api key (401) — \
+                 check proxy.api_key in the config"
+            )));
+        }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
                 "port {port} is in use by something that is not llmux ({detail}) — refusing to stop it"
@@ -403,6 +425,14 @@ mod tests {
     fn classify_probe_accepts_llmux_shape() {
         let probe = classify_probe(StatusCode::OK, &llmux_status_body());
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
+    }
+
+    #[test]
+    fn classify_probe_maps_401_to_unauthorized() {
+        // A remote llmux that wants an api_key we didn't present: NOT foreign.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid proxy API key"}}"#;
+        let probe = classify_probe(StatusCode::UNAUTHORIZED, body);
+        assert!(matches!(probe, ServerProbe::Unauthorized), "{probe:?}");
     }
 
     #[test]

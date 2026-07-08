@@ -253,6 +253,12 @@ async fn server(args: ServerArgs, remote: Option<String>) -> Result<(), CliError
             }
             return attach(proxy_base_url(port), api_key, pid).await;
         }
+        daemon::ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "a llmux daemon on port {port} rejected the local api key (401) — \
+                 check proxy.api_key in the config"
+            )));
+        }
         daemon::ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
                 "port {port} is in use by something that is not llmux ({detail})\n\
@@ -366,6 +372,10 @@ async fn dashboard_endpoint(endpoint: Endpoint, use_tui: bool) -> Result<(), Cli
         }
         daemon::ServerProbe::NotRunning => Err(CliError::Message(format!(
             "no llmux daemon at {host}:{port} — check the host/port and that the remote server is up"
+        ))),
+        daemon::ServerProbe::Unauthorized => Err(CliError::Message(format!(
+            "authentication failed at {host}:{port} (401) — set or fix `remote.api_key` in \
+             ~/.config/llmux.json (it must be the remote daemon's proxy.api_key)"
         ))),
         daemon::ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
             "{host}:{port} is in use by something that is not llmux ({detail})"
