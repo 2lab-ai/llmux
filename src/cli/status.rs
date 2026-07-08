@@ -41,6 +41,10 @@ pub async fn run(args: StatusArgs, remote: Option<String>) -> Result<(), CliErro
             }
             std::process::exit(1);
         }
+        ServerProbe::Unauthorized => Err(CliError::Message(format!(
+            "llmux on port {port} rejected the api key (401) — check `remote.api_key` \
+             (remote) or `proxy.api_key` (local) in the config"
+        ))),
         ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
             "port {port} answers but is not llmux: {detail}"
         ))),
