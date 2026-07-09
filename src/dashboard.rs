@@ -477,6 +477,20 @@ pub struct DashboardDoc {
     /// from an older daemon → the client defaults the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// Domain abbreviations for the accounts table's name column (config
+    /// `domain_abbrev`): `ai3@insightquest.io` renders `ai3@iq.io`. Carried
+    /// here so BOTH TUI backends abbreviate identically (local builds the doc
+    /// in-process; attach receives it here); account names in the document
+    /// itself stay real, same convention as `email_anonymous`. Additive:
+    /// absent in docs from an older daemon → the built-in default map.
+    #[serde(default = "crate::config::default_domain_abbrev")]
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Fill direction for the TUI quota gauges (config `quota_display`):
+    /// `used` fills as quota burns, `remaining` drains toward the reset.
+    /// Display-only boot default — the TUI `u` key overrides it live for the
+    /// session. Additive: absent in docs from an older daemon → `used`.
+    #[serde(default)]
+    pub quota_display: crate::config::QuotaDisplay,
     /// Data-quality qualifiers for the derived statistics (issue #62 S2).
     /// The server is the SSOT for the label wording — the TUI and the Islands
     /// app render these strings verbatim instead of hardcoding copies that
@@ -942,6 +956,12 @@ pub struct DocMeta {
     /// Config `show_fable_weekly` (fable-usage U9a): whether the TUI renders
     /// the Fable weekly gauge. See [`DashboardDoc::show_fable_weekly`].
     pub show_fable_weekly: bool,
+    /// Config `domain_abbrev`: accounts-table domain abbreviations. See
+    /// [`DashboardDoc::domain_abbrev`].
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Config `quota_display`: quota-gauge fill direction. See
+    /// [`DashboardDoc::quota_display`].
+    pub quota_display: crate::config::QuotaDisplay,
     /// API-equivalent pricing overrides from `[pricing]` in the live config
     /// (Feature D). Empty = use the built-in default rate table. Threaded here
     /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
@@ -1398,6 +1418,8 @@ pub(crate) fn dashboard_doc(
         codex: meta.codex.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
+        domain_abbrev: meta.domain_abbrev.clone(),
+        quota_display: meta.quota_display,
         // Canonical label wording (issue #62 S2) — constant per build, not
         // state-derived; `Default` IS the canonical set.
         data_quality: DataQualityDoc::default(),
@@ -1440,6 +1462,10 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
         show_fable_weekly: state.config.show_fable_weekly,
+        // Config-file display settings, same convention as show_fable_weekly:
+        // no runtime endpoint; the TUI `u` key overrides quota_display locally.
+        domain_abbrev: state.config.domain_abbrev.clone(),
+        quota_display: state.config.quota_display,
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -1483,6 +1509,8 @@ mod tests {
             pricing_overrides: HashMap::new(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::Used,
         }
     }
 

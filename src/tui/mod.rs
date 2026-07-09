@@ -267,6 +267,9 @@ pub(crate) struct Chrome {
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
     /// a masked prompt (`••••`) of this width, never the raw key.
     pub add_input_len: usize,
+    /// Session-local `u`-key override of the quota-gauge fill direction;
+    /// `None` = the config default carried on the view applies.
+    pub quota_display_override: Option<crate::config::QuotaDisplay>,
 }
 
 /// Attach-mode banner state.
@@ -381,6 +384,10 @@ struct App {
     /// difference is where the minted credential is injected. `None` on a
     /// headless client (the picker shows the `llmux login` fallback instead).
     pending_login: Option<LoginKind>,
+    /// Session-local override of the quota-gauge fill direction, flipped with
+    /// `u` (MAIN and the Accounts overlay). `None` until the first press — the
+    /// config default carried on the view applies.
+    quota_display_override: Option<crate::config::QuotaDisplay>,
 }
 
 impl App {
@@ -403,6 +410,7 @@ impl App {
             session_cursor: 0,
             add_input: String::new(),
             pending_login: None,
+            quota_display_override: None,
         }
     }
 
@@ -437,6 +445,7 @@ impl App {
             sessions_loading: self.sessions_loading,
             session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
+            quota_display_override: self.quota_display_override,
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -685,8 +694,34 @@ impl App {
             KeyCode::Char('f') => self.toggle_codex_fast(view),
             KeyCode::Char('m') => self.cycle_codex_model(view),
             KeyCode::Char('e') => self.cycle_codex_effort(view),
+            // Quota-gauge fill direction (used% grows / left% drains) —
+            // session-local override of config `quota_display`.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
             _ => {}
         }
+    }
+
+    /// Flip the quota-gauge fill direction between used% and remaining%
+    /// (session-local override of config `quota_display`; the config default
+    /// applies until the first press). Color bands stay keyed on USED
+    /// utilization either way — this only flips what the fill length means.
+    fn toggle_quota_display(&mut self, view: Option<&DashboardView>) {
+        use crate::config::QuotaDisplay;
+        let current = self
+            .quota_display_override
+            .unwrap_or_else(|| view.map_or(QuotaDisplay::Used, |v| v.quota_display));
+        let next = match current {
+            QuotaDisplay::Used => QuotaDisplay::Remaining,
+            QuotaDisplay::Remaining => QuotaDisplay::Used,
+        };
+        self.quota_display_override = Some(next);
+        self.set_status(
+            match next {
+                QuotaDisplay::Used => "quota gauges fill: used%",
+                QuotaDisplay::Remaining => "quota gauges fill: remaining%",
+            }
+            .into(),
+        );
     }
 
     /// Key handling for the Accounts overlay (`a`). Houses the issue #3/#4
@@ -697,6 +732,9 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.overlay = Overlay::None,
+            // Same fill-direction toggle as MAIN — the accounts overlay is
+            // where the gauges live full-width.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). Rows render in selection order; the current account
             // (when one exists) is always row 0 — start the cursor there.
@@ -2117,6 +2155,8 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::Used,
             data_quality: crate::dashboard::DataQualityDoc::default(),
         }
     }

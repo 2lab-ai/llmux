@@ -1,7 +1,7 @@
 //! Config schema v1 for `~/.config/llmux.json` (see `.prd/02-architecture.md`).
 //! These structs are the on-disk contract; they are complete and purely declarative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +86,40 @@ pub struct Config {
     /// this field loads with the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// TUI display: shorten well-known email domains in the accounts table
+    /// (`ai3@insightquest.io` → `ai3@iq.io`). Render-only — API documents and
+    /// interactive targets (switch/remove) keep real ids, same layering as
+    /// `email_anonymous`. Additive
+    /// (`#[serde(default = "default_domain_abbrev")]`): a config without this
+    /// field loads the built-in `{"insightquest.io": "iq.io"}` map; set `{}`
+    /// explicitly to disable abbreviation.
+    #[serde(default = "default_domain_abbrev")]
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Which quantity the TUI quota gauges FILL with: `"used"` (default — the
+    /// bar grows as quota burns) or `"remaining"` (the bar drains toward the
+    /// reset). Color bands stay keyed on USED utilization either way. The TUI
+    /// `u` key overrides this live for the session; this field is the boot
+    /// default. Additive (`#[serde(default)]`): older configs load as `used`.
+    #[serde(default)]
+    pub quota_display: QuotaDisplay,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// Fill direction for the TUI quota gauges (config `quota_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaDisplay {
+    /// Fill = fraction of the window already used (default).
+    #[default]
+    Used,
+    /// Fill = fraction still available before the ceiling.
+    Remaining,
+}
+
+/// Built-in domain abbreviations for the accounts table (`domain_abbrev`).
+pub fn default_domain_abbrev() -> BTreeMap<String, String> {
+    BTreeMap::from([("insightquest.io".to_string(), "iq.io".to_string())])
 }
 
 impl Default for Config {
@@ -103,6 +135,8 @@ impl Default for Config {
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: default_domain_abbrev(),
+            quota_display: QuotaDisplay::default(),
             accounts: Vec::new(),
         }
     }

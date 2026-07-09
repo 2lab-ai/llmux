@@ -28,6 +28,10 @@ use super::view::DashboardView;
 use super::{anim, Chrome, Mode, Overlay};
 
 const GAUGE_BAR_WIDTH: usize = 8;
+/// Total width of one quota gauge cell in the accounts table: the whole cell
+/// is one bar (reverse-video fill = utilization) with the reset countdown
+/// overlaid inside, so the old `bar + percent label` split no longer applies.
+const QUOTA_CELL_WIDTH: usize = GAUGE_BAR_WIDTH + 8;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
@@ -88,6 +92,9 @@ struct FrameCtx {
     /// surfaces that render from `chrome` only (sessions overlay, footer
     /// status) can mask without a `view` handle.
     mask: bool,
+    /// Effective quota-gauge fill direction this frame: the `u`-key session
+    /// override when set, else the config default carried on the view.
+    quota_display: crate::config::QuotaDisplay,
 }
 
 /// Display form of an account name under the `email_anonymous` setting:
@@ -99,6 +106,32 @@ fn masked_name(name: &str, mask: bool) -> String {
         crate::demo::alias_always(name)
     } else {
         name.to_string()
+    }
+}
+
+/// Accounts-table display form of an account id: mask first (the
+/// `email_anonymous` aliasing), then strip the `{group}:` prefix — the table's
+/// `group` column already says CLAUDE/CODEX, so repeating it per name is pure
+/// width — then abbreviate the email domain via config `domain_abbrev`
+/// (`ai3@insightquest.io` → `ai3@iq.io`). Render layer ONLY, exactly like
+/// [`masked_name`]: the snapshot keeps real ids so switch/remove still
+/// address the pool correctly. The detail pane keeps the FULL raw id (it is
+/// the fidelity surface, issue #70).
+fn row_account_name(
+    raw: &str,
+    mask: bool,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let masked = masked_name(raw, mask);
+    let bare = masked
+        .split_once(':')
+        .map_or(masked.as_str(), |(_, rest)| rest);
+    match bare.split_once('@') {
+        Some((local, domain)) => match abbrev.get(domain) {
+            Some(short) => format!("{local}@{short}"),
+            None => bare.to_string(),
+        },
+        None => bare.to_string(),
     }
 }
 
@@ -138,6 +171,7 @@ pub(crate) fn draw(
         headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
         frame: chrome.frame,
         mask: view.email_anonymous,
+        quota_display: chrome.quota_display_override.unwrap_or(view.quota_display),
     };
 
     // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
@@ -787,11 +821,15 @@ fn account_row<'a>(
     };
     let name = if is_current {
         Span::styled(
-            masked_name(&account.id.0, ctx.mask),
+            row_account_name(&account.id.0, ctx.mask, &view.domain_abbrev),
             Style::new().add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::raw(masked_name(&account.id.0, ctx.mask))
+        Span::raw(row_account_name(
+            &account.id.0,
+            ctx.mask,
+            &view.domain_abbrev,
+        ))
     };
     let parked = matches!(gate, Some(IneligibleReason::CoolingDown));
     // Poller-health overlay (issue #33): a failing usage poll makes every
@@ -810,6 +848,7 @@ fn account_row<'a>(
         now,
         max_age,
         consecutive_failures,
+        ctx.quota_display,
     );
     let seven_gauge = window_gauge_cell(
         &account.seven_day,
@@ -818,6 +857,7 @@ fn account_row<'a>(
         now,
         max_age,
         consecutive_failures,
+        ctx.quota_display,
     );
     let totals = view.totals_for(&account.id.0);
 
@@ -845,6 +885,7 @@ fn account_row<'a>(
             wide,
             max_age,
             consecutive_failures,
+            ctx.quota_display,
         ));
     }
     cells.push(Cell::from(in_flight_span(account.in_flight)));
@@ -920,16 +961,103 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// One quota window → its gauge cell. The gauge label is ALWAYS the
-/// percentage (req4: it used to flip to the reset countdown when parked / over
-/// threshold, which put a duration where a percent belongs — confusing).
-/// Over-threshold is already signaled by the red color and a `!` marker; the
-/// reset countdown lives in the selected-account detail pane (issue #70 — the
-/// per-row reset columns were relocated there, not dropped).
+/// Build one in-bar quota line: a `width`-column bar whose leading
+/// `fill`-fraction of columns render REVERSE-video in `color` (the fill), with
+/// `text` overlaid centered on top. The first `bold_chars` characters of
+/// `text` (the larger countdown unit) are emboldened. Spans are split at the
+/// fill boundary so the fill shows behind the text — a single-style span
+/// could not paint a partial background. Only spaces + the caller's text are
+/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
+/// `anim.rs` is untouched.
+fn quota_bar_line(
+    fill: f64,
+    color: Color,
+    text: &str,
+    bold_chars: usize,
+    width: usize,
+) -> Line<'static> {
+    let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    let chars: Vec<char> = text.chars().collect();
+    let text_len = chars.len().min(width);
+    let start = (width - text_len) / 2;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for col in 0..width {
+        let ch = if col >= start && col < start + text_len {
+            chars[col - start]
+        } else {
+            ' '
+        };
+        let mut style = Style::new().fg(color);
+        if col < fill_cols {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if col >= start && col < start + bold_chars.min(text_len) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if run_style == Some(style) {
+            run.push(ch);
+        } else {
+            if let Some(prev) = run_style {
+                spans.push(Span::styled(std::mem::take(&mut run), prev));
+            }
+            run.push(ch);
+            run_style = Some(style);
+        }
+    }
+    if let Some(prev) = run_style {
+        spans.push(Span::styled(run, prev));
+    }
+    Line::from(spans)
+}
+
+/// The text overlaid inside a quota bar: the top-2-unit reset countdown
+/// (`7d 10h`), a `!` when the account is parked / past its threshold, and the
+/// window display-state glyph when the value is not fresh (issue #33). Returns
+/// `(text, bold_chars)` where `bold_chars` covers the FIRST countdown unit —
+/// the day/hour magnitude carries most of the signal, so it gets the emphasis.
+/// An expired window (no live reset) reads `0s` — honest and ASCII-narrow.
+fn quota_bar_text(
+    window: &QuotaWindow,
+    now: SystemTime,
+    over: bool,
+    display: WindowDisplayState,
+) -> (String, usize) {
+    let (head, tail) = match window.resets_at.duration_since(now) {
+        Ok(rem) if !rem.is_zero() => format::countdown_units(rem),
+        _ => ("0s".to_string(), None),
+    };
+    let bold_chars = head.chars().count();
+    let mut text = head;
+    if let Some(tail) = tail {
+        text.push(' ');
+        text.push_str(&tail);
+    }
+    if over {
+        text.push('!');
+    }
+    if !matches!(display, WindowDisplayState::Populated) {
+        text.push(' ');
+        text.push(display.glyph());
+    }
+    (text, bold_chars)
+}
+
+/// One quota window → its gauge cell: the WHOLE cell is one bar whose
+/// reverse-video fill is the utilization (fill direction per `quota_display`:
+/// `used` grows as quota burns, `remaining` drains toward the reset), with the
+/// reset countdown overlaid inside ([`quota_bar_text`]). This supersedes req4
+/// ("the gauge label is ALWAYS the percentage"): that rule existed because the
+/// countdown once REPLACED the percent label — now both facts render at once
+/// (fill + color carry utilization, the in-bar text carries the reset), so
+/// neither hides the other. Color bands stay keyed on USED utilization
+/// regardless of the fill direction.
 ///
-/// Issue #33: the gauge cell also carries the [`WindowDisplayState`] so a
-/// never-used (`cold`), stale, or poll-degraded window is visibly distinct from
-/// an honest `0%` — render-only, derived from already-recorded state.
+/// Issue #33: the cell still carries the [`WindowDisplayState`] so a
+/// never-used (`cold`), stale, or poll-degraded window is visibly distinct
+/// from an honest fresh value — render-only, derived from recorded state.
+#[allow(clippy::too_many_arguments)]
 fn window_gauge_cell(
     window: &Option<QuotaWindow>,
     threshold: f64,
@@ -937,6 +1065,7 @@ fn window_gauge_cell(
     now: SystemTime,
     max_age: Duration,
     consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
 ) -> Cell<'static> {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
@@ -949,29 +1078,21 @@ fn window_gauge_cell(
     };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
-    // A trailing `!` flags an account that is parked or past its threshold —
-    // the signal the old countdown-swap was carrying, without hiding the %.
+    // The `!` flags an account that is parked or past its threshold — same
+    // signal as before, now carried inside the bar text.
     let over = parked || utilization > threshold;
-    let label = if over {
-        format!("{}!", format::percent(utilization))
-    } else {
-        format::percent(utilization)
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => utilization,
+        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
-    let mut spans = vec![
-        Span::styled(
-            format::gauge_bar(utilization, GAUGE_BAR_WIDTH),
-            Style::new().fg(color),
-        ),
-        Span::raw(" "),
-        Span::styled(label, Style::new().fg(color)),
-    ];
-    // Stale / poll-degraded windows still carry a real value, but it is no
-    // longer trustworthy — flag it with the state glyph so it reads distinctly
-    // from a fresh populated window (issue #33). Populated needs no marker.
-    if !matches!(display, WindowDisplayState::Populated) {
-        spans.push(Span::styled(format!(" {}", display.glyph()), dim()));
-    }
-    Cell::from(Line::from(spans))
+    let (text, bold_chars) = quota_bar_text(window, now, over, display);
+    Cell::from(quota_bar_line(
+        fill,
+        color,
+        &text,
+        bold_chars,
+        QUOTA_CELL_WIDTH,
+    ))
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
@@ -979,7 +1100,8 @@ fn window_gauge_cell(
 /// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
 /// critical coloring:
 ///
-/// - Present window: bar + `%` in wide mode, a compact `F 97%` marker in
+/// - Present window: the same in-bar countdown gauge as 5h/7d
+///   ([`quota_bar_line`]) in wide mode, a compact `F 7d!` countdown marker in
 ///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
 ///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
@@ -1004,6 +1126,7 @@ fn fable_gauge_cell(
     wide: bool,
     max_age: Duration,
     consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
 ) -> Cell<'static> {
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -1037,29 +1160,36 @@ fn fable_gauge_cell(
     // `!` on the red-critical read, same signal window_cells carries with its
     // over-threshold `!`.
     let over = matches!(level, GaugeLevel::Red);
-    let label = if over {
-        format!("{}!", format::percent(utilization))
-    } else {
-        format::percent(utilization)
-    };
     if wide {
-        let mut spans = vec![
-            Span::styled(
-                format::gauge_bar(utilization, GAUGE_BAR_WIDTH),
-                Style::new().fg(color),
-            ),
-            Span::raw(" "),
-            Span::styled(label, Style::new().fg(color)),
-        ];
-        // Stale / poll-degraded still flag distinctly (issue #33 parity).
-        if !matches!(display, WindowDisplayState::Populated) {
-            spans.push(Span::styled(format!(" {}", display.glyph()), dim()));
-        }
-        Cell::from(Line::from(spans))
+        // Same in-bar countdown gauge as the 5h/7d cells; the critical
+        // override only changes the color/`!`, never the fill math.
+        let fill = match mode {
+            crate::config::QuotaDisplay::Used => utilization,
+            crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
+        };
+        let (text, bold_chars) = quota_bar_text(&scoped.window, now, over, display);
+        Cell::from(quota_bar_line(
+            fill,
+            color,
+            &text,
+            bold_chars,
+            QUOTA_CELL_WIDTH,
+        ))
     } else {
-        // Compact narrow marker (W0 example `F 97!`): `F` + percent + critical
-        // `!`, colored. No bar — the narrow width budget has no room for one.
-        Cell::from(Span::styled(format!("F {label}"), Style::new().fg(color)))
+        // Compact narrow marker: `F` + the top countdown unit + critical `!`
+        // (`F 7d!`), colored. No bar — the narrow width budget has no room for
+        // one. An expired window (no live reset) falls back to the percent so
+        // the marker never reads as a live countdown to a past reset.
+        let label = match scoped.window.resets_at.duration_since(now) {
+            Ok(rem) if !rem.is_zero() => format::countdown_units(rem).0,
+            _ => format::percent(utilization),
+        };
+        let text = if over {
+            format!("F {label}!")
+        } else {
+            format!("F {label}")
+        };
+        Cell::from(Span::styled(text, Style::new().fg(color)))
     }
 }
 
@@ -2578,6 +2708,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 spans.extend([
                     key("f/m/e"),
                     Span::raw(" codex  "),
+                    key("u"),
+                    Span::raw(" used/left  "),
                     key("↑↓"),
                     Span::raw(" scroll"),
                 ]);
@@ -2596,6 +2728,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 Span::raw(" login  "),
                 key("r"),
                 Span::raw(" remove  "),
+                key("u"),
+                Span::raw(" used/left  "),
                 key("Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -2764,8 +2898,72 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::Used,
             data_quality: crate::dashboard::DataQualityDoc::default(),
         }
+    }
+
+    #[test]
+    fn row_account_name_strips_group_prefix_and_abbreviates_domain() {
+        let abbrev = crate::config::default_domain_abbrev();
+        assert_eq!(
+            row_account_name("claude:ai3@insightquest.io", false, &abbrev),
+            "ai3@iq.io"
+        );
+        assert_eq!(
+            row_account_name("codex:ai@insightquest.io", false, &abbrev),
+            "ai@iq.io"
+        );
+        // Unmapped domain: prefix still stripped, domain untouched.
+        assert_eq!(
+            row_account_name("claude:x@example.com", false, &abbrev),
+            "x@example.com"
+        );
+        // No prefix / no email shape: passes through.
+        assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
+    }
+
+    #[test]
+    fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
+        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16);
+        let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 16, "cell is exactly bar-width wide");
+        // First 8 columns reversed (the fill), the rest plain.
+        let mut col = 0usize;
+        for span in &line.spans {
+            let rev = span.style.add_modifier.contains(Modifier::REVERSED);
+            for _ in span.content.chars() {
+                assert_eq!(rev, col < 8, "column {col} reversal");
+                col += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn quota_bar_line_empty_and_full_fill() {
+        for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
+            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16);
+            let rev: usize = line
+                .spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|s| s.content.chars().count())
+                .sum();
+            assert_eq!(rev, want_rev, "fill {fill}");
+        }
+    }
+
+    #[test]
+    fn quota_bar_line_bolds_only_the_leading_unit() {
+        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16);
+        let bold: String = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(bold, "7d", "emphasis covers the larger unit only");
     }
 
     /// Chrome with a given overlay active and `Mode::Normal` (issue #5). The
@@ -2785,6 +2983,7 @@ mod tests {
             sessions_loading: false,
             session_cursor: 0,
             add_input_len: 0,
+            quota_display_override: None,
             attach: None,
         }
     }
@@ -3553,7 +3752,8 @@ mod tests {
             AccountId("claude:me@example.com".into()),
         );
 
-        // Toggle ON (wide layout, width ≥ WIDE_TABLE_AT): Fbl header + 97% gauge.
+        // Toggle ON (wide layout, width ≥ WIDE_TABLE_AT): Fbl header + the
+        // in-bar reset countdown (80_000s out → "22h 13m", critical `!`).
         view.show_fable_weekly = true;
         let on = render(&view, &chrome_overlay(Overlay::None), 200, 20);
         assert!(
@@ -3561,13 +3761,14 @@ mod tests {
             "toggle ON: wide table shows the Fbl gauge column header:\n{on}"
         );
         assert!(
-            on.contains("97%"),
-            "toggle ON: Fable weekly percent rendered:\n{on}"
+            on.contains("22h 13m!"),
+            "toggle ON: Fable weekly in-bar countdown rendered with critical `!`:\n{on}"
         );
-        // The pre-W3 5h gauge is still present and unchanged alongside it.
-        assert!(on.contains("42%"), "toggle ON: 5h gauge still rendered");
+        // The 5h gauge is still present alongside it (+3600s reads "59m …" by
+        // the time the render clock ticks past the helper's `now`).
+        assert!(on.contains("59m"), "toggle ON: 5h gauge still rendered");
 
-        // Toggle OFF: no Fbl column, no Fable percent, 5h column unchanged.
+        // Toggle OFF: no Fbl column, no Fable countdown, 5h column unchanged.
         view.show_fable_weekly = false;
         let off = render(&view, &chrome_overlay(Overlay::None), 200, 20);
         assert!(
@@ -3575,12 +3776,12 @@ mod tests {
             "toggle OFF: no Fbl column header:\n{off}"
         );
         assert!(
-            !off.contains("97%"),
-            "toggle OFF: no Fable weekly percent:\n{off}"
+            !off.contains("22h 13m"),
+            "toggle OFF: no Fable weekly countdown:\n{off}"
         );
         assert!(
-            off.contains("42%"),
-            "toggle OFF: pre-W3 5h gauge unchanged:\n{off}"
+            off.contains("59m"),
+            "toggle OFF: 5h gauge unchanged:\n{off}"
         );
     }
 
@@ -3598,18 +3799,19 @@ mod tests {
             AccountId("claude:me@example.com".into()),
         );
 
-        // Width < WIDE_TABLE_AT → narrow layout.
+        // Width < WIDE_TABLE_AT → narrow layout. The compact marker carries
+        // the top countdown unit + the critical `!` (80_000s out → "F 22h!").
         view.show_fable_weekly = true;
         let on = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            on.contains("F 97%"),
-            "narrow toggle ON: compact `F 97%` marker rendered:\n{on}"
+            on.contains("F 22h!"),
+            "narrow toggle ON: compact `F 22h!` marker rendered:\n{on}"
         );
 
         view.show_fable_weekly = false;
         let off = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            !off.contains("F 97%"),
+            !off.contains("F 22h"),
             "narrow toggle OFF: no Fable marker:\n{off}"
         );
     }
@@ -3721,15 +3923,15 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Narrow marker: `F 76%` with no critical `!` (is_active must not force
-        // the over-threshold marker at 76%).
+        // Narrow marker: the countdown (`F 22h`) with no critical `!`
+        // (is_active must not force the over-threshold marker at 76%).
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 76%"),
-            "76%/warning/is_active renders its normal percent:\n{narrow}"
+            narrow.contains("F 22h"),
+            "76%/warning/is_active renders its normal countdown marker:\n{narrow}"
         );
         assert!(
-            !narrow.contains("76%!"),
+            !narrow.contains("22h!"),
             "is_active alone must NOT force the red-critical `!` marker:\n{narrow}"
         );
     }

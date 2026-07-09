@@ -69,6 +69,15 @@ pub(crate) struct DashboardView {
     /// always reaches the view (see [`AccountSnapshot::scoped_limits`] rebuilt
     /// below) — this flag only gates the render.
     pub show_fable_weekly: bool,
+    /// Accounts-table domain abbreviations (config `domain_abbrev`, carried on
+    /// the document): render `ai3@insightquest.io` as `ai3@iq.io`. Render-only
+    /// — the snapshot keeps real ids, same layering as `email_anonymous`.
+    pub domain_abbrev: std::collections::BTreeMap<String, String>,
+    /// Boot default for the quota-gauge fill direction (config
+    /// `quota_display`, carried on the document). The TUI `u` key holds a
+    /// session-local override in `Chrome`; the effective mode is resolved per
+    /// frame in `ui::draw`.
+    pub quota_display: crate::config::QuotaDisplay,
     /// Data-quality label wording (issue #62 S2), carried verbatim from the
     /// document — the server owns the wording, `ui.rs` renders the cost /
     /// model-usage-scope qualifiers from these strings. A doc from an older
@@ -336,6 +345,8 @@ impl DashboardView {
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
             show_fable_weekly: doc.show_fable_weekly,
+            domain_abbrev: doc.domain_abbrev.clone(),
+            quota_display: doc.quota_display,
             data_quality: doc.data_quality.clone(),
         }
     }
@@ -750,6 +761,35 @@ mod tests {
         assert!(!view.show_fable_weekly);
         // No scoped rows in this doc → empty, not a crash.
         assert!(view.snapshot.accounts[0].fable_weekly().is_none());
+    }
+
+    #[test]
+    fn display_settings_survive_doc_to_view_and_default() {
+        // A doc from an older daemon (neither field) → the built-in abbrev map
+        // and `used` fill, mirroring the show_fable_weekly additive convention.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(
+            view.domain_abbrev
+                .get("insightquest.io")
+                .map(String::as_str),
+            Some("iq.io"),
+            "absent wire field defaults to the built-in map"
+        );
+        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
+
+        // Explicit wire values thread through.
+        let mut json = doc_json();
+        json["domain_abbrev"] = serde_json::json!({"example.com": "ex"});
+        json["quota_display"] = serde_json::json!("remaining");
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(
+            view.domain_abbrev.get("example.com").map(String::as_str),
+            Some("ex")
+        );
+        assert!(view.domain_abbrev.get("insightquest.io").is_none());
+        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Remaining);
     }
 
     #[test]
