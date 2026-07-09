@@ -138,6 +138,23 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     if config.version != 1 {
         return Err(ConfigError::UnsupportedVersion(config.version));
     }
+    // Idle-probe always-on migration (#45). Pre-#45 builds serialized the OLD
+    // conservative default triple — enabled=false, cooldown=3600, sweep=0 — for
+    // every user who never touched the block, so a live config carrying EXACTLY
+    // that triple is indistinguishable from "unset". Treat it as unset and adopt
+    // the new always-on defaults, otherwise the stale serialized value would
+    // pin probing off forever. Any OTHER combination is an operator's explicit
+    // choice and is kept verbatim: an operator opting out post-upgrade sets
+    // enabled=false with a non-default cooldown or a non-zero sweep, which no
+    // longer matches this triple.
+    const LEGACY_IDLE_PROBE_DEFAULT: IdleProbeConfig = IdleProbeConfig {
+        enabled: false,
+        per_account_cooldown_secs: 3600,
+        sweep_secs: 0,
+    };
+    if config.proxy.idle_probe == LEGACY_IDLE_PROBE_DEFAULT {
+        config.proxy.idle_probe = IdleProbeConfig::default();
+    }
     // Demo mode: swap account identities for stable fakes at the source so every
     // surface (dashboard, logs, status) shows the alias. Credentials are keyed
     // by token/uuid, not name, so they keep working.
@@ -837,6 +854,69 @@ mod tests {
 
         let parsed: IdleProbeConfig = serde_json::from_str("{}").expect("empty block parses");
         assert_eq!(parsed, defaults, "missing fields load always-on");
+    }
+
+    #[test]
+    fn legacy_idle_probe_default_triple_upgrades_to_always_on() {
+        // A config written by a pre-#45 build for a user who never touched the
+        // block carries EXACTLY the old conservative triple. That is
+        // indistinguishable from "unset", so load_path must treat it as unset
+        // and adopt the new always-on defaults (else it would pin probing off).
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "proxy": { "idle_probe": {
+                "enabled": false, "per_account_cooldown_secs": 3600, "sweep_secs": 0 } } }"#,
+        )
+        .expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(
+            loaded.proxy.idle_probe,
+            IdleProbeConfig::default(),
+            "legacy triple upgrades to always-on"
+        );
+        assert!(loaded.proxy.idle_probe.enabled);
+        assert_eq!(loaded.proxy.idle_probe.sweep_secs, 3600);
+    }
+
+    #[test]
+    fn explicit_idle_probe_opt_out_survives_load_unchanged() {
+        // enabled=false BUT with a non-default cooldown → an operator's explicit
+        // post-upgrade opt-out, not the legacy triple. It must load verbatim.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "proxy": { "idle_probe": {
+                "enabled": false, "per_account_cooldown_secs": 7200, "sweep_secs": 0 } } }"#,
+        )
+        .expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(
+            loaded.proxy.idle_probe,
+            IdleProbeConfig {
+                enabled: false,
+                per_account_cooldown_secs: 7200,
+                sweep_secs: 0,
+            },
+            "an explicit non-default opt-out is kept verbatim"
+        );
+    }
+
+    #[test]
+    fn missing_idle_probe_block_loads_always_on_via_load_path() {
+        // A config with no idle_probe (or no proxy) block at all loads the
+        // always-on defaults through the serde defaults — no migration needed.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(&path, r#"{ "version": 1 }"#).expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(loaded.proxy.idle_probe, IdleProbeConfig::default());
+        assert!(loaded.proxy.idle_probe.enabled);
     }
 
     #[test]
