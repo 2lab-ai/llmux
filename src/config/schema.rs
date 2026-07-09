@@ -421,15 +421,18 @@ impl Default for ProxyConfig {
 ///
 /// Both modes share a global kill-switch (`enabled = false` disables ALL
 /// probing) and a per-account cooldown so a single account is probed at most
-/// once per `per_account_cooldown_secs`. Defaults are conservative: probing
-/// OFF, the sweep OFF, and a 1-hour cooldown if it is turned on.
+/// once per `per_account_cooldown_secs`. Defaults are ALWAYS-ON (issue #45):
+/// probing enabled with an hourly sweep, so cold accounts populate their
+/// windows out of the box; the kill-switch remains for operators who want
+/// zero probe traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdleProbeConfig {
-    /// Master kill-switch. `false` (the default) disables all idle probing
-    /// (on-demand AND the timer sweep); `true` allows a single gated probe per
-    /// idle account. Conservative default: a real (if minimal) request is only
-    /// ever sent when the operator opts in.
-    #[serde(default)]
+    /// Master kill-switch. `true` (the default, per issue #45's always-on
+    /// mandate) allows a single gated probe per idle account; `false` disables
+    /// all idle probing (on-demand AND the timer sweep). Cost when on is
+    /// bounded by the per-account cooldown: at most one `max_tokens = 1`
+    /// request per cold account per hour, and only while it has no window.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Minimum wall-clock gap between two probes of the SAME account, seconds.
     /// Once an account is probed, a second probe is suppressed until this
@@ -438,15 +441,13 @@ pub struct IdleProbeConfig {
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
     /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
-    /// (issue #45), seconds. `0` (the default) disables the sweep entirely; the
-    /// probe then stays purely on-demand. When `> 0` and `enabled = true`, a
-    /// background task probes every cold account every `sweep_secs` seconds,
-    /// reusing the same kill-switch + per-account cooldown (so the cooldown —
-    /// not this cadence — bounds cost: at most one probe per account per
+    /// (issue #45), seconds. Default 3600 (hourly — one tick per default
+    /// cooldown). `0` disables the sweep entirely; the probe then stays purely
+    /// on-demand. When `> 0` and `enabled = true`, a background task probes
+    /// every cold account every `sweep_secs` seconds, reusing the same
+    /// kill-switch + per-account cooldown (so the cooldown — not this cadence
+    /// — bounds cost: at most one probe per account per
     /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
-    /// A sensible operating value is one tick per cooldown (e.g. `3600`).
-    /// Additive (`#[serde(default)]`) so a config written before this field
-    /// loads with the sweep OFF.
     #[serde(default = "default_idle_probe_sweep_secs")]
     pub sweep_secs: u64,
 }
@@ -454,7 +455,7 @@ pub struct IdleProbeConfig {
 impl Default for IdleProbeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_true(),
             per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
             sweep_secs: default_idle_probe_sweep_secs(),
         }
@@ -799,14 +800,12 @@ fn default_idle_probe_cooldown_secs() -> u64 {
     3600
 }
 
-/// Default idle-probe timer-sweep cadence: `0` = OFF (issue #45). The sweep is
-/// opt-in: even with `enabled = true`, no background probing happens until the
-/// operator sets a positive `sweep_secs`. A sensible operating value is one
-/// tick per `per_account_cooldown_secs` (one probe / account / hour), but the
-/// conservative default keeps the timer dormant so upgrading does not start
-/// spending quota on cold accounts unannounced.
+/// Default idle-probe timer-sweep cadence: hourly (issue #45's always-on
+/// mandate) — one tick per default `per_account_cooldown_secs`, so the steady
+/// state is at most one 1-token probe per cold account per hour, and none once
+/// the account has a window.
 fn default_idle_probe_sweep_secs() -> u64 {
-    0
+    3600
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).

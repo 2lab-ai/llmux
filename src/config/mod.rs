@@ -793,6 +793,21 @@ mod tests {
     }
 
     #[test]
+    fn idle_probe_defaults_are_always_on() {
+        // Issue #45: the probe is ALWAYS-ON out of the box — a cold account
+        // (no 5h/7d window) gets a 1-token probe without any operator opt-in.
+        // Both the Rust default and a config file missing the block entirely
+        // must load enabled with an hourly sweep.
+        let defaults = IdleProbeConfig::default();
+        assert!(defaults.enabled, "probing on by default");
+        assert_eq!(defaults.per_account_cooldown_secs, 3600);
+        assert_eq!(defaults.sweep_secs, 3600, "hourly sweep by default");
+
+        let parsed: IdleProbeConfig = serde_json::from_str("{}").expect("empty block parses");
+        assert_eq!(parsed, defaults, "missing fields load always-on");
+    }
+
+    #[test]
     fn config_path_env_override() {
         // Only this test touches LLMUX_CONFIG; every other test uses
         // the *_path variants, so no env race across the parallel runner.

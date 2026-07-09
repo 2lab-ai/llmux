@@ -2216,11 +2216,14 @@ mod tests {
     }
 
     fn test_state(upstream: &str, accounts: Vec<AccountConfig>) -> AppState {
-        let config = Config {
+        let mut config = Config {
             upstream: upstream.to_string(),
             accounts,
             ..Default::default()
         };
+        // Idle probing is always-on by default (#45); left enabled it would
+        // spawn background max_tokens=1 probes that race this test's upstream.
+        config.proxy.idle_probe.enabled = false;
         let pool = AccountPool::new(&config.accounts);
         let mut state = AppState::new(config, pool, None, None).expect("state");
         state.config_path = None; // never touch the real user config in tests
