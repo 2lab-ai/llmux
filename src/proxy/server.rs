@@ -102,9 +102,9 @@ pub struct AppState {
     pub codex: Arc<crate::provider::codex::CodexProvider>,
     /// On-demand idle-account usage probe (issue #21). Fires at most one
     /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
-    /// ranking/display has real 5h/7d data — never a background loop. Disabled
-    /// by default (`config.proxy.idle_probe.enabled`); cooldown-gated per
-    /// account so traffic-driven triggers never burst.
+    /// ranking/display has real 5h/7d data. Enabled by default (#45;
+    /// `config.proxy.idle_probe.enabled`), with the background timer sweep in
+    /// [`serve`] driving it; cooldown-gated per account so triggers never burst.
     pub idle_prober: Arc<IdleProber<ReqwestProber>>,
     /// Model→backend-group classifier, built from `config.routing`. When
     /// routing is disabled it is the builtin classifier and is never consulted

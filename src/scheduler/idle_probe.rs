@@ -121,27 +121,29 @@ impl<P: Prober> IdleProber<P> {
     }
 
     /// True if the account currently has NO window at all (neither 5h nor
-    /// 7d) — the only case a probe is for. An account with any window is
-    /// already covered by headers/poll and is left alone.
-    fn has_no_window(&self, account: &AccountId) -> bool {
+    /// 7d) AND is not operator-paused — the only case a probe is for. An
+    /// account with any window is already covered by headers/poll, and a
+    /// paused account was explicitly benched by the operator (spending quota
+    /// on it would contradict the pause), so both are left alone.
+    fn probe_eligible(&self, account: &AccountId) -> bool {
         self.pool
             .snapshot()
             .accounts
             .iter()
             .find(|a| &a.id == account)
-            .is_some_and(|a| a.five_hour.is_none() && a.seven_day.is_none())
+            .is_some_and(|a| !a.paused && a.five_hour.is_none() && a.seven_day.is_none())
     }
 
     /// On-demand entry point: probe `account` once iff probing is enabled, the
-    /// account has no window, and its cooldown has elapsed. Returns whether a
-    /// probe was actually sent. On a successful send the parsed
+    /// account has no window and is not paused, and its cooldown has elapsed.
+    /// Returns whether a probe was actually sent. On a successful send the parsed
     /// `anthropic-ratelimit-*` headers are recorded into the pool via
     /// [`AccountPool::record_headers`] (the `WindowSource::Headers` path).
     ///
     /// The pure gating (`try_acquire`) completes and the lock is released
     /// BEFORE the `.await` on the send — no std lock is held across await.
     pub async fn probe_if_idle(&self, account: &AccountId, now: SystemTime) -> bool {
-        if !self.config.enabled || !self.has_no_window(account) {
+        if !self.config.enabled || !self.probe_eligible(account) {
             return false;
         }
         let Some(credential) = self.pool.credential(account) else {
@@ -346,7 +348,7 @@ mod tests {
         assert!(orch.probe_if_idle(&id("a"), now()).await);
         assert_eq!(prober.call_count(), 1);
 
-        // Even after the window expires (forcing `has_no_window` true again by
+        // Even after the window expires (forcing `probe_eligible` true again by
         // clearing it), the cooldown alone must suppress a second probe.
         pool.snapshot(); // (no-op read; window still present here)
         assert!(
@@ -358,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn cooldown_gate_suppresses_even_when_window_unknown() {
-        // Isolate the cooldown from `has_no_window`: a prober that returns NO
+        // Isolate the cooldown from `probe_eligible`: a prober that returns NO
         // usable headers leaves the account windowless, so only the cooldown
         // can stop the second probe.
         let pool = AccountPool::new(&[oauth_account("a")]);
@@ -402,6 +404,23 @@ mod tests {
             pool.snapshot().accounts[0].five_hour.is_none(),
             "no window recorded"
         );
+    }
+
+    #[tokio::test]
+    async fn paused_account_is_not_probed() {
+        // Operator pause (config `paused_accounts`) excludes an account from
+        // automatic selection — probing it would spend quota on an account the
+        // operator explicitly benched, so the probe must skip it too.
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.apply_paused(&std::iter::once("a".to_string()).collect());
+        let prober = CountingProber::new(0.42);
+        let orch = IdleProber::new(pool.clone(), &prober, cfg(true, 3600));
+
+        assert!(
+            !orch.probe_if_idle(&id("a"), now()).await,
+            "paused account: no probe"
+        );
+        assert_eq!(prober.call_count(), 0);
     }
 
     #[tokio::test]
