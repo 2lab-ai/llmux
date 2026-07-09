@@ -761,10 +761,11 @@ fn draw_accounts(
     // column, no width taken. Wide gets a full gauge column; narrow gets a
     // compact marker column (the width budget is tight there).
     let show_fable = view.show_fable_weekly;
-    // The account column is sized to its CONTENT (the widest display name this
-    // frame), never `Fill`: with the bare abbreviated names a fill column
-    // parked a runway of dead space between the names and the data columns.
-    // Floor = the header word; no cap needed (names are already abbreviated).
+    // The account column is `Min(widest display name)`: every name always
+    // fits, and any width LEFT OVER after the fixed data columns is handed to
+    // the account column (Z 2026-07-09: "남는 공간을 account에 최대 할당") —
+    // so the table uses the full terminal width without ever squeezing a
+    // name. Floor = the header word.
     let name_width = ctx
         .order
         .iter()
@@ -782,7 +783,7 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Length(name_width),
+            Constraint::Min(name_width),
             Constraint::Length(20),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
@@ -804,7 +805,7 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Length(name_width),
+            Constraint::Min(name_width),
             Constraint::Length(20),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
