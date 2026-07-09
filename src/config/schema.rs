@@ -117,8 +117,29 @@ pub struct Config {
     /// entries stay pure credentials. Additive: older configs load empty.
     #[serde(default)]
     pub account_limits: BTreeMap<String, AccountLimits>,
+    /// Optional one-line event banner rendered at the very top of the
+    /// dashboard TUI (e.g. a limited-time model promotion countdown). Absent by
+    /// default — the banner takes no row when unset or once its deadline has
+    /// passed. Additive (`#[serde(default)]`): a config written before this
+    /// field loads with no event. See [`EventConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<EventConfig>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// One-line dashboard event banner (config `event`). Display-only: the TUI
+/// renders a single top line while `until` is in the future, then nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventConfig {
+    /// Short human label, e.g. `Fable 5`. Rendered bold at the banner's head.
+    pub label: String,
+    /// Deadline as an RFC3339 timestamp WITH an explicit offset, e.g.
+    /// `2026-07-12T23:59:59-07:00`. The banner renders the deadline in THIS
+    /// offset (labeling the zone from it: `-07:00`→PT, `-04:00`→ET, else
+    /// `UTC±HH`) and counts down to it live; once it passes the banner
+    /// disappears. An unparseable value renders no banner (never a crash).
+    pub until: String,
 }
 
 /// Per-account utilization-ceiling overrides (config `account_limits`); every
@@ -179,6 +200,7 @@ impl Default for Config {
             quota_display: QuotaDisplay::default(),
             paused_accounts: std::collections::BTreeSet::new(),
             account_limits: BTreeMap::new(),
+            event: None,
             accounts: Vec::new(),
         }
     }

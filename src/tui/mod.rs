@@ -449,9 +449,14 @@ impl App {
     /// the first document arrives.
     fn view(&self, now: SystemTime) -> Option<DashboardView> {
         match &self.backend {
-            Backend::Local(state) => Some(DashboardView::from_doc(&crate::dashboard::build_doc(
-                state, now,
-            ))),
+            Backend::Local(state) => {
+                // Local mode owns the loaded Config, so the top-of-dashboard
+                // event banner is read straight from it (display-local; not
+                // plumbed through the `/llmux/dashboard` snapshot).
+                let mut view = DashboardView::from_doc(&crate::dashboard::build_doc(state, now));
+                view.event = state.config.event.clone();
+                Some(view)
+            }
             Backend::Remote(remote) => remote.doc.as_ref().map(DashboardView::from_doc),
         }
     }
@@ -2531,6 +2536,7 @@ mod tests {
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
+            event: None,
         }
     }
 }

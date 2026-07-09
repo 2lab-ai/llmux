@@ -219,6 +219,37 @@ pub(crate) fn draw(
 /// in-flight + activity. No navigation, no overlay surfaces. The selected-
 /// account detail pane and the full log console moved to the Accounts and Logs
 /// overlays respectively; the model strip stays here.
+/// Build the one-line event banner for the very top of MAIN from the configured
+/// event, or `None` when there is no event or its deadline has passed (then no
+/// row is reserved). Pretty and compact:
+/// `Fable 5 · until 7/12 23:59:59 PT · 3d 15h 15m 25s left` — the deadline is
+/// rendered in its own RFC3339 offset (zone labeled from it) and the remaining
+/// time ticks with the existing per-frame redraw. Bold label, dim separators —
+/// distinct but tasteful, consistent with the rest of the TUI.
+fn event_banner_line(event: &crate::config::EventConfig, now: SystemTime) -> Option<Line<'static>> {
+    let deadline = format::parse_event_deadline(&event.until)?;
+    let remaining = deadline
+        .at
+        .duration_since(now)
+        .ok()
+        .filter(|rem| !rem.is_zero())?;
+    let sep = Span::styled(" · ", dim());
+    Some(Line::from(vec![
+        Span::styled(
+            event.label.clone(),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+        sep.clone(),
+        Span::styled("until ", dim()),
+        Span::styled(deadline.display_label(), Style::new().fg(Color::Cyan)),
+        sep,
+        Span::styled(
+            format!("{} left", format::remaining_hms(remaining)),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ]))
+}
+
 fn draw_main(
     frame: &mut Frame,
     view: &DashboardView,
@@ -228,6 +259,11 @@ fn draw_main(
     hits: &mut Option<ActivityChrome>,
 ) {
     let snapshot = &view.snapshot;
+    // Event banner (config `event`): ONE line pinned to the very top while the
+    // deadline is in the future; zero height (no reserved row) when absent,
+    // unparseable, or past.
+    let event_line = view.event.as_ref().and_then(|e| event_banner_line(e, now));
+    let banner_height = u16::from(event_line.is_some());
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     // Compact model strip (req12): only when model data exists. 0 height (no
     // pane) otherwise, so the idle layout is unchanged.
@@ -238,8 +274,9 @@ fn draw_main(
     } else {
         0
     };
-    let [header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
+    let [banner_area, header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
         Layout::vertical([
+            Constraint::Length(banner_height),
             Constraint::Length(1),
             Constraint::Length(table_height),
             Constraint::Length(8),
@@ -249,6 +286,9 @@ fn draw_main(
         ])
         .areas(frame.area());
 
+    if let Some(line) = event_line {
+        frame.render_widget(Paragraph::new(line), banner_area);
+    }
     draw_header(frame, header_area, view, chrome);
     draw_accounts(frame, table_area, view, ctx, chrome);
     draw_middle(frame, middle_area, view, ctx, chrome);
@@ -3023,6 +3063,7 @@ mod tests {
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
+            event: None,
         }
     }
 
