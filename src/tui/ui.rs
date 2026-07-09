@@ -20,7 +20,7 @@ use crate::scheduler::select::IneligibleReason;
 use crate::scheduler::window::{
     classify_window_display, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
 };
-use crate::scheduler::{select, AccountSnapshot, CRITICAL_UTILIZATION};
+use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
@@ -731,7 +731,7 @@ fn draw_accounts(
     let wide = area.width >= WIDE_TABLE_AT;
 
     let selected = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
+        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
             Some(idx.min(ctx.order.len().saturating_sub(1)))
         }
         // NewLogin is a provider picker, not an account-row cursor.
@@ -915,6 +915,7 @@ fn account_row<'a>(
             consecutive_failures,
             ctx.quota_display,
             ctx.reset_absolute,
+            select::effective_limits(account, params).2,
         ));
     }
     cells.push(Cell::from(in_flight_span(account.in_flight)));
@@ -1199,6 +1200,7 @@ fn window_gauge_cell(
 /// - Absent window (no Fable scope on this account): the same cold/stale/
 ///   poll-degraded state 5h/7d show for an absent window, via
 ///   [`classify_window_display`] — never a crash or blank.
+#[allow(clippy::too_many_arguments)]
 fn fable_gauge_cell(
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
@@ -1207,6 +1209,7 @@ fn fable_gauge_cell(
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
+    fable_max: f64,
 ) -> Cell<'static> {
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -1230,7 +1233,7 @@ fn fable_gauge_cell(
     // just-reset 0% window red. `is_active` is NOT a red trigger either — it
     // marks the representative limit, not an exhausted one. Otherwise fall to
     // the fill band.
-    let critical = scoped.is_constraining(now, CRITICAL_UTILIZATION);
+    let critical = scoped.is_constraining(now, fable_max);
     let level = if critical {
         GaugeLevel::Red
     } else {
@@ -1533,7 +1536,7 @@ fn draw_detail(
 ) {
     let snapshot = &view.snapshot;
     let pos = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } => {
+        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
             idx.min(ctx.order.len().saturating_sub(1))
         }
         // NewLogin keeps the detail pane on the current account.
@@ -2861,6 +2864,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             Span::raw(" switch  "),
             key("p"),
             Span::raw(" pause  "),
+            key("L"),
+            Span::raw(" limits  "),
             key("n"),
             Span::raw(" new login  "),
             key("Esc"),
@@ -2868,6 +2873,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ]),
         // The typed key is shown ONLY as a masked width — never the raw
         // characters (AGENTS.md credential rule).
+        Mode::EditLimits { .. } => Line::from(vec![
+            Span::raw(" limits (5h,7d,fbl %): "),
+            Span::styled(
+                format!("{}▏", chrome.limits_input),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            key("Enter"),
+            Span::raw(" apply  "),
+            key("Esc"),
+            Span::raw(" cancel"),
+        ]),
         Mode::AddKey => Line::from(vec![
             Span::raw(" add account — key: "),
             Span::styled(
@@ -2959,6 +2976,7 @@ mod tests {
             select_params: select::SelectParams {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
+                fable_weekly_max: 0.98,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -3069,6 +3087,7 @@ mod tests {
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,
+            limits_input: String::new(),
             attach: None,
         }
     }
@@ -3818,6 +3837,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }
     }
 
@@ -3948,6 +3968,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -4013,6 +4034,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -4082,6 +4104,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -4158,6 +4181,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         view.snapshot
             .current

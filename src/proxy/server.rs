@@ -193,6 +193,7 @@ impl AppState {
         // serves its first selection so a paused account never gets picked at
         // boot (post-boot changes flow through `apply_roster`).
         pool.apply_paused(&config.paused_accounts);
+        pool.apply_limits(&config.account_limits);
         // `connect_timeout` bounds the connect phase; `read_timeout` bounds
         // post-connect silence — a silent upstream that connects then stalls
         // would otherwise hang the session and pin the account. This is an
@@ -390,6 +391,36 @@ impl AppState {
         Ok(known)
     }
 
+    /// Set / clear the per-account ceiling overrides (config `account_limits`)
+    /// — read-merge-write + live roster re-apply, like
+    /// [`Self::set_account_paused`]. An all-`None` limits value removes the
+    /// entry (global ceilings apply again). `Ok(false)` = unknown account.
+    pub fn set_account_limits(
+        &self,
+        name: &str,
+        limits: crate::config::AccountLimits,
+    ) -> Result<bool, crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let mut known = false;
+        let merged = crate::config::update_path(path, |c| {
+            known = c.accounts.iter().any(|a| a.name == name);
+            if known {
+                if limits.is_empty() {
+                    c.account_limits.remove(name);
+                } else {
+                    c.account_limits.insert(name.to_string(), limits);
+                }
+            }
+        })?;
+        if known {
+            self.apply_roster(&merged);
+            tracing::info!(account = %name, ?limits, "account limits updated");
+        }
+        Ok(known)
+    }
+
     pub fn remove_account(&self, name: &str) -> Result<bool, crate::config::ConfigError> {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::NoConfigDir);
@@ -450,6 +481,7 @@ impl AppState {
     fn apply_roster(&self, merged: &Config) {
         self.pool.reload_accounts(&merged.accounts);
         self.pool.apply_paused(&merged.paused_accounts);
+        self.pool.apply_limits(&merged.account_limits);
         let params = self.select_params();
         let now = SystemTime::now();
         for group in eval_groups(&self.pool, self.config.routing.enabled) {
@@ -809,6 +841,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/pause-account", post(pause_account_endpoint))
+        .route("/llmux/account-limits", post(account_limits_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
@@ -1600,6 +1633,67 @@ async fn pause_account_endpoint(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AccountLimitsRequest {
+    account: String,
+    /// Fractions 0..=1; absent field = no override for that window. All three
+    /// absent = clear the account's overrides entirely.
+    five_hour_max: Option<f64>,
+    seven_day_max: Option<f64>,
+    fable_weekly_max: Option<f64>,
+}
+
+/// `POST /llmux/account-limits` — set/clear per-account utilization ceilings
+/// (TUI `L` in the switcher). Values are fractions 0..=1.
+async fn account_limits_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<AccountLimitsRequest>,
+) -> Response {
+    let name = body.account.trim().to_string();
+    if name.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "account is required");
+    }
+    for (label, v) in [
+        ("five_hour_max", body.five_hour_max),
+        ("seven_day_max", body.seven_day_max),
+        ("fable_weekly_max", body.fable_weekly_max),
+    ] {
+        if let Some(v) = v {
+            if !(0.0..=1.0).contains(&v) {
+                return relay_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("{label} must be a fraction in 0..=1 (got {v})"),
+                );
+            }
+        }
+    }
+    let limits = crate::config::AccountLimits {
+        five_hour_max: body.five_hour_max,
+        seven_day_max: body.seven_day_max,
+        fable_weekly_max: body.fable_weekly_max,
+    };
+    match state.set_account_limits(&name, limits) {
+        Ok(true) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "account": name }).to_string(),
+        )
+            .into_response(),
+        Ok(false) => relay_error(
+            StatusCode::NOT_FOUND,
+            &format!("account {name:?} not found"),
+        ),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot set limits",
+        ),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
 /// `POST /llmux/shutdown` — graceful server exit (same loopback /
 /// proxy-api-key rules as every route, via the shared middleware). The 200
 /// is delivered before the process exits: hyper's graceful shutdown stops
@@ -1775,6 +1869,7 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
             usage_max_age: Duration::from_secs(600),
         }
     }

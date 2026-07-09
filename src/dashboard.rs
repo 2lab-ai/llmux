@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::logging::LogLine;
 use crate::proxy::server::{AppState, UsageTotals, EVALUATE_TICK};
 use crate::scheduler::select::{self, SelectParams};
-use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot, CRITICAL_UTILIZATION};
+use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::tui::activity::{
     normalize_model, ActivityLog, ClientUsage, Completed, CompletedBody, InFlight, ModelUsage,
     StatsWindow, Totals, WindowedRow,
@@ -581,6 +581,9 @@ pub struct CodexSettingsDoc {
 pub struct SelectParamsDoc {
     pub five_hour_max: f64,
     pub seven_day_max: f64,
+    /// Fable-weekly ceiling (additive: docs from older daemons default 0.98).
+    #[serde(default = "crate::config::default_fable_weekly_max")]
+    pub fable_weekly_max: f64,
     pub usage_max_age_secs: u64,
 }
 
@@ -589,6 +592,7 @@ impl From<&SelectParams> for SelectParamsDoc {
         Self {
             five_hour_max: params.five_hour_max,
             seven_day_max: params.seven_day_max,
+            fable_weekly_max: params.fable_weekly_max,
             usage_max_age_secs: params.usage_max_age.as_secs(),
         }
     }
@@ -599,6 +603,7 @@ impl From<&SelectParamsDoc> for SelectParams {
         Self {
             five_hour_max: doc.five_hour_max,
             seven_day_max: doc.seven_day_max,
+            fable_weekly_max: doc.fable_weekly_max,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
         }
     }
@@ -639,6 +644,10 @@ pub struct AccountDoc {
     /// Additive: absent in docs from an older daemon → false.
     #[serde(default)]
     pub paused: bool,
+    /// Per-account ceiling overrides (config `account_limits`); absent/null =
+    /// the global scheduler ceilings apply. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::config::AccountLimits>,
     /// Proxy-lifetime relayed totals (status parity).
     pub totals: LifetimeTotalsDoc,
     /// Activity-log totals (ok/err + token split) for the table/detail panes.
@@ -1039,6 +1048,7 @@ fn window_doc(
 fn scoped_window_doc(
     scoped: &crate::scheduler::window::ScopedQuotaWindow,
     now: SystemTime,
+    threshold: f64,
 ) -> ScopedWindowDoc {
     ScopedWindowDoc {
         utilization: scoped.window.utilization,
@@ -1051,7 +1061,7 @@ fn scoped_window_doc(
             .unwrap_or(0),
         severity: scoped.severity.label().to_string(),
         is_active: scoped.is_active,
-        constraining: scoped.is_constraining(now, CRITICAL_UTILIZATION),
+        constraining: scoped.is_constraining(now, threshold),
     }
 }
 
@@ -1215,6 +1225,9 @@ pub(crate) fn dashboard_doc(
             let (status, blocked) =
                 account_status_blocked(account, snapshot, params, now, headers_only);
             let cooling = account.cooldown_until.is_some_and(|until| until > now);
+            // The account's EFFECTIVE Fable ceiling: per-account override else
+            // global — the doc's `constraining` then matches the selector.
+            let fable_max = select::effective_limits(account, params).2;
             let lifetime = totals.get(&account.id);
             let session = hub
                 .account_totals
@@ -1230,13 +1243,15 @@ pub(crate) fn dashboard_doc(
                 healthy: account.healthy,
                 five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
-                fable_weekly: account.fable_weekly().map(|s| scoped_window_doc(s, now)),
+                fable_weekly: account
+                    .fable_weekly()
+                    .map(|s| scoped_window_doc(s, now, fable_max)),
                 scoped_limits: account
                     .scoped_limits
                     .iter()
                     .map(|s| ScopedLimitDoc {
                         scope_label: s.scope_label.clone(),
-                        window: scoped_window_doc(s, now),
+                        window: scoped_window_doc(s, now, fable_max),
                     })
                     .collect(),
                 cooldown_until: account.cooldown_until.filter(|_| cooling).map(epoch_secs),
@@ -1248,6 +1263,7 @@ pub(crate) fn dashboard_doc(
                 token_expires_at_ms: account.token_expires_at_ms,
                 last_refresh_ms: account.last_refresh_ms,
                 paused: account.paused,
+                limits: (!account.limits.is_empty()).then_some(account.limits),
                 totals: LifetimeTotalsDoc {
                     requests: lifetime.requests,
                     input_tokens: lifetime.input_tokens,
@@ -1494,6 +1510,7 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
             usage_max_age: Duration::from_secs(600),
         }
     }
