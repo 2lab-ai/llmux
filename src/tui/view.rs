@@ -788,7 +788,7 @@ mod tests {
             view.domain_abbrev.get("example.com").map(String::as_str),
             Some("ex")
         );
-        assert!(view.domain_abbrev.get("example.com").is_none());
+        assert!(!view.domain_abbrev.contains_key("example.com"));
         assert_eq!(view.quota_display, crate::config::QuotaDisplay::Remaining);
     }
 
