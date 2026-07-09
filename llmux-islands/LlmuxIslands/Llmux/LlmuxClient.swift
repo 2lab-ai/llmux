@@ -91,6 +91,23 @@ struct LlmuxClient: Sendable {
         return try JSONDecoder().decode(Ack.self, from: data).emailAnonymous
     }
 
+    /// `POST /llmux/events` with `{id, from, to, content}` — idempotent upsert
+    /// of ONE event by id. 200 echoes `{"ok": true, "events": [<stored list>]}`;
+    /// 400 on validation failure (non-empty id/content, parseable from/to,
+    /// from < to). Returns nil only when the echo shape is unrecognized (the
+    /// caller keeps its local list and refreshes via the dashboard).
+    func upsertEvent(_ event: LlmuxEvent) async throws -> [LlmuxEvent]? {
+        let data = try await send(makeRequest("/llmux/events", method: "POST", json: event.jsonObject))
+        return LlmuxEventList.decode(data)
+    }
+
+    /// `POST /llmux/events` with `{"remove": "<id>"}` — idempotent remove (an
+    /// absent id is still 200). Same echo shape as the upsert.
+    func removeEvent(id: String) async throws -> [LlmuxEvent]? {
+        let data = try await send(makeRequest("/llmux/events", method: "POST", json: ["remove": id]))
+        return LlmuxEventList.decode(data)
+    }
+
     /// `POST /llmux/login/start` — begin a daemon-run OAuth login (FR4).
     func startLogin(provider: String) async throws -> LoginStartResponse {
         let data = try await send(makeRequest("/llmux/login/start", method: "POST", json: ["provider": provider]))

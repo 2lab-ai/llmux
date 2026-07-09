@@ -47,6 +47,13 @@ targets:
       - path: LlmuxIslandsTests
       - path: LlmuxIslands/Llmux/LlmuxStatus.swift
       - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
+      # Foundation-only `llmux` CLI output parsing (CLIParse / ReleaseChannel /
+      # UpdateOutcome). The Process-spawning CLIRunner lives here too but is
+      # never invoked by the tests — they feed canned strings only.
+      - path: LlmuxIslands/Llmux/CLIRunner.swift
+      # Events DTO + pure time parsing/rendering + echo-list decoding
+      # (LlmuxEvent / LlmuxEventTime / LlmuxEventList). No networking in tests.
+      - path: LlmuxIslands/Llmux/LlmuxEvents.swift
       # Foundation-only analytics logic (issue #62 S4): formatting, the
       # health-warning rule, data-quality fallbacks, (group, model) keying.
       - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
