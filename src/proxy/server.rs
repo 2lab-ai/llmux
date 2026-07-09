@@ -453,6 +453,26 @@ impl AppState {
         Ok(known)
     }
 
+    /// Set / clear the dashboard event banner (config `event`) —
+    /// read-merge-write persistence, mirroring [`Self::set_account_paused`].
+    /// `event = None` clears it. Persistence IS the whole effect: the banner is
+    /// a display-config field read from the loaded config (there is no live
+    /// atomic like `email_anonymous`), so a running local TUI picks the change
+    /// up on its next boot / an attached dashboard re-reads it. Returns the
+    /// persisted value (post read-merge-write) for the endpoint to echo.
+    /// `NoConfigDir` when persistence is disabled (the setter would be a no-op).
+    pub fn set_event(
+        &self,
+        event: Option<crate::config::EventConfig>,
+    ) -> Result<Option<crate::config::EventConfig>, crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let merged = crate::config::update_path(path, |c| c.event = event.clone())?;
+        tracing::info!(event = ?merged.event, "event banner updated");
+        Ok(merged.event)
+    }
+
     pub fn remove_account(&self, name: &str) -> Result<bool, crate::config::ConfigError> {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::NoConfigDir);
@@ -875,6 +895,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
+        .route("/llmux/event", post(event_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
@@ -1746,6 +1767,92 @@ async fn scheduler_mode_endpoint(
             serde_json::json!({ "ok": true, "mode": mode.label() }).to_string(),
         )
             .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EventRequest {
+    /// Short banner label (e.g. `Fable 5`). Present + non-empty to SET; absent
+    /// to CLEAR.
+    #[serde(default)]
+    label: Option<String>,
+    /// RFC3339 deadline WITH an explicit offset (e.g.
+    /// `2026-07-12T23:59:59-07:00`) or a `Z` suffix. Present to SET; absent to
+    /// CLEAR. Must parse with [`crate::event::parse_event_deadline`] — the same
+    /// parser the TUI banner renders with.
+    #[serde(default)]
+    until: Option<String>,
+}
+
+/// `POST /llmux/event` — set or clear the top-of-dashboard event banner (config
+/// `event`). The banner is display-only; this is the operator API that replaces
+/// hand-editing `event` in `~/.config/llmux.json`. Body conventions:
+///   - `{ "label": "Fable 5", "until": "2026-07-12T23:59:59-07:00" }` → SET.
+///   - `{}` or `null` (an empty/absent body) → CLEAR.
+///
+/// `label` and `until` are both required to SET; sending exactly one is a 400.
+/// `until` is validated up front with the SAME parser the banner renders with,
+/// so an unparseable deadline is rejected here rather than silently rendering
+/// no banner later. Persisted read-merge-write via [`AppState::set_event`].
+async fn event_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<Option<EventRequest>>,
+) -> Response {
+    // `{}` and `null` both deserialize to "no fields" → clear.
+    let req = body.0.unwrap_or(EventRequest {
+        label: None,
+        until: None,
+    });
+    let event = match (req.label, req.until) {
+        (None, None) => None, // clear
+        (Some(label), Some(until)) => {
+            let label = label.trim();
+            if label.is_empty() {
+                return relay_error(StatusCode::BAD_REQUEST, "label must be non-empty");
+            }
+            let until = until.trim();
+            if crate::event::parse_event_deadline(until).is_none() {
+                return relay_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "until must be an RFC3339 timestamp with an explicit offset \
+                         (e.g. 2026-07-12T23:59:59-07:00); could not parse {until:?}"
+                    ),
+                );
+            }
+            Some(crate::config::EventConfig {
+                label: label.to_string(),
+                until: until.to_string(),
+            })
+        }
+        (Some(_), None) => {
+            return relay_error(
+                StatusCode::BAD_REQUEST,
+                "until is required to set an event (send {} to clear)",
+            )
+        }
+        (None, Some(_)) => {
+            return relay_error(
+                StatusCode::BAD_REQUEST,
+                "label is required to set an event (send {} to clear)",
+            )
+        }
+    };
+    match state.set_event(event) {
+        Ok(stored) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "event": stored }).to_string(),
+        )
+            .into_response(),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot set event",
+        ),
         Err(err) => relay_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("config write failed: {err}"),
@@ -2813,5 +2920,129 @@ mod tests {
             Some("lm-secret")
         ));
         assert!(client_auth_ok(Some("lm-secret"), Some(loopback), None));
+    }
+
+    #[tokio::test]
+    async fn event_endpoint_sets_and_persists() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("keep")]);
+
+        let response = event_endpoint(
+            State(state.clone()),
+            axum::extract::Json(Some(EventRequest {
+                label: Some("  Fable 5  ".into()),
+                until: Some("2026-07-12T23:59:59-07:00".into()),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        // The echoed event is trimmed and stored verbatim.
+        assert_eq!(body["event"]["label"], "Fable 5");
+        assert_eq!(body["event"]["until"], "2026-07-12T23:59:59-07:00");
+
+        // Persisted read-merge-write: the banner is on disk AND the seeded
+        // account survived the write.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let event = on_disk.event.as_ref().expect("event persisted");
+        assert_eq!(event.label, "Fable 5");
+        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+        assert_eq!(on_disk.accounts.len(), 1, "seeded account preserved");
+    }
+
+    #[tokio::test]
+    async fn event_endpoint_clears_with_empty_body() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        // Seed an event first.
+        state
+            .set_event(Some(crate::config::EventConfig {
+                label: "Fable 5".into(),
+                until: "2026-07-12T23:59:59-07:00".into(),
+            }))
+            .expect("seed event");
+
+        // `{}` (both fields absent) clears it.
+        let response = event_endpoint(
+            State(state.clone()),
+            axum::extract::Json(Some(EventRequest {
+                label: None,
+                until: None,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert!(body["event"].is_null(), "cleared → event: null");
+        assert!(
+            crate::config::load_path(&path)
+                .expect("reload")
+                .event
+                .is_none(),
+            "on-disk event cleared"
+        );
+
+        // A `null` body (Json None) also clears (idempotent here).
+        let response = event_endpoint(State(state), axum::extract::Json(None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn event_endpoint_rejects_unparseable_until() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        let response = event_endpoint(
+            State(state),
+            axum::extract::Json(Some(EventRequest {
+                label: Some("Fable 5".into()),
+                until: Some("not-a-timestamp".into()),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Nothing written on rejection.
+        assert!(crate::config::load_path(&path)
+            .expect("reload")
+            .event
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn event_endpoint_rejects_partial_and_blank_label() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        // label without until → 400.
+        let response = event_endpoint(
+            State(state.clone()),
+            axum::extract::Json(Some(EventRequest {
+                label: Some("Fable 5".into()),
+                until: None,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Present-but-blank label with a valid until → 400.
+        let response = event_endpoint(
+            State(state.clone()),
+            axum::extract::Json(Some(EventRequest {
+                label: Some("   ".into()),
+                until: Some("2026-07-12T23:59:59-07:00".into()),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(crate::config::load_path(&path)
+            .expect("reload")
+            .event
+            .is_none());
     }
 }
