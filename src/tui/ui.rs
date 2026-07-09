@@ -227,7 +227,7 @@ pub(crate) fn draw(
 /// time ticks with the existing per-frame redraw. Bold label, dim separators —
 /// distinct but tasteful, consistent with the rest of the TUI.
 fn event_banner_line(event: &crate::config::EventConfig, now: SystemTime) -> Option<Line<'static>> {
-    let deadline = format::parse_event_deadline(&event.until)?;
+    let deadline = crate::event::parse_event_deadline(&event.until)?;
     let remaining = deadline
         .at
         .duration_since(now)
