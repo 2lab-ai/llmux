@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, State};
@@ -172,6 +172,15 @@ pub struct AppState {
     /// `S` / `POST /llmux/scheduler-mode` flip reflects in the very next
     /// `select_params()` without restart.
     pub round_robin: Arc<AtomicBool>,
+    /// LIVE value of the top-of-dashboard event banner (config `event`), same
+    /// live-holder convention as `email_anonymous`/`round_robin`: seeded from
+    /// `config.event` at boot, replaced by `POST /llmux/event` (via
+    /// [`Self::set_event`]) after the persist, and read into the dashboard
+    /// document each frame/poll — so a running daemon serves the new banner
+    /// immediately, in BOTH TUI backends. `RwLock` (not an atomic) because the
+    /// value is a struct; the lock is only ever held for a short clone/store,
+    /// never across an await.
+    pub event: Arc<RwLock<Option<crate::config::EventConfig>>>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
@@ -264,6 +273,7 @@ impl AppState {
             round_robin: Arc::new(AtomicBool::new(
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
+            event: Arc::new(RwLock::new(config.event.clone())),
             config,
             events: Some(events_tx),
             hub: Arc::new(DashboardHub::default()),
@@ -454,13 +464,13 @@ impl AppState {
     }
 
     /// Set / clear the dashboard event banner (config `event`) —
-    /// read-merge-write persistence, mirroring [`Self::set_account_paused`].
-    /// `event = None` clears it. Persistence IS the whole effect: the banner is
-    /// a display-config field read from the loaded config (there is no live
-    /// atomic like `email_anonymous`), so a running local TUI picks the change
-    /// up on its next boot / an attached dashboard re-reads it. Returns the
-    /// persisted value (post read-merge-write) for the endpoint to echo.
-    /// `NoConfigDir` when persistence is disabled (the setter would be a no-op).
+    /// read-merge-write persistence, mirroring [`Self::set_scheduler_mode`].
+    /// `event = None` clears it. After the persist succeeds, the live
+    /// [`Self::event`] holder is replaced with the merged value, so a running
+    /// daemon serves the new banner in the very next dashboard document — in
+    /// BOTH TUI backends — without a restart or re-read. Returns the persisted
+    /// value (post read-merge-write) for the endpoint to echo. `NoConfigDir`
+    /// when persistence is disabled (the setter would be a no-op).
     pub fn set_event(
         &self,
         event: Option<crate::config::EventConfig>,
@@ -469,6 +479,12 @@ impl AppState {
             return Err(crate::config::ConfigError::NoConfigDir);
         };
         let merged = crate::config::update_path(path, |c| c.event = event.clone())?;
+        // Update the live holder only after the persist succeeds, so a failed
+        // write never leaves the in-memory banner ahead of disk.
+        *self
+            .event
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = merged.event.clone();
         tracing::info!(event = ?merged.event, "event banner updated");
         Ok(merged.event)
     }
@@ -2950,6 +2966,35 @@ mod tests {
         assert_eq!(event.label, "Fable 5");
         assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
         assert_eq!(on_disk.accounts.len(), 1, "seeded account preserved");
+
+        // Live: the running daemon serves the new banner on the very next
+        // dashboard document — no restart, no config reload (the whole point of
+        // the live holder). This is what BOTH TUI backends render.
+        let doc = crate::dashboard::build_doc(&state, SystemTime::now());
+        let doc_event = doc.event.as_ref().expect("build_doc carries the event");
+        assert_eq!(doc_event.label, "Fable 5");
+        assert_eq!(doc_event.until, "2026-07-12T23:59:59-07:00");
+    }
+
+    #[test]
+    fn build_doc_seeds_event_from_config_at_boot() {
+        // The live holder is seeded from `config.event` in `AppState::new`, so
+        // a daemon booted with a configured banner serves it in the FIRST
+        // dashboard document — before any `POST /llmux/event`.
+        let config = Config {
+            accounts: vec![oauth_account("a")],
+            event: Some(crate::config::EventConfig {
+                label: "Fable 5".into(),
+                until: "2026-07-12T23:59:59-07:00".into(),
+            }),
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let state = AppState::new(config, pool, None, None).expect("state");
+        let doc = crate::dashboard::build_doc(&state, SystemTime::now());
+        let event = doc.event.as_ref().expect("config event seeded into doc");
+        assert_eq!(event.label, "Fable 5");
+        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
     }
 
     #[tokio::test]
@@ -2984,6 +3029,14 @@ mod tests {
                 .event
                 .is_none(),
             "on-disk event cleared"
+        );
+        // Live holder cleared too → the next dashboard document drops the
+        // banner without a reload.
+        assert!(
+            crate::dashboard::build_doc(&state, SystemTime::now())
+                .event
+                .is_none(),
+            "build_doc reflects the cleared banner live"
         );
 
         // A `null` body (Json None) also clears (idempotent here).

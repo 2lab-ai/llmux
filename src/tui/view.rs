@@ -83,12 +83,12 @@ pub(crate) struct DashboardView {
     /// model-usage-scope qualifiers from these strings. A doc from an older
     /// daemon fills the byte-identical canonical defaults via serde.
     pub data_quality: crate::dashboard::DataQualityDoc,
-    /// Optional top-of-dashboard event banner (config `event`). Populated ONLY
-    /// in local mode, where the TUI process owns the loaded `Config` and reads
-    /// it directly (see `App::view`); it is a purely display-local concern that
-    /// is deliberately NOT plumbed through the `/llmux/dashboard` snapshot, so
-    /// in attach mode this stays `None`. `ui.rs` renders one line while the
-    /// deadline is in the future and nothing once it passes.
+    /// Optional top-of-dashboard event banner (config `event`). Carried through
+    /// the `/llmux/dashboard` document from the daemon's live event holder
+    /// ([`crate::proxy::server::AppState::event`]), so it populates in BOTH
+    /// backends (local builds the doc in-process; attach receives it) and a
+    /// `POST /llmux/event` reflects on the next frame/poll. `ui.rs` renders one
+    /// line while the deadline is in the future and nothing once it passes.
     pub event: Option<crate::config::EventConfig>,
 }
 
@@ -357,9 +357,11 @@ impl DashboardView {
             domain_abbrev: doc.domain_abbrev.clone(),
             quota_display: doc.quota_display,
             data_quality: doc.data_quality.clone(),
-            // Not carried on the wire (display-local, local-mode only); the
-            // local backend fills it from the loaded Config in `App::view`.
-            event: None,
+            // Carried on the wire from the daemon's live event holder (config
+            // `event`), so the banner renders identically in BOTH backends and
+            // a `POST /llmux/event` reflects on the next document. Absent →
+            // `None` (no banner).
+            event: doc.event.clone(),
         }
     }
 
@@ -543,6 +545,27 @@ mod tests {
         let view2 = DashboardView::from_doc(&doc2);
         assert_eq!(view2.in_flight[0].group, None);
         assert_eq!(view2.in_flight[0].model, None);
+    }
+
+    #[test]
+    fn from_doc_round_trips_the_event_banner() {
+        // The event banner rides the doc from the daemon's live holder, so both
+        // backends render it through from_doc. Present → carried verbatim.
+        let mut json = doc_json();
+        json["event"] = serde_json::json!({
+            "label": "Fable 5",
+            "until": "2026-07-12T23:59:59-07:00",
+        });
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        let event = view.event.as_ref().expect("event carried through from_doc");
+        assert_eq!(event.label, "Fable 5");
+        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+
+        // Absent (older/quiet daemon) → parses to None, no banner. This is the
+        // additive `skip_serializing_if` contract: `doc_json()` has no `event`.
+        let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        assert!(DashboardView::from_doc(&doc2).event.is_none());
     }
 
     #[test]

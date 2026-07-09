@@ -449,14 +449,12 @@ impl App {
     /// the first document arrives.
     fn view(&self, now: SystemTime) -> Option<DashboardView> {
         match &self.backend {
-            Backend::Local(state) => {
-                // Local mode owns the loaded Config, so the top-of-dashboard
-                // event banner is read straight from it (display-local; not
-                // plumbed through the `/llmux/dashboard` snapshot).
-                let mut view = DashboardView::from_doc(&crate::dashboard::build_doc(state, now));
-                view.event = state.config.event.clone();
-                Some(view)
-            }
+            // The event banner rides the dashboard document from the daemon's
+            // live event holder, so both backends get it through `from_doc` —
+            // no local-only special case.
+            Backend::Local(state) => Some(DashboardView::from_doc(&crate::dashboard::build_doc(
+                state, now,
+            ))),
             Backend::Remote(remote) => remote.doc.as_ref().map(DashboardView::from_doc),
         }
     }
