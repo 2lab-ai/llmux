@@ -239,6 +239,19 @@ pub(crate) fn absolute_label(at: SystemTime, now: SystemTime, offset_secs: i64) 
     format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
 }
 
+/// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,
+/// zero-padded clock, at the given UTC `offset_secs`. Pure (offset injected)
+/// so the label is unit-testable without the machine's zone.
+pub(crate) fn month_day_hm(at: SystemTime, offset_secs: i64) -> String {
+    let epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let local = (epoch as i64).saturating_add(offset_secs);
+    let (_, month, day) = civil_from_days(local.div_euclid(86_400));
+    format!("{}/{} {}", month, day, clock_hm(at, offset_secs))
+}
+
 /// Days-since-epoch → (year, month, day), Howard Hinnant's civil algorithm.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;

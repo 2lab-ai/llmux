@@ -172,15 +172,15 @@ pub struct AppState {
     /// `S` / `POST /llmux/scheduler-mode` flip reflects in the very next
     /// `select_params()` without restart.
     pub round_robin: Arc<AtomicBool>,
-    /// LIVE value of the top-of-dashboard event banner (config `event`), same
+    /// LIVE value of the top-of-dashboard event banners (config `events`), same
     /// live-holder convention as `email_anonymous`/`round_robin`: seeded from
-    /// `config.event` at boot, replaced by `POST /llmux/event` (via
-    /// [`Self::set_event`]) after the persist, and read into the dashboard
-    /// document each frame/poll — so a running daemon serves the new banner
-    /// immediately, in BOTH TUI backends. `RwLock` (not an atomic) because the
-    /// value is a struct; the lock is only ever held for a short clone/store,
-    /// never across an await.
-    pub event: Arc<RwLock<Option<crate::config::EventConfig>>>,
+    /// `config.events` at boot, updated by `POST /llmux/events` (via
+    /// [`Self::upsert_event`] / [`Self::remove_event`]) after the persist, and
+    /// read into the dashboard document each frame/poll — so a running daemon
+    /// serves the new banner immediately, in BOTH TUI backends. `RwLock` (not an
+    /// atomic) because the value is a `Vec`; the lock is only ever held for a
+    /// short clone/store, never across an await.
+    pub event_banners: Arc<RwLock<Vec<crate::config::EventBanner>>>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
@@ -273,7 +273,7 @@ impl AppState {
             round_robin: Arc::new(AtomicBool::new(
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
-            event: Arc::new(RwLock::new(config.event.clone())),
+            event_banners: Arc::new(RwLock::new(config.events.clone())),
             config,
             events: Some(events_tx),
             hub: Arc::new(DashboardHub::default()),
@@ -463,30 +463,56 @@ impl AppState {
         Ok(known)
     }
 
-    /// Set / clear the dashboard event banner (config `event`) —
-    /// read-merge-write persistence, mirroring [`Self::set_scheduler_mode`].
-    /// `event = None` clears it. After the persist succeeds, the live
-    /// [`Self::event`] holder is replaced with the merged value, so a running
-    /// daemon serves the new banner in the very next dashboard document — in
-    /// BOTH TUI backends — without a restart or re-read. Returns the persisted
-    /// value (post read-merge-write) for the endpoint to echo. `NoConfigDir`
-    /// when persistence is disabled (the setter would be a no-op).
-    pub fn set_event(
+    /// Upsert one dashboard event banner (config `events`) by `id`: an entry
+    /// with the same `id` is replaced in place, a new `id` is appended.
+    /// IDEMPOTENT — an identical payload persists the same list. Read-merge-write
+    /// persistence, mirroring [`Self::set_scheduler_mode`]. After the persist
+    /// succeeds, the live [`Self::event_banners`] holder is replaced with the
+    /// merged list, so a running daemon serves the change in the very next
+    /// dashboard document — in BOTH TUI backends — without a restart or re-read.
+    /// Returns the persisted list (post read-merge-write) for the endpoint to
+    /// echo. `NoConfigDir` when persistence is disabled (a no-op then).
+    pub fn upsert_event(
         &self,
-        event: Option<crate::config::EventConfig>,
-    ) -> Result<Option<crate::config::EventConfig>, crate::config::ConfigError> {
+        banner: crate::config::EventBanner,
+    ) -> Result<Vec<crate::config::EventBanner>, crate::config::ConfigError> {
+        self.persist_events(
+            |events| match events.iter_mut().find(|e| e.id == banner.id) {
+                Some(existing) => *existing = banner.clone(),
+                None => events.push(banner.clone()),
+            },
+        )
+    }
+
+    /// Remove the dashboard event banner with `id` (config `events`).
+    /// IDEMPOTENT — removing an absent id persists the unchanged list. Same
+    /// read-merge-write + live-holder update as [`Self::upsert_event`]; returns
+    /// the persisted list for the endpoint to echo.
+    pub fn remove_event(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::config::EventBanner>, crate::config::ConfigError> {
+        self.persist_events(|events| events.retain(|e| e.id != id))
+    }
+
+    /// Shared read-merge-write for the event-banner list: apply `mutate` to
+    /// `config.events`, persist, then mirror the merged list into the live
+    /// holder only after the write succeeds (so a failed write never leaves the
+    /// in-memory banners ahead of disk).
+    fn persist_events(
+        &self,
+        mutate: impl Fn(&mut Vec<crate::config::EventBanner>),
+    ) -> Result<Vec<crate::config::EventBanner>, crate::config::ConfigError> {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::NoConfigDir);
         };
-        let merged = crate::config::update_path(path, |c| c.event = event.clone())?;
-        // Update the live holder only after the persist succeeds, so a failed
-        // write never leaves the in-memory banner ahead of disk.
+        let merged = crate::config::update_path(path, |c| mutate(&mut c.events))?;
         *self
-            .event
+            .event_banners
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = merged.event.clone();
-        tracing::info!(event = ?merged.event, "event banner updated");
-        Ok(merged.event)
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = merged.events.clone();
+        tracing::info!(count = merged.events.len(), "event banners updated");
+        Ok(merged.events)
     }
 
     pub fn remove_account(&self, name: &str) -> Result<bool, crate::config::ConfigError> {
@@ -911,7 +937,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
-        .route("/llmux/event", post(event_endpoint))
+        .route("/llmux/events", post(events_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
@@ -1791,80 +1817,120 @@ async fn scheduler_mode_endpoint(
 }
 
 #[derive(serde::Deserialize)]
-struct EventRequest {
-    /// Short banner label (e.g. `Fable 5`). Present + non-empty to SET; absent
-    /// to CLEAR.
+struct EventsRequest {
+    /// REMOVE directive: `{ "remove": "<id>" }` deletes the banner with that
+    /// `id` (idempotent). When present, the upsert fields below are ignored.
     #[serde(default)]
-    label: Option<String>,
-    /// RFC3339 deadline WITH an explicit offset (e.g.
-    /// `2026-07-12T23:59:59-07:00`) or a `Z` suffix. Present to SET; absent to
-    /// CLEAR. Must parse with [`crate::event::parse_event_deadline`] — the same
-    /// parser the TUI banner renders with.
+    remove: Option<String>,
+    /// Stable identifier / upsert key (required to upsert).
     #[serde(default)]
-    until: Option<String>,
+    id: Option<String>,
+    /// Window start — RFC3339-with-offset or compact `YYYYMMDDHHMM` (local).
+    #[serde(default)]
+    from: Option<String>,
+    /// Window end — same two forms as `from`; must parse strictly after it.
+    #[serde(default)]
+    to: Option<String>,
+    /// Rendered banner text.
+    #[serde(default)]
+    content: Option<String>,
 }
 
-/// `POST /llmux/event` — set or clear the top-of-dashboard event banner (config
-/// `event`). The banner is display-only; this is the operator API that replaces
-/// hand-editing `event` in `~/.config/llmux.json`. Body conventions:
-///   - `{ "label": "Fable 5", "until": "2026-07-12T23:59:59-07:00" }` → SET.
-///   - `{}` or `null` (an empty/absent body) → CLEAR.
+/// Build the shared `{ "ok": true, "events": [...] }` 200 response.
+fn ok_events(events: Vec<crate::config::EventBanner>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "ok": true, "events": events }).to_string(),
+    )
+        .into_response()
+}
+
+/// `POST /llmux/events` — upsert or remove ONE top-of-dashboard event banner
+/// (config `events`). The banner is display-only; this is the operator API that
+/// replaces hand-editing `events` in `~/.config/llmux.json`. Body conventions
+/// (matching the flat POST+JSON idiom of the other `/llmux/*` mutations):
+///   - `{ "id", "from", "to", "content" }` → IDEMPOTENT upsert by `id` (same
+///     id replaces that entry, a new id appends; an identical payload is a
+///     no-op that still returns 200).
+///   - `{ "remove": "<id>" }` → remove that banner by id (idempotent).
 ///
-/// `label` and `until` are both required to SET; sending exactly one is a 400.
-/// `until` is validated up front with the SAME parser the banner renders with,
-/// so an unparseable deadline is rejected here rather than silently rendering
-/// no banner later. Persisted read-merge-write via [`AppState::set_event`].
-async fn event_endpoint(
+/// Both branches echo the stored list. Upsert validation: non-empty `id` and
+/// `content`; `from`/`to` each parse via [`crate::event::parse_event_time`]
+/// (the SAME parser the banner renders with, so an unparseable timestamp is
+/// rejected here rather than silently rendering no banner later); `from` must
+/// be strictly earlier than `to`. Persisted read-merge-write via
+/// [`AppState::upsert_event`] / [`AppState::remove_event`].
+async fn events_endpoint(
     State(state): State<AppState>,
-    body: axum::extract::Json<Option<EventRequest>>,
+    body: axum::extract::Json<EventsRequest>,
 ) -> Response {
-    // `{}` and `null` both deserialize to "no fields" → clear.
-    let req = body.0.unwrap_or(EventRequest {
-        label: None,
-        until: None,
-    });
-    let event = match (req.label, req.until) {
-        (None, None) => None, // clear
-        (Some(label), Some(until)) => {
-            let label = label.trim();
-            if label.is_empty() {
-                return relay_error(StatusCode::BAD_REQUEST, "label must be non-empty");
-            }
-            let until = until.trim();
-            if crate::event::parse_event_deadline(until).is_none() {
-                return relay_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "until must be an RFC3339 timestamp with an explicit offset \
-                         (e.g. 2026-07-12T23:59:59-07:00); could not parse {until:?}"
-                    ),
-                );
-            }
-            Some(crate::config::EventConfig {
-                label: label.to_string(),
-                until: until.to_string(),
-            })
+    let req = body.0;
+
+    // Remove branch: `{ "remove": "<id>" }`.
+    if let Some(id) = req.remove {
+        let id = id.trim();
+        if id.is_empty() {
+            return relay_error(StatusCode::BAD_REQUEST, "remove must be a non-empty id");
         }
-        (Some(_), None) => {
-            return relay_error(
-                StatusCode::BAD_REQUEST,
-                "until is required to set an event (send {} to clear)",
-            )
-        }
-        (None, Some(_)) => {
-            return relay_error(
-                StatusCode::BAD_REQUEST,
-                "label is required to set an event (send {} to clear)",
-            )
-        }
+        return match state.remove_event(id) {
+            Ok(stored) => ok_events(stored),
+            Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "config persistence disabled; cannot remove event",
+            ),
+            Err(err) => relay_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("config write failed: {err}"),
+            ),
+        };
+    }
+
+    // Upsert branch: all four fields required.
+    let (Some(id), Some(from), Some(to), Some(content)) = (req.id, req.from, req.to, req.content)
+    else {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            "id, from, to and content are required to upsert an event \
+             (or send {\"remove\": \"<id>\"} to remove one)",
+        );
     };
-    match state.set_event(event) {
-        Ok(stored) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "ok": true, "event": stored }).to_string(),
-        )
-            .into_response(),
+    let (id, from, to, content) = (id.trim(), from.trim(), to.trim(), content.trim());
+    if id.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "id must be non-empty");
+    }
+    if content.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "content must be non-empty");
+    }
+    let Some(from_at) = crate::event::parse_event_time(from) else {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "from must be an RFC3339 timestamp with an explicit offset or a \
+                 compact YYYYMMDDHHMM local time; could not parse {from:?}"
+            ),
+        );
+    };
+    let Some(to_at) = crate::event::parse_event_time(to) else {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "to must be an RFC3339 timestamp with an explicit offset or a \
+                 compact YYYYMMDDHHMM local time; could not parse {to:?}"
+            ),
+        );
+    };
+    if from_at >= to_at {
+        return relay_error(StatusCode::BAD_REQUEST, "from must be earlier than to");
+    }
+    let banner = crate::config::EventBanner {
+        id: id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        content: content.to_string(),
+    };
+    match state.upsert_event(banner) {
+        Ok(stored) => ok_events(stored),
         Err(crate::config::ConfigError::NoConfigDir) => relay_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "config persistence disabled; cannot set event",
@@ -2938,164 +3004,235 @@ mod tests {
         assert!(client_auth_ok(Some("lm-secret"), Some(loopback), None));
     }
 
+    /// An `EventsRequest` upsert body (all four fields present).
+    fn upsert_req(id: &str, from: &str, to: &str, content: &str) -> EventsRequest {
+        EventsRequest {
+            remove: None,
+            id: Some(id.into()),
+            from: Some(from.into()),
+            to: Some(to.into()),
+            content: Some(content.into()),
+        }
+    }
+
+    /// An `EventsRequest` remove body.
+    fn remove_req(id: &str) -> EventsRequest {
+        EventsRequest {
+            remove: Some(id.into()),
+            id: None,
+            from: None,
+            to: None,
+            content: None,
+        }
+    }
+
     #[tokio::test]
-    async fn event_endpoint_sets_and_persists() {
+    async fn events_endpoint_upserts_and_persists() {
         let dir = TempDir::new();
         let path = dir.path().join("llmux.json");
         let state = endpoint_state(&path, vec![oauth_account("keep")]);
 
-        let response = event_endpoint(
+        // The example entry, with the compact local-time format and padded
+        // whitespace to prove trimming.
+        let response = events_endpoint(
             State(state.clone()),
-            axum::extract::Json(Some(EventRequest {
-                label: Some("  Fable 5  ".into()),
-                until: Some("2026-07-12T23:59:59-07:00".into()),
-            })),
+            axum::extract::Json(upsert_req(
+                "  20260712-fable5  ",
+                "202607080000",
+                "202607130000",
+                "  Fable 5 Available until 7/12  ",
+            )),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["ok"], true);
-        // The echoed event is trimmed and stored verbatim.
-        assert_eq!(body["event"]["label"], "Fable 5");
-        assert_eq!(body["event"]["until"], "2026-07-12T23:59:59-07:00");
+        // The echoed list carries the trimmed, stored entry.
+        assert_eq!(body["events"][0]["id"], "20260712-fable5");
+        assert_eq!(body["events"][0]["from"], "202607080000");
+        assert_eq!(body["events"][0]["to"], "202607130000");
+        assert_eq!(body["events"][0]["content"], "Fable 5 Available until 7/12");
 
         // Persisted read-merge-write: the banner is on disk AND the seeded
         // account survived the write.
         let on_disk = crate::config::load_path(&path).expect("reload");
-        let event = on_disk.event.as_ref().expect("event persisted");
-        assert_eq!(event.label, "Fable 5");
-        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+        assert_eq!(on_disk.events.len(), 1, "event persisted");
+        assert_eq!(on_disk.events[0].id, "20260712-fable5");
         assert_eq!(on_disk.accounts.len(), 1, "seeded account preserved");
 
         // Live: the running daemon serves the new banner on the very next
-        // dashboard document — no restart, no config reload (the whole point of
-        // the live holder). This is what BOTH TUI backends render.
+        // dashboard document — no restart, no config reload. Both TUI backends
+        // render this.
         let doc = crate::dashboard::build_doc(&state, SystemTime::now());
-        let doc_event = doc.event.as_ref().expect("build_doc carries the event");
-        assert_eq!(doc_event.label, "Fable 5");
-        assert_eq!(doc_event.until, "2026-07-12T23:59:59-07:00");
+        assert_eq!(doc.events.len(), 1, "build_doc carries the event");
+        assert_eq!(doc.events[0].content, "Fable 5 Available until 7/12");
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_upsert_is_idempotent_and_appends_new_ids() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+
+        // Same id twice with different content → ONE entry, replaced.
+        events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "202607080000", "202607130000", "first")),
+        )
+        .await;
+        let response = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "202607080000", "202607130000", "second")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"].as_array().expect("array").len(), 1);
+        assert_eq!(body["events"][0]["content"], "second", "same id replaced");
+
+        // An IDENTICAL payload is a no-op that still 200s and keeps one entry.
+        let response = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "202607080000", "202607130000", "second")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"].as_array().expect("array").len(), 1);
+
+        // A NEW id appends.
+        let response = events_endpoint(
+            State(state),
+            axum::extract::Json(upsert_req("b", "202607080000", "202607130000", "other")),
+        )
+        .await;
+        let body = response_json(response).await;
+        assert_eq!(body["events"].as_array().expect("array").len(), 2);
+        // On-disk order: replaced-in-place "a" first, appended "b" second.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.events[0].id, "a");
+        assert_eq!(on_disk.events[1].id, "b");
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_removes_by_id_idempotently() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![]);
+        state
+            .upsert_event(crate::config::EventBanner {
+                id: "a".into(),
+                from: "202607080000".into(),
+                to: "202607130000".into(),
+                content: "keep".into(),
+            })
+            .expect("seed a");
+        state
+            .upsert_event(crate::config::EventBanner {
+                id: "b".into(),
+                from: "202607080000".into(),
+                to: "202607130000".into(),
+                content: "drop".into(),
+            })
+            .expect("seed b");
+
+        // Remove "b" → only "a" remains, on disk and live.
+        let response =
+            events_endpoint(State(state.clone()), axum::extract::Json(remove_req("b"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"].as_array().expect("array").len(), 1);
+        assert_eq!(body["events"][0]["id"], "a");
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.events.len(), 1);
+        assert_eq!(on_disk.events[0].id, "a");
+
+        // Removing an absent id is idempotent — still 200, unchanged list.
+        let response = events_endpoint(State(state), axum::extract::Json(remove_req("b"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"].as_array().expect("array").len(), 1);
     }
 
     #[test]
-    fn build_doc_seeds_event_from_config_at_boot() {
-        // The live holder is seeded from `config.event` in `AppState::new`, so
-        // a daemon booted with a configured banner serves it in the FIRST
-        // dashboard document — before any `POST /llmux/event`.
+    fn build_doc_seeds_events_from_config_at_boot() {
+        // The live holder is seeded from `config.events` in `AppState::new`, so
+        // a daemon booted with configured banners serves them in the FIRST
+        // dashboard document — before any `POST /llmux/events`.
         let config = Config {
             accounts: vec![oauth_account("a")],
-            event: Some(crate::config::EventConfig {
-                label: "Fable 5".into(),
-                until: "2026-07-12T23:59:59-07:00".into(),
-            }),
+            events: vec![crate::config::EventBanner {
+                id: "20260712-fable5".into(),
+                from: "202607080000".into(),
+                to: "202607130000".into(),
+                content: "Fable 5 Available until 7/12".into(),
+            }],
             ..Default::default()
         };
         let pool = AccountPool::new(&config.accounts);
         let state = AppState::new(config, pool, None, None).expect("state");
         let doc = crate::dashboard::build_doc(&state, SystemTime::now());
-        let event = doc.event.as_ref().expect("config event seeded into doc");
-        assert_eq!(event.label, "Fable 5");
-        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+        assert_eq!(doc.events.len(), 1, "config events seeded into doc");
+        assert_eq!(doc.events[0].id, "20260712-fable5");
     }
 
     #[tokio::test]
-    async fn event_endpoint_clears_with_empty_body() {
-        let dir = TempDir::new();
-        let path = dir.path().join("llmux.json");
-        let state = endpoint_state(&path, vec![oauth_account("a")]);
-        // Seed an event first.
-        state
-            .set_event(Some(crate::config::EventConfig {
-                label: "Fable 5".into(),
-                until: "2026-07-12T23:59:59-07:00".into(),
-            }))
-            .expect("seed event");
-
-        // `{}` (both fields absent) clears it.
-        let response = event_endpoint(
-            State(state.clone()),
-            axum::extract::Json(Some(EventRequest {
-                label: None,
-                until: None,
-            })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["ok"], true);
-        assert!(body["event"].is_null(), "cleared → event: null");
-        assert!(
-            crate::config::load_path(&path)
-                .expect("reload")
-                .event
-                .is_none(),
-            "on-disk event cleared"
-        );
-        // Live holder cleared too → the next dashboard document drops the
-        // banner without a reload.
-        assert!(
-            crate::dashboard::build_doc(&state, SystemTime::now())
-                .event
-                .is_none(),
-            "build_doc reflects the cleared banner live"
-        );
-
-        // A `null` body (Json None) also clears (idempotent here).
-        let response = event_endpoint(State(state), axum::extract::Json(None)).await;
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn event_endpoint_rejects_unparseable_until() {
+    async fn events_endpoint_rejects_invalid_upserts() {
         let dir = TempDir::new();
         let path = dir.path().join("llmux.json");
         let state = endpoint_state(&path, vec![]);
 
-        let response = event_endpoint(
-            State(state),
-            axum::extract::Json(Some(EventRequest {
-                label: Some("Fable 5".into()),
-                until: Some("not-a-timestamp".into()),
-            })),
+        // Unparseable `from`.
+        let bad_from = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "not-a-time", "202607130000", "c")),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        // Nothing written on rejection.
+        assert_eq!(bad_from.status(), StatusCode::BAD_REQUEST);
+
+        // `from` >= `to`.
+        let inverted = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "202607130000", "202607080000", "c")),
+        )
+        .await;
+        assert_eq!(inverted.status(), StatusCode::BAD_REQUEST);
+
+        // Blank id and blank content.
+        let blank_id = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("  ", "202607080000", "202607130000", "c")),
+        )
+        .await;
+        assert_eq!(blank_id.status(), StatusCode::BAD_REQUEST);
+        let blank_content = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(upsert_req("a", "202607080000", "202607130000", "  ")),
+        )
+        .await;
+        assert_eq!(blank_content.status(), StatusCode::BAD_REQUEST);
+
+        // Missing fields (only id) → 400. Blank remove → 400.
+        let missing = events_endpoint(
+            State(state.clone()),
+            axum::extract::Json(EventsRequest {
+                remove: None,
+                id: Some("a".into()),
+                from: None,
+                to: None,
+                content: None,
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let blank_remove =
+            events_endpoint(State(state), axum::extract::Json(remove_req("  "))).await;
+        assert_eq!(blank_remove.status(), StatusCode::BAD_REQUEST);
+
+        // Nothing written across all rejections.
         assert!(crate::config::load_path(&path)
             .expect("reload")
-            .event
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn event_endpoint_rejects_partial_and_blank_label() {
-        let dir = TempDir::new();
-        let path = dir.path().join("llmux.json");
-        let state = endpoint_state(&path, vec![]);
-
-        // label without until → 400.
-        let response = event_endpoint(
-            State(state.clone()),
-            axum::extract::Json(Some(EventRequest {
-                label: Some("Fable 5".into()),
-                until: None,
-            })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // Present-but-blank label with a valid until → 400.
-        let response = event_endpoint(
-            State(state.clone()),
-            axum::extract::Json(Some(EventRequest {
-                label: Some("   ".into()),
-                until: Some("2026-07-12T23:59:59-07:00".into()),
-            })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(crate::config::load_path(&path)
-            .expect("reload")
-            .event
-            .is_none());
+            .events
+            .is_empty());
     }
 }

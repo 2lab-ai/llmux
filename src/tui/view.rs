@@ -83,13 +83,14 @@ pub(crate) struct DashboardView {
     /// model-usage-scope qualifiers from these strings. A doc from an older
     /// daemon fills the byte-identical canonical defaults via serde.
     pub data_quality: crate::dashboard::DataQualityDoc,
-    /// Optional top-of-dashboard event banner (config `event`). Carried through
-    /// the `/llmux/dashboard` document from the daemon's live event holder
-    /// ([`crate::proxy::server::AppState::event`]), so it populates in BOTH
-    /// backends (local builds the doc in-process; attach receives it) and a
-    /// `POST /llmux/event` reflects on the next frame/poll. `ui.rs` renders one
-    /// line while the deadline is in the future and nothing once it passes.
-    pub event: Option<crate::config::EventConfig>,
+    /// Top-of-dashboard event banners (config `events`). Carried through the
+    /// `/llmux/dashboard` document from the daemon's live holder
+    /// ([`crate::proxy::server::AppState::event_banners`]), so they populate in
+    /// BOTH backends (local builds the doc in-process; attach receives it) and a
+    /// `POST /llmux/events` reflects on the next frame/poll. `ui.rs` renders the
+    /// active banner (`from <= now < to`) with the earliest `to` as one line,
+    /// and nothing when none is active.
+    pub events: Vec<crate::config::EventBanner>,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -358,10 +359,10 @@ impl DashboardView {
             quota_display: doc.quota_display,
             data_quality: doc.data_quality.clone(),
             // Carried on the wire from the daemon's live event holder (config
-            // `event`), so the banner renders identically in BOTH backends and
-            // a `POST /llmux/event` reflects on the next document. Absent →
-            // `None` (no banner).
-            event: doc.event.clone(),
+            // `events`), so the banner renders identically in BOTH backends and
+            // a `POST /llmux/events` reflects on the next document. Absent →
+            // empty (no banner).
+            events: doc.events.clone(),
         }
     }
 
@@ -548,24 +549,26 @@ mod tests {
     }
 
     #[test]
-    fn from_doc_round_trips_the_event_banner() {
-        // The event banner rides the doc from the daemon's live holder, so both
-        // backends render it through from_doc. Present → carried verbatim.
+    fn from_doc_round_trips_the_event_banners() {
+        // The event banners ride the doc from the daemon's live holder, so both
+        // backends render them through from_doc. Present → carried verbatim.
         let mut json = doc_json();
-        json["event"] = serde_json::json!({
-            "label": "Fable 5",
-            "until": "2026-07-12T23:59:59-07:00",
-        });
+        json["events"] = serde_json::json!([{
+            "id": "20260712-fable5",
+            "from": "202607080000",
+            "to": "202607130000",
+            "content": "Fable 5 Available until 7/12",
+        }]);
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
-        let event = view.event.as_ref().expect("event carried through from_doc");
-        assert_eq!(event.label, "Fable 5");
-        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+        assert_eq!(view.events.len(), 1, "events carried through from_doc");
+        assert_eq!(view.events[0].id, "20260712-fable5");
+        assert_eq!(view.events[0].content, "Fable 5 Available until 7/12");
 
-        // Absent (older/quiet daemon) → parses to None, no banner. This is the
-        // additive `skip_serializing_if` contract: `doc_json()` has no `event`.
+        // Absent (older/quiet daemon) → parses to empty, no banner. This is the
+        // additive `skip_serializing_if` contract: `doc_json()` has no `events`.
         let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
-        assert!(DashboardView::from_doc(&doc2).event.is_none());
+        assert!(DashboardView::from_doc(&doc2).events.is_empty());
     }
 
     #[test]
