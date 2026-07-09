@@ -44,9 +44,12 @@ struct LlmuxDashboard: Decodable {
     /// Data-quality labels (issue #62 U18). The server field ships in a later
     /// slice — decoded fully optionally so its absence today is not an error.
     let dataQuality: LlmuxDashboardDataQuality?
+    /// Operator events list (replaces the single event banner). Additive →
+    /// `[]` for daemons that predate it or carry no events.
+    let events: [LlmuxEvent]
 
     enum CodingKeys: String, CodingKey {
-        case version, port, current, accounts, totals, windowed, activity
+        case version, port, current, accounts, totals, windowed, activity, events
         case uptimeSecs = "uptime_secs"
         case currentByGroup = "current_by_group"
         case modelUsage = "model_usage"
@@ -72,6 +75,7 @@ struct LlmuxDashboard: Decodable {
         emailAnonymous = try c.decodeIfPresent(Bool.self, forKey: .emailAnonymous)
         showFableWeekly = try c.decodeIfPresent(Bool.self, forKey: .showFableWeekly)
         dataQuality = try c.decodeIfPresent(LlmuxDashboardDataQuality.self, forKey: .dataQuality)
+        events = try c.decodeIfPresent([LlmuxEvent].self, forKey: .events) ?? []
     }
 }
 
