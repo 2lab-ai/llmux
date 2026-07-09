@@ -500,6 +500,16 @@ pub struct DashboardDoc {
     /// construction (see [`DataQualityDoc`]).
     #[serde(default)]
     pub data_quality: DataQualityDoc,
+    /// Live top-of-dashboard event banner (config `event`), read from the
+    /// daemon's live [`crate::proxy::server::AppState::event`] holder each frame
+    /// / poll. Carried here so BOTH TUI backends render it identically (local
+    /// builds the doc in-process; attach receives it here) and a `POST
+    /// /llmux/event` reflects on the next document without restart. Additive:
+    /// `skip_serializing_if = "Option::is_none"` keeps it off the wire when
+    /// unset, and an absent field parses back to `None`, so an older client
+    /// attaching to a newer daemon (and vice versa) is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<crate::config::EventConfig>,
 }
 
 /// Serde default for additive `bool` fields that default ON.
@@ -989,6 +999,10 @@ pub struct DocMeta {
     /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
     /// already carries the config-derived display fields the builder needs.
     pub pricing_overrides: HashMap<String, crate::pricing::ModelPrice>,
+    /// Live event banner (config `event`), read from the daemon's live
+    /// [`crate::proxy::server::AppState::event`] holder. See
+    /// [`DashboardDoc::event`].
+    pub event: Option<crate::config::EventConfig>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1453,6 +1467,9 @@ pub(crate) fn dashboard_doc(
         // Canonical label wording (issue #62 S2) — constant per build, not
         // state-derived; `Default` IS the canonical set.
         data_quality: DataQualityDoc::default(),
+        // Live event banner (config `event`), read from the daemon's live
+        // holder in `build_doc`; carried so both TUI backends render it.
+        event: meta.event.clone(),
     }
 }
 
@@ -1496,6 +1513,13 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // no runtime endpoint; the TUI `u` key overrides quota_display locally.
         domain_abbrev: state.config.domain_abbrev.clone(),
         quota_display: state.config.quota_display,
+        // Live event holder, not the config snapshot: a `POST /llmux/event`
+        // must reflect on the very next frame/poll without restart.
+        event: state
+            .event
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -1543,6 +1567,7 @@ mod tests {
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::Used,
+            event: None,
         }
     }
 
@@ -1966,6 +1991,36 @@ mod tests {
             now(),
             meta,
         )
+    }
+
+    #[test]
+    fn doc_carries_event_from_meta_and_skips_it_when_absent() {
+        // Present: the meta's live-holder event lands in the doc and survives a
+        // JSON round-trip verbatim.
+        let mut meta = meta();
+        meta.event = Some(crate::config::EventConfig {
+            label: "Fable 5".into(),
+            until: "2026-07-12T23:59:59-07:00".into(),
+        });
+        let doc = seeded_doc_with_meta(&meta);
+        let event = doc.event.as_ref().expect("meta event carried into doc");
+        assert_eq!(event.label, "Fable 5");
+        let json: serde_json::Value = serde_json::to_value(&doc).expect("serialize");
+        assert_eq!(json["event"]["label"], "Fable 5");
+        assert_eq!(json["event"]["until"], "2026-07-12T23:59:59-07:00");
+        let reparsed: DashboardDoc = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(reparsed.event, doc.event);
+
+        // Absent: `meta()` defaults `event: None`, so the additive
+        // `skip_serializing_if` keeps the field off the wire entirely — an
+        // older client never sees an unexpected key.
+        let doc_none = seeded_doc();
+        assert!(doc_none.event.is_none());
+        let json_none: serde_json::Value = serde_json::to_value(&doc_none).expect("serialize");
+        assert!(
+            json_none.get("event").is_none(),
+            "event omitted from the wire when None"
+        );
     }
 
     #[test]
