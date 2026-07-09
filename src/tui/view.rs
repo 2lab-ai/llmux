@@ -776,12 +776,16 @@ mod tests {
             Some("iq.io"),
             "absent wire field defaults to the built-in map"
         );
-        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
+        assert_eq!(
+            view.quota_display,
+            crate::config::QuotaDisplay::Remaining,
+            "default fill is remaining — full green bar draining"
+        );
 
         // Explicit wire values thread through.
         let mut json = doc_json();
         json["domain_abbrev"] = serde_json::json!({"example.com": "ex"});
-        json["quota_display"] = serde_json::json!("remaining");
+        json["quota_display"] = serde_json::json!("used");
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert_eq!(
@@ -789,7 +793,7 @@ mod tests {
             Some("ex")
         );
         assert!(!view.domain_abbrev.contains_key("insightquest.io"));
-        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Remaining);
+        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
     }
 
     #[test]

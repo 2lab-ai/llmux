@@ -486,9 +486,10 @@ pub struct DashboardDoc {
     #[serde(default = "crate::config::default_domain_abbrev")]
     pub domain_abbrev: BTreeMap<String, String>,
     /// Fill direction for the TUI quota gauges (config `quota_display`):
-    /// `used` fills as quota burns, `remaining` drains toward the reset.
-    /// Display-only boot default — the TUI `u` key overrides it live for the
-    /// session. Additive: absent in docs from an older daemon → `used`.
+    /// `remaining` (default) drains toward the reset, `used` fills as quota
+    /// burns. Display-only boot default — the TUI `u` key overrides it live
+    /// for the session. Additive: absent in docs from an older daemon →
+    /// `remaining`.
     #[serde(default)]
     pub quota_display: crate::config::QuotaDisplay,
     /// Data-quality qualifiers for the derived statistics (issue #62 S2).
