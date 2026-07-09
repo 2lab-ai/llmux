@@ -488,6 +488,38 @@ pub struct SchedulerConfig {
     /// gated by this). Default 0.98. Additive: older configs load 0.98.
     #[serde(default = "default_fable_weekly_max")]
     pub fable_weekly_max: f64,
+    /// Which selection algorithm runs (see README "Schedulers"): `default`
+    /// (quota-maximizing perishability score) or `round-robin` (sequential
+    /// exhaust in roster order — the fewest-switches mode; each account
+    /// switch invalidates the upstream prompt cache, so fewer switches =
+    /// fewer re-read tokens). Toggle live from the TUI with `S`. Additive:
+    /// older configs load `default`.
+    #[serde(default)]
+    pub mode: SchedulerMode,
+}
+
+/// Selection algorithm (config `scheduler.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerMode {
+    /// Quota-maximizing: perishability-scored pick with damped proactive
+    /// switching (the historical behavior).
+    #[default]
+    Default,
+    /// Sequential exhaust: stay on the current account until it is hard
+    /// ineligible, then move to the NEXT account in roster order (wrapping).
+    /// Minimizes account switches (prompt-cache friendly).
+    RoundRobin,
+}
+
+impl SchedulerMode {
+    /// Stable wire/display label (matches the serde encoding).
+    pub fn label(self) -> &'static str {
+        match self {
+            SchedulerMode::Default => "default",
+            SchedulerMode::RoundRobin => "round-robin",
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -499,6 +531,7 @@ impl Default for SchedulerConfig {
             usage_max_age_secs: default_usage_max_age_secs(),
             refresh_ahead_secs: default_refresh_ahead_secs(),
             fable_weekly_max: default_fable_weekly_max(),
+            mode: SchedulerMode::default(),
         }
     }
 }

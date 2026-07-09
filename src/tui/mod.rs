@@ -336,6 +336,9 @@ struct Remote {
     /// Limits change queued by the switcher's `L` editor, performed by the
     /// event loop via `POST /llmux/account-limits`.
     pending_limits: Option<(String, crate::config::AccountLimits)>,
+    /// Scheduler-mode change queued by `S`, performed by the event loop via
+    /// `POST /llmux/scheduler-mode`.
+    pending_mode: Option<crate::config::SchedulerMode>,
     /// API key for a new account, queued by the `a` flow and performed by the
     /// event loop via `POST /llmux/add-account`. Held only until the POST
     /// fires; never logged or rendered raw.
@@ -727,8 +730,61 @@ impl App {
             KeyCode::Char('u') => self.toggle_quota_display(view),
             // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
             KeyCode::Char('t') => self.toggle_reset_display(),
+            // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
+            KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
         }
+    }
+
+    /// Flip the scheduler between default and round-robin (persisted server
+    /// side; see README "Schedulers").
+    fn toggle_scheduler_mode(&mut self, view: Option<&DashboardView>) {
+        use crate::config::SchedulerMode;
+        let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
+        let next = match current {
+            SchedulerMode::Default => SchedulerMode::RoundRobin,
+            SchedulerMode::RoundRobin => SchedulerMode::Default,
+        };
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_scheduler_mode(next) {
+                Ok(mode) => self.set_status(format!("scheduler mode: {}", mode.label())),
+                Err(err) => self.set_status(format!("scheduler mode change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_mode = Some(next);
+                self.set_status(format!("scheduler mode → {}…", next.label()));
+            }
+        }
+    }
+
+    fn take_pending_mode(&mut self) -> Option<crate::config::SchedulerMode> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_mode.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote mode change (`POST /llmux/scheduler-mode`).
+    async fn perform_remote_mode(&mut self, mode: crate::config::SchedulerMode) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/scheduler-mode", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "mode": mode.label() }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("scheduler mode: {}", mode.label())
+            }
+            Ok(response) => format!("scheduler mode change failed: {}", response.status()),
+            Err(err) => format!("scheduler mode change failed: {err}"),
+        };
+        self.set_status(message);
     }
 
     /// Flip the quota bars between reset countdown and absolute UTC stamp.
@@ -1673,6 +1729,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_codex: None,
         pending_pause: None,
         pending_limits: None,
+        pending_mode: None,
         pending_add: None,
         pending_remove: None,
     })));
@@ -1781,6 +1838,10 @@ async fn event_loop(
         }
         if let Some((account, limits)) = app.take_pending_limits() {
             app.perform_remote_limits(account, limits).await;
+            redraw = true;
+        }
+        if let Some(mode) = app.take_pending_mode() {
+            app.perform_remote_mode(mode).await;
             redraw = true;
         }
         if let Some(api_key) = app.take_pending_add() {
@@ -1956,6 +2017,7 @@ mod tests {
             pending_codex: None,
             pending_pause: None,
             pending_limits: None,
+            pending_mode: None,
             pending_add: None,
             pending_remove: None,
         })))
@@ -2442,6 +2504,7 @@ mod tests {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
+                mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),

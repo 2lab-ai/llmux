@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
     AccountLimits, CodexConfig, Config, IdleProbeConfig, ProxyConfig, QuotaDisplay, RawIoConfig,
-    RoutingConfig, SchedulerConfig, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES,
-    DEFAULT_UPSTREAM,
+    RoutingConfig, SchedulerConfig, SchedulerMode, Upsert, DEFAULT_CODEX_TOKEN_URL,
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
