@@ -18,6 +18,8 @@ pub struct SelectParams {
     pub five_hour_max: f64,
     /// 7d utilization ceiling (default 0.99).
     pub seven_day_max: f64,
+    /// Fable-weekly utilization ceiling for FABLE requests (default 0.98).
+    pub fable_weekly_max: f64,
     /// Usage data older than this makes an account ineligible — unless ALL
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
@@ -29,6 +31,7 @@ impl From<&SchedulerConfig> for SelectParams {
         Self {
             five_hour_max: cfg.five_hour_max,
             seven_day_max: cfg.seven_day_max,
+            fable_weekly_max: cfg.fable_weekly_max,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
         }
     }
@@ -87,6 +90,19 @@ pub enum RequestScope {
 /// Boundary semantics: a window AT the threshold is still eligible
 /// (`utilization <= max`); only strictly-over crosses the gate. A missing
 /// window is a cold account — utilization 0, immediately eligible.
+/// The 5h/7d/Fable ceilings that apply to THIS account: the per-account
+/// override (config `account_limits`) when set, else the global params.
+pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64, f64) {
+    (
+        account.limits.five_hour_max.unwrap_or(params.five_hour_max),
+        account.limits.seven_day_max.unwrap_or(params.seven_day_max),
+        account
+            .limits
+            .fable_weekly_max
+            .unwrap_or(params.fable_weekly_max),
+    )
+}
+
 pub fn eligibility(
     account: &AccountSnapshot,
     params: &SelectParams,
@@ -131,16 +147,17 @@ pub fn gate(
     {
         return Some(IneligibleReason::CoolingDown);
     }
+    let (five_max, seven_max, _) = effective_limits(account, params);
     let five = account
         .five_hour
         .map_or(0.0, |w| w.effective_utilization(now));
-    if five > params.five_hour_max {
+    if five > five_max {
         return Some(IneligibleReason::FiveHourOverThreshold);
     }
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    if seven > params.seven_day_max {
+    if seven > seven_max {
         return Some(IneligibleReason::SevenDayOverThreshold);
     }
     // Codex accounts are exempt from the staleness gate: there is no usage
@@ -184,7 +201,7 @@ pub fn gate_scoped(
         if account.fable_cooldown_active(now) {
             return Some(IneligibleReason::FableCoolingDown);
         }
-        if account.fable_weekly_exhausted(now) {
+        if account.fable_weekly_exhausted(now, effective_limits(account, params).2) {
             return Some(IneligibleReason::FableWeeklyExhausted);
         }
     }
@@ -475,8 +492,9 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    let r5 = (params.five_hour_max - five).max(0.0);
-    let r7 = (params.seven_day_max - seven).max(0.0);
+    let (five_max, seven_max, _) = effective_limits(account, params);
+    let r5 = (five_max - five).max(0.0);
+    let r7 = (seven_max - seven).max(0.0);
     let servable_now = r5.min(r7);
     let urgency = match live_reset(&account.seven_day, now) {
         Some(reset) => {
@@ -647,7 +665,7 @@ pub fn blocking_reason(
             format!(
                 "5h {:.1}% > {:.0}%",
                 util * 100.0,
-                params.five_hour_max * 100.0
+                effective_limits(account, params).0 * 100.0
             )
         }
         IneligibleReason::SevenDayOverThreshold => {
@@ -657,7 +675,7 @@ pub fn blocking_reason(
             format!(
                 "7d {:.1}% > {:.0}%",
                 util * 100.0,
-                params.seven_day_max * 100.0
+                effective_limits(account, params).1 * 100.0
             )
         }
         IneligibleReason::UsageStale => {
@@ -850,6 +868,7 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -884,7 +903,35 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }
+    }
+
+    #[test]
+    fn per_account_limit_overrides_beat_the_global_ceilings() {
+        // Global 5h ceiling is 0.90; this account overrides it down to 0.50.
+        let mut a = account("alpha");
+        a.five_hour = Some(window(0.60, 3_600));
+        a.limits.five_hour_max = Some(0.50);
+        assert_eq!(
+            eligibility(&a, &params(), now(), false),
+            Some(IneligibleReason::FiveHourOverThreshold),
+            "0.60 > per-account 0.50 even though the global ceiling is 0.90"
+        );
+        // The blocking reason reports the EFFECTIVE ceiling.
+        let reason = blocking_reason(
+            &a,
+            IneligibleReason::FiveHourOverThreshold,
+            &params(),
+            now(),
+        );
+        assert!(
+            reason.contains("> 50%"),
+            "effective ceiling in text: {reason}"
+        );
+        // Clearing the override restores the global ceiling.
+        a.limits.five_hour_max = None;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
     }
 
     #[test]
@@ -2085,6 +2132,7 @@ mod tests {
         let p = SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 1.0,
+            fable_weekly_max: 0.98,
             usage_max_age: Duration::from_secs(600),
         };
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
@@ -2262,7 +2310,7 @@ mod tests {
         // a Fable request must be ALLOWED (gate returns None).
         let ok = fable_headroom("ok");
         assert!(
-            !ok.fable_weekly_exhausted(now()),
+            !ok.fable_weekly_exhausted(now(), 0.98),
             "76%/warning/is_active is NOT exhausted — it still has headroom"
         );
         assert_eq!(
@@ -2273,7 +2321,7 @@ mod tests {
         // Contrast: a genuinely exhausted Fable account (100%/Critical/is_active)
         // IS still excluded from Fable routing.
         let dead = fable_critical("dead");
-        assert!(dead.fable_weekly_exhausted(now()));
+        assert!(dead.fable_weekly_exhausted(now(), 0.98));
         assert_eq!(
             gate_scoped(&dead, &params(), now(), false, false, RequestScope::Fable),
             Some(IneligibleReason::FableWeeklyExhausted),

@@ -189,6 +189,9 @@ pub struct AccountState {
     /// selection AND manual switch until resumed. Windows keep polling so the
     /// gauges stay truthful while parked.
     pub paused: bool,
+    /// Per-account ceiling overrides (config `account_limits`); empty = the
+    /// global scheduler ceilings apply.
+    pub limits: crate::config::AccountLimits,
 }
 
 impl AccountState {
@@ -206,6 +209,7 @@ impl AccountState {
             cooldown_set_at: None,
             in_flight: 0,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }
     }
 
@@ -696,6 +700,7 @@ impl PoolState {
                     },
                     last_refresh_ms: a.credential.last_refresh_ms(),
                     paused: a.paused,
+                    limits: a.limits,
                 })
                 .collect(),
             current: self.current.clone(),
@@ -794,6 +799,9 @@ pub struct AccountSnapshot {
     /// Operator pause (config `paused_accounts`): gates automatic selection
     /// and manual switch in every mode until resumed.
     pub paused: bool,
+    /// Per-account ceiling overrides (config `account_limits`); `None` fields
+    /// fall back to the global [`select::SelectParams`] ceilings.
+    pub limits: crate::config::AccountLimits,
 }
 
 impl AccountSnapshot {
@@ -834,12 +842,14 @@ impl AccountSnapshot {
     }
 
     /// Preemptive Fable-routing exclusion (W2 point 4): this account's Fable
-    /// weekly bucket is currently constraining (`is_active` / critical / ≥95%,
-    /// reset-aware), so Fable requests should avoid it while non-Fable traffic
-    /// stays eligible.
-    pub fn fable_weekly_exhausted(&self, now: SystemTime) -> bool {
+    /// weekly bucket is currently constraining (`is_active` / critical / over
+    /// `threshold`, reset-aware), so Fable requests should avoid it while
+    /// non-Fable traffic stays eligible. `threshold` is the account's
+    /// EFFECTIVE Fable ceiling (config `scheduler.fable_weekly_max`, default
+    /// 0.98, overridable per account via `account_limits`).
+    pub fn fable_weekly_exhausted(&self, now: SystemTime, threshold: f64) -> bool {
         self.fable_weekly()
-            .is_some_and(|s| s.is_constraining(now, CRITICAL_UTILIZATION))
+            .is_some_and(|s| s.is_constraining(now, threshold))
     }
 }
 
@@ -1180,6 +1190,18 @@ impl AccountPool {
             account.paused = paused.contains(&account.id.0);
         }
     }
+
+    /// Apply the per-account ceiling overrides (config `account_limits`) to
+    /// the live pool — same config-is-SSOT convention as [`Self::apply_paused`].
+    pub fn apply_limits(
+        &self,
+        limits: &std::collections::BTreeMap<String, crate::config::AccountLimits>,
+    ) {
+        let mut state = self.write();
+        for account in &mut state.accounts {
+            account.limits = limits.get(&account.id.0).copied().unwrap_or_default();
+        }
+    }
 }
 
 /// Drop-based guard pinning one account for one in-flight request.
@@ -1239,6 +1261,7 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -1585,7 +1608,7 @@ mod tests {
         let a = &snapshot.accounts[0];
         assert!(a.fable_cooldown_active(now()), "Fable-scoped cooldown set");
         assert!(
-            a.fable_weekly_exhausted(now()),
+            a.fable_weekly_exhausted(now(), 0.98),
             "preemptive Fable exclusion also engaged"
         );
     }

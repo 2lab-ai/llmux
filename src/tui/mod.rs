@@ -207,6 +207,12 @@ pub(crate) enum Mode {
     NewLogin {
         idx: usize,
     },
+    /// Editing per-account ceiling overrides for the switcher's highlighted
+    /// row (`L`). The typed text lives in [`App::add_input`]; format
+    /// `5h,7d,fbl` percents, empty = back to the global ceilings.
+    EditLimits {
+        idx: usize,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -272,6 +278,9 @@ pub(crate) struct Chrome {
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
     /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
     pub reset_absolute: bool,
+    /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
+    /// Rendered raw in the footer (percent ceilings are not secrets).
+    pub limits_input: String,
 }
 
 /// Attach-mode banner state.
@@ -324,6 +333,9 @@ struct Remote {
     /// Pause/resume queued by the switcher's `p` key, performed by the event
     /// loop via `POST /llmux/pause-account`.
     pending_pause: Option<(String, bool)>,
+    /// Limits change queued by the switcher's `L` editor, performed by the
+    /// event loop via `POST /llmux/account-limits`.
+    pending_limits: Option<(String, crate::config::AccountLimits)>,
     /// API key for a new account, queued by the `a` flow and performed by the
     /// event loop via `POST /llmux/add-account`. Held only until the POST
     /// fires; never logged or rendered raw.
@@ -456,6 +468,11 @@ impl App {
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
+            limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
+                self.add_input.clone()
+            } else {
+                String::new()
+            },
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -512,6 +529,7 @@ impl App {
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
         match self.mode {
             Mode::Select { idx } => return self.on_key_select(key.code, idx, view),
+            Mode::EditLimits { idx } => return self.on_key_edit_limits(key.code, idx, view),
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
@@ -924,6 +942,124 @@ impl App {
         self.set_status(message);
     }
 
+    fn take_pending_limits(&mut self) -> Option<(String, crate::config::AccountLimits)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_limits.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote limits change (`POST /llmux/account-limits`).
+    async fn perform_remote_limits(
+        &mut self,
+        account: String,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/account-limits", remote.base_url);
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "account": account,
+            "five_hour_max": limits.five_hour_max,
+            "seven_day_max": limits.seven_day_max,
+            "fable_weekly_max": limits.fable_weekly_max,
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("limits updated for {account}")
+            }
+            Ok(response) => format!("limits change failed: {}", response.status()),
+            Err(err) => format!("limits change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Open the limits editor for the switcher's highlighted row (`L` in
+    /// `Mode::Select`). Input format: `5h,7d,fbl` as percents (`90,98,98`),
+    /// missing/empty positions keep no override, empty input = all-global.
+    fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let fmt = |v: Option<f64>| v.map_or("global".to_string(), |v| format!("{:.0}%", v * 100.0));
+        self.add_input.clear();
+        self.mode = Mode::EditLimits { idx };
+        self.set_status(format!(
+            "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
+            target.id,
+            fmt(target.limits.five_hour_max),
+            fmt(target.limits.seven_day_max),
+            fmt(target.limits.fable_weekly_max),
+        ));
+    }
+
+    /// Key handling for `Mode::EditLimits`: plain text entry (digits, `,`,
+    /// `.`, space), Enter parses + applies, Esc cancels back to the switcher.
+    fn on_key_edit_limits(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' || c == '.' || c == ' ' => {
+                self.add_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.add_input.pop();
+            }
+            KeyCode::Esc => {
+                self.add_input.clear();
+                self.mode = Mode::Select { idx };
+            }
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.add_input);
+                match parse_limits_input(&raw) {
+                    Ok(limits) => {
+                        self.apply_limits_selected(idx, view, limits);
+                        self.mode = Mode::Select { idx };
+                    }
+                    Err(err) => {
+                        // Keep editing — restore the text so it can be fixed.
+                        self.add_input = raw;
+                        self.set_status(err);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply parsed limits to the highlighted row (local: in-process persist;
+    /// attach: queue the POST).
+    fn apply_limits_selected(
+        &mut self,
+        idx: usize,
+        view: Option<&DashboardView>,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_account_limits(&name, limits) {
+                Ok(true) => self.set_status(format!("limits updated for {name}")),
+                Ok(false) => self.set_status(format!("account {name} not found")),
+                Err(err) => self.set_status(format!("limits change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_limits = Some((name.clone(), limits));
+                self.set_status(format!("updating limits for {name}…"));
+            }
+        }
+    }
+
     /// Toggle the operator pause on the switcher's highlighted row (`p` in
     /// `Mode::Select`). Local mode applies + persists in-process; attach mode
     /// queues the POST for the event loop.
@@ -1018,6 +1154,9 @@ impl App {
                 self.toggle_pause_selected(idx, view);
                 self.mode = Mode::Select { idx };
             }
+            // `L` from the switcher: edit the highlighted account's ceiling
+            // overrides (config `account_limits`).
+            KeyCode::Char('L') => self.open_limits_editor(idx, view),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
@@ -1533,6 +1672,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_switch: None,
         pending_codex: None,
         pending_pause: None,
+        pending_limits: None,
         pending_add: None,
         pending_remove: None,
     })));
@@ -1639,6 +1779,10 @@ async fn event_loop(
             app.perform_remote_pause(account, paused).await;
             redraw = true;
         }
+        if let Some((account, limits)) = app.take_pending_limits() {
+            app.perform_remote_limits(account, limits).await;
+            redraw = true;
+        }
         if let Some(api_key) = app.take_pending_add() {
             app.perform_remote_add(api_key).await;
             redraw = true;
@@ -1737,8 +1881,64 @@ fn load_sessions() -> Vec<crate::session::Session> {
     crate::session::fold_sessions(&records)
 }
 
+/// Parse the limits-editor input: comma/space-separated percents in order
+/// `5h, 7d, fbl` — `"90,98,98"`, `"90"` (5h only), `"90,,98"` (skip 7d),
+/// `""` (all global). Values are percents; `>1` divides by 100, `<=1` is
+/// taken as a fraction, so `0.9` and `90` mean the same ceiling.
+fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String> {
+    let mut vals: [Option<f64>; 3] = [None, None, None];
+    let cleaned = raw.trim();
+    if !cleaned.is_empty() {
+        let parts: Vec<&str> = cleaned.split(',').collect();
+        if parts.len() > 3 {
+            return Err("at most 3 values: 5h,7d,fbl".into());
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let n: f64 = part
+                .parse()
+                .map_err(|_| format!("not a number: {part:?}"))?;
+            let frac = if n > 1.0 { n / 100.0 } else { n };
+            if !(frac > 0.0 && frac <= 1.0) {
+                return Err(format!("{part:?} out of range (1..=100%)"));
+            }
+            vals[i] = Some(frac);
+        }
+    }
+    Ok(crate::config::AccountLimits {
+        five_hour_max: vals[0],
+        seven_day_max: vals[1],
+        fable_weekly_max: vals[2],
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
+        let p = super::parse_limits_input;
+        let l = p("90,98,98").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.90));
+        assert_eq!(l.seven_day_max, Some(0.98));
+        assert_eq!(l.fable_weekly_max, Some(0.98));
+        // Fractions work too; positions may be skipped.
+        let l = p("0.5,,97").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.5));
+        assert_eq!(l.seven_day_max, None);
+        assert_eq!(l.fable_weekly_max, Some(0.97));
+        // Empty = clear all overrides.
+        assert!(p("").unwrap().is_empty());
+        assert!(p("  ").unwrap().is_empty());
+        // Errors: junk, out of range, too many.
+        assert!(p("abc").is_err());
+        assert!(p("0").is_err());
+        assert!(p("101").is_err());
+        assert!(p("1,2,3,4").is_err());
+    }
+
     use super::*;
 
     /// An `App` on a remote backend — buildable without a terminal, so the
@@ -1755,6 +1955,7 @@ mod tests {
             pending_switch: None,
             pending_codex: None,
             pending_pause: None,
+            pending_limits: None,
             pending_add: None,
             pending_remove: None,
         })))
@@ -2223,6 +2424,7 @@ mod tests {
             token_expires_at_ms: None,
             last_refresh_ms: None,
             paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         v
     }
@@ -2239,6 +2441,7 @@ mod tests {
             select_params: select::SelectParams {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
+                fable_weekly_max: 0.98,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),

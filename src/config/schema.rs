@@ -111,8 +111,38 @@ pub struct Config {
     /// (`#[serde(default)]`): older configs load with nothing paused.
     #[serde(default)]
     pub paused_accounts: std::collections::BTreeSet<String>,
+    /// Per-account overrides of the scheduler's utilization ceilings, keyed by
+    /// account name. Absent fields fall back to the global `scheduler.*`
+    /// values. Kept as a top-level map (like `paused_accounts`) so account
+    /// entries stay pure credentials. Additive: older configs load empty.
+    #[serde(default)]
+    pub account_limits: BTreeMap<String, AccountLimits>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// Per-account utilization-ceiling overrides (config `account_limits`); every
+/// field optional — `None` falls back to the global scheduler value.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AccountLimits {
+    /// Override of `scheduler.five_hour_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_max: Option<f64>,
+    /// Override of `scheduler.seven_day_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_max: Option<f64>,
+    /// Override of `scheduler.fable_weekly_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable_weekly_max: Option<f64>,
+}
+
+impl AccountLimits {
+    /// True when no field overrides anything — the map entry can be dropped.
+    pub fn is_empty(&self) -> bool {
+        self.five_hour_max.is_none()
+            && self.seven_day_max.is_none()
+            && self.fable_weekly_max.is_none()
+    }
 }
 
 /// Fill direction for the TUI quota gauges (config `quota_display`).
@@ -148,6 +178,7 @@ impl Default for Config {
             domain_abbrev: default_domain_abbrev(),
             quota_display: QuotaDisplay::default(),
             paused_accounts: std::collections::BTreeSet::new(),
+            account_limits: BTreeMap::new(),
             accounts: Vec::new(),
         }
     }
@@ -452,6 +483,11 @@ pub struct SchedulerConfig {
     /// tokens live ~8h).
     #[serde(default = "default_refresh_ahead_secs")]
     pub refresh_ahead_secs: u64,
+    /// Max Fable-weekly (7d Fbl) utilization before the account is
+    /// preemptively excluded for FABLE requests (non-Fable traffic is never
+    /// gated by this). Default 0.98. Additive: older configs load 0.98.
+    #[serde(default = "default_fable_weekly_max")]
+    pub fable_weekly_max: f64,
 }
 
 impl Default for SchedulerConfig {
@@ -462,6 +498,7 @@ impl Default for SchedulerConfig {
             usage_poll_secs: default_usage_poll_secs(),
             usage_max_age_secs: default_usage_max_age_secs(),
             refresh_ahead_secs: default_refresh_ahead_secs(),
+            fable_weekly_max: default_fable_weekly_max(),
         }
     }
 }
@@ -697,6 +734,10 @@ fn default_max_request_bytes() -> usize {
 
 fn default_upstream() -> String {
     DEFAULT_UPSTREAM.to_string()
+}
+
+pub fn default_fable_weekly_max() -> f64 {
+    0.98
 }
 
 fn default_five_hour_max() -> f64 {
