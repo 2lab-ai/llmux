@@ -20,6 +20,8 @@ pub struct SelectParams {
     pub seven_day_max: f64,
     /// Fable-weekly utilization ceiling for FABLE requests (default 0.98).
     pub fable_weekly_max: f64,
+    /// Selection algorithm (config `scheduler.mode`).
+    pub mode: crate::config::SchedulerMode,
     /// Usage data older than this makes an account ineligible — unless ALL
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
@@ -32,6 +34,7 @@ impl From<&SchedulerConfig> for SelectParams {
             five_hour_max: cfg.five_hour_max,
             seven_day_max: cfg.seven_day_max,
             fable_weekly_max: cfg.fable_weekly_max,
+            mode: cfg.mode,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
         }
     }
@@ -366,11 +369,17 @@ pub fn pick_scoped(
 
     // In heuristic-degraded mode every candidate is heuristic-parked: rank by
     // soonest `cooldown_until` so the next request lands on the soonest-freed
-    // account. Otherwise use the normal perishability comparator.
-    let best = eligible
-        .iter()
-        .copied()
-        .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded));
+    // account. Otherwise use the mode's comparator: round-robin picks the next
+    // ROSTER-order account after the current (wrapping) — deterministic,
+    // score-free — while default uses the perishability comparator.
+    let best = if params.mode == crate::config::SchedulerMode::RoundRobin && !heuristic_degraded {
+        round_robin_next(snapshot, &eligible, group_current(snapshot, group, scope))
+    } else {
+        eligible
+            .iter()
+            .copied()
+            .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded))
+    };
 
     // Stickiness with a perishability override: stay on an eligible current
     // unless some account is worth CLEARLY more right now — its score exceeds
@@ -385,7 +394,19 @@ pub fn pick_scoped(
     // current.
     if !heuristic_degraded {
         if let Some(current_id) = group_current(snapshot, group, scope) {
-            if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
+            if eligible.iter().any(|a| &a.id == current_id) {
+                // Round-robin stickiness is ABSOLUTE: an eligible current is
+                // never proactively abandoned — the whole point of the mode is
+                // to preserve upstream prompt-cache locality until the account
+                // is hard ineligible.
+                if params.mode == crate::config::SchedulerMode::RoundRobin {
+                    return Decision::Stay;
+                }
+                let current = eligible
+                    .iter()
+                    .copied()
+                    .find(|a| &a.id == current_id)
+                    .expect("checked above");
                 let clearly_better = match best {
                     Some(best) if &best.id != current_id => {
                         account_score(best, params, now)
@@ -408,6 +429,26 @@ pub fn pick_scoped(
             retry_after: soonest_reset(snapshot, now),
         },
     }
+}
+
+/// Round-robin choice: the first ELIGIBLE account after the current one in
+/// roster (snapshot/config) order, wrapping; with no current, the first
+/// eligible account in roster order. `eligible` preserves roster order
+/// because it filters `snapshot.accounts` in place.
+fn round_robin_next<'a>(
+    snapshot: &'a PoolSnapshot,
+    eligible: &[&'a AccountSnapshot],
+    current: Option<&AccountId>,
+) -> Option<&'a AccountSnapshot> {
+    let is_eligible = |id: &AccountId| eligible.iter().any(|a| &a.id == id);
+    let start = current
+        .and_then(|cur| snapshot.accounts.iter().position(|a| &a.id == cur))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let n = snapshot.accounts.len();
+    (0..n)
+        .map(|offset| &snapshot.accounts[(start + offset) % n])
+        .find(|a| is_eligible(&a.id))
 }
 
 /// The current account for the active selection scope: the group's slot when
@@ -438,6 +479,16 @@ pub fn next_in_line(
     let headers_only = headers_only_mode(snapshot, params, group, now);
     // The per-group "next" line is a display reader over the non-Fable current.
     let current = group_current(snapshot, group, RequestScope::NonFable);
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        let eligible: Vec<&AccountSnapshot> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| in_group(a, group))
+            .filter(|a| Some(&a.id) != current)
+            .filter(|a| eligibility(a, params, now, headers_only).is_none())
+            .collect();
+        return round_robin_next(snapshot, &eligible, current).map(|a| a.id.clone());
+    }
     snapshot
         .accounts
         .iter()
@@ -620,15 +671,23 @@ pub fn selection_order(
             ineligible.push(idx);
         }
     }
-    eligible.sort_by(|&a, &b| {
-        rank(
-            &snapshot.accounts[a],
-            &snapshot.accounts[b],
-            params,
-            group,
-            now,
-        )
-    });
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        // Display the literal rotation: roster order starting after the
+        // current account (wrapping) — the order round_robin_next serves.
+        let start = current.first().map(|&i| i + 1).unwrap_or(0);
+        let n = snapshot.accounts.len().max(1);
+        eligible.sort_by_key(|&i| (i + n - (start % n)) % n);
+    } else {
+        eligible.sort_by(|&a, &b| {
+            rank(
+                &snapshot.accounts[a],
+                &snapshot.accounts[b],
+                params,
+                group,
+                now,
+            )
+        });
+    }
     current
         .into_iter()
         .chain(eligible)
@@ -869,6 +928,7 @@ mod tests {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -905,6 +965,49 @@ mod tests {
             paused: false,
             limits: crate::config::AccountLimits::default(),
         }
+    }
+
+    #[test]
+    fn round_robin_stays_until_hard_ineligible_then_takes_roster_order() {
+        let rr = || {
+            let mut p = params();
+            p.mode = crate::config::SchedulerMode::RoundRobin;
+            p
+        };
+        // Three accounts in roster order a, b, c; current = b.
+        let mut a = account("a");
+        a.seven_day = Some(window(0.10, 600_000));
+        let mut b = account("b");
+        b.seven_day = Some(window(0.95, 1_000)); // resets soon → default mode would prefer burning it? b IS current
+        let mut c = account("c");
+        c.seven_day = Some(window(0.20, 500_000));
+        // Current b is still eligible → absolute stay, even though other
+        // accounts may score higher.
+        let snap = pool(vec![a.clone(), b.clone(), c.clone()], Some("b"));
+        assert_eq!(pick(&snap, &rr(), None, now()), Decision::Stay);
+        // Current b crosses its 7d ceiling → hard ineligible → the NEXT
+        // roster account after b is c (wrap would continue to a).
+        let mut b_dead = b.clone();
+        b_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a.clone(), b_dead, c.clone()], Some("b"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("c".into())
+            },
+            "roster order after the current, not the best score"
+        );
+        // Wrapping: current = c (last) → next is a.
+        let mut c_dead = c.clone();
+        c_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a, account("b2"), c_dead], Some("c"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("a".into())
+            },
+            "rotation wraps to the roster head"
+        );
     }
 
     #[test]
@@ -2133,6 +2236,7 @@ mod tests {
             five_hour_max: 0.90,
             seven_day_max: 1.0,
             fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         };
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {

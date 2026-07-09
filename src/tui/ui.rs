@@ -1398,6 +1398,22 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
         lines.push(Line::from(spans));
     }
 
+    // Scheduler mode line (S toggles): round-robin reads emphasized — it is
+    // the "you asked for minimal switching" state worth noticing at a glance.
+    let mode = view.select_params.mode;
+    lines.push(Line::from(vec![
+        label("mode"),
+        Span::styled(
+            mode.label().to_string(),
+            if mode == crate::config::SchedulerMode::RoundRobin {
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            },
+        ),
+        Span::styled("   [S switch]", dim()),
+    ]));
+
     lines.push(Line::from(vec![
         label("poller"),
         Span::raw(poller_summary(view, now)),
@@ -2793,6 +2809,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" used/left  "),
                     key("t"),
                     Span::raw(" eta/utc  "),
+                    key("S"),
+                    Span::raw(" sched  "),
                     key("↑↓"),
                     Span::raw(" scroll"),
                 ]);
@@ -2977,6 +2995,7 @@ mod tests {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
+                mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),

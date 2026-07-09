@@ -584,6 +584,11 @@ pub struct SelectParamsDoc {
     /// Fable-weekly ceiling (additive: docs from older daemons default 0.98).
     #[serde(default = "crate::config::default_fable_weekly_max")]
     pub fable_weekly_max: f64,
+    /// Selection algorithm (additive: docs from older daemons default
+    /// `default`). Carried so attach-mode display order / next-in-line match
+    /// the daemon's actual scheduler.
+    #[serde(default)]
+    pub mode: crate::config::SchedulerMode,
     pub usage_max_age_secs: u64,
 }
 
@@ -593,6 +598,7 @@ impl From<&SelectParams> for SelectParamsDoc {
             five_hour_max: params.five_hour_max,
             seven_day_max: params.seven_day_max,
             fable_weekly_max: params.fable_weekly_max,
+            mode: params.mode,
             usage_max_age_secs: params.usage_max_age.as_secs(),
         }
     }
@@ -604,6 +610,7 @@ impl From<&SelectParamsDoc> for SelectParams {
             five_hour_max: doc.five_hour_max,
             seven_day_max: doc.seven_day_max,
             fable_weekly_max: doc.fable_weekly_max,
+            mode: doc.mode,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
         }
     }
@@ -1511,6 +1518,7 @@ mod tests {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }

@@ -1262,6 +1262,7 @@ mod tests {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }

@@ -167,6 +167,11 @@ pub struct AppState {
     /// `AppState.config` is a per-clone snapshot; shared mutable state must
     /// ride an `Arc`.
     pub email_anonymous: Arc<AtomicBool>,
+    /// Live scheduler mode (config `scheduler.mode`), same atomic convention
+    /// as `email_anonymous`: `false` = default, `true` = round-robin. A TUI
+    /// `S` / `POST /llmux/scheduler-mode` flip reflects in the very next
+    /// `select_params()` without restart.
+    pub round_robin: Arc<AtomicBool>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
@@ -256,6 +261,9 @@ impl AppState {
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
+            round_robin: Arc::new(AtomicBool::new(
+                config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
+            )),
             config,
             events: Some(events_tx),
             hub: Arc::new(DashboardHub::default()),
@@ -269,7 +277,31 @@ impl AppState {
     }
 
     pub fn select_params(&self) -> SelectParams {
-        SelectParams::from(&self.config.scheduler)
+        let mut params = SelectParams::from(&self.config.scheduler);
+        // The live atomic wins over the boot-time config snapshot.
+        params.mode = if self.round_robin.load(Ordering::Relaxed) {
+            crate::config::SchedulerMode::RoundRobin
+        } else {
+            crate::config::SchedulerMode::Default
+        };
+        params
+    }
+
+    /// Flip the scheduler mode live + persist it (config `scheduler.mode`,
+    /// read-merge-write). Returns the newly effective mode.
+    pub fn set_scheduler_mode(
+        &self,
+        mode: crate::config::SchedulerMode,
+    ) -> Result<crate::config::SchedulerMode, crate::config::ConfigError> {
+        self.round_robin.store(
+            mode == crate::config::SchedulerMode::RoundRobin,
+            Ordering::Relaxed,
+        );
+        if let Some(path) = &self.config_path {
+            crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
+        }
+        tracing::info!(mode = mode.label(), "scheduler mode updated");
+        Ok(mode)
     }
 
     /// On-demand idle-account probe trigger (issue #21). For every account in
@@ -842,6 +874,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
+        .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
@@ -1694,6 +1727,32 @@ async fn account_limits_endpoint(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct SchedulerModeRequest {
+    /// `"default"` or `"round-robin"`.
+    mode: crate::config::SchedulerMode,
+}
+
+/// `POST /llmux/scheduler-mode` — flip the selection algorithm live (TUI `S`;
+/// persisted to config `scheduler.mode`).
+async fn scheduler_mode_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<SchedulerModeRequest>,
+) -> Response {
+    match state.set_scheduler_mode(body.mode) {
+        Ok(mode) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "mode": mode.label() }).to_string(),
+        )
+            .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
 /// `POST /llmux/shutdown` — graceful server exit (same loopback /
 /// proxy-api-key rules as every route, via the shared middleware). The 200
 /// is delivered before the process exits: hyper's graceful shutdown stops
@@ -1870,6 +1929,7 @@ mod tests {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }
