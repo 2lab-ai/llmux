@@ -83,6 +83,13 @@ pub(crate) struct DashboardView {
     /// model-usage-scope qualifiers from these strings. A doc from an older
     /// daemon fills the byte-identical canonical defaults via serde.
     pub data_quality: crate::dashboard::DataQualityDoc,
+    /// Optional top-of-dashboard event banner (config `event`). Populated ONLY
+    /// in local mode, where the TUI process owns the loaded `Config` and reads
+    /// it directly (see `App::view`); it is a purely display-local concern that
+    /// is deliberately NOT plumbed through the `/llmux/dashboard` snapshot, so
+    /// in attach mode this stays `None`. `ui.rs` renders one line while the
+    /// deadline is in the future and nothing once it passes.
+    pub event: Option<crate::config::EventConfig>,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -350,6 +357,9 @@ impl DashboardView {
             domain_abbrev: doc.domain_abbrev.clone(),
             quota_display: doc.quota_display,
             data_quality: doc.data_quality.clone(),
+            // Not carried on the wire (display-local, local-mode only); the
+            // local backend fills it from the loaded Config in `App::view`.
+            event: None,
         }
     }
 

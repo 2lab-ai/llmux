@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, CodexConfig, Config, IdleProbeConfig, ProxyConfig, QuotaDisplay, RawIoConfig,
-    RoutingConfig, SchedulerConfig, SchedulerMode, Upsert, DEFAULT_CODEX_TOKEN_URL,
+    AccountLimits, CodexConfig, Config, EventConfig, IdleProbeConfig, ProxyConfig, QuotaDisplay,
+    RawIoConfig, RoutingConfig, SchedulerConfig, SchedulerMode, Upsert, DEFAULT_CODEX_TOKEN_URL,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_UPSTREAM,
 };
 
@@ -608,6 +608,38 @@ mod tests {
         // and preserves the rest of the fresh on-disk state.
         update_path(&path, |c| c.email_anonymous = false).expect("update");
         assert!(!load_path(&path).expect("reload").email_anonymous);
+    }
+
+    #[test]
+    fn event_banner_is_additive_and_parses_when_present() {
+        // A config written before the `event` block existed loads with no
+        // banner (the field defaults to None; nothing is reserved on screen).
+        let old: Config = serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert_eq!(old.event, None, "absent block → None");
+
+        // A present block parses into its label + deadline verbatim.
+        let raw = r#"{
+            "version": 1,
+            "event": { "label": "Fable 5", "until": "2026-07-12T23:59:59-07:00" }
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("event config parses");
+        let event = config.event.as_ref().expect("event present");
+        assert_eq!(event.label, "Fable 5");
+        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+
+        // None is omitted on write (byte-compatible until an event is set) and
+        // an explicit event round-trips.
+        assert!(
+            serde_json::to_value(&old)
+                .expect("json")
+                .get("event")
+                .is_none(),
+            "None omitted on write"
+        );
+        let round: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("re-parse");
+        assert_eq!(round.event, config.event);
     }
 
     #[test]
