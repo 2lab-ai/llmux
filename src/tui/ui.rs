@@ -757,20 +757,35 @@ fn draw_accounts(
     // column, no width taken. Wide gets a full gauge column; narrow gets a
     // compact marker column (the width budget is tight there).
     let show_fable = view.show_fable_weekly;
+    // The account column is sized to its CONTENT (the widest display name this
+    // frame), never `Fill`: with the bare abbreviated names a fill column
+    // parked a runway of dead space between the names and the data columns.
+    // Floor = the header word; no cap needed (names are already abbreviated).
+    let name_width = ctx
+        .order
+        .iter()
+        .map(|&idx| {
+            row_account_name(&snapshot.accounts[idx].id.0, ctx.mask, &view.domain_abbrev)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+        .max("account".len()) as u16;
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Fill(1),
+            Constraint::Length(name_width),
             Constraint::Length(20),
-            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(QUOTA_CELL_WIDTH as u16),
+            Constraint::Length(QUOTA_CELL_WIDTH as u16),
         ];
         if show_fable {
             header.push("7d Fbl");
-            constraints.push(Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16));
+            constraints.push(Constraint::Length(QUOTA_CELL_WIDTH as u16));
         }
         header.extend(["if", "req", "tok"]);
         constraints.extend([
@@ -785,10 +800,10 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Fill(1),
+            Constraint::Length(name_width),
             Constraint::Length(20),
-            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
-            Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
+            Constraint::Length(QUOTA_CELL_WIDTH as u16),
+            Constraint::Length(QUOTA_CELL_WIDTH as u16),
         ];
         if show_fable {
             header.push("7d Fbl");
@@ -1051,16 +1066,20 @@ fn quota_bar_text(
 /// Assemble one full quota gauge cell line: the countdown bar
 /// ([`quota_bar_line`], `QUOTA_BAR_WIDTH` cols) + a space + the right-aligned
 /// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
-/// exactly `QUOTA_CELL_WIDTH` columns total.
+/// exactly `QUOTA_CELL_WIDTH` columns total. The label is the percent of the
+/// FILL fraction, so number and bar always say the same thing: in the default
+/// `remaining` mode a fresh account reads a full green bar + `100%` and
+/// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
+/// past threshold) stays keyed on USED utilization either way, as do the
+/// color bands.
 fn quota_cell_line(
     fill: f64,
     color: Color,
     bar_text: &str,
     bold_chars: usize,
-    utilization: f64,
     over: bool,
 ) -> Line<'static> {
-    let mut label = format::percent(utilization);
+    let mut label = format::percent(fill);
     if over {
         label.push('!');
     }
@@ -1115,14 +1134,7 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars) = quota_bar_text(window, now, display);
-    Cell::from(quota_cell_line(
-        fill,
-        color,
-        &text,
-        bold_chars,
-        utilization,
-        over,
-    ))
+    Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
@@ -1198,22 +1210,19 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
         let (text, bold_chars) = quota_bar_text(&scoped.window, now, display);
-        Cell::from(quota_cell_line(
-            fill,
-            color,
-            &text,
-            bold_chars,
-            utilization,
-            over,
-        ))
+        Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
         // (`F 7d!`), colored. No bar — the narrow width budget has no room for
-        // one. An expired window (no live reset) falls back to the percent so
-        // the marker never reads as a live countdown to a past reset.
+        // one. An expired window (no live reset) falls back to the mode-flipped
+        // percent so the marker never reads as a live countdown to a past
+        // reset (just-reset in `remaining` mode = `F 100%`, full quota back).
         let label = match scoped.window.resets_at.duration_since(now) {
             Ok(rem) if !rem.is_zero() => format::countdown_units(rem).0,
-            _ => format::percent(utilization),
+            _ => match mode {
+                crate::config::QuotaDisplay::Used => format::percent(utilization),
+                crate::config::QuotaDisplay::Remaining => format::percent(1.0 - utilization),
+            },
         };
         let text = if over {
             format!("F {label}!")
@@ -2930,7 +2939,7 @@ mod tests {
             email_anonymous: false,
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
-            quota_display: crate::config::QuotaDisplay::Used,
+            quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
         }
     }
@@ -3796,14 +3805,17 @@ mod tests {
             "toggle ON: Fable weekly in-bar countdown rendered:\n{on}"
         );
         assert!(
-            on.contains("97%!"),
-            "toggle ON: Fable percent label carries the critical `!`:\n{on}"
+            on.contains("3%!"),
+            "toggle ON: Fable remaining-percent label carries the critical `!`:\n{on}"
         );
         // The 5h gauge is still present alongside it (+3600s reads "59m …" by
         // the time the render clock ticks past the helper's `now`) with its
         // percent label restored on the right.
         assert!(on.contains("59m"), "toggle ON: 5h gauge still rendered");
-        assert!(on.contains("42%"), "toggle ON: 5h percent label rendered");
+        assert!(
+            on.contains("58%"),
+            "toggle ON: 5h remaining-percent label rendered (42% used)"
+        );
 
         // Toggle OFF: no Fbl column, no Fable countdown, 5h column unchanged.
         view.show_fable_weekly = false;
@@ -3977,8 +3989,8 @@ mod tests {
     /// window is expired (util → 0) but its `severity` field can still be a
     /// stale `Critical` until the next usage poll. The gauge must key off the
     /// reset-aware `is_constraining` (which short-circuits on `is_expired`), so
-    /// a just-reset window renders its honest `F 0%` with NO forced-red `!` —
-    /// not the old red `F 0%!`.
+    /// a just-reset window renders its honest full-quota `F 100%` (remaining
+    /// mode) with NO forced-red `!` — not the old red critical flash.
     #[test]
     fn fable_gauge_reset_window_is_not_forced_red() {
         use crate::routing::BackendGroup;
@@ -4028,16 +4040,17 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Expired → effective utilization 0 → `F 0%`, and because
-        // `is_constraining` short-circuits on the expired window the stale
-        // `Critical` severity does NOT force the red-critical `!` marker.
+        // Expired → effective utilization 0 → remaining-mode label `F 100%`
+        // (full quota is back), and because `is_constraining` short-circuits
+        // on the expired window the stale `Critical` severity does NOT force
+        // the red-critical `!` marker.
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 0%"),
-            "expired/reset Fable window renders its honest 0%:\n{narrow}"
+            narrow.contains("F 100%"),
+            "expired/reset Fable window renders its honest full-quota 100%:\n{narrow}"
         );
         assert!(
-            !narrow.contains("0%!"),
+            !narrow.contains("100%!"),
             "stale-critical severity on an expired window must NOT force the red `!`:\n{narrow}"
         );
     }

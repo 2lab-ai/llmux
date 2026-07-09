@@ -2156,7 +2156,7 @@ mod tests {
             email_anonymous: false,
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
-            quota_display: crate::config::QuotaDisplay::Used,
+            quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
         }
     }
