@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, CodexConfig, Config, EventConfig, IdleProbeConfig, ProxyConfig, QuotaDisplay,
+    AccountLimits, CodexConfig, Config, EventBanner, IdleProbeConfig, ProxyConfig, QuotaDisplay,
     RawIoConfig, RoutingConfig, SchedulerConfig, SchedulerMode, Upsert, DEFAULT_CODEX_TOKEN_URL,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_UPSTREAM,
 };
@@ -628,35 +628,46 @@ mod tests {
     }
 
     #[test]
-    fn event_banner_is_additive_and_parses_when_present() {
-        // A config written before the `event` block existed loads with no
-        // banner (the field defaults to None; nothing is reserved on screen).
+    fn event_banners_are_additive_and_parse_when_present() {
+        // A config written before the `events` block existed — and one still
+        // carrying the removed singular `event` key — both load with an empty
+        // list (the orphan key is ignored, nothing reserved on screen).
         let old: Config = serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
-        assert_eq!(old.event, None, "absent block → None");
+        assert!(old.events.is_empty(), "absent block → empty");
+        let orphan: Config =
+            serde_json::from_str(r#"{ "version": 1, "event": { "label": "x", "until": "y" } }"#)
+                .expect("orphan event key ignored");
+        assert!(orphan.events.is_empty(), "removed singular key dropped");
 
-        // A present block parses into its label + deadline verbatim.
+        // A present list parses each entry verbatim (accepting the compact form).
         let raw = r#"{
             "version": 1,
-            "event": { "label": "Fable 5", "until": "2026-07-12T23:59:59-07:00" }
+            "events": [
+                { "id": "20260712-fable5", "from": "202607080000", "to": "202607130000",
+                  "content": "Fable 5 Available until 7/12" }
+            ]
         }"#;
-        let config: Config = serde_json::from_str(raw).expect("event config parses");
-        let event = config.event.as_ref().expect("event present");
-        assert_eq!(event.label, "Fable 5");
-        assert_eq!(event.until, "2026-07-12T23:59:59-07:00");
+        let config: Config = serde_json::from_str(raw).expect("events config parses");
+        assert_eq!(config.events.len(), 1);
+        let event = &config.events[0];
+        assert_eq!(event.id, "20260712-fable5");
+        assert_eq!(event.from, "202607080000");
+        assert_eq!(event.to, "202607130000");
+        assert_eq!(event.content, "Fable 5 Available until 7/12");
 
-        // None is omitted on write (byte-compatible until an event is set) and
-        // an explicit event round-trips.
+        // An empty list is omitted on write (byte-compatible until one is set)
+        // and a populated list round-trips.
         assert!(
             serde_json::to_value(&old)
                 .expect("json")
-                .get("event")
+                .get("events")
                 .is_none(),
-            "None omitted on write"
+            "empty list omitted on write"
         );
         let round: Config =
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("re-parse");
-        assert_eq!(round.event, config.event);
+        assert_eq!(round.events, config.events);
     }
 
     #[test]

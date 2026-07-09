@@ -220,28 +220,41 @@ pub(crate) fn draw(
 /// account detail pane and the full log console moved to the Accounts and Logs
 /// overlays respectively; the model strip stays here.
 /// Build the one-line event banner for the very top of MAIN from the configured
-/// event, or `None` when there is no event or its deadline has passed (then no
-/// row is reserved). Pretty and compact:
-/// `Fable 5 · until 7/12 23:59:59 PT · 3d 15h 15m 25s left` — the deadline is
-/// rendered in its own RFC3339 offset (zone labeled from it) and the remaining
-/// time ticks with the existing per-frame redraw. Bold label, dim separators —
-/// distinct but tasteful, consistent with the rest of the TUI.
-fn event_banner_line(event: &crate::config::EventConfig, now: SystemTime) -> Option<Line<'static>> {
-    let deadline = crate::event::parse_event_deadline(&event.until)?;
-    let remaining = deadline
-        .at
-        .duration_since(now)
-        .ok()
-        .filter(|rem| !rem.is_zero())?;
+/// `events`, or `None` when none is active (then no row is reserved). An event
+/// is ACTIVE while `from <= now < to`; among the active ones the banner shows
+/// the single one with the EARLIEST `to`. Pretty and compact, all times LOCAL:
+/// `Fable 5 Available until 7/12 · until 7/12 23:59 · 3d 15h 15m 25s left` — the
+/// deadline is rendered in local time and the remaining time ticks with the
+/// existing per-frame redraw. Bold content, dim separators — distinct but
+/// tasteful, consistent with the rest of the TUI.
+fn event_banner_line(
+    events: &[crate::config::EventBanner],
+    now: SystemTime,
+) -> Option<Line<'static>> {
+    // Active = from <= now < to; pick the one with the earliest `to`.
+    let (to, event) = events
+        .iter()
+        .filter_map(|e| {
+            let from = crate::event::parse_event_time(&e.from)?;
+            let to = crate::event::parse_event_time(&e.to)?;
+            (from <= now && now < to).then_some((to, e))
+        })
+        .min_by_key(|(to, _)| *to)?;
+    // `now < to` guarantees a positive remaining.
+    let remaining = to.duration_since(now).ok()?;
+    let offset = format::local_offset_secs(to);
     let sep = Span::styled(" · ", dim());
     Some(Line::from(vec![
         Span::styled(
-            event.label.clone(),
+            event.content.clone(),
             Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
         Span::styled("until ", dim()),
-        Span::styled(deadline.display_label(), Style::new().fg(Color::Cyan)),
+        Span::styled(
+            format::month_day_hm(to, offset),
+            Style::new().fg(Color::Cyan),
+        ),
         sep,
         Span::styled(
             format!("{} left", format::remaining_hms(remaining)),
@@ -259,10 +272,10 @@ fn draw_main(
     hits: &mut Option<ActivityChrome>,
 ) {
     let snapshot = &view.snapshot;
-    // Event banner (config `event`): ONE line pinned to the very top while the
-    // deadline is in the future; zero height (no reserved row) when absent,
-    // unparseable, or past.
-    let event_line = view.event.as_ref().and_then(|e| event_banner_line(e, now));
+    // Event banner (config `events`): ONE line pinned to the very top while an
+    // event is active; zero height (no reserved row) when none is active
+    // (unparseable, before `from`, or past `to`).
+    let event_line = event_banner_line(&view.events, now);
     let banner_height = u16::from(event_line.is_some());
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     // Compact model strip (req12): only when model data exists. 0 height (no
@@ -3063,8 +3076,72 @@ mod tests {
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
-            event: None,
+            events: Vec::new(),
         }
+    }
+
+    /// An event banner active for a wide window around `now`, so a test only
+    /// varies the field under scrutiny. `to` is compact local time.
+    #[cfg(test)]
+    fn banner(id: &str, from: &str, to: &str, content: &str) -> crate::config::EventBanner {
+        crate::config::EventBanner {
+            id: id.into(),
+            from: from.into(),
+            to: to.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn event_banner_line_shows_only_active_events() {
+        // Anchor `now` to a fixed instant so the compact (local-time) windows
+        // resolve deterministically relative to it.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
+        // Absolute UTC bounds via RFC3339 so the test does not depend on the
+        // machine's zone.
+        let before = "2020-01-01T00:00:00Z";
+        let mid_from = "2020-01-01T00:00:00Z";
+        let far_to = "2100-01-01T00:00:00Z";
+
+        // No events → no banner.
+        assert!(event_banner_line(&[], now).is_none());
+
+        // Before `from` (window entirely in the future) → hidden.
+        let future = banner(
+            "f",
+            "2099-01-01T00:00:00Z",
+            "2099-02-01T00:00:00Z",
+            "future",
+        );
+        assert!(event_banner_line(std::slice::from_ref(&future), now).is_none());
+
+        // After `to` (window entirely in the past) → hidden.
+        let stale = banner("s", before, "2020-02-01T00:00:00Z", "stale");
+        assert!(event_banner_line(std::slice::from_ref(&stale), now).is_none());
+
+        // Active (`from <= now < to`) → shown, content in the line.
+        let active = banner("a", mid_from, far_to, "Fable 5 Available until 7/12");
+        let line = event_banner_line(std::slice::from_ref(&active), now).expect("active shown");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("Fable 5 Available until 7/12"),
+            "content rendered: {text}"
+        );
+        assert!(text.contains("until "), "deadline label present: {text}");
+        assert!(text.contains("left"), "countdown present: {text}");
+    }
+
+    #[test]
+    fn event_banner_line_picks_earliest_active_to() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
+        let from = "2020-01-01T00:00:00Z";
+        // Two active events; the one with the EARLIER `to` wins.
+        let later = banner("late", from, "2100-01-01T00:00:00Z", "later end");
+        let sooner = banner("soon", from, "2099-01-01T00:00:00Z", "sooner end");
+        let line = event_banner_line(&[later, sooner], now).expect("one active");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("sooner end"), "earliest-to wins: {text}");
+        assert!(!text.contains("later end"), "other event hidden: {text}");
     }
 
     #[test]

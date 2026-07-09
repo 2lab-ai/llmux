@@ -117,29 +117,38 @@ pub struct Config {
     /// entries stay pure credentials. Additive: older configs load empty.
     #[serde(default)]
     pub account_limits: BTreeMap<String, AccountLimits>,
-    /// Optional one-line event banner rendered at the very top of the
-    /// dashboard TUI (e.g. a limited-time model promotion countdown). Absent by
-    /// default — the banner takes no row when unset or once its deadline has
-    /// passed. Additive (`#[serde(default)]`): a config written before this
-    /// field loads with no event. See [`EventConfig`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event: Option<EventConfig>,
+    /// Dashboard event banners (config `events`). Each entry is an
+    /// [`EventBanner`] with an active window `[from, to)`; the TUI renders the
+    /// active one with the EARLIEST `to` as a single top line, and nothing when
+    /// none is active. Managed at runtime via `POST /llmux/events` (upsert by
+    /// `id`) and remove. Additive (`#[serde(default)]`): older configs — and a
+    /// config still carrying the removed singular `event` key — load with an
+    /// empty list (the orphan key is ignored and dropped on the next save).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventBanner>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
 
-/// One-line dashboard event banner (config `event`). Display-only: the TUI
-/// renders a single top line while `until` is in the future, then nothing.
+/// One dashboard event banner (an element of config `events`). Display-only:
+/// the TUI renders the active banner (`from <= now < to`) with the earliest
+/// `to` as a single top line. `id` is the stable upsert key (`POST
+/// /llmux/events` replaces the entry with the same `id`); `from`/`to` are
+/// timestamps in EITHER RFC3339-with-offset (`2026-07-12T23:59:59-07:00`) or
+/// compact `YYYYMMDDHHMM` (12 digits, LOCAL wall-clock) form — see
+/// [`crate::event::parse_event_time`]; `content` is the rendered message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventConfig {
-    /// Short human label, e.g. `Fable 5`. Rendered bold at the banner's head.
-    pub label: String,
-    /// Deadline as an RFC3339 timestamp WITH an explicit offset, e.g.
-    /// `2026-07-12T23:59:59-07:00`. The banner renders the deadline in THIS
-    /// offset (labeling the zone from it: `-07:00`→PT, `-04:00`→ET, else
-    /// `UTC±HH`) and counts down to it live; once it passes the banner
-    /// disappears. An unparseable value renders no banner (never a crash).
-    pub until: String,
+pub struct EventBanner {
+    /// Stable identifier, the upsert/remove key (e.g. `20260712-fable5`).
+    pub id: String,
+    /// Window start (inclusive). RFC3339-with-offset or compact
+    /// `YYYYMMDDHHMM` (local time).
+    pub from: String,
+    /// Window end (exclusive). Same two accepted forms as `from`; must parse
+    /// to an instant strictly after `from`.
+    pub to: String,
+    /// Rendered banner text, e.g. `Fable 5 Available until 7/12`.
+    pub content: String,
 }
 
 /// Per-account utilization-ceiling overrides (config `account_limits`); every
@@ -200,7 +209,7 @@ impl Default for Config {
             quota_display: QuotaDisplay::default(),
             paused_accounts: std::collections::BTreeSet::new(),
             account_limits: BTreeMap::new(),
-            event: None,
+            events: Vec::new(),
             accounts: Vec::new(),
         }
     }
