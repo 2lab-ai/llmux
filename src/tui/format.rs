@@ -48,6 +48,29 @@ pub(crate) fn countdown(remaining: Duration) -> String {
     }
 }
 
+/// [`countdown`] split into its two styled parts for the in-bar quota
+/// countdown: `("7d", Some("10h"))`, `("10h", Some("15m"))`,
+/// `("17m", Some("35s"))`, `("42s", None)`. The FIRST (larger) unit is the
+/// one the renderer emphasizes — it carries most of the signal.
+pub(crate) fn countdown_units(remaining: Duration) -> (String, Option<String>) {
+    let total = remaining.as_secs();
+    let (days, hours, mins, secs) = (
+        total / 86_400,
+        (total % 86_400) / 3_600,
+        (total % 3_600) / 60,
+        total % 60,
+    );
+    if days > 0 {
+        (format!("{days}d"), Some(format!("{hours}h")))
+    } else if hours > 0 {
+        (format!("{hours}h"), Some(format!("{mins:02}m")))
+    } else if mins > 0 {
+        (format!("{mins}m"), Some(format!("{secs:02}s")))
+    } else {
+        (format!("{secs}s"), None)
+    }
+}
+
 /// Fixed-width utilization bar, e.g. `▰▰▰▱▱▱▱▱` (utilization clamped 0..=1).
 pub(crate) fn gauge_bar(utilization: f64, width: usize) -> String {
     let clamped = utilization.clamp(0.0, 1.0);
@@ -268,6 +291,29 @@ mod tests {
         assert_eq!(
             countdown(Duration::from_secs(2 * 86_400 + 4 * 3_600)),
             "2d 4h"
+        );
+    }
+
+    #[test]
+    fn countdown_units_split_matches_countdown_banding() {
+        let d = Duration::from_secs;
+        assert_eq!(
+            countdown_units(d(7 * 86_400 + 10 * 3_600)),
+            ("7d".to_string(), Some("10h".to_string()))
+        );
+        assert_eq!(
+            countdown_units(d(10 * 3_600 + 15 * 60)),
+            ("10h".to_string(), Some("15m".to_string()))
+        );
+        assert_eq!(
+            countdown_units(d(17 * 60 + 35)),
+            ("17m".to_string(), Some("35s".to_string()))
+        );
+        assert_eq!(countdown_units(d(42)), ("42s".to_string(), None));
+        // Sub-unit zero padding mirrors `countdown`.
+        assert_eq!(
+            countdown_units(d(3_600 + 5 * 60)),
+            ("1h".to_string(), Some("05m".to_string()))
         );
     }
 
