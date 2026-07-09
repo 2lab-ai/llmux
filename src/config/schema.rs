@@ -103,6 +103,14 @@ pub struct Config {
     /// Additive (`#[serde(default)]`): older configs load as `remaining`.
     #[serde(default)]
     pub quota_display: QuotaDisplay,
+    /// Account names the scheduler must NOT auto-select (operator pause).
+    /// A paused account is ineligible for automatic selection AND manual
+    /// switch (resume it first); its live windows keep polling so the gauges
+    /// stay truthful. Kept as a top-level set (not a per-account field) so
+    /// the on-disk account entries stay pure credentials. Additive
+    /// (`#[serde(default)]`): older configs load with nothing paused.
+    #[serde(default)]
+    pub paused_accounts: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -139,6 +147,7 @@ impl Default for Config {
             show_fable_weekly: true,
             domain_abbrev: default_domain_abbrev(),
             quota_display: QuotaDisplay::default(),
+            paused_accounts: std::collections::BTreeSet::new(),
             accounts: Vec::new(),
         }
     }

@@ -185,6 +185,10 @@ pub struct AccountState {
     pub cooldown_set_at: Option<SystemTime>,
     /// Live leases (in-flight requests pinned to this account).
     pub in_flight: u32,
+    /// Operator pause (config `paused_accounts`): excluded from automatic
+    /// selection AND manual switch until resumed. Windows keep polling so the
+    /// gauges stay truthful while parked.
+    pub paused: bool,
 }
 
 impl AccountState {
@@ -201,6 +205,7 @@ impl AccountState {
             cooldown_source: None,
             cooldown_set_at: None,
             in_flight: 0,
+            paused: false,
         }
     }
 
@@ -690,6 +695,7 @@ impl PoolState {
                         _ => None,
                     },
                     last_refresh_ms: a.credential.last_refresh_ms(),
+                    paused: a.paused,
                 })
                 .collect(),
             current: self.current.clone(),
@@ -785,6 +791,9 @@ pub struct AccountSnapshot {
     /// `None` for API-key accounts and never-refreshed oauth accounts —
     /// rendered as "never" in the dashboard.
     pub last_refresh_ms: Option<u64>,
+    /// Operator pause (config `paused_accounts`): gates automatic selection
+    /// and manual switch in every mode until resumed.
+    pub paused: bool,
 }
 
 impl AccountSnapshot {
@@ -1158,6 +1167,18 @@ impl AccountPool {
             .current
             .retain(|_, current| next.iter().any(|a| &a.id == current));
         state.accounts = next;
+    }
+
+    /// Apply the operator pause set (config `paused_accounts`) to the live
+    /// pool — called next to [`Self::reload_accounts`] whenever the config is
+    /// (re)applied, so the config file stays the single source of truth. A
+    /// paused CURRENT account is not force-switched here; the next
+    /// `evaluate` tick sees it ineligible and moves off it cooperatively.
+    pub fn apply_paused(&self, paused: &std::collections::BTreeSet<String>) {
+        let mut state = self.write();
+        for account in &mut state.accounts {
+            account.paused = paused.contains(&account.id.0);
+        }
     }
 }
 

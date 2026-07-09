@@ -270,6 +270,8 @@ pub(crate) struct Chrome {
     /// Session-local `u`-key override of the quota-gauge fill direction;
     /// `None` = the config default carried on the view applies.
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
+    pub reset_absolute: bool,
 }
 
 /// Attach-mode banner state.
@@ -319,6 +321,9 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
+    /// Pause/resume queued by the switcher's `p` key, performed by the event
+    /// loop via `POST /llmux/pause-account`.
+    pending_pause: Option<(String, bool)>,
     /// API key for a new account, queued by the `a` flow and performed by the
     /// event loop via `POST /llmux/add-account`. Held only until the POST
     /// fires; never logged or rendered raw.
@@ -388,6 +393,9 @@ struct App {
     /// `u` (MAIN and the Accounts overlay). `None` until the first press — the
     /// config default carried on the view applies.
     quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// Session toggle (`t`): quota bars show the reset as an absolute UTC
+    /// stamp instead of the countdown.
+    reset_absolute: bool,
 }
 
 impl App {
@@ -411,6 +419,7 @@ impl App {
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
+            reset_absolute: false,
         }
     }
 
@@ -446,6 +455,7 @@ impl App {
             session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
+            reset_absolute: self.reset_absolute,
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -697,8 +707,23 @@ impl App {
             // Quota-gauge fill direction (used% grows / left% drains) —
             // session-local override of config `quota_display`.
             KeyCode::Char('u') => self.toggle_quota_display(view),
+            // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
+            KeyCode::Char('t') => self.toggle_reset_display(),
             _ => {}
         }
+    }
+
+    /// Flip the quota bars between reset countdown and absolute UTC stamp.
+    fn toggle_reset_display(&mut self) {
+        self.reset_absolute = !self.reset_absolute;
+        self.set_status(
+            if self.reset_absolute {
+                "reset shown as absolute time (UTC)"
+            } else {
+                "reset shown as countdown"
+            }
+            .into(),
+        );
     }
 
     /// Flip the quota-gauge fill direction between used% and remaining%
@@ -735,6 +760,7 @@ impl App {
             // Same fill-direction toggle as MAIN — the accounts overlay is
             // where the gauges live full-width.
             KeyCode::Char('u') => self.toggle_quota_display(view),
+            KeyCode::Char('t') => self.toggle_reset_display(),
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). Rows render in selection order; the current account
             // (when one exists) is always row 0 — start the cursor there.
@@ -869,6 +895,67 @@ impl App {
         }
     }
 
+    fn take_pending_pause(&mut self) -> Option<(String, bool)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_pause.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote pause/resume (`POST /llmux/pause-account`).
+    async fn perform_remote_pause(&mut self, account: String, paused: bool) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/pause-account", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "account": account, "paused": paused }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let verb = if paused { "paused" } else { "resumed" };
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("{verb} {account}"),
+            Ok(response) => format!("pause change failed: {}", response.status()),
+            Err(err) => format!("pause change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Toggle the operator pause on the switcher's highlighted row (`p` in
+    /// `Mode::Select`). Local mode applies + persists in-process; attach mode
+    /// queues the POST for the event loop.
+    fn toggle_pause_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        // The cursor indexes DISPLAY rows (selection order), not config order.
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        let next = !target.paused;
+        match &mut self.backend {
+            Backend::Local(state) => {
+                let verb = if next { "paused" } else { "resumed" };
+                match state.set_account_paused(&name, next) {
+                    Ok(true) => self.set_status(format!("{verb} {name}")),
+                    Ok(false) => self.set_status(format!("account {name} not found")),
+                    Err(err) => self.set_status(format!("pause change failed: {err}")),
+                }
+            }
+            Backend::Remote(remote) => {
+                remote.pending_pause = Some((name.clone(), next));
+                self.set_status(format!(
+                    "{} {name}…",
+                    if next { "pausing" } else { "resuming" }
+                ));
+            }
+        }
+    }
+
     /// Perform the queued remote codex change (`POST /llmux/codex`).
     async fn perform_remote_codex(&mut self, new: CodexSettingsDoc) {
         let Backend::Remote(remote) = &mut self.backend else {
@@ -925,6 +1012,12 @@ impl App {
             // `n` from the switcher: start a brand-new login (issue #4's
             // headline path — "start a new login from the account switcher").
             KeyCode::Char('n') => self.open_new_login(),
+            // `p` from the switcher: pause/resume the highlighted account
+            // (operator pause — excluded from selection until resumed).
+            KeyCode::Char('p') => {
+                self.toggle_pause_selected(idx, view);
+                self.mode = Mode::Select { idx };
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
@@ -1303,7 +1396,14 @@ impl App {
         let headers_only =
             select::headers_only_mode(&view.snapshot, &view.select_params, None, now);
         if let Some(reason) = select::eligibility(target, &view.select_params, now, headers_only) {
-            self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            if reason == select::IneligibleReason::Paused {
+                self.set_status(format!(
+                    "cannot switch to {}: paused — press p to resume",
+                    target.id
+                ));
+            } else {
+                self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            }
             return;
         }
         let target_id = target.id.clone();
@@ -1432,6 +1532,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         connected: false,
         pending_switch: None,
         pending_codex: None,
+        pending_pause: None,
         pending_add: None,
         pending_remove: None,
     })));
@@ -1532,6 +1633,10 @@ async fn event_loop(
         }
         if let Some(codex) = app.take_pending_codex() {
             app.perform_remote_codex(codex).await;
+            redraw = true;
+        }
+        if let Some((account, paused)) = app.take_pending_pause() {
+            app.perform_remote_pause(account, paused).await;
             redraw = true;
         }
         if let Some(api_key) = app.take_pending_add() {
@@ -1649,6 +1754,7 @@ mod tests {
             connected: false,
             pending_switch: None,
             pending_codex: None,
+            pending_pause: None,
             pending_add: None,
             pending_remove: None,
         })))
@@ -2116,6 +2222,7 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }];
         v
     }
