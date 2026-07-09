@@ -89,6 +89,9 @@ struct UsageAccountTile: Identifiable {
     let info: CLIUsageInfo?
     let errorMessage: String?
     let issue: UsageIssue?
+    /// Operator pause: rendered sepia + context-menu Resume. Defaulted so
+    /// non-llmux construction sites stay source-compatible.
+    var paused: Bool = false
 }
 
 private struct UsageAccountTileRowHeightsPreferenceKey: PreferenceKey {
@@ -110,6 +113,7 @@ struct UsageAccountTileGrid: View {
     var claudeCodeTokenStatusByAccountId: [String: ClaudeCodeTokenStatus] = [:]
     var onSetClaudeCodeTokenEnabled: ((String, Bool) -> Void)? = nil
     var onRemove: ((String) -> Void)? = nil
+    var onSetPaused: ((String, Bool) -> Void)? = nil
 
     @State private var rowHeights: [Int: CGFloat] = [:]
 
@@ -138,6 +142,11 @@ struct UsageAccountTileGrid: View {
                     onSetClaudeCodeTokenEnabled: onSetClaudeCodeTokenEnabled
                 )
                 .contextMenu {
+                    if let onSetPaused {
+                        Button(indexed.tile.paused ? "Resume \(indexed.tile.label)" : "Pause \(indexed.tile.label)") {
+                            onSetPaused(indexed.tile.accountId, !indexed.tile.paused)
+                        }
+                    }
                     if let onRemove {
                         Button("Remove \(indexed.tile.label)", role: .destructive) {
                             onRemove(indexed.tile.accountId)
@@ -202,6 +211,11 @@ private struct UsageAccountTileCard: View {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
             )
+            // Paused accounts read sepia — desaturate, tint warm, dim — so the
+            // parked state is visible at a glance (resume via context menu).
+            .saturation(tile.paused ? 0 : 1)
+            .colorMultiply(tile.paused ? Color(red: 1.0, green: 0.9, blue: 0.72) : .white)
+            .opacity(tile.paused ? 0.8 : 1)
             .onHover { isHovered = $0 }
             .animation(.easeInOut(duration: 0.15), value: isHovered)
     }

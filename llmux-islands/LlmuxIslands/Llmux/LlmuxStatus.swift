@@ -33,9 +33,12 @@ struct LlmuxAccountRecord: Decodable {
     let fableWeekly: LlmuxScopedWindow?
     let inFlight: Int?
     let tokenExpiresAtMs: UInt64?
+    /// Operator pause (llmux 0.2.16+): the scheduler skips this account until
+    /// resumed. Optional — an older daemon omits the field.
+    let paused: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, type, group, status
+        case name, type, group, status, paused
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"

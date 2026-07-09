@@ -128,6 +128,35 @@ pub(crate) fn refreshed_marker(last_refresh_ms: Option<u64>, now: SystemTime) ->
     Some(format!("\u{21bb}{}", age_unit(ago)))
 }
 
+/// Fixed-width `MM/DD HH:MM` in UTC (11 chars) for the quota bars' absolute
+/// reset-time display (the `t` toggle). UTC by the same reasoning as
+/// [`clock_hms_utc`]; the in-bar width budget has no room for a zone suffix,
+/// so the toggle's footer hint carries the "UTC" fact. Civil-date math is the
+/// standard days-from-epoch algorithm (Howard Hinnant) — no chrono needed.
+pub(crate) fn absolute_utc_label(at: SystemTime) -> String {
+    let secs = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let day_secs = secs % 86_400;
+    // Civil from days (valid for the unix era we care about).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{m:02}/{d:02} {:02}:{:02}",
+        day_secs / 3_600,
+        (day_secs % 3_600) / 60
+    )
+}
+
 /// Wall-clock HH:MM:SS in UTC for activity-log timestamps. UTC (not local)
 /// because std has no timezone database and pulling chrono in for a log
 /// prefix isn't worth the dependency.

@@ -27,18 +27,18 @@ use super::format::{self, GaugeLevel};
 use super::view::DashboardView;
 use super::{anim, Chrome, Mode, Overlay};
 
-const GAUGE_BAR_WIDTH: usize = 8;
-/// Total width of one quota gauge cell in the accounts table (unchanged from
-/// the pre-density layout, so the column budget is identical): a reverse-video
-/// bar (fill = utilization, reset countdown overlaid inside) plus a
-/// right-aligned percent label — both facts, numeric and spatial, at once.
-const QUOTA_CELL_WIDTH: usize = GAUGE_BAR_WIDTH + 8;
+/// Total width of one quota gauge cell in the accounts table: a reverse-video
+/// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
+/// one separator space, and a right-aligned percent label — both facts,
+/// numeric and spatial, at once. 17 columns (bar 11, space, label 5).
+const QUOTA_CELL_WIDTH: usize = QUOTA_BAR_WIDTH + 1 + QUOTA_LABEL_WIDTH;
 /// Right-aligned percent label slot inside the quota cell: worst case
 /// `100%!` (the parked/over `!` rides the label, as it always did).
 const QUOTA_LABEL_WIDTH: usize = 5;
-/// The bar portion of the quota cell: cell minus label minus one separator
-/// space. 10 columns — the top-2-unit countdown ("10h 15m", 7 chars) fits.
-const QUOTA_BAR_WIDTH: usize = QUOTA_CELL_WIDTH - QUOTA_LABEL_WIDTH - 1;
+/// The bar portion of the quota cell: 11 columns — sized to the WIDEST text
+/// the bar hosts, the absolute reset stamp `MM/DD HH:MM` (`t` toggle, exactly
+/// 11 chars); the top-2-unit countdown ("10h 15m" + state glyph) also fits.
+const QUOTA_BAR_WIDTH: usize = 11;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
@@ -102,6 +102,9 @@ struct FrameCtx {
     /// Effective quota-gauge fill direction this frame: the `u`-key session
     /// override when set, else the config default carried on the view.
     quota_display: crate::config::QuotaDisplay,
+    /// `t`-key session toggle: quota bars show the reset as an absolute UTC
+    /// stamp (`07/07 13:50`) instead of the countdown.
+    reset_absolute: bool,
 }
 
 /// Display form of an account name under the `email_anonymous` setting:
@@ -179,6 +182,7 @@ pub(crate) fn draw(
         frame: chrome.frame,
         mask: view.email_anonymous,
         quota_display: chrome.quota_display_override.unwrap_or(view.quota_display),
+        reset_absolute: chrome.reset_absolute,
     };
 
     // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
@@ -871,6 +875,7 @@ fn account_row<'a>(
         max_age,
         consecutive_failures,
         ctx.quota_display,
+        ctx.reset_absolute,
     );
     let seven_gauge = window_gauge_cell(
         &account.seven_day,
@@ -880,6 +885,7 @@ fn account_row<'a>(
         max_age,
         consecutive_failures,
         ctx.quota_display,
+        ctx.reset_absolute,
     );
     let totals = view.totals_for(&account.id.0);
 
@@ -908,6 +914,7 @@ fn account_row<'a>(
             max_age,
             consecutive_failures,
             ctx.quota_display,
+            ctx.reset_absolute,
         ));
     }
     cells.push(Cell::from(in_flight_span(account.in_flight)));
@@ -948,15 +955,32 @@ fn status_span(
             Span::styled(format!("{} ready", anim::idle_drift(frame)), dim())
         };
     };
+    // Cooldowns render TIME-ONLY (`▌ 45m 34s`, yellow): the rotating-timer
+    // glyph + yellow already say "waiting", so the word "cooldown" was pure
+    // width (Z 2026-07-09). The `/llmux/status` API string is untouched —
+    // `blocking_reason` still says "cooldown 45m34s" there.
+    if reason == IneligibleReason::CoolingDown {
+        let left = account
+            .cooldown_until
+            .and_then(|until| until.duration_since(now).ok())
+            .map(format::countdown)
+            .unwrap_or_default();
+        return Span::styled(
+            format!("{} {left}", anim::half_block_clock(frame)),
+            Style::new().fg(Color::Yellow),
+        );
+    }
     let text = select::blocking_reason(account, reason, params, now);
     // Each blocked state gets its own animated glyph so the WHY reads at a
     // glance: blinking alert (auth), shade filling up (over quota), a rotating
-    // timer (cooldown), a faint drift (stale data).
+    // timer (cooldown), a faint drift (stale data), a steady held block
+    // (operator pause).
     let (glyph, style) = match reason {
         IneligibleReason::AuthUnhealthy => (
             anim::blink(frame, '!'),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        IneligibleReason::Paused => ('⠿', Style::new().fg(Color::Yellow)),
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => {
             (anim::shade_breathe(frame), Style::new().fg(Color::Red))
         }
@@ -1045,17 +1069,29 @@ fn quota_bar_text(
     window: &QuotaWindow,
     now: SystemTime,
     display: WindowDisplayState,
+    absolute: bool,
 ) -> (String, usize) {
-    let (head, tail) = match window.resets_at.duration_since(now) {
-        Ok(rem) if !rem.is_zero() => format::countdown_units(rem),
-        _ => ("0s".to_string(), None),
+    let live = window
+        .resets_at
+        .duration_since(now)
+        .ok()
+        .filter(|rem| !rem.is_zero());
+    let (mut text, bold_chars) = match (absolute, live) {
+        // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
+        (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
+        (false, Some(rem)) => {
+            let (head, tail) = format::countdown_units(rem);
+            let bold = head.chars().count();
+            let mut text = head;
+            if let Some(tail) = tail {
+                text.push(' ');
+                text.push_str(&tail);
+            }
+            (text, bold)
+        }
+        // Expired window: no live reset to point at in either mode.
+        (_, None) => ("0s".to_string(), 2),
     };
-    let bold_chars = head.chars().count();
-    let mut text = head;
-    if let Some(tail) = tail {
-        text.push(' ');
-        text.push_str(&tail);
-    }
     if !matches!(display, WindowDisplayState::Populated) {
         text.push(' ');
         text.push(display.glyph());
@@ -1114,6 +1150,7 @@ fn window_gauge_cell(
     max_age: Duration,
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
+    reset_absolute: bool,
 ) -> Cell<'static> {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
@@ -1133,7 +1170,7 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Used => utilization,
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
-    let (text, bold_chars) = quota_bar_text(window, now, display);
+    let (text, bold_chars) = quota_bar_text(window, now, display, reset_absolute);
     Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
 }
 
@@ -1169,6 +1206,7 @@ fn fable_gauge_cell(
     max_age: Duration,
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
+    reset_absolute: bool,
 ) -> Cell<'static> {
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -1209,7 +1247,7 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Used => utilization,
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
-        let (text, bold_chars) = quota_bar_text(&scoped.window, now, display);
+        let (text, bold_chars) = quota_bar_text(&scoped.window, now, display, reset_absolute);
         Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
@@ -2750,6 +2788,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" codex  "),
                     key("u"),
                     Span::raw(" used/left  "),
+                    key("t"),
+                    Span::raw(" eta/utc  "),
                     key("↑↓"),
                     Span::raw(" scroll"),
                 ]);
@@ -2770,6 +2810,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 Span::raw(" remove  "),
                 key("u"),
                 Span::raw(" used/left  "),
+                key("t"),
+                Span::raw(" eta/utc  "),
                 key("Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -2817,6 +2859,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             Span::raw(" move  "),
             key("Enter"),
             Span::raw(" switch  "),
+            key("p"),
+            Span::raw(" pause  "),
             key("n"),
             Span::raw(" new login  "),
             key("Esc"),
@@ -3024,6 +3068,7 @@ mod tests {
             session_cursor: 0,
             add_input_len: 0,
             quota_display_override: None,
+            reset_absolute: false,
             attach: None,
         }
     }
@@ -3772,6 +3817,7 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }
     }
 
@@ -3901,6 +3947,7 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -3965,6 +4012,7 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -4033,6 +4081,7 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -4108,6 +4157,7 @@ mod tests {
             in_flight: 1,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }];
         view.snapshot
             .current

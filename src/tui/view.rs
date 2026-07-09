@@ -171,6 +171,7 @@ impl DashboardView {
                 in_flight: a.in_flight,
                 token_expires_at_ms: a.token_expires_at_ms,
                 last_refresh_ms: a.last_refresh_ms,
+                paused: a.paused,
             })
             .collect();
         // Rebuild the per-group current map. A current daemon sends the full

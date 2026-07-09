@@ -72,6 +72,13 @@ struct LlmuxClient: Sendable {
         _ = try await send(makeRequest("/llmux/remove-account", method: "POST", json: ["name": name, "confirm": true]))
     }
 
+    /// `POST /llmux/pause-account` — pause/resume one account. The daemon
+    /// persists the flag and the scheduler skips a paused account until it is
+    /// resumed.
+    func setPaused(name: String, paused: Bool) async throws {
+        _ = try await send(makeRequest("/llmux/pause-account", method: "POST", json: ["account": name, "paused": paused]))
+    }
+
     /// `POST /llmux/settings` — flip the server-owned email-anonymous display
     /// setting. The daemon persists it (read-merge-write) and applies it live;
     /// returns the acknowledged effective value.

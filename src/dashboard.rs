@@ -634,6 +634,11 @@ pub struct AccountDoc {
     pub in_flight: u32,
     pub token_expires_at_ms: Option<u64>,
     pub last_refresh_ms: Option<u64>,
+    /// Operator pause (config `paused_accounts`): the scheduler will not
+    /// auto-select this account, and manual switch is refused until resumed.
+    /// Additive: absent in docs from an older daemon → false.
+    #[serde(default)]
+    pub paused: bool,
     /// Proxy-lifetime relayed totals (status parity).
     pub totals: LifetimeTotalsDoc,
     /// Activity-log totals (ok/err + token split) for the table/detail panes.
@@ -1242,6 +1247,7 @@ pub(crate) fn dashboard_doc(
                 in_flight: account.in_flight,
                 token_expires_at_ms: account.token_expires_at_ms,
                 last_refresh_ms: account.last_refresh_ms,
+                paused: account.paused,
                 totals: LifetimeTotalsDoc {
                     requests: lifetime.requests,
                     input_tokens: lifetime.input_tokens,

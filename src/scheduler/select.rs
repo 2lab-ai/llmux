@@ -51,6 +51,9 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IneligibleReason {
     AuthUnhealthy,
+    /// Operator pause (config `paused_accounts`): absolute — gates automatic
+    /// selection, manual switch, and every degraded mode alike, until resumed.
+    Paused,
     CoolingDown,
     FiveHourOverThreshold,
     SevenDayOverThreshold,
@@ -113,6 +116,12 @@ pub fn gate(
 ) -> Option<IneligibleReason> {
     if !account.healthy {
         return Some(IneligibleReason::AuthUnhealthy);
+    }
+    // Operator pause is absolute: it gates in every mode (including the
+    // headers-only and heuristic-degraded fallbacks) — a paused account only
+    // returns to service when the operator resumes it.
+    if account.paused {
+        return Some(IneligibleReason::Paused);
     }
     // A cooldown gates UNLESS we are in heuristic-degraded mode and this park
     // is a Heuristic one — a RetryAfter park is an explicit upstream
@@ -621,6 +630,7 @@ pub fn blocking_reason(
 ) -> String {
     match reason {
         IneligibleReason::AuthUnhealthy => "auth failed".to_string(),
+        IneligibleReason::Paused => "paused".to_string(),
         IneligibleReason::CoolingDown => {
             match account
                 .cooldown_until
@@ -873,7 +883,30 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
         }
+    }
+
+    #[test]
+    fn paused_account_is_ineligible_in_every_mode_and_reads_paused() {
+        let mut a = account("alpha");
+        a.paused = true;
+        // Normal, headers-only, and heuristic-degraded modes all refuse it.
+        for (headers_only, degraded) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                gate(&a, &params(), now(), headers_only, degraded),
+                Some(IneligibleReason::Paused),
+                "headers_only={headers_only} degraded={degraded}"
+            );
+        }
+        assert_eq!(
+            blocking_reason(&a, IneligibleReason::Paused, &params(), now()),
+            "paused"
+        );
+        // Resumed → eligible again.
+        a.paused = false;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
     }
 
     /// Build a snapshot whose legacy current slot is `current` (the

@@ -189,6 +189,10 @@ impl AppState {
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
+        // Operator pause set from the loaded config — applied before the pool
+        // serves its first selection so a paused account never gets picked at
+        // boot (post-boot changes flow through `apply_roster`).
+        pool.apply_paused(&config.paused_accounts);
         // `connect_timeout` bounds the connect phase; `read_timeout` bounds
         // post-connect silence — a silent upstream that connects then stalls
         // would otherwise hang the session and pin the account. This is an
@@ -355,6 +359,37 @@ impl AppState {
     /// live pool. The SINGLE in-process implementation behind both the local
     /// TUI `r`-key path and the `POST /llmux/remove-account` endpoint. Returns
     /// `Ok(true)` when an account was removed, `Ok(false)` when none matched.
+    /// Set / clear the operator pause on one account (config
+    /// `paused_accounts` — read-merge-write, then roster re-apply so the live
+    /// pool honors it immediately, no restart). `Ok(false)` when no account
+    /// with that name exists. A paused CURRENT account is moved off
+    /// cooperatively by the next evaluate tick.
+    pub fn set_account_paused(
+        &self,
+        name: &str,
+        paused: bool,
+    ) -> Result<bool, crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::NoConfigDir);
+        };
+        let mut known = false;
+        let merged = crate::config::update_path(path, |c| {
+            known = c.accounts.iter().any(|a| a.name == name);
+            if known {
+                if paused {
+                    c.paused_accounts.insert(name.to_string());
+                } else {
+                    c.paused_accounts.remove(name);
+                }
+            }
+        })?;
+        if known {
+            self.apply_roster(&merged);
+            tracing::info!(account = %name, paused, "account pause updated");
+        }
+        Ok(known)
+    }
+
     pub fn remove_account(&self, name: &str) -> Result<bool, crate::config::ConfigError> {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::NoConfigDir);
@@ -414,6 +449,7 @@ impl AppState {
     /// [`Self::add_apikey_account`] / [`Self::remove_account`].
     fn apply_roster(&self, merged: &Config) {
         self.pool.reload_accounts(&merged.accounts);
+        self.pool.apply_paused(&merged.paused_accounts);
         let params = self.select_params();
         let now = SystemTime::now();
         for group in eval_groups(&self.pool, self.config.routing.enabled) {
@@ -772,6 +808,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/add-account", post(add_account_endpoint))
         .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
+        .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
@@ -1514,6 +1551,47 @@ async fn remove_account_endpoint(
         Err(crate::config::ConfigError::NoConfigDir) => relay_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "config persistence disabled; cannot remove account",
+        ),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PauseAccountRequest {
+    /// Account name (real id, e.g. `claude:x@y`).
+    account: String,
+    /// `true` to pause (exclude from selection), `false` to resume.
+    paused: bool,
+}
+
+/// `POST /llmux/pause-account` — set/clear the operator pause on one account
+/// (TUI `p` in the switcher; llmux-islands context menu). Persisted to config
+/// `paused_accounts` and applied to the live pool immediately.
+async fn pause_account_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<PauseAccountRequest>,
+) -> Response {
+    let name = body.account.trim().to_string();
+    if name.is_empty() {
+        return relay_error(StatusCode::BAD_REQUEST, "account is required");
+    }
+    match state.set_account_paused(&name, body.paused) {
+        Ok(true) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "account": name, "paused": body.paused }).to_string(),
+        )
+            .into_response(),
+        Ok(false) => relay_error(
+            StatusCode::NOT_FOUND,
+            &format!("account {name:?} not found"),
+        ),
+        Err(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot pause account",
         ),
         Err(err) => relay_error(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -94,9 +94,11 @@ struct LlmuxDashboardAccount: Decodable {
     let inFlight: Int?
     let tokenExpiresAtMs: UInt64?
     let lastRefreshMs: UInt64?
+    /// Operator pause (llmux 0.2.16+); optional for older daemons.
+    let paused: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, type, status, blocked, healthy
+        case name, type, status, blocked, healthy, paused
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"
@@ -401,7 +403,8 @@ extension LlmuxDashboardAccount {
             sevenDay: sevenDay.map { LlmuxWindow(utilization: $0.utilization, resetsInSecs: $0.resetsInSecs) },
             fableWeekly: fableWeekly,
             inFlight: inFlight,
-            tokenExpiresAtMs: tokenExpiresAtMs
+            tokenExpiresAtMs: tokenExpiresAtMs,
+            paused: paused
         )
     }
 }
