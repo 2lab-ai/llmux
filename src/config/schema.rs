@@ -95,11 +95,12 @@ pub struct Config {
     /// explicitly to disable abbreviation.
     #[serde(default = "default_domain_abbrev")]
     pub domain_abbrev: BTreeMap<String, String>,
-    /// Which quantity the TUI quota gauges FILL with: `"used"` (default — the
-    /// bar grows as quota burns) or `"remaining"` (the bar drains toward the
-    /// reset). Color bands stay keyed on USED utilization either way. The TUI
-    /// `u` key overrides this live for the session; this field is the boot
-    /// default. Additive (`#[serde(default)]`): older configs load as `used`.
+    /// Which quantity the TUI quota gauges FILL with: `"remaining"` (default
+    /// — a fresh account is a full green bar that drains as quota burns, per
+    /// Z's 2026-07-09 direction) or `"used"` (the bar grows instead). Color
+    /// bands stay keyed on USED utilization either way. The TUI `u` key
+    /// overrides this live for the session; this field is the boot default.
+    /// Additive (`#[serde(default)]`): older configs load as `remaining`.
     #[serde(default)]
     pub quota_display: QuotaDisplay,
     #[serde(default)]
@@ -110,10 +111,11 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuotaDisplay {
-    /// Fill = fraction of the window already used (default).
-    #[default]
+    /// Fill = fraction of the window already used (the bar grows).
     Used,
-    /// Fill = fraction still available before the ceiling.
+    /// Fill = fraction still available before the ceiling (default — a full
+    /// green bar drains toward the reset).
+    #[default]
     Remaining,
 }
 

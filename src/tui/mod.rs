@@ -709,7 +709,7 @@ impl App {
         use crate::config::QuotaDisplay;
         let current = self
             .quota_display_override
-            .unwrap_or_else(|| view.map_or(QuotaDisplay::Used, |v| v.quota_display));
+            .unwrap_or_else(|| view.map_or(QuotaDisplay::default(), |v| v.quota_display));
         let next = match current {
             QuotaDisplay::Used => QuotaDisplay::Remaining,
             QuotaDisplay::Remaining => QuotaDisplay::Used,

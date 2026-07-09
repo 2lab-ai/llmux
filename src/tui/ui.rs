@@ -28,10 +28,17 @@ use super::view::DashboardView;
 use super::{anim, Chrome, Mode, Overlay};
 
 const GAUGE_BAR_WIDTH: usize = 8;
-/// Total width of one quota gauge cell in the accounts table: the whole cell
-/// is one bar (reverse-video fill = utilization) with the reset countdown
-/// overlaid inside, so the old `bar + percent label` split no longer applies.
+/// Total width of one quota gauge cell in the accounts table (unchanged from
+/// the pre-density layout, so the column budget is identical): a reverse-video
+/// bar (fill = utilization, reset countdown overlaid inside) plus a
+/// right-aligned percent label — both facts, numeric and spatial, at once.
 const QUOTA_CELL_WIDTH: usize = GAUGE_BAR_WIDTH + 8;
+/// Right-aligned percent label slot inside the quota cell: worst case
+/// `100%!` (the parked/over `!` rides the label, as it always did).
+const QUOTA_LABEL_WIDTH: usize = 5;
+/// The bar portion of the quota cell: cell minus label minus one separator
+/// space. 10 columns — the top-2-unit countdown ("10h 15m", 7 chars) fits.
+const QUOTA_BAR_WIDTH: usize = QUOTA_CELL_WIDTH - QUOTA_LABEL_WIDTH - 1;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
@@ -762,7 +769,7 @@ fn draw_accounts(
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
         ];
         if show_fable {
-            header.push("Fbl");
+            header.push("7d Fbl");
             constraints.push(Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16));
         }
         header.extend(["if", "req", "tok"]);
@@ -784,7 +791,7 @@ fn draw_accounts(
             Constraint::Length((GAUGE_BAR_WIDTH + 8) as u16),
         ];
         if show_fable {
-            header.push("Fbl");
+            header.push("7d Fbl");
             // Compact marker column ("F 100%!" fits in 7): no bar.
             constraints.push(Constraint::Length(7));
         }
@@ -1013,15 +1020,15 @@ fn quota_bar_line(
 }
 
 /// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`), a `!` when the account is parked / past its threshold, and the
-/// window display-state glyph when the value is not fresh (issue #33). Returns
-/// `(text, bold_chars)` where `bold_chars` covers the FIRST countdown unit —
-/// the day/hour magnitude carries most of the signal, so it gets the emphasis.
+/// (`7d 10h`) plus the window display-state glyph when the value is not fresh
+/// (issue #33). The parked/over `!` is NOT here — it rides the percent label
+/// to the right of the bar, where it always lived. Returns `(text,
+/// bold_chars)` where `bold_chars` covers the FIRST countdown unit — the
+/// day/hour magnitude carries most of the signal, so it gets the emphasis.
 /// An expired window (no live reset) reads `0s` — honest and ASCII-narrow.
 fn quota_bar_text(
     window: &QuotaWindow,
     now: SystemTime,
-    over: bool,
     display: WindowDisplayState,
 ) -> (String, usize) {
     let (head, tail) = match window.resets_at.duration_since(now) {
@@ -1034,14 +1041,36 @@ fn quota_bar_text(
         text.push(' ');
         text.push_str(&tail);
     }
-    if over {
-        text.push('!');
-    }
     if !matches!(display, WindowDisplayState::Populated) {
         text.push(' ');
         text.push(display.glyph());
     }
     (text, bold_chars)
+}
+
+/// Assemble one full quota gauge cell line: the countdown bar
+/// ([`quota_bar_line`], `QUOTA_BAR_WIDTH` cols) + a space + the right-aligned
+/// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
+/// exactly `QUOTA_CELL_WIDTH` columns total.
+fn quota_cell_line(
+    fill: f64,
+    color: Color,
+    bar_text: &str,
+    bold_chars: usize,
+    utilization: f64,
+    over: bool,
+) -> Line<'static> {
+    let mut label = format::percent(utilization);
+    if over {
+        label.push('!');
+    }
+    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, QUOTA_BAR_WIDTH);
+    line.spans.push(Span::raw(" "));
+    line.spans.push(Span::styled(
+        format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
+        Style::new().fg(color),
+    ));
+    line
 }
 
 /// One quota window → its gauge cell: the WHOLE cell is one bar whose
@@ -1078,20 +1107,21 @@ fn window_gauge_cell(
     };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
-    // The `!` flags an account that is parked or past its threshold — same
-    // signal as before, now carried inside the bar text.
+    // The `!` flags an account that is parked or past its threshold — carried
+    // on the percent label, where it always lived.
     let over = parked || utilization > threshold;
     let fill = match mode {
         crate::config::QuotaDisplay::Used => utilization,
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
-    let (text, bold_chars) = quota_bar_text(window, now, over, display);
-    Cell::from(quota_bar_line(
+    let (text, bold_chars) = quota_bar_text(window, now, display);
+    Cell::from(quota_cell_line(
         fill,
         color,
         &text,
         bold_chars,
-        QUOTA_CELL_WIDTH,
+        utilization,
+        over,
     ))
 }
 
@@ -1167,13 +1197,14 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Used => utilization,
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
-        let (text, bold_chars) = quota_bar_text(&scoped.window, now, over, display);
-        Cell::from(quota_bar_line(
+        let (text, bold_chars) = quota_bar_text(&scoped.window, now, display);
+        Cell::from(quota_cell_line(
             fill,
             color,
             &text,
             bold_chars,
-            QUOTA_CELL_WIDTH,
+            utilization,
+            over,
         ))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
@@ -3761,12 +3792,18 @@ mod tests {
             "toggle ON: wide table shows the Fbl gauge column header:\n{on}"
         );
         assert!(
-            on.contains("22h 13m!"),
-            "toggle ON: Fable weekly in-bar countdown rendered with critical `!`:\n{on}"
+            on.contains("22h 13m"),
+            "toggle ON: Fable weekly in-bar countdown rendered:\n{on}"
+        );
+        assert!(
+            on.contains("97%!"),
+            "toggle ON: Fable percent label carries the critical `!`:\n{on}"
         );
         // The 5h gauge is still present alongside it (+3600s reads "59m …" by
-        // the time the render clock ticks past the helper's `now`).
+        // the time the render clock ticks past the helper's `now`) with its
+        // percent label restored on the right.
         assert!(on.contains("59m"), "toggle ON: 5h gauge still rendered");
+        assert!(on.contains("42%"), "toggle ON: 5h percent label rendered");
 
         // Toggle OFF: no Fbl column, no Fable countdown, 5h column unchanged.
         view.show_fable_weekly = false;
@@ -4224,7 +4261,7 @@ mod tests {
             .find(|r| r.contains(" account ") && r.contains("status"))
             .expect("accounts header row");
         for kept in [
-            "group", "account", "status", "5h", "7d", "Fbl", "if", "req", "tok",
+            "group", "account", "status", "5h", "7d", "7d Fbl", "if", "req", "tok",
         ] {
             assert!(header.contains(kept), "header keeps `{kept}`:\n{header}");
         }
