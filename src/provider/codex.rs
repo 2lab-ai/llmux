@@ -302,8 +302,12 @@ const CODEX_EFFORT_VALUES: &[&str] = &[
 
 /// Returns true when `model` belongs to the gpt-5.6 family, which natively
 /// supports the `max` / `ultra` reasoning levels (openai/codex models.json).
+/// The boundary is exact-generation: `gpt-5.6` itself or a `gpt-5.6-` variant.
+/// A bare `starts_with("gpt-5.6")` would wrongly match a hypothetical future
+/// `gpt-5.60-...` id, whose effort support is unknown.
 fn supports_extended_efforts(model: &str) -> bool {
-    model.to_ascii_lowercase().starts_with("gpt-5.6")
+    let m = model.to_ascii_lowercase();
+    m == "gpt-5.6" || m.starts_with("gpt-5.6-")
 }
 
 /// Per-request reasoning effort: the Claude Agent SDK carries the session's
@@ -907,11 +911,23 @@ impl CodexSseConverter {
             // `cached` is `Some` only when the upstream reported the field, so
             // the dashboard renders unavailable (not 0) when it is absent.
             // Clamp to the total: a cache read can never exceed the tokens
-            // actually received (guards a malformed `cached > input` payload).
+            // actually received (guards a malformed `cached > input` payload) —
+            // and a payload that actually violates the invariant is worth
+            // operator eyes, so the clamp warns with the raw values instead of
+            // silently rewriting them.
             let cached = details
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
-                .map(|c| c.min(total_input));
+                .map(|c| {
+                    if c > total_input {
+                        tracing::warn!(
+                            cached_tokens = c,
+                            input_tokens = total_input,
+                            "codex: malformed upstream usage (cached_tokens > input_tokens); clamping"
+                        );
+                    }
+                    c.min(total_input)
+                });
             // OpenAI carries the cache-WRITE subset in the same details object.
             // It is 0 on today's wire, but map it to `cache_creation_input_tokens`
             // so the dashboard's cache split stays correct if it ever isn't.
@@ -1485,6 +1501,29 @@ mod tests {
         });
         let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
         assert_eq!(upstream["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn extended_efforts_boundary_is_exact_generation_not_a_bare_prefix() {
+        // gpt-5.6 itself and its `-` variants get max/ultra.
+        assert!(supports_extended_efforts("gpt-5.6"));
+        assert!(supports_extended_efforts("gpt-5.6-sol"));
+        assert!(supports_extended_efforts("GPT-5.6-TERRA"));
+        // A hypothetical future gpt-5.60 must NOT match the 5.6 boundary —
+        // its effort support is unknown, so `max` clamps like any other model.
+        assert!(!supports_extended_efforts("gpt-5.60-sol"));
+        assert!(!supports_extended_efforts("gpt-5.60"));
+        assert!(!supports_extended_efforts("gpt-5.5"));
+        let effort = resolve_reasoning_effort(
+            &json!({ "output_config": { "effort": "max" } }),
+            None,
+            "gpt-5.60-sol",
+        );
+        assert_eq!(
+            effort.as_deref(),
+            Some("xhigh"),
+            "max clamps on the unknown 5.60 generation"
+        );
     }
 
     #[test]

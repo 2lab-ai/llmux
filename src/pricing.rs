@@ -107,15 +107,19 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(HAIKU_TIER)
     } else if model_norm_lower.starts_with("claude-fable-") {
         Some(FABLE_TIER)
-    } else if model_norm_lower.starts_with("gpt-5.5") {
+    } else if model_norm_lower.starts_with("gpt-5.5-") {
+        // Generation boundary: bare `gpt-5.5` matched exactly above; the
+        // prefix branch requires the `-` so `gpt-5.50-*` never takes 5.5
+        // rates (mirrors codex.rs `supports_extended_efforts`).
         Some(GPT_5_5)
-    } else if model_norm_lower.starts_with("gpt-5.6-terra") {
+    } else if model_norm_lower.starts_with("gpt-5.6-terra-") {
         Some(GPT_5_6_TERRA)
-    } else if model_norm_lower.starts_with("gpt-5.6-luna") {
+    } else if model_norm_lower.starts_with("gpt-5.6-luna-") {
         Some(GPT_5_6_LUNA)
-    } else if model_norm_lower.starts_with("gpt-5.6") {
-        // Sol is the flagship default: bare `gpt-5.6`, `gpt-5.6-sol`, and any
-        // future dated `gpt-5.6-sol-*` snapshot all resolve here.
+    } else if model_norm_lower.starts_with("gpt-5.6-") {
+        // Sol is the flagship default: `gpt-5.6-sol` (exact, above) and any
+        // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
+        // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
     } else {
         None
@@ -325,6 +329,27 @@ mod tests {
             &empty(),
         );
         approx(cost, 0.0);
+    }
+
+    #[test]
+    fn gpt_5_60_does_not_resolve_to_gpt_5_6_pricing() {
+        // Generation boundary: `gpt-5.60-sol` is NOT a gpt-5.6 model. It must
+        // miss the built-in table entirely (no bare `gpt-5.6` prefix match)
+        // and land on the codex group fallback (gpt-5.5 rates), same as any
+        // other unknown codex model.
+        assert_eq!(builtin_price("gpt-5.60-sol"), None);
+        assert_eq!(builtin_price("gpt-5.60-terra"), None);
+        assert_eq!(builtin_price("gpt-5.50-mini"), None);
+        assert_eq!(
+            price_for("codex", "gpt-5.60-sol", &empty()),
+            Some(GPT_5_5),
+            "unknown codex model takes the group fallback"
+        );
+        // The boundary must not break real dated snapshots of the family.
+        assert_eq!(builtin_price("gpt-5.6-sol-20260709"), Some(GPT_5_6_SOL));
+        assert_eq!(builtin_price("gpt-5.6-terra-20260709"), Some(GPT_5_6_TERRA));
+        assert_eq!(builtin_price("gpt-5.6-luna-20260709"), Some(GPT_5_6_LUNA));
+        assert_eq!(builtin_price("gpt-5.5-codex"), Some(GPT_5_5));
     }
 
     #[test]
