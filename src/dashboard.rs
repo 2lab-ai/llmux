@@ -968,6 +968,14 @@ pub enum CompletedDoc {
 pub struct TokensDoc {
     pub input: u64,
     pub output: u64,
+    /// Cache-read / cache-write splits, when the upstream reported them.
+    /// `None` (absent on the wire) is distinct from `Some(0)` — the TUI detail
+    /// row renders unavailable as `—`. Additive: docs written before these
+    /// fields existed deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1379,6 +1387,8 @@ pub(crate) fn dashboard_doc(
                     tokens: tokens.map(|t| TokensDoc {
                         input: t.input,
                         output: t.output,
+                        cache_read: t.cache_read,
+                        cache_creation: t.cache_creation,
                     }),
                     // Per-request API-equivalent cost: 0.0 unless group, model,
                     // and the upstream token usage are ALL known (Feature D).
@@ -1917,12 +1927,18 @@ mod tests {
                 model,
                 effort,
                 fast,
+                tokens,
                 ..
             } => {
                 assert_eq!(group.as_deref(), Some("codex"));
                 assert_eq!(model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert!(*fast, "codex fast mode is carried into the doc");
+                // The full token split rides the doc — cache counters included,
+                // so the ATTACH-mode detail row is not permanently `—`.
+                let t = tokens.expect("tokens");
+                assert_eq!(t.cache_read, Some(120));
+                assert_eq!(t.cache_creation, None, "unreported stays None");
             }
             other => panic!("expected request, got {other:?}"),
         }
@@ -1935,6 +1951,28 @@ mod tests {
         assert_eq!(doc.logs.len(), 1);
         assert_eq!(doc.logs[0].level, "INFO");
         assert!(doc.logs[0].text.contains("proxy listening"));
+    }
+
+    #[test]
+    fn tokens_doc_cache_fields_are_additive_and_round_trip() {
+        // Docs written before the cache split existed deserialize to None.
+        let old: TokensDoc = serde_json::from_str(r#"{"input":70,"output":30}"#).expect("old doc");
+        assert_eq!(old.cache_read, None);
+        assert_eq!(old.cache_creation, None);
+        // Round-trip preserves the split; absent counters are omitted on the
+        // wire (never serialized as null/0).
+        let json = serde_json::to_string(&TokensDoc {
+            input: 1,
+            output: 2,
+            cache_read: Some(3),
+            cache_creation: None,
+        })
+        .expect("serialize");
+        assert!(json.contains(r#""cache_read":3"#));
+        assert!(!json.contains("cache_creation"));
+        let back: TokensDoc = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.cache_read, Some(3));
+        assert_eq!(back.cache_creation, None);
     }
 
     #[test]

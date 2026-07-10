@@ -290,12 +290,15 @@ impl DashboardView {
                         account: account.clone(),
                         status: *status,
                         duration: Duration::from_millis(*duration_ms),
-                        // The activity line shows only the in/out total; cache
-                        // detail rides the model-usage rows, not these entries.
+                        // Full token split, cache counters included, so the
+                        // ATTACH-mode detail row renders cache_read /
+                        // cache_creation instead of a permanent `—`. `None`
+                        // stays `None` (older docs / upstream didn't report).
                         tokens: tokens.map(|t| TokenCounts {
                             input: t.input,
                             output: t.output,
-                            ..Default::default()
+                            cache_read: t.cache_read,
+                            cache_creation: t.cache_creation,
                         }),
                         group: group.clone(),
                         model: model.clone(),
@@ -473,7 +476,8 @@ mod tests {
                 "completed": [
                     { "kind": "request", "at_ms": 999_940_000u64, "method": "POST",
                       "path": "/v1/messages", "account": "a", "status": 200,
-                      "duration_ms": 1400, "tokens": { "input": 70, "output": 30 } },
+                      "duration_ms": 1400,
+                      "tokens": { "input": 70, "output": 30, "cache_read": 12 } },
                     { "kind": "note", "at_ms": 999_910_000u64,
                       "text": "switch (none) → a (initial selection)", "error": false },
                 ],
@@ -652,12 +656,15 @@ mod tests {
             } => {
                 assert_eq!(*status, 200);
                 assert_eq!(*duration, Duration::from_millis(1400));
+                // The cache split survives doc→view (ATTACH mode): a reported
+                // cache_read arrives; an unreported cache_creation stays None.
                 assert_eq!(
                     *tokens,
                     Some(TokenCounts {
                         input: 70,
                         output: 30,
-                        ..Default::default()
+                        cache_read: Some(12),
+                        cache_creation: None,
                     })
                 );
             }

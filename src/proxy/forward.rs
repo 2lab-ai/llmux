@@ -214,19 +214,21 @@ impl ForwardContext {
     }
 
     /// The `(group, model, effort, fast)` shown in the activity log. Codex: the
-    /// configured model + the PER-REQUEST effective effort/fast that went
-    /// upstream ([`CodexProvider::request_effort_fast`]); Claude: the inbound
-    /// model + the thinking budget, never fast. All `None`/`false` before the
-    /// provider path is chosen (early failures).
+    /// PER-REQUEST resolved upstream model + effective effort/fast that went
+    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model +
+    /// the thinking budget, never fast. All `None`/`false` before the provider
+    /// path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
         match self.served_codex {
             Some(true) => {
-                // Per-request effective effort + fast (matches the wire), not
-                // the static shape default.
-                let (effort, fast) = state.codex.request_effort_fast(&self.body);
+                // Per-request effective model + effort + fast (matches the
+                // wire), not the static shape defaults: a request for gpt-5.5
+                // under a gpt-5.6-sol pin records gpt-5.5, and a FAILED
+                // request still names the model that failed.
+                let (model, effort, fast) = state.codex.request_meta(&self.body);
                 FinishedMeta {
                     group: Some("codex".to_string()),
-                    model: Some(state.codex.model()),
+                    model: Some(model),
                     effort,
                     fast,
                 }
@@ -718,10 +720,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             account,
         );
         // Served (group, model) for in-flight model attribution (req11): codex
-        // → the configured upstream model; claude → the inbound model. Mirrors
-        // `finished_meta` so the in-flight row matches its eventual finish.
+        // → the PER-REQUEST resolved upstream model; claude → the inbound
+        // model. Mirrors `finished_meta` so the in-flight row matches its
+        // eventual finish.
         let (served_group, served_model) = match BackendGroup::from_kind(credential.kind()) {
-            BackendGroup::Codex => (Some("codex".to_string()), Some(state.codex.model())),
+            BackendGroup::Codex => (
+                Some("codex".to_string()),
+                Some(state.codex.request_meta(&ctx.body).0),
+            ),
             _ => (Some("claude".to_string()), ctx.model.clone()),
         };
         state.emit(ActivityEvent::RequestRouted {
@@ -1643,12 +1649,12 @@ async fn relay_codex(
     let status = response.status();
     // Codex trace (best-effort): input breakdown captured now from the inbound
     // body, terminal outcome written at each return below. `model` is what the
-    // request is served as (codex's configured model).
+    // request is served as (the per-request resolved upstream model).
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
         state.config.codex.trace,
         ctx.activity_id,
         &ctx.path_query,
-        Some(state.codex.model()),
+        Some(state.codex.request_meta(&ctx.body).0),
         &ctx.body,
     );
     ctx.log(format!(
