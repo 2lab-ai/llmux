@@ -76,9 +76,20 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
     let report = brew::execute_switch(host, current, target, islands, daemon_running)?;
 
     // Restart the daemon so the freshly installed binary is the one serving.
+    // NEVER current_exe(): this process runs from the keg the switch just
+    // uninstalled — resolve the target formula's binary via brew instead
+    // (and fail here, daemon untouched, if it can't be found).
     if report.daemon_running {
         println!("restarting the daemon on the new binary…");
-        daemon::restart().await?;
+        let exe = host.formula_bin_path(target.formula()).ok_or_else(|| {
+            CliError::Message(format!(
+                "could not locate the {formula} binary after the switch \
+                 (brew --prefix {formula})\n\
+                 The daemon was not restarted — once resolved, run: llmux restart",
+                formula = target.formula()
+            ))
+        })?;
+        daemon::restart(Some(exe)).await?;
     }
 
     let old = report.old_version.as_deref().unwrap_or("(unknown)");

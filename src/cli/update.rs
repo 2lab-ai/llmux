@@ -47,9 +47,20 @@ pub async fn run(args: UpdateArgs) -> Result<(), CliError> {
     }
 
     // Restart the daemon only if it is running AND the binary changed.
+    // Spawn the freshly upgraded formula's binary, not current_exe(): brew
+    // removed the keg this process may be running from, and (both-installed
+    // state) current_exe may even be the OTHER channel's binary.
     if brew::should_restart_daemon(daemon_running, report.formula_changed()) {
         println!("binary changed — restarting the daemon…");
-        daemon::restart().await?;
+        let exe = host.formula_bin_path(channel.formula()).ok_or_else(|| {
+            CliError::Message(format!(
+                "could not locate the {formula} binary after the upgrade \
+                 (brew --prefix {formula})\n\
+                 The daemon was not restarted — once resolved, run: llmux restart",
+                formula = channel.formula()
+            ))
+        })?;
+        daemon::restart(Some(exe)).await?;
     }
 
     // Relaunch Islands only if it was running AND the cask changed.
