@@ -1828,8 +1828,10 @@ async fn codex_settings_endpoint_changes_the_upstream_request() {
     assert_eq!(echoed["default_model"], "gpt-5.5-codex");
     assert_eq!(echoed["reasoning_effort"], "high");
 
-    // The next codex request reflects the new shape on the wire.
-    let body = r#"{"model":"gpt-5.5","max_tokens":16,"stream":true,
+    // The next codex request reflects the new shape on the wire. The request
+    // names a codex-routed but UNKNOWN model id — known-valid slugs (e.g.
+    // gpt-5.5) now pass through verbatim and would bypass the pin.
+    let body = r#"{"model":"gpt-imaginary","max_tokens":16,"stream":true,
         "messages":[{"role":"user","content":"hi"}]}"#;
     let response = post_messages(&client, &proxy, body).await;
     assert_eq!(response.status(), 200);
@@ -1920,8 +1922,8 @@ async fn gpt_5_5_request_leases_codex_account() {
     );
     let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
     assert_eq!(
-        upstream_body["model"], "gpt-5.6-sol",
-        "codex provider pins the default codex model upstream"
+        upstream_body["model"], "gpt-5.5",
+        "known-valid slugs pass through verbatim (the client chose gpt-5.5)"
     );
 
     // The codex slot is current; the claude slot is independent.
