@@ -9,8 +9,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    AccountConfig, AccountCredential, CodexConfig, Config, IdleProbeConfig, ProxyConfig,
-    RawIoConfig, RoutingConfig, SchedulerConfig, Upsert, DEFAULT_CODEX_TOKEN_URL,
+    default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
+    AccountLimits, CodexConfig, Config, EventBanner, IdleProbeConfig, ProxyConfig, QuotaDisplay,
+    RawIoConfig, RoutingConfig, SchedulerConfig, SchedulerMode, Upsert, DEFAULT_CODEX_TOKEN_URL,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_UPSTREAM,
 };
 
@@ -136,6 +137,23 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     let mut config: Config = serde_json::from_str(&raw)?;
     if config.version != 1 {
         return Err(ConfigError::UnsupportedVersion(config.version));
+    }
+    // Idle-probe always-on migration (#45). Pre-#45 builds serialized the OLD
+    // conservative default triple — enabled=false, cooldown=3600, sweep=0 — for
+    // every user who never touched the block, so a live config carrying EXACTLY
+    // that triple is indistinguishable from "unset". Treat it as unset and adopt
+    // the new always-on defaults, otherwise the stale serialized value would
+    // pin probing off forever. Any OTHER combination is an operator's explicit
+    // choice and is kept verbatim: an operator opting out post-upgrade sets
+    // enabled=false with a non-default cooldown or a non-zero sweep, which no
+    // longer matches this triple.
+    const LEGACY_IDLE_PROBE_DEFAULT: IdleProbeConfig = IdleProbeConfig {
+        enabled: false,
+        per_account_cooldown_secs: 3600,
+        sweep_secs: 0,
+    };
+    if config.proxy.idle_probe == LEGACY_IDLE_PROBE_DEFAULT {
+        config.proxy.idle_probe = IdleProbeConfig::default();
     }
     // Demo mode: swap account identities for stable fakes at the source so every
     // surface (dashboard, logs, status) shows the alias. Credentials are keyed
@@ -610,6 +628,49 @@ mod tests {
     }
 
     #[test]
+    fn event_banners_are_additive_and_parse_when_present() {
+        // A config written before the `events` block existed — and one still
+        // carrying the removed singular `event` key — both load with an empty
+        // list (the orphan key is ignored, nothing reserved on screen).
+        let old: Config = serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
+        assert!(old.events.is_empty(), "absent block → empty");
+        let orphan: Config =
+            serde_json::from_str(r#"{ "version": 1, "event": { "label": "x", "until": "y" } }"#)
+                .expect("orphan event key ignored");
+        assert!(orphan.events.is_empty(), "removed singular key dropped");
+
+        // A present list parses each entry verbatim (accepting the compact form).
+        let raw = r#"{
+            "version": 1,
+            "events": [
+                { "id": "20260712-fable5", "from": "202607080000", "to": "202607130000",
+                  "content": "Fable 5 Available until 7/12" }
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(raw).expect("events config parses");
+        assert_eq!(config.events.len(), 1);
+        let event = &config.events[0];
+        assert_eq!(event.id, "20260712-fable5");
+        assert_eq!(event.from, "202607080000");
+        assert_eq!(event.to, "202607130000");
+        assert_eq!(event.content, "Fable 5 Available until 7/12");
+
+        // An empty list is omitted on write (byte-compatible until one is set)
+        // and a populated list round-trips.
+        assert!(
+            serde_json::to_value(&old)
+                .expect("json")
+                .get("events")
+                .is_none(),
+            "empty list omitted on write"
+        );
+        let round: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("re-parse");
+        assert_eq!(round.events, config.events);
+    }
+
+    #[test]
     fn codex_accounts_dedup_by_account_id_and_update_tokens() {
         let mut config = Config::default();
         config.accounts.push(codex_account("codex-old", "acct-1"));
@@ -789,6 +850,84 @@ mod tests {
             let mode = fs::metadata(&path).expect("meta").permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn idle_probe_defaults_are_always_on() {
+        // Issue #45: the probe is ALWAYS-ON out of the box — a cold account
+        // (no 5h/7d window) gets a 1-token probe without any operator opt-in.
+        // Both the Rust default and a config file missing the block entirely
+        // must load enabled with an hourly sweep.
+        let defaults = IdleProbeConfig::default();
+        assert!(defaults.enabled, "probing on by default");
+        assert_eq!(defaults.per_account_cooldown_secs, 3600);
+        assert_eq!(defaults.sweep_secs, 3600, "hourly sweep by default");
+
+        let parsed: IdleProbeConfig = serde_json::from_str("{}").expect("empty block parses");
+        assert_eq!(parsed, defaults, "missing fields load always-on");
+    }
+
+    #[test]
+    fn legacy_idle_probe_default_triple_upgrades_to_always_on() {
+        // A config written by a pre-#45 build for a user who never touched the
+        // block carries EXACTLY the old conservative triple. That is
+        // indistinguishable from "unset", so load_path must treat it as unset
+        // and adopt the new always-on defaults (else it would pin probing off).
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "proxy": { "idle_probe": {
+                "enabled": false, "per_account_cooldown_secs": 3600, "sweep_secs": 0 } } }"#,
+        )
+        .expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(
+            loaded.proxy.idle_probe,
+            IdleProbeConfig::default(),
+            "legacy triple upgrades to always-on"
+        );
+        assert!(loaded.proxy.idle_probe.enabled);
+        assert_eq!(loaded.proxy.idle_probe.sweep_secs, 3600);
+    }
+
+    #[test]
+    fn explicit_idle_probe_opt_out_survives_load_unchanged() {
+        // enabled=false BUT with a non-default cooldown → an operator's explicit
+        // post-upgrade opt-out, not the legacy triple. It must load verbatim.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "proxy": { "idle_probe": {
+                "enabled": false, "per_account_cooldown_secs": 7200, "sweep_secs": 0 } } }"#,
+        )
+        .expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(
+            loaded.proxy.idle_probe,
+            IdleProbeConfig {
+                enabled: false,
+                per_account_cooldown_secs: 7200,
+                sweep_secs: 0,
+            },
+            "an explicit non-default opt-out is kept verbatim"
+        );
+    }
+
+    #[test]
+    fn missing_idle_probe_block_loads_always_on_via_load_path() {
+        // A config with no idle_probe (or no proxy) block at all loads the
+        // always-on defaults through the serde defaults — no migration needed.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(&path, r#"{ "version": 1 }"#).expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(loaded.proxy.idle_probe, IdleProbeConfig::default());
+        assert!(loaded.proxy.idle_probe.enabled);
     }
 
     #[test]

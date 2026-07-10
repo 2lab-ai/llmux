@@ -44,9 +44,12 @@ struct LlmuxDashboard: Decodable {
     /// Data-quality labels (issue #62 U18). The server field ships in a later
     /// slice — decoded fully optionally so its absence today is not an error.
     let dataQuality: LlmuxDashboardDataQuality?
+    /// Operator events list (replaces the single event banner). Additive →
+    /// `[]` for daemons that predate it or carry no events.
+    let events: [LlmuxEvent]
 
     enum CodingKeys: String, CodingKey {
-        case version, port, current, accounts, totals, windowed, activity
+        case version, port, current, accounts, totals, windowed, activity, events
         case uptimeSecs = "uptime_secs"
         case currentByGroup = "current_by_group"
         case modelUsage = "model_usage"
@@ -72,6 +75,7 @@ struct LlmuxDashboard: Decodable {
         emailAnonymous = try c.decodeIfPresent(Bool.self, forKey: .emailAnonymous)
         showFableWeekly = try c.decodeIfPresent(Bool.self, forKey: .showFableWeekly)
         dataQuality = try c.decodeIfPresent(LlmuxDashboardDataQuality.self, forKey: .dataQuality)
+        events = try c.decodeIfPresent([LlmuxEvent].self, forKey: .events) ?? []
     }
 }
 
@@ -94,9 +98,11 @@ struct LlmuxDashboardAccount: Decodable {
     let inFlight: Int?
     let tokenExpiresAtMs: UInt64?
     let lastRefreshMs: UInt64?
+    /// Operator pause (llmux 0.2.16+); optional for older daemons.
+    let paused: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, type, status, blocked, healthy
+        case name, type, status, blocked, healthy, paused
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"
@@ -401,7 +407,8 @@ extension LlmuxDashboardAccount {
             sevenDay: sevenDay.map { LlmuxWindow(utilization: $0.utilization, resetsInSecs: $0.resetsInSecs) },
             fableWeekly: fableWeekly,
             inFlight: inFlight,
-            tokenExpiresAtMs: tokenExpiresAtMs
+            tokenExpiresAtMs: tokenExpiresAtMs,
+            paused: paused
         )
     }
 }

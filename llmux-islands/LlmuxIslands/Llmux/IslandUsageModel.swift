@@ -210,7 +210,8 @@ final class IslandUsageModel: ObservableObject {
             tokenRefresh: tile.tokenRefresh,
             info: tile.info,
             errorMessage: tile.errorMessage,
-            issue: tile.issue
+            issue: tile.issue,
+            paused: tile.paused
         )
     }
 
@@ -264,7 +265,8 @@ final class IslandUsageModel: ObservableObject {
             tokenRefresh: tokenRefresh,
             info: info,
             errorMessage: authFailed ? "auth failed — re-login" : nil,
-            issue: nil
+            issue: nil,
+            paused: a.paused ?? false
         )
     }
 
@@ -285,6 +287,18 @@ final class IslandUsageModel: ObservableObject {
     func remove(_ name: String) async {
         do {
             try await client.remove(name: name)
+            await refresh()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Pause/resume one account (context menu). The daemon persists the flag
+    /// (`paused_accounts`) and the scheduler skips the account until resumed;
+    /// the sepia tile state follows on the next refresh.
+    func setPaused(_ name: String, paused: Bool) async {
+        do {
+            try await client.setPaused(name: name, paused: paused)
             await refresh()
         } catch {
             lastError = error.localizedDescription

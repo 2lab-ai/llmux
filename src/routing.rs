@@ -99,9 +99,12 @@ impl Rule {
     }
 }
 
-/// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, and
-/// the exact `gpt-5.5` / `gpt-5.6` family ids (covered by `gpt-` already, but
-/// kept explicit so the intent survives a future prefix change).
+/// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, the
+/// exact `gpt-5.5` / `gpt-5.6` family ids (covered by `gpt-` already, but kept
+/// explicit so the intent survives a future prefix change), and the bare
+/// variant aliases `sol` / `terra` / `luna` (which the codex provider resolves
+/// to the latest gpt generation of that variant — see
+/// [`crate::provider::codex`]).
 fn builtin_codex_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gpt-".to_string()),
@@ -112,6 +115,9 @@ fn builtin_codex_rules() -> Vec<Rule> {
         Rule::Exact("gpt-5.5".to_string()),
         Rule::Exact("gpt-5.6".to_string()),
         Rule::Exact("gpt-5.6-sol".to_string()),
+        Rule::Exact("sol".to_string()),
+        Rule::Exact("terra".to_string()),
+        Rule::Exact("luna".to_string()),
     ]
 }
 
@@ -334,6 +340,22 @@ mod tests {
         assert_eq!(builtin().classify(Some("o3")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("o3-pro")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("o4-mini")), BackendGroup::Codex);
+    }
+
+    #[test]
+    fn bare_variant_aliases_route_to_codex() {
+        // The bare variant aliases resolve upstream to the latest gpt
+        // generation of that variant; routing classifies them to codex.
+        assert_eq!(builtin().classify(Some("sol")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("terra")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("luna")), BackendGroup::Codex);
+        // Exact, case-insensitive like the rest.
+        assert_eq!(builtin().classify(Some("SOL")), BackendGroup::Codex);
+        // Not a substring rule: a name merely containing "sol" is unaffected.
+        assert_eq!(
+            builtin().classify(Some("solar-flare")),
+            BackendGroup::Claude
+        );
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub struct SelectParams {
     pub five_hour_max: f64,
     /// 7d utilization ceiling (default 0.99).
     pub seven_day_max: f64,
+    /// Fable-weekly utilization ceiling for FABLE requests (default 0.98).
+    pub fable_weekly_max: f64,
+    /// Selection algorithm (config `scheduler.mode`).
+    pub mode: crate::config::SchedulerMode,
     /// Usage data older than this makes an account ineligible — unless ALL
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
@@ -29,6 +33,8 @@ impl From<&SchedulerConfig> for SelectParams {
         Self {
             five_hour_max: cfg.five_hour_max,
             seven_day_max: cfg.seven_day_max,
+            fable_weekly_max: cfg.fable_weekly_max,
+            mode: cfg.mode,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
         }
     }
@@ -51,6 +57,9 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IneligibleReason {
     AuthUnhealthy,
+    /// Operator pause (config `paused_accounts`): absolute — gates automatic
+    /// selection, manual switch, and every degraded mode alike, until resumed.
+    Paused,
     CoolingDown,
     FiveHourOverThreshold,
     SevenDayOverThreshold,
@@ -84,6 +93,19 @@ pub enum RequestScope {
 /// Boundary semantics: a window AT the threshold is still eligible
 /// (`utilization <= max`); only strictly-over crosses the gate. A missing
 /// window is a cold account — utilization 0, immediately eligible.
+/// The 5h/7d/Fable ceilings that apply to THIS account: the per-account
+/// override (config `account_limits`) when set, else the global params.
+pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64, f64) {
+    (
+        account.limits.five_hour_max.unwrap_or(params.five_hour_max),
+        account.limits.seven_day_max.unwrap_or(params.seven_day_max),
+        account
+            .limits
+            .fable_weekly_max
+            .unwrap_or(params.fable_weekly_max),
+    )
+}
+
 pub fn eligibility(
     account: &AccountSnapshot,
     params: &SelectParams,
@@ -114,6 +136,12 @@ pub fn gate(
     if !account.healthy {
         return Some(IneligibleReason::AuthUnhealthy);
     }
+    // Operator pause is absolute: it gates in every mode (including the
+    // headers-only and heuristic-degraded fallbacks) — a paused account only
+    // returns to service when the operator resumes it.
+    if account.paused {
+        return Some(IneligibleReason::Paused);
+    }
     // A cooldown gates UNLESS we are in heuristic-degraded mode and this park
     // is a Heuristic one — a RetryAfter park is an explicit upstream
     // instruction and always gates.
@@ -122,16 +150,17 @@ pub fn gate(
     {
         return Some(IneligibleReason::CoolingDown);
     }
+    let (five_max, seven_max, _) = effective_limits(account, params);
     let five = account
         .five_hour
         .map_or(0.0, |w| w.effective_utilization(now));
-    if five > params.five_hour_max {
+    if five > five_max {
         return Some(IneligibleReason::FiveHourOverThreshold);
     }
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    if seven > params.seven_day_max {
+    if seven > seven_max {
         return Some(IneligibleReason::SevenDayOverThreshold);
     }
     // Codex accounts are exempt from the staleness gate: there is no usage
@@ -175,7 +204,7 @@ pub fn gate_scoped(
         if account.fable_cooldown_active(now) {
             return Some(IneligibleReason::FableCoolingDown);
         }
-        if account.fable_weekly_exhausted(now) {
+        if account.fable_weekly_exhausted(now, effective_limits(account, params).2) {
             return Some(IneligibleReason::FableWeeklyExhausted);
         }
     }
@@ -340,11 +369,17 @@ pub fn pick_scoped(
 
     // In heuristic-degraded mode every candidate is heuristic-parked: rank by
     // soonest `cooldown_until` so the next request lands on the soonest-freed
-    // account. Otherwise use the normal perishability comparator.
-    let best = eligible
-        .iter()
-        .copied()
-        .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded));
+    // account. Otherwise use the mode's comparator: round-robin picks the next
+    // ROSTER-order account after the current (wrapping) — deterministic,
+    // score-free — while default uses the perishability comparator.
+    let best = if params.mode == crate::config::SchedulerMode::RoundRobin && !heuristic_degraded {
+        round_robin_next(snapshot, &eligible, group_current(snapshot, group, scope))
+    } else {
+        eligible
+            .iter()
+            .copied()
+            .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded))
+    };
 
     // Stickiness with a perishability override: stay on an eligible current
     // unless some account is worth CLEARLY more right now — its score exceeds
@@ -359,7 +394,19 @@ pub fn pick_scoped(
     // current.
     if !heuristic_degraded {
         if let Some(current_id) = group_current(snapshot, group, scope) {
-            if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
+            if eligible.iter().any(|a| &a.id == current_id) {
+                // Round-robin stickiness is ABSOLUTE: an eligible current is
+                // never proactively abandoned — the whole point of the mode is
+                // to preserve upstream prompt-cache locality until the account
+                // is hard ineligible.
+                if params.mode == crate::config::SchedulerMode::RoundRobin {
+                    return Decision::Stay;
+                }
+                let current = eligible
+                    .iter()
+                    .copied()
+                    .find(|a| &a.id == current_id)
+                    .expect("checked above");
                 let clearly_better = match best {
                     Some(best) if &best.id != current_id => {
                         account_score(best, params, now)
@@ -382,6 +429,26 @@ pub fn pick_scoped(
             retry_after: soonest_reset(snapshot, now),
         },
     }
+}
+
+/// Round-robin choice: the first ELIGIBLE account after the current one in
+/// roster (snapshot/config) order, wrapping; with no current, the first
+/// eligible account in roster order. `eligible` preserves roster order
+/// because it filters `snapshot.accounts` in place.
+fn round_robin_next<'a>(
+    snapshot: &'a PoolSnapshot,
+    eligible: &[&'a AccountSnapshot],
+    current: Option<&AccountId>,
+) -> Option<&'a AccountSnapshot> {
+    let is_eligible = |id: &AccountId| eligible.iter().any(|a| &a.id == id);
+    let start = current
+        .and_then(|cur| snapshot.accounts.iter().position(|a| &a.id == cur))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let n = snapshot.accounts.len();
+    (0..n)
+        .map(|offset| &snapshot.accounts[(start + offset) % n])
+        .find(|a| is_eligible(&a.id))
 }
 
 /// The current account for the active selection scope: the group's slot when
@@ -412,6 +479,16 @@ pub fn next_in_line(
     let headers_only = headers_only_mode(snapshot, params, group, now);
     // The per-group "next" line is a display reader over the non-Fable current.
     let current = group_current(snapshot, group, RequestScope::NonFable);
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        let eligible: Vec<&AccountSnapshot> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| in_group(a, group))
+            .filter(|a| Some(&a.id) != current)
+            .filter(|a| eligibility(a, params, now, headers_only).is_none())
+            .collect();
+        return round_robin_next(snapshot, &eligible, current).map(|a| a.id.clone());
+    }
     snapshot
         .accounts
         .iter()
@@ -466,8 +543,9 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    let r5 = (params.five_hour_max - five).max(0.0);
-    let r7 = (params.seven_day_max - seven).max(0.0);
+    let (five_max, seven_max, _) = effective_limits(account, params);
+    let r5 = (five_max - five).max(0.0);
+    let r7 = (seven_max - seven).max(0.0);
     let servable_now = r5.min(r7);
     let urgency = match live_reset(&account.seven_day, now) {
         Some(reset) => {
@@ -593,15 +671,23 @@ pub fn selection_order(
             ineligible.push(idx);
         }
     }
-    eligible.sort_by(|&a, &b| {
-        rank(
-            &snapshot.accounts[a],
-            &snapshot.accounts[b],
-            params,
-            group,
-            now,
-        )
-    });
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        // Display the literal rotation: roster order starting after the
+        // current account (wrapping) — the order round_robin_next serves.
+        let start = current.first().map(|&i| i + 1).unwrap_or(0);
+        let n = snapshot.accounts.len().max(1);
+        eligible.sort_by_key(|&i| (i + n - (start % n)) % n);
+    } else {
+        eligible.sort_by(|&a, &b| {
+            rank(
+                &snapshot.accounts[a],
+                &snapshot.accounts[b],
+                params,
+                group,
+                now,
+            )
+        });
+    }
     current
         .into_iter()
         .chain(eligible)
@@ -621,6 +707,7 @@ pub fn blocking_reason(
 ) -> String {
     match reason {
         IneligibleReason::AuthUnhealthy => "auth failed".to_string(),
+        IneligibleReason::Paused => "paused".to_string(),
         IneligibleReason::CoolingDown => {
             match account
                 .cooldown_until
@@ -637,7 +724,7 @@ pub fn blocking_reason(
             format!(
                 "5h {:.1}% > {:.0}%",
                 util * 100.0,
-                params.five_hour_max * 100.0
+                effective_limits(account, params).0 * 100.0
             )
         }
         IneligibleReason::SevenDayOverThreshold => {
@@ -647,7 +734,7 @@ pub fn blocking_reason(
             format!(
                 "7d {:.1}% > {:.0}%",
                 util * 100.0,
-                params.seven_day_max * 100.0
+                effective_limits(account, params).1 * 100.0
             )
         }
         IneligibleReason::UsageStale => {
@@ -840,6 +927,8 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -873,7 +962,101 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
         }
+    }
+
+    #[test]
+    fn round_robin_stays_until_hard_ineligible_then_takes_roster_order() {
+        let rr = || {
+            let mut p = params();
+            p.mode = crate::config::SchedulerMode::RoundRobin;
+            p
+        };
+        // Three accounts in roster order a, b, c; current = b.
+        let mut a = account("a");
+        a.seven_day = Some(window(0.10, 600_000));
+        let mut b = account("b");
+        b.seven_day = Some(window(0.95, 1_000)); // resets soon → default mode would prefer burning it? b IS current
+        let mut c = account("c");
+        c.seven_day = Some(window(0.20, 500_000));
+        // Current b is still eligible → absolute stay, even though other
+        // accounts may score higher.
+        let snap = pool(vec![a.clone(), b.clone(), c.clone()], Some("b"));
+        assert_eq!(pick(&snap, &rr(), None, now()), Decision::Stay);
+        // Current b crosses its 7d ceiling → hard ineligible → the NEXT
+        // roster account after b is c (wrap would continue to a).
+        let mut b_dead = b.clone();
+        b_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a.clone(), b_dead, c.clone()], Some("b"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("c".into())
+            },
+            "roster order after the current, not the best score"
+        );
+        // Wrapping: current = c (last) → next is a.
+        let mut c_dead = c.clone();
+        c_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a, account("b2"), c_dead], Some("c"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("a".into())
+            },
+            "rotation wraps to the roster head"
+        );
+    }
+
+    #[test]
+    fn per_account_limit_overrides_beat_the_global_ceilings() {
+        // Global 5h ceiling is 0.90; this account overrides it down to 0.50.
+        let mut a = account("alpha");
+        a.five_hour = Some(window(0.60, 3_600));
+        a.limits.five_hour_max = Some(0.50);
+        assert_eq!(
+            eligibility(&a, &params(), now(), false),
+            Some(IneligibleReason::FiveHourOverThreshold),
+            "0.60 > per-account 0.50 even though the global ceiling is 0.90"
+        );
+        // The blocking reason reports the EFFECTIVE ceiling.
+        let reason = blocking_reason(
+            &a,
+            IneligibleReason::FiveHourOverThreshold,
+            &params(),
+            now(),
+        );
+        assert!(
+            reason.contains("> 50%"),
+            "effective ceiling in text: {reason}"
+        );
+        // Clearing the override restores the global ceiling.
+        a.limits.five_hour_max = None;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
+    }
+
+    #[test]
+    fn paused_account_is_ineligible_in_every_mode_and_reads_paused() {
+        let mut a = account("alpha");
+        a.paused = true;
+        // Normal, headers-only, and heuristic-degraded modes all refuse it.
+        for (headers_only, degraded) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                gate(&a, &params(), now(), headers_only, degraded),
+                Some(IneligibleReason::Paused),
+                "headers_only={headers_only} degraded={degraded}"
+            );
+        }
+        assert_eq!(
+            blocking_reason(&a, IneligibleReason::Paused, &params(), now()),
+            "paused"
+        );
+        // Resumed → eligible again.
+        a.paused = false;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
     }
 
     /// Build a snapshot whose legacy current slot is `current` (the
@@ -2052,6 +2235,8 @@ mod tests {
         let p = SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 1.0,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         };
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
@@ -2229,7 +2414,7 @@ mod tests {
         // a Fable request must be ALLOWED (gate returns None).
         let ok = fable_headroom("ok");
         assert!(
-            !ok.fable_weekly_exhausted(now()),
+            !ok.fable_weekly_exhausted(now(), 0.98),
             "76%/warning/is_active is NOT exhausted — it still has headroom"
         );
         assert_eq!(
@@ -2240,7 +2425,7 @@ mod tests {
         // Contrast: a genuinely exhausted Fable account (100%/Critical/is_active)
         // IS still excluded from Fable routing.
         let dead = fable_critical("dead");
-        assert!(dead.fable_weekly_exhausted(now()));
+        assert!(dead.fable_weekly_exhausted(now(), 0.98));
         assert_eq!(
             gate_scoped(&dead, &params(), now(), false, false, RequestScope::Fable),
             Some(IneligibleReason::FableWeeklyExhausted),
