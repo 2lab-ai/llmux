@@ -328,6 +328,28 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_sol_cache_read_is_ten_percent_of_input() {
+        // OpenAI bills cached input at the flat gpt-5.x discount (10% of the
+        // input rate). gpt-5.6-sol input is $5/1e6, so 1e6 cache-read tokens
+        // cost $0.50 — a third of a mostly-cached prompt is billed at a tenth,
+        // not the full input rate (the codex cache-read cost regression).
+        let cache = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
+            &tc(0, 0, Some(1_000_000), None),
+            &empty(),
+        );
+        approx(cache, 0.50);
+        let input = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(cache, input * 0.10);
+    }
+
+    #[test]
     fn mixed_tokens_sum_each_component() {
         // opus: 5/25/0.5/6.25 per 1e6.
         // 200k in (1.0) + 100k out (2.5) + 50k cr (0.025) + 40k cc (0.25) = 3.775.
