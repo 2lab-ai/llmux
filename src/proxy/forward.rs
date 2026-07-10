@@ -213,26 +213,36 @@ impl ForwardContext {
         }
     }
 
-    /// The (group, model, effort) triple shown in the activity log. Codex: the
-    /// configured model + effort; Claude: the inbound model + the thinking
-    /// budget. All `None` before the provider path is chosen (early failures).
-    fn finished_meta(&self, state: &AppState) -> (Option<String>, Option<String>, Option<String>) {
+    /// The `(group, model, effort, fast)` shown in the activity log. Codex: the
+    /// configured model + the PER-REQUEST effective effort/fast that went
+    /// upstream ([`CodexProvider::request_effort_fast`]); Claude: the inbound
+    /// model + the thinking budget, never fast. All `None`/`false` before the
+    /// provider path is chosen (early failures).
+    fn finished_meta(&self, state: &AppState) -> FinishedMeta {
         match self.served_codex {
-            Some(true) => (
-                Some("codex".to_string()),
-                Some(state.codex.model()),
-                state.codex.effort(),
-            ),
-            Some(false) => (
-                Some("claude".to_string()),
-                self.model.clone(),
-                effort_from_thinking(&self.body),
-            ),
-            None => (
-                self.group.map(|g| g.as_str().to_string()),
-                self.model.clone(),
-                effort_from_thinking(&self.body),
-            ),
+            Some(true) => {
+                // Per-request effective effort + fast (matches the wire), not
+                // the static shape default.
+                let (effort, fast) = state.codex.request_effort_fast(&self.body);
+                FinishedMeta {
+                    group: Some("codex".to_string()),
+                    model: Some(state.codex.model()),
+                    effort,
+                    fast,
+                }
+            }
+            Some(false) => FinishedMeta {
+                group: Some("claude".to_string()),
+                model: self.model.clone(),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
+            None => FinishedMeta {
+                group: self.group.map(|g| g.as_str().to_string()),
+                model: self.model.clone(),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
         }
     }
 
@@ -264,7 +274,7 @@ impl ForwardContext {
         let Some(path) = self.raw_io_path(state) else {
             return;
         };
-        let (group, model, _effort) = self.finished_meta(state);
+        let FinishedMeta { group, model, .. } = self.finished_meta(state);
         crate::proxy::raw_io::capture(
             Some(path),
             self.activity_id,
@@ -286,7 +296,12 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
     ) {
-        let (group, model, effort) = self.finished_meta(state);
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = self.finished_meta(state);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
             method: self.method.to_string(),
@@ -298,14 +313,47 @@ impl ForwardContext {
             group,
             model,
             effort,
+            fast,
             user_id: self.user_id.clone(),
         });
     }
 }
 
+/// The backend group / served model / per-request effort / fast flag attributed
+/// to a finished request, for the activity event and raw-io capture. Codex
+/// carries the effective per-request effort and fast; Claude the thinking
+/// budget and `fast = false`.
+struct FinishedMeta {
+    group: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    fast: bool,
+}
+
+/// The per-request effort recorded for a CLAUDE request: the raw
+/// `output_config.effort` string the client sent (Claude Code sends
+/// low/medium/high/xhigh/max on the wire), when present; otherwise the
+/// extended-thinking budget label ([`effort_from_thinking`]). `None` when
+/// neither is present. Codex effort comes from the codex resolution instead.
+fn claude_effort(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let output_config = value
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(|e| e.as_str())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string);
+    output_config.or_else(|| effort_from_thinking(body))
+}
+
 /// Map the inbound Anthropic `thinking` block to a compact effort label for
 /// the activity log: `{budget/1000}k` when extended thinking is enabled, else
-/// `None`. (For codex the effort comes from config, not the body.)
+/// `None`. (For codex the effort comes from the per-request resolution, not the
+/// body's thinking block.)
 fn effort_from_thinking(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let thinking = v.get("thinking")?;
@@ -487,6 +535,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 group: None,
                 model: None,
                 effort: None,
+                fast: false,
                 // Body never read → no metering identity; metered as unknown.
                 user_id: None,
             });
@@ -1426,7 +1475,12 @@ async fn relay(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
-        let (group, model, effort) = ctx.finished_meta(state);
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
         // body + a tee of the bytes streamed to the client. The relay keeps TWO
@@ -1492,6 +1546,7 @@ async fn relay(
                         group,
                         model,
                         effort,
+                        fast,
                         user_id,
                     });
                 }
@@ -1646,7 +1701,12 @@ async fn relay_codex(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
-        let (group, model, effort) = ctx.finished_meta(state);
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
         // body + a tee of the Anthropic-SSE bytes EMITTED to the client. The
@@ -1727,6 +1787,7 @@ async fn relay_codex(
                         group,
                         model,
                         effort,
+                        fast,
                         user_id,
                     });
                 }
@@ -1886,6 +1947,36 @@ mod tests {
     use crate::scheduler::AccountPool;
 
     // ---- pure unit tests ----
+
+    #[test]
+    fn claude_effort_prefers_output_config_then_thinking_budget() {
+        // The raw output_config.effort string is recorded verbatim.
+        assert_eq!(
+            claude_effort(br#"{"output_config":{"effort":"low"},"messages":[]}"#).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            claude_effort(br#"{"output_config":{"effort":"max"}}"#).as_deref(),
+            Some("max")
+        );
+        // Absent output_config → fall back to the extended-thinking budget.
+        assert_eq!(
+            claude_effort(br#"{"thinking":{"type":"enabled","budget_tokens":16000}}"#).as_deref(),
+            Some("16k")
+        );
+        // output_config wins over a thinking block when both are present.
+        assert_eq!(
+            claude_effort(
+                br#"{"output_config":{"effort":"high"},"thinking":{"type":"enabled","budget_tokens":16000}}"#
+            )
+            .as_deref(),
+            Some("high")
+        );
+        // Neither present, empty effort, or non-JSON → absent.
+        assert_eq!(claude_effort(br#"{"messages":[]}"#), None);
+        assert_eq!(claude_effort(br#"{"output_config":{"effort":"  "}}"#), None);
+        assert_eq!(claude_effort(b"not json"), None);
+    }
 
     fn oauth_credential(token: &str) -> AccountCredential {
         AccountCredential::Oauth {

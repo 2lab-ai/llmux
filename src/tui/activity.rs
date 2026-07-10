@@ -64,6 +64,8 @@ pub(crate) enum CompletedBody {
         group: Option<String>,
         model: Option<String>,
         effort: Option<String>,
+        /// Codex fast mode was in effect (always `false` for claude).
+        fast: bool,
     },
     Note {
         text: String,
@@ -592,6 +594,10 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Codex fast mode was in effect (always `false` for claude). Additive:
+    /// lines persisted before this field default to `false`.
+    #[serde(default)]
+    pub fast: bool,
     /// Keyless per-client metering identity (issue #32). Additive: lines
     /// persisted before this field default to `None` and replay into the
     /// `unknown` client bucket.
@@ -615,6 +621,7 @@ impl PersistedRequest {
             group,
             model,
             effort,
+            fast,
             user_id,
         } = event
         else {
@@ -637,6 +644,7 @@ impl PersistedRequest {
             group: group.clone(),
             model: model.clone(),
             effort: effort.clone(),
+            fast: *fast,
             user_id: user_id.clone(),
         })
     }
@@ -656,6 +664,7 @@ impl PersistedRequest {
             group: self.group,
             model: self.model,
             effort: self.effort,
+            fast: self.fast,
             user_id: self.user_id,
         };
         (event, ts)
@@ -1169,6 +1178,7 @@ impl ActivityLog {
                 group,
                 model,
                 effort,
+                fast,
                 user_id,
             } => {
                 let routed = self
@@ -1217,6 +1227,7 @@ impl ActivityLog {
                         group,
                         model,
                         effort,
+                        fast,
                     },
                 });
             }
@@ -1312,6 +1323,7 @@ mod tests {
             group: None,
             model: None,
             effort: None,
+            fast: false,
             user_id: None,
         }
     }
@@ -1340,6 +1352,7 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            fast: false,
             user_id: None,
         }
     }
@@ -1367,6 +1380,7 @@ mod tests {
             group: None,
             model: None,
             effort: None,
+            fast: false,
             user_id: user_id.map(str::to_string),
         }
     }
@@ -2232,6 +2246,7 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            fast: false,
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),

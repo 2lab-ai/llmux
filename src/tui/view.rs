@@ -277,6 +277,7 @@ impl DashboardView {
                     group,
                     model,
                     effort,
+                    fast,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -299,6 +300,7 @@ impl DashboardView {
                         group: group.clone(),
                         model: model.clone(),
                         effort: effort.clone(),
+                        fast: *fast,
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {

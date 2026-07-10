@@ -339,6 +339,7 @@ fn trace_event(event: &ActivityEvent) {
             group,
             model,
             effort,
+            fast,
             user_id,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
@@ -361,6 +362,7 @@ fn trace_event(event: &ActivityEvent) {
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
                 effort = effort.as_deref().unwrap_or("-"),
+                fast = *fast,
                 client = user_id.as_deref().unwrap_or("unknown"),
                 "request finished"
             );
@@ -950,6 +952,10 @@ pub enum CompletedDoc {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Codex fast mode was in effect (always `false` for claude). Additive:
+        /// absent (→ `false`) in docs written before this field existed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fast: bool,
     },
     Note {
         at_ms: u64,
@@ -1362,6 +1368,7 @@ pub(crate) fn dashboard_doc(
                     group,
                     model,
                     effort,
+                    fast,
                 } => CompletedDoc::Request {
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
@@ -1384,6 +1391,7 @@ pub(crate) fn dashboard_doc(
                     group: group.clone(),
                     model: model.clone(),
                     effort: effort.clone(),
+                    fast: *fast,
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -1635,6 +1643,7 @@ mod tests {
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
                 effort: Some("high".into()),
+                fast: true,
                 user_id: Some("acct_seed".into()),
             },
             now() - Duration::from_secs(58),
@@ -1901,17 +1910,19 @@ mod tests {
                 ..
             }
         ));
-        // group/model/effort (req7) are carried into the doc.
+        // group/model/effort/fast (req7) are carried into the doc.
         match &doc.activity.completed[0] {
             CompletedDoc::Request {
                 group,
                 model,
                 effort,
+                fast,
                 ..
             } => {
                 assert_eq!(group.as_deref(), Some("codex"));
                 assert_eq!(model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(effort.as_deref(), Some("high"));
+                assert!(*fast, "codex fast mode is carried into the doc");
             }
             other => panic!("expected request, got {other:?}"),
         }
@@ -2362,6 +2373,7 @@ mod tests {
                     group: None,
                     model: None,
                     effort: None,
+                    fast: false,
                     user_id: None,
                 },
                 now() - Duration::from_secs(seeded - i),
@@ -2405,6 +2417,7 @@ mod tests {
             group: Some("claude".into()),
             model: Some("sonnet".into()),
             effort: None,
+            fast: false,
             user_id: None,
         }
     }
