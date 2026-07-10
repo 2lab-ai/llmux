@@ -131,6 +131,17 @@ impl CodexProvider {
         self.shape.read().expect("codex shape lock").effort.clone()
     }
 
+    /// The PER-REQUEST effective `(reasoning effort, fast)` for `anthropic_body`
+    /// under the live shape — the exact values [`Self::build_request`] would
+    /// send upstream, for the activity log. Reuses [`effective_effort_fast`]
+    /// (no duplicated resolution). A non-JSON body (which would fail
+    /// `build_request` anyway) falls back to the shape's own effort/fast.
+    pub fn request_effort_fast(&self, anthropic_body: &[u8]) -> (Option<String>, bool) {
+        let shape = self.shape();
+        let body = serde_json::from_slice::<Value>(anthropic_body).unwrap_or(Value::Null);
+        effective_effort_fast(&body, &shape)
+    }
+
     pub fn endpoint(&self) -> &str {
         &self.base_url
     }
@@ -245,17 +256,34 @@ const PASSTHROUGH_MODELS: &[&str] = &[
     "gpt-5.6-luna",
 ];
 
-/// Resolve the model slug requested upstream: known-valid slugs pass through
+/// The latest gpt generation the bare variant aliases (`sol`/`terra`/`luna`)
+/// and the bare `gpt-5.6` id resolve to. This is the ONE const to bump when a
+/// new generation ships (e.g. `gpt-5.7`): the aliases then follow automatically.
+const LATEST_GPT_GENERATION: &str = "gpt-5.6";
+
+/// Bare variant aliases: routing classifies these to codex (see
+/// [`crate::routing`]) and this provider resolves each to the latest gpt
+/// generation of that variant (`sol` → `gpt-5.6-sol`, …).
+const VARIANT_ALIASES: &[&str] = &["sol", "terra", "luna"];
+
+/// Resolve the model slug requested upstream: the bare variant aliases
+/// (`sol`/`terra`/`luna`) and bare `gpt-5.6` map to the latest gpt generation
+/// of that variant ([`LATEST_GPT_GENERATION`]); known-valid slugs pass through
 /// (the client's choice is honored — soma-work exposes sol/terra as distinct
-/// user-selectable models), bare `gpt-5.6` maps to sol, everything else
-/// (unknown ids, model-less requests) keeps the configured pin.
+/// user-selectable models); everything else (unknown ids, model-less requests)
+/// keeps the configured pin.
 fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
     let Some(req) = requested else {
         return pinned.to_string();
     };
     let req = req.trim().to_ascii_lowercase();
-    if req == "gpt-5.6" {
-        return "gpt-5.6-sol".to_string();
+    // Bare variant alias → latest gpt generation of that variant.
+    if VARIANT_ALIASES.contains(&req.as_str()) {
+        return format!("{LATEST_GPT_GENERATION}-{req}");
+    }
+    // The bare generation id is rejected upstream — map it to the sol flagship.
+    if req == LATEST_GPT_GENERATION {
+        return format!("{LATEST_GPT_GENERATION}-sol");
     }
     if PASSTHROUGH_MODELS.contains(&req.as_str()) {
         return req;
@@ -312,6 +340,21 @@ fn resolve_reasoning_effort(
             }
         })
     })
+}
+
+/// The PER-REQUEST effective `(reasoning effort, fast)` this body would send
+/// upstream under `shape`, WITHOUT building the whole request — the single
+/// source the activity log reads so its recorded effort/fast equal what
+/// actually went on the wire. Mirrors [`translate_request_with`] exactly:
+/// effort resolves against the request's resolved upstream model (so a `max`
+/// on an older model is recorded as the clamped `xhigh`); `fast` is the shape's
+/// fast flag. Returning the tuple here avoids duplicating the resolution logic
+/// in the proxy forward path.
+pub fn effective_effort_fast(body: &Value, shape: &CodexShape) -> (Option<String>, bool) {
+    let requested_model = body.get("model").and_then(Value::as_str);
+    let upstream_model = resolve_upstream_model(requested_model, &shape.model);
+    let effort = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model);
+    (effort, shape.fast)
 }
 
 /// Like [`translate_request`] but with an explicit request [`CodexShape`]
@@ -851,16 +894,27 @@ impl CodexSseConverter {
             // OpenAI `input_tokens` is the cache-INCLUSIVE total; the cached
             // subset is `input_tokens_details.cached_tokens`. Record fresh =
             // total − cached so codex is comparable to the Anthropic side
-            // (which already counts uncached input only).
+            // (which already counts uncached input only), preserving the
+            // invariant `total_input == fresh input + cache_read`.
             let total_input = usage
                 .get("input_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let details = usage.get("input_tokens_details");
             // `cached` is `Some` only when the upstream reported the field, so
             // the dashboard renders unavailable (not 0) when it is absent.
-            let cached = usage
-                .get("input_tokens_details")
+            // Clamp to the total: a cache read can never exceed the tokens
+            // actually received (guards a malformed `cached > input` payload).
+            let cached = details
                 .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .map(|c| c.min(total_input));
+            // OpenAI carries the cache-WRITE subset in the same details object.
+            // It is 0 on today's wire, but map it to `cache_creation_input_tokens`
+            // so the dashboard's cache split stays correct if it ever isn't.
+            // Codex bills nothing for cache creation, so pricing scores it at 0.
+            let cache_write = details
+                .and_then(|d| d.get("cache_write_tokens"))
                 .and_then(Value::as_u64);
             self.cached_input_tokens = cached.unwrap_or(0);
             self.usage = StreamUsage {
@@ -870,8 +924,7 @@ impl CodexSseConverter {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 cache_read_input_tokens: cached,
-                // OpenAI Responses does not report cache-creation tokens.
-                cache_creation_input_tokens: None,
+                cache_creation_input_tokens: cache_write,
             };
         }
         let stop_reason = if self.saw_tool_use {
@@ -889,6 +942,8 @@ impl CodexSseConverter {
                 "usage": {
                     "input_tokens": self.usage.input_tokens,
                     "cache_read_input_tokens": self.cached_input_tokens,
+                    "cache_creation_input_tokens":
+                        self.usage.cache_creation_input_tokens.unwrap_or(0),
                     "output_tokens": self.usage.output_tokens,
                 },
             }),
@@ -943,6 +998,8 @@ impl CodexSseConverter {
             "usage": {
                 "input_tokens": self.usage.input_tokens,
                 "cache_read_input_tokens": self.cached_input_tokens,
+                "cache_creation_input_tokens":
+                    self.usage.cache_creation_input_tokens.unwrap_or(0),
                 "output_tokens": self.usage.output_tokens,
             },
         }))
@@ -1296,6 +1353,49 @@ mod tests {
         let (upstream, _) =
             translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
         assert_eq!(upstream["model"], CODEX_MODEL);
+    }
+
+    #[test]
+    fn bare_variant_aliases_resolve_to_latest_generation() {
+        // `sol`/`terra`/`luna` map to `gpt-5.6-<variant>` (latest generation),
+        // case-insensitively, regardless of the configured pin.
+        for (alias, expected) in [
+            ("sol", "gpt-5.6-sol"),
+            ("terra", "gpt-5.6-terra"),
+            ("luna", "gpt-5.6-luna"),
+            ("LUNA", "gpt-5.6-luna"),
+        ] {
+            let body = json!({ "model": alias, "messages": [{"role":"user","content":"hi"}] });
+            let (upstream, _) =
+                translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+            assert_eq!(upstream["model"], expected, "alias {alias} → {expected}");
+        }
+    }
+
+    #[test]
+    fn request_effort_fast_surfaces_per_request_effective_value() {
+        // The recorded effort must equal what goes upstream, including the
+        // clamp: `max` requested on gpt-5.5 (no extended efforts) → `xhigh`.
+        let shape = CodexShape {
+            model: "gpt-5.5".to_string(),
+            client_model: None,
+            fast: true,
+            effort: Some("low".to_string()),
+        };
+        let body = json!({
+            "model": "gpt-5.5",
+            "output_config": { "effort": "max" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (effort, fast) = effective_effort_fast(&body, &shape);
+        assert_eq!(effort.as_deref(), Some("xhigh"), "max clamps on gpt-5.5");
+        assert!(fast, "fast mirrors the shape flag");
+
+        // The gpt-5.6 family passes max through unclamped; no request effort
+        // falls back to the shape effort.
+        let body = json!({ "model": "sol", "messages": [{"role":"user","content":"hi"}] });
+        let (effort, _) = effective_effort_fast(&body, &shape);
+        assert_eq!(effort.as_deref(), Some("low"), "shape effort when unset");
     }
 
     #[test]
@@ -1773,6 +1873,103 @@ mod tests {
                 input_tokens: 1_000,
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
+                cache_creation_input_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn live_wire_cached_split_matches_openai_responses_sample() {
+        // Verbatim shape from the codex `/responses` upstream: `input_tokens`
+        // is the cache-INCLUSIVE total, with the cached (and write) subsets in
+        // `input_tokens_details`. fresh = 292455 − 100864 = 191591, and the
+        // cached part surfaces as `cache_read_input_tokens` so activity/cost
+        // stop billing the whole prompt at the full input rate.
+        let (converter, events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 292_455,
+                "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 100_864},
+                "output_tokens": 77
+            }}}),
+        ]);
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        assert_eq!(
+            message_delta["usage"]["input_tokens"], 191_591,
+            "fresh = 292455 - 100864"
+        );
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 100_864);
+        assert_eq!(message_delta["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(message_delta["usage"]["output_tokens"], 77);
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 191_591,
+                output_tokens: 77,
+                cache_read_input_tokens: Some(100_864),
+                // `cache_write_tokens` was present (0) → explicit Some(0).
+                cache_creation_input_tokens: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn cached_greater_than_total_clamps_to_total() {
+        // Defensive: a malformed payload where cached exceeds the reported
+        // total must not underflow fresh input or surface a cache read larger
+        // than the tokens received. fresh clamps to 0, cache_read to the total.
+        let (converter, events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 150},
+                "output_tokens": 3
+            }}}),
+        ]);
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        assert_eq!(message_delta["usage"]["input_tokens"], 0);
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 100);
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 0,
+                output_tokens: 3,
+                cache_read_input_tokens: Some(100),
+                cache_creation_input_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_zero_cached_keeps_full_input_and_some_zero_cache_read() {
+        // cached_tokens=0 with no write field: fresh == total, cache_read is an
+        // explicit Some(0) (reported, not unavailable), cache_creation absent.
+        let (converter, _events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 500,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 9
+            }}}),
+        ]);
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 500,
+                output_tokens: 9,
+                cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
             }
         );
