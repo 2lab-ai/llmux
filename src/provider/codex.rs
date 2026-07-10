@@ -131,15 +131,16 @@ impl CodexProvider {
         self.shape.read().expect("codex shape lock").effort.clone()
     }
 
-    /// The PER-REQUEST effective `(reasoning effort, fast)` for `anthropic_body`
-    /// under the live shape — the exact values [`Self::build_request`] would
-    /// send upstream, for the activity log. Reuses [`effective_effort_fast`]
-    /// (no duplicated resolution). A non-JSON body (which would fail
-    /// `build_request` anyway) falls back to the shape's own effort/fast.
-    pub fn request_effort_fast(&self, anthropic_body: &[u8]) -> (Option<String>, bool) {
+    /// The PER-REQUEST effective `(upstream model, reasoning effort, fast)` for
+    /// `anthropic_body` under the live shape — the exact values
+    /// [`Self::build_request`] would send upstream, for the activity log.
+    /// Reuses [`effective_request_meta`] (no duplicated resolution). A non-JSON
+    /// body (which would fail `build_request` anyway) falls back to the shape's
+    /// own model/effort/fast.
+    pub fn request_meta(&self, anthropic_body: &[u8]) -> (String, Option<String>, bool) {
         let shape = self.shape();
         let body = serde_json::from_slice::<Value>(anthropic_body).unwrap_or(Value::Null);
-        effective_effort_fast(&body, &shape)
+        effective_request_meta(&body, &shape)
     }
 
     pub fn endpoint(&self) -> &str {
@@ -342,19 +343,21 @@ fn resolve_reasoning_effort(
     })
 }
 
-/// The PER-REQUEST effective `(reasoning effort, fast)` this body would send
-/// upstream under `shape`, WITHOUT building the whole request — the single
-/// source the activity log reads so its recorded effort/fast equal what
-/// actually went on the wire. Mirrors [`translate_request_with`] exactly:
-/// effort resolves against the request's resolved upstream model (so a `max`
-/// on an older model is recorded as the clamped `xhigh`); `fast` is the shape's
-/// fast flag. Returning the tuple here avoids duplicating the resolution logic
-/// in the proxy forward path.
-pub fn effective_effort_fast(body: &Value, shape: &CodexShape) -> (Option<String>, bool) {
+/// The PER-REQUEST effective `(upstream model, reasoning effort, fast)` this
+/// body would send upstream under `shape`, WITHOUT building the whole request —
+/// the single source the activity log reads so its recorded model/effort/fast
+/// equal what actually went on the wire. Mirrors [`translate_request_with`]
+/// exactly: the model is the [`resolve_upstream_model`] result (a requested
+/// `gpt-5.5` is recorded as `gpt-5.5` even when the shape pins `gpt-5.6-sol`,
+/// and a FAILED request still names the model that failed); effort resolves
+/// against that resolved model (so a `max` on an older model is recorded as the
+/// clamped `xhigh`); `fast` is the shape's fast flag. Returning the tuple here
+/// avoids duplicating the resolution logic in the proxy forward path.
+pub fn effective_request_meta(body: &Value, shape: &CodexShape) -> (String, Option<String>, bool) {
     let requested_model = body.get("model").and_then(Value::as_str);
     let upstream_model = resolve_upstream_model(requested_model, &shape.model);
     let effort = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model);
-    (effort, shape.fast)
+    (upstream_model, effort, shape.fast)
 }
 
 /// Like [`translate_request`] but with an explicit request [`CodexShape`]
@@ -1373,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn request_effort_fast_surfaces_per_request_effective_value() {
+    fn request_meta_surfaces_per_request_effective_value() {
         // The recorded effort must equal what goes upstream, including the
         // clamp: `max` requested on gpt-5.5 (no extended efforts) → `xhigh`.
         let shape = CodexShape {
@@ -1387,15 +1390,50 @@ mod tests {
             "output_config": { "effort": "max" },
             "messages": [{"role":"user","content":"hi"}],
         });
-        let (effort, fast) = effective_effort_fast(&body, &shape);
+        let (model, effort, fast) = effective_request_meta(&body, &shape);
+        assert_eq!(model, "gpt-5.5");
         assert_eq!(effort.as_deref(), Some("xhigh"), "max clamps on gpt-5.5");
         assert!(fast, "fast mirrors the shape flag");
 
         // The gpt-5.6 family passes max through unclamped; no request effort
-        // falls back to the shape effort.
+        // falls back to the shape effort. The alias resolves in the meta too.
         let body = json!({ "model": "sol", "messages": [{"role":"user","content":"hi"}] });
-        let (effort, _) = effective_effort_fast(&body, &shape);
+        let (model, effort, _) = effective_request_meta(&body, &shape);
+        assert_eq!(model, "gpt-5.6-sol", "alias resolved in the recorded meta");
         assert_eq!(effort.as_deref(), Some("low"), "shape effort when unset");
+    }
+
+    #[test]
+    fn request_meta_records_the_resolved_model_not_the_shape_pin() {
+        // Live regression: with the shape pinned to gpt-5.6-sol, a request for
+        // gpt-5.5 was recorded as gpt-5.6-sol in the activity log even though
+        // gpt-5.5 is what actually went upstream (and what the response
+        // echoed). The recorded model must be the per-request resolved slug.
+        let provider = CodexProvider::with_shape(
+            "https://chatgpt.com/backend-api/codex",
+            CodexShape {
+                model: "gpt-5.6-sol".to_string(),
+                client_model: None,
+                fast: false,
+                effort: None,
+            },
+        );
+        let body = br#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}"#;
+        let (model, _, _) = provider.request_meta(body);
+        assert_eq!(model, "gpt-5.5", "resolved request model, not the pin");
+
+        // A luna request that 404s upstream must still be RECORDED as luna —
+        // that is exactly when the operator needs to see which model failed.
+        let body = br#"{"model":"luna","messages":[{"role":"user","content":"hi"}]}"#;
+        let (model, _, _) = provider.request_meta(body);
+        assert_eq!(model, "gpt-5.6-luna");
+
+        // Unknown / absent request models keep the pin.
+        let body = br#"{"model":"my-alias","messages":[{"role":"user","content":"hi"}]}"#;
+        let (model, _, _) = provider.request_meta(body);
+        assert_eq!(model, "gpt-5.6-sol");
+        let (model, _, _) = provider.request_meta(b"not json");
+        assert_eq!(model, "gpt-5.6-sol", "non-JSON body falls back to the pin");
     }
 
     #[test]
