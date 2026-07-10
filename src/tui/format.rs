@@ -48,6 +48,29 @@ pub(crate) fn countdown(remaining: Duration) -> String {
     }
 }
 
+/// [`countdown`] split into its two styled parts for the in-bar quota
+/// countdown: `("7d", Some("10h"))`, `("10h", Some("15m"))`,
+/// `("17m", Some("35s"))`, `("42s", None)`. The FIRST (larger) unit is the
+/// one the renderer emphasizes — it carries most of the signal.
+pub(crate) fn countdown_units(remaining: Duration) -> (String, Option<String>) {
+    let total = remaining.as_secs();
+    let (days, hours, mins, secs) = (
+        total / 86_400,
+        (total % 86_400) / 3_600,
+        (total % 3_600) / 60,
+        total % 60,
+    );
+    if days > 0 {
+        (format!("{days}d"), Some(format!("{hours}h")))
+    } else if hours > 0 {
+        (format!("{hours}h"), Some(format!("{mins:02}m")))
+    } else if mins > 0 {
+        (format!("{mins}m"), Some(format!("{secs:02}s")))
+    } else {
+        (format!("{secs}s"), None)
+    }
+}
+
 /// Fixed-width utilization bar, e.g. `▰▰▰▱▱▱▱▱` (utilization clamped 0..=1).
 pub(crate) fn gauge_bar(utilization: f64, width: usize) -> String {
     let clamped = utilization.clamp(0.0, 1.0);
@@ -103,6 +126,35 @@ pub(crate) fn refreshed_marker(last_refresh_ms: Option<u64>, now: SystemTime) ->
     let at = SystemTime::UNIX_EPOCH + Duration::from_millis(last_refresh_ms?);
     let ago = now.duration_since(at).unwrap_or_default();
     Some(format!("\u{21bb}{}", age_unit(ago)))
+}
+
+/// Fixed-width `MM/DD HH:MM` in UTC (11 chars) for the quota bars' absolute
+/// reset-time display (the `t` toggle). UTC by the same reasoning as
+/// [`clock_hms_utc`]; the in-bar width budget has no room for a zone suffix,
+/// so the toggle's footer hint carries the "UTC" fact. Civil-date math is the
+/// standard days-from-epoch algorithm (Howard Hinnant) — no chrono needed.
+pub(crate) fn absolute_utc_label(at: SystemTime) -> String {
+    let secs = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let day_secs = secs % 86_400;
+    // Civil from days (valid for the unix era we care about).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let _y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{m:02}/{d:02} {:02}:{:02}",
+        day_secs / 3_600,
+        (day_secs % 3_600) / 60
+    )
 }
 
 /// Wall-clock HH:MM:SS in UTC for activity-log timestamps. UTC (not local)
@@ -187,6 +239,19 @@ pub(crate) fn absolute_label(at: SystemTime, now: SystemTime, offset_secs: i64) 
     format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
 }
 
+/// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,
+/// zero-padded clock, at the given UTC `offset_secs`. Pure (offset injected)
+/// so the label is unit-testable without the machine's zone.
+pub(crate) fn month_day_hm(at: SystemTime, offset_secs: i64) -> String {
+    let epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let local = (epoch as i64).saturating_add(offset_secs);
+    let (_, month, day) = civil_from_days(local.div_euclid(86_400));
+    format!("{}/{} {}", month, day, clock_hm(at, offset_secs))
+}
+
 /// Days-since-epoch → (year, month, day), Howard Hinnant's civil algorithm.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -199,6 +264,32 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
     (year + i64::from(month <= 2), month, day)
+}
+
+/// Countdown to a deadline as `Nd Nh Nm Ns` — leading zero units are omitted,
+/// but once a unit appears every smaller one follows, and seconds are ALWAYS
+/// shown (a zero/expired remaining renders `0s`). Distinct from [`countdown`],
+/// which keeps only the largest two units.
+pub(crate) fn remaining_hms(remaining: Duration) -> String {
+    let total = remaining.as_secs();
+    let (days, hours, mins, secs) = (
+        total / 86_400,
+        (total % 86_400) / 3_600,
+        (total % 3_600) / 60,
+        total % 60,
+    );
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 || !parts.is_empty() {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 || !parts.is_empty() {
+        parts.push(format!("{mins}m"));
+    }
+    parts.push(format!("{secs}s"));
+    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -268,6 +359,29 @@ mod tests {
         assert_eq!(
             countdown(Duration::from_secs(2 * 86_400 + 4 * 3_600)),
             "2d 4h"
+        );
+    }
+
+    #[test]
+    fn countdown_units_split_matches_countdown_banding() {
+        let d = Duration::from_secs;
+        assert_eq!(
+            countdown_units(d(7 * 86_400 + 10 * 3_600)),
+            ("7d".to_string(), Some("10h".to_string()))
+        );
+        assert_eq!(
+            countdown_units(d(10 * 3_600 + 15 * 60)),
+            ("10h".to_string(), Some("15m".to_string()))
+        );
+        assert_eq!(
+            countdown_units(d(17 * 60 + 35)),
+            ("17m".to_string(), Some("35s".to_string()))
+        );
+        assert_eq!(countdown_units(d(42)), ("42s".to_string(), None));
+        // Sub-unit zero padding mirrors `countdown`.
+        assert_eq!(
+            countdown_units(d(3_600 + 5 * 60)),
+            ("1h".to_string(), Some("05m".to_string()))
         );
     }
 
@@ -379,5 +493,39 @@ mod tests {
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
         // Leap day.
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    // ---- event banner: remaining-time formatter ----
+
+    #[test]
+    fn remaining_hms_multi_day_shows_all_units() {
+        let d = Duration::from_secs(3 * 86_400 + 15 * 3_600 + 15 * 60 + 25);
+        assert_eq!(remaining_hms(d), "3d 15h 15m 25s");
+        // Zero lower units still render once a higher unit is present.
+        assert_eq!(
+            remaining_hms(Duration::from_secs(2 * 86_400)),
+            "2d 0h 0m 0s"
+        );
+    }
+
+    #[test]
+    fn remaining_hms_under_an_hour_omits_leading_zero_units() {
+        // <1h: no days/hours shown, minutes lead, seconds always.
+        assert_eq!(remaining_hms(Duration::from_secs(15 * 60 + 25)), "15m 25s");
+        // Once minutes appear, seconds follow even when zero.
+        assert_eq!(remaining_hms(Duration::from_secs(5 * 60)), "5m 0s");
+        // Hours present → minutes follow even when zero.
+        assert_eq!(remaining_hms(Duration::from_secs(3_600 + 2)), "1h 0m 2s");
+    }
+
+    #[test]
+    fn remaining_hms_under_a_minute_is_seconds_only() {
+        assert_eq!(remaining_hms(Duration::from_secs(25)), "25s");
+        assert_eq!(remaining_hms(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn remaining_hms_zero_is_zero_seconds() {
+        assert_eq!(remaining_hms(Duration::from_secs(0)), "0s");
     }
 }

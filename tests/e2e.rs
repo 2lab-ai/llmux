@@ -112,7 +112,27 @@ impl Proxy {
     /// [`Self::spawn_config`] with a hook that runs against the tempdir BEFORE
     /// the server starts — the seam for pre-seeding persisted state (e.g. an
     /// `activity.jsonl` from a "previous run") that startup must hydrate.
+    ///
+    /// Idle probing is force-disabled on this path: the probe is always-on by
+    /// default (issue #45), and its background 1-token requests would race the
+    /// scripted mock queues of tests that are not about probing. The probe
+    /// acceptance tests use [`Self::spawn_probing`], which honors the caller's
+    /// `idle_probe` config verbatim.
     async fn spawn_prepared(mut config: Config, prepare: impl FnOnce(&std::path::Path)) -> Self {
+        config.proxy.idle_probe.enabled = false;
+        Self::spawn_probing_prepared(config, prepare).await
+    }
+
+    /// Probe acceptance tests only: spawn with the caller's `idle_probe`
+    /// config taking effect (enabled, kill-switch, sweep cadence).
+    async fn spawn_probing(config: Config) -> Self {
+        Self::spawn_probing_prepared(config, |_| {}).await
+    }
+
+    async fn spawn_probing_prepared(
+        mut config: Config,
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let tmp = TempDir::new();
         prepare(tmp.path());
         let config_path = tmp.path().join("llmux.json");
@@ -2238,7 +2258,7 @@ async fn idle_probe_populates_windows_once_and_respects_cooldown() {
     let mock = MockUpstream::spawn().await;
     // Probe responses (and the served request) all return unified headers by
     // default — b's 5h reads 0.10 from `ScriptedResponse::ok`.
-    let proxy = Proxy::spawn_config(idle_probe_config(&mock, 3600)).await;
+    let proxy = Proxy::spawn_probing(idle_probe_config(&mock, 3600)).await;
 
     // Sanity: b starts windowless (poller's /api/oauth/usage 404s).
     assert!(
@@ -2293,7 +2313,7 @@ async fn idle_probe_kill_switch_disables_probing() {
     let mock = MockUpstream::spawn().await;
     let mut config = idle_probe_config(&mock, 3600);
     config.proxy.idle_probe.enabled = false; // kill-switch
-    let proxy = Proxy::spawn_config(config).await;
+    let proxy = Proxy::spawn_probing(config).await;
 
     let client = reqwest::Client::new();
     let response = post_messages(&client, &proxy, "{}").await;
@@ -2387,7 +2407,7 @@ async fn timer_sweep_warms_cold_codex_account_without_traffic() {
     }
 
     // 1s sweep cadence so the test does not wait long for the first tick.
-    let proxy = Proxy::spawn_config(codex_sweep_config(&mock, 1)).await;
+    let proxy = Proxy::spawn_probing(codex_sweep_config(&mock, 1)).await;
 
     // The codex account starts cold (no traffic, no oauth poll for codex).
     assert!(
@@ -2445,7 +2465,7 @@ async fn timer_sweep_warms_cold_oauth_account_without_traffic() {
     config.proxy.idle_probe.enabled = true;
     config.proxy.idle_probe.per_account_cooldown_secs = 3600;
     config.proxy.idle_probe.sweep_secs = 1; // tight cadence so the test is quick
-    let proxy = Proxy::spawn_config(config).await;
+    let proxy = Proxy::spawn_probing(config).await;
 
     // `a` starts cold: its /api/oauth/usage poll 404s and there is no traffic.
     assert!(
@@ -2493,7 +2513,7 @@ async fn timer_sweep_kill_switch_disables_sweep() {
 
     let mut config = codex_sweep_config(&mock, 1);
     config.proxy.idle_probe.enabled = false; // kill-switch
-    let proxy = Proxy::spawn_config(config).await;
+    let proxy = Proxy::spawn_probing(config).await;
 
     // Give the sweep generous wall-clock time to fire several ticks were it
     // ever going to — with the kill-switch on, none should.
@@ -2517,11 +2537,12 @@ async fn timer_sweep_kill_switch_disables_sweep() {
     );
 }
 
-/// Acceptance (#45): `sweep_secs = 0` (the default) keeps the timer OFF even
-/// when the probe is `enabled` — a cold Codex account stays cold with no
-/// traffic (the sweep is opt-in, on-demand probing is unaffected).
+/// Acceptance (#45): `sweep_secs = 0` is an explicit opt-out that keeps the
+/// timer OFF even when the probe is `enabled` (the always-on default is a
+/// positive `sweep_secs`, so 0 must be set deliberately) — a cold Codex account
+/// stays cold with no traffic (on-demand probing is unaffected).
 #[tokio::test]
-async fn timer_sweep_off_by_default_when_sweep_secs_zero() {
+async fn timer_sweep_disabled_when_sweep_secs_zero() {
     let mock = MockUpstream::spawn().await;
     for _ in 0..4 {
         mock.push(ScriptedResponse::sse_codex(
@@ -2535,7 +2556,7 @@ async fn timer_sweep_off_by_default_when_sweep_secs_zero() {
     }
 
     // enabled = true but sweep_secs = 0 ⇒ no background sweep task is spawned.
-    let proxy = Proxy::spawn_config(codex_sweep_config(&mock, 0)).await;
+    let proxy = Proxy::spawn_probing(codex_sweep_config(&mock, 0)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(

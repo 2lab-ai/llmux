@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::logging::LogLine;
 use crate::proxy::server::{AppState, UsageTotals, EVALUATE_TICK};
 use crate::scheduler::select::{self, SelectParams};
-use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot, CRITICAL_UTILIZATION};
+use crate::scheduler::{AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::tui::activity::{
     normalize_model, ActivityLog, ClientUsage, Completed, CompletedBody, InFlight, ModelUsage,
     StatsWindow, Totals, WindowedRow,
@@ -319,12 +319,16 @@ fn trace_event(event: &ActivityEvent) {
             account,
             group,
             model,
+            effort,
+            fast,
         } => {
             tracing::debug!(
                 id,
                 %account,
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
+                effort = effort.as_deref().unwrap_or("-"),
+                fast = *fast,
                 "request routed"
             );
         }
@@ -339,6 +343,7 @@ fn trace_event(event: &ActivityEvent) {
             group,
             model,
             effort,
+            fast,
             user_id,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
@@ -361,6 +366,7 @@ fn trace_event(event: &ActivityEvent) {
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
                 effort = effort.as_deref().unwrap_or("-"),
+                fast = *fast,
                 client = user_id.as_deref().unwrap_or("unknown"),
                 "request finished"
             );
@@ -477,6 +483,21 @@ pub struct DashboardDoc {
     /// from an older daemon → the client defaults the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// Domain abbreviations for the accounts table's name column (config
+    /// `domain_abbrev`): `ai3@insightquest.io` renders `ai3@iq.io`. Carried
+    /// here so BOTH TUI backends abbreviate identically (local builds the doc
+    /// in-process; attach receives it here); account names in the document
+    /// itself stay real, same convention as `email_anonymous`. Additive:
+    /// absent in docs from an older daemon → the built-in default map.
+    #[serde(default = "crate::config::default_domain_abbrev")]
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Fill direction for the TUI quota gauges (config `quota_display`):
+    /// `remaining` (default) drains toward the reset, `used` fills as quota
+    /// burns. Display-only boot default — the TUI `u` key overrides it live
+    /// for the session. Additive: absent in docs from an older daemon →
+    /// `remaining`.
+    #[serde(default)]
+    pub quota_display: crate::config::QuotaDisplay,
     /// Data-quality qualifiers for the derived statistics (issue #62 S2).
     /// The server is the SSOT for the label wording — the TUI and the Islands
     /// app render these strings verbatim instead of hardcoding copies that
@@ -485,6 +506,16 @@ pub struct DashboardDoc {
     /// construction (see [`DataQualityDoc`]).
     #[serde(default)]
     pub data_quality: DataQualityDoc,
+    /// Live top-of-dashboard event banners (config `events`), read from the
+    /// daemon's live [`crate::proxy::server::AppState::event_banners`] holder
+    /// each frame / poll. Carried here so BOTH TUI backends render them
+    /// identically (local builds the doc in-process; attach receives it here)
+    /// and a `POST /llmux/events` reflects on the next document without restart.
+    /// Additive: `skip_serializing_if = "Vec::is_empty"` keeps it off the wire
+    /// when empty, and an absent field parses back to an empty list, so an older
+    /// client attaching to a newer daemon (and vice versa) is unaffected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::config::EventBanner>,
 }
 
 /// Serde default for additive `bool` fields that default ON.
@@ -566,6 +597,14 @@ pub struct CodexSettingsDoc {
 pub struct SelectParamsDoc {
     pub five_hour_max: f64,
     pub seven_day_max: f64,
+    /// Fable-weekly ceiling (additive: docs from older daemons default 0.98).
+    #[serde(default = "crate::config::default_fable_weekly_max")]
+    pub fable_weekly_max: f64,
+    /// Selection algorithm (additive: docs from older daemons default
+    /// `default`). Carried so attach-mode display order / next-in-line match
+    /// the daemon's actual scheduler.
+    #[serde(default)]
+    pub mode: crate::config::SchedulerMode,
     pub usage_max_age_secs: u64,
 }
 
@@ -574,6 +613,8 @@ impl From<&SelectParams> for SelectParamsDoc {
         Self {
             five_hour_max: params.five_hour_max,
             seven_day_max: params.seven_day_max,
+            fable_weekly_max: params.fable_weekly_max,
+            mode: params.mode,
             usage_max_age_secs: params.usage_max_age.as_secs(),
         }
     }
@@ -584,6 +625,8 @@ impl From<&SelectParamsDoc> for SelectParams {
         Self {
             five_hour_max: doc.five_hour_max,
             seven_day_max: doc.seven_day_max,
+            fable_weekly_max: doc.fable_weekly_max,
+            mode: doc.mode,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
         }
     }
@@ -619,6 +662,15 @@ pub struct AccountDoc {
     pub in_flight: u32,
     pub token_expires_at_ms: Option<u64>,
     pub last_refresh_ms: Option<u64>,
+    /// Operator pause (config `paused_accounts`): the scheduler will not
+    /// auto-select this account, and manual switch is refused until resumed.
+    /// Additive: absent in docs from an older daemon → false.
+    #[serde(default)]
+    pub paused: bool,
+    /// Per-account ceiling overrides (config `account_limits`); absent/null =
+    /// the global scheduler ceilings apply. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::config::AccountLimits>,
     /// Proxy-lifetime relayed totals (status parity).
     pub totals: LifetimeTotalsDoc,
     /// Activity-log totals (ok/err + token split) for the table/detail panes.
@@ -870,13 +922,18 @@ pub struct InFlightDoc {
     pub path: String,
     pub account: Option<String>,
     pub started_at_ms: u64,
-    /// Backend group / served model, filled at routing time so the in-flight
-    /// row can show the model badge while running (issue #2 2a). Additive:
-    /// absent in docs written before these fields existed.
+    /// Backend group / served model / per-request effort / fast, filled at
+    /// routing time so the in-flight row can show the same metadata badge as a
+    /// completed row while running (issue #2 2a). Additive: absent in docs
+    /// written before these fields existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,6 +961,10 @@ pub enum CompletedDoc {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Codex fast mode was in effect (always `false` for claude). Additive:
+        /// absent (→ `false`) in docs written before this field existed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fast: bool,
     },
     Note {
         at_ms: u64,
@@ -916,6 +977,14 @@ pub enum CompletedDoc {
 pub struct TokensDoc {
     pub input: u64,
     pub output: u64,
+    /// Cache-read / cache-write splits, when the upstream reported them.
+    /// `None` (absent on the wire) is distinct from `Some(0)` — the TUI detail
+    /// row renders unavailable as `—`. Additive: docs written before these
+    /// fields existed deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -942,11 +1011,21 @@ pub struct DocMeta {
     /// Config `show_fable_weekly` (fable-usage U9a): whether the TUI renders
     /// the Fable weekly gauge. See [`DashboardDoc::show_fable_weekly`].
     pub show_fable_weekly: bool,
+    /// Config `domain_abbrev`: accounts-table domain abbreviations. See
+    /// [`DashboardDoc::domain_abbrev`].
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Config `quota_display`: quota-gauge fill direction. See
+    /// [`DashboardDoc::quota_display`].
+    pub quota_display: crate::config::QuotaDisplay,
     /// API-equivalent pricing overrides from `[pricing]` in the live config
     /// (Feature D). Empty = use the built-in default rate table. Threaded here
     /// (rather than into the pure `dashboard_doc` signature) because `DocMeta`
     /// already carries the config-derived display fields the builder needs.
     pub pricing_overrides: HashMap<String, crate::pricing::ModelPrice>,
+    /// Live event banners (config `events`), read from the daemon's live
+    /// [`crate::proxy::server::AppState::event_banners`] holder. See
+    /// [`DashboardDoc::events`].
+    pub events: Vec<crate::config::EventBanner>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1013,6 +1092,7 @@ fn window_doc(
 fn scoped_window_doc(
     scoped: &crate::scheduler::window::ScopedQuotaWindow,
     now: SystemTime,
+    threshold: f64,
 ) -> ScopedWindowDoc {
     ScopedWindowDoc {
         utilization: scoped.window.utilization,
@@ -1025,7 +1105,7 @@ fn scoped_window_doc(
             .unwrap_or(0),
         severity: scoped.severity.label().to_string(),
         is_active: scoped.is_active,
-        constraining: scoped.is_constraining(now, CRITICAL_UTILIZATION),
+        constraining: scoped.is_constraining(now, threshold),
     }
 }
 
@@ -1189,6 +1269,9 @@ pub(crate) fn dashboard_doc(
             let (status, blocked) =
                 account_status_blocked(account, snapshot, params, now, headers_only);
             let cooling = account.cooldown_until.is_some_and(|until| until > now);
+            // The account's EFFECTIVE Fable ceiling: per-account override else
+            // global — the doc's `constraining` then matches the selector.
+            let fable_max = select::effective_limits(account, params).2;
             let lifetime = totals.get(&account.id);
             let session = hub
                 .account_totals
@@ -1204,13 +1287,15 @@ pub(crate) fn dashboard_doc(
                 healthy: account.healthy,
                 five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
-                fable_weekly: account.fable_weekly().map(|s| scoped_window_doc(s, now)),
+                fable_weekly: account
+                    .fable_weekly()
+                    .map(|s| scoped_window_doc(s, now, fable_max)),
                 scoped_limits: account
                     .scoped_limits
                     .iter()
                     .map(|s| ScopedLimitDoc {
                         scope_label: s.scope_label.clone(),
-                        window: scoped_window_doc(s, now),
+                        window: scoped_window_doc(s, now, fable_max),
                     })
                     .collect(),
                 cooldown_until: account.cooldown_until.filter(|_| cooling).map(epoch_secs),
@@ -1221,6 +1306,8 @@ pub(crate) fn dashboard_doc(
                 in_flight: account.in_flight,
                 token_expires_at_ms: account.token_expires_at_ms,
                 last_refresh_ms: account.last_refresh_ms,
+                paused: account.paused,
+                limits: (!account.limits.is_empty()).then_some(account.limits),
                 totals: LifetimeTotalsDoc {
                     requests: lifetime.requests,
                     input_tokens: lifetime.input_tokens,
@@ -1281,6 +1368,8 @@ pub(crate) fn dashboard_doc(
                 started_at_ms: epoch_ms(r.started_at),
                 group: r.group.clone(),
                 model: r.model.clone(),
+                effort: r.effort.clone(),
+                fast: r.fast,
             })
             .collect(),
         completed: hub
@@ -1298,6 +1387,7 @@ pub(crate) fn dashboard_doc(
                     group,
                     model,
                     effort,
+                    fast,
                 } => CompletedDoc::Request {
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
@@ -1308,6 +1398,8 @@ pub(crate) fn dashboard_doc(
                     tokens: tokens.map(|t| TokensDoc {
                         input: t.input,
                         output: t.output,
+                        cache_read: t.cache_read,
+                        cache_creation: t.cache_creation,
                     }),
                     // Per-request API-equivalent cost: 0.0 unless group, model,
                     // and the upstream token usage are ALL known (Feature D).
@@ -1320,6 +1412,7 @@ pub(crate) fn dashboard_doc(
                     group: group.clone(),
                     model: model.clone(),
                     effort: effort.clone(),
+                    fast: *fast,
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -1398,9 +1491,14 @@ pub(crate) fn dashboard_doc(
         codex: meta.codex.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
+        domain_abbrev: meta.domain_abbrev.clone(),
+        quota_display: meta.quota_display,
         // Canonical label wording (issue #62 S2) — constant per build, not
         // state-derived; `Default` IS the canonical set.
         data_quality: DataQualityDoc::default(),
+        // Live event banners (config `events`), read from the daemon's live
+        // holder in `build_doc`; carried so both TUI backends render them.
+        events: meta.events.clone(),
     }
 }
 
@@ -1440,6 +1538,17 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
         show_fable_weekly: state.config.show_fable_weekly,
+        // Config-file display settings, same convention as show_fable_weekly:
+        // no runtime endpoint; the TUI `u` key overrides quota_display locally.
+        domain_abbrev: state.config.domain_abbrev.clone(),
+        quota_display: state.config.quota_display,
+        // Live event holder, not the config snapshot: a `POST /llmux/events`
+        // must reflect on the very next frame/poll without restart.
+        events: state
+            .event_banners
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -1461,6 +1570,8 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -1483,6 +1594,9 @@ mod tests {
             pricing_overrides: HashMap::new(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::Used,
+            events: Vec::new(),
         }
     }
 
@@ -1550,6 +1664,7 @@ mod tests {
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
                 effort: Some("high".into()),
+                fast: true,
                 user_id: Some("acct_seed".into()),
             },
             now() - Duration::from_secs(58),
@@ -1570,6 +1685,8 @@ mod tests {
                 account: "a".into(),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
+                effort: Some("xhigh".into()),
+                fast: true,
             },
             now() - Duration::from_secs(2),
         );
@@ -1808,6 +1925,10 @@ mod tests {
         assert_eq!(doc.activity.in_flight.len(), 1);
         assert_eq!(doc.activity.in_flight[0].id, 2);
         assert_eq!(doc.activity.in_flight[0].path, "/v1/messages");
+        // Routed effort/fast ride the in-flight doc so the running badge
+        // matches the eventual completed badge.
+        assert_eq!(doc.activity.in_flight[0].effort.as_deref(), Some("xhigh"));
+        assert!(doc.activity.in_flight[0].fast);
         assert!(matches!(
             &doc.activity.completed[0],
             CompletedDoc::Request {
@@ -1816,17 +1937,25 @@ mod tests {
                 ..
             }
         ));
-        // group/model/effort (req7) are carried into the doc.
+        // group/model/effort/fast (req7) are carried into the doc.
         match &doc.activity.completed[0] {
             CompletedDoc::Request {
                 group,
                 model,
                 effort,
+                fast,
+                tokens,
                 ..
             } => {
                 assert_eq!(group.as_deref(), Some("codex"));
                 assert_eq!(model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(effort.as_deref(), Some("high"));
+                assert!(*fast, "codex fast mode is carried into the doc");
+                // The full token split rides the doc — cache counters included,
+                // so the ATTACH-mode detail row is not permanently `—`.
+                let t = tokens.expect("tokens");
+                assert_eq!(t.cache_read, Some(120));
+                assert_eq!(t.cache_creation, None, "unreported stays None");
             }
             other => panic!("expected request, got {other:?}"),
         }
@@ -1839,6 +1968,28 @@ mod tests {
         assert_eq!(doc.logs.len(), 1);
         assert_eq!(doc.logs[0].level, "INFO");
         assert!(doc.logs[0].text.contains("proxy listening"));
+    }
+
+    #[test]
+    fn tokens_doc_cache_fields_are_additive_and_round_trip() {
+        // Docs written before the cache split existed deserialize to None.
+        let old: TokensDoc = serde_json::from_str(r#"{"input":70,"output":30}"#).expect("old doc");
+        assert_eq!(old.cache_read, None);
+        assert_eq!(old.cache_creation, None);
+        // Round-trip preserves the split; absent counters are omitted on the
+        // wire (never serialized as null/0).
+        let json = serde_json::to_string(&TokensDoc {
+            input: 1,
+            output: 2,
+            cache_read: Some(3),
+            cache_creation: None,
+        })
+        .expect("serialize");
+        assert!(json.contains(r#""cache_read":3"#));
+        assert!(!json.contains("cache_creation"));
+        let back: TokensDoc = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.cache_read, Some(3));
+        assert_eq!(back.cache_creation, None);
     }
 
     #[test]
@@ -1906,6 +2057,38 @@ mod tests {
             now(),
             meta,
         )
+    }
+
+    #[test]
+    fn doc_carries_events_from_meta_and_skips_them_when_empty() {
+        // Present: the meta's live-holder events land in the doc and survive a
+        // JSON round-trip verbatim.
+        let mut meta = meta();
+        meta.events = vec![crate::config::EventBanner {
+            id: "20260712-fable5".into(),
+            from: "202607080000".into(),
+            to: "202607130000".into(),
+            content: "Fable 5 Available until 7/12".into(),
+        }];
+        let doc = seeded_doc_with_meta(&meta);
+        assert_eq!(doc.events.len(), 1, "meta events carried into doc");
+        assert_eq!(doc.events[0].id, "20260712-fable5");
+        let json: serde_json::Value = serde_json::to_value(&doc).expect("serialize");
+        assert_eq!(json["events"][0]["id"], "20260712-fable5");
+        assert_eq!(json["events"][0]["content"], "Fable 5 Available until 7/12");
+        let reparsed: DashboardDoc = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(reparsed.events, doc.events);
+
+        // Empty: `meta()` defaults `events: []`, so the additive
+        // `skip_serializing_if` keeps the field off the wire entirely — an
+        // older client never sees an unexpected key.
+        let doc_none = seeded_doc();
+        assert!(doc_none.events.is_empty());
+        let json_none: serde_json::Value = serde_json::to_value(&doc_none).expect("serialize");
+        assert!(
+            json_none.get("events").is_none(),
+            "events omitted from the wire when empty"
+        );
     }
 
     #[test]
@@ -2245,6 +2428,7 @@ mod tests {
                     group: None,
                     model: None,
                     effort: None,
+                    fast: false,
                     user_id: None,
                 },
                 now() - Duration::from_secs(seeded - i),
@@ -2288,6 +2472,7 @@ mod tests {
             group: Some("claude".into()),
             model: Some("sonnet".into()),
             effort: None,
+            fast: false,
             user_id: None,
         }
     }

@@ -69,11 +69,28 @@ pub(crate) struct DashboardView {
     /// always reaches the view (see [`AccountSnapshot::scoped_limits`] rebuilt
     /// below) — this flag only gates the render.
     pub show_fable_weekly: bool,
+    /// Accounts-table domain abbreviations (config `domain_abbrev`, carried on
+    /// the document): render `ai3@insightquest.io` as `ai3@iq.io`. Render-only
+    /// — the snapshot keeps real ids, same layering as `email_anonymous`.
+    pub domain_abbrev: std::collections::BTreeMap<String, String>,
+    /// Boot default for the quota-gauge fill direction (config
+    /// `quota_display`, carried on the document). The TUI `u` key holds a
+    /// session-local override in `Chrome`; the effective mode is resolved per
+    /// frame in `ui::draw`.
+    pub quota_display: crate::config::QuotaDisplay,
     /// Data-quality label wording (issue #62 S2), carried verbatim from the
     /// document — the server owns the wording, `ui.rs` renders the cost /
     /// model-usage-scope qualifiers from these strings. A doc from an older
     /// daemon fills the byte-identical canonical defaults via serde.
     pub data_quality: crate::dashboard::DataQualityDoc,
+    /// Top-of-dashboard event banners (config `events`). Carried through the
+    /// `/llmux/dashboard` document from the daemon's live holder
+    /// ([`crate::proxy::server::AppState::event_banners`]), so they populate in
+    /// BOTH backends (local builds the doc in-process; attach receives it) and a
+    /// `POST /llmux/events` reflects on the next frame/poll. `ui.rs` renders the
+    /// active banner (`from <= now < to`) with the earliest `to` as one line,
+    /// and nothing when none is active.
+    pub events: Vec<crate::config::EventBanner>,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -162,6 +179,8 @@ impl DashboardView {
                 in_flight: a.in_flight,
                 token_expires_at_ms: a.token_expires_at_ms,
                 last_refresh_ms: a.last_refresh_ms,
+                paused: a.paused,
+                limits: a.limits.unwrap_or_default(),
             })
             .collect();
         // Rebuild the per-group current map. A current daemon sends the full
@@ -234,11 +253,13 @@ impl DashboardView {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 account: r.account.clone(),
-                // group/model are filled at routing time and carried over the
-                // wire so the in-flight row shows the model badge while running
-                // (issue #2 2a).
+                // group/model/effort/fast are filled at routing time and
+                // carried over the wire so the in-flight row shows the same
+                // metadata badge as a completed row while running (issue #2 2a).
                 group: r.group.clone(),
                 model: r.model.clone(),
+                effort: r.effort.clone(),
+                fast: r.fast,
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -258,6 +279,7 @@ impl DashboardView {
                     group,
                     model,
                     effort,
+                    fast,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -270,16 +292,20 @@ impl DashboardView {
                         account: account.clone(),
                         status: *status,
                         duration: Duration::from_millis(*duration_ms),
-                        // The activity line shows only the in/out total; cache
-                        // detail rides the model-usage rows, not these entries.
+                        // Full token split, cache counters included, so the
+                        // ATTACH-mode detail row renders cache_read /
+                        // cache_creation instead of a permanent `—`. `None`
+                        // stays `None` (older docs / upstream didn't report).
                         tokens: tokens.map(|t| TokenCounts {
                             input: t.input,
                             output: t.output,
-                            ..Default::default()
+                            cache_read: t.cache_read,
+                            cache_creation: t.cache_creation,
                         }),
                         group: group.clone(),
                         model: model.clone(),
                         effort: effort.clone(),
+                        fast: *fast,
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -336,7 +362,14 @@ impl DashboardView {
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
             show_fable_weekly: doc.show_fable_weekly,
+            domain_abbrev: doc.domain_abbrev.clone(),
+            quota_display: doc.quota_display,
             data_quality: doc.data_quality.clone(),
+            // Carried on the wire from the daemon's live event holder (config
+            // `events`), so the banner renders identically in BOTH backends and
+            // a `POST /llmux/events` reflects on the next document. Absent →
+            // empty (no banner).
+            events: doc.events.clone(),
         }
     }
 
@@ -445,7 +478,8 @@ mod tests {
                 "completed": [
                     { "kind": "request", "at_ms": 999_940_000u64, "method": "POST",
                       "path": "/v1/messages", "account": "a", "status": 200,
-                      "duration_ms": 1400, "tokens": { "input": 70, "output": 30 } },
+                      "duration_ms": 1400,
+                      "tokens": { "input": 70, "output": 30, "cache_read": 12 } },
                     { "kind": "note", "at_ms": 999_910_000u64,
                       "text": "switch (none) → a (initial selection)", "error": false },
                 ],
@@ -507,6 +541,8 @@ mod tests {
         let infl = &mut json["activity"]["in_flight"][0];
         infl["group"] = serde_json::json!("claude");
         infl["model"] = serde_json::json!("claude-opus-4-8");
+        infl["effort"] = serde_json::json!("low");
+        infl["fast"] = serde_json::json!(true);
 
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
@@ -514,12 +550,41 @@ mod tests {
         assert_eq!(view.in_flight.len(), 1);
         assert_eq!(view.in_flight[0].group.as_deref(), Some("claude"));
         assert_eq!(view.in_flight[0].model.as_deref(), Some("claude-opus-4-8"));
+        // effort/fast ride the same hop so the running badge matches the
+        // completed badge.
+        assert_eq!(view.in_flight[0].effort.as_deref(), Some("low"));
+        assert!(view.in_flight[0].fast);
 
-        // And a doc WITHOUT the fields still parses (back-compat → None).
+        // And a doc WITHOUT the fields still parses (back-compat → None/false).
         let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
         let view2 = DashboardView::from_doc(&doc2);
         assert_eq!(view2.in_flight[0].group, None);
         assert_eq!(view2.in_flight[0].model, None);
+        assert_eq!(view2.in_flight[0].effort, None);
+        assert!(!view2.in_flight[0].fast);
+    }
+
+    #[test]
+    fn from_doc_round_trips_the_event_banners() {
+        // The event banners ride the doc from the daemon's live holder, so both
+        // backends render them through from_doc. Present → carried verbatim.
+        let mut json = doc_json();
+        json["events"] = serde_json::json!([{
+            "id": "20260712-fable5",
+            "from": "202607080000",
+            "to": "202607130000",
+            "content": "Fable 5 Available until 7/12",
+        }]);
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.events.len(), 1, "events carried through from_doc");
+        assert_eq!(view.events[0].id, "20260712-fable5");
+        assert_eq!(view.events[0].content, "Fable 5 Available until 7/12");
+
+        // Absent (older/quiet daemon) → parses to empty, no banner. This is the
+        // additive `skip_serializing_if` contract: `doc_json()` has no `events`.
+        let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        assert!(DashboardView::from_doc(&doc2).events.is_empty());
     }
 
     #[test]
@@ -601,12 +666,15 @@ mod tests {
             } => {
                 assert_eq!(*status, 200);
                 assert_eq!(*duration, Duration::from_millis(1400));
+                // The cache split survives doc→view (ATTACH mode): a reported
+                // cache_read arrives; an unreported cache_creation stays None.
                 assert_eq!(
                     *tokens,
                     Some(TokenCounts {
                         input: 70,
                         output: 30,
-                        ..Default::default()
+                        cache_read: Some(12),
+                        cache_creation: None,
                     })
                 );
             }
@@ -750,6 +818,39 @@ mod tests {
         assert!(!view.show_fable_weekly);
         // No scoped rows in this doc → empty, not a crash.
         assert!(view.snapshot.accounts[0].fable_weekly().is_none());
+    }
+
+    #[test]
+    fn display_settings_survive_doc_to_view_and_default() {
+        // A doc from an older daemon (neither field) → the built-in abbrev map
+        // and `used` fill, mirroring the show_fable_weekly additive convention.
+        let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(
+            view.domain_abbrev
+                .get("insightquest.io")
+                .map(String::as_str),
+            Some("iq.io"),
+            "absent wire field defaults to the built-in map"
+        );
+        assert_eq!(
+            view.quota_display,
+            crate::config::QuotaDisplay::Remaining,
+            "default fill is remaining — full green bar draining"
+        );
+
+        // Explicit wire values thread through.
+        let mut json = doc_json();
+        json["domain_abbrev"] = serde_json::json!({"example.com": "ex"});
+        json["quota_display"] = serde_json::json!("used");
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(
+            view.domain_abbrev.get("example.com").map(String::as_str),
+            Some("ex")
+        );
+        assert!(!view.domain_abbrev.contains_key("insightquest.io"));
+        assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
     }
 
     #[test]

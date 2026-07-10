@@ -72,6 +72,13 @@ struct LlmuxClient: Sendable {
         _ = try await send(makeRequest("/llmux/remove-account", method: "POST", json: ["name": name, "confirm": true]))
     }
 
+    /// `POST /llmux/pause-account` — pause/resume one account. The daemon
+    /// persists the flag and the scheduler skips a paused account until it is
+    /// resumed.
+    func setPaused(name: String, paused: Bool) async throws {
+        _ = try await send(makeRequest("/llmux/pause-account", method: "POST", json: ["account": name, "paused": paused]))
+    }
+
     /// `POST /llmux/settings` — flip the server-owned email-anonymous display
     /// setting. The daemon persists it (read-merge-write) and applies it live;
     /// returns the acknowledged effective value.
@@ -82,6 +89,23 @@ struct LlmuxClient: Sendable {
             enum CodingKeys: String, CodingKey { case emailAnonymous = "email_anonymous" }
         }
         return try JSONDecoder().decode(Ack.self, from: data).emailAnonymous
+    }
+
+    /// `POST /llmux/events` with `{id, from, to, content}` — idempotent upsert
+    /// of ONE event by id. 200 echoes `{"ok": true, "events": [<stored list>]}`;
+    /// 400 on validation failure (non-empty id/content, parseable from/to,
+    /// from < to). Returns nil only when the echo shape is unrecognized (the
+    /// caller keeps its local list and refreshes via the dashboard).
+    func upsertEvent(_ event: LlmuxEvent) async throws -> [LlmuxEvent]? {
+        let data = try await send(makeRequest("/llmux/events", method: "POST", json: event.jsonObject))
+        return LlmuxEventList.decode(data)
+    }
+
+    /// `POST /llmux/events` with `{"remove": "<id>"}` — idempotent remove (an
+    /// absent id is still 200). Same echo shape as the upsert.
+    func removeEvent(id: String) async throws -> [LlmuxEvent]? {
+        let data = try await send(makeRequest("/llmux/events", method: "POST", json: ["remove": id]))
+        return LlmuxEventList.decode(data)
     }
 
     /// `POST /llmux/login/start` — begin a daemon-run OAuth login (FR4).

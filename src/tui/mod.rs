@@ -213,6 +213,12 @@ pub(crate) enum Mode {
     NewLogin {
         idx: usize,
     },
+    /// Editing per-account ceiling overrides for the switcher's highlighted
+    /// row (`L`). The typed text lives in [`App::add_input`]; format
+    /// `5h,7d,fbl` percents, empty = back to the global ceilings.
+    EditLimits {
+        idx: usize,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -273,6 +279,14 @@ pub(crate) struct Chrome {
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
     /// a masked prompt (`••••`) of this width, never the raw key.
     pub add_input_len: usize,
+    /// Session-local `u`-key override of the quota-gauge fill direction;
+    /// `None` = the config default carried on the view applies.
+    pub quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
+    pub reset_absolute: bool,
+    /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
+    /// Rendered raw in the footer (percent ceilings are not secrets).
+    pub limits_input: String,
 }
 
 /// Attach-mode banner state.
@@ -322,6 +336,15 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
+    /// Pause/resume queued by the switcher's `p` key, performed by the event
+    /// loop via `POST /llmux/pause-account`.
+    pending_pause: Option<(String, bool)>,
+    /// Limits change queued by the switcher's `L` editor, performed by the
+    /// event loop via `POST /llmux/account-limits`.
+    pending_limits: Option<(String, crate::config::AccountLimits)>,
+    /// Scheduler-mode change queued by `S`, performed by the event loop via
+    /// `POST /llmux/scheduler-mode`.
+    pending_mode: Option<crate::config::SchedulerMode>,
     /// API key for a new account, queued by the `a` flow and performed by the
     /// event loop via `POST /llmux/add-account`. Held only until the POST
     /// fires; never logged or rendered raw.
@@ -387,6 +410,13 @@ struct App {
     /// difference is where the minted credential is injected. `None` on a
     /// headless client (the picker shows the `llmux login` fallback instead).
     pending_login: Option<LoginKind>,
+    /// Session-local override of the quota-gauge fill direction, flipped with
+    /// `u` (MAIN and the Accounts overlay). `None` until the first press — the
+    /// config default carried on the view applies.
+    quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// Session toggle (`t`): quota bars show the reset as an absolute UTC
+    /// stamp instead of the countdown.
+    reset_absolute: bool,
 }
 
 impl App {
@@ -409,6 +439,8 @@ impl App {
             session_cursor: 0,
             add_input: String::new(),
             pending_login: None,
+            quota_display_override: None,
+            reset_absolute: false,
         }
     }
 
@@ -423,6 +455,9 @@ impl App {
     /// the first document arrives.
     fn view(&self, now: SystemTime) -> Option<DashboardView> {
         match &self.backend {
+            // The event banner rides the dashboard document from the daemon's
+            // live event holder, so both backends get it through `from_doc` —
+            // no local-only special case.
             Backend::Local(state) => Some(DashboardView::from_doc(&crate::dashboard::build_doc(
                 state, now,
             ))),
@@ -443,6 +478,13 @@ impl App {
             sessions_loading: self.sessions_loading,
             session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
+            quota_display_override: self.quota_display_override,
+            reset_absolute: self.reset_absolute,
+            limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
+                self.add_input.clone()
+            } else {
+                String::new()
+            },
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -499,6 +541,7 @@ impl App {
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
         match self.mode {
             Mode::Select { idx } => return self.on_key_select(key.code, idx, view),
+            Mode::EditLimits { idx } => return self.on_key_edit_limits(key.code, idx, view),
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
@@ -691,8 +734,102 @@ impl App {
             KeyCode::Char('f') => self.toggle_codex_fast(view),
             KeyCode::Char('m') => self.cycle_codex_model(view),
             KeyCode::Char('e') => self.cycle_codex_effort(view),
+            // Quota-gauge fill direction (used% grows / left% drains) —
+            // session-local override of config `quota_display`.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
+            // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
+            KeyCode::Char('t') => self.toggle_reset_display(),
+            // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
+            KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
         }
+    }
+
+    /// Flip the scheduler between default and round-robin (persisted server
+    /// side; see README "Schedulers").
+    fn toggle_scheduler_mode(&mut self, view: Option<&DashboardView>) {
+        use crate::config::SchedulerMode;
+        let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
+        let next = match current {
+            SchedulerMode::Default => SchedulerMode::RoundRobin,
+            SchedulerMode::RoundRobin => SchedulerMode::Default,
+        };
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_scheduler_mode(next) {
+                Ok(mode) => self.set_status(format!("scheduler mode: {}", mode.label())),
+                Err(err) => self.set_status(format!("scheduler mode change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_mode = Some(next);
+                self.set_status(format!("scheduler mode → {}…", next.label()));
+            }
+        }
+    }
+
+    fn take_pending_mode(&mut self) -> Option<crate::config::SchedulerMode> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_mode.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote mode change (`POST /llmux/scheduler-mode`).
+    async fn perform_remote_mode(&mut self, mode: crate::config::SchedulerMode) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/scheduler-mode", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "mode": mode.label() }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("scheduler mode: {}", mode.label())
+            }
+            Ok(response) => format!("scheduler mode change failed: {}", response.status()),
+            Err(err) => format!("scheduler mode change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Flip the quota bars between reset countdown and absolute UTC stamp.
+    fn toggle_reset_display(&mut self) {
+        self.reset_absolute = !self.reset_absolute;
+        self.set_status(
+            if self.reset_absolute {
+                "reset shown as absolute time (UTC)"
+            } else {
+                "reset shown as countdown"
+            }
+            .into(),
+        );
+    }
+
+    /// Flip the quota-gauge fill direction between used% and remaining%
+    /// (session-local override of config `quota_display`; the config default
+    /// applies until the first press). Color bands stay keyed on USED
+    /// utilization either way — this only flips what the fill length means.
+    fn toggle_quota_display(&mut self, view: Option<&DashboardView>) {
+        use crate::config::QuotaDisplay;
+        let current = self
+            .quota_display_override
+            .unwrap_or_else(|| view.map_or(QuotaDisplay::default(), |v| v.quota_display));
+        let next = match current {
+            QuotaDisplay::Used => QuotaDisplay::Remaining,
+            QuotaDisplay::Remaining => QuotaDisplay::Used,
+        };
+        self.quota_display_override = Some(next);
+        self.set_status(
+            match next {
+                QuotaDisplay::Used => "quota gauges fill: used%",
+                QuotaDisplay::Remaining => "quota gauges fill: remaining%",
+            }
+            .into(),
+        );
     }
 
     /// Key handling for the Accounts overlay (`a`). Houses the issue #3/#4
@@ -703,6 +840,10 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.overlay = Overlay::None,
+            // Same fill-direction toggle as MAIN — the accounts overlay is
+            // where the gauges live full-width.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
+            KeyCode::Char('t') => self.toggle_reset_display(),
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). Rows render in selection order; the current account
             // (when one exists) is always row 0 — start the cursor there.
@@ -837,6 +978,185 @@ impl App {
         }
     }
 
+    fn take_pending_pause(&mut self) -> Option<(String, bool)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_pause.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote pause/resume (`POST /llmux/pause-account`).
+    async fn perform_remote_pause(&mut self, account: String, paused: bool) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/pause-account", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "account": account, "paused": paused }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let verb = if paused { "paused" } else { "resumed" };
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("{verb} {account}"),
+            Ok(response) => format!("pause change failed: {}", response.status()),
+            Err(err) => format!("pause change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    fn take_pending_limits(&mut self) -> Option<(String, crate::config::AccountLimits)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_limits.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote limits change (`POST /llmux/account-limits`).
+    async fn perform_remote_limits(
+        &mut self,
+        account: String,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/account-limits", remote.base_url);
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "account": account,
+            "five_hour_max": limits.five_hour_max,
+            "seven_day_max": limits.seven_day_max,
+            "fable_weekly_max": limits.fable_weekly_max,
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("limits updated for {account}")
+            }
+            Ok(response) => format!("limits change failed: {}", response.status()),
+            Err(err) => format!("limits change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Open the limits editor for the switcher's highlighted row (`L` in
+    /// `Mode::Select`). Input format: `5h,7d,fbl` as percents (`90,98,98`),
+    /// missing/empty positions keep no override, empty input = all-global.
+    fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let fmt = |v: Option<f64>| v.map_or("global".to_string(), |v| format!("{:.0}%", v * 100.0));
+        self.add_input.clear();
+        self.mode = Mode::EditLimits { idx };
+        self.set_status(format!(
+            "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
+            target.id,
+            fmt(target.limits.five_hour_max),
+            fmt(target.limits.seven_day_max),
+            fmt(target.limits.fable_weekly_max),
+        ));
+    }
+
+    /// Key handling for `Mode::EditLimits`: plain text entry (digits, `,`,
+    /// `.`, space), Enter parses + applies, Esc cancels back to the switcher.
+    fn on_key_edit_limits(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' || c == '.' || c == ' ' => {
+                self.add_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.add_input.pop();
+            }
+            KeyCode::Esc => {
+                self.add_input.clear();
+                self.mode = Mode::Select { idx };
+            }
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.add_input);
+                match parse_limits_input(&raw) {
+                    Ok(limits) => {
+                        self.apply_limits_selected(idx, view, limits);
+                        self.mode = Mode::Select { idx };
+                    }
+                    Err(err) => {
+                        // Keep editing — restore the text so it can be fixed.
+                        self.add_input = raw;
+                        self.set_status(err);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply parsed limits to the highlighted row (local: in-process persist;
+    /// attach: queue the POST).
+    fn apply_limits_selected(
+        &mut self,
+        idx: usize,
+        view: Option<&DashboardView>,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_account_limits(&name, limits) {
+                Ok(true) => self.set_status(format!("limits updated for {name}")),
+                Ok(false) => self.set_status(format!("account {name} not found")),
+                Err(err) => self.set_status(format!("limits change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_limits = Some((name.clone(), limits));
+                self.set_status(format!("updating limits for {name}…"));
+            }
+        }
+    }
+
+    /// Toggle the operator pause on the switcher's highlighted row (`p` in
+    /// `Mode::Select`). Local mode applies + persists in-process; attach mode
+    /// queues the POST for the event loop.
+    fn toggle_pause_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        // The cursor indexes DISPLAY rows (selection order), not config order.
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        let next = !target.paused;
+        match &mut self.backend {
+            Backend::Local(state) => {
+                let verb = if next { "paused" } else { "resumed" };
+                match state.set_account_paused(&name, next) {
+                    Ok(true) => self.set_status(format!("{verb} {name}")),
+                    Ok(false) => self.set_status(format!("account {name} not found")),
+                    Err(err) => self.set_status(format!("pause change failed: {err}")),
+                }
+            }
+            Backend::Remote(remote) => {
+                remote.pending_pause = Some((name.clone(), next));
+                self.set_status(format!(
+                    "{} {name}…",
+                    if next { "pausing" } else { "resuming" }
+                ));
+            }
+        }
+    }
+
     /// Perform the queued remote codex change (`POST /llmux/codex`).
     async fn perform_remote_codex(&mut self, new: CodexSettingsDoc) {
         let Backend::Remote(remote) = &mut self.backend else {
@@ -893,6 +1213,15 @@ impl App {
             // `n` from the switcher: start a brand-new login (issue #4's
             // headline path — "start a new login from the account switcher").
             KeyCode::Char('n') => self.open_new_login(),
+            // `p` from the switcher: pause/resume the highlighted account
+            // (operator pause — excluded from selection until resumed).
+            KeyCode::Char('p') => {
+                self.toggle_pause_selected(idx, view);
+                self.mode = Mode::Select { idx };
+            }
+            // `L` from the switcher: edit the highlighted account's ceiling
+            // overrides (config `account_limits`).
+            KeyCode::Char('L') => self.open_limits_editor(idx, view),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
@@ -1271,7 +1600,14 @@ impl App {
         let headers_only =
             select::headers_only_mode(&view.snapshot, &view.select_params, None, now);
         if let Some(reason) = select::eligibility(target, &view.select_params, now, headers_only) {
-            self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            if reason == select::IneligibleReason::Paused {
+                self.set_status(format!(
+                    "cannot switch to {}: paused — press p to resume",
+                    target.id
+                ));
+            } else {
+                self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            }
             return;
         }
         let target_id = target.id.clone();
@@ -1400,6 +1736,9 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         connected: false,
         pending_switch: None,
         pending_codex: None,
+        pending_pause: None,
+        pending_limits: None,
+        pending_mode: None,
         pending_add: None,
         pending_remove: None,
     })));
@@ -1502,6 +1841,18 @@ async fn event_loop(
             app.perform_remote_codex(codex).await;
             redraw = true;
         }
+        if let Some((account, paused)) = app.take_pending_pause() {
+            app.perform_remote_pause(account, paused).await;
+            redraw = true;
+        }
+        if let Some((account, limits)) = app.take_pending_limits() {
+            app.perform_remote_limits(account, limits).await;
+            redraw = true;
+        }
+        if let Some(mode) = app.take_pending_mode() {
+            app.perform_remote_mode(mode).await;
+            redraw = true;
+        }
         if let Some(api_key) = app.take_pending_add() {
             app.perform_remote_add(api_key).await;
             redraw = true;
@@ -1600,8 +1951,64 @@ fn load_sessions() -> Vec<crate::session::Session> {
     crate::session::fold_sessions(&records)
 }
 
+/// Parse the limits-editor input: comma/space-separated percents in order
+/// `5h, 7d, fbl` — `"90,98,98"`, `"90"` (5h only), `"90,,98"` (skip 7d),
+/// `""` (all global). Values are percents; `>1` divides by 100, `<=1` is
+/// taken as a fraction, so `0.9` and `90` mean the same ceiling.
+fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String> {
+    let mut vals: [Option<f64>; 3] = [None, None, None];
+    let cleaned = raw.trim();
+    if !cleaned.is_empty() {
+        let parts: Vec<&str> = cleaned.split(',').collect();
+        if parts.len() > 3 {
+            return Err("at most 3 values: 5h,7d,fbl".into());
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let n: f64 = part
+                .parse()
+                .map_err(|_| format!("not a number: {part:?}"))?;
+            let frac = if n > 1.0 { n / 100.0 } else { n };
+            if !(frac > 0.0 && frac <= 1.0) {
+                return Err(format!("{part:?} out of range (1..=100%)"));
+            }
+            vals[i] = Some(frac);
+        }
+    }
+    Ok(crate::config::AccountLimits {
+        five_hour_max: vals[0],
+        seven_day_max: vals[1],
+        fable_weekly_max: vals[2],
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
+        let p = super::parse_limits_input;
+        let l = p("90,98,98").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.90));
+        assert_eq!(l.seven_day_max, Some(0.98));
+        assert_eq!(l.fable_weekly_max, Some(0.98));
+        // Fractions work too; positions may be skipped.
+        let l = p("0.5,,97").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.5));
+        assert_eq!(l.seven_day_max, None);
+        assert_eq!(l.fable_weekly_max, Some(0.97));
+        // Empty = clear all overrides.
+        assert!(p("").unwrap().is_empty());
+        assert!(p("  ").unwrap().is_empty());
+        // Errors: junk, out of range, too many.
+        assert!(p("abc").is_err());
+        assert!(p("0").is_err());
+        assert!(p("101").is_err());
+        assert!(p("1,2,3,4").is_err());
+    }
+
     use super::*;
 
     /// An `App` on a remote backend — buildable without a terminal, so the
@@ -1617,6 +2024,9 @@ mod tests {
             connected: false,
             pending_switch: None,
             pending_codex: None,
+            pending_pause: None,
+            pending_limits: None,
+            pending_mode: None,
             pending_add: None,
             pending_remove: None,
         })))
@@ -2084,6 +2494,8 @@ mod tests {
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         v
     }
@@ -2100,6 +2512,8 @@ mod tests {
             select_params: select::SelectParams {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
+                fable_weekly_max: 0.98,
+                mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -2123,7 +2537,10 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
+            events: Vec::new(),
         }
     }
 }

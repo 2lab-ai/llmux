@@ -1,7 +1,7 @@
 //! Config schema v1 for `~/.config/llmux.json` (see `.prd/02-architecture.md`).
 //! These structs are the on-disk contract; they are complete and purely declarative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +86,110 @@ pub struct Config {
     /// this field loads with the gauge ON.
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
+    /// TUI display: shorten well-known email domains in the accounts table
+    /// (`ai3@insightquest.io` → `ai3@iq.io`). Render-only — API documents and
+    /// interactive targets (switch/remove) keep real ids, same layering as
+    /// `email_anonymous`. Additive
+    /// (`#[serde(default = "default_domain_abbrev")]`): a config without this
+    /// field loads the built-in `{"insightquest.io": "iq.io"}` map; set `{}`
+    /// explicitly to disable abbreviation.
+    #[serde(default = "default_domain_abbrev")]
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Which quantity the TUI quota gauges FILL with: `"remaining"` (default
+    /// — a fresh account is a full green bar that drains as quota burns, per
+    /// Z's 2026-07-09 direction) or `"used"` (the bar grows instead). Color
+    /// bands stay keyed on USED utilization either way. The TUI `u` key
+    /// overrides this live for the session; this field is the boot default.
+    /// Additive (`#[serde(default)]`): older configs load as `remaining`.
+    #[serde(default)]
+    pub quota_display: QuotaDisplay,
+    /// Account names the scheduler must NOT auto-select (operator pause).
+    /// A paused account is ineligible for automatic selection AND manual
+    /// switch (resume it first); its live windows keep polling so the gauges
+    /// stay truthful. Kept as a top-level set (not a per-account field) so
+    /// the on-disk account entries stay pure credentials. Additive
+    /// (`#[serde(default)]`): older configs load with nothing paused.
+    #[serde(default)]
+    pub paused_accounts: std::collections::BTreeSet<String>,
+    /// Per-account overrides of the scheduler's utilization ceilings, keyed by
+    /// account name. Absent fields fall back to the global `scheduler.*`
+    /// values. Kept as a top-level map (like `paused_accounts`) so account
+    /// entries stay pure credentials. Additive: older configs load empty.
+    #[serde(default)]
+    pub account_limits: BTreeMap<String, AccountLimits>,
+    /// Dashboard event banners (config `events`). Each entry is an
+    /// [`EventBanner`] with an active window `[from, to)`; the TUI renders the
+    /// active one with the EARLIEST `to` as a single top line, and nothing when
+    /// none is active. Managed at runtime via `POST /llmux/events` (upsert by
+    /// `id`) and remove. Additive (`#[serde(default)]`): older configs — and a
+    /// config still carrying the removed singular `event` key — load with an
+    /// empty list (the orphan key is ignored and dropped on the next save).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventBanner>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// One dashboard event banner (an element of config `events`). Display-only:
+/// the TUI renders the active banner (`from <= now < to`) with the earliest
+/// `to` as a single top line. `id` is the stable upsert key (`POST
+/// /llmux/events` replaces the entry with the same `id`); `from`/`to` are
+/// timestamps in EITHER RFC3339-with-offset (`2026-07-12T23:59:59-07:00`) or
+/// compact `YYYYMMDDHHMM` (12 digits, LOCAL wall-clock) form — see
+/// [`crate::event::parse_event_time`]; `content` is the rendered message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBanner {
+    /// Stable identifier, the upsert/remove key (e.g. `20260712-fable5`).
+    pub id: String,
+    /// Window start (inclusive). RFC3339-with-offset or compact
+    /// `YYYYMMDDHHMM` (local time).
+    pub from: String,
+    /// Window end (exclusive). Same two accepted forms as `from`; must parse
+    /// to an instant strictly after `from`.
+    pub to: String,
+    /// Rendered banner text, e.g. `Fable 5 Available until 7/12`.
+    pub content: String,
+}
+
+/// Per-account utilization-ceiling overrides (config `account_limits`); every
+/// field optional — `None` falls back to the global scheduler value.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AccountLimits {
+    /// Override of `scheduler.five_hour_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_max: Option<f64>,
+    /// Override of `scheduler.seven_day_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_max: Option<f64>,
+    /// Override of `scheduler.fable_weekly_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable_weekly_max: Option<f64>,
+}
+
+impl AccountLimits {
+    /// True when no field overrides anything — the map entry can be dropped.
+    pub fn is_empty(&self) -> bool {
+        self.five_hour_max.is_none()
+            && self.seven_day_max.is_none()
+            && self.fable_weekly_max.is_none()
+    }
+}
+
+/// Fill direction for the TUI quota gauges (config `quota_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaDisplay {
+    /// Fill = fraction of the window already used (the bar grows).
+    Used,
+    /// Fill = fraction still available before the ceiling (default — a full
+    /// green bar drains toward the reset).
+    #[default]
+    Remaining,
+}
+
+/// Built-in domain abbreviations for the accounts table (`domain_abbrev`).
+pub fn default_domain_abbrev() -> BTreeMap<String, String> {
+    BTreeMap::from([("insightquest.io".to_string(), "iq.io".to_string())])
 }
 
 impl Default for Config {
@@ -103,6 +205,11 @@ impl Default for Config {
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
             show_fable_weekly: true,
+            domain_abbrev: default_domain_abbrev(),
+            quota_display: QuotaDisplay::default(),
+            paused_accounts: std::collections::BTreeSet::new(),
+            account_limits: BTreeMap::new(),
+            events: Vec::new(),
             accounts: Vec::new(),
         }
     }
@@ -345,15 +452,18 @@ impl Default for ProxyConfig {
 ///
 /// Both modes share a global kill-switch (`enabled = false` disables ALL
 /// probing) and a per-account cooldown so a single account is probed at most
-/// once per `per_account_cooldown_secs`. Defaults are conservative: probing
-/// OFF, the sweep OFF, and a 1-hour cooldown if it is turned on.
+/// once per `per_account_cooldown_secs`. Defaults are ALWAYS-ON (issue #45):
+/// probing enabled with an hourly sweep, so cold accounts populate their
+/// windows out of the box; the kill-switch remains for operators who want
+/// zero probe traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdleProbeConfig {
-    /// Master kill-switch. `false` (the default) disables all idle probing
-    /// (on-demand AND the timer sweep); `true` allows a single gated probe per
-    /// idle account. Conservative default: a real (if minimal) request is only
-    /// ever sent when the operator opts in.
-    #[serde(default)]
+    /// Master kill-switch. `true` (the default, per issue #45's always-on
+    /// mandate) allows a single gated probe per idle account; `false` disables
+    /// all idle probing (on-demand AND the timer sweep). Cost when on is
+    /// bounded by the per-account cooldown: at most one `max_tokens = 1`
+    /// request per cold account per hour, and only while it has no window.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Minimum wall-clock gap between two probes of the SAME account, seconds.
     /// Once an account is probed, a second probe is suppressed until this
@@ -362,15 +472,13 @@ pub struct IdleProbeConfig {
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
     /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
-    /// (issue #45), seconds. `0` (the default) disables the sweep entirely; the
-    /// probe then stays purely on-demand. When `> 0` and `enabled = true`, a
-    /// background task probes every cold account every `sweep_secs` seconds,
-    /// reusing the same kill-switch + per-account cooldown (so the cooldown —
-    /// not this cadence — bounds cost: at most one probe per account per
+    /// (issue #45), seconds. Default 3600 (hourly — one tick per default
+    /// cooldown). `0` disables the sweep entirely; the probe then stays purely
+    /// on-demand. When `> 0` and `enabled = true`, a background task probes
+    /// every cold account every `sweep_secs` seconds, reusing the same
+    /// kill-switch + per-account cooldown (so the cooldown — not this cadence
+    /// — bounds cost: at most one probe per account per
     /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
-    /// A sensible operating value is one tick per cooldown (e.g. `3600`).
-    /// Additive (`#[serde(default)]`) so a config written before this field
-    /// loads with the sweep OFF.
     #[serde(default = "default_idle_probe_sweep_secs")]
     pub sweep_secs: u64,
 }
@@ -378,7 +486,7 @@ pub struct IdleProbeConfig {
 impl Default for IdleProbeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_true(),
             per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
             sweep_secs: default_idle_probe_sweep_secs(),
         }
@@ -407,6 +515,43 @@ pub struct SchedulerConfig {
     /// tokens live ~8h).
     #[serde(default = "default_refresh_ahead_secs")]
     pub refresh_ahead_secs: u64,
+    /// Max Fable-weekly (7d Fbl) utilization before the account is
+    /// preemptively excluded for FABLE requests (non-Fable traffic is never
+    /// gated by this). Default 0.98. Additive: older configs load 0.98.
+    #[serde(default = "default_fable_weekly_max")]
+    pub fable_weekly_max: f64,
+    /// Which selection algorithm runs (see README "Schedulers"): `default`
+    /// (quota-maximizing perishability score) or `round-robin` (sequential
+    /// exhaust in roster order — the fewest-switches mode; each account
+    /// switch invalidates the upstream prompt cache, so fewer switches =
+    /// fewer re-read tokens). Toggle live from the TUI with `S`. Additive:
+    /// older configs load `default`.
+    #[serde(default)]
+    pub mode: SchedulerMode,
+}
+
+/// Selection algorithm (config `scheduler.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerMode {
+    /// Quota-maximizing: perishability-scored pick with damped proactive
+    /// switching (the historical behavior).
+    #[default]
+    Default,
+    /// Sequential exhaust: stay on the current account until it is hard
+    /// ineligible, then move to the NEXT account in roster order (wrapping).
+    /// Minimizes account switches (prompt-cache friendly).
+    RoundRobin,
+}
+
+impl SchedulerMode {
+    /// Stable wire/display label (matches the serde encoding).
+    pub fn label(self) -> &'static str {
+        match self {
+            SchedulerMode::Default => "default",
+            SchedulerMode::RoundRobin => "round-robin",
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -417,6 +562,8 @@ impl Default for SchedulerConfig {
             usage_poll_secs: default_usage_poll_secs(),
             usage_max_age_secs: default_usage_max_age_secs(),
             refresh_ahead_secs: default_refresh_ahead_secs(),
+            fable_weekly_max: default_fable_weekly_max(),
+            mode: SchedulerMode::default(),
         }
     }
 }
@@ -655,6 +802,10 @@ fn default_upstream() -> String {
     DEFAULT_UPSTREAM.to_string()
 }
 
+pub fn default_fable_weekly_max() -> f64 {
+    0.98
+}
+
 fn default_five_hour_max() -> f64 {
     0.90
 }
@@ -681,14 +832,12 @@ fn default_idle_probe_cooldown_secs() -> u64 {
     3600
 }
 
-/// Default idle-probe timer-sweep cadence: `0` = OFF (issue #45). The sweep is
-/// opt-in: even with `enabled = true`, no background probing happens until the
-/// operator sets a positive `sweep_secs`. A sensible operating value is one
-/// tick per `per_account_cooldown_secs` (one probe / account / hour), but the
-/// conservative default keeps the timer dormant so upgrading does not start
-/// spending quota on cold accounts unannounced.
+/// Default idle-probe timer-sweep cadence: hourly (issue #45's always-on
+/// mandate) — one tick per default `per_account_cooldown_secs`, so the steady
+/// state is at most one 1-token probe per cold account per hour, and none once
+/// the account has a window.
 fn default_idle_probe_sweep_secs() -> u64 {
-    0
+    3600
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).

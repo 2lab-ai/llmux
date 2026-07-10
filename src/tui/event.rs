@@ -55,17 +55,25 @@ pub enum ActivityEvent {
         path: String,
     },
     /// The scheduler leased an account for request `id`. Carries the served
-    /// `(group, model)` identity decided at lease time so the dashboard can
-    /// attribute in-flight requests to a model row before they finish.
+    /// `(group, model, effort, fast)` identity decided at lease time so the
+    /// dashboard can attribute in-flight requests to a model row — and render
+    /// the same metadata badge as completed rows — before they finish.
     RequestRouted {
         id: u64,
         account: String,
         /// Backend group of the leased account (`"claude"`/`"codex"`), when
         /// routing attributed one.
         group: Option<String>,
-        /// Served model: codex → the configured upstream model; claude → the
-        /// inbound model string.
+        /// Served model: codex → the per-request resolved upstream model;
+        /// claude → the inbound model string.
         model: Option<String>,
+        /// Per-request effective reasoning effort (codex: resolved + clamped;
+        /// claude: `output_config.effort` / thinking budget), when known.
+        /// Mirrors the eventual `RequestFinished.effort`.
+        effort: Option<String>,
+        /// Whether codex fast mode is in effect for this request (always
+        /// `false` for claude). Mirrors the eventual `RequestFinished.fast`.
+        fast: bool,
     },
     /// Request `id` completed (any status, including upstream errors).
     RequestFinished {
@@ -85,9 +93,14 @@ pub enum ActivityEvent {
         /// Model slug actually served (codex: the configured model; claude:
         /// the inbound model string), when known.
         model: Option<String>,
-        /// Reasoning effort (codex: configured effort; claude: thinking
-        /// budget like `"16k"`), when known.
+        /// Reasoning effort (codex: the PER-REQUEST effective effort that went
+        /// upstream, after the clamp; claude: thinking budget like `"16k"`),
+        /// when known.
         effort: Option<String>,
+        /// Whether codex fast mode (`service_tier: "priority"`) was in effect
+        /// for this request. Always `false` for claude requests and pre-routing
+        /// failures. Additive observability field.
+        fast: bool,
         /// Keyless per-client attribution identity (issue #32): the
         /// `metadata.user_id` parsed from the request body, when present
         /// (~98.9% of real requests). `None` requests are metered into the

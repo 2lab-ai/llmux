@@ -4,16 +4,19 @@
 
 pub mod accounts;
 pub mod api;
+pub mod brew;
+pub mod channel;
 pub mod daemon;
 pub mod env;
 pub mod import;
 pub mod login;
 pub mod run;
 pub mod status;
+pub mod update;
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -73,6 +76,15 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Debug: perform a GET against the upstream API on the current account.
     Api(ApiArgs),
+    /// Print the current release channel, or switch it (`stable`/`preview`).
+    ///
+    /// The channel is derived from what Homebrew has installed — there is no
+    /// config field. Switching runs the brew install/uninstall dance, mirrors
+    /// it onto the Islands cask, and restarts a running daemon.
+    Channel(ChannelArgs),
+    /// Self-update on the current channel (`brew upgrade`), then restart the
+    /// daemon / relaunch Islands only if their versions actually changed.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -169,6 +181,23 @@ pub struct ApiArgs {
     pub path: String,
 }
 
+#[derive(Debug, Args)]
+pub struct ChannelArgs {
+    /// Target channel to switch to. Omit to print the current channel.
+    #[arg(value_enum)]
+    pub channel: Option<ChannelName>,
+}
+
+/// The user-facing channel names accepted by `llmux channel <name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ChannelName {
+    Stable,
+    Preview,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {}
+
 /// Dispatch a parsed CLI invocation to its handler.
 ///
 /// Tracing init lives here (not in `main`): the server command chooses its
@@ -194,6 +223,8 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Accounts(args) => accounts::list(args).await,
         Command::Remove(args) => accounts::remove(args).await,
         Command::Api(args) => api::run(args).await,
+        Command::Channel(args) => channel::run(args).await,
+        Command::Update(args) => update::run(args).await,
     }
 }
 

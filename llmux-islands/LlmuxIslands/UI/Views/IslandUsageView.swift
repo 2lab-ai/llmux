@@ -74,7 +74,8 @@ struct IslandUsageView: View {
                     tiles: model.tiles,
                     columns: columns,
                     now: now,
-                    onRemove: { name in Task { await model.remove(name) } }
+                    onRemove: { name in Task { await model.remove(name) } },
+                    onSetPaused: { name, paused in Task { await model.setPaused(name, paused: paused) } }
                 )
                 .padding(.bottom, 4)
             }
