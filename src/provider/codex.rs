@@ -21,7 +21,13 @@ use crate::proxy::sse::{SseTransform, StreamUsage};
 /// lives in `config.codex.default_model`; this const is the compile-time
 /// fallback and the value [`CodexShape::default`] uses (so tests and the
 /// `new(base_url)` constructor preserve the original pinned behavior).
-pub const CODEX_MODEL: &str = "gpt-5.5";
+///
+/// `gpt-5.6-sol` (2026-07-09 launch, flagship tier): probed against the
+/// ChatGPT-account codex backend — bare `gpt-5.6` and `gpt-5.6-codex` are
+/// rejected ("model is not supported when using Codex with a ChatGPT
+/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. Measured input
+/// acceptance: ~370k tokens pass, ~380k rejected (up from gpt-5.5's 272k).
+pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Request path appended to the configured codex upstream.
 pub const RESPONSES_PATH: &str = "/responses";

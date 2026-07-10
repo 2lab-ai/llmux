@@ -67,6 +67,14 @@ const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
 /// `group == "codex"` unknown-model fallback.
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-sol (flagship, 2026-07-09 launch): same rates as gpt-5.5
+/// ($5 in / $30 out, cache read at 90% discount). Codex: no cache-creation
+/// charge.
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-terra (mid tier): $2.50 in / $15 out, cache read 0.25.
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
+/// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -82,6 +90,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
+        "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
+        "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
+        "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         _ => None,
     };
     if exact.is_some() {
@@ -98,6 +109,14 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(FABLE_TIER)
     } else if model_norm_lower.starts_with("gpt-5.5") {
         Some(GPT_5_5)
+    } else if model_norm_lower.starts_with("gpt-5.6-terra") {
+        Some(GPT_5_6_TERRA)
+    } else if model_norm_lower.starts_with("gpt-5.6-luna") {
+        Some(GPT_5_6_LUNA)
+    } else if model_norm_lower.starts_with("gpt-5.6") {
+        // Sol is the flagship default: bare `gpt-5.6`, `gpt-5.6-sol`, and any
+        // future dated `gpt-5.6-sol-*` snapshot all resolve here.
+        Some(GPT_5_6_SOL)
     } else {
         None
     }
@@ -261,6 +280,47 @@ mod tests {
         let cost = cost_usd(
             "codex",
             "gpt-5.5",
+            &tc(0, 0, None, Some(1_000_000)),
+            &empty(),
+        );
+        approx(cost, 0.0);
+    }
+
+    #[test]
+    fn gpt_5_6_sol_matches_exact_and_bare_and_prefix() {
+        // Exact `gpt-5.6-sol`, the bare `gpt-5.6` alias, and a future dated
+        // snapshot all resolve to sol rates ($5 in / $30 out / $0.5 cache read).
+        for model in ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-sol-20260709"] {
+            let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
+            approx(cost, 5.00);
+            let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
+            approx(out, 30.00);
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_terra_and_luna_have_tier_rates() {
+        let terra = cost_usd(
+            "codex",
+            "gpt-5.6-terra",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(terra, 2.50);
+        let luna = cost_usd(
+            "codex",
+            "gpt-5.6-luna",
+            &tc(0, 1_000_000, None, None),
+            &empty(),
+        );
+        approx(luna, 6.00);
+    }
+
+    #[test]
+    fn gpt_5_6_has_no_cache_creation_charge() {
+        let cost = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
             &tc(0, 0, None, Some(1_000_000)),
             &empty(),
         );
