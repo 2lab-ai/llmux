@@ -66,7 +66,13 @@ use view::DashboardView;
 
 /// Codex models the dashboard cycles through with `m` (req8.1). Any model can
 /// still be set via config / the control endpoint; this is the quick-pick set.
-const CODEX_MODELS: &[&str] = &["gpt-5.5", "gpt-5.5-codex", "gpt-5-codex"];
+const CODEX_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.5-codex",
+    "gpt-5-codex",
+];
 /// Reasoning-effort levels cycled with `e`; "" = unset (backend default).
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
 

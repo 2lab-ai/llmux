@@ -100,8 +100,8 @@ impl Rule {
 }
 
 /// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, and
-/// the exact `gpt-5.5` (covered by `gpt-` already, but kept explicit so the
-/// intent survives a future prefix change).
+/// the exact `gpt-5.5` / `gpt-5.6` family ids (covered by `gpt-` already, but
+/// kept explicit so the intent survives a future prefix change).
 fn builtin_codex_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gpt-".to_string()),
@@ -110,6 +110,8 @@ fn builtin_codex_rules() -> Vec<Rule> {
         Rule::Prefix("o4".to_string()),
         Rule::Substring("codex".to_string()),
         Rule::Exact("gpt-5.5".to_string()),
+        Rule::Exact("gpt-5.6".to_string()),
+        Rule::Exact("gpt-5.6-sol".to_string()),
     ]
 }
 
