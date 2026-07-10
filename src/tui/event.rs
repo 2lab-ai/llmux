@@ -85,9 +85,14 @@ pub enum ActivityEvent {
         /// Model slug actually served (codex: the configured model; claude:
         /// the inbound model string), when known.
         model: Option<String>,
-        /// Reasoning effort (codex: configured effort; claude: thinking
-        /// budget like `"16k"`), when known.
+        /// Reasoning effort (codex: the PER-REQUEST effective effort that went
+        /// upstream, after the clamp; claude: thinking budget like `"16k"`),
+        /// when known.
         effort: Option<String>,
+        /// Whether codex fast mode (`service_tier: "priority"`) was in effect
+        /// for this request. Always `false` for claude requests and pre-routing
+        /// failures. Additive observability field.
+        fast: bool,
         /// Keyless per-client attribution identity (issue #32): the
         /// `metadata.user_id` parsed from the request body, when present
         /// (~98.9% of real requests). `None` requests are metered into the

@@ -1881,11 +1881,14 @@ fn draw_activity(
                 Span::raw(format!("  {} {}", request.method, request.path)),
             ];
             // [group model] badge while in flight (issue #2, 2a). The data is
-            // filled at routing time (req11); effort is not carried in-flight,
-            // so the badge mirrors completed rows minus the effort suffix.
-            if let Some(meta) =
-                activity_meta(request.group.as_deref(), request.model.as_deref(), None)
-            {
+            // filled at routing time (req11); effort/fast are not carried
+            // in-flight, so the badge mirrors completed rows minus those tokens.
+            if let Some(meta) = activity_meta(
+                request.group.as_deref(),
+                request.model.as_deref(),
+                None,
+                false,
+            ) {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(meta, group_color(request.group.as_deref())));
             }
@@ -1977,6 +1980,7 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
             group,
             model,
             effort,
+            fast,
         } => {
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
@@ -2013,8 +2017,9 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
                 }
             }
             let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
-            // [group model·effort] badge, when known (req7).
-            if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref())
+            // [group model effort fast] badge, when known (req7).
+            if let Some(meta) =
+                activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
             {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(meta, group_color(group.as_deref())));
@@ -2052,6 +2057,7 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
         group,
         model,
         effort,
+        fast,
     } = &entry.body
     else {
         return Vec::new();
@@ -2092,9 +2098,15 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
     };
     let effort_label = effort
         .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && *e != "-")
         .map(|e| format!(" · effort {e}"))
         .unwrap_or_default();
-    lines.push(indent("model", format!("{model_label}{effort_label}")));
+    let fast_label = if *fast { " · fast" } else { "" };
+    lines.push(indent(
+        "model",
+        format!("{model_label}{effort_label}{fast_label}"),
+    ));
     match tokens {
         Some(t) => {
             lines.push(indent(
@@ -2171,28 +2183,37 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Compose the `[group model·effort]` badge for an activity line, or `None`
-/// when nothing is known. The model id is abbreviated via [`abbrev_model`].
-/// Examples: `[codex gpt-5.5·high]`, `[claude opus-4-8·16k]`, `[claude]`.
-fn activity_meta(group: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Option<String> {
-    if group.is_none() && model.is_none() && effort.is_none() {
+/// Compose the space-separated `[group model effort fast]` badge for an
+/// activity line, or `None` when nothing is known. The model id is abbreviated
+/// via [`abbrev_model`]; the effort token is dropped when unknown (`None`,
+/// empty, or `"-"`) and the `fast` token appears only when codex fast mode was
+/// on — so there are never trailing spaces. Examples:
+/// `[codex gpt-5.6-sol max fast]`, `[claude fable-5 low]`, `[codex gpt-5.5]`.
+fn activity_meta(
+    group: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    fast: bool,
+) -> Option<String> {
+    // Treat "-"/empty effort as unknown (the fold stamps unknown as "none"/"-").
+    let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
+    if group.is_none() && model.is_none() && effort.is_none() && !fast {
         return None;
     }
-    let mut label = String::new();
+    let mut parts: Vec<&str> = Vec::new();
     if let Some(g) = group {
-        label.push_str(g);
+        parts.push(g);
     }
     if let Some(m) = model {
-        if !label.is_empty() {
-            label.push(' ');
-        }
-        label.push_str(abbrev_model(group, m));
+        parts.push(abbrev_model(group, m));
     }
     if let Some(e) = effort {
-        label.push('·');
-        label.push_str(e);
+        parts.push(e);
     }
-    Some(format!("[{label}]"))
+    if fast {
+        parts.push("fast");
+    }
+    Some(format!("[{}]", parts.join(" ")))
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -3644,26 +3665,54 @@ mod tests {
     fn activity_meta_abbreviates_claude_prefix_only(/* issue #2, 2b */) {
         // Claude models drop the redundant `claude-` prefix.
         assert_eq!(
-            activity_meta(Some("claude"), Some("claude-opus-4-8"), None).as_deref(),
+            activity_meta(Some("claude"), Some("claude-opus-4-8"), None, false).as_deref(),
             Some("[claude opus-4-8]")
         );
         // Codex/gpt models are unchanged.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high")).as_deref(),
-            Some("[codex gpt-5.5·high]")
+            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high"), false).as_deref(),
+            Some("[codex gpt-5.5 high]")
         );
         // A claude model without the prefix, and unknown groups, pass through.
         assert_eq!(
-            activity_meta(Some("claude"), Some("opus-4-8"), None).as_deref(),
+            activity_meta(Some("claude"), Some("opus-4-8"), None, false).as_deref(),
             Some("[claude opus-4-8]")
         );
         assert_eq!(
-            activity_meta(None, Some("claude-haiku-4-5"), None).as_deref(),
+            activity_meta(None, Some("claude-haiku-4-5"), None, false).as_deref(),
             Some("[claude-haiku-4-5]"),
             "no group → no claude- stripping"
         );
         // Nothing known → no badge.
-        assert_eq!(activity_meta(None, None, None), None);
+        assert_eq!(activity_meta(None, None, None, false), None);
+    }
+
+    #[test]
+    fn activity_meta_appends_effort_and_fast_space_separated() {
+        // Effort + fast render as bare space-separated tokens (no `·`).
+        assert_eq!(
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true).as_deref(),
+            Some("[codex gpt-5.6-sol max fast]")
+        );
+        // Claude never fast; effort shows when known.
+        assert_eq!(
+            activity_meta(Some("claude"), Some("fable-5"), Some("low"), false).as_deref(),
+            Some("[claude fable-5 low]")
+        );
+        // Unknown effort ("-"/empty) is omitted — no trailing space.
+        assert_eq!(
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("-"), false).as_deref(),
+            Some("[codex gpt-5.6-sol]")
+        );
+        assert_eq!(
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some(""), false).as_deref(),
+            Some("[codex gpt-5.6-sol]")
+        );
+        // Fast with unknown effort still appends only the fast token.
+        assert_eq!(
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).as_deref(),
+            Some("[codex gpt-5.6-sol fast]")
+        );
     }
 
     #[test]
@@ -3772,6 +3821,7 @@ mod tests {
                 group: group.map(str::to_string),
                 model: model.map(str::to_string),
                 effort: None,
+                fast: false,
             },
         }
     }
@@ -4361,6 +4411,7 @@ mod tests {
                     group: Some("claude".into()),
                     model: Some("claude-opus-4-8".into()),
                     effort: None,
+                    fast: false,
                 },
             },
             Completed {
