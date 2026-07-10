@@ -16,7 +16,7 @@ use super::{proxy_base_url, CliError, RunArgs};
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
 
-    match ensure_server_running(&config, args.force).await? {
+    match ensure_server_running(&config, args.force, None).await? {
         EnsureOutcome::Started { pid } => {
             eprintln!(
                 "started llmux server (pid {pid}) on port {}",
