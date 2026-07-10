@@ -775,8 +775,9 @@ fn default_codex_token_url() -> String {
 }
 
 /// Default codex model slug (the value `CODEX_MODEL` used to hardcode).
+/// Must stay in sync with `provider::codex::CODEX_MODEL`.
 fn default_codex_model() -> String {
-    "gpt-5.5".to_string()
+    "gpt-5.6-sol".to_string()
 }
 
 fn default_port() -> u16 {

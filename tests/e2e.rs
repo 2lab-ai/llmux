@@ -1099,7 +1099,7 @@ fn parse_anthropic_sse(body: &str) -> Vec<(String, serde_json::Value)> {
 
 /// C1: a streaming Anthropic request served by a codex account comes back as
 /// well-formed Anthropic SSE including a full tool_use round, while the
-/// upstream saw a Responses-API request (model pinned to gpt-5.5, codex
+/// upstream saw a Responses-API request (model pinned to the default codex
 /// headers, translated body) — even with the upstream stream fragmented
 /// across awkward chunk boundaries.
 #[tokio::test]
@@ -1146,7 +1146,7 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
         ],
         "full body:\n{body}"
     );
-    assert_eq!(events[0].1["message"]["model"], "gpt-5.5");
+    assert_eq!(events[0].1["message"]["model"], "gpt-5.6-sol");
     assert_eq!(events[2].1["delta"]["text"], "Let me check.");
     assert_eq!(events[4].1["content_block"]["type"], "tool_use");
     assert_eq!(events[4].1["content_block"]["id"], "call_w1");
@@ -1166,7 +1166,10 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
     assert_eq!(seen[0].originator.as_deref(), Some("codex_cli_rs"));
     assert_eq!(seen[0].x_api_key, None, "client x-api-key never leaks");
     let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
-    assert_eq!(upstream_body["model"], "gpt-5.5", "model always rewritten");
+    assert_eq!(
+        upstream_body["model"], "gpt-5.6-sol",
+        "model always rewritten"
+    );
     assert_eq!(upstream_body["instructions"], "Be helpful.");
     assert_eq!(upstream_body["stream"], true);
     assert_eq!(upstream_body["store"], false);
@@ -1239,7 +1242,7 @@ async fn codex_account_aggregates_non_streaming_requests() {
     );
     let message: serde_json::Value = response.json().await.expect("json");
     assert_eq!(message["type"], "message");
-    assert_eq!(message["model"], "gpt-5.5");
+    assert_eq!(message["model"], "gpt-5.6-sol");
     assert_eq!(message["stop_reason"], "tool_use");
     assert_eq!(message["content"][0]["type"], "text");
     assert_eq!(message["content"][0]["text"], "Let me check.");
@@ -1845,8 +1848,10 @@ async fn codex_settings_endpoint_changes_the_upstream_request() {
     assert_eq!(echoed["default_model"], "gpt-5.5-codex");
     assert_eq!(echoed["reasoning_effort"], "high");
 
-    // The next codex request reflects the new shape on the wire.
-    let body = r#"{"model":"gpt-5.5","max_tokens":16,"stream":true,
+    // The next codex request reflects the new shape on the wire. The request
+    // names a codex-routed but UNKNOWN model id — known-valid slugs (e.g.
+    // gpt-5.5) now pass through verbatim and would bypass the pin.
+    let body = r#"{"model":"gpt-imaginary","max_tokens":16,"stream":true,
         "messages":[{"role":"user","content":"hi"}]}"#;
     let response = post_messages(&client, &proxy, body).await;
     assert_eq!(response.status(), 200);
@@ -1938,7 +1943,7 @@ async fn gpt_5_5_request_leases_codex_account() {
     let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
     assert_eq!(
         upstream_body["model"], "gpt-5.5",
-        "codex provider pins gpt-5.5 upstream"
+        "known-valid slugs pass through verbatim (the client chose gpt-5.5)"
     );
 
     // The codex slot is current; the claude slot is independent.

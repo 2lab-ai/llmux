@@ -21,7 +21,14 @@ use crate::proxy::sse::{SseTransform, StreamUsage};
 /// lives in `config.codex.default_model`; this const is the compile-time
 /// fallback and the value [`CodexShape::default`] uses (so tests and the
 /// `new(base_url)` constructor preserve the original pinned behavior).
-pub const CODEX_MODEL: &str = "gpt-5.5";
+///
+/// `gpt-5.6-sol` (2026-07-09 launch, flagship tier): probed against the
+/// ChatGPT-account codex backend — bare `gpt-5.6` and `gpt-5.6-codex` are
+/// rejected ("model is not supported when using Codex with a ChatGPT
+/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. Context window
+/// 372,000 per the openai/codex model catalog (probe-consistent: 369,755
+/// tokens pass, ~380k rejected; gpt-5.5 is 272k).
+pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Request path appended to the configured codex upstream.
 pub const RESPONSES_PATH: &str = "/responses";
@@ -223,25 +230,113 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
     translate_request_with(body, session_id, &CodexShape::default())
 }
 
+/// Upstream slugs the ChatGPT-account codex backend is known to accept
+/// (probed 2026-07-10; `gpt-5.6-luna` parses upstream but currently returns
+/// "Model not found" — kept so it starts working the moment OpenAI enables
+/// it). Requests naming one of these are forwarded VERBATIM; the bare
+/// `gpt-5.6` id maps to the sol flagship (the backend rejects the bare id);
+/// any other requested model keeps the configured pin.
+const PASSTHROUGH_MODELS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.5-codex",
+    "gpt-5-codex",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+
+/// Resolve the model slug requested upstream: known-valid slugs pass through
+/// (the client's choice is honored — soma-work exposes sol/terra as distinct
+/// user-selectable models), bare `gpt-5.6` maps to sol, everything else
+/// (unknown ids, model-less requests) keeps the configured pin.
+fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
+    let Some(req) = requested else {
+        return pinned.to_string();
+    };
+    let req = req.trim().to_ascii_lowercase();
+    if req == "gpt-5.6" {
+        return "gpt-5.6-sol".to_string();
+    }
+    if PASSTHROUGH_MODELS.contains(&req.as_str()) {
+        return req;
+    }
+    pinned.to_string()
+}
+
+/// Valid codex `reasoning.effort` values. Per the openai/codex model
+/// catalog (models-manager/models.json): the gpt-5.6 family supports
+/// low/medium/high/xhigh/max (+ `ultra` on sol/terra); gpt-5.5 tops out at
+/// xhigh. none/minimal are documented CLI values.
+const CODEX_EFFORT_VALUES: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Returns true when `model` belongs to the gpt-5.6 family, which natively
+/// supports the `max` / `ultra` reasoning levels (openai/codex models.json).
+fn supports_extended_efforts(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("gpt-5.6")
+}
+
+/// Per-request reasoning effort: the Claude Agent SDK carries the session's
+/// effort as Anthropic `output_config.effort` (observed on the wire,
+/// 2026-07-10). `max`/`ultra` pass through for the gpt-5.6 family (natively
+/// supported per the codex model catalog) and clamp to `xhigh` for older
+/// models. Invalid / absent request values fall back to the configured
+/// shape effort (empty / "default" = unset, backend default).
+fn resolve_reasoning_effort(
+    body: &Value,
+    shape_effort: Option<&str>,
+    upstream_model: &str,
+) -> Option<String> {
+    let clamp = |e: String| {
+        if (e == "max" || e == "ultra") && !supports_extended_efforts(upstream_model) {
+            "xhigh".to_string()
+        } else {
+            e
+        }
+    };
+    let requested = body
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(Value::as_str)
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| CODEX_EFFORT_VALUES.contains(&e.as_str()))
+        .map(clamp);
+    requested.or_else(|| {
+        shape_effort.and_then(|e| {
+            let e = e.trim();
+            if e.is_empty() || e.eq_ignore_ascii_case("default") {
+                None
+            } else {
+                Some(clamp(e.to_ascii_lowercase()))
+            }
+        })
+    })
+}
+
 /// Like [`translate_request`] but with an explicit request [`CodexShape`]
-/// (configurable model / fast tier / reasoning effort). The model is ALWAYS
-/// rewritten to `shape.model`; `max_tokens` and `tool_choice` are ignored
-/// (logged at debug); images and thinking blocks are dropped (warn/debug).
-/// When `shape.fast`, `service_tier: "priority"` is added (the wire value the
-/// codex CLI sends for fast mode); when `shape.effort` is set, a
-/// `reasoning: { effort }` object is added.
+/// (configurable model / fast tier / reasoning effort). Known-valid slugs in
+/// the request pass through verbatim (`resolve_upstream_model`); everything
+/// else is rewritten to `shape.model`. `max_tokens` and `tool_choice` are
+/// ignored (logged at debug); images and thinking blocks are dropped
+/// (warn/debug). When `shape.fast`, `service_tier: "priority"` is added (the
+/// wire value the codex CLI sends for fast mode); reasoning effort comes from
+/// the request's `output_config.effort` when valid, else `shape.effort`
+/// (`resolve_reasoning_effort`).
 pub fn translate_request_with(
     body: &Value,
     session_id: &str,
     shape: &CodexShape,
 ) -> Result<(Value, bool), ProviderError> {
     let client_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    if let Some(model) = body.get("model").and_then(Value::as_str) {
-        if model != shape.model {
+    let requested_model = body.get("model").and_then(Value::as_str);
+    let upstream_model = resolve_upstream_model(requested_model, &shape.model);
+    if let Some(model) = requested_model {
+        if model != upstream_model {
             tracing::debug!(
                 client_model = model,
                 "codex: model rewritten to {}",
-                shape.model
+                upstream_model
             );
         }
     }
@@ -268,7 +363,7 @@ pub fn translate_request_with(
         .unwrap_or_default();
 
     let mut upstream = json!({
-        "model": shape.model,
+        "model": upstream_model,
         "instructions": instructions,
         "input": input,
         "tools": tools,
@@ -279,12 +374,10 @@ pub fn translate_request_with(
         "include": ["reasoning.encrypted_content"],
     });
     // Reasoning effort: codex CLI sends `reasoning: { effort }`; omit to keep
-    // the backend default. (Empty / "default" effort is treated as unset.)
-    if let Some(effort) = shape.effort.as_deref() {
-        let effort = effort.trim();
-        if !effort.is_empty() && !effort.eq_ignore_ascii_case("default") {
-            upstream["reasoning"] = json!({ "effort": effort.to_ascii_lowercase() });
-        }
+    // the backend default. Per-request `output_config.effort` (Claude Agent
+    // SDK wire format) wins over the configured shape effort.
+    if let Some(effort) = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model) {
+        upstream["reasoning"] = json!({ "effort": effort });
     }
     // Fast mode: codex stores "fast" in config but sends `service_tier:
     // "priority"` on the wire. Only emit the field when fast is on.
@@ -936,6 +1029,20 @@ impl SseTransform for CodexSseConverter {
                 {
                     self.message_id = id.to_string();
                 }
+                // Adopt the upstream-reported model as the real model: with
+                // per-request model pass-through the request may name a
+                // different slug than the configured pin, and the upstream
+                // response is the single source of truth. `client_model`
+                // (when set) still wins for the client-facing stamp.
+                if let Some(m) = value
+                    .get("response")
+                    .and_then(|r| r.get("model"))
+                    .and_then(Value::as_str)
+                {
+                    if !m.is_empty() {
+                        self.model = m.to_string();
+                    }
+                }
                 self.ensure_started(&mut out);
             }
             "response.output_item.added" => {
@@ -1151,7 +1258,10 @@ mod tests {
 
     #[test]
     fn shape_sets_configurable_model_fast_tier_and_effort() {
-        let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });
+        // An UNKNOWN client model keeps the configured pin (pass-through only
+        // applies to known-valid upstream slugs).
+        let body =
+            json!({ "model": "my-custom-alias", "messages": [{"role":"user","content":"hi"}] });
         let shape = CodexShape {
             model: "gpt-5.5-codex".to_string(),
             client_model: None,
@@ -1167,8 +1277,83 @@ mod tests {
     }
 
     #[test]
+    fn known_slugs_pass_through_and_bare_gpt56_maps_to_sol() {
+        // Known-valid upstream slugs are forwarded verbatim — the client's
+        // model choice is honored even when it differs from the pin.
+        for slug in ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let body = json!({ "model": slug, "messages": [{"role":"user","content":"hi"}] });
+            let (upstream, _) =
+                translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+            assert_eq!(upstream["model"], slug, "known slug passes through");
+        }
+        // The bare gpt-5.6 id is rejected upstream — mapped to the sol tier.
+        let body = json!({ "model": "GPT-5.6", "messages": [{"role":"user","content":"hi"}] });
+        let (upstream, _) =
+            translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+        assert_eq!(upstream["model"], "gpt-5.6-sol");
+        // Model-less requests keep the pin.
+        let body = json!({ "messages": [{"role":"user","content":"hi"}] });
+        let (upstream, _) =
+            translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+        assert_eq!(upstream["model"], CODEX_MODEL);
+    }
+
+    #[test]
+    fn request_output_config_effort_wins_over_shape_and_maps_max() {
+        // The Claude Agent SDK carries session effort as output_config.effort.
+        let shape = CodexShape {
+            model: CODEX_MODEL.to_string(),
+            client_model: None,
+            fast: false,
+            effort: Some("low".to_string()),
+        };
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "output_config": { "effort": "HIGH" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "high",
+            "request effort wins"
+        );
+
+        // The gpt-5.6 family natively supports max/ultra (codex catalog) —
+        // pass through unclamped.
+        for e in ["max", "ultra"] {
+            let body = json!({
+                "model": "gpt-5.6-sol",
+                "output_config": { "effort": e },
+                "messages": [{"role":"user","content":"hi"}],
+            });
+            let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+            assert_eq!(upstream["reasoning"]["effort"], e);
+        }
+
+        // Older models top out at xhigh — max clamps.
+        let body = json!({
+            "model": "gpt-5.5",
+            "output_config": { "effort": "max" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+        assert_eq!(upstream["reasoning"]["effort"], "xhigh");
+
+        // Invalid request efforts fall back to the shape effort.
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "output_config": { "effort": "turbo" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+        assert_eq!(upstream["reasoning"]["effort"], "low");
+    }
+
+    #[test]
     fn shape_default_omits_tier_and_reasoning() {
-        let body = json!({ "model": "gpt-5.5", "messages": [{"role":"user","content":"hi"}] });
+        // Unknown model id → pinned default; no tier/effort emitted.
+        let body =
+            json!({ "model": "unknown-model", "messages": [{"role":"user","content":"hi"}] });
         let (upstream, _) =
             translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
         assert_eq!(upstream["model"], CODEX_MODEL);
