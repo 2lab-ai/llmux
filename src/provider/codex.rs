@@ -25,8 +25,9 @@ use crate::proxy::sse::{SseTransform, StreamUsage};
 /// `gpt-5.6-sol` (2026-07-09 launch, flagship tier): probed against the
 /// ChatGPT-account codex backend — bare `gpt-5.6` and `gpt-5.6-codex` are
 /// rejected ("model is not supported when using Codex with a ChatGPT
-/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. Measured input
-/// acceptance: ~370k tokens pass, ~380k rejected (up from gpt-5.5's 272k).
+/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. Context window
+/// 372,000 per the openai/codex model catalog (probe-consistent: 369,755
+/// tokens pass, ~380k rejected; gpt-5.5 is 272k).
 pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Request path appended to the configured codex upstream.
@@ -262,30 +263,52 @@ fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
     pinned.to_string()
 }
 
-/// Valid codex `reasoning.effort` values (probed: sol/terra accept
-/// low/medium/high/xhigh; none/minimal are documented CLI values).
-const CODEX_EFFORT_VALUES: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
+/// Valid codex `reasoning.effort` values. Per the openai/codex model
+/// catalog (models-manager/models.json): the gpt-5.6 family supports
+/// low/medium/high/xhigh/max (+ `ultra` on sol/terra); gpt-5.5 tops out at
+/// xhigh. none/minimal are documented CLI values.
+const CODEX_EFFORT_VALUES: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Returns true when `model` belongs to the gpt-5.6 family, which natively
+/// supports the `max` / `ultra` reasoning levels (openai/codex models.json).
+fn supports_extended_efforts(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("gpt-5.6")
+}
 
 /// Per-request reasoning effort: the Claude Agent SDK carries the session's
 /// effort as Anthropic `output_config.effort` (observed on the wire,
-/// 2026-07-10). Anthropic's `max` level has no codex equivalent — clamp to
-/// `xhigh`. Invalid / absent request values fall back to the configured
+/// 2026-07-10). `max`/`ultra` pass through for the gpt-5.6 family (natively
+/// supported per the codex model catalog) and clamp to `xhigh` for older
+/// models. Invalid / absent request values fall back to the configured
 /// shape effort (empty / "default" = unset, backend default).
-fn resolve_reasoning_effort(body: &Value, shape_effort: Option<&str>) -> Option<String> {
+fn resolve_reasoning_effort(
+    body: &Value,
+    shape_effort: Option<&str>,
+    upstream_model: &str,
+) -> Option<String> {
+    let clamp = |e: String| {
+        if (e == "max" || e == "ultra") && !supports_extended_efforts(upstream_model) {
+            "xhigh".to_string()
+        } else {
+            e
+        }
+    };
     let requested = body
         .get("output_config")
         .and_then(|c| c.get("effort"))
         .and_then(Value::as_str)
         .map(|e| e.trim().to_ascii_lowercase())
-        .map(|e| if e == "max" { "xhigh".to_string() } else { e })
-        .filter(|e| CODEX_EFFORT_VALUES.contains(&e.as_str()));
+        .filter(|e| CODEX_EFFORT_VALUES.contains(&e.as_str()))
+        .map(clamp);
     requested.or_else(|| {
         shape_effort.and_then(|e| {
             let e = e.trim();
             if e.is_empty() || e.eq_ignore_ascii_case("default") {
                 None
             } else {
-                Some(e.to_ascii_lowercase())
+                Some(clamp(e.to_ascii_lowercase()))
             }
         })
     })
@@ -353,7 +376,7 @@ pub fn translate_request_with(
     // Reasoning effort: codex CLI sends `reasoning: { effort }`; omit to keep
     // the backend default. Per-request `output_config.effort` (Claude Agent
     // SDK wire format) wins over the configured shape effort.
-    if let Some(effort) = resolve_reasoning_effort(body, shape.effort.as_deref()) {
+    if let Some(effort) = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model) {
         upstream["reasoning"] = json!({ "effort": effort });
     }
     // Fast mode: codex stores "fast" in config but sends `service_tier:
@@ -1295,9 +1318,21 @@ mod tests {
             "request effort wins"
         );
 
-        // Anthropic `max` has no codex equivalent — clamps to xhigh.
+        // The gpt-5.6 family natively supports max/ultra (codex catalog) —
+        // pass through unclamped.
+        for e in ["max", "ultra"] {
+            let body = json!({
+                "model": "gpt-5.6-sol",
+                "output_config": { "effort": e },
+                "messages": [{"role":"user","content":"hi"}],
+            });
+            let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
+            assert_eq!(upstream["reasoning"]["effort"], e);
+        }
+
+        // Older models top out at xhigh — max clamps.
         let body = json!({
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.5",
             "output_config": { "effort": "max" },
             "messages": [{"role":"user","content":"hi"}],
         });
