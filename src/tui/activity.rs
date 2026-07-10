@@ -36,8 +36,9 @@ const MAX_IN_FLIGHT: usize = 64;
 const STALE_IN_FLIGHT: Duration = Duration::from_secs(300);
 
 /// A request that has started but not finished — rendered with a spinner.
-/// `group`/`model` are filled at routing time so the dashboard can attribute
-/// in-flight requests to a model row before they complete (req11).
+/// `group`/`model`/`effort`/`fast` are filled at routing time so the dashboard
+/// can attribute in-flight requests to a model row — and show the same
+/// metadata badge as completed rows — before they complete (req11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InFlight {
     pub id: u64,
@@ -46,6 +47,10 @@ pub(crate) struct InFlight {
     pub account: Option<String>,
     pub group: Option<String>,
     pub model: Option<String>,
+    /// Per-request effective reasoning effort, when known at routing time.
+    pub effort: Option<String>,
+    /// Codex fast mode in effect (always `false` for claude).
+    pub fast: bool,
     pub started_at: SystemTime,
 }
 
@@ -1152,6 +1157,8 @@ impl ActivityLog {
                     account: None,
                     group: None,
                     model: None,
+                    effort: None,
+                    fast: false,
                     started_at: now,
                 });
             }
@@ -1160,11 +1167,15 @@ impl ActivityLog {
                 account,
                 group,
                 model,
+                effort,
+                fast,
             } => {
                 if let Some(entry) = self.in_flight.iter_mut().find(|r| r.id == id) {
                     entry.account = Some(account);
                     entry.group = group;
                     entry.model = model;
+                    entry.effort = effort;
+                    entry.fast = fast;
                 }
             }
             ActivityEvent::RequestFinished {
@@ -1421,12 +1432,17 @@ mod tests {
         assert_eq!(log.in_flight().len(), 1);
         assert_eq!(log.in_flight()[0].account, None);
 
+        assert_eq!(log.in_flight()[0].effort, None, "unknown before routing");
+        assert!(!log.in_flight()[0].fast, "fast off before routing");
+
         log.apply(
             ActivityEvent::RequestRouted {
                 id: 7,
                 account: "a@x.com".into(),
                 group: Some("claude".into()),
                 model: Some("claude-sonnet-4-5".into()),
+                effort: Some("low".into()),
+                fast: true,
             },
             at(1),
         );
@@ -1436,6 +1452,10 @@ mod tests {
             log.in_flight()[0].model.as_deref(),
             Some("claude-sonnet-4-5")
         );
+        // The routed event's per-request effort/fast land on the in-flight row
+        // so the running badge matches the eventual completed badge.
+        assert_eq!(log.in_flight()[0].effort.as_deref(), Some("low"));
+        assert!(log.in_flight()[0].fast);
 
         // Finish without an explicit account: the routed account is kept.
         log.apply(finished(7, None, Some((1_000, 200))), at(2));

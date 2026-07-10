@@ -253,11 +253,13 @@ impl DashboardView {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 account: r.account.clone(),
-                // group/model are filled at routing time and carried over the
-                // wire so the in-flight row shows the model badge while running
-                // (issue #2 2a).
+                // group/model/effort/fast are filled at routing time and
+                // carried over the wire so the in-flight row shows the same
+                // metadata badge as a completed row while running (issue #2 2a).
                 group: r.group.clone(),
                 model: r.model.clone(),
+                effort: r.effort.clone(),
+                fast: r.fast,
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -539,6 +541,8 @@ mod tests {
         let infl = &mut json["activity"]["in_flight"][0];
         infl["group"] = serde_json::json!("claude");
         infl["model"] = serde_json::json!("claude-opus-4-8");
+        infl["effort"] = serde_json::json!("low");
+        infl["fast"] = serde_json::json!(true);
 
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
@@ -546,12 +550,18 @@ mod tests {
         assert_eq!(view.in_flight.len(), 1);
         assert_eq!(view.in_flight[0].group.as_deref(), Some("claude"));
         assert_eq!(view.in_flight[0].model.as_deref(), Some("claude-opus-4-8"));
+        // effort/fast ride the same hop so the running badge matches the
+        // completed badge.
+        assert_eq!(view.in_flight[0].effort.as_deref(), Some("low"));
+        assert!(view.in_flight[0].fast);
 
-        // And a doc WITHOUT the fields still parses (back-compat → None).
+        // And a doc WITHOUT the fields still parses (back-compat → None/false).
         let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
         let view2 = DashboardView::from_doc(&doc2);
         assert_eq!(view2.in_flight[0].group, None);
         assert_eq!(view2.in_flight[0].model, None);
+        assert_eq!(view2.in_flight[0].effort, None);
+        assert!(!view2.in_flight[0].fast);
     }
 
     #[test]

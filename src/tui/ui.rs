@@ -1880,14 +1880,15 @@ fn draw_activity(
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
                 Span::raw(format!("  {} {}", request.method, request.path)),
             ];
-            // [group model] badge while in flight (issue #2, 2a). The data is
-            // filled at routing time (req11); effort/fast are not carried
-            // in-flight, so the badge mirrors completed rows minus those tokens.
+            // [group model effort fast] badge while in flight (issue #2, 2a).
+            // All four are filled at routing time (req11) with the same
+            // per-request values the finish will record, so the running badge
+            // reads exactly like its eventual completed row.
             if let Some(meta) = activity_meta(
                 request.group.as_deref(),
                 request.model.as_deref(),
-                None,
-                false,
+                request.effort.as_deref(),
+                request.fast,
             ) {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(meta, group_color(request.group.as_deref())));
@@ -3339,6 +3340,8 @@ mod tests {
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -3717,6 +3720,8 @@ mod tests {
 
     #[test]
     fn in_flight_row_shows_abbreviated_model_badge(/* issue #2, 2a */) {
+        // No effort / fast off: the badge is just [group model] — no stray
+        // separators or trailing spaces.
         let mut view = view_with(Vec::new());
         view.in_flight = vec![super::super::activity::InFlight {
             id: 1,
@@ -3725,16 +3730,41 @@ mod tests {
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         assert!(
-            text.contains("opus-4-8"),
-            "in-flight row shows the model name (2a)"
+            text.contains("[claude opus-4-8]"),
+            "in-flight badge without effort/fast is [group model] only"
         );
         assert!(
             !text.contains("claude-opus-4-8"),
             "model label is abbreviated, not the raw claude- id (2b)"
+        );
+    }
+
+    #[test]
+    fn in_flight_row_shows_effort_and_fast_like_a_completed_row() {
+        // Routed effort/fast render on the RUNNING row with the same bracket
+        // tag format as its eventual completed entry.
+        let mut view = view_with(Vec::new());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("codex:me@example.com".into()),
+            group: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("max".into()),
+            fast: true,
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        assert!(
+            text.contains("[codex gpt-5.6-sol max fast]"),
+            "in-flight badge carries effort + fast, got:\n{text}"
         );
     }
 
@@ -4396,6 +4426,8 @@ mod tests {
             account: Some(LEAK.into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
             started_at: UNIX_EPOCH,
         }];
         view.completed = vec![

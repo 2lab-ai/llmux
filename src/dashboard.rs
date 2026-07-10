@@ -319,12 +319,16 @@ fn trace_event(event: &ActivityEvent) {
             account,
             group,
             model,
+            effort,
+            fast,
         } => {
             tracing::debug!(
                 id,
                 %account,
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
+                effort = effort.as_deref().unwrap_or("-"),
+                fast = *fast,
                 "request routed"
             );
         }
@@ -918,13 +922,18 @@ pub struct InFlightDoc {
     pub path: String,
     pub account: Option<String>,
     pub started_at_ms: u64,
-    /// Backend group / served model, filled at routing time so the in-flight
-    /// row can show the model badge while running (issue #2 2a). Additive:
-    /// absent in docs written before these fields existed.
+    /// Backend group / served model / per-request effort / fast, filled at
+    /// routing time so the in-flight row can show the same metadata badge as a
+    /// completed row while running (issue #2 2a). Additive: absent in docs
+    /// written before these fields existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1359,6 +1368,8 @@ pub(crate) fn dashboard_doc(
                 started_at_ms: epoch_ms(r.started_at),
                 group: r.group.clone(),
                 model: r.model.clone(),
+                effort: r.effort.clone(),
+                fast: r.fast,
             })
             .collect(),
         completed: hub
@@ -1674,6 +1685,8 @@ mod tests {
                 account: "a".into(),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
+                effort: Some("xhigh".into()),
+                fast: true,
             },
             now() - Duration::from_secs(2),
         );
@@ -1912,6 +1925,10 @@ mod tests {
         assert_eq!(doc.activity.in_flight.len(), 1);
         assert_eq!(doc.activity.in_flight[0].id, 2);
         assert_eq!(doc.activity.in_flight[0].path, "/v1/messages");
+        // Routed effort/fast ride the in-flight doc so the running badge
+        // matches the eventual completed badge.
+        assert_eq!(doc.activity.in_flight[0].effort.as_deref(), Some("xhigh"));
+        assert!(doc.activity.in_flight[0].fast);
         assert!(matches!(
             &doc.activity.completed[0],
             CompletedDoc::Request {

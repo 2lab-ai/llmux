@@ -719,22 +719,31 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             group.map(|g| g.as_str()).unwrap_or("legacy"),
             account,
         );
-        // Served (group, model) for in-flight model attribution (req11): codex
-        // → the PER-REQUEST resolved upstream model; claude → the inbound
-        // model. Mirrors `finished_meta` so the in-flight row matches its
-        // eventual finish.
-        let (served_group, served_model) = match BackendGroup::from_kind(credential.kind()) {
-            BackendGroup::Codex => (
-                Some("codex".to_string()),
-                Some(state.codex.request_meta(&ctx.body).0),
-            ),
-            _ => (Some("claude".to_string()), ctx.model.clone()),
-        };
+        // Served (group, model, effort, fast) for in-flight attribution
+        // (req11): codex → the PER-REQUEST resolved upstream model + effective
+        // effort/fast; claude → the inbound model + client effort, never fast.
+        // Mirrors `finished_meta` so the in-flight row matches its eventual
+        // finish (same badge while running as when done).
+        let (served_group, served_model, served_effort, served_fast) =
+            match BackendGroup::from_kind(credential.kind()) {
+                BackendGroup::Codex => {
+                    let (model, effort, fast) = state.codex.request_meta(&ctx.body);
+                    (Some("codex".to_string()), Some(model), effort, fast)
+                }
+                _ => (
+                    Some("claude".to_string()),
+                    ctx.model.clone(),
+                    claude_effort(&ctx.body),
+                    false,
+                ),
+            };
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
             account: account.0.clone(),
             group: served_group,
             model: served_model,
+            effort: served_effort,
+            fast: served_fast,
         });
 
         // 2. Proactive refresh: oauth-style tokens (anthropic oauth AND
