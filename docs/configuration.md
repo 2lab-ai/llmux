@@ -26,7 +26,7 @@ The config file is written with mode `0600`. Updates use atomic read-merge-write
     "on_empty_group": "error"
   },
   "codex": {
-    "default_model": "gpt-5.5",
+    "default_model": "gpt-5.6-sol",
     "fast": false
   },
   "accounts": [
@@ -103,7 +103,7 @@ Codex settings are configurable in the config file and adjustable live from the 
 
 | Key | Meaning |
 |---|---|
-| `codex.default_model` | Upstream Codex model slug; default `gpt-5.5`. |
+| `codex.default_model` | Upstream Codex model slug; default `gpt-5.6-sol`. |
 | `codex.fast` | Sends `service_tier: "priority"` when true. |
 | `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 
