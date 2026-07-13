@@ -6,17 +6,24 @@
 use crate::config::{AccountCredential, Config};
 
 use super::daemon::{self, ServerProbe};
-use super::{now_ms, prompt_line, AccountsArgs, CliError, RemoveArgs};
+use super::{now_ms, prompt_line, resolve_endpoint, AccountsArgs, CliError, Endpoint, RemoveArgs};
 
 /// List configured accounts: name, type, tier when stored, masked
 /// credential; `-v` adds token expiry detail. `--json` instead emits the live
-/// dashboard document (see [`list_json`]).
-pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
-    if args.json {
-        return list_json().await;
-    }
-
+/// dashboard document (see [`list_live`]).
+///
+/// The offline table reads THIS machine's config, so it only makes sense for
+/// the LOCAL daemon. `--json` — and ANY remote invocation (`--remote` /
+/// `remote.host`) — instead reads the live account pool from the resolved
+/// daemon, so a remote client sees the remote's shared pool (the wrong pool
+/// would be this machine's empty config) rather than silently listing nothing.
+pub async fn list(args: AccountsArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
+    let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
+
+    if args.json || endpoint.remote {
+        return list_live(&endpoint).await;
+    }
 
     if config.accounts.is_empty() {
         println!("No accounts configured.");
@@ -71,7 +78,9 @@ pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `llmux accounts --json` — print the live account dashboard as JSON.
+/// Print the live account dashboard document from a resolved daemon endpoint
+/// (local or remote) as JSON — used by `llmux accounts --json` and by any
+/// remote `llmux accounts` (a pure client has no local pool to list offline).
 ///
 /// The usage windows the user wants (5h/7d utilization + resets, in-flight,
 /// token health) live only in the running server, so this mirrors
@@ -84,11 +93,10 @@ pub async fn list(args: AccountsArgs) -> Result<(), CliError> {
 /// `resets_in_secs`), `in_flight`, and `token_expires_at_ms` /
 /// `last_refresh_ms`. Pretty-printed (`{:#}`) so it is readable as well as
 /// machine-parseable.
-async fn list_json() -> Result<(), CliError> {
-    let config = crate::config::load_or_init()?;
-    let port = config.proxy.port;
+async fn list_live(endpoint: &Endpoint) -> Result<(), CliError> {
+    let port = endpoint.port;
 
-    match daemon::probe_server(port, config.proxy.api_key.as_deref()).await? {
+    match daemon::probe_server(&endpoint.base_url, endpoint.api_key.as_deref()).await? {
         ServerProbe::Running { status } => {
             println!("{status:#}");
             Ok(())
@@ -100,6 +108,10 @@ async fn list_json() -> Result<(), CliError> {
             );
             std::process::exit(1);
         }
+        ServerProbe::Unauthorized => Err(CliError::Message(format!(
+            "llmux on port {port} rejected the api key (401) — check `remote.api_key` \
+             (remote) or `proxy.api_key` (local) in the config"
+        ))),
         ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
             "port {port} answers but is not llmux: {detail}"
         ))),
@@ -195,5 +207,39 @@ mod tests {
         assert_eq!(describe_expiry(now - 1, now), "expired");
         assert_eq!(describe_expiry(now + 5 * 60_000, now), "expires in 5m");
         assert_eq!(describe_expiry(now + 90 * 60_000, now), "expires in 1h 30m");
+    }
+
+    /// The live listing follows the endpoint it is given, NOT the local config:
+    /// point `list_live` at a mock llmux `/llmux/status` server (as a remote
+    /// endpoint would be resolved) and it probes THAT address and returns Ok —
+    /// proving `accounts` reads the resolved (remote) pool, not this machine's.
+    #[tokio::test]
+    async fn list_live_follows_the_given_endpoint() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let body = serde_json::json!({
+            "version": crate::build_info::version_string(),
+            "current": null,
+            "accounts": [],
+        })
+        .to_string();
+        let app = Router::new().route("/llmux/status", get(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = Endpoint {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: Some("lm-remote".into()),
+            remote: true,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        // Running (llmux-shaped 2xx) → Ok; this only passes if the probe hit the
+        // endpoint's own base_url rather than the local proxy port.
+        list_live(&endpoint).await.unwrap();
     }
 }

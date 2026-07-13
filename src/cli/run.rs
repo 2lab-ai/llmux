@@ -3,34 +3,58 @@
 //! injected.
 
 use super::daemon::{ensure_server_running, EnsureOutcome};
-use super::{proxy_base_url, CliError, RunArgs};
+use super::{resolve_endpoint, CliError, RunArgs};
 
-/// Ensure a server is listening (herdr-style auto-start: detached daemon +
-/// readiness wait — see `cli::daemon`), then spawn `claude` with
+/// Local mode: ensure a server is listening (herdr-style auto-start: detached
+/// daemon + readiness wait — see `cli::daemon`), then spawn `claude` with
 /// `ANTHROPIC_BASE_URL=http://localhost:<port>` and pass-through args, and
-/// propagate its exit code.
+/// propagate its exit code. Only `ANTHROPIC_BASE_URL` is set — Claude Code
+/// keeps its own OAuth token (which the proxy accepts from localhost); not
+/// setting `ANTHROPIC_API_KEY` keeps it in subscription mode.
 ///
-/// Only `ANTHROPIC_BASE_URL` is set — Claude Code keeps its own OAuth
-/// token (which the proxy accepts from localhost); not setting
-/// `ANTHROPIC_API_KEY` keeps it in subscription mode.
-pub async fn run(args: RunArgs) -> Result<(), CliError> {
+/// Remote mode (`--remote` / `remote.host`): no local daemon is started;
+/// `claude` is pointed at the remote proxy and `ANTHROPIC_API_KEY` is exported
+/// with the remote's `x-api-key` so the off-loopback client-auth gate passes.
+/// The proxy still replaces the client credential with the real upstream
+/// account, so subscription mode is preserved at the account layer.
+pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
+    let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
 
-    match ensure_server_running(&config, args.force, None).await? {
-        EnsureOutcome::Started { pid } => {
-            eprintln!(
-                "started llmux server (pid {pid}) on port {}",
-                config.proxy.port
-            );
+    // Remote mode: never auto-start a local daemon — point `claude` straight
+    // at the remote proxy. Off-loopback the proxy enforces its `x-api-key`, so
+    // we MUST export `ANTHROPIC_API_KEY` (the analogue of llmux-islands'
+    // `x-api-key` header); the proxy still swaps in the real upstream account
+    // credential, so the client key only unlocks the proxy's own gate.
+    let mut claude_api_key: Option<String> = None;
+    if endpoint.remote {
+        match &endpoint.api_key {
+            Some(key) => claude_api_key = Some(key.clone()),
+            None => eprintln!(
+                "warning: remote {}:{} has no api_key configured (set remote.api_key in \
+                 ~/.config/llmux.json) — the proxy will reject the request unless it runs \
+                 with no key",
+                endpoint.host, endpoint.port
+            ),
         }
-        EnsureOutcome::Restarted { pid } => {
-            eprintln!(
-                "restarted llmux server (pid {pid}) on port {} → {}",
-                config.proxy.port,
-                crate::build_info::version_string()
-            );
+        eprintln!("using remote llmux at {}:{}", endpoint.host, endpoint.port);
+    } else {
+        match ensure_server_running(&config, args.force, None).await? {
+            EnsureOutcome::Started { pid } => {
+                eprintln!(
+                    "started llmux server (pid {pid}) on port {}",
+                    config.proxy.port
+                );
+            }
+            EnsureOutcome::Restarted { pid } => {
+                eprintln!(
+                    "restarted llmux server (pid {pid}) on port {} → {}",
+                    config.proxy.port,
+                    crate::build_info::version_string()
+                );
+            }
+            EnsureOutcome::AlreadyRunning => {}
         }
-        EnsureOutcome::AlreadyRunning => {}
     }
 
     let mut claude_args = args.args.as_slice();
@@ -38,18 +62,20 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         claude_args = &claude_args[1..];
     }
 
-    let status = tokio::process::Command::new("claude")
+    let mut command = tokio::process::Command::new("claude");
+    command
         .args(claude_args)
-        .env("ANTHROPIC_BASE_URL", proxy_base_url(config.proxy.port))
-        .status()
-        .await
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CliError::Message("claude not found in PATH — install Claude Code first".into())
-            } else {
-                CliError::Message(format!("failed to start claude: {err}"))
-            }
-        })?;
+        .env("ANTHROPIC_BASE_URL", &endpoint.base_url);
+    if let Some(key) = &claude_api_key {
+        command.env("ANTHROPIC_API_KEY", key);
+    }
+    let status = command.status().await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CliError::Message("claude not found in PATH — install Claude Code first".into())
+        } else {
+            CliError::Message(format!("failed to start claude: {err}"))
+        }
+    })?;
 
     std::process::exit(exit_code(&status));
 }

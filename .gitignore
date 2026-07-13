@@ -5,3 +5,7 @@ config.json
 .claude/*
 !.claude/skills/
 !.claude/skills/**
+
+# cleanup sweep 2026-07-08
+dist/*.backup.app/
+.worktrees/
