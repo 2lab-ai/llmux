@@ -42,6 +42,10 @@ const QUOTA_BAR_WIDTH: usize = 11;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
+/// Max width of the accounts-table name column (Z 2026-07-13: cap at 20 — the
+/// leftover-space allocation made it too wide). Longer names are clipped by the
+/// cell.
+const NAME_COL_MAX: u16 = 20;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
 /// Rows shown in the always-visible compact model strip (req12). Width of its
@@ -814,12 +818,13 @@ fn draw_accounts(
     // column, no width taken. Wide gets a full gauge column; narrow gets a
     // compact marker column (the width budget is tight there).
     let show_fable = view.show_fable_weekly;
-    // The account column is `Min(widest display name)`: every name always
-    // fits, and any width LEFT OVER after the fixed data columns is handed to
-    // the account column (Z 2026-07-09: "남는 공간을 account에 최대 할당") —
-    // so the table uses the full terminal width without ever squeezing a
-    // name. Floor = the header word.
-    let name_width = ctx
+    // The account column is a fixed `Length(name_width)` that fits the widest
+    // display name up to NAME_COL_MAX (floor = the header word "account").
+    // Because it is Length, not Min, leftover width after the fixed data
+    // columns is NO LONGER poured into it (Z 2026-07-13: supersedes the
+    // 2026-07-09 "남는 공간을 account에 최대 할당" directive — that made the
+    // column too wide). Names longer than the cap are clipped by the cell.
+    let name_width = (ctx
         .order
         .iter()
         .map(|&idx| {
@@ -829,14 +834,15 @@ fn draw_accounts(
         })
         .max()
         .unwrap_or(0)
-        .max("account".len()) as u16;
+        .max("account".len()) as u16)
+        .min(NAME_COL_MAX);
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Min(name_width),
+            Constraint::Length(name_width),
             Constraint::Length(20),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
@@ -858,7 +864,7 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Min(name_width),
+            Constraint::Length(name_width),
             Constraint::Length(20),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
             Constraint::Length(QUOTA_CELL_WIDTH as u16),
@@ -4115,6 +4121,45 @@ mod tests {
         assert!(
             off.contains("59m"),
             "toggle OFF: 5h gauge unchanged:\n{off}"
+        );
+    }
+
+    /// Cap receipt (Z 2026-07-13): the account name column is a fixed
+    /// `Length` clamped to `NAME_COL_MAX` (20). A longer name renders its
+    /// prefix in the table row but is clipped at the cap — leftover terminal
+    /// width no longer widens the column, superseding the 2026-07-09
+    /// leftover-allocation behavior.
+    #[test]
+    fn account_name_column_clips_at_name_col_max() {
+        use crate::scheduler::AccountId;
+
+        let mut view = view_with(Vec::new());
+        let mut a = fable_account();
+        a.id = AccountId("claude:really.long.account.name.overflow@example.com".into());
+        view.snapshot.accounts = vec![a];
+
+        // Wide layout so leftover width is maximal — under the old `Min`
+        // behavior the whole name would have fit; under the `Length` cap it
+        // does not.
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 40);
+
+        let name_row = rows
+            .iter()
+            .find(|line| line.contains("really.long.account"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a table row rendering the name prefix:\n{}",
+                    rows.join("\n")
+                )
+            });
+        assert!(
+            !name_row.contains("name.overflow"),
+            "name column clipped at NAME_COL_MAX (chars past the 20-col cap dropped):\n{name_row}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains("account")),
+            "the accounts table renders its `account` header word:\n{}",
+            rows.join("\n")
         );
     }
 
