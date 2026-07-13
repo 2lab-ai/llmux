@@ -52,14 +52,7 @@ pub async fn run(args: UpdateArgs) -> Result<(), CliError> {
     // state) current_exe may even be the OTHER channel's binary.
     if brew::should_restart_daemon(daemon_running, report.formula_changed()) {
         println!("binary changed — restarting the daemon…");
-        let exe = host.formula_bin_path(channel.formula()).ok_or_else(|| {
-            CliError::Message(format!(
-                "could not locate the {formula} binary after the upgrade \
-                 (brew --prefix {formula})\n\
-                 The daemon was not restarted — once resolved, run: llmux restart",
-                formula = channel.formula()
-            ))
-        })?;
+        let exe = brew::installed_binary(&host, channel)?;
         daemon::restart(Some(exe)).await?;
     }
 
