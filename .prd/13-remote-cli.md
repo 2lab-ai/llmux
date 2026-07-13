@@ -53,7 +53,8 @@ review MUST-FIX #1 on PR #74).
 
 Endpoints are **plain `http://`** and carry the proxy api_key plus prompt traffic.
 Documented constraint: use remote mode only over a trusted, encrypted overlay (Tailscale /
-WireGuard / LAN you own). A TLS/HTTPS path is out of scope here and tracked for stable.
+WireGuard) ONLY — ownership is not encryption. A TLS/HTTPS path is out of scope here and
+tracked for stable.
 
 ## UX deliverables
 

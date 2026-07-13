@@ -50,8 +50,8 @@ Remote daemon:
   stop/restart/remove/login/import are refused (run them on the daemon's host);
   channel/update stay local (they manage this machine's binary).
 
-  Transport is plain HTTP — use only over a trusted, encrypted overlay
-  (Tailscale / WireGuard / a LAN you own).";
+  Transport is plain HTTP — use over a trusted, encrypted overlay
+  (Tailscale / WireGuard) ONLY. Ownership is not encryption.";
 
 #[derive(Debug, Parser)]
 #[command(
