@@ -34,7 +34,7 @@ use crate::config::AccountCredential;
 use crate::provider::{anthropic, AnthropicRequest, Provider as _, ProviderRequest};
 use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
-use crate::scheduler::{headers as rl_headers, AccountId};
+use crate::scheduler::{headers as rl_headers, AccountId, DEFAULT_HEURISTIC_COOLDOWN};
 use crate::tui::{ActivityEvent, TokenCounts};
 
 /// Hop-by-hop headers stripped from the client request before forwarding
@@ -91,6 +91,23 @@ const EXHAUST_PARK_BUDGET: Duration = Duration::from_secs(20);
 /// policy is unit-testable without a 20-second sleep.
 fn should_park_exhausted(min_expiry: Duration, already_parked: Duration) -> bool {
     min_expiry <= MAX_EXHAUST_PARK && already_parked + min_expiry <= EXHAUST_PARK_BUDGET
+}
+
+/// Grace-park policy for a COMPLETED retry-after-less 429 sweep (2026-07-13T23:01Z
+/// incident). A non-Fable burst never reaches the cooldown-blocked path above:
+/// `heuristic_degraded_mode` keeps leasing through the Heuristic cooldowns the
+/// sweep just recorded, so the pool never goes `Exhausted` and `should_park_
+/// exhausted`'s trigger never fires — the request instead hammers all in-group
+/// accounts 429→switch→429 with no sleep and 502s in seconds, while the upstream
+/// burst clears ~20-30s later (measured: 1 opus-4-8 request, 8 accounts, 13 hops
+/// in ~8s). Once the forward loop detects the completed sweep it paces on the
+/// full [`DEFAULT_HEURISTIC_COOLDOWN`] (the soonest a heuristic park lifts).
+/// Same budget philosophy as [`should_park_exhausted`]: park only while the
+/// accumulated parked time stays within [`EXHAUST_PARK_BUDGET`], and REFUSE
+/// (never clamp) past it — a shorter sleep would just wake into a still-bursting
+/// pool. Pure, so the budget cutoff is unit-testable without an 8-second sleep.
+fn should_park_swept(already_parked: Duration) -> bool {
+    already_parked + DEFAULT_HEURISTIC_COOLDOWN <= EXHAUST_PARK_BUDGET
 }
 
 /// Classification of an upstream response/failure, driving the retry
@@ -628,6 +645,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     let mut exhaust_parks = 0u32;
     // Accounts already granted their one forced post-401 refresh.
     let mut force_refreshed: HashSet<AccountId> = HashSet::new();
+    // Accounts this request has hit with a retry-after-LESS 429 (the None
+    // branch below). When this set covers every leasable candidate the request
+    // has swept the whole pool and must pace, not hammer (2026-07-13 incident;
+    // see `should_park_swept`). Only retry-after-less 429s populate it —
+    // retry-after 429s and other errors are unrelated.
+    let mut swept: HashSet<AccountId> = HashSet::new();
 
     // Resolve the effective routing group, applying `on_empty_group` when the
     // model's group has no configured account. `None` = legacy path.
@@ -1055,6 +1078,92 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             "recorded scope-aware 429 cooldown"
                         );
                         drop(lease);
+                        // Sweep-detect (2026-07-13T23:01Z incident): a
+                        // retry-after-less 429 records a Heuristic cooldown, but
+                        // `heuristic_degraded_mode` leases straight through it, so
+                        // the pool never goes Exhausted and #83's grace-park path
+                        // is unreachable for a non-Fable burst — the request just
+                        // hammers every account with no sleep. Count the accounts
+                        // this request could still lease (ignoring the transient
+                        // heuristic cooldowns it is recording); once we have swept
+                        // all of them, pace on the heuristic cooldown instead of
+                        // burning the switch budget.
+                        swept.insert(account.clone());
+                        let sweep_snapshot = state.pool.snapshot();
+                        let sweep_now = SystemTime::now();
+                        // The bug is specific to an ACCOUNT-WIDE heuristic lockout:
+                        // only then does `heuristic_degraded_mode` keep leasing
+                        // through the cooldowns so the pool never exhausts. A Fable
+                        // request records a MODEL-SCOPED cooldown and leaves the
+                        // account-wide state eligible (mod.rs record_429_classified),
+                        // so it does NOT enter heuristic-degraded mode and is handled
+                        // by the #83 CooldownBlocked path above — don't hijack it.
+                        // Candidate count then confirms EVERY leasable account was
+                        // actually swept (an account another request already parked
+                        // is still leasable in degraded mode, so must be probed too).
+                        let candidates = select::degraded_candidate_count(
+                            &sweep_snapshot,
+                            &params,
+                            group,
+                            scope,
+                            sweep_now,
+                        );
+                        let swept_whole_pool = select::heuristic_degraded_mode(
+                            &sweep_snapshot,
+                            &params,
+                            group,
+                            sweep_now,
+                        ) && swept.len() >= candidates.max(1);
+                        if swept_whole_pool {
+                            if should_park_swept(exhaust_parked) {
+                                let park = DEFAULT_HEURISTIC_COOLDOWN;
+                                exhaust_parked += park;
+                                exhaust_parks += 1;
+                                // Reset the switch counter: the post-park reprobe
+                                // is a fresh attempt at a (hopefully) recovered
+                                // pool, not another hop in the sweep. Without this
+                                // the reprobe trips `switches > max_switches` and
+                                // 502s the very request we parked to rescue.
+                                switches = 0;
+                                tracing::info!(
+                                    parks = exhaust_parks,
+                                    parked_ms = exhaust_parked.as_millis() as u64,
+                                    candidates,
+                                    "429 burst swept every in-scope account; pacing on heuristic cooldown before reprobe"
+                                );
+                                tokio::time::sleep(park).await;
+                                // Keep `swept` intact: if the reprobe 429s again
+                                // the burst is still on and we re-detect the
+                                // completed sweep immediately (re-park within
+                                // budget, else the 502 below).
+                                continue;
+                            }
+                            // Budget spent: stop paying for parks and hand back the
+                            // same deliberate transient 502 as the #83 cooldown
+                            // path, so the client retries promptly instead of
+                            // honoring a bogus quota-exhausted wait.
+                            tracing::info!(
+                                parks = exhaust_parks,
+                                parked_ms = exhaust_parked.as_millis() as u64,
+                                "429-burst sweep parks did not outlast the burst; answering transient 502"
+                            );
+                            ctx.log(
+                                "=== ERROR ===\nall eligible accounts transiently rate-limited"
+                                    .to_string(),
+                            );
+                            ctx.flush_log(state);
+                            state.emit(ActivityEvent::Error {
+                                context: Some("scheduler".into()),
+                                message: format!(
+                                    "{} eligible account(s) transiently rate-limited",
+                                    candidates.max(1)
+                                ),
+                            });
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            return transient_response(
+                                "upstream is temporarily rate-limiting (not a usage limit)",
+                            );
+                        }
                         switches += 1;
                         if switches > max_switches {
                             ctx.flush_log(state);
@@ -3037,6 +3146,33 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn swept_park_policy_paces_within_budget_then_refuses() {
+        // 2026-07-13T23:01Z incident: a completed retry-after-less 429 sweep
+        // paces on the full DEFAULT_HEURISTIC_COOLDOWN (8s). The budget cutoff
+        // is unit-tested here so the 20s EXHAUST_PARK_BUDGET reject is proven
+        // WITHOUT three real 8s sleeps in an e2e test.
+        // First two parks fit (0+8=8, 8+8=16 ≤ 20).
+        assert!(should_park_swept(Duration::ZERO));
+        assert!(should_park_swept(DEFAULT_HEURISTIC_COOLDOWN));
+        // Boundary: a park landing the total EXACTLY on the budget is allowed
+        // (12s + 8s == 20s).
+        assert!(should_park_swept(
+            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN
+        ));
+        // 1ms of overshoot is refused — the budget is a hard, pre-checked cap
+        // on TOTAL parked time (not clamped): starting this park would push the
+        // total past 20s.
+        assert!(!should_park_swept(
+            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN + Duration::from_millis(1)
+        ));
+        // A third 8s park (16s already parked → 24s) overshoots → transient 502.
+        assert!(!should_park_swept(
+            DEFAULT_HEURISTIC_COOLDOWN + DEFAULT_HEURISTIC_COOLDOWN
+        ));
+        assert!(!should_park_swept(EXHAUST_PARK_BUDGET));
+    }
+
     #[tokio::test]
     async fn fable_429_burst_rides_out_consecutive_grace_parks_to_200() {
         // 2026-07-10 incident regression: under an org-level 429 burst the
@@ -3110,6 +3246,81 @@ mod tests {
             seen,
             vec!["Bearer at-a".to_string(), "Bearer at-b".to_string()],
             "park #1 → a retried (429), park #2 → b served"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_fable_opus_429_burst_paces_on_cooldown_then_200_not_instant_502() {
+        // 2026-07-13T23:01Z incident: a NON-Fable request (claude-opus-4-8)
+        // records ACCOUNT-WIDE heuristic cooldowns on a retry-after-less 429,
+        // but `heuristic_degraded_mode` keeps leasing straight through them, so
+        // the pool never reaches CooldownBlocked exhaustion and the #83
+        // grace-park budget is unreachable. Production saw one opus-4-8 request
+        // sweep 8 accounts 13× in ~8s and 502 the client, while the upstream
+        // burst cleared ~20-30s later (a wait would have returned 200).
+        //
+        // The fix: once the request has 429-swept every in-scope candidate
+        // (here both accounts) it paces on DEFAULT_HEURISTIC_COOLDOWN (8s)
+        // instead of hammering, then reprobes into the recovered pool → 200.
+        //   attempt 1: a → 429 (heuristic cooldown), swept={a}, b still free
+        //   attempt 2: b → 429 (heuristic cooldown), swept={a,b} == whole pool
+        //              → pace 8s (switch counter reset so the reprobe isn't
+        //              cap-killed)
+        //   attempt 3: script empty → default 200 (burst cleared). Stickiness
+        //              keeps the reprobe on b (the last-leased, now-eligible
+        //              account) — the load-bearing facts are that both were
+        //              swept first and the reprobe served a 200, not which of
+        //              the two eligible accounts it stuck to.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::Rate { retry_after: None });
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "swept pool must pace on the cooldown and reprobe to 200, not instant 502"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(7_500),
+            "the request waited out ~one heuristic cooldown (~8s), took {elapsed:?}"
+        );
+        let seen: Vec<String> = shared
+            .seen
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter_map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            seen.len(),
+            3,
+            "two 429 sweep hops + one reprobe, got {seen:?}"
+        );
+        assert_eq!(
+            &seen[..2],
+            &["Bearer at-a".to_string(), "Bearer at-b".to_string()],
+            "attempts 1-2 swept the whole pool (both 429) before any park"
+        );
+        assert!(
+            seen[2] == "Bearer at-a" || seen[2] == "Bearer at-b",
+            "the post-park reprobe hit one of the recovered accounts, got {:?}",
+            seen[2]
         );
     }
 
