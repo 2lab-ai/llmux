@@ -52,11 +52,13 @@ fn detect(host: &dyn Host) -> Result<brew::Detected, CliError> {
 /// `llmux channel <target>` — switch NOW.
 async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
     let current = detect(host)?.channel;
+    let islands = brew::installed_islands_channel(host.brew_casks().as_deref());
     if current == target {
         // Both installed? "nothing to do" would leave the stray formula (and
-        // its every-command warning) in place forever — consolidate instead.
-        // The serving daemon already runs the target binary; the relink only
-        // restores the symlink, so no restart is needed.
+        // its every-command warning) in place forever — consolidate instead,
+        // mirroring a stray-channel Islands cask too (it blocks the formula
+        // uninstall). The serving daemon already runs the target binary; the
+        // relink only restores the symlink, so no restart is needed.
         let other = target.other();
         if host.installed_version(other.formula(), false).is_some() {
             println!(
@@ -64,7 +66,7 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
                 target.label(),
                 other.formula()
             );
-            for cmd in brew::consolidate_plan(target) {
+            for cmd in brew::consolidate_plan(target, islands) {
                 host.run_brew(&cmd.args())?;
             }
         } else {
@@ -72,8 +74,6 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
         }
         return Ok(());
     }
-
-    let islands = brew::installed_islands_channel(host.brew_casks().as_deref());
 
     // Is a daemon up on the configured port? (Decides the post-switch
     // restart; a foreign/absent listener means no restart.)
