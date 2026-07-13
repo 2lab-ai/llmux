@@ -1108,6 +1108,23 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             scope,
                             sweep_now,
                         );
+                        // Deliberately a CARDINALITY compare (`swept.len() >=
+                        // candidates`), not a set-inclusion check that `swept`
+                        // ⊇ the exact candidate ids. When the guard holds,
+                        // heuristic-degraded mode is active, which by its own
+                        // definition means every in-scope candidate is CURRENTLY
+                        // heuristic-parked — evidence the burst is org-level, not
+                        // one bad account. At that point WHO did the parking is
+                        // irrelevant to the decision (this request or a sibling
+                        // under the same burst); all that matters is that the
+                        // whole candidate pool is transiently down. The only way
+                        // cardinality and true membership disagree is if a
+                        // candidate churned in/out between the per-429 snapshots
+                        // (a sibling recovers/parks an account mid-sweep); the
+                        // worst case is one unnecessary park (~8s) — strictly the
+                        // safe side (pace, never hammer), and self-correcting on
+                        // the next probe. A membership check would instead risk
+                        // MISSING completion under churn and resume hammering.
                         let swept_whole_pool = select::heuristic_degraded_mode(
                             &sweep_snapshot,
                             &params,
@@ -3321,6 +3338,133 @@ mod tests {
             seen[2] == "Bearer at-a" || seen[2] == "Bearer at-b",
             "the post-park reprobe hit one of the recovered accounts, got {:?}",
             seen[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_non_fable_429_bursts_stay_within_aggregate_attempt_cap() {
+        // gpt56 MUST-FIX: the sweep-pacing must not AMPLIFY load under
+        // concurrency. Three non-Fable (opus-4-8) requests hit the same
+        // 2-account pool while it is bursting; each must sweep at most one lap
+        // (2 accounts) and reprobe once, so the aggregate upstream attempt
+        // count stays bounded (no thundering herd of retries) and every request
+        // still rides the burst out to 200. Interleaving is nondeterministic,
+        // so ONLY the aggregate cap + all-200 are asserted, never per-request
+        // ordering.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // Enough 429s to 429 every sweep hop across all three requests
+            // (3 requests × 2-account sweep = 6); the script then empties and
+            // the default 200 serves each request's reprobe.
+            for _ in 0..6 {
+                script.push_back(Scripted::Rate { retry_after: None });
+            }
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let (r1, r2, r3) = tokio::join!(
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+        );
+        let elapsed = started.elapsed();
+
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "request {i} must ride the burst out to 200, not 502"
+            );
+        }
+        let attempts = shared.seen.lock().expect("seen lock").len();
+        assert!(
+            attempts <= 9,
+            "aggregate upstream attempts must stay bounded (≤ 3×sweep(2) + 3×probe(1) = 9); \
+             a hammer would blow far past this. got {attempts}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(25),
+            "pacing (not hammering) must not stall the batch, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_fable_429_sweep_exhausts_park_budget_then_transient_502() {
+        // gpt56 nice-to-have: the second-park → budget-reject state machine for
+        // a single non-Fable request whose burst OUTLASTS the park budget.
+        //   att1,2:  a→429, b→429  → whole pool swept  → park #1 (+8s, 0+8≤20)
+        //   att3,4:  b→429, a→429  → whole pool swept  → park #2 (+8s, 8+8≤20)
+        //   att5,6:  a→429, b→429  → whole pool swept  → park #3 REFUSED
+        //            (16+8 = 24 > 20 budget) → deliberate transient 502.
+        //
+        // NB: a park lasts DEFAULT_HEURISTIC_COOLDOWN (8s) — exactly the cooldown
+        // it records — so BOTH accounts' cooldowns expire during the park. The
+        // post-park reprobe therefore re-cools ONE account (still eligible), then
+        // must switch to re-cool the OTHER before `heuristic_degraded_mode`
+        // re-engages and the sweep is re-detected. So each re-establishment is
+        // TWO upstream attempts, not one → 6 total attempts across 2 real parks,
+        // not the 4 a "one-probe-per-park" model would predict.
+        //
+        // Uses REAL time (~16s): paused-time (`start_paused`) is flaky in
+        // combination with the real-TCP mock upstream (the sleep advances
+        // instantly but the socket round-trips don't), so we accept the wall
+        // clock here rather than fight that interaction.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // 3 sweep laps × 2 accounts = 6 429s; the request 502s on the 3rd
+            // (budget-refused) sweep completion, so no Ok is ever reached.
+            for _ in 0..6 {
+                script.push_back(Scripted::Rate { retry_after: None });
+            }
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "a burst that outlasts the park budget must fall back to the transient 502"
+        );
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "no fabricated window-scale retry-after on the transient fallback"
+        );
+        let attempts = shared.seen.lock().expect("seen lock").len();
+        assert_eq!(
+            attempts, 6,
+            "3 two-hop sweep laps (each park expires both cooldowns); the 3rd \
+             lap's completion is budget-refused before any further upstream call"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(15_500),
+            "two full 8s parks were actually waited out (~16s), took {elapsed:?}"
         );
     }
 
