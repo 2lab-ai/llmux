@@ -65,9 +65,33 @@ const REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_CLIENT_RETRY_AFTER_SECS: u64 = 60;
 
 /// When the pool is only cooldown-blocked and the soonest park expires within
-/// this bound, wait it out once inside the request instead of failing
-/// (issue #71 F5).
+/// this bound, wait it out inside the request instead of failing (issue #71
+/// F5). Bounds each INDIVIDUAL grace park — longer recoveries belong to the
+/// client's own retry (the transient 502 tells it to).
 const MAX_EXHAUST_PARK: Duration = Duration::from_secs(3);
+
+/// Total in-request grace-park budget (issue #71 F5, extended). A single park
+/// proved insufficient under a multi-second org-level 429 burst (2026-07-10
+/// incident: one fable-5 request swept all 8 claude accounts in ~5s, the one
+/// 3s grace park woke into a still-parked pool, and the client saw 502 pairs).
+/// Cooldowns free account by account, so riding out such a burst takes
+/// CONSECUTIVE short parks; they accumulate up to this budget before the
+/// request falls back to the deliberate transient 502 (unchanged semantics —
+/// that 502 stays the terminal answer once waiting stops being cheap).
+const EXHAUST_PARK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Grace-park policy for a cooldown-blocked pool (issue #71 F5 + budget):
+/// park only while recovery is imminent (`min_expiry` within
+/// [`MAX_EXHAUST_PARK`]) AND completing THIS park keeps the request within its
+/// [`EXHAUST_PARK_BUDGET`]. The budget is a hard cap on TOTAL parked time, so
+/// the check is pre-emptive: `already_parked + min_expiry` must fit. We refuse
+/// (rather than clamp to the remaining budget) because `min_expiry` is the
+/// soonest a cooldown lifts — a shorter sleep would wake into a still-locked
+/// pool, pure waste that only delays the transient 502. Pure, so the budget
+/// policy is unit-testable without a 20-second sleep.
+fn should_park_exhausted(min_expiry: Duration, already_parked: Duration) -> bool {
+    min_expiry <= MAX_EXHAUST_PARK && already_parked + min_expiry <= EXHAUST_PARK_BUDGET
+}
 
 /// Classification of an upstream response/failure, driving the retry
 /// decision table in the architecture doc.
@@ -593,9 +617,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     let max_switches = accounts.max(1);
     let mut switches = 0usize;
     let mut same_account_waits = 0u32;
-    // One in-request grace park when the pool is only cooldown-blocked and
-    // recovery is imminent (issue #71 F5) — strictly once per request.
-    let mut parked_exhausted = false;
+    // In-request grace parks when the pool is only cooldown-blocked and
+    // recovery is imminent (issue #71 F5): each park waits out the soonest
+    // cooldown (at most MAX_EXHAUST_PARK) and a request may park REPEATEDLY —
+    // an org-level 429 burst frees accounts one by one, so a single park wakes
+    // into a still-parked pool (2026-07-10 incident). The accumulated parked
+    // time is capped by EXHAUST_PARK_BUDGET; past it (or when recovery is not
+    // imminent) the request takes the deliberate transient-502 fallback below.
+    let mut exhaust_parked = Duration::ZERO;
+    let mut exhaust_parks = 0u32;
     // Accounts already granted their one forced post-401 refresh.
     let mut force_refreshed: HashSet<AccountId> = HashSet::new();
 
@@ -628,23 +658,47 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // 1. Lease the current account for the group (evaluate on demand when
         // none).
         let lease = match acquire_lease(state, group, &params, scope) {
-            Ok(lease) => lease,
+            Ok(lease) => {
+                // Forensics for the multi-park path: one quiet line per park
+                // episode when the pool recovered after grace park(s) — never
+                // one line per park.
+                if exhaust_parks > 0 {
+                    tracing::debug!(
+                        parks = exhaust_parks,
+                        parked_ms = exhaust_parked.as_millis() as u64,
+                        "pool recovered after in-request exhaustion grace park(s)"
+                    );
+                    // Reset the episode counter (not the budget) so a later
+                    // fallback logs only its own episode.
+                    exhaust_parks = 0;
+                }
+                lease
+            }
             Err(info) => match info.kind {
                 select::ExhaustionKind::CooldownBlocked {
                     min_expiry,
                     upstream_mandated: false,
                 } => {
                     // Transient park, NOT quota exhaustion: the pool recovers
-                    // in seconds. If recovery is imminent, wait it out once
-                    // in-request (the 01:27:54 200 two seconds after the
-                    // burst proves this wins); otherwise answer the same
-                    // transient 502 as the switch-cap exit below so the
-                    // client retries promptly instead of honoring a bogus
-                    // half-hour retry-after.
-                    if !parked_exhausted && min_expiry <= MAX_EXHAUST_PARK {
-                        parked_exhausted = true;
+                    // in seconds. While recovery is imminent, wait it out
+                    // in-request (issue #71 F5) — repeatedly, because a burst
+                    // frees accounts one by one — accumulating parked time up
+                    // to EXHAUST_PARK_BUDGET. Budget spent or recovery not
+                    // imminent → the same transient 502 as the switch-cap
+                    // exit below, so the client retries promptly instead of
+                    // honoring a bogus half-hour retry-after.
+                    if should_park_exhausted(min_expiry, exhaust_parked) {
+                        exhaust_parked += min_expiry;
+                        exhaust_parks += 1;
                         tokio::time::sleep(min_expiry).await;
                         continue;
+                    }
+                    if exhaust_parks > 0 {
+                        tracing::info!(
+                            parks = exhaust_parks,
+                            parked_ms = exhaust_parked.as_millis() as u64,
+                            "exhaustion grace parks did not outlast the burst; answering transient 502"
+                        );
                     }
                     ctx.log(
                         "=== ERROR ===\nall eligible accounts transiently rate-limited".to_string(),
@@ -2934,6 +2988,128 @@ mod tests {
         assert!(
             text.contains("temporarily rate-limiting"),
             "transient wording expected, got: {text}"
+        );
+    }
+
+    #[test]
+    fn exhaust_park_policy_parks_within_budget_only() {
+        // Imminent recovery, budget untouched → park (issue #71 F5).
+        assert!(should_park_exhausted(
+            Duration::from_secs(2),
+            Duration::ZERO
+        ));
+        // Consecutive parks keep going while the accumulated time stays under
+        // the budget — this is the 2026-07-10 incident fix (one park is not
+        // enough when a burst frees accounts one by one). Boundary: a park that
+        // lands the accumulated total EXACTLY on the budget is still allowed
+        // (17s + 3s == 20s).
+        assert!(should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK
+        ));
+        // But 1ms of overshoot is refused — the budget is a hard cap on TOTAL
+        // parked time, checked BEFORE the sleep (MUST-FIX ①): starting this 3s
+        // park would push the total to 20s + 1ms.
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK + Duration::from_millis(1)
+        ));
+        // With only 1ms of budget left, a full 3s park overshoots and is
+        // refused (this assertion was TRUE under the pre-check-order bug, which
+        // let the worst-case total reach ~23s).
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - Duration::from_millis(1)
+        ));
+        // Budget spent → the transient 502 fallback, exactly as before.
+        assert!(!should_park_exhausted(
+            Duration::from_secs(1),
+            EXHAUST_PARK_BUDGET
+        ));
+        assert!(!should_park_exhausted(
+            Duration::from_millis(100),
+            EXHAUST_PARK_BUDGET + Duration::from_secs(5)
+        ));
+        // Recovery not imminent → 502 regardless of remaining budget.
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK + Duration::from_millis(1),
+            Duration::ZERO
+        ));
+    }
+
+    #[tokio::test]
+    async fn fable_429_burst_rides_out_consecutive_grace_parks_to_200() {
+        // 2026-07-10 incident regression: under an org-level 429 burst the
+        // fable-scoped cooldowns free account by account, so ONE grace park
+        // wakes into a still-parked pool. The old one-shot `parked_exhausted`
+        // bool then answered the transient 502; the park BUDGET must instead
+        // keep waiting (each park ≤ MAX_EXHAUST_PARK, total ≤
+        // EXHAUST_PARK_BUDGET) until an account frees and the request ends 200.
+        //
+        // Timeline (parks backdated so each remaining wait is ~1s):
+        //   t≈0   both accounts fable-parked → exhaustion → grace park #1 (~1s)
+        //   t≈1   a frees → leased → upstream 429s again (burst not over) →
+        //         a re-parked 8s → exhaustion again → grace park #2 (~1s)
+        //         [before the fix: 502 HERE — the one-shot park was spent]
+        //   t≈2   b frees → leased → upstream 200 → request succeeds.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // Round-2 429 for the first account to free; the script then
+            // empties and the mock's default 200 serves the third attempt.
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        // Backdate the burst's first sweep: fable-scoped parks are 8s long
+        // (DEFAULT_HEURISTIC_COOLDOWN), so recording them 7s/6s in the past
+        // leaves ~1s/~2s remaining — both within MAX_EXHAUST_PARK.
+        let now = SystemTime::now();
+        state.pool.record_429_classified(
+            &AccountId("a".into()),
+            None,
+            Some("claude-fable-5"),
+            now - Duration::from_secs(7),
+        );
+        state.pool.record_429_classified(
+            &AccountId("b".into()),
+            None,
+            Some("claude-fable-5"),
+            now - Duration::from_secs(6),
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-fable-5","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "consecutive grace parks must ride out the burst, not 502"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1_800),
+            "both parks were actually waited out (~1s + ~1s), took {elapsed:?}"
+        );
+        // a freed first and 429'd (round 2 of the burst); b served the 200.
+        let seen: Vec<String> = shared
+            .seen
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter_map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["Bearer at-a".to_string(), "Bearer at-b".to_string()],
+            "park #1 → a retried (429), park #2 → b served"
         );
     }
 
