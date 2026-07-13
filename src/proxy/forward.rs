@@ -82,11 +82,15 @@ const EXHAUST_PARK_BUDGET: Duration = Duration::from_secs(20);
 
 /// Grace-park policy for a cooldown-blocked pool (issue #71 F5 + budget):
 /// park only while recovery is imminent (`min_expiry` within
-/// [`MAX_EXHAUST_PARK`]) AND the request has not yet slept away its
-/// [`EXHAUST_PARK_BUDGET`]. Pure, so the budget policy is unit-testable
-/// without a 20-second sleep.
+/// [`MAX_EXHAUST_PARK`]) AND completing THIS park keeps the request within its
+/// [`EXHAUST_PARK_BUDGET`]. The budget is a hard cap on TOTAL parked time, so
+/// the check is pre-emptive: `already_parked + min_expiry` must fit. We refuse
+/// (rather than clamp to the remaining budget) because `min_expiry` is the
+/// soonest a cooldown lifts — a shorter sleep would wake into a still-locked
+/// pool, pure waste that only delays the transient 502. Pure, so the budget
+/// policy is unit-testable without a 20-second sleep.
 fn should_park_exhausted(min_expiry: Duration, already_parked: Duration) -> bool {
-    min_expiry <= MAX_EXHAUST_PARK && already_parked < EXHAUST_PARK_BUDGET
+    min_expiry <= MAX_EXHAUST_PARK && already_parked + min_expiry <= EXHAUST_PARK_BUDGET
 }
 
 /// Classification of an upstream response/failure, driving the retry
@@ -2994,10 +2998,26 @@ mod tests {
             Duration::from_secs(2),
             Duration::ZERO
         ));
-        // Consecutive parks keep going while the accumulated time is under
+        // Consecutive parks keep going while the accumulated time stays under
         // the budget — this is the 2026-07-10 incident fix (one park is not
-        // enough when a burst frees accounts one by one).
+        // enough when a burst frees accounts one by one). Boundary: a park that
+        // lands the accumulated total EXACTLY on the budget is still allowed
+        // (17s + 3s == 20s).
         assert!(should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK
+        ));
+        // But 1ms of overshoot is refused — the budget is a hard cap on TOTAL
+        // parked time, checked BEFORE the sleep (MUST-FIX ①): starting this 3s
+        // park would push the total to 20s + 1ms.
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK + Duration::from_millis(1)
+        ));
+        // With only 1ms of budget left, a full 3s park overshoots and is
+        // refused (this assertion was TRUE under the pre-check-order bug, which
+        // let the worst-case total reach ~23s).
+        assert!(!should_park_exhausted(
             MAX_EXHAUST_PARK,
             EXHAUST_PARK_BUDGET - Duration::from_millis(1)
         ));
