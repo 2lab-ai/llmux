@@ -176,6 +176,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # PAT (or GitHub App token) with actions:write on 2lab-ai/homebrew-tap,
+      # so a fresh preview auto-bumps the tap formula instead of waiting on the
+      # tap's 6h cron. Optional: absent → the step below no-ops and the cron
+      # still catches up (no regression).
+      TAP_DISPATCH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -248,3 +254,15 @@ jobs:
             [ -n "$tag" ] || continue
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < old-preview-tags.txt
+
+      - name: Bump Homebrew tap to this preview
+        # Fire-and-forget: kick the tap's bump.yml so `brew upgrade
+        # llmux-preview` sees this build immediately. Skipped when the token
+        # secret is unset (the tap's 6h cron still bumps eventually).
+        if: ${{ env.TAP_DISPATCH_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ env.TAP_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run bump.yml --repo 2lab-ai/homebrew-tap
+          echo "dispatched homebrew-tap bump.yml for ${{ needs.preflight.outputs.tag }}"

@@ -7,17 +7,18 @@ use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 use super::daemon::{self, ServerProbe};
-use super::{CliError, StatusArgs};
+use super::{resolve_endpoint, CliError, StatusArgs};
 
 /// Probe the configured port (shared with `llmux run`'s auto-start —
 /// see `cli::daemon`) and render the herdr-style sections. A server that is
 /// not running prints the client section + `status: not running` and exits 1.
-pub async fn run(args: StatusArgs) -> Result<(), CliError> {
+pub async fn run(args: StatusArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
-    let port = config.proxy.port;
+    let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
+    let port = endpoint.port;
     let client_version = crate::build_info::version_string();
 
-    match daemon::probe_server(port, config.proxy.api_key.as_deref()).await? {
+    match daemon::probe_server(&endpoint.base_url, endpoint.api_key.as_deref()).await? {
         ServerProbe::Running { status } => {
             if args.json {
                 println!("{status:#}");
@@ -40,6 +41,10 @@ pub async fn run(args: StatusArgs) -> Result<(), CliError> {
             }
             std::process::exit(1);
         }
+        ServerProbe::Unauthorized => Err(CliError::Message(format!(
+            "llmux on port {port} rejected the api key (401) — check `remote.api_key` \
+             (remote) or `proxy.api_key` (local) in the config"
+        ))),
         ServerProbe::Foreign { detail } => Err(CliError::Message(format!(
             "port {port} answers but is not llmux: {detail}"
         ))),

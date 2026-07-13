@@ -126,6 +126,17 @@ pub struct Config {
     /// empty list (the orphan key is ignored and dropped on the next save).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventBanner>,
+    /// Point the CLI *client* commands at a remote llmux daemon instead of a
+    /// local one (issue: remote proxy support). When `remote.host` is set,
+    /// `llmux run` exports `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` for the
+    /// remote and does NOT auto-start a local daemon; `llmux server`,
+    /// `llmux dashboard`, `llmux status`, and `llmux env` attach to / describe
+    /// the remote. This is the CLI analogue of what llmux-islands already does
+    /// (host/port + `x-api-key`). The `--remote host[:port]` global flag
+    /// overrides it per-invocation. Additive (`#[serde(default)]`): a config
+    /// written before this field loads with remote OFF (all-local behavior).
+    #[serde(default)]
+    pub remote: RemoteConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -192,6 +203,26 @@ pub fn default_domain_abbrev() -> BTreeMap<String, String> {
     BTreeMap::from([("insightquest.io".to_string(), "iq.io".to_string())])
 }
 
+/// Remote-daemon target for the CLI client commands. All fields optional:
+/// `host` unset (the default) means "operate against the local daemon" and the
+/// whole section is inert. When `host` is set, off-loopback access requires the
+/// remote's proxy `api_key` presented as `x-api-key` — so `api_key` is
+/// effectively mandatory unless the remote runs with no key configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Remote daemon host (e.g. `llmux-host` or `100.64.0.1`). Unset →
+    /// remote mode OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Remote daemon port. Unset → [`DEFAULT_PORT`] (3456).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Proxy `api_key` presented to the remote as `x-api-key`. Required
+    /// off-loopback unless the remote has no api_key configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -210,6 +241,7 @@ impl Default for Config {
             paused_accounts: std::collections::BTreeSet::new(),
             account_limits: BTreeMap::new(),
             events: Vec::new(),
+            remote: RemoteConfig::default(),
             accounts: Vec::new(),
         }
     }
