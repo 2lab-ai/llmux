@@ -182,14 +182,17 @@ pub fn detect_channel(
 }
 
 /// PURE: the ordered `brew` commands to switch from `current` to `target`.
-/// The binary formulae both link `bin/llmux`, so the OLD one is uninstalled
-/// BEFORE the new one is installed — that removes the symlink and sidesteps a
-/// brew link conflict entirely (the running process keeps its open file).
-/// When the target formula is ALREADY installed (the both-installed state
+/// Each Islands cask DEPENDS on its channel's formula, so the ordering is
+/// dependency-driven: the outgoing cask is uninstalled FIRST (brew refuses to
+/// uninstall a formula something depends on — live-verified: `brew uninstall
+/// llmux` fails with "required by llmux-islands"), the outgoing formula next
+/// (that removes the shared `bin/llmux` symlink and sidesteps a link conflict;
+/// the running process keeps its open file), then the target formula, and the
+/// target cask LAST so its formula dependency is already present. When the
+/// target formula is ALREADY installed (the both-installed state
 /// `detect_channel` warns about), `brew install` is a no-op that does NOT
-/// restore the `bin/llmux` symlink the uninstall just removed — so the plan
-/// relinks instead. The Islands cask is mirrored only when a cask is
-/// installed and not already on the target channel. Assumes
+/// restore the symlink — so the plan relinks instead. The cask is mirrored
+/// only when one is installed and not already on the target channel. Assumes
 /// `current != target` (the no-op case is handled by the command, not the
 /// plan).
 pub fn switch_plan(
@@ -198,7 +201,18 @@ pub fn switch_plan(
     islands: Option<Channel>,
     target_installed: bool,
 ) -> Vec<BrewCmd> {
+    let mirror_islands = islands.is_some_and(|installed| installed != target);
     let mut cmds = vec![BrewCmd::new(["update"])];
+    // Outgoing cask first — it depends on the outgoing formula.
+    if mirror_islands {
+        if let Some(installed) = islands {
+            cmds.push(BrewCmd::new([
+                "uninstall",
+                "--cask",
+                installed.islands_cask(),
+            ]));
+        }
+    }
     // Formula: uninstall the outgoing channel, then install (or relink) the
     // target.
     cmds.push(BrewCmd::new(["uninstall", current.formula()]));
@@ -207,16 +221,9 @@ pub fn switch_plan(
     } else {
         cmds.push(BrewCmd::new(["install", target.formula()]));
     }
-    // Islands cask mirror — only if installed and on the wrong channel.
-    if let Some(installed) = islands {
-        if installed != target {
-            cmds.push(BrewCmd::new([
-                "uninstall",
-                "--cask",
-                installed.islands_cask(),
-            ]));
-            cmds.push(BrewCmd::new(["install", "--cask", target.islands_cask()]));
-        }
+    // Target cask last — its formula dependency is in place now.
+    if mirror_islands {
+        cmds.push(BrewCmd::new(["install", "--cask", target.islands_cask()]));
     }
     cmds
 }
@@ -225,13 +232,24 @@ pub fn switch_plan(
 /// user re-selects the channel they are already on. `detect_channel` makes
 /// preview win whenever both formulae are installed, so `llmux channel
 /// preview` would otherwise no-op forever while the "both installed" warning
-/// keeps firing on every command. Remove the stray formula, then relink the
-/// target (the uninstall may have owned the shared `bin/llmux` symlink).
-pub fn consolidate_plan(target: Channel) -> Vec<BrewCmd> {
-    vec![
-        BrewCmd::new(["uninstall", target.other().formula()]),
-        BrewCmd::new(["link", "--overwrite", target.formula()]),
-    ]
+/// keeps firing on every command. Same dependency ordering as [`switch_plan`]:
+/// a stray-channel Islands cask blocks `brew uninstall` of the stray formula,
+/// so it is removed first and the target-channel cask installed last. Then
+/// remove the stray formula and relink the target (the uninstall may have
+/// owned the shared `bin/llmux` symlink).
+pub fn consolidate_plan(target: Channel, islands: Option<Channel>) -> Vec<BrewCmd> {
+    let stray = target.other();
+    let mirror_islands = islands == Some(stray);
+    let mut cmds = Vec::new();
+    if mirror_islands {
+        cmds.push(BrewCmd::new(["uninstall", "--cask", stray.islands_cask()]));
+    }
+    cmds.push(BrewCmd::new(["uninstall", stray.formula()]));
+    cmds.push(BrewCmd::new(["link", "--overwrite", target.formula()]));
+    if mirror_islands {
+        cmds.push(BrewCmd::new(["install", "--cask", target.islands_cask()]));
+    }
+    cmds
 }
 
 /// The installed binary a post-update/switch daemon restart must spawn,
@@ -687,17 +705,37 @@ mod tests {
         // Re-selecting the current channel in the both-installed state must
         // remove the OTHER formula and restore the target's symlink.
         assert_eq!(
-            consolidate_plan(Channel::Preview),
+            consolidate_plan(Channel::Preview, None),
             vec![
                 BrewCmd(strs(&["uninstall", "llmux"])),
                 BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
             ]
         );
         assert_eq!(
-            consolidate_plan(Channel::Stable),
+            consolidate_plan(Channel::Stable, None),
             vec![
                 BrewCmd(strs(&["uninstall", "llmux-preview"])),
                 BrewCmd(strs(&["link", "--overwrite", "llmux"])),
+            ]
+        );
+        // A stray-channel Islands cask blocks `brew uninstall <stray formula>`
+        // (live-verified on iq-64: "required by llmux-islands") — it must be
+        // removed first and the target-channel cask installed last.
+        assert_eq!(
+            consolidate_plan(Channel::Preview, Some(Channel::Stable)),
+            vec![
+                BrewCmd(strs(&["uninstall", "--cask", "llmux-islands"])),
+                BrewCmd(strs(&["uninstall", "llmux"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
+                BrewCmd(strs(&["install", "--cask", "llmux-islands-preview"])),
+            ]
+        );
+        // Islands already on the target channel → formula-only consolidation.
+        assert_eq!(
+            consolidate_plan(Channel::Preview, Some(Channel::Preview)),
+            vec![
+                BrewCmd(strs(&["uninstall", "llmux"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
             ]
         );
     }
@@ -734,9 +772,11 @@ mod tests {
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
+                // Outgoing cask FIRST: it depends on the outgoing formula, so
+                // brew would refuse the formula uninstall while it exists.
+                BrewCmd(strs(&["uninstall", "--cask", "llmux-islands-preview"])),
                 BrewCmd(strs(&["uninstall", "llmux-preview"])),
                 BrewCmd(strs(&["install", "llmux"])),
-                BrewCmd(strs(&["uninstall", "--cask", "llmux-islands-preview"])),
                 BrewCmd(strs(&["install", "--cask", "llmux-islands"])),
             ]
         );
