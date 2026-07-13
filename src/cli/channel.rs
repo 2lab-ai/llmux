@@ -53,7 +53,23 @@ fn detect(host: &dyn Host) -> Result<brew::Detected, CliError> {
 async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
     let current = detect(host)?.channel;
     if current == target {
-        println!("already on the {} channel — nothing to do", target.label());
+        // Both installed? "nothing to do" would leave the stray formula (and
+        // its every-command warning) in place forever — consolidate instead.
+        // The serving daemon already runs the target binary; the relink only
+        // restores the symlink, so no restart is needed.
+        let other = target.other();
+        if host.installed_version(other.formula(), false).is_some() {
+            println!(
+                "already on the {} channel — consolidating: removing {}",
+                target.label(),
+                other.formula()
+            );
+            for cmd in brew::consolidate_plan(target) {
+                host.run_brew(&cmd.args())?;
+            }
+        } else {
+            println!("already on the {} channel — nothing to do", target.label());
+        }
         return Ok(());
     }
 
@@ -76,9 +92,13 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
     let report = brew::execute_switch(host, current, target, islands, daemon_running)?;
 
     // Restart the daemon so the freshly installed binary is the one serving.
+    // NEVER current_exe(): this process runs from the keg the switch just
+    // uninstalled — resolve the target formula's binary via brew instead
+    // (and fail here, daemon untouched, if it can't be found).
     if report.daemon_running {
         println!("restarting the daemon on the new binary…");
-        daemon::restart().await?;
+        let exe = brew::installed_binary(host, target)?;
+        daemon::restart(Some(exe)).await?;
     }
 
     let old = report.old_version.as_deref().unwrap_or("(unknown)");

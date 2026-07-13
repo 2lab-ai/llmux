@@ -214,7 +214,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Server(args) => server(args).await,
         Command::Run(args) => run::run(args).await,
         Command::Stop(args) => daemon::stop(args).await,
-        Command::Restart(_) => daemon::restart().await,
+        Command::Restart(_) => daemon::restart(None).await,
         Command::Login(args) => login::run(args).await,
         Command::Import(args) => import::run(args).await,
         Command::Env(args) => env::run(args).await,
