@@ -112,6 +112,12 @@ pub trait Host {
     fn installed_version(&self, name: &str, cask: bool) -> Option<String>;
     /// Run `brew <args>`, streaming stdio to the user. Errs on non-zero exit.
     fn run_brew(&self, args: &[&str]) -> Result<(), CliError>;
+    /// Absolute path to a formula's installed `llmux` binary (via
+    /// `brew --prefix <formula>`), verified to exist on disk. `None` when the
+    /// formula is not installed or brew can't answer. This is the binary a
+    /// post-update/switch daemon restart must spawn — `current_exe()` may be
+    /// the keg brew just deleted.
+    fn formula_bin_path(&self, formula: &str) -> Option<std::path::PathBuf>;
     /// Is the Islands menu-bar app currently running?
     fn islands_running(&self) -> bool;
     /// Best-effort relaunch of the Islands app (quit + reopen).
@@ -179,14 +185,28 @@ pub fn detect_channel(
 /// The binary formulae both link `bin/llmux`, so the OLD one is uninstalled
 /// BEFORE the new one is installed — that removes the symlink and sidesteps a
 /// brew link conflict entirely (the running process keeps its open file).
-/// The Islands cask is mirrored only when a cask is installed and not already
-/// on the target channel. Assumes `current != target` (the no-op case is
-/// handled by the command, not the plan).
-pub fn switch_plan(current: Channel, target: Channel, islands: Option<Channel>) -> Vec<BrewCmd> {
+/// When the target formula is ALREADY installed (the both-installed state
+/// `detect_channel` warns about), `brew install` is a no-op that does NOT
+/// restore the `bin/llmux` symlink the uninstall just removed — so the plan
+/// relinks instead. The Islands cask is mirrored only when a cask is
+/// installed and not already on the target channel. Assumes
+/// `current != target` (the no-op case is handled by the command, not the
+/// plan).
+pub fn switch_plan(
+    current: Channel,
+    target: Channel,
+    islands: Option<Channel>,
+    target_installed: bool,
+) -> Vec<BrewCmd> {
     let mut cmds = vec![BrewCmd::new(["update"])];
-    // Formula: uninstall the outgoing channel, then install the target.
+    // Formula: uninstall the outgoing channel, then install (or relink) the
+    // target.
     cmds.push(BrewCmd::new(["uninstall", current.formula()]));
-    cmds.push(BrewCmd::new(["install", target.formula()]));
+    if target_installed {
+        cmds.push(BrewCmd::new(["link", "--overwrite", target.formula()]));
+    } else {
+        cmds.push(BrewCmd::new(["install", target.formula()]));
+    }
     // Islands cask mirror — only if installed and on the wrong channel.
     if let Some(installed) = islands {
         if installed != target {
@@ -199,6 +219,33 @@ pub fn switch_plan(current: Channel, target: Channel, islands: Option<Channel>) 
         }
     }
     cmds
+}
+
+/// PURE: the `brew` commands to consolidate the both-installed state when the
+/// user re-selects the channel they are already on. `detect_channel` makes
+/// preview win whenever both formulae are installed, so `llmux channel
+/// preview` would otherwise no-op forever while the "both installed" warning
+/// keeps firing on every command. Remove the stray formula, then relink the
+/// target (the uninstall may have owned the shared `bin/llmux` symlink).
+pub fn consolidate_plan(target: Channel) -> Vec<BrewCmd> {
+    vec![
+        BrewCmd::new(["uninstall", target.other().formula()]),
+        BrewCmd::new(["link", "--overwrite", target.formula()]),
+    ]
+}
+
+/// The installed binary a post-update/switch daemon restart must spawn,
+/// resolved through brew (never `current_exe()` — that may be the keg brew
+/// just deleted). Errs with recovery guidance; callers treat the error as
+/// "daemon untouched".
+pub fn installed_binary(host: &dyn Host, channel: Channel) -> Result<std::path::PathBuf, CliError> {
+    host.formula_bin_path(channel.formula()).ok_or_else(|| {
+        CliError::Message(format!(
+            "could not locate the {formula} binary (brew --prefix {formula})\n\
+             The daemon was not restarted — once resolved, run: llmux restart",
+            formula = channel.formula()
+        ))
+    })
 }
 
 /// PURE: the `brew` commands for an in-channel self-update. Always refresh the
@@ -275,7 +322,8 @@ pub fn execute_switch(
     daemon_running: bool,
 ) -> Result<SwitchReport, CliError> {
     let old_version = host.installed_version(current.formula(), false);
-    for cmd in switch_plan(current, target, islands) {
+    let target_installed = host.installed_version(target.formula(), false).is_some();
+    for cmd in switch_plan(current, target, islands, target_installed) {
         host.run_brew(&cmd.args())?;
     }
     let new_version = host.installed_version(target.formula(), false);
@@ -407,6 +455,25 @@ impl Host for RealHost {
         Ok(())
     }
 
+    fn formula_bin_path(&self, formula: &str) -> Option<std::path::PathBuf> {
+        // `brew --prefix <formula>` prints the opt path even for a formula
+        // that is not installed — the exists() check below is what makes the
+        // answer authoritative.
+        let output = std::process::Command::new("brew")
+            .args(["--prefix", formula])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if prefix.is_empty() {
+            return None;
+        }
+        let bin = std::path::PathBuf::from(prefix).join("bin").join("llmux");
+        bin.exists().then_some(bin)
+    }
+
     fn islands_running(&self) -> bool {
         // `pgrep -x` matches the exact process name (the app's PRODUCT_NAME,
         // `LlmuxIslands`, from llmux-islands/project.yml).
@@ -455,6 +522,8 @@ pub(crate) mod testing {
         /// by `on_run` to model an upgrade changing the installed version.
         pub versions: VersionStore,
         pub islands_running: bool,
+        /// `formula` → binary path answered by `formula_bin_path`.
+        pub bin_paths: Vec<(String, std::path::PathBuf)>,
         /// Ordered log: `"brew <args>"` and `"relaunch-islands"`.
         pub calls: RefCell<Vec<String>>,
         /// Optional hook: given the brew args just run, mutate `versions`
@@ -470,6 +539,7 @@ pub(crate) mod testing {
                 binary: None,
                 versions: RefCell::new(Vec::new()),
                 islands_running: false,
+                bin_paths: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 on_run: None,
             }
@@ -511,6 +581,12 @@ pub(crate) mod testing {
                 hook(args, &self.versions);
             }
             Ok(())
+        }
+        fn formula_bin_path(&self, formula: &str) -> Option<std::path::PathBuf> {
+            self.bin_paths
+                .iter()
+                .find(|(name, _)| name == formula)
+                .map(|(_, path)| path.clone())
         }
         fn islands_running(&self) -> bool {
             self.islands_running
@@ -579,7 +655,7 @@ mod tests {
 
     #[test]
     fn switch_plan_uninstalls_old_before_installing_new() {
-        let plan = switch_plan(Channel::Stable, Channel::Preview, None);
+        let plan = switch_plan(Channel::Stable, Channel::Preview, None, false);
         assert_eq!(
             plan,
             vec![
@@ -591,8 +667,69 @@ mod tests {
     }
 
     #[test]
+    fn switch_plan_relinks_when_target_already_installed() {
+        // Both-installed state: `brew install` would be a no-op warning and
+        // leave the target UNLINKED after the uninstall removed the shared
+        // `bin/llmux` symlink — the plan must relink instead.
+        let plan = switch_plan(Channel::Preview, Channel::Stable, None, true);
+        assert_eq!(
+            plan,
+            vec![
+                BrewCmd(strs(&["update"])),
+                BrewCmd(strs(&["uninstall", "llmux-preview"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn consolidate_plan_removes_stray_and_relinks_target() {
+        // Re-selecting the current channel in the both-installed state must
+        // remove the OTHER formula and restore the target's symlink.
+        assert_eq!(
+            consolidate_plan(Channel::Preview),
+            vec![
+                BrewCmd(strs(&["uninstall", "llmux"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
+            ]
+        );
+        assert_eq!(
+            consolidate_plan(Channel::Stable),
+            vec![
+                BrewCmd(strs(&["uninstall", "llmux-preview"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_binary_resolves_or_errors_with_guidance() {
+        let mut host = FakeHost::new();
+        host.bin_paths = vec![(
+            "llmux".into(),
+            std::path::PathBuf::from("/opt/homebrew/opt/llmux/bin/llmux"),
+        )];
+        assert_eq!(
+            installed_binary(&host, Channel::Stable).unwrap(),
+            std::path::PathBuf::from("/opt/homebrew/opt/llmux/bin/llmux")
+        );
+        let err = installed_binary(&host, Channel::Preview).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("llmux-preview"), "names the formula: {msg}");
+        assert!(
+            msg.contains("was not restarted"),
+            "promises the daemon was untouched: {msg}"
+        );
+    }
+
+    #[test]
     fn switch_plan_mirrors_islands_cask_when_installed_off_target() {
-        let plan = switch_plan(Channel::Preview, Channel::Stable, Some(Channel::Preview));
+        let plan = switch_plan(
+            Channel::Preview,
+            Channel::Stable,
+            Some(Channel::Preview),
+            false,
+        );
         assert_eq!(
             plan,
             vec![
@@ -608,7 +745,12 @@ mod tests {
     #[test]
     fn switch_plan_skips_cask_already_on_target_channel() {
         // Islands somehow already on the target channel → no cask churn.
-        let plan = switch_plan(Channel::Stable, Channel::Preview, Some(Channel::Preview));
+        let plan = switch_plan(
+            Channel::Stable,
+            Channel::Preview,
+            Some(Channel::Preview),
+            false,
+        );
         assert!(
             !plan.iter().any(|c| c.0.contains(&"--cask".to_string())),
             "no cask commands: {plan:?}"
@@ -664,8 +806,21 @@ mod tests {
 
     #[test]
     fn execute_switch_runs_plan_in_order_and_reports_versions() {
-        let host = FakeHost::new()
-            .with_versions(&[("llmux", false, "0.1.0"), ("llmux-preview", false, "0.2.0")]);
+        // Only the OUTGOING formula is installed up front; the target's
+        // version appears when the plan's `install` runs (`on_run` hook) —
+        // pre-populating it would model the both-installed state, which
+        // plans a relink instead of an install.
+        let host = FakeHost {
+            on_run: Some(Box::new(|args, versions| {
+                if args == ["install", "llmux-preview"] {
+                    versions
+                        .borrow_mut()
+                        .push((("llmux-preview".into(), false), "0.2.0".into()));
+                }
+            })),
+            ..FakeHost::new()
+        }
+        .with_versions(&[("llmux", false, "0.1.0")]);
         let report = execute_switch(&host, Channel::Stable, Channel::Preview, None, true).unwrap();
         assert_eq!(report.old_version.as_deref(), Some("0.1.0"));
         assert_eq!(report.new_version.as_deref(), Some("0.2.0"));
@@ -676,6 +831,27 @@ mod tests {
                 "brew update",
                 "brew uninstall llmux",
                 "brew install llmux-preview",
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_switch_relinks_instead_of_installing_when_target_present() {
+        // The exact both-installed state from the field: preview + stable
+        // both listed, switching preview → stable. `brew install llmux`
+        // would no-op and leave `bin/llmux` unlinked after the uninstall.
+        let host = FakeHost::new().with_versions(&[
+            ("llmux", false, "0.2.16"),
+            ("llmux-preview", false, "2026.07.10.0734"),
+        ]);
+        let report = execute_switch(&host, Channel::Preview, Channel::Stable, None, true).unwrap();
+        assert_eq!(report.new_version.as_deref(), Some("0.2.16"));
+        assert_eq!(
+            *host.calls.borrow(),
+            vec![
+                "brew update",
+                "brew uninstall llmux-preview",
+                "brew link --overwrite llmux",
             ]
         );
     }

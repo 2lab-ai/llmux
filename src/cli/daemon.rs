@@ -18,8 +18,11 @@ use crate::config::Config;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Max wait for a spawned daemon to answer the status endpoint (and for a
-/// stopped server to release the port).
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// stopped server to release the port). A daemon loading many accounts takes
+/// ~10s to answer; 5s produced false "not ready" failures that tempted users
+/// into a second restart which drained the healthy new daemon. Polling is
+/// every [`POLL_INTERVAL`], so a fast startup is not slowed by the headroom.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Drain budget for a version-gated restart: longer than `stop`'s 5s so an
 /// in-flight request on the old daemon (it may hold several live accounts,
@@ -141,15 +144,25 @@ fn should_restart(running_version: Option<&str>, current_version: &str, force: b
 pub async fn ensure_server_running(
     config: &Config,
     force: bool,
+    server_exe: Option<PathBuf>,
 ) -> Result<EnsureOutcome, CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
     let mut restarting = false;
+    let mut exe: Option<PathBuf> = None;
     match probe_server(port, api_key).await? {
         ServerProbe::Running { status } => {
             let current = crate::build_info::version_string();
             let running = status.get("version").and_then(serde_json::Value::as_str);
             if should_restart(running, &current, force) {
+                // Resolve and verify the spawn target BEFORE draining:
+                // killing the old daemon and then failing to spawn would
+                // leave the user with no server at all (exactly what a
+                // channel switch did when it spawned the keg brew had just
+                // uninstalled). Only spawn-reaching paths resolve — the
+                // reuse path above must keep working from an unlinked
+                // binary against a healthy daemon.
+                exe = Some(resolve_server_exe(server_exe.clone())?);
                 // Drain the old daemon cooperatively before we spawn over it.
                 shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT).await?;
                 restarting = true;
@@ -177,8 +190,14 @@ pub async fn ensure_server_running(
                 .into(),
         ));
     }
+    let exe = match exe {
+        Some(exe) => exe,
+        // Nothing was drained above (fresh start) — resolve just before the
+        // spawn, still failing cleanly with no daemon harmed.
+        None => resolve_server_exe(server_exe)?,
+    };
     let log_path = server_log_path()?;
-    let pid = spawn_server_daemon(&log_path)?;
+    let pid = spawn_server_daemon(&log_path, &exe)?;
     wait_until_ready(port, api_key, READY_TIMEOUT)
         .await
         .map_err(|err| CliError::Message(format!("{err}\nServer log: {}", log_path.display())))?;
@@ -191,12 +210,27 @@ pub async fn ensure_server_running(
 
 /// `llmux restart` — explicitly drain-if-running and (re)spawn the daemon,
 /// then print status. Unlike `run`, this never execs `claude`: it is just the
-/// server-lifecycle half, with `force` so a same-version daemon is replaced too.
-pub async fn restart() -> Result<(), CliError> {
+/// server-lifecycle half, with `force` so a same-version daemon is replaced
+/// too. `server_exe` overrides which binary is spawned (`update`/`channel`
+/// pass the freshly installed one); `None` spawns this CLI's own image.
+pub async fn restart(server_exe: Option<PathBuf>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let port = config.proxy.port;
-    let version = crate::build_info::version_string();
-    match ensure_server_running(&config, true).await? {
+    let outcome = ensure_server_running(&config, true, server_exe).await?;
+    // Report the version the daemon actually runs, not this CLI's: after an
+    // update/switch the spawned binary is newer than the invoking process.
+    // Display-only, so a transient probe miss must never fail a restart that
+    // already succeeded (a "failed" report invites the second restart that
+    // drains the healthy new daemon).
+    let version = match probe_server(port, config.proxy.api_key.as_deref()).await {
+        Ok(ServerProbe::Running { status }) => status
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(crate::build_info::version_string),
+        _ => crate::build_info::version_string(),
+    };
+    match outcome {
         EnsureOutcome::Started { pid } => {
             println!("started llmux server (pid {pid}) on port {port} → {version}");
         }
@@ -211,11 +245,32 @@ pub async fn restart() -> Result<(), CliError> {
     Ok(())
 }
 
-/// Spawn `current_exe() server --no-tui` fully detached: own process group
+/// The executable a (re)spawned daemon runs: the caller's override or this
+/// CLI's own image — verified to exist. `current_exe()` can name a path that
+/// no longer exists (macOS keeps answering after the file is unlinked), e.g.
+/// the brew keg an update/switch just removed; spawning it would ENOENT
+/// *after* the old daemon was already drained.
+fn resolve_server_exe(server_exe: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let exe = match server_exe {
+        Some(exe) => exe,
+        None => std::env::current_exe()?,
+    };
+    if exe.exists() {
+        Ok(exe)
+    } else {
+        Err(CliError::Message(format!(
+            "server binary no longer exists at {} (removed by an update/uninstall?)\n\
+             The running daemon was left untouched. Re-run from the installed \
+             binary: llmux restart",
+            exe.display()
+        )))
+    }
+}
+
+/// Spawn `<exe> server --no-tui` fully detached: own process group
 /// (survives this CLI and its terminal), stdin/stdout null, stderr appended
 /// to the log file (the non-TUI server logs to stderr). Never waited on.
-fn spawn_server_daemon(log_path: &Path) -> Result<u32, CliError> {
-    let exe = std::env::current_exe()?;
+fn spawn_server_daemon(log_path: &Path, exe: &Path) -> Result<u32, CliError> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -477,6 +532,51 @@ mod tests {
             !should_restart(None, cur, false),
             "unparseable version must not churn on its own"
         );
+    }
+
+    /// The spawn target is verified up front: a caller-provided path that no
+    /// longer exists (a brew keg removed by update/switch) must error out
+    /// BEFORE any running daemon would be drained.
+    #[test]
+    fn resolve_server_exe_rejects_missing_override() {
+        let missing = std::env::temp_dir().join("llmux-test-definitely-missing/bin/llmux");
+        let err = resolve_server_exe(Some(missing.clone())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error names the missing path: {msg}"
+        );
+        assert!(
+            msg.contains("left untouched"),
+            "error promises the daemon was not drained: {msg}"
+        );
+    }
+
+    /// Regression: a healthy same-version daemon must be REUSED even when the
+    /// spawn target doesn't exist (e.g. this CLI's keg was unlinked by a brew
+    /// upgrade in another shell). The resolve must only run on spawn-reaching
+    /// paths — never in front of the read-only reuse path.
+    #[tokio::test]
+    async fn already_running_reuses_without_resolving_missing_exe() {
+        let port = spawn_status_mock(llmux_status_body()).await;
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "proxy": { "port": port }
+        }))
+        .unwrap();
+        let missing = std::env::temp_dir().join("llmux-test-missing-reuse/bin/llmux");
+        let outcome = ensure_server_running(&config, false, Some(missing))
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnsureOutcome::AlreadyRunning);
+    }
+
+    #[test]
+    fn resolve_server_exe_accepts_existing_override_and_self() {
+        // An existing override passes through unchanged.
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(resolve_server_exe(Some(exe.clone())).unwrap(), exe);
+        // No override → this binary (the test runner exists by definition).
+        assert_eq!(resolve_server_exe(None).unwrap(), exe);
     }
 
     /// Serve `body` (200) at `/llmux/status` on 127.0.0.1:0.
