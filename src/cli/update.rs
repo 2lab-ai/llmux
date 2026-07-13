@@ -26,7 +26,11 @@ pub async fn run(args: UpdateArgs) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let port = config.proxy.port;
     let daemon_running = matches!(
-        daemon::probe_server(port, config.proxy.api_key.as_deref()).await?,
+        daemon::probe_server(
+            &super::proxy_base_url(port),
+            config.proxy.api_key.as_deref()
+        )
+        .await?,
         daemon::ServerProbe::Running { .. }
     );
 
