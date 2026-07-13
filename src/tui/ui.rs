@@ -44,8 +44,10 @@ const QUOTA_BAR_WIDTH: usize = 11;
 /// ~3× the base keeps the absolute reset stamp readable. The floor stays
 /// `QUOTA_BAR_WIDTH` (no leftover → today's exact layout).
 const GAUGE_BAR_MAX: usize = 32;
-/// Width at/above which the accounts table shows the wide column set
-/// (type, absolute reset times, lifetime req/tok).
+/// Width at/above which the MODELS table shows the wide column set. The
+/// accounts table no longer uses this: it computes whether the wide column
+/// set actually fits (Z 2026-07-13 — the fixed 150 threshold predated the
+/// NAME_COL_MAX cap and caused a 1-col layout flap at 149/150).
 const WIDE_TABLE_AT: u16 = 150;
 /// Max width of the accounts-table name column (Z 2026-07-13: cap at 20 — the
 /// leftover-space allocation made it too wide). Longer names are clipped by the
@@ -790,8 +792,6 @@ fn draw_accounts(
         frame.render_widget(empty, area);
         return;
     }
-    let wide = area.width >= WIDE_TABLE_AT;
-
     let show_fable = view.show_fable_weekly;
     // The account column is a fixed `Length(name_width)` that fits the widest
     // display name up to NAME_COL_MAX (floor = the header word "account").
@@ -811,6 +811,17 @@ fn draw_accounts(
         .unwrap_or(0)
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
+    // The wide column set is used whenever it actually FITS (Z 2026-07-13:
+    // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
+    // hid req/tok and poured the width into fat bars instead). Minimum wide
+    // width = the wide fixed columns + minimum-size gauges + column spacing,
+    // mirroring the bar_width math below. WIDE_TABLE_AT now governs only the
+    // models table.
+    let wide = {
+        let n_gauges = 2 + show_fable as usize;
+        let min_wide = 47 + name_width as usize + n_gauges * QUOTA_CELL_WIDTH + (8 + n_gauges - 1);
+        area.width as usize >= min_wide
+    };
     // Leftover terminal width — everything past the FIXED columns and the 1-col
     // inter-column spacing — is poured into the quota gauge BARS instead of
     // dying as dead space on the right (Z 2026-07-13, follow-up to the
@@ -4257,6 +4268,40 @@ mod tests {
         assert!(
             narrow_row.trim_end().chars().count() <= 120,
             "at 120 cols the same row stays within the terminal width:\n{narrow_row}"
+        );
+    }
+
+    /// Z 2026-07-13 screenshots — a 1-col layout flap at 149/150: the old fixed
+    /// `WIDE_TABLE_AT=150` predated the NAME_COL_MAX cap, so at ~149 cols the
+    /// wide column set (req/tok) was hidden and the width poured into fat bars.
+    /// The wide set must engage as soon as it actually fits.
+    #[test]
+    fn accounts_wide_set_fits_before_150() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+
+        // 149 cols: wide set already fits → header carries req + tok (under the
+        // old 150 threshold this row would be the narrow set, no req/tok).
+        let at_149 = render_rows(&view, &chrome_overlay(Overlay::None), 149, 40);
+        let header_149 = at_149
+            .iter()
+            .find(|line| line.contains("account") && line.contains("5h"))
+            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_149.join("\n")));
+        assert!(
+            header_149.contains("req") && header_149.contains("tok"),
+            "at 149 cols the wide set fits — header shows req + tok:\n{header_149}"
+        );
+
+        // 110 cols: too narrow for the wide set → header has 5h but not req.
+        let at_110 = render_rows(&view, &chrome_overlay(Overlay::None), 110, 40);
+        let header_110 = at_110
+            .iter()
+            .find(|line| line.contains("account") && line.contains("5h"))
+            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_110.join("\n")));
+        assert!(
+            !header_110.contains("req"),
+            "at 110 cols the narrow set still exists — no req column:\n{header_110}"
         );
     }
 
