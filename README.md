@@ -187,8 +187,9 @@ loudly** — it never silently acts on a local daemon.
 ### Transport security
 
 Endpoints are plain `http://` and carry the proxy api_key plus prompt traffic
-in the clear. Use remote mode **only over a trusted, encrypted overlay**
-(Tailscale / WireGuard / a LAN you own). A TLS/HTTPS path is out of scope for
+in the clear. Use remote mode **only over a trusted, encrypted overlay
+(Tailscale / WireGuard) ONLY** — ownership is not encryption, so a LAN alone is
+not enough. A TLS/HTTPS path is out of scope for
 now.
 
 ## Switching models
