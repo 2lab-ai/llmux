@@ -39,6 +39,11 @@ const QUOTA_LABEL_WIDTH: usize = 5;
 /// the bar hosts, the absolute reset stamp `MM/DD HH:MM` (`t` toggle, exactly
 /// 11 chars); the top-2-unit countdown ("10h 15m" + state glyph) also fits.
 const QUOTA_BAR_WIDTH: usize = 11;
+/// Cap on the quota gauge bar width when leftover terminal width is poured into
+/// it (Z 2026-07-13): cap so ultra-wide terminals don't render comedy bars;
+/// ~3× the base keeps the absolute reset stamp readable. The floor stays
+/// `QUOTA_BAR_WIDTH` (no leftover → today's exact layout).
+const GAUGE_BAR_MAX: usize = 32;
 /// Width at/above which the accounts table shows the wide column set
 /// (type, absolute reset times, lifetime req/tok).
 const WIDE_TABLE_AT: u16 = 150;
@@ -787,36 +792,6 @@ fn draw_accounts(
     }
     let wide = area.width >= WIDE_TABLE_AT;
 
-    let selected = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
-            Some(idx.min(ctx.order.len().saturating_sub(1)))
-        }
-        // NewLogin is a provider picker, not an account-row cursor.
-        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
-    };
-    let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
-        let account = &snapshot.accounts[account_idx];
-        let cursor = selected == Some(pos);
-        let row = account_row(account, view, ctx, pos, wide, cursor);
-        if cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
-        } else {
-            row
-        }
-    });
-
-    // "group" (claude/codex — the model group, colored + prominent) leads the
-    // data columns. Issue #70: the default row is the COMPRESSED set — group,
-    // #, account, status, the three gauges, if (+ lifetime req/tok in wide).
-    // The `auth` type, the per-window reset times, and the token expiry/refresh
-    // cluster moved to the selected-account detail pane (`draw_detail`, on MAIN
-    // beside the summary and full-width in the Accounts overlay) — relocated,
-    // not dropped.
-    //
-    // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge, and
-    // ONLY when `show_fable_weekly` is on — off renders the table with no
-    // column, no width taken. Wide gets a full gauge column; narrow gets a
-    // compact marker column (the width budget is tight there).
     let show_fable = view.show_fable_weekly;
     // The account column is a fixed `Length(name_width)` that fits the widest
     // display name up to NAME_COL_MAX (floor = the header word "account").
@@ -836,6 +811,68 @@ fn draw_accounts(
         .unwrap_or(0)
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
+    // Leftover terminal width — everything past the FIXED columns and the 1-col
+    // inter-column spacing — is poured into the quota gauge BARS instead of
+    // dying as dead space on the right (Z 2026-07-13, follow-up to the
+    // NAME_COL_MAX cap: every column is a fixed `Length` now, so without this
+    // the table packs left and wastes the right edge). Each STRETCHY gauge
+    // column grows its bar by an equal share of the leftover; the compact
+    // narrow Fbl marker never stretches. Floor = QUOTA_BAR_WIDTH (leftover 0 →
+    // today's exact layout), ceiling = GAUGE_BAR_MAX.
+    let bar_width = {
+        // `fixed_total` sums the constraint Lengths exactly as built below
+        // (name + the base QUOTA_CELL_WIDTH gauge cells + the conditional
+        // compact-7 Fbl marker) plus the (ncols - 1) inter-column spaces; the
+        // `n_gauges` stretchy gauge columns share whatever width is left.
+        let n_gauges = if wide { 2 + show_fable as usize } else { 2 };
+        let (fixed_total, ncols) = if wide {
+            // marker 2 + group 7 + # 2 + status 20 + if 3 + req 6 + tok 7 = 47.
+            let ncols = 8 + n_gauges;
+            let fixed = 47 + name_width as usize + n_gauges * QUOTA_CELL_WIDTH;
+            (fixed, ncols)
+        } else {
+            // marker 2 + group 7 + # 2 + status 20 + if 3 = 34, + the compact
+            // 7-wide Fbl marker when shown (it does NOT stretch).
+            let ncols = 8 + show_fable as usize;
+            let fixed =
+                34 + name_width as usize + 2 * QUOTA_CELL_WIDTH + if show_fable { 7 } else { 0 };
+            (fixed, ncols)
+        };
+        let leftover = (area.width as usize).saturating_sub(fixed_total + (ncols - 1));
+        (QUOTA_BAR_WIDTH + leftover / n_gauges).min(GAUGE_BAR_MAX)
+    };
+    let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
+
+    let selected = match chrome.mode {
+        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
+            Some(idx.min(ctx.order.len().saturating_sub(1)))
+        }
+        // NewLogin is a provider picker, not an account-row cursor.
+        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
+    };
+    let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
+        let account = &snapshot.accounts[account_idx];
+        let cursor = selected == Some(pos);
+        let row = account_row(account, view, ctx, pos, wide, cursor, bar_width);
+        if cursor {
+            row.style(Style::new().add_modifier(Modifier::REVERSED))
+        } else {
+            row
+        }
+    });
+
+    // "group" (claude/codex — the model group, colored + prominent) leads the
+    // data columns. Issue #70: the default row is the COMPRESSED set — group,
+    // #, account, status, the three gauges, if (+ lifetime req/tok in wide).
+    // The `auth` type, the per-window reset times, and the token expiry/refresh
+    // cluster moved to the selected-account detail pane (`draw_detail`, on MAIN
+    // beside the summary and full-width in the Accounts overlay) — relocated,
+    // not dropped.
+    //
+    // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge, and
+    // ONLY when `show_fable_weekly` is on — off renders the table with no
+    // column, no width taken. Wide gets a full gauge column; narrow gets a
+    // compact marker column (the width budget is tight there).
     let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
         let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
         let mut constraints = vec![
@@ -844,12 +881,12 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(name_width),
             Constraint::Length(20),
-            Constraint::Length(QUOTA_CELL_WIDTH as u16),
-            Constraint::Length(QUOTA_CELL_WIDTH as u16),
+            Constraint::Length(gauge_cell),
+            Constraint::Length(gauge_cell),
         ];
         if show_fable {
             header.push("7d Fbl");
-            constraints.push(Constraint::Length(QUOTA_CELL_WIDTH as u16));
+            constraints.push(Constraint::Length(gauge_cell));
         }
         header.extend(["if", "req", "tok"]);
         constraints.extend([
@@ -866,12 +903,12 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(name_width),
             Constraint::Length(20),
-            Constraint::Length(QUOTA_CELL_WIDTH as u16),
-            Constraint::Length(QUOTA_CELL_WIDTH as u16),
+            Constraint::Length(gauge_cell),
+            Constraint::Length(gauge_cell),
         ];
         if show_fable {
             header.push("7d Fbl");
-            // Compact marker column ("F 100%!" fits in 7): no bar.
+            // Compact marker column ("F 100%!" fits in 7): no bar, no stretch.
             constraints.push(Constraint::Length(7));
         }
         header.extend(["if"]);
@@ -893,6 +930,7 @@ fn account_row<'a>(
     pos: usize,
     wide: bool,
     cursor: bool,
+    bar_width: usize,
 ) -> Row<'a> {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -936,6 +974,7 @@ fn account_row<'a>(
         consecutive_failures,
         ctx.quota_display,
         ctx.reset_absolute,
+        bar_width,
     );
     let seven_gauge = window_gauge_cell(
         &account.seven_day,
@@ -946,6 +985,7 @@ fn account_row<'a>(
         consecutive_failures,
         ctx.quota_display,
         ctx.reset_absolute,
+        bar_width,
     );
     let totals = view.totals_for(&account.id.0);
 
@@ -976,6 +1016,7 @@ fn account_row<'a>(
             ctx.quota_display,
             ctx.reset_absolute,
             select::effective_limits(account, params).2,
+            bar_width,
         ));
     }
     cells.push(Cell::from(in_flight_span(account.in_flight)));
@@ -1161,9 +1202,11 @@ fn quota_bar_text(
 }
 
 /// Assemble one full quota gauge cell line: the countdown bar
-/// ([`quota_bar_line`], `QUOTA_BAR_WIDTH` cols) + a space + the right-aligned
+/// ([`quota_bar_line`], `bar_width` cols) + a space + the right-aligned
 /// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
-/// exactly `QUOTA_CELL_WIDTH` columns total. The label is the percent of the
+/// `bar_width + 1 + QUOTA_LABEL_WIDTH` columns total (`QUOTA_CELL_WIDTH` is the
+/// minimum, when the terminal has no leftover width to pour into the bar). The
+/// label is the percent of the
 /// FILL fraction, so number and bar always say the same thing: in the default
 /// `remaining` mode a fresh account reads a full green bar + `100%` and
 /// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
@@ -1175,12 +1218,13 @@ fn quota_cell_line(
     bar_text: &str,
     bold_chars: usize,
     over: bool,
+    bar_width: usize,
 ) -> Line<'static> {
     let mut label = format::percent(fill);
     if over {
         label.push('!');
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, QUOTA_BAR_WIDTH);
+    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
         format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
@@ -1212,6 +1256,7 @@ fn window_gauge_cell(
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
+    bar_width: usize,
 ) -> Cell<'static> {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
@@ -1232,7 +1277,9 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars) = quota_bar_text(window, now, display, reset_absolute);
-    Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
+    Cell::from(quota_cell_line(
+        fill, color, &text, bold_chars, over, bar_width,
+    ))
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
@@ -1270,6 +1317,7 @@ fn fable_gauge_cell(
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
     fable_max: f64,
+    bar_width: usize,
 ) -> Cell<'static> {
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -1311,7 +1359,9 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
         let (text, bold_chars) = quota_bar_text(&scoped.window, now, display, reset_absolute);
-        Cell::from(quota_cell_line(fill, color, &text, bold_chars, over))
+        Cell::from(quota_cell_line(
+            fill, color, &text, bold_chars, over, bar_width,
+        ))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
         // (`F 7d!`), colored. No bar — the narrow width budget has no room for
@@ -4160,6 +4210,53 @@ mod tests {
             rows.iter().any(|line| line.contains("account")),
             "the accounts table renders its `account` header word:\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// Leftover-width receipt (Z 2026-07-13): with every column a fixed
+    /// `Length`, the leftover terminal width is poured into the quota gauge
+    /// BARS instead of dying as dead space on the right (~col 120) — the
+    /// follow-up to the NAME_COL_MAX cap. A wide (200-col) render reaches near
+    /// the right edge; the same account at 120 cols stays within the terminal.
+    #[test]
+    fn accounts_gauges_absorb_leftover_width() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+
+        // Wide: leftover width flows into the 3 gauge bars, so the row's content
+        // reaches near the 200-col right edge (was dying at ~120 dead-space).
+        let wide = render_rows(&view, &chrome_overlay(Overlay::None), 200, 40);
+        let wide_row = wide
+            .iter()
+            .find(|line| line.contains("me@"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a table row with the account name:\n{}",
+                    wide.join("\n")
+                )
+            });
+        assert!(
+            wide_row.trim_end().chars().count() >= 170,
+            "leftover width goes to the gauge bars — the row reaches near the \
+             200-col right edge instead of dying at ~120:\n{wide_row}"
+        );
+
+        // Narrow: the same row still fits inside a 120-col terminal (the bars
+        // only absorb what is actually left over).
+        let narrow = render_rows(&view, &chrome_overlay(Overlay::None), 120, 40);
+        let narrow_row = narrow
+            .iter()
+            .find(|line| line.contains("me@"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a table row with the account name:\n{}",
+                    narrow.join("\n")
+                )
+            });
+        assert!(
+            narrow_row.trim_end().chars().count() <= 120,
+            "at 120 cols the same row stays within the terminal width:\n{narrow_row}"
         );
     }
 
