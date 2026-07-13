@@ -221,6 +221,33 @@ pub fn switch_plan(
     cmds
 }
 
+/// PURE: the `brew` commands to consolidate the both-installed state when the
+/// user re-selects the channel they are already on. `detect_channel` makes
+/// preview win whenever both formulae are installed, so `llmux channel
+/// preview` would otherwise no-op forever while the "both installed" warning
+/// keeps firing on every command. Remove the stray formula, then relink the
+/// target (the uninstall may have owned the shared `bin/llmux` symlink).
+pub fn consolidate_plan(target: Channel) -> Vec<BrewCmd> {
+    vec![
+        BrewCmd::new(["uninstall", target.other().formula()]),
+        BrewCmd::new(["link", "--overwrite", target.formula()]),
+    ]
+}
+
+/// The installed binary a post-update/switch daemon restart must spawn,
+/// resolved through brew (never `current_exe()` — that may be the keg brew
+/// just deleted). Errs with recovery guidance; callers treat the error as
+/// "daemon untouched".
+pub fn installed_binary(host: &dyn Host, channel: Channel) -> Result<std::path::PathBuf, CliError> {
+    host.formula_bin_path(channel.formula()).ok_or_else(|| {
+        CliError::Message(format!(
+            "could not locate the {formula} binary (brew --prefix {formula})\n\
+             The daemon was not restarted — once resolved, run: llmux restart",
+            formula = channel.formula()
+        ))
+    })
+}
+
 /// PURE: the `brew` commands for an in-channel self-update. Always refresh the
 /// tap, upgrade the channel formula, and upgrade the Islands cask when one is
 /// installed on this channel.
@@ -652,6 +679,46 @@ mod tests {
                 BrewCmd(strs(&["uninstall", "llmux-preview"])),
                 BrewCmd(strs(&["link", "--overwrite", "llmux"])),
             ]
+        );
+    }
+
+    #[test]
+    fn consolidate_plan_removes_stray_and_relinks_target() {
+        // Re-selecting the current channel in the both-installed state must
+        // remove the OTHER formula and restore the target's symlink.
+        assert_eq!(
+            consolidate_plan(Channel::Preview),
+            vec![
+                BrewCmd(strs(&["uninstall", "llmux"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
+            ]
+        );
+        assert_eq!(
+            consolidate_plan(Channel::Stable),
+            vec![
+                BrewCmd(strs(&["uninstall", "llmux-preview"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_binary_resolves_or_errors_with_guidance() {
+        let mut host = FakeHost::new();
+        host.bin_paths = vec![(
+            "llmux".into(),
+            std::path::PathBuf::from("/opt/homebrew/opt/llmux/bin/llmux"),
+        )];
+        assert_eq!(
+            installed_binary(&host, Channel::Stable).unwrap(),
+            std::path::PathBuf::from("/opt/homebrew/opt/llmux/bin/llmux")
+        );
+        let err = installed_binary(&host, Channel::Preview).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("llmux-preview"), "names the formula: {msg}");
+        assert!(
+            msg.contains("was not restarted"),
+            "promises the daemon was untouched: {msg}"
         );
     }
 

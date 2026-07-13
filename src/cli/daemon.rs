@@ -148,17 +148,21 @@ pub async fn ensure_server_running(
 ) -> Result<EnsureOutcome, CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
-    // Resolve and verify the spawn target BEFORE touching a running daemon:
-    // draining the old one and then failing to spawn would leave the user
-    // with no server at all (exactly what a channel switch did when it
-    // spawned the keg brew had just uninstalled).
-    let exe = resolve_server_exe(server_exe)?;
     let mut restarting = false;
+    let mut exe: Option<PathBuf> = None;
     match probe_server(port, api_key).await? {
         ServerProbe::Running { status } => {
             let current = crate::build_info::version_string();
             let running = status.get("version").and_then(serde_json::Value::as_str);
             if should_restart(running, &current, force) {
+                // Resolve and verify the spawn target BEFORE draining:
+                // killing the old daemon and then failing to spawn would
+                // leave the user with no server at all (exactly what a
+                // channel switch did when it spawned the keg brew had just
+                // uninstalled). Only spawn-reaching paths resolve — the
+                // reuse path above must keep working from an unlinked
+                // binary against a healthy daemon.
+                exe = Some(resolve_server_exe(server_exe.clone())?);
                 // Drain the old daemon cooperatively before we spawn over it.
                 shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT).await?;
                 restarting = true;
@@ -186,6 +190,12 @@ pub async fn ensure_server_running(
                 .into(),
         ));
     }
+    let exe = match exe {
+        Some(exe) => exe,
+        // Nothing was drained above (fresh start) — resolve just before the
+        // spawn, still failing cleanly with no daemon harmed.
+        None => resolve_server_exe(server_exe)?,
+    };
     let log_path = server_log_path()?;
     let pid = spawn_server_daemon(&log_path, &exe)?;
     wait_until_ready(port, api_key, READY_TIMEOUT)
@@ -209,8 +219,11 @@ pub async fn restart(server_exe: Option<PathBuf>) -> Result<(), CliError> {
     let outcome = ensure_server_running(&config, true, server_exe).await?;
     // Report the version the daemon actually runs, not this CLI's: after an
     // update/switch the spawned binary is newer than the invoking process.
-    let version = match probe_server(port, config.proxy.api_key.as_deref()).await? {
-        ServerProbe::Running { status } => status
+    // Display-only, so a transient probe miss must never fail a restart that
+    // already succeeded (a "failed" report invites the second restart that
+    // drains the healthy new daemon).
+    let version = match probe_server(port, config.proxy.api_key.as_deref()).await {
+        Ok(ServerProbe::Running { status }) => status
             .get("version")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
@@ -537,6 +550,24 @@ mod tests {
             msg.contains("left untouched"),
             "error promises the daemon was not drained: {msg}"
         );
+    }
+
+    /// Regression: a healthy same-version daemon must be REUSED even when the
+    /// spawn target doesn't exist (e.g. this CLI's keg was unlinked by a brew
+    /// upgrade in another shell). The resolve must only run on spawn-reaching
+    /// paths — never in front of the read-only reuse path.
+    #[tokio::test]
+    async fn already_running_reuses_without_resolving_missing_exe() {
+        let port = spawn_status_mock(llmux_status_body()).await;
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "proxy": { "port": port }
+        }))
+        .unwrap();
+        let missing = std::env::temp_dir().join("llmux-test-missing-reuse/bin/llmux");
+        let outcome = ensure_server_running(&config, false, Some(missing))
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnsureOutcome::AlreadyRunning);
     }
 
     #[test]
