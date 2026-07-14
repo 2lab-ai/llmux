@@ -1,0 +1,664 @@
+//! glance-triage: the render-only triage layer over already-in-memory state.
+//!
+//! Three pure pieces, all consumed by `ui.rs`:
+//!
+//! 1. [`health_verdict`] — the always-present header verdict: an
+//!    `[OK]/[WARN]/[FAIL]` tag plus ONE named dominant condition and a `+N`
+//!    overflow marker, computed from a rolling 5-minute window
+//!    ([`HealthCounts`]), poller staleness, and account states. Dominance:
+//!    poller-stale / auth-broken, then 429·5xx storm, then exhausted, then
+//!    healthy.
+//! 2. [`intervention_order`] — the accounts table sorted by what the operator
+//!    should act on, NOT registration/scheduler-preference order. in-flight is
+//!    deliberately NOT a sort key (it toggles per request and would destroy
+//!    the row-position memory a glance table exists for).
+//! 3. [`collapse_completed`] — folds runs of at least [`FOLD_MIN`] CONSECUTIVE
+//!    completed-2xx entries with an identical (method, path, account, group,
+//!    model) key into one counted row. Non-2xx, in-flight, notes and control
+//!    events never fold; non-consecutive entries are never grouped (that would
+//!    reorder history).
+//!
+//! No persistence, no config surface: thresholds are the named constants below.
+
+use std::cmp::Reverse;
+use std::time::{Duration, SystemTime};
+
+use crate::scheduler::select::{self, IneligibleReason, SelectParams};
+use crate::scheduler::{AccountSnapshot, PoolSnapshot};
+
+use super::activity::{Completed, CompletedBody};
+use super::view::DashboardView;
+
+/// A storm needs a SUSTAINED count in the 5m window — a single 429 is normal
+/// backoff and must never flip the verdict (MUST-FIX 3).
+pub(crate) const STORM_MIN_EVENTS: u64 = 10;
+/// Generic error storm: at least this many errors AND at least half of the
+/// window's requests failing.
+pub(crate) const ERROR_STORM_MIN: u64 = 10;
+/// An oauth poller whose last success is older than this is stale — the proxy
+/// is flying blind on that account's quota.
+pub(crate) const POLLER_STALE_AFTER: Duration = Duration::from_secs(300);
+/// Or: this many consecutive poll failures, whichever trips first.
+pub(crate) const POLLER_FAILS_MIN: u32 = 3;
+/// Fold runs only from this length: 1–2 repeats read fine as-is.
+pub(crate) const FOLD_MIN: usize = 3;
+
+// ---------------------------------------------------------------------------
+// Header verdict
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// One named condition, worst-first. `account` carries the RAW id — the render
+/// site masks it (`email_anonymous`) exactly like every other surface.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Condition {
+    pub level: VerdictLevel,
+    /// Condition name + numbers, without the account id ("429 STORM ×186/5m").
+    pub text: String,
+    /// Raw account id to append (masked at render), when account-scoped.
+    pub account: Option<String>,
+}
+
+/// The header verdict: the single worst live condition plus how many more are
+/// active. `conditions` is the full dominance-ordered list (first = headline).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Verdict {
+    pub conditions: Vec<Condition>,
+}
+
+impl Verdict {
+    pub(crate) fn level(&self) -> VerdictLevel {
+        self.conditions
+            .first()
+            .map_or(VerdictLevel::Ok, |c| c.level)
+    }
+
+    pub(crate) fn headline(&self) -> Option<&Condition> {
+        self.conditions.first()
+    }
+
+    /// Additional active conditions beyond the headline (the `+N` marker).
+    pub(crate) fn more(&self) -> usize {
+        self.conditions.len().saturating_sub(1)
+    }
+}
+
+/// Compute the dominance-ordered condition list for one frame. Pure: reads
+/// only the view + `now`, so a deterministic clock tests every threshold.
+pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
+    let mut conditions: Vec<Condition> = Vec::new();
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let headers_only = select::headers_only_mode(snapshot, params, None, now);
+
+    // 1. Poller stale / auth broken — the proxy is BLIND, worse than a storm.
+    let mut stale_poll: Option<(String, Duration)> = None;
+    for account in &snapshot.accounts {
+        if let Some(health) = view.poll_health(&account.id.0) {
+            let aged = health
+                .last_ok
+                .and_then(|ok| now.duration_since(ok).ok())
+                .filter(|&age| age > POLLER_STALE_AFTER);
+            if health.consecutive_failures >= POLLER_FAILS_MIN || aged.is_some() {
+                let age = aged.unwrap_or_default();
+                // Keep the WORST (oldest) stale account as the representative.
+                if stale_poll.as_ref().is_none_or(|(_, worst)| age > *worst) {
+                    stale_poll = Some((account.id.0.clone(), age));
+                }
+            }
+        }
+    }
+    if let Some((account, age)) = stale_poll {
+        let since = if age > Duration::ZERO {
+            format!(" last ok {}", select::compact_duration(age))
+        } else {
+            String::new()
+        };
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: format!("POLLER STALE{since}"),
+            account: Some(account),
+        });
+    }
+    let broken: Vec<&AccountSnapshot> = snapshot.accounts.iter().filter(|a| !a.healthy).collect();
+    if let Some(first) = broken.first() {
+        let extra = broken.len() - 1;
+        let suffix = if extra > 0 {
+            format!(" +{extra}")
+        } else {
+            String::new()
+        };
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: format!("AUTH BROKEN{suffix}"),
+            account: Some(first.id.0.clone()),
+        });
+    }
+
+    // 2. Storms over the rolling 5m window (dedicated deque, never the
+    //    capacity-bounded ring — MUST-FIX 3).
+    let health = view.health;
+    if health.s429 >= STORM_MIN_EVENTS {
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: format!("429 STORM ×{}/5m", health.s429),
+            account: None,
+        });
+    } else if health.s5xx >= STORM_MIN_EVENTS {
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: format!("5xx STORM ×{}/5m", health.s5xx),
+            account: None,
+        });
+    } else if health.errors >= ERROR_STORM_MIN && health.errors * 2 >= health.requests {
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: format!("ERROR STORM ×{}/5m", health.errors),
+            account: None,
+        });
+    }
+
+    // 3. Exhausted / quota-critical accounts (worst utilization first).
+    let mut exhausted: Vec<(&AccountSnapshot, &'static str, f64)> = snapshot
+        .accounts
+        .iter()
+        .filter_map(|account| {
+            let gate = select::eligibility(account, params, now, headers_only);
+            let window = match gate {
+                Some(IneligibleReason::FiveHourOverThreshold) => {
+                    ("5h", account.five_hour.as_ref().map(|w| w.utilization))
+                }
+                Some(IneligibleReason::SevenDayOverThreshold) => {
+                    ("7d", account.seven_day.as_ref().map(|w| w.utilization))
+                }
+                Some(IneligibleReason::FableWeeklyExhausted) => ("fable", None),
+                _ => return None,
+            };
+            Some((account, window.0, window.1.unwrap_or(1.0)))
+        })
+        .collect();
+    exhausted.sort_by(|a, b| b.2.total_cmp(&a.2));
+    if let Some(&(account, window, util)) = exhausted.first() {
+        let extra = exhausted.len() - 1;
+        let suffix = if extra > 0 {
+            format!(" +{extra}")
+        } else {
+            String::new()
+        };
+        conditions.push(Condition {
+            level: VerdictLevel::Warn,
+            text: format!("QUOTA CRITICAL {window} {:.0}%{suffix}", util * 100.0),
+            account: Some(account.id.0.clone()),
+        });
+    }
+
+    Verdict { conditions }
+}
+
+// ---------------------------------------------------------------------------
+// Accounts intervention order
+// ---------------------------------------------------------------------------
+
+/// Urgency tier of one account row: lower renders higher. in-flight is NOT a
+/// key anywhere here (MUST-FIX 4 — row jitter would destroy position memory).
+fn tier(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> u8 {
+    match gate {
+        Some(
+            IneligibleReason::FiveHourOverThreshold
+            | IneligibleReason::SevenDayOverThreshold
+            | IneligibleReason::FableWeeklyExhausted,
+        ) => 0,
+        Some(IneligibleReason::AuthUnhealthy) => 1,
+        // Cooling down still has KNOWN usage — it sorts with the usage tier.
+        Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => 2,
+        None if account.five_hour.is_some() => 2,
+        // Eligible but no 5h sample yet: "ready" — below the known rows.
+        None => 3,
+        Some(IneligibleReason::Paused) => 4,
+        // cold / unknown last — distinctly BELOW paused so a stale account
+        // can't shadow an operator decision. (#33 keeps the label distinct.)
+        Some(IneligibleReason::UsageStale) => 5,
+    }
+}
+
+/// Whether the row deserves the leading `!` urgency marker (tiers 0–1).
+pub(crate) fn urgent(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> bool {
+    tier(account, gate) <= 1
+}
+
+/// Indices into `snapshot.accounts`, exhausted → auth-broken → known 5h desc
+/// (cooldowns included) → ready → paused → cold/unknown; stable (config
+/// index) within a tier so rows never swap without a state change.
+pub(crate) fn intervention_order(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+) -> Vec<usize> {
+    let headers_only = select::headers_only_mode(snapshot, params, None, now);
+    let mut order: Vec<usize> = (0..snapshot.accounts.len()).collect();
+    order.sort_by_key(|&idx| {
+        let account = &snapshot.accounts[idx];
+        let gate = select::eligibility(account, params, now, headers_only);
+        let tier = tier(account, gate);
+        // Within the usage tier, higher 5h utilization = closer to the top
+        // (permille avoids float keys). Other tiers keep config order.
+        let usage_rank = if tier == 2 {
+            let permille = account
+                .five_hour
+                .as_ref()
+                .map(|w| (w.utilization.clamp(0.0, 1.0) * 1000.0) as u32)
+                .unwrap_or(0);
+            Reverse(permille)
+        } else {
+            Reverse(0)
+        };
+        (tier, usage_rank, idx)
+    });
+    order
+}
+
+// ---------------------------------------------------------------------------
+// Activity run folding
+// ---------------------------------------------------------------------------
+
+/// One renderable activity row after folding: either a single entry or a run
+/// of ≥[`FOLD_MIN`] consecutive same-key completed-2xx entries. Indices point
+/// into the newest-first `completed` slice; a run's `start` is its NEWEST
+/// entry (the run key / click target).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivityRow {
+    Single(usize),
+    Run { start: usize, len: usize },
+}
+
+/// The fold identity — (method, path, account, group, model): consecutive
+/// completed entries with 2xx status and this exact key collapse into one
+/// counted row.
+type FoldKey<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+/// `None` = never foldable (notes, non-2xx, anything without a full key).
+fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
+    match &entry.body {
+        CompletedBody::Request {
+            method,
+            path,
+            account,
+            status,
+            group,
+            model,
+            ..
+        } if (200..300).contains(status) => Some((
+            method.as_str(),
+            path.as_str(),
+            account.as_deref(),
+            group.as_deref(),
+            model.as_deref(),
+        )),
+        _ => None,
+    }
+}
+
+/// Fold the newest-first completed list into render rows. Order-preserving:
+/// only CONSECUTIVE entries group, so history is never rearranged.
+pub(crate) fn collapse_completed(completed: &[Completed]) -> Vec<ActivityRow> {
+    let mut rows: Vec<ActivityRow> = Vec::with_capacity(completed.len());
+    let mut i = 0;
+    while i < completed.len() {
+        let Some(key) = fold_key(&completed[i]) else {
+            rows.push(ActivityRow::Single(i));
+            i += 1;
+            continue;
+        };
+        let mut len = 1;
+        while i + len < completed.len() && fold_key(&completed[i + len]) == Some(key) {
+            len += 1;
+        }
+        if len >= FOLD_MIN {
+            rows.push(ActivityRow::Run { start: i, len });
+        } else {
+            for offset in 0..len {
+                rows.push(ActivityRow::Single(i + offset));
+            }
+        }
+        i += len;
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AccountLimits;
+    use crate::routing::BackendGroup;
+    use crate::scheduler::window::{QuotaWindow, WindowSource};
+    use crate::scheduler::AccountId;
+    use crate::tui::activity::HealthCounts;
+    use std::collections::BTreeMap;
+    use std::time::UNIX_EPOCH;
+
+    fn now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    fn window(utilization: f64) -> QuotaWindow {
+        QuotaWindow {
+            utilization,
+            resets_at: now() + Duration::from_secs(3600),
+            fetched_at: now(),
+            source: WindowSource::Headers,
+        }
+    }
+
+    fn account(id: &str) -> AccountSnapshot {
+        AccountSnapshot {
+            id: AccountId(id.to_string()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(window(0.10)),
+            seven_day: Some(window(0.10)),
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: AccountLimits::default(),
+        }
+    }
+
+    fn pool(accounts: Vec<AccountSnapshot>) -> PoolSnapshot {
+        PoolSnapshot {
+            accounts,
+            current: BTreeMap::new(),
+            fable_current: BTreeMap::new(),
+        }
+    }
+
+    fn params() -> SelectParams {
+        SelectParams {
+            five_hour_max: 0.90,
+            seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
+            usage_max_age: Duration::from_secs(600),
+        }
+    }
+
+    fn ordered_ids(snapshot: &PoolSnapshot) -> Vec<String> {
+        intervention_order(snapshot, &params(), now())
+            .into_iter()
+            .map(|i| snapshot.accounts[i].id.0.clone())
+            .collect()
+    }
+
+    // ---- intervention order ----
+
+    #[test]
+    fn exhausted_pins_top_then_auth_then_usage_desc() {
+        let mut low = account("low");
+        low.five_hour = Some(window(0.08));
+        let mut high = account("high");
+        high.five_hour = Some(window(0.30));
+        let mut broken = account("broken");
+        broken.healthy = false;
+        let mut exhausted = account("exhausted");
+        exhausted.five_hour = Some(window(0.97));
+        // Registration order buries the urgent rows at the END on purpose.
+        let snapshot = pool(vec![low, high, broken, exhausted]);
+        assert_eq!(
+            ordered_ids(&snapshot),
+            vec!["exhausted", "broken", "high", "low"]
+        );
+    }
+
+    #[test]
+    fn in_flight_is_not_a_sort_key() {
+        let mut idle_high = account("idle-high");
+        idle_high.five_hour = Some(window(0.50));
+        let mut busy_low = account("busy-low");
+        busy_low.five_hour = Some(window(0.10));
+        busy_low.in_flight = 3;
+        let snapshot = pool(vec![idle_high, busy_low]);
+        // Higher usage outranks in-flight activity; toggling in_flight can
+        // never reorder rows.
+        assert_eq!(ordered_ids(&snapshot), vec!["idle-high", "busy-low"]);
+    }
+
+    #[test]
+    fn ties_are_stable_by_config_index() {
+        let a = account("first");
+        let b = account("second");
+        let snapshot = pool(vec![a, b]);
+        assert_eq!(ordered_ids(&snapshot), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn cold_unknown_sorts_below_ready_and_paused() {
+        let mut cold = account("cold");
+        cold.five_hour = None;
+        cold.seven_day = None;
+        cold.credential_kind = "apikey"; // apikey with no data = ready tier
+        let ready = {
+            let mut a = account("ready");
+            a.five_hour = None;
+            a.seven_day = None;
+            a.credential_kind = "apikey";
+            a
+        };
+        let mut paused = account("paused");
+        paused.paused = true;
+        let known = account("known");
+        let snapshot = pool(vec![cold, ready, paused, known]);
+        let ids = ordered_ids(&snapshot);
+        assert_eq!(ids[0], "known");
+        let pos = |id: &str| ids.iter().position(|x| x == id).unwrap();
+        assert!(pos("paused") > pos("ready"));
+    }
+
+    // ---- verdict ----
+
+    fn view_with(snapshot: PoolSnapshot, health: HealthCounts) -> DashboardView {
+        DashboardView {
+            version: "llmux test".into(),
+            pid: 1,
+            uptime: Duration::from_secs(1),
+            port: 3456,
+            upstream: None,
+            config_path: None,
+            select_params: params(),
+            refresh_ahead: Duration::from_secs(0),
+            evaluate_tick: Duration::from_secs(60),
+            snapshot,
+            last_switch: None,
+            poll_health: std::collections::HashMap::new(),
+            session_totals: std::collections::HashMap::new(),
+            global_totals: Default::default(),
+            rpm_5m: 0.0,
+            in_flight: Vec::new(),
+            completed: Vec::new(),
+            logs: Vec::new(),
+            model_usage: Vec::new(),
+            client_usage: Vec::new(),
+            windowed: Vec::new(),
+            codex: Default::default(),
+            email_anonymous: false,
+            show_fable_weekly: false,
+            domain_abbrev: BTreeMap::new(),
+            quota_display: Default::default(),
+            data_quality: Default::default(),
+            events: Vec::new(),
+            health,
+        }
+    }
+
+    #[test]
+    fn healthy_is_quiet_and_single_429_never_storms() {
+        let health = HealthCounts {
+            requests: 40,
+            errors: 1,
+            s429: 1,
+            ..Default::default()
+        };
+        let verdict = health_verdict(&view_with(pool(vec![account("a")]), health), now());
+        assert_eq!(verdict.level(), VerdictLevel::Ok);
+        assert!(verdict.conditions.is_empty());
+    }
+
+    #[test]
+    fn sustained_429s_trip_the_storm_threshold() {
+        let health = HealthCounts {
+            requests: 40,
+            errors: STORM_MIN_EVENTS,
+            s429: STORM_MIN_EVENTS,
+            ..Default::default()
+        };
+        let verdict = health_verdict(&view_with(pool(vec![account("a")]), health), now());
+        assert_eq!(verdict.level(), VerdictLevel::Fail);
+        let head = verdict.headline().expect("condition");
+        assert!(head.text.contains("429 STORM"), "got {}", head.text);
+    }
+
+    #[test]
+    fn auth_broken_dominates_a_storm() {
+        let mut broken = account("broken");
+        broken.healthy = false;
+        let health = HealthCounts {
+            requests: 100,
+            errors: 50,
+            s429: 50,
+            ..Default::default()
+        };
+        let verdict = health_verdict(&view_with(pool(vec![broken]), health), now());
+        let head = verdict.headline().expect("condition");
+        assert!(head.text.contains("AUTH BROKEN"), "got {}", head.text);
+        assert_eq!(verdict.more(), 1, "storm stays visible as +1");
+    }
+
+    #[test]
+    fn exhausted_account_is_a_warning_not_a_failure() {
+        let mut exhausted = account("exhausted");
+        exhausted.five_hour = Some(window(0.97));
+        let verdict = health_verdict(
+            &view_with(pool(vec![exhausted]), HealthCounts::default()),
+            now(),
+        );
+        assert_eq!(verdict.level(), VerdictLevel::Warn);
+        let head = verdict.headline().expect("condition");
+        assert!(head.text.contains("QUOTA CRITICAL"), "got {}", head.text);
+        assert_eq!(head.account.as_deref(), Some("exhausted"));
+    }
+
+    // ---- activity folding ----
+
+    fn request(status: u16, path: &str, at_secs: u64) -> Completed {
+        Completed {
+            at: UNIX_EPOCH + Duration::from_secs(at_secs),
+            body: CompletedBody::Request {
+                method: "POST".into(),
+                path: path.into(),
+                account: Some("a@x".into()),
+                status,
+                duration: Duration::from_secs(1),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("opus".into()),
+                effort: None,
+                fast: false,
+            },
+        }
+    }
+
+    fn note(at_secs: u64) -> Completed {
+        Completed {
+            at: UNIX_EPOCH + Duration::from_secs(at_secs),
+            body: CompletedBody::Note {
+                text: "switch a → b".into(),
+                error: false,
+            },
+        }
+    }
+
+    #[test]
+    fn consecutive_2xx_runs_fold_from_fold_min() {
+        let entries = vec![
+            request(200, "/v1/messages", 30),
+            request(200, "/v1/messages", 20),
+            request(200, "/v1/messages", 10),
+        ];
+        assert_eq!(
+            collapse_completed(&entries),
+            vec![ActivityRow::Run { start: 0, len: 3 }]
+        );
+    }
+
+    #[test]
+    fn short_runs_stay_single() {
+        let entries = vec![
+            request(200, "/v1/messages", 20),
+            request(200, "/v1/messages", 10),
+        ];
+        assert_eq!(
+            collapse_completed(&entries),
+            vec![ActivityRow::Single(0), ActivityRow::Single(1)]
+        );
+    }
+
+    #[test]
+    fn non_2xx_and_notes_never_fold_and_break_runs() {
+        let entries = vec![
+            request(200, "/v1/messages", 60),
+            request(200, "/v1/messages", 50),
+            request(429, "/v1/messages", 40),
+            request(429, "/v1/messages", 35),
+            request(429, "/v1/messages", 33),
+            request(200, "/v1/messages", 30),
+            note(25),
+            request(200, "/v1/messages", 20),
+            request(200, "/v1/messages", 15),
+            request(200, "/v1/messages", 10),
+        ];
+        let rows = collapse_completed(&entries);
+        // 2×200 stay single; 3×429 stay single (errors NEVER fold); one 200
+        // then a note then a foldable 3-run.
+        assert_eq!(
+            rows,
+            vec![
+                ActivityRow::Single(0),
+                ActivityRow::Single(1),
+                ActivityRow::Single(2),
+                ActivityRow::Single(3),
+                ActivityRow::Single(4),
+                ActivityRow::Single(5),
+                ActivityRow::Single(6),
+                ActivityRow::Run { start: 7, len: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn key_change_breaks_a_run() {
+        let entries = vec![
+            request(200, "/v1/messages", 40),
+            request(200, "/v1/messages", 30),
+            request(200, "/other", 20),
+            request(200, "/v1/messages", 10),
+        ];
+        let rows = collapse_completed(&entries);
+        assert!(rows.iter().all(|r| matches!(r, ActivityRow::Single(_))));
+    }
+}

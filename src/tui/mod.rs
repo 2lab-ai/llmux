@@ -32,6 +32,7 @@ mod event;
 // `llmux status` output and the dashboard agree on the display.
 pub(crate) mod format;
 pub(crate) mod logs;
+mod triage;
 mod ui;
 mod view;
 
@@ -2504,6 +2505,7 @@ mod tests {
         use crate::scheduler::PoolSnapshot;
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            health: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,
