@@ -52,11 +52,11 @@ RUN /usr/lib/qt6/bin/qmllint \
     qml/Main.qml qml/Usage.qml qml/Statistics.qml qml/Menu.qml
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/llmux-islands-linux/target \
-    timeout 20s cargo run --locked -- --smoke-test
+    timeout 20s ./target/debug/llmux-islands-linux --smoke-test
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/llmux-islands-linux/target \
     snapshot_status=0 \
-    && snapshot_log="$(timeout 40s cargo run --locked -- --snapshot-dir /tmp/llmux-islands-snapshots 2>&1)" \
+    && snapshot_log="$(timeout 40s ./target/debug/llmux-islands-linux --snapshot-dir /tmp/llmux-islands-snapshots 2>&1)" \
        || snapshot_status="$?" \
     && printf 'snapshot process exit: %s\n%s\n' "$snapshot_status" "$snapshot_log" \
     && test "$snapshot_status" -eq 0 \
