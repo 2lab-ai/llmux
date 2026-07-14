@@ -54,6 +54,9 @@ pub mod qobject {
         #[qinvokable]
         fn exit_headless(self: Pin<&mut Self>, exit_code: i32);
 
+        #[qinvokable]
+        fn fail_headless(self: Pin<&mut Self>, message: &QString);
+
         #[qsignal]
         fn platform_command(self: Pin<&mut Self>, command: &QString, payload: &QString);
     }
@@ -209,6 +212,13 @@ impl qobject::IslandsController {
     pub fn exit_headless(self: Pin<&mut Self>, exit_code: i32) {
         if *self.smoke_mode() || *self.snapshot_mode() {
             snapshot::exit_immediately(exit_code);
+        }
+    }
+
+    pub fn fail_headless(self: Pin<&mut Self>, message: &QString) {
+        if *self.smoke_mode() || *self.snapshot_mode() {
+            eprintln!("snapshot failure: {}", message.to_string());
+            snapshot::exit_immediately(2);
         }
     }
 

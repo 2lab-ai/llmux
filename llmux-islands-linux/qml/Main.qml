@@ -350,7 +350,16 @@ Kirigami.ApplicationWindow {
         console.error("Snapshot failure: " + message)
         dispatchError = message
         quitRequested = true
-        controller.exitHeadless(2)
+        controller.failHeadless(message)
+    }
+
+    function retrySnapshot(message) {
+        snapshotCaptureAttempts += 1
+        if (snapshotCaptureAttempts >= 50) {
+            failSnapshot(message)
+            return
+        }
+        snapshotCaptureTimer.restart()
     }
 
     function snapshotSurfaceCount(name) {
@@ -366,12 +375,7 @@ Kirigami.ApplicationWindow {
             return
         if (!semanticOpen || surfaceLoader.status !== Loader.Ready
                 || width !== 960 || height !== preferredWindowContentHeight) {
-            snapshotCaptureAttempts += 1
-            if (snapshotCaptureAttempts >= 50) {
-                failSnapshot(qsTr("Snapshot surface did not become ready"))
-                return
-            }
-            snapshotCaptureTimer.restart()
+            retrySnapshot(qsTr("Snapshot surface did not become ready"))
             return
         }
 
@@ -379,20 +383,20 @@ Kirigami.ApplicationWindow {
         var surface = snapshotSurfaces[snapshotIndex]
         if (surface === "usage" && snapshotSurfaceCount("renderedGaugeCount") < 1) {
             snapshotCaptureBusy = false
-            failSnapshot(qsTr("Usage snapshot rendered no quota gauges"))
+            retrySnapshot(qsTr("Usage snapshot rendered no quota gauges"))
             return
         }
         if (surface === "statistics"
                 && (snapshotSurfaceCount("renderedHeatmapCellCount") < 1
                     || snapshotSurfaceCount("renderedServingAccountCount") < 1)) {
             snapshotCaptureBusy = false
-            failSnapshot(qsTr("Statistics snapshot rendered incomplete nested data"))
+            retrySnapshot(qsTr("Statistics snapshot rendered incomplete nested data"))
             return
         }
         if (surface === "receipts"
                 && snapshotSurfaceCount("renderedVerificationReceiptCount") < 1) {
             snapshotCaptureBusy = false
-            failSnapshot(qsTr("Receipt snapshot rendered no verification receipt"))
+            retrySnapshot(qsTr("Receipt snapshot rendered no verification receipt"))
             return
         }
         var outputPath = controller.snapshotDir + "/" + surface + ".png"

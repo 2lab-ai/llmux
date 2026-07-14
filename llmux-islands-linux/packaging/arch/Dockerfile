@@ -58,7 +58,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     snapshot_status=0 \
     && snapshot_log="$(timeout 40s cargo run --locked -- --snapshot-dir /tmp/llmux-islands-snapshots 2>&1)" \
        || snapshot_status="$?" \
-    && printf '%s\n' "$snapshot_log" \
+    && printf 'snapshot process exit: %s\n%s\n' "$snapshot_status" "$snapshot_log" \
     && test "$snapshot_status" -eq 0 \
     && if printf '%s\n' "$snapshot_log" | grep -Fq 'QML warning:'; then exit 1; fi \
     && hashes='' \
