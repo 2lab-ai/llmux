@@ -247,13 +247,15 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "configure_headless_environment",
         "ControllerModel::from_fixture(options, SNAPSHOT_NOW_MS)",
         "let headless_run = smoke_mode || snapshot_request.is_some()",
-        "if headless_run || exit_code != 0",
+        "snapshot::exit_immediately(exit_code)",
     ] {
         assert!(main.contains(marker), "snapshot CLI must contain {marker}");
     }
     for marker in [
         "qproperty(bool, snapshot_mode)",
         "qproperty(QString, snapshot_dir)",
+        "fn exit_headless(self: Pin<&mut Self>, exit_code: i32)",
+        "snapshot::exit_immediately(exit_code)",
         "LocalSettings::default()",
         "snapshot-fixture",
     ] {
@@ -266,7 +268,8 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "snapshotSurfaces: [\"usage\", \"statistics\", \"receipts\", \"menu\"]",
         "captureTarget.grabToImage",
         "result.saveToFile(outputPath)",
-        "Qt.exit(2)",
+        "controller.exitHeadless(2)",
+        "controller.exitHeadless(0)",
         "if (!controller.snapshotMode && !controller.smokeMode)",
         "running: !controller.smokeMode && !controller.snapshotMode",
         "Snapshot run timed out",

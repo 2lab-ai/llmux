@@ -51,6 +51,9 @@ pub mod qobject {
         #[qinvokable]
         fn dispatch(self: Pin<&mut Self>, action: &QString, payload_json: &QString);
 
+        #[qinvokable]
+        fn exit_headless(self: Pin<&mut Self>, exit_code: i32);
+
         #[qsignal]
         fn platform_command(self: Pin<&mut Self>, command: &QString, payload: &QString);
     }
@@ -203,6 +206,12 @@ impl Default for IslandsControllerRust {
 }
 
 impl qobject::IslandsController {
+    pub fn exit_headless(self: Pin<&mut Self>, exit_code: i32) {
+        if *self.smoke_mode() || *self.snapshot_mode() {
+            snapshot::exit_immediately(exit_code);
+        }
+    }
+
     pub fn dispatch(mut self: Pin<&mut Self>, action: &QString, payload_json: &QString) {
         let action = action.to_string();
         let payload_json = payload_json.to_string();

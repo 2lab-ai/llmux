@@ -151,6 +151,17 @@ pub fn active() -> Option<&'static SnapshotRequest> {
     ACTIVE_REQUEST.get().and_then(Option::as_ref)
 }
 
+/// Terminate a short-lived offscreen process without running C/C++ `atexit`
+/// handlers. Qt's offscreen platform can fault while destroying its global
+/// QApplication/plugin state after the useful smoke or snapshot work has
+/// already completed. This is intentionally not a live-desktop quit path.
+pub fn exit_immediately(exit_code: i32) -> ! {
+    let exit_code = exit_code.clamp(0, 255);
+    // SAFETY: `_exit` accepts any byte-sized process status and never returns.
+    // It is selected specifically to skip process-global Qt destructors.
+    unsafe { libc::_exit(exit_code) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{request_from_args, SNAPSHOT_SURFACES};

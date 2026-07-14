@@ -73,7 +73,10 @@ fn main() {
     // headless contract, and snapshot files have already been flushed before
     // QML exits, so avoid the unreliable platform-plugin teardown only for
     // explicit smoke/snapshot processes. Live desktop sessions still unwind.
-    if headless_run || exit_code != 0 {
+    if headless_run {
+        snapshot::exit_immediately(exit_code);
+    }
+    if exit_code != 0 {
         std::process::exit(exit_code);
     }
 }
