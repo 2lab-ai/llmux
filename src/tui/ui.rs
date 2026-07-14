@@ -3297,22 +3297,22 @@ fn cell_width(text: &str) -> usize {
 }
 
 /// `…`-clip `text` to at most `max` display CELLS (the cell-aware sibling of
-/// [`truncate_chars`]). The ellipsis itself counts one cell; a char that
-/// would straddle the boundary is dropped rather than overflowed.
+/// [`truncate_chars`]). `max == 0` yields the empty string. The bound is
+/// enforced by WHOLE-STRING re-measurement with the same [`cell_width`] the
+/// caller pads with — never by summing per-char widths, which disagrees with
+/// string measurement on context-sensitive sequences (VS16/ZWJ): chars are
+/// popped until the remainder plus the one-cell ellipsis fits (review R2).
 fn truncate_cells(text: &str, max: usize) -> String {
     if cell_width(text) <= max {
         return text.to_string();
     }
-    let budget = max.saturating_sub(1); // room for the ellipsis
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        used += w;
-        out.push(ch);
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max - 1; // room for the ellipsis
+    let mut out = text.to_string();
+    while !out.is_empty() && cell_width(&out) > budget {
+        out.pop();
     }
     out.push('\u{2026}');
     out
@@ -3351,12 +3351,16 @@ fn activity_meta(
     if let Some(m) = model {
         // Dynamic budget: the slot minus brackets, the fixed tokens, and one
         // separator per join — the model is clipped ONLY when the completed
-        // badge would overflow the slot.
+        // badge would overflow the slot. A zero budget drops the token
+        // entirely rather than leaving a stray one-cell ellipsis.
         let others: usize = fixed.iter().map(|p| cell_width(p)).sum();
         let seps = fixed.len(); // one space joins the model to each side used
         let budget = ACTIVITY_META_WIDTH.saturating_sub(2 + others + seps);
-        let insert_at = usize::from(group.is_some()); // model follows group
-        parts.insert(insert_at, truncate_cells(m, budget));
+        let clipped = truncate_cells(m, budget);
+        if !clipped.is_empty() {
+            let insert_at = usize::from(group.is_some()); // model follows group
+            parts.insert(insert_at, clipped);
+        }
     }
     let body = if parts.is_empty() {
         String::new()
@@ -4949,6 +4953,30 @@ mod tests {
                 false,
             ),
             activity_meta(Some("한글그룹"), None, Some("높음"), false),
+            // Context-sensitive sequences (VS16 emoji presentation, ZWJ
+            // families, skin-tone modifiers) — truncation re-measures the
+            // WHOLE string with the same accounting as the final padding,
+            // so these cannot shift the column either (review R2).
+            activity_meta(
+                Some("claude"),
+                Some("☂\u{fe0f}-model-\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-\u{1f44d}\u{1f3fd}-very-long-tail"),
+                Some("high"),
+                false,
+            ),
+            activity_meta(
+                Some("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"),
+                None,
+                Some("☂\u{fe0f}\u{1f44d}\u{1f3fd}"),
+                false,
+            ),
+            // Fixed tokens eating the whole slot → the model token is
+            // DROPPED (no stray one-cell ellipsis), the badge itself clips.
+            activity_meta(
+                Some("a-very-long-group-name-x"),
+                Some("some-model"),
+                Some("effort-that-overflows"),
+                true,
+            ),
         ] {
             assert_eq!(
                 cell_width(&meta),
@@ -5014,12 +5042,16 @@ mod tests {
             .map(|i| model_row("claude", &format!("m-{i}"), 1_000 - i as u64, 10))
             .collect();
         let view = view_with(docs);
+        // Assertions pin the actual rendered rows (last visible + first
+        // hidden model id), not just the title's self-reported count.
         // Default auto height shows MODEL_STRIP_ROWS rows.
         let text = render(&view, &chrome_overlay(Overlay::None), 220, 50);
         assert!(
             text.contains(" models — top 5 of 7 by tokens"),
             "default strip shows 5 rows"
         );
+        assert!(text.contains("m-4"), "5th row rendered at default height");
+        assert!(!text.contains("m-5"), "6th row hidden at default height");
         // Drag-expanded pane (border + header + 7): every row fits.
         let mut chrome = chrome_overlay(Overlay::None);
         chrome.pane_heights.strip = Some(9);
@@ -5027,6 +5059,10 @@ mod tests {
         assert!(
             text.contains(" models — top 7 of 7 by tokens"),
             "a taller pane reveals more rows"
+        );
+        assert!(
+            text.contains("m-6"),
+            "last row rendered when dragged taller"
         );
         // Shrunk to the drag minimum (border + header + 1).
         let mut chrome = chrome_overlay(Overlay::None);
@@ -5036,6 +5072,8 @@ mod tests {
             text.contains(" models — top 1 of 7 by tokens"),
             "the minimum pane still renders one row"
         );
+        assert!(text.contains("m-0"), "first row rendered at minimum height");
+        assert!(!text.contains("m-1"), "second row hidden at minimum height");
     }
 
     #[test]
