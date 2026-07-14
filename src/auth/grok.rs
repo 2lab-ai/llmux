@@ -91,6 +91,25 @@ fn validate_endpoint(raw: &str, field: &'static str) -> Result<String, AuthError
     Ok(raw.to_string())
 }
 
+/// Whether a persisted refresh endpoint may receive the refresh token:
+/// the x.ai boundary (https) or loopback (any scheme the client accepts —
+/// http://127.0.0.1 / http://localhost — used by tests and local mocks).
+fn refresh_endpoint_allowed(raw: &str) -> bool {
+    if validate_endpoint(raw, "token_endpoint").is_ok() {
+        return true;
+    }
+    let host = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .map(|rest| {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 /// Hostname of an `https://` URL (lowercased; userinfo and port stripped).
 /// `None` for any other scheme — https is required, so that suffices. Kept
 /// dependency-free (no `url` crate in the tree).
@@ -327,10 +346,23 @@ pub async fn refresh_grok_at(
     token_endpoint: &str,
     refresh_token: &str,
 ) -> Result<OAuthTokens, AuthError> {
-    let token_endpoint = if token_endpoint.trim().is_empty() {
+    // Validate on EVERY use, not just at discovery (external review
+    // MUST-FIX, 2026-07-14): the persisted endpoint comes from the config
+    // file and would otherwise receive the refresh token wherever it points.
+    // A non-x.ai persisted value falls back to fresh discovery instead of
+    // being trusted. Loopback stays allowed — local mocks/tests can't
+    // exfiltrate off-host, and whoever controls loopback controls the host.
+    let trimmed = token_endpoint.trim();
+    let token_endpoint = if trimmed.is_empty() {
         discover(client).await?.token_endpoint
+    } else if refresh_endpoint_allowed(trimmed) {
+        trimmed.to_string()
     } else {
-        token_endpoint.trim().to_string()
+        tracing::warn!(
+            endpoint = trimmed,
+            "grok: persisted token_endpoint failed x.ai validation; re-discovering"
+        );
+        discover(client).await?.token_endpoint
     };
     let form_body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={}",
@@ -427,20 +459,37 @@ pub fn grok_account_name(email: &str, subject: &str) -> String {
     format!("grok:{}", now_ms())
 }
 
-/// Build the persistable account from a completed device-code login.
-pub fn account_from_bundle(bundle: &GrokTokenBundle, token_endpoint: &str) -> AccountConfig {
+/// Build the persistable account from a completed device-code login. An
+/// initial login WITHOUT a refresh token is an error (external review N1):
+/// the account would silently die at first access-token expiry. (Refresh
+/// responses omitting the field keep the stored token — different contract,
+/// see `refresh_grok_at` / C8.)
+pub fn account_from_bundle(
+    bundle: &GrokTokenBundle,
+    token_endpoint: &str,
+) -> Result<AccountConfig, AuthError> {
+    let Some(refresh_token) = bundle
+        .tokens
+        .refresh_token
+        .clone()
+        .filter(|t| !t.is_empty())
+    else {
+        return Err(AuthError::GrokAuth(
+            "login token response missing refresh_token (offline_access not granted?)",
+        ));
+    };
     let (email, subject) = grok_identity(bundle.id_token.as_deref());
-    AccountConfig {
+    Ok(AccountConfig {
         name: grok_account_name(&email, &subject),
         credential: AccountCredential::Grok {
             subject,
             access_token: bundle.tokens.access_token.clone(),
-            refresh_token: bundle.tokens.refresh_token.clone().unwrap_or_default(),
+            refresh_token,
             expires_at_ms: bundle.tokens.expires_at_ms,
             token_endpoint: token_endpoint.to_string(),
             last_refresh_ms: Some(now_ms()),
         },
-    }
+    })
 }
 
 fn now_ms() -> u64 {
@@ -665,6 +714,38 @@ mod tests {
             matches!(err, AuthError::RefreshPermanent { .. }),
             "invalid_grant → Permanent (re-login required): {err}"
         );
+    }
+
+    #[test]
+    fn refresh_endpoint_validation_gates_every_use() {
+        assert!(refresh_endpoint_allowed("https://auth.x.ai/oauth/token"));
+        assert!(refresh_endpoint_allowed("http://127.0.0.1:3498/token"));
+        assert!(refresh_endpoint_allowed("http://localhost:8080/token"));
+        assert!(!refresh_endpoint_allowed("https://evil.example.com/token"));
+        assert!(!refresh_endpoint_allowed("https://evil-x.ai/token"));
+        assert!(!refresh_endpoint_allowed("http://10.0.0.5/token"));
+    }
+
+    #[test]
+    fn n1_initial_login_requires_refresh_token() {
+        let bundle = GrokTokenBundle {
+            tokens: OAuthTokens {
+                access_token: "at".into(),
+                refresh_token: None,
+                expires_at_ms: 1,
+            },
+            id_token: None,
+        };
+        assert!(account_from_bundle(&bundle, "https://auth.x.ai/t").is_err());
+        let ok = GrokTokenBundle {
+            tokens: OAuthTokens {
+                access_token: "at".into(),
+                refresh_token: Some("rt".into()),
+                expires_at_ms: 1,
+            },
+            id_token: None,
+        };
+        assert!(account_from_bundle(&ok, "https://auth.x.ai/t").is_ok());
     }
 
     #[test]
