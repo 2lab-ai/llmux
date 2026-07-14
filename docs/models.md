@@ -1,0 +1,111 @@
+# Model catalog
+
+llmux exposes the **known** models — a curated set plus the live grok pin — as
+a machine-readable catalog. This is deliberately not an exhaustive list of
+everything routable: at request time the grok provider forwards ANY `grok-*` id
+verbatim (see [alias semantics](#alias-semantics)), so a request or config pin
+naming an id outside the curated set still works. Such an out-of-catalog pin
+appears here as a **synthesized row** with null metadata (see
+[out-of-catalog pin](#out-of-catalog-grok-pin)).
+
+## Endpoints
+
+- `GET /models`
+- `GET /llmux/models`
+
+Both return the **same** payload and sit behind the same loopback + proxy
+api-key gate as every other route:
+
+```json
+{ "models": [ /* ModelEntry, ... */ ] }
+```
+
+Registering root `/models` reserves a path that previously fell through to the
+upstream proxy fallback. Anthropic exposes no root `/models`, and `/v1/models`
+is left untouched (still proxied upstream), so nothing regresses.
+
+## Response schema
+
+Each element of `models` is a `ModelEntry`:
+
+| Key           | Type                | Meaning                                                        |
+| ------------- | ------------------- | ------------------------------------------------------------- |
+| `id`          | string              | Concrete upstream model id.                                   |
+| `aliases`     | array of strings    | Extra request slugs that resolve to this id (may be empty).   |
+| `name`        | string              | Human-facing display name.                                    |
+| `efforts`     | array of strings    | Accepted `reasoning.effort` values, low→high (may be empty).  |
+| `max_context` | integer or `null`   | Context window in tokens; `null` when unpublished.            |
+| `group`       | string              | Backend group: `claude`, `codex`, or `grok`.                  |
+
+`max_context: null` means the context window is not published for that id —
+not that it is zero.
+
+## Alias semantics
+
+- **grok family alias** — `"grok"` is dynamic: it attaches to whichever grok id
+  is the current live pin (`POST /llmux/grok` / `config.grok.default_model`). A
+  bare `grok` request routes to that pin, so the catalog advertises the alias on
+  exactly the pinned entry. Any `grok-*` id also passes through verbatim.
+- **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
+  generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
+  `gpt-5.6` id resolves to the `sol` flagship. These are advertised statically
+  on the corresponding entries.
+- **claude has no aliases** — llmux passes claude requests through unchanged and
+  does not shape them, so bare names like `opus` only *route* to the claude
+  group; they are never resolved to a concrete id, and claude entries carry an
+  empty `efforts` menu.
+
+### Out-of-catalog grok pin
+
+`config.grok.default_model` may pin ANY `grok-*` slug — including ids not in the
+curated table below (e.g. `grok-code-fast-1`). Because the provider forwards
+such ids verbatim, the pin is real and routable, so the `"grok"` family alias
+must have an owner. When the pin matches no curated id, the catalog appends a
+**synthesized** grok row: `id` = the pin, `name` = the pin verbatim, `aliases`
+= `["grok"]`, `efforts` from the thinking-level lookup (empty unless the id is a
+known reasoner), and `max_context` = `null`. The null metadata reflects that
+llmux has no published context/name for an id it does not curate.
+
+## Current catalog
+
+| id                       | aliases              | name          | efforts                              | max_context | group  |
+| ------------------------ | -------------------- | ------------- | ------------------------------------ | ----------- | ------ |
+| claude-fable-5           | —                    | Claude Fable 5| —                                    | 200000\*    | claude |
+| claude-opus-4-8          | —                    | Claude Opus 4.8| —                                   | 200000      | claude |
+| claude-sonnet-4-6        | —                    | Claude Sonnet 4.6| —                                 | 200000      | claude |
+| claude-sonnet-4-5        | —                    | Claude Sonnet 4.5| —                                 | 200000      | claude |
+| claude-haiku-4-5         | —                    | Claude Haiku 4.5| —                                  | 200000      | claude |
+| gpt-5.5                  | —                    | GPT-5.5       | low, medium, high, xhigh             | 272000      | codex  |
+| gpt-5.5-codex            | —                    | GPT-5.5-Codex | low, medium, high, xhigh             | null        | codex  |
+| gpt-5-codex              | —                    | GPT-5-Codex   | low, medium, high, xhigh             | null        | codex  |
+| gpt-5.6-sol              | sol, gpt-5.6         | GPT-5.6-Sol   | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-terra            | terra                | GPT-5.6-Terra | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-luna             | luna                 | GPT-5.6-Luna  | low, medium, high, xhigh, max        | 372000      | codex  |
+| grok-4.5                 | grok (when pinned)   | Grok 4.5      | low, medium, high                    | 500000      | grok   |
+| grok-4.3                 | grok (when pinned)   | Grok 4.3      | none, low, medium, high              | null        | grok   |
+| grok-3-mini              | grok (when pinned)   | Grok 3 Mini   | low, medium, high                    | null        | grok   |
+| grok-composer-2.5-fast   | grok (when pinned)   | Composer 2.5  | —                                    | 200000      | grok   |
+| grok-build-0.1           | grok (when pinned)   | Grok Build 0.1| —                                    | 256000      | grok   |
+
+"grok (when pinned)" means the `grok` alias appears on that row only while it is
+the live grok pin.
+
+## Sources
+
+Evidence gathered 2026-07-14.
+
+- **Codex context windows and effort menus** — the openai/codex model catalog
+  (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` / `-terra`
+  support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh (context
+  272000). `gpt-5.5-codex` / `gpt-5-codex` are absent from the current
+  models.json (legacy passthrough) — context unknown (`null`), effort menu the
+  documented low→xhigh floor.
+- **Grok context windows / names** — the live `cli-chat-proxy` `/v1/models`
+  probe 2026-07-14 (`grok-4.5` ctx 500000; `grok-composer-2.5-fast` ctx 200000).
+  `grok-build-0.1` ctx 256000 from `docs/grok/spec.md`. Grok effort menus come
+  from the provider's per-model thinking-level table; models with no thinking
+  support (`grok-composer-2.5-fast`, `grok-build-0.1`) have an empty menu.
+  `grok-4.3` / `grok-3-mini` context windows are not published → `null`.
+- **Claude context windows** — the Anthropic subscription standard of 200000
+  tokens per id. `claude-fable-5` (\*) is **nominal / unverified**. llmux does
+  not shape claude requests, so their effort menus are empty.
