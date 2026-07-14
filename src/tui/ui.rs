@@ -1002,11 +1002,13 @@ fn account_row<'a>(
             (false, true) => "►",
             (false, false) => "",
         };
+        // Fixed 2-column content in every state, so cursor/urgent
+        // combinations never nudge the columns to their right.
         let text = match (lead, urgent) {
-            ("", true) => "!".to_string(),
-            ("", false) => " ".to_string(),
+            ("", true) => "! ".to_string(),
+            ("", false) => "  ".to_string(),
             (lead, true) => format!("{lead}!"),
-            (lead, false) => lead.to_string(),
+            (lead, false) => format!("{lead} "),
         };
         let style = if urgent {
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -2087,15 +2089,14 @@ fn draw_activity(
             }
             ActivityRow::Run { start, len } => {
                 let run = &view.completed[*start..*start + *len];
-                // The run's stable identity = its OLDEST member's key: the
-                // newest end grows with fresh traffic (a newest-keyed run
-                // would collapse on every refresh), the oldest survives until
-                // the ring drops it. The whole block is ONE hit, so a click
-                // toggles the fold.
-                let key = run[run.len() - 1].activity_key();
-                let expanded = key
-                    .as_ref()
-                    .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(k));
+                // Expansion matches ANY member (not just the oldest), so a
+                // tail run on a FULL ring — whose oldest member is evicted on
+                // every append — stays expanded until the clicked member
+                // itself ages out. The whole block is ONE hit; the toggle key
+                // echoes the matched member while expanded so the next click
+                // collapses instead of re-keying.
+                let (expanded, key) =
+                    triage::run_toggle_key(run, chrome.expanded_activity.as_ref());
                 let row_y = body_top.saturating_add(lines.len() as u16);
                 lines.push(folded_run_line(run, expanded, view.email_anonymous));
                 let mut height = 1u16;

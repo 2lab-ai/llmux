@@ -201,6 +201,18 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
         });
     }
 
+    // 4. No health telemetry (attach to an old daemon): the verdict CANNOT
+    //    say healthy — absence of data is never evidence of health. Lowest
+    //    dominance: any real condition above still headlines, but a
+    //    condition-free old daemon renders [WARN], not a false [OK].
+    if view.health.is_none() {
+        conditions.push(Condition {
+            level: VerdictLevel::Warn,
+            text: "ERR TELEMETRY UNAVAILABLE (old daemon)".to_string(),
+            account: None,
+        });
+    }
+
     Verdict { conditions }
 }
 
@@ -313,6 +325,27 @@ fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
         )),
         _ => None,
     }
+}
+
+/// Whether a folded run is the one the operator expanded, and the key a
+/// click should toggle. The expansion key is matched against EVERY member —
+/// not just the oldest — so a long-lived run at the FULL ring's tail (whose
+/// oldest member is evicted on each append) stays expanded until the clicked
+/// member itself ages out of the ring. Returns the toggle key: the matched
+/// member's key while expanded (so the next click collapses), else the
+/// oldest member's key (the stable expand target).
+pub(crate) fn run_toggle_key(
+    run: &[Completed],
+    expanded: Option<&super::activity::ActivityKey>,
+) -> (bool, Option<super::activity::ActivityKey>) {
+    if let Some(expanded) = expanded {
+        for entry in run {
+            if entry.activity_key().as_ref() == Some(expanded) {
+                return (true, Some(expanded.clone()));
+            }
+        }
+    }
+    (false, run.last().and_then(|entry| entry.activity_key()))
 }
 
 /// Fold the newest-first completed list into render rows. Order-preserving:
@@ -596,6 +629,19 @@ mod tests {
         assert_eq!(head.account.as_deref(), Some("exhausted"));
     }
 
+    #[test]
+    fn old_daemon_with_no_conditions_never_says_healthy() {
+        // No account/poller condition AND no telemetry: the dangerous case —
+        // the verdict must be a named WARN, not a false [OK] healthy.
+        let verdict = health_verdict(&view_without_health(pool(vec![account("a")])), now());
+        assert_eq!(verdict.level(), VerdictLevel::Warn);
+        assert!(verdict
+            .headline()
+            .expect("condition")
+            .text
+            .contains("TELEMETRY UNAVAILABLE"));
+    }
+
     // ---- activity folding ----
 
     fn request(status: u16, path: &str, at_secs: u64) -> Completed {
@@ -681,6 +727,32 @@ mod tests {
                 ActivityRow::Run { start: 7, len: 3 },
             ]
         );
+    }
+
+    #[test]
+    fn run_expansion_survives_oldest_member_eviction() {
+        // A full ring evicts its overall-oldest entry on every append. The
+        // expansion must match ANY member, so the run the operator expanded
+        // stays open when its (previous) oldest member is evicted — and the
+        // toggle key echoes the matched member so the next click collapses.
+        let run = vec![
+            request(200, "/v1/messages", 40),
+            request(200, "/v1/messages", 30),
+            request(200, "/v1/messages", 20),
+        ];
+        let clicked = run[1].activity_key().expect("key");
+        let (expanded, toggle) = run_toggle_key(&run, Some(&clicked));
+        assert!(expanded);
+        assert_eq!(toggle.as_ref(), Some(&clicked));
+        // Once the clicked member itself ages out, the run collapses
+        // gracefully and re-arms on the new oldest member.
+        let evicted = vec![run[0].clone(), run[1].clone()];
+        let old_oldest = request(200, "/v1/messages", 10)
+            .activity_key()
+            .expect("key");
+        let (expanded, toggle) = run_toggle_key(&evicted, Some(&old_oldest));
+        assert!(!expanded);
+        assert_eq!(toggle, evicted[1].activity_key());
     }
 
     #[test]
