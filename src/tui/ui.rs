@@ -1195,12 +1195,19 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
 /// could not paint a partial background. Only spaces + the caller's text are
 /// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
 /// `anim.rs` is untouched.
+///
+/// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
+/// the FIXED last bar column, independent of the centered `text`, so the
+/// time never shifts when the marker appears or disappears (Z 2026-07-15).
+/// A text long enough to reach that column loses its last char to the
+/// marker — the marker is the rarer, higher-signal fact.
 fn quota_bar_line(
     fill: f64,
     color: Color,
     text: &str,
     bold_chars: usize,
     width: usize,
+    marker: Option<char>,
 ) -> Line<'static> {
     let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
     let chars: Vec<char> = text.chars().collect();
@@ -1210,7 +1217,9 @@ fn quota_bar_line(
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
     for col in 0..width {
-        let ch = if col >= start && col < start + text_len {
+        let ch = if marker.is_some() && col == width.saturating_sub(1) {
+            marker.unwrap_or(' ')
+        } else if col >= start && col < start + text_len {
             chars[col - start]
         } else {
             ' '
@@ -1239,24 +1248,28 @@ fn quota_bar_line(
 }
 
 /// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`) plus the window display-state glyph when the value is not fresh
-/// (issue #33). The parked/over `!` is NOT here — it rides the percent label
-/// to the right of the bar, where it always lived. Returns `(text,
-/// bold_chars)` where `bold_chars` covers the FIRST countdown unit — the
-/// day/hour magnitude carries most of the signal, so it gets the emphasis.
-/// An expired window (no live reset) reads `0s` — honest and ASCII-narrow.
+/// (`7d 10h`), plus the window display-state glyph when the value is not
+/// fresh (issue #33) — returned SEPARATELY so the renderer can pin it to a
+/// fixed trailing column instead of appending it to the centered time (the
+/// append shifted the time sideways whenever the glyph came and went — Z
+/// 2026-07-15 "가운데 시간 표시 위치 고정"). The parked/over `!` is NOT here —
+/// it rides the percent label to the right of the bar, where it always
+/// lived. Returns `(text, bold_chars, marker)` where `bold_chars` covers the
+/// FIRST countdown unit — the day/hour magnitude carries most of the signal,
+/// so it gets the emphasis. An expired window (no live reset) reads `0s` —
+/// honest and ASCII-narrow.
 fn quota_bar_text(
     window: &QuotaWindow,
     now: SystemTime,
     display: WindowDisplayState,
     absolute: bool,
-) -> (String, usize) {
+) -> (String, usize, Option<char>) {
     let live = window
         .resets_at
         .duration_since(now)
         .ok()
         .filter(|rem| !rem.is_zero());
-    let (mut text, bold_chars) = match (absolute, live) {
+    let (text, bold_chars) = match (absolute, live) {
         // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
         (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
         (false, Some(rem)) => {
@@ -1272,11 +1285,8 @@ fn quota_bar_text(
         // Expired window: no live reset to point at in either mode.
         (_, None) => ("0s".to_string(), 2),
     };
-    if !matches!(display, WindowDisplayState::Populated) {
-        text.push(' ');
-        text.push(display.glyph());
-    }
-    (text, bold_chars)
+    let marker = (!matches!(display, WindowDisplayState::Populated)).then(|| display.glyph());
+    (text, bold_chars, marker)
 }
 
 /// Assemble one full quota gauge cell line: the countdown bar
@@ -1290,6 +1300,7 @@ fn quota_bar_text(
 /// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
 /// past threshold) stays keyed on USED utilization either way, as do the
 /// color bands.
+#[allow(clippy::too_many_arguments)]
 fn quota_cell_line(
     fill: f64,
     color: Color,
@@ -1297,12 +1308,13 @@ fn quota_cell_line(
     bold_chars: usize,
     over: bool,
     bar_width: usize,
+    marker: Option<char>,
 ) -> Line<'static> {
     let mut label = format::percent(fill);
     if over {
         label.push('!');
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width);
+    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width, marker);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
         format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
@@ -1354,9 +1366,9 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Used => utilization,
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
-    let (text, bold_chars) = quota_bar_text(window, now, display, reset_absolute);
+    let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
     Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width,
+        fill, color, &text, bold_chars, over, bar_width, marker,
     ))
 }
 
@@ -1436,9 +1448,10 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Used => utilization,
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
-        let (text, bold_chars) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+        let (text, bold_chars, marker) =
+            quota_bar_text(&scoped.window, now, display, reset_absolute);
         Cell::from(quota_cell_line(
-            fill, color, &text, bold_chars, over, bar_width,
+            fill, color, &text, bold_chars, over, bar_width, marker,
         ))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
@@ -3512,7 +3525,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
-        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16);
+        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None);
         let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 16, "cell is exactly bar-width wide");
         // First 8 columns reversed (the fill), the rest plain.
@@ -3527,9 +3540,40 @@ mod tests {
     }
 
     #[test]
+    fn quota_bar_time_position_is_fixed_regardless_of_marker() {
+        // Z 2026-07-15: the freshness marker (○/◑) used to be APPENDED to the
+        // centered time, shifting the time sideways whenever the marker came
+        // and went. Now the time centers identically and the marker owns the
+        // fixed last column.
+        let flat = |line: ratatui::text::Line| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let without = flat(quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None));
+        let with = flat(quota_bar_line(
+            0.5,
+            Color::Green,
+            "7d 10h",
+            2,
+            16,
+            Some('○'),
+        ));
+        assert_eq!(
+            without.find("7d 10h"),
+            with.find("7d 10h"),
+            "time column must not move when the marker appears"
+        );
+        assert_eq!(
+            with.chars().last(),
+            Some('○'),
+            "marker pinned to last column"
+        );
+        assert_eq!(with.chars().count(), 16);
+    }
+
+    #[test]
     fn quota_bar_line_empty_and_full_fill() {
         for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
-            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16);
+            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16, None);
             let rev: usize = line
                 .spans
                 .iter()
@@ -3542,7 +3586,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_bolds_only_the_leading_unit() {
-        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16);
+        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16, None);
         let bold: String = line
             .spans
             .iter()
