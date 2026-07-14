@@ -25,6 +25,7 @@ final class IslandUsageModel: ObservableObject {
     /// first poll completes (and even when the daemon is unreachable).
     @Published var claudeInFlight: Int = DemoMode.forcedInFlight?.claude ?? 0
     @Published var codexInFlight: Int = DemoMode.forcedInFlight?.codex ?? 0
+    @Published var grokInFlight: Int = DemoMode.forcedInFlight?.grok ?? 0
 
     // Dashboard analytics (issue #62 S3): published for the analytics UI
     // (Phase 2). Empty/nil when the daemon predates `/llmux/dashboard` (the
@@ -58,10 +59,15 @@ final class IslandUsageModel: ObservableObject {
     }
 
     struct LoginFlow: Equatable {
-        var provider: String       // "claude" | "codex"
+        var provider: String       // "claude" | "codex" | "grok"
         var phase: String          // "starting" | "pending" | "done" | "error"
         var message: String?
         var state: String?
+        /// Device-code flow (grok): verification page + code, surfaced so a
+        /// REMOTE daemon's login is still completable from this machine (the
+        /// daemon's own browser-open lands on the daemon host).
+        var verificationUri: String?
+        var userCode: String?
     }
 
     // Rebuilt from the saved settings on each use so the Settings window's
@@ -104,6 +110,7 @@ final class IslandUsageModel: ObservableObject {
         let counts = Self.inFlightCounts(records)
         claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
         codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
+        grokInFlight = DemoMode.forcedInFlight?.grok ?? counts.grok
         applyServerEmailAnonymous(dash.emailAnonymous)
         healthWarningCount = DashboardHealth.summary(dash.accounts).total
         dashboard = dash
@@ -129,6 +136,7 @@ final class IslandUsageModel: ObservableObject {
             let counts = Self.inFlightCounts(status.accounts)
             claudeInFlight = DemoMode.forcedInFlight?.claude ?? counts.claude
             codexInFlight = DemoMode.forcedInFlight?.codex ?? counts.codex
+        grokInFlight = DemoMode.forcedInFlight?.grok ?? counts.grok
             applyServerEmailAnonymous(status.emailAnonymous)
             healthWarningCount = DashboardHealth.summary(records: status.accounts).total
             connection = .online
@@ -173,26 +181,29 @@ final class IslandUsageModel: ObservableObject {
         }
     }
 
-    /// Σ `in_flight` per provider. Anything that isn't codex counts as claude,
-    /// mirroring the provider split used for the usage tiles.
-    static func inFlightCounts(_ accounts: [LlmuxAccountRecord]) -> (claude: Int, codex: Int) {
+    /// Σ `in_flight` per provider. Anything that isn't codex/grok counts as
+    /// claude, mirroring the provider split used for the usage tiles.
+    static func inFlightCounts(_ accounts: [LlmuxAccountRecord]) -> (claude: Int, codex: Int, grok: Int) {
         var claude = 0
         var codex = 0
+        var grok = 0
         for account in accounts {
             let sessions = account.inFlight ?? 0
-            if Self.provider(of: account) == .codex {
-                codex += sessions
-            } else {
-                claude += sessions
+            switch Self.provider(of: account) {
+            case .codex: codex += sessions
+            case .grok: grok += sessions
+            default: claude += sessions
             }
         }
-        return (claude, codex)
+        return (claude, codex, grok)
     }
 
     /// The provider an llmux account record maps onto (single source of the
-    /// claude/codex split — used by both the tiles and the in-flight sums).
+    /// claude/codex/grok split — used by both the tiles and the in-flight sums).
     static func provider(of a: LlmuxAccountRecord) -> UsageProvider {
-        (a.group?.lowercased() == "codex" || a.type.lowercased() == "codex") ? .codex : .claude
+        if a.group?.lowercased() == "codex" || a.type.lowercased() == "codex" { return .codex }
+        if a.group?.lowercased() == "grok" || a.type.lowercased() == "grok" { return .grok }
+        return .claude
     }
 
     /// Replace an account's real email/label with a stable fake so a public demo
@@ -322,6 +333,10 @@ final class IslandUsageModel: ObservableObject {
                     let result = try await client.loginStatus(state: state)
                     consecutiveErrors = 0
                     login?.phase = result.phase
+                    if let uri = result.verificationUri, login?.verificationUri == nil {
+                        login?.verificationUri = uri
+                        login?.userCode = result.userCode
+                    }
                     if result.phase == "done" {
                         login?.message = result.account
                         await refresh()

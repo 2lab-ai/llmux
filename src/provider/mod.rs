@@ -11,6 +11,8 @@
 
 pub mod anthropic;
 pub mod codex;
+pub mod grok;
+pub mod responses;
 pub mod stubs;
 
 use crate::config::AccountCredential;

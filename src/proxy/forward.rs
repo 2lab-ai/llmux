@@ -198,6 +198,19 @@ pub fn rewrite_headers(headers: &mut HeaderMap, credential: &AccountCredential) 
     }
 }
 
+/// The free-tier rolling window cli-chat-proxy advertises ("Usage resets
+/// over a rolling 24-hour window") — an ESTIMATE used as probe-not-before
+/// when a grok 429 carries the exhaustion marker but no Retry-After
+/// (CLIProxyAPI xai_executor.go:2521-2545; docs/grok/spec.md §R1).
+pub(crate) const GROK_FREE_USAGE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether a grok 429 error body names free-tier exhaustion. Substring match
+/// on the detail text, mirroring CLIProxyAPI's `code`/`error` scan.
+pub(crate) fn grok_free_usage_exhausted(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("free-usage-exhausted") || lower.contains("included free usage")
+}
+
 /// Parse a `retry-after` header (delta-seconds form). The HTTP-date form is
 /// not parsed — Anthropic sends seconds; an unparseable value falls back to
 /// the heuristic cooldown via `None`.
@@ -232,11 +245,11 @@ struct ForwardContext {
     /// `Some`, the scheduler is filtered to that group and the leased
     /// credential must belong to it.
     group: Option<BackendGroup>,
-    /// Whether the request was actually served by the codex provider, set once
-    /// the account is leased and the provider path is chosen (`None` before
+    /// The backend group that actually SERVED the request, set once the
+    /// account is leased and the provider path is chosen (`None` before
     /// then, e.g. a pre-routing failure). Drives the activity log's
     /// group/model/effort columns even when `group` is `None` (routing off).
-    served_codex: Option<bool>,
+    served_by: Option<BackendGroup>,
 }
 
 impl ForwardContext {
@@ -260,8 +273,8 @@ impl ForwardContext {
     /// the thinking budget, never fast. All `None`/`false` before the provider
     /// path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
-        match self.served_codex {
-            Some(true) => {
+        match self.served_by {
+            Some(BackendGroup::Codex) => {
                 // Per-request effective model + effort + fast (matches the
                 // wire), not the static shape defaults: a request for gpt-5.5
                 // under a gpt-5.6-sol pin records gpt-5.5, and a FAILED
@@ -274,7 +287,16 @@ impl ForwardContext {
                     fast,
                 }
             }
-            Some(false) => FinishedMeta {
+            Some(BackendGroup::Grok) => {
+                let (model, effort) = state.grok.request_meta(&self.body);
+                FinishedMeta {
+                    group: Some("grok".to_string()),
+                    model: Some(model),
+                    effort,
+                    fast: false,
+                }
+            }
+            Some(BackendGroup::Claude) => FinishedMeta {
                 group: Some("claude".to_string()),
                 model: self.model.clone(),
                 effort: claude_effort(&self.body),
@@ -438,6 +460,20 @@ async fn upstream_error_detail(response: reqwest::Response) -> String {
 fn condense_error_body(body: &[u8]) -> String {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(err) = v.get("error") {
+            // xAI/grok error shape: `error` is a plain STRING (optionally
+            // beside a `code`), e.g. `{"code":"subscription:free-usage-
+            // exhausted","error":"You have exhausted…"}`. Preserve both —
+            // the grok 429 marker match reads this condensed detail
+            // (live receipt 2026-07-14: collapsing it to "error" made
+            // free-usage-exhausted invisible and the 24h park unreachable).
+            if let Some(msg) = err.as_str() {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                return if code.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{code}: {msg}")
+                };
+            }
             let ty = err.get("type").and_then(|t| t.as_str()).unwrap_or("error");
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
             return if msg.is_empty() {
@@ -615,7 +651,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         model,
         user_id,
         group,
-        served_codex: None,
+        served_by: None,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -807,7 +843,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     let (model, effort, fast) = state.codex.request_meta(&ctx.body);
                     (Some("codex".to_string()), Some(model), effort, fast)
                 }
-                _ => (
+                BackendGroup::Grok => {
+                    let (model, effort) = state.grok.request_meta(&ctx.body);
+                    (Some("grok".to_string()), Some(model), effort, false)
+                }
+                BackendGroup::Claude => (
                     Some("claude".to_string()),
                     ctx.model.clone(),
                     claude_effort(&ctx.body),
@@ -855,37 +895,37 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 3. Codex accounts serve the Messages API only: count_tokens is
-        // answered locally with a naive estimate (no upstream equivalent);
-        // any other endpoint is a clear 501.
+        // 3. Translate-path accounts (codex, grok) serve the Messages API
+        // only: count_tokens is answered locally with a naive estimate (no
+        // upstream equivalent); any other endpoint is a clear 501.
         //
-        // With routing ON the codex path is driven by the request's GROUP
-        // (`group == Codex`) — which, by the invariant asserted above, always
-        // matches the leased credential's kind. With routing OFF (`group` is
-        // `None`) it falls back to the legacy credential check (codex stays
-        // the cross-group overflow pool).
-        let is_codex = match group {
-            Some(g) => g == BackendGroup::Codex,
-            None => matches!(credential, AccountCredential::Codex { .. }),
-        };
+        // With routing ON the translate path is driven by the request's GROUP
+        // — which, by the invariant asserted above, always matches the leased
+        // credential's kind. With routing OFF (`group` is `None`) it falls
+        // back to the legacy credential check (translate accounts stay the
+        // cross-group overflow pool).
+        let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
+        let is_translate = served != BackendGroup::Claude;
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
-        ctx.served_codex = Some(is_codex);
-        if is_codex {
+        ctx.served_by = Some(served);
+        if is_translate {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
                 drop(lease);
-                return codex_count_tokens_response(state, ctx, &account);
+                return translate_count_tokens_response(state, ctx, &account, served);
             }
             if path != "/v1/messages" {
                 drop(lease);
-                ctx.log(format!("=== ERROR ===\ncodex account cannot serve {path}"));
+                ctx.log(format!(
+                    "=== ERROR ===\n{served} account cannot serve {path}"
+                ));
                 ctx.flush_log(state);
                 ctx.emit_finished(state, Some(&account), StatusCode::NOT_IMPLEMENTED, None);
                 return error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "not_supported_error",
-                    &format!("codex accounts only serve /v1/messages (requested {path})"),
+                    &format!("{served} accounts only serve /v1/messages (requested {path})"),
                 );
             }
         }
@@ -901,14 +941,25 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 &format!("request rewrite failed: {err}"),
             )
         };
-        // `Some(client_stream)` marks the codex transform path; `None` is the
-        // untouched byte-identity passthrough.
-        let mut codex_stream: Option<bool> = None;
-        let (upstream_req, endpoint) = if is_codex {
-            match state.codex.build_request(&ctx.body, &credential) {
-                Ok((req, client_stream)) => {
-                    codex_stream = Some(client_stream);
-                    (req, state.codex.endpoint().to_string())
+        // `Some(client_stream)` marks the translate (codex/grok) transform
+        // path; `None` is the untouched byte-identity passthrough.
+        let mut translate_stream: Option<bool> = None;
+        let (upstream_req, endpoint) = if is_translate {
+            let built = match served {
+                BackendGroup::Codex => state
+                    .codex
+                    .build_request(&ctx.body, &credential)
+                    .map(|out| (out, state.codex.endpoint().to_string())),
+                BackendGroup::Grok => state
+                    .grok
+                    .build_request(&ctx.body, &credential)
+                    .map(|out| (out, state.grok.endpoint().to_string())),
+                BackendGroup::Claude => unreachable!("is_translate excludes claude"),
+            };
+            match built {
+                Ok(((req, client_stream), endpoint)) => {
+                    translate_stream = Some(client_stream);
+                    (req, endpoint)
                 }
                 Err(err) => {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
@@ -988,9 +1039,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // 5. Taxonomy.
         match classify(response.status(), response.headers()) {
             UpstreamSignal::Relay => {
-                return match codex_stream {
+                return match translate_stream {
                     Some(client_stream) => {
-                        relay_codex(state, ctx, lease, account, response, client_stream).await
+                        relay_translate(state, ctx, lease, account, response, client_stream, served)
+                            .await
                     }
                     None => relay(state, ctx, lease, account, response).await,
                 };
@@ -1001,6 +1053,21 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 ctx.log(format!(
                     "=== RESPONSE 429 (retry-after: {retry_after:?}) ===\n{headers_log}\n{detail}"
                 ));
+                // Grok free-tier exhaustion (docs/grok/spec.md §R1, C9): no
+                // Retry-After header, but the body names the rolling 24h
+                // window. Header wins when present (unchanged path); the
+                // marker parks with an ESTIMATED probe-not-before — the true
+                // reset time is unknowable from the 429.
+                let retry_after = match retry_after {
+                    None if served == BackendGroup::Grok && grok_free_usage_exhausted(&detail) => {
+                        tracing::info!(
+                            account = %account,
+                            "grok free usage exhausted; parking ~24h (estimated rolling window)"
+                        );
+                        Some(GROK_FREE_USAGE_COOLDOWN)
+                    }
+                    other => other,
+                };
                 let retry_note = match retry_after {
                     Some(d) => format!(" · retry-after {}s", d.as_secs()),
                     None => String::new(),
@@ -1393,30 +1460,35 @@ fn resolve_group(
         .on_empty_group
         .eq_ignore_ascii_case("fallback")
     {
-        let other = match group {
-            BackendGroup::Claude => BackendGroup::Codex,
-            BackendGroup::Codex => BackendGroup::Claude,
-        };
-        if has_account(other) {
-            tracing::info!(
-                model, from = %group, to = %other,
-                "routing: matched group empty; on_empty_group=fallback → other group"
-            );
-            return Ok(Some(other));
+        // Fixed fallback scan order Claude → Codex → Grok (spec §R5, C2b):
+        // the first OTHER group with ≥1 configured account serves the
+        // request under its own provider semantics.
+        for &other in BackendGroup::ALL {
+            if other == group {
+                continue;
+            }
+            if has_account(other) {
+                tracing::info!(
+                    model, from = %group, to = %other,
+                    "routing: matched group empty; on_empty_group=fallback → other group"
+                );
+                return Ok(Some(other));
+            }
         }
-        // Neither group has an account — fall through to the 404.
+        // No group has an account — fall through to the 404.
     }
     let message = format!("no {group} account configured for model {model}");
     tracing::warn!(model, %group, "routing: {message}");
     Err(Box::new(not_found_response(&message)))
 }
 
-/// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth` and
-/// `Codex` both rotate access tokens; `Apikey` never expires.
+/// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth`,
+/// `Codex`, and `Grok` all rotate access tokens; `Apikey` never expires.
 fn refreshable_expiry(credential: &AccountCredential) -> Option<u64> {
     match credential {
         AccountCredential::Oauth { expires_at_ms, .. }
-        | AccountCredential::Codex { expires_at_ms, .. } => Some(*expires_at_ms),
+        | AccountCredential::Codex { expires_at_ms, .. }
+        | AccountCredential::Grok { expires_at_ms, .. } => Some(*expires_at_ms),
         AccountCredential::Apikey { .. } => None,
     }
 }
@@ -1472,6 +1544,16 @@ pub(crate) async fn refresh_credential(
             )
             .await
         }
+        AccountCredential::Grok {
+            refresh_token,
+            token_endpoint,
+            ..
+        } => {
+            // Grok refreshes hit the token endpoint persisted at login
+            // (OIDC-discovered; re-discovered inside when blank). Same
+            // no-coalescer rationale as codex (C8).
+            crate::auth::grok::refresh_grok_at(&state.client, token_endpoint, refresh_token).await
+        }
         AccountCredential::Apikey { .. } => return RefreshOutcome::Failed,
     };
     match outcome {
@@ -1515,6 +1597,25 @@ pub(crate) async fn refresh_credential(
                         last_refresh_ms: Some(refreshed_at_ms),
                     },
                     non_empty_or(account_id, &account.0),
+                ),
+                AccountCredential::Grok {
+                    subject,
+                    refresh_token,
+                    token_endpoint,
+                    ..
+                } => (
+                    AccountCredential::Grok {
+                        subject: subject.clone(),
+                        access_token: tokens.access_token.clone(),
+                        refresh_token: tokens
+                            .refresh_token
+                            .clone()
+                            .unwrap_or_else(|| refresh_token.clone()),
+                        expires_at_ms: tokens.expires_at_ms,
+                        token_endpoint: token_endpoint.clone(),
+                        last_refresh_ms: Some(refreshed_at_ms),
+                    },
+                    non_empty_or(subject, &account.0),
                 ),
                 AccountCredential::Apikey { .. } => unreachable!("filtered above"),
             };
@@ -1794,16 +1895,17 @@ async fn relay(
 /// "hung vs completed" question and no real upstream usage to record — the
 /// trace exists to diagnose the `/v1/messages` relay path. Tracing it would
 /// only add instant, usage-less noise to the file.
-fn codex_count_tokens_response(
+fn translate_count_tokens_response(
     state: &AppState,
     ctx: &mut ForwardContext,
     account: &AccountId,
+    served: BackendGroup,
 ) -> Response {
     let estimate = serde_json::from_slice::<serde_json::Value>(&ctx.body)
-        .map(|v| crate::provider::codex::estimate_input_tokens(&v))
+        .map(|v| crate::provider::responses::estimate_input_tokens(&v))
         .unwrap_or(1);
     ctx.log(format!(
-        "=== RESPONSE (codex count_tokens estimate: {estimate}) ==="
+        "=== RESPONSE ({served} count_tokens estimate: {estimate}) ==="
     ));
     ctx.flush_log(state);
     ctx.emit_finished(state, Some(account), StatusCode::OK, None);
@@ -1816,38 +1918,51 @@ fn codex_count_tokens_response(
     response
 }
 
-/// Terminal relay for a codex upstream response. Every request goes upstream
-/// with `stream: true`, so a 2xx from `/responses` IS a Responses SSE stream
-/// by contract — the real chatgpt.com backend sends streaming 200s with NO
-/// `content-type` header at all (live capture 2026-06-12), so sniffing the
-/// header would misclassify good streams. 2xx therefore always enters the
-/// transform path: converted to Anthropic SSE on the fly (streaming clients)
-/// or aggregated into one Messages JSON document (non-streaming clients); a
-/// 2xx body that is not actually SSE terminates with a clean Anthropic
-/// `error` event from the converter. Non-2xx bodies are wrapped into
-/// Anthropic error shapes — codex bytes are NEVER relayed verbatim (the
-/// client speaks the Anthropic wire format only).
-async fn relay_codex(
+/// Terminal relay for a translate-path (codex/grok) upstream response. Every
+/// request goes upstream with `stream: true`, so a 2xx from `/responses` IS a
+/// Responses SSE stream by contract — the real chatgpt.com backend sends
+/// streaming 200s with NO `content-type` header at all (live capture
+/// 2026-06-12), so sniffing the header would misclassify good streams. 2xx
+/// therefore always enters the transform path: converted to Anthropic SSE on
+/// the fly (streaming clients) or aggregated into one Messages JSON document
+/// (non-streaming clients); a 2xx body that is not actually SSE terminates
+/// with a clean Anthropic `error` event from the converter. Non-2xx bodies
+/// are wrapped into Anthropic error shapes — upstream bytes are NEVER relayed
+/// verbatim (the client speaks the Anthropic wire format only).
+async fn relay_translate(
     state: &AppState,
     ctx: &mut ForwardContext,
     lease: crate::scheduler::AccountLease,
     account: AccountId,
     response: reqwest::Response,
     client_stream: bool,
+    served: BackendGroup,
 ) -> Response {
     let status = response.status();
-    // Codex trace (best-effort): input breakdown captured now from the inbound
-    // body, terminal outcome written at each return below. `model` is what the
-    // request is served as (the per-request resolved upstream model).
+    // Request trace (best-effort): input breakdown captured now from the
+    // inbound body, terminal outcome written at each return below. `model` is
+    // what the request is served as (the per-request resolved upstream
+    // model). Grok rides the same trace file as codex (model field
+    // identifies the provider).
+    let (trace_enabled, trace_model) = match served {
+        BackendGroup::Grok => (
+            state.config.grok.trace,
+            state.grok.request_meta(&ctx.body).0,
+        ),
+        _ => (
+            state.config.codex.trace,
+            state.codex.request_meta(&ctx.body).0,
+        ),
+    };
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
-        state.config.codex.trace,
+        trace_enabled,
         ctx.activity_id,
         &ctx.path_query,
-        Some(state.codex.request_meta(&ctx.body).0),
+        Some(trace_model),
         &ctx.body,
     );
     ctx.log(format!(
-        "=== RESPONSE {status} (codex) ===\n{}",
+        "=== RESPONSE {status} ({served}) ===\n{}",
         format_headers(response.headers())
     ));
     if !status.is_success() {
@@ -1866,7 +1981,7 @@ async fn relay_codex(
             (status, "api_error")
         };
         trace.write_error(
-            &format!("codex upstream {out_status}: {}", body_excerpt(&bytes)),
+            &format!("{served} upstream {out_status}: {}", body_excerpt(&bytes)),
             0,
             ctx.started.elapsed().as_millis(),
         );
@@ -1877,7 +1992,7 @@ async fn relay_codex(
         return error_response(
             out_status,
             error_type,
-            &format!("codex upstream: {}", body_excerpt(&bytes)),
+            &format!("{served} upstream: {}", body_excerpt(&bytes)),
         );
     }
 
@@ -1885,7 +2000,10 @@ async fn relay_codex(
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
-        let converter = state.codex.converter();
+        let converter = match served {
+            BackendGroup::Grok => state.grok.converter(),
+            _ => state.codex.converter(),
+        };
         let totals = state.totals.clone();
         let logger = state.logger.clone();
         let request_id = ctx.request_id;
@@ -1959,7 +2077,7 @@ async fn relay_codex(
                 }
                 if log_enabled {
                     sections.push(format!(
-                        "=== RESPONSE BODY (codex→anthropic, first {} bytes) ===\n{}",
+                        "=== RESPONSE BODY (translate→anthropic, first {} bytes) ===\n{}",
                         captured.len(),
                         String::from_utf8_lossy(&captured)
                     ));
@@ -2004,7 +2122,10 @@ async fn relay_codex(
     // Non-streaming client: consume the whole upstream stream through the
     // converter, then answer with the aggregated Messages JSON.
     use tokio_stream::StreamExt as _;
-    let mut converter = state.codex.converter();
+    let mut converter = match served {
+        BackendGroup::Grok => state.grok.converter(),
+        _ => state.codex.converter(),
+    };
     let mut events = sse::EventBuffer::new();
     let mut stream = Box::pin(response.bytes_stream());
     while let Some(item) = stream.next().await {
@@ -2142,6 +2263,150 @@ mod tests {
     use crate::scheduler::AccountPool;
 
     // ---- pure unit tests ----
+
+    fn grok_account(name: &str, token: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Grok {
+                subject: format!("sub-{name}"),
+                access_token: token.to_string(),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: far_future_ms(),
+                token_endpoint: "https://auth.x.ai/token".to_string(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    fn ctx_for_group(model: &str, group: BackendGroup) -> ForwardContext {
+        ForwardContext {
+            method: Method::POST,
+            path_query: "/v1/messages".to_string(),
+            headers: HeaderMap::new(),
+            body: Bytes::from(format!(r#"{{"model":"{model}","messages":[]}}"#)),
+            request_id: 0,
+            log_enabled: false,
+            sections: Vec::new(),
+            activity_id: 0,
+            started: std::time::Instant::now(),
+            model: Some(model.to_string()),
+            user_id: None,
+            group: Some(group),
+            served_by: None,
+        }
+    }
+
+    // ---- C9: grok free-usage-exhausted marker ----
+    #[test]
+    fn c9_free_usage_marker_matches_code_and_message_forms() {
+        assert!(grok_free_usage_exhausted(
+            r#"{"code":"subscription:free-usage-exhausted"}"#
+        ));
+        assert!(grok_free_usage_exhausted(
+            "You have exhausted your included free usage."
+        ));
+        assert!(grok_free_usage_exhausted("FREE-USAGE-EXHAUSTED"));
+        assert!(!grok_free_usage_exhausted("rate limited, slow down"));
+        assert_eq!(GROK_FREE_USAGE_COOLDOWN, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn c9_marker_survives_the_real_condense_chain() {
+        // The live path matches on `upstream_error_detail`'s CONDENSED
+        // output, not the raw body — the xAI shape's string-valued `error`
+        // must survive condensation (live receipt 7, 2026-07-14: it did
+        // not, and the 24h park was unreachable).
+        let xai_429 = br#"{"code":"subscription:free-usage-exhausted","error":"You have exhausted your included free usage. Usage resets over a rolling 24-hour window."}"#;
+        let detail = condense_error_body(xai_429);
+        assert!(
+            detail.contains("free-usage-exhausted") && detail.contains("included free usage"),
+            "condensed detail keeps the marker: {detail}"
+        );
+        assert!(grok_free_usage_exhausted(&detail));
+        // Anthropic/codex object shape unchanged.
+        let anthropic = br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert_eq!(
+            condense_error_body(anthropic),
+            "rate_limit_error: slow down"
+        );
+    }
+
+    // ---- C2b: on_empty_group fallback fixed order + parked ≠ empty ----
+    #[test]
+    fn c2b_empty_grok_group_falls_back_in_fixed_order() {
+        // fallback configured, grok group EMPTY, claude + codex configured →
+        // Claude wins (first in the fixed order).
+        let mut config = Config {
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        };
+        config.routing.on_empty_group = "fallback".to_string();
+        config.proxy.idle_probe.enabled = false;
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        let resolved = resolve_group(&state, &ctx, &snapshot).expect("fallback resolves");
+        assert_eq!(
+            resolved,
+            Some(BackendGroup::Claude),
+            "fixed order: Claude first"
+        );
+    }
+
+    #[test]
+    fn c2b_empty_grok_group_errors_without_fallback() {
+        let mut config = Config {
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        };
+        config.routing.on_empty_group = "error".to_string();
+        config.proxy.idle_probe.enabled = false;
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        assert!(
+            resolve_group(&state, &ctx, &snapshot).is_err(),
+            "on_empty_group=error → 404"
+        );
+    }
+
+    #[test]
+    fn c2b_configured_grok_group_resolves_even_if_all_parked() {
+        // A grok account EXISTS → the group is not empty; resolve_group
+        // returns Grok regardless of park/limit state (parked ≠ empty —
+        // in-group all-limited behavior applies downstream, spec §R5).
+        let config = Config {
+            accounts: vec![oauth_account("a", "at-a"), grok_account("g", "at-g")],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        state.pool.record_429_classified(
+            &AccountId("g".into()),
+            Some(Duration::from_secs(86_400)),
+            Some("grok-4.5"),
+            SystemTime::now(),
+        );
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        let resolved = resolve_group(&state, &ctx, &snapshot).expect("resolves");
+        assert_eq!(
+            resolved,
+            Some(BackendGroup::Grok),
+            "parked but configured stays in-group"
+        );
+    }
 
     #[test]
     fn claude_effort_prefers_output_config_then_thinking_budget() {

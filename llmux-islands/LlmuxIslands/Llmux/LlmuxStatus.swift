@@ -20,8 +20,8 @@ struct LlmuxStatus: Decodable {
 
 struct LlmuxAccountRecord: Decodable {
     let name: String
-    let type: String            // "oauth" | "apikey" | "codex"
-    let group: String?          // "claude" | "codex"
+    let type: String            // "oauth" | "apikey" | "codex" | "grok"
+    let group: String?          // "claude" | "codex" | "grok"
     let status: String?         // "active" | "ok" | "cooldown" | "auth_failed"
     let fiveHour: LlmuxWindow?
     let sevenDay: LlmuxWindow?
@@ -93,4 +93,14 @@ struct LoginStatusResponse: Decodable {
     let phase: String            // "pending" | "done" | "error"
     let account: String?
     let error: String?
+    /// Device-code flow only (grok): the page the user must approve on and
+    /// the code shown there. Absent for the PKCE flows and on old daemons.
+    let verificationUri: String?
+    let userCode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, account, error
+        case verificationUri = "verification_uri"
+        case userCode = "user_code"
+    }
 }

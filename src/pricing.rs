@@ -75,6 +75,11 @@ const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
 /// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
 const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
+/// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
+/// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
+/// Like the codex rows, an API-list-price EQUIVALENT for subscription
+/// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
+const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -93,6 +98,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
+        "grok-4.5" => Some(GROK_4_5),
         _ => None,
     };
     if exact.is_some() {
@@ -166,6 +172,7 @@ pub fn price_for(
     match group.to_ascii_lowercase().as_str() {
         "claude" => Some(OPUS_TIER),
         "codex" => Some(GPT_5_5),
+        "grok" => Some(GROK_4_5),
         _ => None,
     }
 }
@@ -219,6 +226,23 @@ pub fn cost_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- C14: grok pricing ----
+    #[test]
+    fn c14_grok_prices_and_group_fallback() {
+        let overrides = std::collections::HashMap::new();
+        let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
+        assert_eq!(
+            (p.input, p.output, p.cache_read, p.cache_creation),
+            (2.0, 6.0, 0.5, 0.0)
+        );
+        let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
+        assert_eq!(
+            (f.input, f.output),
+            (2.0, 6.0),
+            "unknown grok model → grok fallback"
+        );
+    }
 
     const EPS: f64 = 1e-9;
 

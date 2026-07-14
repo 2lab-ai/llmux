@@ -100,6 +100,9 @@ pub struct AppState {
     /// The OpenAI Codex provider (Responses API translation) for
     /// `type: "codex"` accounts. Holds the per-process session id.
     pub codex: Arc<crate::provider::codex::CodexProvider>,
+    /// xAI grok provider (docs/grok/spec.md): live-mutable shape behind
+    /// `POST /llmux/grok`, same contract as `codex`.
+    pub grok: Arc<crate::provider::grok::GrokProvider>,
     /// On-demand idle-account usage probe (issue #21). Fires at most one
     /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
     /// ranking/display has real 5h/7d data. Enabled by default (#45;
@@ -224,6 +227,10 @@ impl AppState {
             config.codex.upstream.clone(),
             crate::provider::codex::CodexShape::from_config(&config.codex),
         ));
+        let grok = Arc::new(crate::provider::grok::GrokProvider::with_shape(
+            config.grok.upstream.clone(),
+            crate::provider::grok::GrokShape::from_config(&config.grok),
+        ));
         // On-demand idle probe (issue #21): reuses the same client + provider
         // hooks the forward path uses to send one gated `max_tokens = 1` ping.
         let idle_prober = Arc::new(IdleProber::new(
@@ -242,6 +249,7 @@ impl AppState {
         let classifier = Arc::new(crate::routing::Classifier::from_config(
             &config.routing.claude_models,
             &config.routing.codex_models,
+            &config.routing.grok_models,
             &config.routing.default_group,
         ));
         // A non-default upstream (staging, e2e mock) must also receive the
@@ -261,6 +269,7 @@ impl AppState {
             logger,
             provider,
             codex,
+            grok,
             idle_prober,
             classifier,
             refresher: Arc::new(refresher),
@@ -882,7 +891,8 @@ pub async fn background_refresh_pass(state: &AppState) {
         };
         let expires_at_ms = match &credential {
             AccountCredential::Oauth { expires_at_ms, .. }
-            | AccountCredential::Codex { expires_at_ms, .. } => *expires_at_ms,
+            | AccountCredential::Codex { expires_at_ms, .. }
+            | AccountCredential::Grok { expires_at_ms, .. } => *expires_at_ms,
             AccountCredential::Apikey { .. } => continue,
         };
         if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
@@ -930,6 +940,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/dashboard", get(dashboard_endpoint))
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
+        .route("/llmux/grok", post(grok_config_endpoint))
         .route("/llmux/settings", post(settings_endpoint))
         .route("/llmux/add-account", post(add_account_endpoint))
         .route("/llmux/inject-account", post(inject_account_endpoint))
@@ -1304,6 +1315,69 @@ async fn codex_config_endpoint(
         .into_response()
 }
 
+/// Partial update for `POST /llmux/grok` (docs/grok/spec.md §R4, C10 —
+/// dashboard/islands grok settings). Same partial-update contract as
+/// `POST /llmux/codex`; differences (intentional, spec §R1/T4): effort is
+/// VALIDATED against the closed superset `none|low|medium|high` (per-model
+/// clamping happens at request time), there is no `fast` (xAI has no service
+/// tier), and the response reports whether the config write succeeded
+/// (`persisted`) instead of hiding a failed persist.
+#[derive(serde::Deserialize)]
+struct GrokConfigRequest {
+    default_model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+async fn grok_config_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<GrokConfigRequest>,
+) -> Response {
+    let mut shape = state.grok.shape();
+    if let Some(model) = body.default_model.as_deref() {
+        if !model.trim().is_empty() {
+            shape.model = model.trim().to_string();
+        }
+    }
+    if let Some(effort) = body.reasoning_effort.as_deref() {
+        let e = effort.trim().to_ascii_lowercase();
+        if e.is_empty() || e == "unset" {
+            shape.effort = None;
+        } else if crate::provider::grok::is_valid_config_effort(&e) {
+            shape.effort = Some(e);
+        } else {
+            return relay_error(
+                StatusCode::BAD_REQUEST,
+                "reasoning_effort must be one of none|low|medium|high (or empty/'unset' to clear)",
+            );
+        }
+    }
+    // Apply live (takes effect on the next request) ...
+    state.grok.set_shape(shape.clone());
+    // ... and persist so it survives a daemon restart. The outcome is
+    // reported, not swallowed (C10).
+    let persisted = match &state.config_path {
+        Some(path) => crate::config::update_path(path, |c| {
+            c.grok.default_model = shape.model.clone();
+            c.grok.reasoning_effort = shape.effort.clone();
+        })
+        .map_err(|err| tracing::warn!(error = %err, "grok config persist failed"))
+        .is_ok(),
+        None => false,
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "ok": true,
+            "default_model": shape.model,
+            "reasoning_effort": shape.effort,
+            "persisted": persisted,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// Partial update for `POST /llmux/settings` — daemon-wide display settings.
 /// Every field is optional; an omitted field keeps its current value (same
 /// contract as `POST /llmux/codex`), so the endpoint stays additive as more
@@ -1449,7 +1523,8 @@ async fn inject_account_endpoint(
     // the upsert — never the raw token (AGENTS.md credential rule).
     let access_token_masked = match &account.credential {
         AccountCredential::Oauth { access_token, .. }
-        | AccountCredential::Codex { access_token, .. } => {
+        | AccountCredential::Codex { access_token, .. }
+        | AccountCredential::Grok { access_token, .. } => {
             Some(crate::proxy::logging::mask_credentials(access_token))
         }
         AccountCredential::Apikey { .. } => None,
@@ -1521,7 +1596,7 @@ async fn login_start_endpoint(
     let Some(provider) = super::login::LoginProvider::parse(&body.provider) else {
         return relay_error(
             StatusCode::BAD_REQUEST,
-            "provider must be 'claude' or 'codex'",
+            "provider must be 'claude', 'codex', or 'grok'",
         );
     };
     if state.config_path.is_none() {
@@ -1544,7 +1619,7 @@ async fn login_start_endpoint(
     let app = state.clone();
     let task_state = state_id.clone();
     let handle = tokio::spawn(async move {
-        let phase = match run_login(&app, provider).await {
+        let phase = match run_login(&app, provider, &task_state).await {
             Ok(account) => super::login::LoginPhase::Done { account },
             Err(message) => super::login::LoginPhase::Error { message },
         };
@@ -1572,6 +1647,7 @@ async fn login_start_endpoint(
 async fn run_login(
     state: &AppState,
     provider: super::login::LoginProvider,
+    state_id: &str,
 ) -> Result<String, String> {
     use super::login::LoginProvider;
     let account = match provider {
@@ -1586,6 +1662,29 @@ async fn run_login(
         )
         .await
         .map_err(|e| e.to_string())?,
+        LoginProvider::Grok => {
+            // Device-code flow (docs/grok/spec.md T2): no localhost
+            // callback. Publish the verification URL so the GUI can open it
+            // (and best-effort open it daemon-side too), then poll.
+            let discovery = crate::auth::grok::discover(&state.client)
+                .await
+                .map_err(|e| e.to_string())?;
+            let device = crate::auth::grok::request_device_code(&state.client, &discovery)
+                .await
+                .map_err(|e| e.to_string())?;
+            state.logins.set_verification(
+                state_id,
+                device.open_url().to_string(),
+                device.user_code.clone(),
+            );
+            crate::auth::oauth::open_browser(device.open_url());
+            let bundle =
+                crate::auth::grok::poll_token(&state.client, &discovery.token_endpoint, &device)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint)
+                .map_err(|e| e.to_string())?
+        }
     };
     state
         .inject_account(account)
@@ -1602,7 +1701,20 @@ async fn login_status_endpoint(
     axum::extract::Query(query): axum::extract::Query<LoginStatusQuery>,
 ) -> Response {
     let body = match state.logins.status(&query.state) {
-        Some(super::login::LoginPhase::Pending) => serde_json::json!({ "phase": "pending" }),
+        Some(super::login::LoginPhase::Pending) => {
+            // Additive: `verification_uri`/`user_code` appear only once the
+            // grok device flow mints them (docs/grok/spec.md T2, C11);
+            // older clients ignore the extra fields.
+            let (uri, code) = state.logins.verification(&query.state);
+            match uri {
+                Some(uri) => serde_json::json!({
+                    "phase": "pending",
+                    "verification_uri": uri,
+                    "user_code": code,
+                }),
+                None => serde_json::json!({ "phase": "pending" }),
+            }
+        }
         Some(super::login::LoginPhase::Done { account }) => {
             serde_json::json!({ "phase": "done", "account": account })
         }
@@ -2521,6 +2633,91 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    // ---- C10: POST /llmux/grok ----
+    #[tokio::test]
+    async fn c10_grok_config_partial_update_persists_and_validates() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("keep")]);
+
+        // Partial update: model + effort (superset value "none" accepted).
+        let response = grok_config_endpoint(
+            State(state.clone()),
+            axum::extract::Json(GrokConfigRequest {
+                default_model: Some("grok-4.3".into()),
+                reasoning_effort: Some("none".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["default_model"], "grok-4.3");
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["persisted"], true, "config write reported (C10)");
+        // Applied live + persisted.
+        assert_eq!(state.grok.model(), "grok-4.3");
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.grok.default_model, "grok-4.3");
+        assert_eq!(on_disk.grok.reasoning_effort.as_deref(), Some("none"));
+
+        // Omitted field keeps current value; "unset" clears effort.
+        let response = grok_config_endpoint(
+            State(state.clone()),
+            axum::extract::Json(GrokConfigRequest {
+                default_model: None,
+                reasoning_effort: Some("unset".into()),
+            }),
+        )
+        .await;
+        let body = response_json(response).await;
+        assert_eq!(body["default_model"], "grok-4.3", "omitted model kept");
+        assert!(body["reasoning_effort"].is_null(), "unset clears");
+
+        // Garbage effort → 400, nothing changed.
+        let response = grok_config_endpoint(
+            State(state.clone()),
+            axum::extract::Json(GrokConfigRequest {
+                default_model: None,
+                reasoning_effort: Some("xhigh".into()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "xhigh not in grok superset"
+        );
+        assert_eq!(state.grok.model(), "grok-4.3");
+    }
+
+    // ---- C11: login status carries device-flow verification fields ----
+    #[tokio::test]
+    async fn c11_login_status_carries_verification_uri_while_pending() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("keep")]);
+        assert!(state.logins.begin("st-1".to_string()));
+        state.logins.set_verification(
+            "st-1",
+            "https://x.ai/device?code=ABCD".to_string(),
+            "ABCD-EFGH".to_string(),
+        );
+        let response = login_status_endpoint(
+            State(state.clone()),
+            axum::extract::Query(LoginStatusQuery {
+                state: "st-1".to_string(),
+            }),
+        )
+        .await;
+        let body = response_json(response).await;
+        assert_eq!(body["phase"], "pending");
+        assert_eq!(body["verification_uri"], "https://x.ai/device?code=ABCD");
+        assert_eq!(body["user_code"], "ABCD-EFGH");
+        // Non-grok pending logins (no verification published) stay minimal.
+        assert!(!state.logins.begin("st-1b".to_string()), "single slot");
     }
 
     #[tokio::test]

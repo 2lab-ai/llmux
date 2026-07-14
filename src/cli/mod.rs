@@ -158,6 +158,10 @@ pub struct LoginArgs {
     /// OAuth browser flow instead of the Claude flow.
     #[arg(long, conflicts_with = "api")]
     pub codex: bool,
+    /// Add an xAI Grok subscription account via the device-code flow
+    /// (opens a verification page; no localhost callback).
+    #[arg(long, conflicts_with_all = ["api", "codex"])]
+    pub grok: bool,
 }
 
 #[derive(Debug, Args)]
@@ -743,6 +747,7 @@ mod tests {
             remote_refused_command(&Command::Login(LoginArgs {
                 api: false,
                 codex: false,
+                grok: false,
             })),
             Some("login")
         );
