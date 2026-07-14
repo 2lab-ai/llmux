@@ -253,12 +253,14 @@ This is a practical Claude Code context-management workaround: use the 1M Claude
 
 ## Documentation
 
-- [Docs index](docs/README.md) — the map for detailed guides.
-- [Operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard behavior, scheduling policy, model routing details, and Codex backend behavior.
-- [Configuration](docs/configuration.md) — config file location, proxy keys, scheduler knobs, routing options, Codex settings, and account types.
+- [Docs index](docs/README.md) — map of all guides.
+- [Operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, Codex backend.
+- [Configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types.
+- [Models](docs/models.md) — catalog, aliases, context windows, group routing.
 - [FAQ](docs/faq.md) — context-window workarounds and common usage questions.
-- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, and recording setup.
-- [Contributor guide](AGENTS.md) — architecture rules and development conventions.
+- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion.
+- [System prompts (multi-model)](docs/system-prompts/README.md) — **real captured wire system prompts** under [`docs/system-prompts/samples/`](docs/system-prompts/samples/) (what Claude Code actually injects when routing through grok/gpt/claude).
+- [Contributor guide](AGENTS.md) — architecture rules, conventions, runbooks (SSOT for agents).
 
 ## Compliance & caveats
 
