@@ -490,6 +490,10 @@ pub struct DashboardDoc {
     /// Additive: absent in docs written before this existed.
     #[serde(default)]
     pub codex: CodexSettingsDoc,
+    /// Live grok request settings (UI-3 U12 — group-settings bar effort
+    /// override). Additive: absent in older docs → unavailable.
+    #[serde(default)]
+    pub grok: GrokSettingsDoc,
     /// Live `email_anonymous` display setting. Account names in THIS document
     /// stay real (SSOT T1); the renderer masks at draw time when this is on,
     /// so an API flip reflects on the next frame/poll without restart — in
@@ -610,6 +614,19 @@ pub struct CodexSettingsDoc {
     pub available: bool,
     #[serde(default)]
     pub fast: bool,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Live grok provider settings (UI-3 U12), mirroring [`CodexSettingsDoc`]:
+/// `available` is false when no grok account is configured; `effort` `None`
+/// = bypass (the client's `output_config.effort` rides through).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrokSettingsDoc {
+    #[serde(default)]
+    pub available: bool,
     #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1069,8 @@ pub struct DocMeta {
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
     pub codex: CodexSettingsDoc,
+    /// Live grok settings (UI-3 U12), same convention as `codex`.
+    pub grok: GrokSettingsDoc,
     /// Live `email_anonymous` display setting (see
     /// [`DashboardDoc::email_anonymous`]).
     pub email_anonymous: bool,
@@ -1554,6 +1573,7 @@ pub(crate) fn dashboard_doc(
             })
             .collect(),
         codex: meta.codex.clone(),
+        grok: meta.grok.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
@@ -1574,6 +1594,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let params = state.select_params();
     let hub = state.hub.view(now);
     let codex_shape = state.codex.shape();
+    let grok_shape = state.grok.shape();
     let meta = DocMeta {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
@@ -1590,6 +1611,14 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             fast: codex_shape.fast,
             model: codex_shape.model,
             effort: codex_shape.effort,
+        },
+        grok: GrokSettingsDoc {
+            available: snapshot
+                .accounts
+                .iter()
+                .any(|a| a.group == crate::routing::BackendGroup::Grok),
+            model: grok_shape.model,
+            effort: grok_shape.effort,
         },
         // Pricing overrides from the live config's `[pricing]` section
         // (Feature D); empty → built-in default rate table.
@@ -1643,6 +1672,7 @@ mod tests {
 
     fn meta() -> DocMeta {
         DocMeta {
+            grok: GrokSettingsDoc::default(),
             pid: 4321,
             uptime_secs: 130,
             port: 3456,

@@ -74,8 +74,15 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5.5-codex",
     "gpt-5-codex",
 ];
-/// Reasoning-effort levels cycled with `e`; "" = unset (backend default).
-const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+/// Reasoning-effort levels cycled with `e` (and the group-settings bar);
+/// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
+/// U12). A concrete value OVERRIDES every request. `max` is native on the
+/// gpt-5.6 family and clamps to `xhigh` on older models.
+const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
+/// Values are the config superset (`none|low|medium|high`) — per-model
+/// clamping happens at request time in the provider.
+const GROK_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
 
 /// One-line summary of codex settings for the status bar.
 fn codex_status_line(c: &CodexSettingsDoc) -> String {
@@ -83,7 +90,7 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
         "codex {} · fast {} · effort {}",
         c.model,
         if c.fast { "on" } else { "off" },
-        c.effort.as_deref().unwrap_or("default"),
+        c.effort.as_deref().unwrap_or("bypass"),
     )
 }
 
@@ -381,6 +388,10 @@ struct Remote {
     /// Account name queued for removal (`r` confirm), performed by the event
     /// loop via `POST /llmux/remove-account`.
     pending_remove: Option<String>,
+    /// Grok effort change queued by the group-settings bar (UI-3 U12),
+    /// performed by the event loop via `POST /llmux/grok`. Inner `None` =
+    /// clear to bypass.
+    pending_grok: Option<Option<String>>,
 }
 
 /// One message from the remote fetch task.
@@ -422,6 +433,8 @@ struct App {
     account_row_chrome: Vec<ui::AccountRowHit>,
     /// The rendered context menu's hit layout (UI-3 U11), when open.
     menu_chrome: Option<ui::MenuChrome>,
+    /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
+    setting_chrome: Vec<ui::SettingHit>,
     /// Anchor cell of the open context menu (col, row).
     menu_anchor: Option<(u16, u16)>,
     /// Whether the limits editor was opened FROM the context menu (then it
@@ -485,6 +498,7 @@ impl App {
             pane_heights: PaneHeights::default(),
             account_row_chrome: Vec::new(),
             menu_chrome: None,
+            setting_chrome: Vec::new(),
             menu_anchor: None,
             limits_from_menu: false,
             drag: None,
@@ -699,6 +713,27 @@ impl App {
                     .copied()
                 {
                     self.drag = Some(sep);
+                    return true;
+                }
+                // Group-settings bar (UI-3 U9/U10): click a segment to
+                // rotate that setting.
+                if let Some(action) = self
+                    .setting_chrome
+                    .iter()
+                    .find(|h| {
+                        mouse.row == h.area.y
+                            && mouse.column >= h.area.x
+                            && mouse.column < h.area.right()
+                    })
+                    .map(|h| h.action)
+                {
+                    match action {
+                        ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
+                        ui::SettingAction::CodexModel => self.cycle_codex_model(view),
+                        ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
+                        ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
+                        ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                    }
                     return true;
                 }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
@@ -1179,6 +1214,71 @@ impl App {
         } else {
             self.set_status("codex: no codex account".into());
         }
+    }
+
+    /// Cycle the grok effort override (UI-3 U12): bypass → none → low →
+    /// medium → high → bypass. Local mode applies + persists in-process;
+    /// attach mode queues `POST /llmux/grok`.
+    fn cycle_grok_effort(&mut self, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        if !view.grok.available {
+            self.set_status("grok: no grok account".into());
+            return;
+        }
+        let cur = view.grok.effort.as_deref().unwrap_or("");
+        let next = GROK_EFFORTS
+            .iter()
+            .position(|e| *e == cur)
+            .map(|i| (i + 1) % GROK_EFFORTS.len())
+            .unwrap_or(0);
+        let effort = (!GROK_EFFORTS[next].is_empty()).then(|| GROK_EFFORTS[next].to_string());
+        let label = effort.clone().unwrap_or_else(|| "bypass".to_string());
+        match &mut self.backend {
+            Backend::Local(state) => {
+                let mut shape = state.grok.shape();
+                shape.effort = effort.clone();
+                state.grok.set_shape(shape);
+                if let Some(path) = &state.config_path {
+                    let _ = crate::config::update_path(path, |c| {
+                        c.grok.reasoning_effort = effort.clone();
+                    });
+                }
+                self.set_status(format!("grok effort: {label}"));
+            }
+            Backend::Remote(remote) => {
+                remote.pending_grok = Some(effort);
+                self.set_status(format!("grok effort → {label}…"));
+            }
+        }
+    }
+
+    fn take_pending_grok(&mut self) -> Option<Option<String>> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_grok.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote grok effort change (`POST /llmux/grok`).
+    /// `None` clears to bypass (the endpoint's "unset" form).
+    async fn perform_remote_grok(&mut self, effort: Option<String>) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/grok", remote.base_url);
+        let label = effort.as_deref().unwrap_or("bypass").to_string();
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "reasoning_effort": effort.as_deref().unwrap_or("unset"),
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("grok effort: {label}"),
+            Ok(response) => format!("grok effort change failed: {}", response.status()),
+            Err(err) => format!("grok effort change failed: {err}"),
+        };
+        self.set_status(message);
     }
 
     /// Apply a codex settings change: locally in-process, or queued for the
@@ -1992,6 +2092,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_mode: None,
         pending_add: None,
         pending_remove: None,
+        pending_grok: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
     restore_terminal();
@@ -2112,6 +2213,10 @@ async fn event_loop(
             app.perform_remote_remove(name).await;
             redraw = true;
         }
+        if let Some(effort) = app.take_pending_grok() {
+            app.perform_remote_grok(effort).await;
+            redraw = true;
+        }
         // A new browser login needs the RAW terminal back: the OAuth flow
         // prints prompts and may read a pasted code from stdin, which would
         // corrupt the alternate-screen TUI. Suspend (restore the terminal),
@@ -2140,6 +2245,7 @@ async fn event_loop(
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
+            app.setting_chrome = main.settings;
         }
     }
 }
@@ -2285,6 +2391,7 @@ mod tests {
             pending_mode: None,
             pending_add: None,
             pending_remove: None,
+            pending_grok: None,
         })))
     }
 
@@ -2584,6 +2691,62 @@ mod tests {
         };
         assert!(app.on_mouse(lclick_outside, Some(&view)));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// UI-3 U9/U10/U12: clicking a group-settings segment rotates that
+    /// setting; the codex effort cycle now includes `max`; the grok effort
+    /// cycle queues the `POST /llmux/grok` change with bypass in the loop.
+    #[test]
+    fn settings_bar_click_rotates_settings() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut view = stats_view_with_account();
+        view.grok.available = true;
+        view.grok.effort = None; // bypass
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        view.codex.effort = Some("xhigh".into());
+        let mut app = remote_app();
+        app.setting_chrome = vec![
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 30,
+                    width: 10,
+                    height: 1,
+                },
+                action: ui::SettingAction::CodexEffort,
+            },
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 20,
+                    y: 30,
+                    width: 6,
+                    height: 1,
+                },
+                action: ui::SettingAction::GrokEffort,
+            },
+        ];
+        let click = |x: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        };
+        // codex effort: xhigh → max (the new top of the cycle).
+        assert!(app.on_mouse(click(3), Some(&view)));
+        assert_eq!(
+            app.take_pending_codex().map(|c| c.effort),
+            Some(Some("max".to_string())),
+            "xhigh cycles to max"
+        );
+        // grok effort: bypass → none (first concrete value), queued for the
+        // grok endpoint.
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(Some("none".to_string())));
+        // Cycling from the top of the grok list wraps back to bypass.
+        view.grok.effort = Some("high".into());
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(None), "high wraps to bypass");
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
@@ -2949,6 +3112,7 @@ mod tests {
         use crate::scheduler::PoolSnapshot;
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            grok: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,

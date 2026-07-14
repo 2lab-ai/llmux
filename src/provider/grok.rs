@@ -256,11 +256,14 @@ fn thinking_levels(model: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Per-request reasoning effort for grok (spec §R1, single-source rule):
-/// the request's `output_config.effort` (Claude Agent SDK wire) wins over
-/// the configured shape effort; the winner clamps INTO the effective
-/// model's level set. Models outside [`GROK_THINKING_LEVELS`] always yield
-/// `None` (omit `reasoning`). A clamped result of `none` also yields `None`
-/// — omission is the only universally-accepted zero form.
+/// a CONFIGURED shape effort OVERRIDES the request's `output_config.effort`
+/// (UI-3 U12 — unset shape = bypass, the client value rides through); the
+/// winner clamps INTO the effective model's level set. Models outside
+/// [`GROK_THINKING_LEVELS`] always yield `None` (omit `reasoning`). A
+/// clamped result of `none` also yields `None` — omission is the only
+/// universally-accepted zero form. Precedence flipped 2026-07-15 (was
+/// request-wins — codex parity): Claude Code always sends an effort, so a
+/// configured override could never apply.
 fn resolve_reasoning_effort(
     body: &Value,
     shape_effort: Option<&str>,
@@ -277,7 +280,7 @@ fn resolve_reasoning_effort(
         .map(|e| e.trim().to_ascii_lowercase())
         .filter(|e| !e.is_empty() && e != "default")
         .filter(|e| GROK_EFFORT_INPUTS.contains(&e.as_str()));
-    let candidate = requested.or(configured)?;
+    let candidate = configured.or(requested)?;
     let clamped = match candidate.as_str() {
         "none" | "minimal" => {
             if levels.contains(&"none") {
