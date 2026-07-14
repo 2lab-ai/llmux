@@ -96,9 +96,10 @@
    stability contract as codex's `prompt_cache_key`, codex.rs:79-83; it is NOT
    per-conversation) →
    headers: `Authorization: Bearer {access_token}`, `Accept: text/event-stream`,
-   `x-grok-conv-id: {session_id}`, and (upstream == official cli-chat-proxy) identity
-   trio `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 0.2.93` /
-   `User-Agent: xai-grok-workspace/0.2.93` →
+   and (upstream == official cli-chat-proxy) identity trio
+   `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 0.2.93` /
+   `User-Agent: xai-grok-workspace/0.2.93` — **no `x-grok-conv-id`** (spec §R1,
+   consensus round 3: CLIProxyAPI omits it for standard chat) →
    `POST https://cli-chat-proxy.grok.com/v1/responses` →
    Responses SSE → `responses::SseTransform` (shared, currently proxy/sse.rs path) →
    Anthropic SSE events → client. `client_model` override applies to the reported
@@ -120,12 +121,12 @@
 1. **Entry** — `POST /llmux/grok` (new route beside `/llmux/codex`, server.rs:775 chain,
    same auth gate).
 2. **Input** — `{"default_model"?: string, "reasoning_effort"?: string}` — partial;
-   empty/`"unset"` effort clears; unknown fields rejected by serde deny? (parity: codex
-   struct ignores unknown — keep identical semantics).
+   empty/`"unset"` effort clears; unknown fields ignored (parity: codex struct).
 3. **Layer flow** — deserialize → `state.grok.shape()` → merge → validate effort ∈
-   {low, medium, high, "" (clear)} (invalid → 400; note: codex endpoint does NOT
-   validate — grok validates because the clamp set is closed; recorded as intentional
-   asymmetry) → `state.grok.set_shape(…)` (RwLock write) →
+   SUPERSET {none, low, medium, high, "" (clear)} (invalid → 400; the per-MODEL clamp
+   happens at request time against the effective model — spec §R1 single-source rule;
+   codex endpoint does not validate at all; recorded as intentional asymmetry) →
+   `state.grok.set_shape(…)` (RwLock write) →
    `config::update_path(c.grok.default_model = …, c.grok.reasoning_effort = …)`.
 4. **Side effects** — next request uses the new shape; config persisted.
 5. **Errors** — config write failure → 200 with live-applied, `persisted:false` in the
@@ -179,14 +180,14 @@
 | C1 | Contract | Messages body w/ model grok-4.5 + output_config.effort=xhigh → upstream JSON: model verbatim, reasoning.effort="high" (clamped), NO include/service_tier, store:false | T3 §3 |
 | C2 | Contract | model "gpt-5.6-sol" routes Codex; "grok-4.5" routes Grok; "claude-…" routes Claude; unmatched → default_group; non-empty `routing.grok_models` REPLACES builtin grok rules | T3 §3 |
 | C2b | Contract | on_empty_group="fallback": zero configured grok accounts + grok model → fixed-order fallback (Claude first configured wins) + serving provider's own model rewrite applies; group with only PARKED accounts does NOT fall back | T3 §3, T5 |
-| C3 | Contract | grok headers: Bearer + conv-id + identity trio on official upstream; identity trio ABSENT on custom upstream | T3 §3 |
-| C4 | Sad | effort "none" → "low" (grok-4.5, zero disallowed); "ultra" → "high"; invalid effort string → shape effort fallback; model outside thinking table (grok-build-0.1) → NO reasoning field even with effort configured | T3 §3 |
+| C3 | Contract | grok headers: Bearer + identity trio on official upstream; identity trio ABSENT on custom upstream; NO x-grok-conv-id either way | T3 §3 |
+| C4 | Sad | effort "none" → "low" (grok-4.5, zero disallowed); "none" on grok-4.3 (none in level set) → reasoning field OMITTED; "ultra" → "high"; invalid effort string → shape effort fallback; model outside thinking table (grok-build-0.1) → NO reasoning field even with effort configured | T3 §3 |
 | C5 | Happy | device-code poll: form carries grant_type+device_code+client_id; pending→pending→success yields TokenData; slow_down grows interval | T1 §3 (mock server) |
 | C6 | Sad | poll access_denied → terminal error, no config write | T1 §5 |
 | C7 | Contract | AccountCredential::Grok serde round-trip in llmux.json; upsert-by-name idempotent | T1 §3-4 |
 | C8 | Contract | refresh_credential Grok arm: form grant_type=refresh_token+client_id to stored token_endpoint; response WITH refresh_token rotates it, WITHOUT keeps old; expires_at_ms+last_refresh_ms updated in same swap; invalid_grant → Permanent | T3 §3, spec §R1 |
 | C9 | Sad | 429 + marker body (no Retry-After) → 24h estimated park; 429 + Retry-After header → header wins; generic 429 → no explicit park | T5 |
-| C10 | Contract | POST /llmux/grok partial update + persist (response carries persisted:true/false); invalid effort → 400 | T4 |
+| C10 | Contract | POST /llmux/grok partial update + persist (response carries persisted:true/false); effort superset none/low/medium/high accepted, garbage → 400 | T4 |
 | C11 | Contract | /llmux/login/start grok → status carries verification_uri (+user_code) while pending; _complete absent → plain URI fallback | T2 |
 | C12 | Regression | ENTIRE existing codex test suite green with codex.rs as adapter (no behavioral diff), at the extraction commit itself | R5 |
 | C13 | Contract | status JSON: grok account row shape (group/type/gauges null) | T6 |
