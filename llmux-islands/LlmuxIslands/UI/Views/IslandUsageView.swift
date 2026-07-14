@@ -18,6 +18,11 @@ struct IslandUsageView: View {
         ]
     }
 
+    private var loginInProgress: Bool {
+        guard let phase = model.login?.phase else { return false }
+        return phase == "starting" || phase == "pending" || phase == "cancelling"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
@@ -33,7 +38,9 @@ struct IslandUsageView: View {
                 .foregroundColor(.white)
             connectionBadge
             Spacer()
-            iconButton(adding ? "xmark" : "plus") { adding.toggle() }
+            iconButton(adding ? "xmark" : "plus", disabled: loginInProgress) {
+                adding.toggle()
+            }
             iconButton("arrow.clockwise") { Task { await model.refresh() } }
         }
         .padding(.horizontal, 2)
@@ -64,7 +71,7 @@ struct IslandUsageView: View {
         } else if case .offline = model.connection, model.tiles.isEmpty {
             stateMessage(icon: "bolt.horizontal.circle",
                          title: "llmux not reachable",
-                         detail: "start the daemon: llmux run  (:3456)",
+                         detail: "check the configured llmux endpoint and credentials",
                          tint: TerminalColors.red.opacity(0.85))
         } else if model.tiles.isEmpty {
             stateMessage(icon: "tray", title: "No accounts yet", detail: "add one with the + button", tint: .white.opacity(0.35))
@@ -97,7 +104,11 @@ struct IslandUsageView: View {
         .padding(.vertical, 24)
     }
 
-    private func iconButton(_ symbol: String, _ action: @escaping () -> Void) -> some View {
+    private func iconButton(
+        _ symbol: String,
+        disabled: Bool = false,
+        _ action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 11, weight: .semibold))
@@ -106,6 +117,8 @@ struct IslandUsageView: View {
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.06)))
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.45 : 1)
     }
 }
 
@@ -276,7 +289,7 @@ private struct LoginProgressView: View {
     @ObservedObject var model: IslandUsageModel
 
     var body: some View {
-        let inProgress = login.phase == "pending" || login.phase == "starting"
+        let inProgress = login.phase == "pending" || login.phase == "starting" || login.phase == "cancelling"
         VStack(spacing: 12) {
             switch login.phase {
             case "done":
@@ -285,6 +298,9 @@ private struct LoginProgressView: View {
             case "error":
                 Image(systemName: "xmark.octagon.fill").font(.system(size: 30)).foregroundColor(TerminalColors.red)
                 Text(login.message ?? "login failed").foregroundColor(.white.opacity(0.75)).multilineTextAlignment(.center)
+            case "cancelling":
+                ProgressView().controlSize(.large)
+                Text(login.message ?? "Cancelling login…").foregroundColor(.white.opacity(0.75))
             default:
                 ProgressView().controlSize(.large)
                 Text(login.message ?? "Waiting for browser…").foregroundColor(.white.opacity(0.75))

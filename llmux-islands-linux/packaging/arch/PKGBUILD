@@ -1,0 +1,65 @@
+# Maintainer: 2lab.ai <z@2lab.ai>
+
+pkgname=llmux-islands-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="KDE control surface for the llmux proxy"
+arch=('x86_64' 'aarch64')
+url="https://github.com/2lab-ai/llmux"
+license=('MIT')
+depends=(
+  'gtk3'
+  'kirigami'
+  'layer-shell-qt'
+  'libcanberra'
+  'libnotify'
+  'qqc2-desktop-style'
+  'qt6-base'
+  'qt6-declarative'
+  'qt6-svg'
+  'qt6-wayland'
+)
+makedepends=('cargo' 'clang' 'git' 'qt6-tools')
+optdepends=('llmux: local proxy daemon started when the configured endpoint is loopback')
+provides=('llmux-islands')
+conflicts=('llmux-islands')
+# makepkg enables C/C++ LTO by default. Its injected -flto flags leave the
+# generated CXX-Qt support archive without the symbols rustc links from it.
+# Rust's normal release optimization remains enabled.
+options=('!lto')
+# CI points this at a local Git commit containing the exact checkout under
+# test; normal makepkg/AUR builds use the canonical upstream repository.
+source=("llmux::git+${LLMUX_SOURCE_URL:-https://github.com/2lab-ai/llmux.git}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/llmux"
+  printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd "$srcdir/llmux/llmux-islands-linux"
+  QMAKE=/usr/bin/qmake6 cargo build --release --locked
+}
+
+check() {
+  cd "$srcdir/llmux/llmux-islands-linux"
+  cargo test --no-default-features --locked
+}
+
+package() {
+  cd "$srcdir/llmux"
+  install -Dm755 \
+    llmux-islands-linux/target/release/llmux-islands-linux \
+    "$pkgdir/usr/bin/llmux-islands-linux"
+  install -Dm644 \
+    llmux-islands-linux/resources/io.twolab.LlmuxIslands.desktop \
+    "$pkgdir/usr/share/applications/io.twolab.LlmuxIslands.desktop"
+  install -Dm644 \
+    llmux-islands-linux/resources/io.twolab.LlmuxIslands.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.twolab.LlmuxIslands.metainfo.xml"
+  install -Dm644 \
+    llmux-islands-linux/resources/icons/io.twolab.LlmuxIslands.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.twolab.LlmuxIslands.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

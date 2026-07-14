@@ -85,6 +85,7 @@ struct LlmuxScopedWindow: Decodable {
 }
 
 struct LoginStartResponse: Decodable {
+    let ok: Bool
     let state: String
     let provider: String?
 }

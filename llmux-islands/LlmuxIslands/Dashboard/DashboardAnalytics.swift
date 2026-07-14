@@ -184,8 +184,9 @@ enum DashboardHealth {
         return result
     }
 
-    /// Status-fallback accounts (`/llmux/status`, old daemons) — same rule, so
-    /// the closed-island warning color works on both poll paths.
+    /// Pure DTO helper for compatibility-fixture tests. Live status-only
+    /// responses are normalized and their health projection is derived by
+    /// Rust, not by this Swift overload.
     static func summary(records: [LlmuxAccountRecord]) -> Summary {
         var result = Summary()
         for record in records {

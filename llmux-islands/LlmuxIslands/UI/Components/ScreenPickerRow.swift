@@ -67,8 +67,7 @@ struct ScreenPickerRow: View {
                         sublabel: "Built-in or Main",
                         isSelected: screenSelector.selectionMode == .automatic
                     ) {
-                        screenSelector.selectAutomatic()
-                        triggerWindowRecreation()
+                        Task { await IslandUsageModel.shared.selectScreen(nil) }
                         collapseAfterDelay()
                     }
 
@@ -80,8 +79,7 @@ struct ScreenPickerRow: View {
                             isSelected: screenSelector.selectionMode == .specificScreen &&
                                        screenSelector.isSelected(screen)
                         ) {
-                            screenSelector.selectScreen(screen)
-                            triggerWindowRecreation()
+                            Task { await IslandUsageModel.shared.selectScreen(screen) }
                             collapseAfterDelay()
                         }
                     }
@@ -117,14 +115,6 @@ struct ScreenPickerRow: View {
             parts.append("Main")
         }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
-    }
-
-    private func triggerWindowRecreation() {
-        // Notify to recreate the window
-        NotificationCenter.default.post(
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
     }
 
     private func collapseAfterDelay() {
