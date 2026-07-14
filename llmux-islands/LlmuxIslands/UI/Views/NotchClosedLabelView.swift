@@ -27,6 +27,10 @@ struct NotchClosedLabelView: View {
     let codexCount: Int
     /// Σ in-flight sessions over Grok accounts — drives `{k}`.
     let grokCount: Int
+    /// exception-beacon: the worst live exception, or `.none` for today's
+    /// label pixel-identical. The chip is STATIC (decoupled from the rainbow
+    /// loop) so a warning never reads as decoration.
+    var signal: GlanceSignal = .none
     /// Whether the island is actually on screen (NotchView's `isVisible`). On
     /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
     /// 30fps timeline paused then instead of animating an invisible view.
@@ -60,7 +64,8 @@ struct NotchClosedLabelView: View {
                 jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
                 claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
                 codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed),
-                grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed)
+                grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed),
+                signal: signal
             )
         }
     }
@@ -120,6 +125,9 @@ struct NotchClosedLabelContent: View {
     let codexHue: Double
     /// 0..<1 rainbow hue for the grok `[icon]{k}` group.
     let grokHue: Double
+    /// exception-beacon chip; `.none` renders today's label pixel-identical
+    /// (no reserved slot, no spacer).
+    var signal: GlanceSignal = .none
 
     var body: some View {
         HStack(spacing: 8) {
@@ -132,18 +140,55 @@ struct NotchClosedLabelContent: View {
                 .truncationMode(.tail)
                 .minimumScaleFactor(0.6)
 
-            ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
-                .offset(y: jumpOffset)
+            if case .offline = signal {
+                // Observation failure ≠ zero activity: hide the (stale)
+                // session groups, dim the mascot, and SAY offline.
+                ClaudeCrabIcon(size: 14, animateLegs: false)
+                    .opacity(0.35)
+                chip("offline", color: Color.white.opacity(0.45))
+            } else {
+                ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
+                    .offset(y: jumpOffset)
 
-            if claudeCount > 0 {
-                providerGroup(.claude, count: claudeCount, hue: claudeHue)
+                if claudeCount > 0 {
+                    providerGroup(.claude, count: claudeCount, hue: claudeHue)
+                }
+                if codexCount > 0 {
+                    providerGroup(.codex, count: codexCount, hue: codexHue)
+                }
+                if grokCount > 0 {
+                    providerGroup(.grok, count: grokCount, hue: grokHue)
+                }
+
+                if let text = signal.chipText {
+                    chip(text, color: chipColor)
+                }
             }
-            if codexCount > 0 {
-                providerGroup(.codex, count: codexCount, hue: codexHue)
-            }
-            if grokCount > 0 {
-                providerGroup(.grok, count: grokCount, hue: grokHue)
-            }
+        }
+    }
+
+    /// Severity color — reinforcement only; the TEXT carries the meaning.
+    private var chipColor: Color {
+        switch signal {
+        case .auth, .limit: return Color(red: 1.0, green: 0.42, blue: 0.36)
+        case .lowQuota: return Color(red: 1.0, green: 0.72, blue: 0.28)
+        case .degraded: return Color(red: 0.95, green: 0.62, blue: 0.45)
+        case .offline, .none: return Color.white.opacity(0.45)
+        }
+    }
+
+    /// The one static exception chip: a hairline divider + short text token.
+    @ViewBuilder
+    private func chip(_ text: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Rectangle()
+                .fill(Color.white.opacity(0.25))
+                .frame(width: 1, height: 10)
+            Text(text)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(color)
+                .lineLimit(1)
         }
     }
 
