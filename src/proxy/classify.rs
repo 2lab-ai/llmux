@@ -76,6 +76,19 @@ fn kind_from_signatures(system: &str, last_user: &str) -> &'static str {
     if last_user.starts_with("Based on the conversation transcript above") {
         return "audit";
     }
+    // Claude Code's per-session rate-limit status probe: a bare "quota" user
+    // turn with `max_tokens: 1` (raw-io capture 2026-07-15). Not an llmux
+    // probe (ours sends "." outside the forward path) — without this tag it
+    // reads as a fake `user` row.
+    if last_user.trim() == "quota" {
+        return "quota";
+    }
+    // Claude Code's return-recap control turn, fired when a session resumes
+    // ("The user stepped away and is coming back.") — harness scaffolding,
+    // not typed input.
+    if last_user.trim_start().starts_with("The user stepped away") {
+        return "recap";
+    }
     // Execution families: subagent / SDK-host / main CLI — all carry a real
     // input turn, so they read as flavored `user` kinds.
     if system.contains("cc_is_subagent=true") || system.contains("running within the Claude Agent")
@@ -235,6 +248,21 @@ mod tests {
                     "[SUGGESTION MODE: Suggest what the user might naturally type next]",
                 ),
                 "suggest",
+            ),
+            (
+                // Claude Code's per-session rate-limit probe (raw-io 2026-07-15).
+                body(
+                    "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "quota",
+                ),
+                "quota",
+            ),
+            (
+                body(
+                    "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "The user stepped away and is coming back.",
+                ),
+                "recap",
             ),
         ];
         for (b, want) in cases {
