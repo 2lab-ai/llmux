@@ -24,8 +24,8 @@ llmux makes a different bet:
 
 - **Keep Claude Code as the canonical harness.** Do not port your workflow to every vendor CLI.
 - **Move the model boundary behind a local proxy.** Claude Code talks to `http://localhost:3456`; llmux decides which account/backend serves the request.
-- **Use every account deliberately.** Multiple Claude subscription/API-key accounts and optional Codex accounts live in one cockpit, with quota-aware routing instead of manual juggling.
-- **Treat model choice as a setting, not a migration.** `opus`, `sonnet`, `gpt-5.5`, and future model names become routing signals, not reasons to rebuild your agent stack.
+- **Use every account deliberately.** Multiple Claude subscription/API-key accounts, plus optional Codex and Grok accounts, live in one cockpit with quota-aware routing instead of manual juggling.
+- **Treat model choice as a setting, not a migration.** `fable`, `opus`, `gpt-5.6-sol`, `grok-4.5`, and future model names become routing signals, not reasons to rebuild your agent stack.
 
 The result: your workflow stays still while the model market moves.
 
@@ -41,12 +41,16 @@ llmux breaks the chain by standardizing on one harness and making the account/mo
 ## What ships today
 
 - **Local Anthropic-compatible proxy** for Claude Code: `ANTHROPIC_BASE_URL=http://localhost:3456` is the integration contract.
-- **One Rust binary, `llmux`**, with daemon, login/import, dashboard, status, account management, and Claude Code launch commands.
-- **Multi-account Claude scheduling** across subscription and API-key accounts.
-- **Model-to-backend routing**: Claude-like model names route to Claude accounts; `gpt-*` / `codex` model names can route to Codex accounts.
-- **Codex backend adapter** that translates Claude Code Messages requests into the Codex Responses backend and streams Anthropic-style SSE back to Claude Code.
-- **Detached daemon + live TUI dashboard** for quota windows, account health, routing, and manual switching.
+- **One Rust binary, `llmux`**, with daemon, login/import, dashboard, status, account management, channel/update, and Claude Code launch (`run`).
+- **Three backend groups** in one pool: **Claude** (subscription + API key), **Codex** (`gpt-*` / ChatGPT subscription), **Grok** (xAI device-code login + `grok-*` models).
+- **Multi-account scheduling** with perishable-quota scoring (`default`) or sticky exhaust (`round-robin`), Fable weekly ceilings, and 429 cooldown parking — not manual account juggling.
+- **Model-to-backend routing**: Claude-like names → Claude group; `gpt-*` / `codex` → Codex; `grok` / `grok-*` → Grok. Override via config routing tables.
+- **Codex + Grok adapters** that accept Claude Code Messages requests and stream Anthropic-style SSE back (Responses-family upstreams under the hood).
+- **Remote-first CLI**: `--remote host[:port]` or `remote.host` in config drives one central daemon from many machines (Tailscale/WireGuard). See [Using a remote daemon](#using-a-remote-daemon).
+- **Model catalog API**: `GET /models` and `GET /llmux/models` — curated ids, aliases, efforts, `max_context`, group. See [docs/models.md](docs/models.md).
+- **Detached daemon + live TUI dashboard** for quota windows (incl. Fable weekly / Grok rate-limit gauges), account health, routing, and manual switch.
 - **llmux Islands**, a native macOS menu-bar/notch companion for glanceable usage and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md).
+- **Stable + preview channels** via Homebrew (`llmux` / `llmux-preview`), with `llmux channel` and `llmux update`.
 
 ## Install
 
@@ -87,6 +91,9 @@ llmux login --api
 
 # Optional: Codex / ChatGPT subscription account
 llmux login --codex
+
+# Optional: Grok / xAI account (device-code flow)
+llmux login --grok
 
 # Or import supported local credential stores
 llmux import
@@ -197,13 +204,26 @@ now.
 Claude Code's model name becomes the routing signal:
 
 ```text
-/model opus
-/model sonnet
-/model gpt-5.5
-/model gpt-5.5[1m]
+/model fable
+/model opus[1m]
+/model gpt-5.6-sol
+/model gpt-5.6-sol[1m]
+/model grok-4.5
+/model grok
 ```
 
-With default routing, Claude-like names use the Claude account group and `gpt-*` / `codex` names use the Codex group. The full routing rules, config keys, and override syntax are in [docs/configuration.md](docs/configuration.md) and [docs/operational-reference.md](docs/operational-reference.md).
+With default routing:
+
+| Name pattern | Backend group |
+| --- | --- |
+| Claude-like (`fable`, `opus`, `sonnet`, `haiku`, `claude-*`) | Claude accounts |
+| `gpt-*` / `codex` / aliases (`sol`, `terra`, `luna`) | Codex accounts |
+| `grok` / `grok-*` | Grok accounts |
+
+The curated catalog (ids, aliases, efforts, context windows) is at
+`GET /models` / `GET /llmux/models` and [docs/models.md](docs/models.md). Full
+routing config keys live in [docs/configuration.md](docs/configuration.md) and
+[docs/operational-reference.md](docs/operational-reference.md).
 
 ## Schedulers
 
@@ -241,24 +261,30 @@ The selection logic is pure and lives in `src/scheduler/select.rs` (`pick_scoped
 
 ### `gpt-5.5` stops around 265k context. What should I do?
 
-If Claude Code blocks a `gpt-5.5` session around ~265k tokens even after selecting `gpt-5.5[1m]`, switch temporarily to a Claude model with a 1M context window, compact there, then switch back:
+If Claude Code blocks a long `gpt-*` session (empirically mid-200k class, even
+with a `[1m]` display suffix), switch temporarily to a Claude 1M model, compact
+there, then switch back:
 
 ```text
-/model opus[1m]      # or /model sonnet[1m]
+/model opus[1m]          # or fable[1m] / sonnet[1m]
 /compact
-/model gpt-5.5[1m]
+/model gpt-5.6-sol[1m]   # or gpt-5.5[1m]
 ```
 
-This is a practical Claude Code context-management workaround: use the 1M Claude model for the compaction step, then continue routing work to `gpt-5.5[1m]` through llmux. More context-window notes live in [docs/faq.md](docs/faq.md).
+This is a Claude Code context-management workaround: use the 1M Claude model for
+the compaction step, then continue routing through llmux. Details:
+[docs/faq.md](docs/faq.md).
 
 ## Documentation
 
-- [Docs index](docs/README.md) — the map for detailed guides.
-- [Operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard behavior, scheduling policy, model routing details, and Codex backend behavior.
-- [Configuration](docs/configuration.md) — config file location, proxy keys, scheduler knobs, routing options, Codex settings, and account types.
+- [Docs index](docs/README.md) — map of all guides.
+- [Operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, Codex backend.
+- [Configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types.
+- [Models](docs/models.md) — catalog, aliases, context windows, group routing.
 - [FAQ](docs/faq.md) — context-window workarounds and common usage questions.
-- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, and recording setup.
-- [Contributor guide](AGENTS.md) — architecture rules and development conventions.
+- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion.
+- [System prompts (multi-model)](docs/system-prompts/README.md) — **real captured wire system prompts** under [`docs/system-prompts/samples/`](docs/system-prompts/samples/) (what Claude Code actually injects when routing through grok/gpt/claude).
+- [Contributor guide](AGENTS.md) — architecture rules, conventions, runbooks (SSOT for agents).
 
 ## Compliance & caveats
 
