@@ -62,7 +62,10 @@ fn every_statistics_surface_has_an_explicit_renderer() {
         "function renderedVerificationReceiptCount()",
         "Verification receipts",
     ] {
-        assert!(qml.contains(marker), "missing receipt evidence marker {marker}");
+        assert!(
+            qml.contains(marker),
+            "missing receipt evidence marker {marker}"
+        );
     }
 }
 
