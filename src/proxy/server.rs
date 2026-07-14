@@ -2716,10 +2716,7 @@ mod tests {
         assert_eq!(body["verification_uri"], "https://x.ai/device?code=ABCD");
         assert_eq!(body["user_code"], "ABCD-EFGH");
         // Non-grok pending logins (no verification published) stay minimal.
-        assert!(
-            !state.logins.begin("st-1b".to_string()),
-            "single slot"
-        );
+        assert!(!state.logins.begin("st-1b".to_string()), "single slot");
     }
 
     #[tokio::test]

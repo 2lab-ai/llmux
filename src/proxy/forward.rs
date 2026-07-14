@@ -460,6 +460,20 @@ async fn upstream_error_detail(response: reqwest::Response) -> String {
 fn condense_error_body(body: &[u8]) -> String {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(err) = v.get("error") {
+            // xAI/grok error shape: `error` is a plain STRING (optionally
+            // beside a `code`), e.g. `{"code":"subscription:free-usage-
+            // exhausted","error":"You have exhausted…"}`. Preserve both —
+            // the grok 429 marker match reads this condensed detail
+            // (live receipt 2026-07-14: collapsing it to "error" made
+            // free-usage-exhausted invisible and the 24h park unreachable).
+            if let Some(msg) = err.as_str() {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                return if code.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{code}: {msg}")
+                };
+            }
             let ty = err.get("type").and_then(|t| t.as_str()).unwrap_or("error");
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
             return if msg.is_empty() {
@@ -2294,6 +2308,27 @@ mod tests {
         assert!(grok_free_usage_exhausted("FREE-USAGE-EXHAUSTED"));
         assert!(!grok_free_usage_exhausted("rate limited, slow down"));
         assert_eq!(GROK_FREE_USAGE_COOLDOWN, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn c9_marker_survives_the_real_condense_chain() {
+        // The live path matches on `upstream_error_detail`'s CONDENSED
+        // output, not the raw body — the xAI shape's string-valued `error`
+        // must survive condensation (live receipt 7, 2026-07-14: it did
+        // not, and the 24h park was unreachable).
+        let xai_429 = br#"{"code":"subscription:free-usage-exhausted","error":"You have exhausted your included free usage. Usage resets over a rolling 24-hour window."}"#;
+        let detail = condense_error_body(xai_429);
+        assert!(
+            detail.contains("free-usage-exhausted") && detail.contains("included free usage"),
+            "condensed detail keeps the marker: {detail}"
+        );
+        assert!(grok_free_usage_exhausted(&detail));
+        // Anthropic/codex object shape unchanged.
+        let anthropic = br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert_eq!(
+            condense_error_body(anthropic),
+            "rate_limit_error: slow down"
+        );
     }
 
     // ---- C2b: on_empty_group fallback fixed order + parked ≠ empty ----

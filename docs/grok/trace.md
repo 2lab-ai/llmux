@@ -203,18 +203,43 @@ target exists for it; otherwise receipt = snapshot/live capture.
 
 | Unit | Status |
 |---|---|
-| responses core extraction (C12) | NOT STARTED |
-| routing 3rd group (C2) | NOT STARTED |
-| config schema + credential (C7) | NOT STARTED |
-| auth::grok device flow (C5, C6) | NOT STARTED |
-| provider grok adapter (C1, C3, C4) | NOT STARTED |
-| forward dispatch + refresh + 429 (C8, C9) | NOT STARTED |
-| server endpoints (C10, C11) | NOT STARTED |
-| pricing + status (C13, C14) | NOT STARTED |
-| CLI login --grok | NOT STARTED |
-| islands Swift surfaces | NOT STARTED |
+| responses core extraction (C12) | GREEN (commit cd192f3; 718+38 unchanged) |
+| routing 3rd group (C2, C2b) | GREEN |
+| config schema + credential (C7, C17) | GREEN |
+| auth::grok device flow (C5, C6, C8) | GREEN |
+| provider grok adapter (C1, C3, C4, C15, C16) | GREEN |
+| forward dispatch + refresh + 429 (C9) | GREEN |
+| server endpoints (C10, C11) | GREEN |
+| pricing (C14) | GREEN |
+| CLI login --grok | built (device-flow units green; interactive path = live receipt) |
+| islands Swift surfaces | built (swiftc -parse clean; type-check = preview CI) |
+| status JSON grok row (C13) | via kind-driven group serialization (server.rs:1116) + C7; live receipt confirms |
 | live receipt | NOT STARTED |
 
 ## Trace deviations (Delta log)
 
-(none yet)
+- MODIFIED (implementation, 2026-07-14): T2 §3 — `LoginPhase::Pending` stays a
+  unit variant; the verification URI/user code live as `LoginJob` fields with
+  `LoginRegistry::{set_verification, verification}` and the status endpoint
+  reads them. Wire contract unchanged (status JSON carries
+  `verification_uri`/`user_code` while pending). Smaller diff than a
+  struct-variant extension across every phase match.
+- MODIFIED (implementation, 2026-07-14): islands does NOT auto-open the
+  verification URL (T2 §3 said `NSWorkspace.open` once). The daemon already
+  opens it host-side (parity with the PKCE flows); a second client-side open
+  would double-tab local setups. Instead the login progress view shows the
+  clickable link + user code, which also covers the remote-daemon case.
+- MODIFIED (implementation, 2026-07-14): spec §R4's "islands settings pane
+  gains a grok row" is deferred — islands has NO codex settings row either
+  (`POST /llmux/codex` is dashboard/CLI-only today), so a grok-only row would
+  exceed codex parity and the user requirements (R2 registration + R3 stats
+  are the islands asks). `POST /llmux/grok` exists for the TUI dashboard/CLI;
+  an islands settings row for BOTH providers is future work.
+- MODIFIED (implementation, 2026-07-14): grok raw-io/trace rides the same
+  `codex-trace.jsonl` file (T3 §7 "grok tag" = the model field identifies the
+  provider); a separate file would fork the trace reader for no diagnostic
+  gain.
+- ADDED (implementation, 2026-07-14): scheduler idle probe explicitly skips
+  grok accounts (both the orchestrator gate and the prober backstop) — grok
+  has no quota surface, so `probe_eligible`'s no-window test would re-probe
+  forever (spec §R3 corollary).
