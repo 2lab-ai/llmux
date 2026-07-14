@@ -102,9 +102,14 @@ enum GlanceResolver {
 
         // 2/3. Windows: exhausted (LIMIT) and approaching (lowQuota).
         // Candidates over EVERY eligible account × {5h, 7d} — never an
-        // average, never a representative account.
+        // average, never a representative account. Eligible = an OPERATIONAL
+        // status ("active"/"ok") and not operator-paused: unknown/cold/
+        // cooldown/degraded states are NEVER promoted into a quota chip
+        // (consensus MUST-FIX 4 — their quota reading is not an action).
         var windows: [WindowState] = []
-        for (index, record) in records.enumerated() where record.status != "auth_failed" {
+        let operational: Set<String?> = ["active", "ok"]
+        for (index, record) in records.enumerated()
+        where operational.contains(record.status) && record.paused != true {
             if let five = record.fiveHour {
                 windows.append(WindowState(
                     index: index, name: record.name, window: "5h",
@@ -130,7 +135,10 @@ enum GlanceResolver {
                 GlanceAttention(
                     account: displayName(state.index, state.name),
                     reason: "\(state.window) limit exhausted",
+                    // The action is always present: wait for the named reset,
+                    // or rotate now when the daemon reports no reset time.
                     detail: state.resetsInSecs.map { "resets in \(Self.duration($0))" }
+                        ?? "reset unknown — rotate accounts"
                 )
             )
         }
@@ -146,6 +154,7 @@ enum GlanceResolver {
                     account: displayName(state.index, state.name),
                     reason: "\(state.window) \(remainingPct(state.utilization))% left",
                     detail: state.resetsInSecs.map { "resets in \(Self.duration($0))" }
+                        ?? "reset unknown — plan a switch"
                 )
             )
         }
@@ -159,7 +168,7 @@ enum GlanceResolver {
                 GlanceAttention(
                     account: displayName(index, record.name),
                     reason: "degraded",
-                    detail: nil
+                    detail: "reported by daemon — check llmux logs"
                 )
             )
         }
