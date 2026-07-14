@@ -61,6 +61,18 @@ with thin per-provider adapters.
   expires_at_ms, token_endpoint, last_refresh_ms }`. Account name convention
   `grok:{email}` (email from id_token JWT `email` claim; fallback `sub`, then epoch-ms —
   mirrors CLIProxyAPI `internal/auth/xai/token.go:71-81`).
+- **OAuth token contract** (normative; C5/C8): device-code poll form =
+  `grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=…&client_id=…`
+  (client_id REQUIRED — xai.go:258-262); refresh form =
+  `grant_type=refresh_token&client_id=…&refresh_token=…` (xai.go:361-368). Rotation:
+  a refresh response's `refresh_token`, when present, REPLACES the stored one; when
+  omitted, the stored one is KEPT (llmux codex parity, forward.rs:1494-1499).
+  `access_token`/`expires_at_ms`/`last_refresh_ms` swap atomically as one credential
+  value (pool swap + config persist, existing `refresh_credential` shape). 401 or
+  `invalid_grant` on refresh → `RefreshOutcome::Permanent` (re-login required, account
+  excluded from retry ticks — existing semantics, server.rs:694,755). OIDC endpoint
+  validation: https + hostname exactly `x.ai` or `*.x.ai` label-boundary suffix
+  (mirror ValidateOAuthEndpoint, xai.go:47-64).
 - `GrokProvider` (new `src/provider/grok.rs`): thin adapter over the shared Responses
   core (R5). `GrokShape { model: "grok-4.5" (default), client_model: Option, effort:
   Option }` — **no `fast`** (xAI has no service tier). Live-mutable behind `RwLock`
@@ -74,13 +86,19 @@ with thin per-provider adapters.
     `prompt_cache_key` body field — grok keeps `prompt_cache_key` too, harmless);
   - `service_tier` never sent; `include: ["reasoning.encrypted_content"]` **not** sent
     (OpenAI-specific; CLIProxyAPI does not send it for xAI);
-  - effort values valid for grok: `low|medium|high`. Per-request
-    `output_config.effort` resolution mirrors codex (codex.rs:319-349) with grok clamp:
-    `none|minimal` → `low`, `xhigh|max|ultra` → `high` (grok-4.5 cannot disable
-    reasoning — models.json:2436 `zero_allowed: false`).
-- Error handling: HTTP 429 whose body matches `free-usage-exhausted` (or "included free
-  usage") → account parked with explicit `retry_after = 24h` (forward.rs retry_after
-  path, forward.rs:1347); generic 429 → existing backoff.
+  - effort is **per-model capability, not provider-global**: a static thinking-levels
+    table (source: CLIProxyAPI registry models.json:2411-2520) —
+    `grok-4.5 → {low,medium,high}`, `grok-4.3 → {none,low,medium,high}`,
+    `grok-3-mini → {low,medium,high}`; models NOT in the table (e.g. `grok-build-0.1`,
+    unknown slugs) get **no `reasoning` field at all** (omission, mirroring CLIProxyAPI's
+    strip at xai_executor.go:1206-1211, debug-logged). For models in the table, the
+    requested/configured effort clamps INTO the model's level set: `none|minimal` → `low`
+    when zero not allowed (else `none`), `xhigh|max|ultra` → `high`.
+- Error handling (429): `Retry-After` header, when present, wins (existing generic
+  path). Else a body whose `code`/`error` contains `free-usage-exhausted` / "included
+  free usage" → park with **estimated** probe-not-before `now+24h` (xAI advertises a
+  rolling 24h window — the real reset time is unknowable from the 429; surfaces render
+  it as an estimate, not a hard reset). Generic 429 → existing backoff untouched.
 
 ### R2. Registration in CLI and islands
 
@@ -152,11 +170,22 @@ with thin per-provider adapters.
 - `codex.rs` shrinks to: `CodexShape`, OAuth/refresh glue, header assembly, flavor
   definition, `effective_request_meta`. `grok.rs` is the same ~small file for grok.
 - `forward.rs` binary `is_codex` dispatch (forward.rs:726-770) becomes a three-way
-  group match; `on_empty_group: "fallback"` (currently flips Claude↔Codex,
-  forward.rs:1153-1154) becomes: fallback tries the remaining groups in fixed order
-  `Claude → Codex → Grok`, first group with ≥1 configured account wins.
+  group match.
+- **`on_empty_group` semantics, made precise** (was ambiguous; consensus review): the
+  empty-group hook fires ONLY when the matched group has **zero configured accounts**
+  (`has_account` = any account whose kind maps to the group, forward.rs:1140 — parked/
+  limited accounts still count as configured). `"fallback"` then tries the remaining
+  groups in fixed order `Claude → Codex → Grok`, first group with ≥1 configured account
+  wins; after fallback the SERVING group's provider applies its own model rewrite (a
+  grok-named request served by claude keeps Anthropic semantics — observable, logged).
+  A group whose accounts are all parked/limited is NOT empty: the request stays
+  in-group and gets the existing all-limited behavior (identical to the claude group
+  today). Contract-tested (C2b).
 - Existing codex unit tests move with the code they test; codex behavior is
   **bit-identical** (gate: full existing test suite green untouched except imports).
+- **Commit discipline**: the behavior-preserving core extraction lands as its own
+  commit (C12 green at that commit), grok lands on top — refactor failures isolate
+  from provider failures.
 
 ## Non-goals (v1)
 
@@ -169,6 +198,35 @@ with thin per-provider adapters.
   without a replay cache. Revisit only if live receipt shows reasoning-continuity loss.
 - Importing grok-cli's own credential store.
 - Active quota polling for grok (no known endpoint).
+
+## Compatibility & rollback (consensus review MUST-FIX)
+
+- `AccountCredential` is an internally-tagged serde enum (`#[serde(tag = "type")]`,
+  schema.rs:614-616): an OLD llmux binary **fails to parse** a config containing
+  `"type": "grok"` (whole-file parse error, accounts is a plain Vec). This is the same
+  contract the `Codex` variant shipped with — precedent, not new risk class — but it is
+  now DOCUMENTED: **downgrade procedure** = remove `grok:*` account entries (and
+  optionally the additive `grok`/`routing.grok_models` sections, which old binaries
+  ignore harmlessly via `#[serde(default)]`) from `~/.config/llmux.json`, then run the
+  old binary. `llmux accounts remove <name>` on the NEW binary is the supported path.
+- Contract test (C17): a pre-grok config (no grok fields) parses and round-trips
+  byte-stable under the new binary — additive-only guarantee.
+- Islands↔daemon version skew: additive JSON only; old islands renders grok accounts
+  as claude-group (existing `== "codex"` check) during upgrade windows — cosmetic,
+  accepted.
+- Cost figures for grok (and codex) subscription accounts are **API-list-price
+  equivalent estimates**, not billed amounts — documented here; UI copy unchanged in
+  v1 (existing cost tiles already carry this meaning for codex).
+
+## Gates (merge-blocking)
+
+1. Behavior-preserving extraction commit: full existing suite green (C12).
+2. All contract tests C1–C17 green.
+3. **Live wire receipt** before merge: at least one captured real
+   `POST …/responses` request + SSE stream against a real grok account through the
+   local daemon (raw_io trace on), INCLUDING a ≥2-turn tool-call round trip
+   (reasoning-continuity check) — this closes spec Risks #2 (wire-shape unknowns).
+4. External reviewer agent pass (zbrain DEV.md §2).
 
 ## Risks / open items
 
