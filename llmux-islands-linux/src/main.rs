@@ -16,6 +16,7 @@ fn main() {
     use std::env;
     use std::pin::Pin;
 
+    let smoke_mode = env::args_os().any(|argument| argument == "--smoke-test");
     let snapshot_request = match snapshot::request_from_args(env::args_os().skip(1)) {
         Ok(request) => request,
         Err(error) => {
@@ -34,6 +35,7 @@ fn main() {
             std::process::exit(2);
         }
     }
+    let headless_run = smoke_mode || snapshot_request.is_some();
     if let Err(error) = snapshot::configure(snapshot_request) {
         eprintln!("snapshot launch error: {error}");
         std::process::exit(2);
@@ -66,7 +68,12 @@ fn main() {
     }
 
     let exit_code = qt_runtime::exec_application();
-    if exit_code != 0 {
+    // Qt's offscreen platform can fault while destroying native/QML objects
+    // after a successful short-lived run. The event-loop result is the
+    // headless contract, and snapshot files have already been flushed before
+    // QML exits, so avoid the unreliable platform-plugin teardown only for
+    // explicit smoke/snapshot processes. Live desktop sessions still unwind.
+    if headless_run || exit_code != 0 {
         std::process::exit(exit_code);
     }
 }
