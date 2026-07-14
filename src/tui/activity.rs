@@ -960,6 +960,26 @@ impl ActivityLog {
             self.clients.entry(key).or_default().add(&totals);
         }
         self.windowed.merge_behind(history.windowed);
+        // Tokens-per-day buckets (UI-3 U14) merge BY DAY so history lands on
+        // its original days — same reasoning as the hourly buckets above.
+        for (day, cells) in history.daily {
+            let dst = self.daily.entry(day).or_default();
+            for (key, t) in cells {
+                let cell = dst.entry(key).or_default();
+                cell.input = cell.input.saturating_add(t.input);
+                cell.output = cell.output.saturating_add(t.output);
+                cell.cache_read = cell.cache_read.saturating_add(t.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(t.cache_creation);
+            }
+        }
+        // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
+        // replayed history for the same client; history fills the gaps under
+        // the same MAX_CLIENTS bound as the live fold.
+        for (uid, label) in history.session_labels {
+            if !self.session_labels.contains_key(&uid) && self.session_labels.len() < MAX_CLIENTS {
+                self.session_labels.insert(uid, label);
+            }
+        }
         merged
     }
 
@@ -1503,6 +1523,57 @@ impl ActivityLog {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hydration_merges_daily_buckets_and_session_labels_behind_live() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let day = |d: u64| UNIX_EPOCH + Duration::from_secs(d * 86_400 + 3600);
+        let finished =
+            |_ts: u64, tok_in: u64, uid: &str, excerpt: &str| ActivityEvent::RequestFinished {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(100),
+                tokens: Some(TokenCounts {
+                    input: tok_in,
+                    output: 10,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("claude".into()),
+                model: Some("claude-fable-5".into()),
+                effort: None,
+                fast: false,
+                user_id: Some(uid.into()),
+                kind: Some("user".into()),
+                excerpt: Some(excerpt.into()),
+            };
+        let _ = day;
+        let mut live = ActivityLog::new(16);
+        live.apply(finished(0, 100, "s1", "live first input"), day(20_000));
+        let mut history = ActivityLog::new(16);
+        history.apply(finished(0, 40, "s1", "old input"), day(19_999));
+        history.apply(finished(0, 70, "s2", "history session"), day(19_998));
+        live.merge_history_behind(history);
+        let daily = live.daily_usage();
+        // Three distinct days, each with its own bucket — history landed on
+        // its ORIGINAL days.
+        assert_eq!(daily.len(), 3);
+        assert!(daily.iter().any(|r| r.day == 19_998 && r.tokens_in == 70));
+        assert!(daily.iter().any(|r| r.day == 20_000 && r.tokens_in == 100));
+        // Live label wins for s1; history fills s2.
+        let labels = live.session_labels();
+        assert_eq!(
+            labels.get("s1").map(String::as_str),
+            Some("live first input")
+        );
+        assert_eq!(
+            labels.get("s2").map(String::as_str),
+            Some("history session")
+        );
+    }
     use super::*;
 
     fn at(secs: u64) -> SystemTime {
