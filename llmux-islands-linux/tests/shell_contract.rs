@@ -246,6 +246,8 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "snapshot::request_from_args",
         "configure_headless_environment",
         "ControllerModel::from_fixture(options, SNAPSHOT_NOW_MS)",
+        "let headless_run = smoke_mode || snapshot_request.is_some()",
+        "if headless_run || exit_code != 0",
     ] {
         assert!(main.contains(marker), "snapshot CLI must contain {marker}");
     }
