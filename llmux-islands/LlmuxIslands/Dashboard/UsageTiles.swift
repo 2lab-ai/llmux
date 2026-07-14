@@ -4,12 +4,14 @@ import AppKit
 enum UsageProvider: Hashable {
     case claude
     case codex
+    case grok
     case gemini
 
     var displayName: String {
         switch self {
         case .claude: "Claude"
         case .codex: "Codex"
+        case .grok: "Grok"
         case .gemini: "Gemini"
         }
     }
@@ -45,6 +47,8 @@ private enum UsageAccountIdFormatter {
             return "acct_claude_\(emailSlug)"
         case .codex:
             return "acct_codex_\(emailSlug)"
+        case .grok:
+            return "acct_grok_\(emailSlug)"
         case .gemini:
             return "acct_gemini_\(emailSlug)"
         }
@@ -471,6 +475,9 @@ private struct UsageProviderColumn: View {
             return tier
         case .codex:
             return normalizeCodexTier(info?.plan)
+        case .grok:
+            // Grok exposes no plan/tier over the llmux status API.
+            return nil
         case .gemini:
             return inferGeminiTier(model: info?.model, plan: info?.plan)
         }
@@ -481,7 +488,7 @@ private struct UsageProviderColumn: View {
         switch provider {
         case .gemini:
             GeminiUsageSummaryRow(info: info, now: now)
-        case .claude, .codex:
+        case .claude, .codex, .grok:
             ForEach(providerWindows, id: \.label) { window in
                 UsageWindowRow(
                     window: window,
@@ -498,7 +505,9 @@ private struct UsageProviderColumn: View {
         switch provider {
         case .gemini:
             return []
-        case .claude, .codex:
+        case .claude, .codex, .grok:
+            // Grok reports no quota windows (docs/grok/spec.md §R3) — the
+            // rows render their placeholder until a parked reset appears.
             var windows: [UsageWindow] = [.fiveHour, .sevenDay]
             // The Fable weekly row is opt-out (default on) and only appears when
             // the daemon actually reports a Fable weekly window for this account.
@@ -611,6 +620,8 @@ private struct TierBadge: View {
         case .codex:
             if key == "plus" { return (Color.white.opacity(0.9), Color.black.opacity(0.85)) }
             if key == "pro" { return (TerminalColors.red, Color.white.opacity(0.9)) }
+        case .grok:
+            break
         case .gemini:
             return (TerminalColors.blue.opacity(0.85), Color.white.opacity(0.9))
         }

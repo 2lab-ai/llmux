@@ -115,6 +115,7 @@ private struct AddAccountInline: View {
     enum Kind: String, CaseIterable, Identifiable {
         case claude = "Claude"
         case codex = "Codex"
+        case grok = "Grok"
         case apiKey = "API Key"
         var id: String { rawValue }
     }
@@ -134,13 +135,13 @@ private struct AddAccountInline: View {
             .labelsHidden()
 
             switch kind {
-            case .claude, .codex:
-                Text("llmux opens your browser to sign in to your \(kind == .claude ? "Claude" : "ChatGPT") subscription. The token stays in the daemon — it never reaches this app.")
+            case .claude, .codex, .grok:
+                Text(loginBlurb)
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.5))
                     .fixedSize(horizontal: false, vertical: true)
-                action(kind == .claude ? "Sign in to Claude" : "Sign in to ChatGPT", disabled: false) {
-                    let provider = kind == .claude ? "claude" : "codex"
+                action(loginButtonTitle, disabled: false) {
+                    let provider = loginProvider
                     onDone()
                     await model.startLogin(provider: provider)
                 }
@@ -159,6 +160,35 @@ private struct AddAccountInline: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+    }
+
+    private var loginProvider: String {
+        switch kind {
+        case .claude: "claude"
+        case .codex: "codex"
+        case .grok: "grok"
+        case .apiKey: ""
+        }
+    }
+
+    private var loginButtonTitle: String {
+        switch kind {
+        case .claude: "Sign in to Claude"
+        case .codex: "Sign in to ChatGPT"
+        case .grok: "Sign in to Grok"
+        case .apiKey: ""
+        }
+    }
+
+    private var loginBlurb: String {
+        switch kind {
+        case .grok:
+            // Device-code flow: the daemon polls while the user approves on
+            // the opened x.ai page (docs/grok/spec.md T2).
+            "llmux opens a grok.com verification page — approve the code there while llmux waits. The token stays in the daemon — it never reaches this app."
+        default:
+            "llmux opens your browser to sign in to your \(kind == .claude ? "Claude" : "ChatGPT") subscription. The token stays in the daemon — it never reaches this app."
+        }
     }
 
     private func field(_ placeholder: String, text: Binding<String>, secure: Bool) -> some View {
@@ -210,8 +240,23 @@ private struct LoginProgressView: View {
             default:
                 ProgressView().controlSize(.large)
                 Text(login.message ?? "Waiting for browser…").foregroundColor(.white.opacity(0.75))
-                Text("Signing in to \(login.provider == "codex" ? "ChatGPT" : "Claude")")
+                Text("Signing in to \(providerLabel)")
                     .font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.4))
+                if let uri = login.verificationUri, let url = URL(string: uri) {
+                    // Grok device flow: clickable verification link (+ code)
+                    // so a remote daemon's login is completable from here.
+                    Link(uri, destination: url)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(TerminalColors.blue)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let code = login.userCode {
+                        Text("Code: \(code)")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.8))
+                            .textSelection(.enabled)
+                    }
+                }
             }
             Button {
                 Task { if inProgress { await model.cancelLogin() } else { model.dismissLogin() } }
@@ -223,5 +268,13 @@ private struct LoginProgressView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 18)
+    }
+
+    private var providerLabel: String {
+        switch login.provider {
+        case "codex": "ChatGPT"
+        case "grok": "Grok"
+        default: "Claude"
+        }
     }
 }
