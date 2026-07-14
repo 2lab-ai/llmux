@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod build_info;
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod dashboard;
