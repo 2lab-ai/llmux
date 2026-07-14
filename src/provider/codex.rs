@@ -299,12 +299,17 @@ fn supports_extended_efforts(model: &str) -> bool {
     m == "gpt-5.6" || m.starts_with("gpt-5.6-")
 }
 
-/// Per-request reasoning effort: the Claude Agent SDK carries the session's
-/// effort as Anthropic `output_config.effort` (observed on the wire,
-/// 2026-07-10). `max`/`ultra` pass through for the gpt-5.6 family (natively
-/// supported per the codex model catalog) and clamp to `xhigh` for older
-/// models. Invalid / absent request values fall back to the configured
-/// shape effort (empty / "default" = unset, backend default).
+/// Per-request reasoning effort: a CONFIGURED shape effort (dashboard `e`
+/// cycle / config `reasoning_effort`) OVERRIDES whatever the client sent —
+/// that is what selecting a concrete value in the UI means (UI-3 U12).
+/// Unset / "default" shape = BYPASS: the request's `output_config.effort`
+/// (the Claude Agent SDK wire form, observed 2026-07-10) passes through.
+/// `max`/`ultra` pass for the gpt-5.6 family (natively supported per the
+/// codex model catalog) and clamp to `xhigh` for older models.
+///
+/// Precedence flipped 2026-07-15 (was request-wins): with request-wins a
+/// configured effort was dead weight for Claude Code traffic, which always
+/// sends `output_config.effort` — the operator's pick could never apply.
 fn resolve_reasoning_effort(
     body: &Value,
     shape_effort: Option<&str>,
@@ -317,22 +322,21 @@ fn resolve_reasoning_effort(
             e
         }
     };
-    let requested = body
-        .get("output_config")
-        .and_then(|c| c.get("effort"))
-        .and_then(Value::as_str)
-        .map(|e| e.trim().to_ascii_lowercase())
-        .filter(|e| CODEX_EFFORT_VALUES.contains(&e.as_str()))
-        .map(clamp);
-    requested.or_else(|| {
-        shape_effort.and_then(|e| {
-            let e = e.trim();
-            if e.is_empty() || e.eq_ignore_ascii_case("default") {
-                None
-            } else {
-                Some(clamp(e.to_ascii_lowercase()))
-            }
-        })
+    let configured = shape_effort.and_then(|e| {
+        let e = e.trim();
+        if e.is_empty() || e.eq_ignore_ascii_case("default") {
+            None // bypass — the client's value rides through below
+        } else {
+            Some(clamp(e.to_ascii_lowercase()))
+        }
+    });
+    configured.or_else(|| {
+        body.get("output_config")
+            .and_then(|c| c.get("effort"))
+            .and_then(Value::as_str)
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| CODEX_EFFORT_VALUES.contains(&e.as_str()))
+            .map(clamp)
     })
 }
 
@@ -506,30 +510,43 @@ mod tests {
 
     #[test]
     fn request_meta_surfaces_per_request_effective_value() {
-        // The recorded effort must equal what goes upstream, including the
-        // clamp: `max` requested on gpt-5.5 (no extended efforts) → `xhigh`.
-        let shape = CodexShape {
+        // BYPASS shape (no configured effort): the client's value rides
+        // through, including the clamp — `max` on gpt-5.5 (no extended
+        // efforts) → `xhigh`.
+        let bypass = CodexShape {
             model: "gpt-5.5".to_string(),
             client_model: None,
             fast: true,
-            effort: Some("low".to_string()),
+            effort: None,
         };
         let body = json!({
             "model": "gpt-5.5",
             "output_config": { "effort": "max" },
             "messages": [{"role":"user","content":"hi"}],
         });
-        let (model, effort, fast) = effective_request_meta(&body, &shape);
+        let (model, effort, fast) = effective_request_meta(&body, &bypass);
         assert_eq!(model, "gpt-5.5");
         assert_eq!(effort.as_deref(), Some("xhigh"), "max clamps on gpt-5.5");
         assert!(fast, "fast mirrors the shape flag");
 
-        // The gpt-5.6 family passes max through unclamped; no request effort
-        // falls back to the shape effort. The alias resolves in the meta too.
-        let body = json!({ "model": "sol", "messages": [{"role":"user","content":"hi"}] });
-        let (model, effort, _) = effective_request_meta(&body, &shape);
+        // A CONFIGURED shape effort overrides the request (UI-3 U12) and the
+        // alias resolves in the meta too.
+        let pinned = CodexShape {
+            effort: Some("low".to_string()),
+            ..bypass.clone()
+        };
+        let body = json!({
+            "model": "sol",
+            "output_config": { "effort": "max" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (model, effort, _) = effective_request_meta(&body, &pinned);
         assert_eq!(model, "gpt-5.6-sol", "alias resolved in the recorded meta");
-        assert_eq!(effort.as_deref(), Some("low"), "shape effort when unset");
+        assert_eq!(
+            effort.as_deref(),
+            Some("low"),
+            "configured effort overrides"
+        );
     }
 
     #[test]
@@ -567,12 +584,13 @@ mod tests {
 
     #[test]
     fn request_output_config_effort_wins_over_shape_and_maps_max() {
-        // The Claude Agent SDK carries session effort as output_config.effort.
+        // The Claude Agent SDK carries session effort as output_config.effort;
+        // with NO configured override (bypass) it rides through.
         let shape = CodexShape {
             model: CODEX_MODEL.to_string(),
             client_model: None,
             fast: false,
-            effort: Some("low".to_string()),
+            effort: None,
         };
         let body = json!({
             "model": "gpt-5.6-sol",
@@ -582,7 +600,18 @@ mod tests {
         let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
         assert_eq!(
             upstream["reasoning"]["effort"], "high",
-            "request effort wins"
+            "bypass: request effort rides through"
+        );
+
+        // A configured effort OVERRIDES the request (UI-3 U12).
+        let pinned = CodexShape {
+            effort: Some("xhigh".to_string()),
+            ..shape.clone()
+        };
+        let (upstream, _) = translate_request_with(&body, "s", &pinned).expect("translate");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "configured effort overrides the request"
         );
 
         // The gpt-5.6 family natively supports max/ultra (codex catalog) —
@@ -606,14 +635,18 @@ mod tests {
         let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
         assert_eq!(upstream["reasoning"]["effort"], "xhigh");
 
-        // Invalid request efforts fall back to the shape effort.
+        // Invalid request efforts under bypass yield no reasoning field at
+        // all (nothing valid to ride through); with a configured override
+        // the override applies regardless.
         let body = json!({
             "model": "gpt-5.6-sol",
             "output_config": { "effort": "turbo" },
             "messages": [{"role":"user","content":"hi"}],
         });
         let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
-        assert_eq!(upstream["reasoning"]["effort"], "low");
+        assert_eq!(upstream["reasoning"]["effort"], serde_json::Value::Null);
+        let (upstream, _) = translate_request_with(&body, "s", &pinned).expect("translate");
+        assert_eq!(upstream["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

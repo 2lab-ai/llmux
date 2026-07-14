@@ -317,7 +317,7 @@ fn draw_main(
         Some(h) if auto_strip_height > 0 => h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT),
         _ => auto_strip_height,
     };
-    let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, footer_area] =
+    let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, groups_area, footer_area] =
         Layout::vertical([
             Constraint::Length(banner_height),
             Constraint::Length(1),
@@ -326,6 +326,7 @@ fn draw_main(
             Constraint::Length(middle_height),
             Constraint::Length(strip_height),
             Constraint::Min(3),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .areas(frame.area());
@@ -367,6 +368,7 @@ fn draw_main(
             pane_top: middle_area.y,
         });
     }
+    let settings = draw_group_settings(frame, groups_area, view);
     // The context menu (UI-3 U11) draws last so it floats over every pane.
     let menu = chrome
         .menu_anchor
@@ -378,10 +380,133 @@ fn draw_main(
         separators,
         account_rows,
         menu,
+        settings,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
+}
+
+/// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
+/// group's live settings; clicking a highlighted segment ROTATES that
+/// setting (scheduler mode, codex model / effort / fast, grok effort).
+/// Effort `bypass` = the client's own value rides through (UI-3 U12).
+fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+    if area.height == 0 {
+        return Vec::new();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut hits: Vec<SettingHit> = Vec::new();
+    let mut x = area.x;
+    let push_plain = |spans: &mut Vec<Span<'static>>, x: &mut u16, text: String, style| {
+        let w = text.chars().count() as u16;
+        spans.push(Span::styled(text, style));
+        *x += w;
+    };
+    let clickable = Style::new()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+    let push_click = |spans: &mut Vec<Span<'static>>,
+                      hits: &mut Vec<SettingHit>,
+                      x: &mut u16,
+                      text: String,
+                      action: SettingAction| {
+        let w = text.chars().count() as u16;
+        hits.push(SettingHit {
+            area: Rect {
+                x: *x,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+            action,
+        });
+        spans.push(Span::styled(text, clickable));
+        *x += w;
+    };
+    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16| {
+        spans.push(Span::styled("  │  ", dim()));
+        *x += 5;
+    };
+
+    push_plain(&mut spans, &mut x, " sched ".into(), dim());
+    push_click(
+        &mut spans,
+        &mut hits,
+        &mut x,
+        view.select_params.mode.label().to_string(),
+        SettingAction::SchedMode,
+    );
+
+    let count = |g: BackendGroup| {
+        view.snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.group == g)
+            .count()
+    };
+    let claude_n = count(BackendGroup::Claude);
+    if claude_n > 0 {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "claude ".into(),
+            group_color(Some("claude")).add_modifier(Modifier::BOLD),
+        );
+        push_plain(&mut spans, &mut x, format!("{claude_n} acc"), dim());
+    }
+    if view.codex.available {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "codex ".into(),
+            group_color(Some("codex")).add_modifier(Modifier::BOLD),
+        );
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.codex.model.clone(),
+            SettingAction::CodexModel,
+        );
+        push_plain(&mut spans, &mut x, " effort:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
+            SettingAction::CodexEffort,
+        );
+        push_plain(&mut spans, &mut x, " fast:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            if view.codex.fast { "on" } else { "off" }.into(),
+            SettingAction::CodexFast,
+        );
+    }
+    if view.grok.available {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "grok ".into(),
+            group_color(Some("grok")).add_modifier(Modifier::BOLD),
+        );
+        push_plain(&mut spans, &mut x, "effort:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
+            SettingAction::GrokEffort,
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hits
 }
 
 /// The tab strip (UI-3 U6): one row of clickable surface names right under
@@ -2363,10 +2488,29 @@ impl MenuChrome {
     }
 }
 
+/// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
+/// its segment cycles the setting to its next value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingAction {
+    SchedMode,
+    CodexModel,
+    CodexEffort,
+    CodexFast,
+    GrokEffort,
+}
+
+/// One clickable segment of the group-settings bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingHit {
+    pub area: Rect,
+    pub action: SettingAction,
+}
+
 /// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
 /// activity panel's rows plus the tab bar, the drag separators, the accounts
-/// rows (right-click), and the open context menu. Threaded back to the
-/// runtime the same way `ActivityChrome` alone used to be.
+/// rows (right-click), the group-settings bar, and the open context menu.
+/// Threaded back to the runtime the same way `ActivityChrome` alone used to
+/// be.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MainChrome {
     pub activity: ActivityChrome,
@@ -2374,6 +2518,7 @@ pub(crate) struct MainChrome {
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
     pub menu: Option<MenuChrome>,
+    pub settings: Vec<SettingHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3840,6 +3985,7 @@ mod tests {
     fn view_with(model_usage: Vec<ModelUsageDoc>) -> DashboardView {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            grok: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -4794,6 +4940,33 @@ mod tests {
             hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
             None
         );
+    }
+
+    #[test]
+    fn group_settings_bar_renders_and_records_clickable_segments() {
+        let mut view = view_with(Vec::new());
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        view.codex.effort = None;
+        view.grok.available = true;
+        view.grok.effort = Some("high".into());
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let settings = hits.expect("layout").settings;
+        let actions: Vec<SettingAction> = settings.iter().map(|h| h.action).collect();
+        assert!(actions.contains(&SettingAction::SchedMode));
+        assert!(actions.contains(&SettingAction::CodexModel));
+        assert!(actions.contains(&SettingAction::CodexEffort));
+        assert!(actions.contains(&SettingAction::CodexFast));
+        assert!(actions.contains(&SettingAction::GrokEffort));
+        let text = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(text.contains("sched"), "scheduler segment visible");
+        assert!(text.contains("effort:bypass"), "codex bypass label visible");
+        assert!(text.contains("effort:high"), "grok effort value visible");
     }
 
     #[test]

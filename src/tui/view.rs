@@ -58,6 +58,8 @@ pub(crate) struct DashboardView {
     pub windowed: Vec<crate::dashboard::WindowedStatsDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
+    /// Live grok settings (UI-3 U12): shown + cycled from the group bar.
+    pub grok: crate::dashboard::GrokSettingsDoc,
     /// Live `email_anonymous` display setting (SSOT E4): when on, every
     /// draw-time surface that shows an account email renders it through
     /// [`crate::demo::alias_always`] / [`crate::demo::mask_email_text`]
@@ -343,6 +345,7 @@ impl DashboardView {
 
         Self {
             session_labels: doc.session_labels.clone(),
+            grok: doc.grok.clone(),
             version: doc.version.clone(),
             pid: doc.pid,
             uptime: Duration::from_secs(doc.uptime_secs),
