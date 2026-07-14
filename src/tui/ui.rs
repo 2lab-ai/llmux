@@ -9,8 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table,
+};
 use ratatui::Frame;
 
 use crate::dashboard::ModelUsageDoc;
@@ -591,12 +594,23 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     // token heatmap (issue #23). The heatmap height tracks the visible cells,
     // capped so the model table/drill-down above always keep room.
     let heatmap_height = heatmap_panel_height(view, chrome.stats_window, area.height);
-    let [table_area, body_area, heatmap_area] = Layout::vertical([
+    // Tokens-per-Day chart slice (UI-3 U14): shown whenever daily data exists
+    // and the overlay is tall enough to keep the model table readable.
+    let chart_height = if view.daily_usage.is_empty() || area.height < 34 {
+        0
+    } else {
+        DAILY_CHART_HEIGHT
+    };
+    let [table_area, chart_area, body_area, heatmap_area] = Layout::vertical([
         Constraint::Length(table_height),
+        Constraint::Length(chart_height),
         Constraint::Min(3),
         Constraint::Length(heatmap_height),
     ])
     .areas(area);
+    if chart_height > 0 {
+        draw_daily_chart(frame, chart_area, view, ctx);
+    }
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
     // of the stats body when there is client usage to show; otherwise the
@@ -615,6 +629,130 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
         draw_clients_compact(frame, clients_area, view);
     }
     draw_heatmap(frame, heatmap_area, view, chrome.stats_window);
+}
+
+/// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
+/// U14): border/title + plot rows + x-axis labels + legend line.
+const DAILY_CHART_HEIGHT: u16 = 13;
+/// Days the Tokens-per-Day chart plots.
+const DAILY_CHART_DAYS: u64 = 14;
+/// Max model lines plotted at once (top by window tokens); more would turn
+/// minimal into noise.
+const DAILY_CHART_SERIES: usize = 4;
+/// Line colors by rank — chosen to stay distinct on dark terminals and to
+/// echo the group hues used elsewhere.
+const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
+    [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
+
+/// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
+/// the trailing [`DAILY_CHART_DAYS`], modern-minimal — no grid, dim axes,
+/// a single legend line with colored dots. Data = the daily fold carried on
+/// the document (history filled by the persisted-request replay).
+fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
+    let today = ctx
+        .now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    let start = today.saturating_sub(DAILY_CHART_DAYS.saturating_sub(1));
+    // Rank models by window total, then build one (x=day-offset, y=tokens)
+    // series per top model, zero-filled across the whole span so a quiet day
+    // reads as a drop to zero, not a gap.
+    let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
+    for r in view.daily_usage.iter().filter(|r| r.day >= start) {
+        *totals
+            .entry((r.group.as_str(), r.model.as_str()))
+            .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
+    }
+    let mut ranked: Vec<((&str, &str), u64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(DAILY_CHART_SERIES);
+    if ranked.is_empty() {
+        return;
+    }
+    let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
+    let days = DAILY_CHART_DAYS as usize;
+    let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
+    for (s, serie) in series.iter_mut().enumerate() {
+        for (i, point) in serie.iter_mut().enumerate() {
+            point.0 = i as f64;
+        }
+        let _ = s;
+    }
+    let mut y_max = 0f64;
+    for r in view.daily_usage.iter().filter(|r| r.day >= start) {
+        if let Some(idx) = ranked
+            .iter()
+            .position(|((g, m), _)| *g == r.group && *m == r.model)
+        {
+            let x = (r.day - start) as usize;
+            let y = (r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation) as f64;
+            series[idx][x].1 += y;
+            y_max = y_max.max(series[idx][x].1);
+        }
+    }
+    let y_max = y_max.max(1.0);
+
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .enumerate()
+        .map(|(i, data)| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(DAILY_CHART_COLORS[i]))
+                .data(data)
+        })
+        .collect();
+    let day_label = |d: u64| {
+        let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
+        let full = format::month_day_hm(at, 0);
+        full.split(' ').next().unwrap_or("").to_string()
+    };
+    let x_axis = Axis::default()
+        .bounds([0.0, (days - 1) as f64])
+        .labels(vec![
+            Span::styled(day_label(start), dim()),
+            Span::styled(day_label(start + DAILY_CHART_DAYS / 2), dim()),
+            Span::styled(day_label(today), dim()),
+        ])
+        .style(dim());
+    let y_axis = Axis::default()
+        .bounds([0.0, y_max])
+        .labels(vec![
+            Span::styled("0", dim()),
+            Span::styled(format::human_count((y_max / 2.0) as u64), dim()),
+            Span::styled(format::human_count(y_max as u64), dim()),
+        ])
+        .style(dim());
+    let [plot_area, legend_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let chart = Chart::new(datasets)
+        .block(
+            Block::new()
+                .borders(Borders::TOP)
+                .title(format!(" tokens per day — last {DAILY_CHART_DAYS}d ")),
+        )
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+    frame.render_widget(chart, plot_area);
+    // Legend: ● model (share%) — one line, dim separators.
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (i, ((group, model), total)) in ranked.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
+        }
+        spans.push(Span::styled(
+            "● ".to_string(),
+            Style::new().fg(DAILY_CHART_COLORS[i]),
+        ));
+        spans.push(Span::raw(format!("{} ", abbrev_model(Some(group), model))));
+        spans.push(Span::styled(
+            format!("({:.1}%)", *total as f64 * 100.0 / grand as f64),
+            dim(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -3986,6 +4124,7 @@ mod tests {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
+            daily_usage: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -4940,6 +5079,53 @@ mod tests {
             hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
             None
         );
+    }
+
+    #[test]
+    fn daily_tokens_chart_renders_title_legend_and_series() {
+        use crate::dashboard::DailyUsageDoc;
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 86_400;
+        view.daily_usage = (0..7)
+            .flat_map(|d| {
+                vec![
+                    DailyUsageDoc {
+                        day: today - d,
+                        group: "claude".into(),
+                        model: "claude-fable-5".into(),
+                        tokens_in: 100_000 * (d + 1),
+                        tokens_out: 50_000,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                    DailyUsageDoc {
+                        day: today - d,
+                        group: "codex".into(),
+                        model: "gpt-5.6-sol".into(),
+                        tokens_in: 40_000,
+                        tokens_out: 10_000,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                ]
+            })
+            .collect();
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(text.contains("tokens per day"), "chart title visible");
+        assert!(text.contains("fable-5"), "legend names the top model");
+        assert!(
+            text.contains("gpt-5.6-sol"),
+            "legend names the second model"
+        );
+        assert!(text.contains('%'), "legend carries shares");
+        // Empty data (or a short terminal) renders no chart, no panic.
+        view.daily_usage.clear();
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(!text.contains("tokens per day"));
     }
 
     #[test]

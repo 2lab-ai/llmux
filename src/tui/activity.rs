@@ -143,6 +143,19 @@ impl Completed {
     }
 }
 
+/// Days of per-day/per-model token history retained for the Tokens-per-Day
+/// chart (UI-3 U14).
+const DAILY_RETAIN_DAYS: u64 = 90;
+
+/// One (day, group, model) cell of the Tokens-per-Day chart (UI-3 U14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DailyTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
 /// Per-account lifetime counters for the table's totals columns and the
 /// global totals pane (ok/error split + in/out token split).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -743,6 +756,11 @@ pub(crate) struct ActivityLog {
     /// plain user-input excerpt seen for it (≤48 chars). Insert-only, bounded
     /// by [`MAX_CLIENTS`].
     session_labels: HashMap<String, String>,
+    /// Tokens-per-day chart data (UI-3 U14): day (epoch days) → (group,
+    /// model) → summed token counts. Fed by the same RequestFinished fold
+    /// (startup replay of the persisted request log fills history), pruned to
+    /// [`DAILY_RETAIN_DAYS`].
+    daily: std::collections::BTreeMap<u64, HashMap<(String, String), DailyTokens>>,
     /// Front = newest (the log renders newest-top).
     completed: VecDeque<Completed>,
     totals: HashMap<String, Totals>,
@@ -991,6 +1009,27 @@ impl ActivityLog {
     /// excerpt. Cloned for the dashboard document.
     pub(crate) fn session_labels(&self) -> HashMap<String, String> {
         self.session_labels.clone()
+    }
+
+    /// Tokens-per-day rows (UI-3 U14), oldest day first. Flattened for the
+    /// dashboard document.
+    pub(crate) fn daily_usage(&self) -> Vec<crate::dashboard::DailyUsageDoc> {
+        self.daily
+            .iter()
+            .flat_map(|(day, cells)| {
+                cells
+                    .iter()
+                    .map(move |((group, model), t)| crate::dashboard::DailyUsageDoc {
+                        day: *day,
+                        group: group.clone(),
+                        model: model.clone(),
+                        tokens_in: t.input,
+                        tokens_out: t.output,
+                        cache_read: t.cache_read,
+                        cache_creation: t.cache_creation,
+                    })
+            })
+            .collect()
     }
 
     /// Per-account totals lookup. The dashboard reads the whole map
@@ -1326,6 +1365,29 @@ impl ActivityLog {
                 // still increments the row's error count even with no tokens.
                 if let (Some(group), Some(model)) = (&group, &model) {
                     self.record_model(group, model, &account, status, tokens, &effort, &path, now);
+                    // Tokens-per-day chart fold (UI-3 U14). `now` is the event
+                    // fold time — the startup replay passes each record's
+                    // PERSISTED timestamp, so history lands on its real day.
+                    if let Some(t) = tokens {
+                        let day = now
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() / 86_400)
+                            .unwrap_or(0);
+                        let cell = self
+                            .daily
+                            .entry(day)
+                            .or_default()
+                            .entry((group.clone(), model.clone()))
+                            .or_default();
+                        cell.input = cell.input.saturating_add(t.input);
+                        cell.output = cell.output.saturating_add(t.output);
+                        cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+                        cell.cache_creation = cell
+                            .cache_creation
+                            .saturating_add(t.cache_creation.unwrap_or(0));
+                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS);
+                        self.daily.retain(|d, _| *d >= cutoff);
+                    }
                 }
                 self.push_health(now, status);
                 self.push(Completed {

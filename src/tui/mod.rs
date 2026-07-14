@@ -3113,6 +3113,7 @@ mod tests {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
+            daily_usage: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,

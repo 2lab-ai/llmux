@@ -243,6 +243,7 @@ impl DashboardHub {
                 .collect(),
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
             session_labels: state.log.session_labels(),
+            daily_usage: state.log.daily_usage(),
         }
     }
 }
@@ -273,6 +274,8 @@ pub(crate) struct HubView {
     /// Derived session titles (TUI UI-3 U2): client `user_id` → first
     /// user-input excerpt.
     pub session_labels: HashMap<String, String>,
+    /// Tokens-per-day chart rows (UI-3 U14).
+    pub daily_usage: Vec<DailyUsageDoc>,
 }
 
 /// Consume the activity-event and tracing-line channels into the hub. The
@@ -494,6 +497,9 @@ pub struct DashboardDoc {
     /// override). Additive: absent in older docs → unavailable.
     #[serde(default)]
     pub grok: GrokSettingsDoc,
+    /// Tokens-per-day chart rows (UI-3 U14), oldest first. Additive.
+    #[serde(default)]
+    pub daily_usage: Vec<DailyUsageDoc>,
     /// Live `email_anonymous` display setting. Account names in THIS document
     /// stay real (SSOT T1); the renderer masks at draw time when this is on,
     /// so an API flip reflects on the next frame/poll without restart — in
@@ -618,6 +624,21 @@ pub struct CodexSettingsDoc {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+}
+
+/// One (day, group, model) row of the Tokens-per-Day chart (UI-3 U14).
+/// `day` is epoch DAYS (UTC). Additive: absent in older docs → no chart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsageDoc {
+    pub day: u64,
+    pub group: String,
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
 }
 
 /// Live grok provider settings (UI-3 U12), mirroring [`CodexSettingsDoc`]:
@@ -1574,6 +1595,7 @@ pub(crate) fn dashboard_doc(
             .collect(),
         codex: meta.codex.clone(),
         grok: meta.grok.clone(),
+        daily_usage: hub.daily_usage.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
