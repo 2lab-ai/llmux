@@ -82,8 +82,12 @@ with thin per-provider adapters.
     `/responses`;
   - identity headers `X-XAI-Token-Auth` / `x-grok-client-version` / `User-Agent`
     attached only when upstream is the official cli-chat-proxy host;
-  - session header `x-grok-conv-id: {session_id}` (codex sends `session_id` +
-    `prompt_cache_key` body field — grok keeps `prompt_cache_key` too, harmless);
+  - **NO `x-grok-conv-id` header** (consensus round 3): CLIProxyAPI sends it only when
+    an execution-session id exists or the model is a `grok-composer-*` requiring
+    isolated conversations (xai_executor.go:1116-1148); for standard grok-4.5 chat it
+    is absent. Omitting it removes any cross-session state-mixing risk from a shared
+    per-process id. Body `prompt_cache_key` = per-process uuid stays (pure cache hint,
+    codex parity — not conversation state);
   - `service_tier` never sent; `include: ["reasoning.encrypted_content"]` **not** sent
     (OpenAI-specific; CLIProxyAPI does not send it for xAI);
   - effort is **per-model capability, not provider-global**: a static thinking-levels
@@ -93,7 +97,15 @@ with thin per-provider adapters.
     unknown slugs) get **no `reasoning` field at all** (omission, mirroring CLIProxyAPI's
     strip at xai_executor.go:1206-1211, debug-logged). For models in the table, the
     requested/configured effort clamps INTO the model's level set: `none|minimal` → `low`
-    when zero not allowed (else `none`), `xhigh|max|ultra` → `high`.
+    when zero not allowed (else `none`), `xhigh|max|ultra` → `high`. When the clamped
+    result is `none` (only reachable on models whose level set contains it, e.g.
+    grok-4.3), the `reasoning` field is OMITTED rather than sent as `"none"` —
+    omission is the only universally-accepted wire form; explicit `"none"` is an
+    untested upstream shape. **The per-model table is the single source of effort
+    truth**: the `POST /llmux/grok` config endpoint accepts the SUPERSET
+    `none|low|medium|high` (plus empty/`unset` to clear) and the per-request clamp
+    against the effective model happens at request time — a configured `none` on a
+    model without `none` degrades to `low` at request time, by the same clamp.
 - Error handling (429): `Retry-After` header, when present, wins (existing generic
   path). Else a body whose `code`/`error` contains `free-usage-exhausted` / "included
   free usage" → park with **estimated** probe-not-before `now+24h` (xAI advertises a
