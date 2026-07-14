@@ -109,6 +109,7 @@ fn kind_static(kind: &str) -> &'static str {
         "oauth" => "oauth",
         "apikey" => "apikey",
         "codex" => "codex",
+        "grok" => "grok",
         _ => "unknown",
     }
 }
@@ -859,5 +860,19 @@ mod tests {
         doc.accounts[0].kind = "gemini".into();
         let view = DashboardView::from_doc(&doc);
         assert_eq!(view.snapshot.accounts[0].credential_kind, "unknown");
+    }
+
+    #[test]
+    fn grok_credential_kind_maps_to_grok_group() {
+        // Attach-mode reconstruction must carry a grok account's group through
+        // to BackendGroup::Grok, not fall through "unknown" to Claude.
+        let mut doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        doc.accounts[0].kind = "grok".into();
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.snapshot.accounts[0].credential_kind, "grok");
+        assert_eq!(
+            view.snapshot.accounts[0].group,
+            crate::routing::BackendGroup::Grok
+        );
     }
 }
