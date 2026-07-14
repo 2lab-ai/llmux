@@ -17,6 +17,25 @@ Llmux Islands [mascot] [Claude activity] [Codex activity]
 
 Activity counters are hidden when the count is zero. When one or more sessions are active, the indicator animates with a rainbow loop; the mascot makes a small jump whose speed scales with activity up to the capped high-activity state.
 
+## KDE / Linux visual language
+
+The KDE shell keeps the native Qt/Plasma integration boundary, but its open
+surface deliberately uses the same visual grammar as the macOS island instead
+of the desktop's default bright widget chrome:
+
+- a near-black panel with subtly bordered 8–10 px rounded cards;
+- white primary text, muted secondary text, and monospaced telemetry;
+- provider accents for Claude, Codex, Grok, and API-key accounts;
+- green, amber, and red quota/status bars that preserve the shared semantic
+  warning thresholds;
+- amber capsule segmented navigation in Statistics and add-account flows;
+- dark custom buttons, fields, selectors, switches, dialogs, request activity,
+  and verification receipts.
+
+This is presentation parity, not a second data model. Usage, Statistics, Menu,
+privacy masking, actions, and receipts still come from the shared Rust UI state
+and use the same deterministic snapshot fixture as the macOS renderer.
+
 ## Requirements
 
 - macOS with Xcode 15+.

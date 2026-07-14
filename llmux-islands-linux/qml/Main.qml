@@ -457,7 +457,17 @@ Kirigami.ApplicationWindow {
     visible: surfaceConfigured && (semanticOpen
         || controller.surfaceMode === "wayland-layer-shell" || noTrayFallback)
     title: qsTr("llmux Islands")
-    color: semanticOpen ? Kirigami.Theme.backgroundColor : "transparent"
+    color: semanticOpen ? IslandTheme.panel : "transparent"
+    palette.window: IslandTheme.panel
+    palette.windowText: IslandTheme.primaryText
+    palette.base: IslandTheme.field
+    palette.alternateBase: IslandTheme.surface
+    palette.text: IslandTheme.primaryText
+    palette.button: IslandTheme.surface
+    palette.buttonText: IslandTheme.primaryText
+    palette.highlight: IslandTheme.amber
+    palette.highlightedText: IslandTheme.panel
+    palette.placeholderText: IslandTheme.tertiaryText
 
     Behavior on width {
         enabled: !controller.smokeMode && !controller.snapshotMode
@@ -572,57 +582,71 @@ Kirigami.ApplicationWindow {
         id: expandedHeader
         visible: root.semanticOpen
         height: visible ? implicitHeight : 0
+        implicitHeight: 58
+
+        background: Rectangle {
+            color: IslandTheme.panel
+            border.color: IslandTheme.border
+            border.width: 0
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: 1
+                color: IslandTheme.border
+            }
+        }
 
         contentItem: RowLayout {
-            spacing: Kirigami.Units.smallSpacing
+            spacing: 14
 
-            Kirigami.Heading {
+            Label {
                 text: qsTr("llmux Islands")
-                level: 2
-                Layout.leftMargin: Kirigami.Units.largeSpacing
+                color: IslandTheme.primaryText
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
+                Layout.leftMargin: IslandTheme.pagePadding
             }
 
             Item {
                 Layout.fillWidth: true
             }
 
-            ToolButton {
-                text: qsTr("Usage")
-                checkable: true
-                checked: root.selectedSurface === "usage"
-                onClicked: root.selectSurface("usage")
-            }
-            ToolButton {
-                text: qsTr("Statistics")
-                checkable: true
-                checked: root.selectedSurface === "statistics"
-                onClicked: root.selectSurface("statistics")
-            }
-            ToolButton {
-                text: qsTr("Menu")
-                checkable: true
-                checked: root.selectedSurface === "menu"
-                onClicked: root.selectSurface("menu")
+            IslandSegmentedControl {
+                Layout.preferredWidth: 330
+                model: [qsTr("Usage"), qsTr("Statistics"), qsTr("Menu")]
+                currentIndex: root.selectedSurface === "statistics" ? 1
+                    : root.selectedSurface === "menu" ? 2 : 0
+                onActivated: function(index) {
+                    root.selectSurface(index === 1 ? "statistics" : index === 2 ? "menu" : "usage")
+                }
             }
 
             Rectangle {
                 radius: height / 2
                 implicitWidth: connectionStatus.implicitWidth
-                    + Kirigami.Units.largeSpacing * 2
+                    + 22
                 implicitHeight: connectionStatus.implicitHeight
-                    + Kirigami.Units.smallSpacing * 2
+                    + 12
                 color: root.uiState.lifecycle === "ready"
-                    ? Kirigami.Theme.positiveBackgroundColor
+                    ? IslandTheme.greenTint
                     : root.uiState.lifecycle === "starting"
-                        ? Kirigami.Theme.neutralBackgroundColor
-                        : Kirigami.Theme.negativeBackgroundColor
-                Layout.rightMargin: Kirigami.Units.largeSpacing
+                        ? IslandTheme.amberTint
+                        : IslandTheme.redTint
+                border.color: root.uiState.lifecycle === "ready"
+                    ? IslandTheme.green : root.uiState.lifecycle === "starting"
+                        ? IslandTheme.amber : IslandTheme.red
+                border.width: 1
+                Layout.rightMargin: IslandTheme.pagePadding
 
                 Label {
                     id: connectionStatus
                     anchors.centerIn: parent
                     text: root.connectionLabel()
-                    color: Kirigami.Theme.textColor
+                    color: IslandTheme.primaryText
+                    font.family: IslandTheme.monoFamily
+                    font.pixelSize: 10
                     elide: Text.ElideMiddle
                 }
             }
@@ -648,8 +672,8 @@ Kirigami.ApplicationWindow {
             anchors.fill: parent
             visible: !root.semanticOpen
             radius: height / 2
-            color: Kirigami.Theme.backgroundColor
-            border.color: Kirigami.Theme.disabledTextColor
+            color: IslandTheme.panel
+            border.color: IslandTheme.borderStrong
             border.width: 1
 
             RowLayout {
@@ -667,7 +691,10 @@ Kirigami.ApplicationWindow {
                 Label {
                     Layout.fillWidth: true
                     text: root.compactProviderSummary()
+                    color: IslandTheme.primaryText
                     font.bold: root.totalInFlight > 0
+                    font.family: IslandTheme.monoFamily
+                    font.pixelSize: 11
                     elide: Text.ElideRight
                     horizontalAlignment: Text.AlignHCenter
                 }
@@ -675,8 +702,8 @@ Kirigami.ApplicationWindow {
                 Label {
                     text: root.uiState.lifecycle === "ready" ? "●" : "○"
                     color: root.uiState.lifecycle === "ready"
-                        ? Kirigami.Theme.positiveTextColor
-                        : Kirigami.Theme.negativeTextColor
+                        ? IslandTheme.green
+                        : IslandTheme.red
                 }
             }
 
