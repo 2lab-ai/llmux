@@ -220,6 +220,13 @@ pub(crate) enum Mode {
     EditLimits {
         idx: usize,
     },
+    /// Right-click context menu on an accounts row (UI-3 U11): `idx` is the
+    /// display row, `item` the highlighted menu entry. The anchor cell lives
+    /// in [`App::menu_anchor`] (Mode stays `Copy`).
+    ContextMenu {
+        idx: usize,
+        item: usize,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -307,6 +314,8 @@ pub(crate) struct Chrome {
     /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
     /// layout.
     pub pane_heights: PaneHeights,
+    /// Anchor cell of the open right-click context menu (UI-3 U11).
+    pub menu_anchor: Option<(u16, u16)>,
 }
 
 /// Attach-mode banner state.
@@ -408,6 +417,16 @@ struct App {
     separator_chrome: Vec<ui::SeparatorHit>,
     /// Session-local pane-height overrides set by separator drags.
     pane_heights: PaneHeights,
+    /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
+    /// right-click target map.
+    account_row_chrome: Vec<ui::AccountRowHit>,
+    /// The rendered context menu's hit layout (UI-3 U11), when open.
+    menu_chrome: Option<ui::MenuChrome>,
+    /// Anchor cell of the open context menu (col, row).
+    menu_anchor: Option<(u16, u16)>,
+    /// Whether the limits editor was opened FROM the context menu (then it
+    /// exits to Normal, not back into the switcher).
+    limits_from_menu: bool,
     /// The separator currently being dragged, if any (mouse button held).
     drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
@@ -464,6 +483,10 @@ impl App {
             tab_chrome: Vec::new(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
+            account_row_chrome: Vec::new(),
+            menu_chrome: None,
+            menu_anchor: None,
+            limits_from_menu: false,
             drag: None,
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
@@ -515,6 +538,7 @@ impl App {
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
             pane_heights: self.pane_heights,
+            menu_anchor: self.menu_anchor,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -580,6 +604,9 @@ impl App {
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
+            Mode::ContextMenu { idx, item } => {
+                return self.on_key_context_menu(key.code, idx, item, view)
+            }
             Mode::Normal => {}
         }
         // Otherwise (Mode::Normal): the active overlay, if any, gets the key;
@@ -616,6 +643,46 @@ impl App {
                 self.open_tab(tab, view);
                 return true;
             }
+        }
+        // An open context menu (UI-3 U11) owns the mouse: click an item to
+        // run it, click anywhere else to dismiss.
+        if let Mode::ContextMenu { idx, .. } = self.mode {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+            ) {
+                match self
+                    .menu_chrome
+                    .as_ref()
+                    .and_then(|m| m.hit_item(mouse.column, mouse.row))
+                {
+                    Some(item) => self.run_menu_item(idx, item, view),
+                    None => self.close_menu(),
+                }
+                return true;
+            }
+            return false;
+        }
+        // Right-click on an accounts row opens its context menu (UI-3 U11).
+        if self.overlay == Overlay::None
+            && self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+        {
+            if let Some(idx) = self
+                .account_row_chrome
+                .iter()
+                .find(|r| {
+                    mouse.row == r.area.y
+                        && mouse.column >= r.area.x
+                        && mouse.column < r.area.right()
+                })
+                .map(|r| r.display_idx)
+            {
+                self.mode = Mode::ContextMenu { idx, item: 0 };
+                self.menu_anchor = Some((mouse.column, mouse.row));
+                return true;
+            }
+            return false;
         }
         // Otherwise only MAIN (no overlay, no pending mode interaction) gets
         // the mouse.
@@ -716,6 +783,61 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Number of context-menu entries (UI-3 U11): switch now / pause·resume /
+    /// set limit / delete.
+    const MENU_ITEMS: usize = 4;
+
+    /// Key handling for the context menu (UI-3 U11): ↑↓ move, Enter runs the
+    /// highlighted entry, Esc (or any other key) dismisses.
+    fn on_key_context_menu(
+        &mut self,
+        code: KeyCode,
+        idx: usize,
+        item: usize,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: item.saturating_sub(1),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: (item + 1).min(Self::MENU_ITEMS - 1),
+                };
+            }
+            KeyCode::Enter => self.run_menu_item(idx, item, view),
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Dismiss the context menu.
+    fn close_menu(&mut self) {
+        self.mode = Mode::Normal;
+        self.menu_anchor = None;
+    }
+
+    /// Run one context-menu entry against the display row `idx`. Every action
+    /// reuses the exact key-flow path (switch / pause / limits editor /
+    /// remove confirm), so local and attach behave identically.
+    fn run_menu_item(&mut self, idx: usize, item: usize, view: Option<&DashboardView>) {
+        self.close_menu();
+        match item {
+            0 => self.try_manual_switch(idx, view),
+            1 => self.toggle_pause_selected(idx, view),
+            2 => {
+                self.limits_from_menu = true;
+                self.open_limits_editor(idx, view);
+            }
+            // Destructive delete keeps its confirm gate (y/N) — never silent.
+            3 => self.mode = Mode::ConfirmRemove { idx },
             _ => {}
         }
     }
@@ -1196,14 +1318,22 @@ impl App {
             }
             KeyCode::Esc => {
                 self.add_input.clear();
-                self.mode = Mode::Select { idx };
+                self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                    Mode::Normal
+                } else {
+                    Mode::Select { idx }
+                };
             }
             KeyCode::Enter => {
                 let raw = std::mem::take(&mut self.add_input);
                 match parse_limits_input(&raw) {
                     Ok(limits) => {
                         self.apply_limits_selected(idx, view, limits);
-                        self.mode = Mode::Select { idx };
+                        self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                            Mode::Normal
+                        } else {
+                            Mode::Select { idx }
+                        };
                     }
                     Err(err) => {
                         // Keep editing — restore the text so it can be fixed.
@@ -2008,6 +2138,8 @@ async fn event_loop(
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
             app.separator_chrome = main.separators;
+            app.account_row_chrome = main.account_rows;
+            app.menu_chrome = main.menu;
         }
     }
 }
@@ -2358,6 +2490,100 @@ mod tests {
         assert!(app.drag.is_none());
         assert!(!app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 20), None));
         assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+    }
+
+    /// UI-3 U11: right-click on an accounts row opens the context menu; the
+    /// items drive the SAME flows as the keys (pause queues the POST, set
+    /// limit opens the editor, delete opens the y/N confirm); Esc closes.
+    #[test]
+    fn right_click_menu_runs_the_account_flows() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = stats_view_with_account();
+        let row_rect = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 1,
+        };
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // pause (item 1): queues the remote pause POST.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
+        assert!(app.menu_anchor.is_some());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "menu closed after running");
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:me@example.com".into(), true))
+        );
+
+        // set limit (item 2): opens the limits editor; Esc exits to Normal
+        // (not into the switcher) because the menu opened it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // delete (item 3): opens the destructive confirm, never silent.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::End), Some(&view)); // unknown key → closes
+        assert_eq!(app.mode, Mode::Normal, "unknown key dismisses");
+        assert!(app.on_mouse(rclick, Some(&view)));
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Down), Some(&view));
+        }
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+
+        // Click outside the open menu dismisses it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_chrome = Some(ui::MenuChrome {
+            area: ratatui::layout::Rect {
+                x: 10,
+                y: 6,
+                width: 14,
+                height: 5,
+            },
+            items: vec![],
+        });
+        let lclick_outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 70,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(lclick_outside, Some(&view)));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
