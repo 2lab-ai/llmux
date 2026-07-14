@@ -24,6 +24,7 @@ use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody};
 use super::format::{self, GaugeLevel};
+use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
 use super::{anim, Chrome, Mode, Overlay};
 
@@ -750,20 +751,61 @@ fn attach_spans(chrome: &Chrome) -> Vec<Span<'static>> {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
-    let mut spans = vec![
-        Span::styled(
-            " llmux ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    // glance-triage atom 1: the header row IS the health verdict — always
+    // present (green included: a positive signal, never health-by-absence),
+    // zero added height, [OK]/[WARN]/[FAIL] text first so the state survives
+    // a no-truecolor panel. Identity (version/port/pid/up) compresses right.
+    let now = SystemTime::now();
+    let verdict = triage::health_verdict(view, now);
+    let (tag, color) = match verdict.level() {
+        VerdictLevel::Ok => ("[OK]", Color::Green),
+        VerdictLevel::Warn => ("[WARN]", Color::Yellow),
+        VerdictLevel::Fail => ("[FAIL]", Color::Red),
+    };
+    let mut spans = vec![Span::styled(
+        format!(" {tag} "),
+        Style::new().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    match verdict.headline() {
+        Some(condition) => {
+            spans.push(Span::styled(
+                condition.text.clone(),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            if let Some(account) = &condition.account {
+                spans.push(Span::styled(
+                    format!(" {}", masked_name(account, view.email_anonymous)),
+                    Style::new().fg(color),
+                ));
+            }
+            if verdict.more() > 0 {
+                spans.push(Span::styled(format!(" +{}", verdict.more()), dim()));
+            }
+        }
+        None => {
+            spans.push(Span::styled("healthy", Style::new().fg(color)));
+            // An old daemon sends no health telemetry: say the err surface
+            // is unavailable — never a fabricated healthy zero.
+            let err = view
+                .health
+                .map_or("—".to_string(), |h| h.errors.to_string());
+            spans.push(Span::styled(
+                format!(" · {:.1} req/m · {err} err/5m", view.rpm_5m),
+                dim(),
+            ));
+        }
+    }
+    spans.push(Span::styled(
+        format!(
+            "  llmux {} :{} pid {} up {} ·{}",
+            view.display_version(),
+            view.port,
+            view.pid,
+            format::countdown(view.uptime),
+            view.snapshot.accounts.len()
         ),
-        Span::styled(view.display_version().to_string(), dim()),
-        Span::raw(format!("  port {} ", view.port)),
-        Span::styled(format!(" pid {} ", view.pid), dim()),
-        Span::styled(format!(" up {} ", format::countdown(view.uptime)), dim()),
-        Span::styled(
-            format!(" {} account(s) ", view.snapshot.accounts.len()),
-            dim(),
-        ),
-    ];
+        dim(),
+    ));
     if let Some(upstream) = &view.upstream {
         spans.push(Span::styled(format!(" → {upstream} "), dim()));
     }
@@ -949,10 +991,35 @@ fn account_row<'a>(
     let is_current = snapshot.is_current(&account.id);
     let gate = select::eligibility(account, params, now, ctx.headers_only);
 
-    let marker = match (cursor, is_current) {
-        (true, _) => Span::styled(">", Style::new().fg(Color::Cyan)),
-        (false, true) => Span::styled("►", Style::new().fg(Color::Green)),
-        (false, false) => Span::raw(" "),
+    // Urgency marker (glance-triage atom 2): tiers 0–1 (exhausted /
+    // auth-broken) ALWAYS carry a `!` — a text signal that survives
+    // no-truecolor panels and is never displaced by the cursor (`>`) or
+    // current (`►`) glyph; the 2-wide cell holds both.
+    let urgent = triage::urgent(account, gate);
+    let marker = {
+        let lead = match (cursor, is_current) {
+            (true, _) => ">",
+            (false, true) => "►",
+            (false, false) => "",
+        };
+        // Fixed 2-column content in every state, so cursor/urgent
+        // combinations never nudge the columns to their right.
+        let text = match (lead, urgent) {
+            ("", true) => "! ".to_string(),
+            ("", false) => "  ".to_string(),
+            (lead, true) => format!("{lead}!"),
+            (lead, false) => format!("{lead} "),
+        };
+        let style = if urgent {
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if cursor {
+            Style::new().fg(Color::Cyan)
+        } else if is_current {
+            Style::new().fg(Color::Green)
+        } else {
+            Style::new()
+        };
+        Span::styled(text, style)
     };
     let name = if is_current {
         Span::styled(
@@ -1980,36 +2047,76 @@ fn draw_activity(
     // hit list records the absolute screen rows each entry owns so the click
     // handler maps a (col,row) back to its stable key. Paragraph renders line 0
     // at `area.y + 1` (the title takes the top border row).
-    let total = view.completed.len();
+    // glance-triage atom 3: fold runs of ≥FOLD_MIN consecutive same-key
+    // completed-2xx entries into one counted row so the success wall stops
+    // drowning exceptions. Non-2xx / notes / control events never fold;
+    // scrolling walks RENDER rows (a folded run is one step of history).
+    let rows = triage::collapse_completed(&view.completed);
+    let total = rows.len();
     let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
     let body_top = area.y.saturating_add(1);
     let mut hits: Vec<ActivityHit> = Vec::new();
-    for entry in view.completed.iter().skip(scroll) {
+    for row in rows.iter().skip(scroll) {
         if lines.len() >= capacity {
             break;
         }
-        let expanded = entry
-            .activity_key()
-            .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
-        let row_y = body_top.saturating_add(lines.len() as u16);
-        lines.push(completed_line(entry, expanded, view.email_anonymous));
-        let mut height = 1u16;
-        if expanded {
-            for detail in completed_detail_lines(entry, view.email_anonymous) {
-                if lines.len() >= capacity {
-                    break;
+        match row {
+            ActivityRow::Single(idx) => {
+                let entry = &view.completed[*idx];
+                let expanded = entry
+                    .activity_key()
+                    .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
+                let row_y = body_top.saturating_add(lines.len() as u16);
+                lines.push(completed_line(entry, expanded, view.email_anonymous));
+                let mut height = 1u16;
+                if expanded {
+                    for detail in completed_detail_lines(entry, view.email_anonymous) {
+                        if lines.len() >= capacity {
+                            break;
+                        }
+                        lines.push(detail);
+                        height = height.saturating_add(1);
+                    }
                 }
-                lines.push(detail);
-                height = height.saturating_add(1);
+                // Only request rows are clickable (notes have no key).
+                if let Some(key) = entry.activity_key() {
+                    hits.push(ActivityHit {
+                        key,
+                        y_start: row_y,
+                        height,
+                    });
+                }
             }
-        }
-        // Only request rows are clickable (notes have no key).
-        if let Some(key) = entry.activity_key() {
-            hits.push(ActivityHit {
-                key,
-                y_start: row_y,
-                height,
-            });
+            ActivityRow::Run { start, len } => {
+                let run = &view.completed[*start..*start + *len];
+                // Expansion matches ANY member (not just the oldest), so a
+                // tail run on a FULL ring — whose oldest member is evicted on
+                // every append — stays expanded until the clicked member
+                // itself ages out. The whole block is ONE hit; the toggle key
+                // echoes the matched member while expanded so the next click
+                // collapses instead of re-keying.
+                let (expanded, key) =
+                    triage::run_toggle_key(run, chrome.expanded_activity.as_ref());
+                let row_y = body_top.saturating_add(lines.len() as u16);
+                lines.push(folded_run_line(run, expanded, view.email_anonymous));
+                let mut height = 1u16;
+                if expanded {
+                    for entry in run {
+                        if lines.len() >= capacity {
+                            break;
+                        }
+                        lines.push(completed_line(entry, false, view.email_anonymous));
+                        height = height.saturating_add(1);
+                    }
+                }
+                if let Some(key) = key {
+                    hits.push(ActivityHit {
+                        key,
+                        y_start: row_y,
+                        height,
+                    });
+                }
+            }
         }
     }
 
@@ -2037,6 +2144,60 @@ fn draw_activity(
 /// expand state (`▸` collapsed / `▾` expanded); notes keep the plain indent.
 /// `mask` applies the email-anonymous display setting: the account name and
 /// any email embedded in a note ("switch a@x → b@y") render aliased.
+/// One folded activity row (glance-triage atom 3): a run of ≥FOLD_MIN
+/// consecutive completed-2xx entries with the identical (method, path,
+/// account, group, model) key renders as `▸ HH:MM–HH:MM N× METHOD path
+/// [meta] → account (all 2xx)`. Click toggles the fold — expanding lists the
+/// member rows verbatim, so nothing is lost, only the default density.
+fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'static> {
+    let marker = if expanded { '▾' } else { '▸' };
+    let newest = &run[0];
+    let oldest = &run[run.len() - 1];
+    let stamp = Span::styled(
+        format!(
+            " {marker} {}–{}  ",
+            format::clock_hms_utc(oldest.at),
+            format::clock_hms_utc(newest.at)
+        ),
+        dim(),
+    );
+    let CompletedBody::Request {
+        method,
+        path,
+        account,
+        group,
+        model,
+        effort,
+        fast,
+        ..
+    } = &newest.body
+    else {
+        // Unreachable by construction (only requests fold); degrade to a note.
+        return Line::from(stamp);
+    };
+    let account = account
+        .as_deref()
+        .map(|a| masked_name(a, mask))
+        .unwrap_or_else(|| "?".to_string());
+    let mut spans = vec![
+        stamp,
+        Span::styled(
+            format!("{}× ", run.len()),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("{method} {path}")),
+    ];
+    if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
+    {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(meta, group_color(group.as_deref())));
+    }
+    spans.push(Span::raw(format!(" → {account} (")));
+    spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
+    spans.push(Span::raw(")"));
+    Line::from(spans)
+}
+
 fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
@@ -3131,6 +3292,7 @@ mod tests {
     fn view_with(model_usage: Vec<ModelUsageDoc>) -> DashboardView {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            health: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,

@@ -28,6 +28,13 @@ pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
 /// dropped event), the oldest in-flight entry is retired as an error note
 /// instead of leaking forever.
 const MAX_IN_FLIGHT: usize = 64;
+/// Rolling window the header health verdict aggregates over (glance-triage).
+pub(crate) const HEALTH_WINDOW: Duration = Duration::from_secs(300);
+/// One bucket per second of [`HEALTH_WINDOW`] (+1 for the partial current
+/// second): the aggregation is EXACT for any request rate at fixed memory —
+/// a raw per-event deque with a length cap would silently shorten the time
+/// window during a storm, exactly when accuracy matters.
+const HEALTH_BUCKET_CAP: usize = HEALTH_WINDOW.as_secs() as usize + 1;
 /// Age after which an in-flight row is presumed finished and swept, even if no
 /// `RequestFinished` event ever arrived (the event was dropped on a full
 /// activity channel). Real requests finish in well under 90s per the daemon
@@ -727,6 +734,50 @@ pub(crate) struct ActivityLog {
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
     windowed: WindowedBuckets,
+    /// Per-second health buckets for the header health verdict (glance-triage
+    /// MUST-FIX 3): the verdict window must NEVER be derived from the
+    /// `completed` ring — [`LOG_CAPACITY`] truncation would undercount a storm
+    /// exactly when accuracy matters most. Back = newest second; pruned to
+    /// [`HEALTH_WINDOW`] on every push, at most [`HEALTH_BUCKET_CAP`] entries
+    /// regardless of request rate.
+    health: VecDeque<(u64, HealthCounts)>,
+}
+
+/// Status-class counts over the last [`HEALTH_WINDOW`], feeding the header
+/// health verdict. Serialized 1:1 into the dashboard document so local and
+/// attach render the identical verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HealthCounts {
+    pub requests: u64,
+    /// Status >= 400.
+    pub errors: u64,
+    pub s429: u64,
+    pub s401: u64,
+    pub s5xx: u64,
+}
+
+impl HealthCounts {
+    /// Fold one finished request's status into the counts.
+    fn add_status(&mut self, status: u16) {
+        self.requests += 1;
+        if status >= 400 {
+            self.errors += 1;
+        }
+        match status {
+            429 => self.s429 += 1,
+            401 => self.s401 += 1,
+            500..=599 => self.s5xx += 1,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &HealthCounts) {
+        self.requests += other.requests;
+        self.errors += other.errors;
+        self.s429 += other.s429;
+        self.s401 += other.s401;
+        self.s5xx += other.s5xx;
+    }
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1226,6 +1277,7 @@ impl ActivityLog {
                 if let (Some(group), Some(model)) = (&group, &model) {
                     self.record_model(group, model, &account, status, tokens, &effort, &path, now);
                 }
+                self.push_health(now, status);
                 self.push(Completed {
                     at: now,
                     body: CompletedBody::Request {
@@ -1283,6 +1335,54 @@ impl ActivityLog {
     fn push(&mut self, entry: Completed) {
         self.completed.push_front(entry);
         self.completed.truncate(self.capacity);
+    }
+
+    /// Record one finished request into its per-second health bucket and
+    /// prune buckets that have aged out of [`HEALTH_WINDOW`].
+    fn push_health(&mut self, at: SystemTime, status: u16) {
+        let sec = at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match self.health.back_mut() {
+            // Same (or out-of-order, sub-second reordering) second: fold into
+            // the newest bucket — delivery is chronological, so this only
+            // ever merges same/adjacent-second arrivals.
+            Some((bucket_sec, counts)) if *bucket_sec >= sec => counts.add_status(status),
+            _ => {
+                let mut counts = HealthCounts::default();
+                counts.add_status(status);
+                self.health.push_back((sec, counts));
+            }
+        }
+        let newest = self.health.back().map(|&(sec, _)| sec).unwrap_or(0);
+        let horizon = newest.saturating_sub(HEALTH_WINDOW.as_secs());
+        while let Some(&(front, _)) = self.health.front() {
+            if front < horizon || self.health.len() > HEALTH_BUCKET_CAP {
+                self.health.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Status-class counts over the last [`HEALTH_WINDOW`] ending at `now`.
+    /// Reads filter by time (pruning happens on push), so a quiet log still
+    /// ages out: a bucket counts only while `now - HEALTH_WINDOW <= at`.
+    pub(crate) fn health_counts(&self, now: SystemTime) -> HealthCounts {
+        let now_sec = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = now_sec.saturating_sub(HEALTH_WINDOW.as_secs());
+        let mut total = HealthCounts::default();
+        for &(sec, counts) in self.health.iter().rev() {
+            if sec < horizon {
+                break;
+            }
+            total.merge(&counts);
+        }
+        total
     }
 }
 
@@ -1606,6 +1706,39 @@ mod tests {
                 tokens_out: 5,
             }
         );
+    }
+
+    // ---- health window (glance-triage) ----
+
+    #[test]
+    fn health_counts_survive_ring_truncation() {
+        // A storm 100 events past LOG_CAPACITY: the completed ring truncates,
+        // the health window must NOT (that undercount was the reason the
+        // verdict gets its own deque — MUST-FIX 3).
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let total = (LOG_CAPACITY + 100) as u64;
+        for i in 0..total {
+            log.apply(finished_status(i, Some("a"), None, 429), at(100 + i));
+        }
+        let now = at(100 + total);
+        assert_eq!(log.completed().count(), LOG_CAPACITY);
+        let counts = log.health_counts(now);
+        assert_eq!(counts.requests, total);
+        assert_eq!(counts.s429, total);
+        assert_eq!(counts.errors, total);
+    }
+
+    #[test]
+    fn health_counts_age_out_of_the_window() {
+        let mut log = ActivityLog::new(10);
+        log.apply(finished_status(1, Some("a"), None, 500), at(1_000 - 400)); // aged out
+        log.apply(finished_status(2, Some("a"), None, 429), at(1_000 - 100));
+        log.apply(finished_status(3, Some("a"), None, 200), at(1_000 - 10));
+        let counts = log.health_counts(at(1_000));
+        assert_eq!(counts.requests, 2);
+        assert_eq!(counts.s429, 1);
+        assert_eq!(counts.s5xx, 0, "outside the 5m window");
+        assert_eq!(counts.errors, 1);
     }
 
     // ---- requests per minute ----
