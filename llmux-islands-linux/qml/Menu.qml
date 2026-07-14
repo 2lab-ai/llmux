@@ -9,6 +9,16 @@ Kirigami.ScrollablePage {
     id: menuPage
     objectName: "menu-surface"
 
+    padding: IslandTheme.pagePadding
+    palette.window: IslandTheme.panel
+    palette.windowText: IslandTheme.primaryText
+    palette.text: IslandTheme.primaryText
+    palette.buttonText: IslandTheme.primaryText
+    palette.base: IslandTheme.field
+    palette.highlight: IslandTheme.amber
+    palette.highlightedText: IslandTheme.panel
+    background: Rectangle { color: IslandTheme.panel }
+
     property var uiState: ({})
     // Kept as shell-facing compatibility inputs while canonical state remains authoritative.
     property string surfaceMode: ""
@@ -285,13 +295,13 @@ Kirigami.ScrollablePage {
     function receiptOutcomeColor(outcome) {
         switch (optionalText(outcome)) {
         case "succeeded":
-            return Kirigami.Theme.positiveTextColor
+            return IslandTheme.green
         case "failed":
-            return Kirigami.Theme.negativeTextColor
+            return IslandTheme.red
         case "cancelled":
-            return Kirigami.Theme.neutralTextColor
+            return IslandTheme.amber
         default:
-            return Kirigami.Theme.disabledTextColor
+            return IslandTheme.secondaryText
         }
     }
 
@@ -327,33 +337,37 @@ Kirigami.ScrollablePage {
     ColumnLayout {
         id: menuContent
         width: menuPage.availableWidth
-        spacing: Kirigami.Units.largeSpacing
+        spacing: IslandTheme.sectionSpacing
 
         RowLayout {
             Layout.fillWidth: true
 
             ColumnLayout {
                 spacing: 0
-                Kirigami.Heading {
+                Label {
                     text: qsTr("Settings")
-                    level: 1
+                    color: IslandTheme.primaryText
+                    font.pixelSize: 20
+                    font.weight: Font.DemiBold
                 }
                 Label {
                     text: qsTr("Display, daemon, desktop, events, and maintenance")
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
+                    font.pixelSize: 11
                 }
             }
 
             Item { Layout.fillWidth: true }
 
-            Button {
+            IslandButton {
                 text: qsTr("Test notification")
                 icon.name: "notifications"
+                highlighted: true
                 onClicked: menuPage.dispatchRequested("test_notification", "{}")
             }
         }
 
-        Kirigami.InlineMessage {
+        IslandInlineMessage {
             Layout.fillWidth: true
             visible: menuPage.optionalText(menuPage.operation.id).length > 0
             type: Kirigami.MessageType.Information
@@ -364,21 +378,20 @@ Kirigami.ScrollablePage {
                 .arg(menuPage.formatTimestamp(menuPage.operation.started_at_ms))
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             Layout.fillWidth: true
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Appearance and notifications")
-                    level: 2
                 }
 
                 Kirigami.FormLayout {
                     Layout.fillWidth: true
 
-                    ComboBox {
+                    IslandComboBox {
                         id: screenSelector
                         Kirigami.FormData.label: qsTr("Screen:")
                         model: menuPage.screens
@@ -391,7 +404,7 @@ Kirigami.ScrollablePage {
                         displayText: currentIndex >= 0
                             ? menuPage.optionLabel(menuPage.screens[currentIndex], currentIndex)
                             : menuPage.unavailableText
-                        delegate: ItemDelegate {
+                        delegate: IslandItemDelegate {
                             required property var modelData
                             required property int index
                             width: screenSelector.width
@@ -412,7 +425,7 @@ Kirigami.ScrollablePage {
                         Kirigami.FormData.label: qsTr("Sound:")
                         Layout.fillWidth: true
 
-                        ComboBox {
+                        IslandComboBox {
                             id: soundSelector
                             Layout.fillWidth: true
                             model: menuPage.sounds
@@ -425,7 +438,7 @@ Kirigami.ScrollablePage {
                             displayText: currentIndex >= 0
                                 ? menuPage.optionLabel(menuPage.sounds[currentIndex], currentIndex)
                                 : menuPage.unavailableText
-                            delegate: ItemDelegate {
+                            delegate: IslandItemDelegate {
                                 required property var modelData
                                 required property int index
                                 width: soundSelector.width
@@ -442,7 +455,7 @@ Kirigami.ScrollablePage {
                             }
                         }
 
-                        Button {
+                        IslandButton {
                             text: qsTr("Preview")
                             icon.name: "media-playback-start"
                             enabled: soundSelector.currentIndex >= 0
@@ -461,7 +474,7 @@ Kirigami.ScrollablePage {
                         }
                     }
 
-                    Switch {
+                    IslandSwitch {
                         Kirigami.FormData.label: qsTr("Privacy:")
                         text: qsTr("Anonymize account email")
                         checked: menuPage.settings.email_anonymous === true
@@ -472,7 +485,7 @@ Kirigami.ScrollablePage {
                         )
                     }
 
-                    Switch {
+                    IslandSwitch {
                         Kirigami.FormData.label: qsTr("Quota:")
                         text: qsTr("Show Fable weekly quota")
                         checked: menuPage.settings.show_fable_weekly === true
@@ -486,7 +499,7 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             id: connectionCard
             objectName: "connection-settings"
             Layout.fillWidth: true
@@ -496,22 +509,21 @@ Kirigami.ScrollablePage {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Kirigami.Heading {
+                    IslandSectionLabel {
                         text: qsTr("Daemon connection")
-                        level: 2
                     }
                     Item { Layout.fillWidth: true }
                     Label {
                         text: menuPage.displayText(menuPage.connection.endpoint_display)
                         elide: Text.ElideMiddle
-                        color: Kirigami.Theme.disabledTextColor
+                        color: IslandTheme.secondaryText
                     }
                 }
 
                 Kirigami.FormLayout {
                     Layout.fillWidth: true
 
-                    ComboBox {
+                    IslandComboBox {
                         id: connectionSchemeSelector
                         objectName: "connection-scheme-selector"
                         Kirigami.FormData.label: qsTr("Scheme:")
@@ -524,7 +536,7 @@ Kirigami.ScrollablePage {
                         }
                     }
 
-                    TextField {
+                    IslandTextField {
                         id: connectionHostField
                         Kirigami.FormData.label: qsTr("Host:")
                         text: menuPage.endpointHost(menuPage.connection.endpoint_display)
@@ -534,7 +546,7 @@ Kirigami.ScrollablePage {
                         onTextEdited: menuPage.connectionValidationMessage = ""
                     }
 
-                    TextField {
+                    IslandTextField {
                         id: connectionPortField
                         Kirigami.FormData.label: qsTr("Port:")
                         text: menuPage.endpointPort(menuPage.connection.endpoint_display)
@@ -545,7 +557,7 @@ Kirigami.ScrollablePage {
                         onTextEdited: menuPage.connectionValidationMessage = ""
                     }
 
-                    TextField {
+                    IslandTextField {
                         id: connectionApiKeyField
                         Kirigami.FormData.label: qsTr("API key:")
                         placeholderText: menuPage.settings.api_key_configured
@@ -562,7 +574,7 @@ Kirigami.ScrollablePage {
                         }
                     }
 
-                    CheckBox {
+                    IslandCheckBox {
                         Kirigami.FormData.label: qsTr("Stored key:")
                         text: qsTr("Clear the stored API key")
                         visible: menuPage.settings.api_key_configured === true
@@ -577,7 +589,7 @@ Kirigami.ScrollablePage {
                     }
                 }
 
-                Kirigami.InlineMessage {
+                IslandInlineMessage {
                     Layout.fillWidth: true
                     visible: menuPage.connectionValidationMessage.length > 0
                     type: Kirigami.MessageType.Error
@@ -592,10 +604,10 @@ Kirigami.ScrollablePage {
                                 ? qsTr("Remote connection · authenticated")
                                 : qsTr("Remote connection · API key required"))
                             : qsTr("Loopback connection")
-                        color: Kirigami.Theme.disabledTextColor
+                        color: IslandTheme.secondaryText
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    IslandButton {
                         text: qsTr("Apply connection")
                         icon.name: "network-connect"
                         enabled: !menuPage.isOperationBusy("settings")
@@ -605,7 +617,7 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             id: desktopCard
             objectName: "desktop-capabilities"
             Layout.fillWidth: true
@@ -613,12 +625,11 @@ Kirigami.ScrollablePage {
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("KDE desktop integration")
-                    level: 2
                 }
 
-                Switch {
+                IslandSwitch {
                     text: qsTr("Launch Islands at login")
                     checked: menuPage.autostart.enabled === true
                     enabled: menuPage.hasOwn(menuPage.autostart, "enabled")
@@ -634,7 +645,7 @@ Kirigami.ScrollablePage {
                     Layout.fillWidth: true
                     visible: !menuPage.hasOwn(menuPage.autostart, "enabled")
                     text: menuPage.unavailableText
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                 }
 
                 GridLayout {
@@ -649,7 +660,7 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: menuPage.surfaceModeText()
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
 
@@ -660,7 +671,7 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: menuPage.capabilityExplanation("layer_shell")
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
 
@@ -671,7 +682,7 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: menuPage.capabilityExplanation("tray")
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
 
@@ -682,7 +693,7 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: menuPage.capabilityExplanation("notifications")
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
 
@@ -694,14 +705,14 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: qsTr("Not required on Plasma; no global pointer monitoring")
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
                 }
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             Layout.fillWidth: true
 
             contentItem: ColumnLayout {
@@ -709,12 +720,11 @@ Kirigami.ScrollablePage {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Kirigami.Heading {
+                    IslandSectionLabel {
                         text: qsTr("Events")
-                        level: 2
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    IslandButton {
                         text: qsTr("Add event")
                         icon.name: "list-add"
                         enabled: !menuPage.isOperationBusy("event")
@@ -726,13 +736,13 @@ Kirigami.ScrollablePage {
                     Layout.fillWidth: true
                     visible: menuPage.events.length === 0
                     text: qsTr("No configured events")
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                 }
 
                 Repeater {
                     model: menuPage.events
 
-                    delegate: Kirigami.AbstractCard {
+                    delegate: IslandCard {
                         id: eventCard
                         required property var modelData
                         readonly property var event: menuPage.objectOrEmpty(modelData)
@@ -754,7 +764,7 @@ Kirigami.ScrollablePage {
                                     text: qsTr("%1 → %2")
                                         .arg(menuPage.displayText(eventCard.event.from))
                                         .arg(menuPage.displayText(eventCard.event.to))
-                                    color: Kirigami.Theme.disabledTextColor
+                                    color: IslandTheme.secondaryText
                                     elide: Text.ElideRight
                                 }
                                 Label {
@@ -764,14 +774,14 @@ Kirigami.ScrollablePage {
                                 }
                             }
 
-                            ToolButton {
+                            IslandButton {
                                 text: qsTr("Edit")
                                 icon.name: "document-edit"
                                 enabled: !menuPage.isOperationBusy("event")
                                 onClicked: eventEditor.openForEdit(eventCard.event)
                             }
 
-                            ToolButton {
+                            IslandButton {
                                 text: qsTr("Remove")
                                 icon.name: "edit-delete"
                                 enabled: menuPage.hasValue(eventCard.event.id)
@@ -787,7 +797,7 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             id: maintenanceCard
             objectName: "maintenance-settings"
             Layout.fillWidth: true
@@ -795,9 +805,8 @@ Kirigami.ScrollablePage {
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Updates")
-                    level: 2
                 }
 
                 Kirigami.FormLayout {
@@ -822,13 +831,13 @@ Kirigami.ScrollablePage {
                             : menuPage.unavailableText
                     }
 
-                    ComboBox {
+                    IslandSegmentedControl {
                         id: channelSelector
                         Kirigami.FormData.label: qsTr("Release channel:")
+                        Layout.fillWidth: true
                         model: ["stable", "preview"]
                         currentIndex: menuPage.currentChannel === "stable" ? 0
                             : menuPage.currentChannel === "preview" ? 1 : -1
-                        displayText: currentIndex >= 0 ? model[currentIndex] : menuPage.unavailableText
                         enabled: !menuPage.isOperationBusy("maintenance")
                         onActivated: function(index) {
                             var selected = model[index]
@@ -840,7 +849,7 @@ Kirigami.ScrollablePage {
                     }
                 }
 
-                Kirigami.InlineMessage {
+                IslandInlineMessage {
                     Layout.fillWidth: true
                     visible: menuPage.hasValue(menuPage.maintenance.instructions)
                     type: Kirigami.MessageType.Information
@@ -853,9 +862,9 @@ Kirigami.ScrollablePage {
                         Layout.fillWidth: true
                         text: qsTr("Package ownership is checked before any update is attempted.")
                         wrapMode: Text.Wrap
-                        color: Kirigami.Theme.disabledTextColor
+                        color: IslandTheme.secondaryText
                     }
-                    Button {
+                    IslandButton {
                         text: menuPage.maintenance.update_available === true
                             ? qsTr("Update now") : qsTr("Check for updates")
                         icon.name: "system-software-update"
@@ -866,23 +875,22 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             objectName: "menu-verification-receipts"
             Layout.fillWidth: true
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Verification receipts")
-                    level: 2
                 }
 
                 Label {
                     Layout.fillWidth: true
                     visible: menuPage.menuReceiptItems.length === 0
                     text: qsTr("No completed settings, event, maintenance, or autostart operations")
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                     wrapMode: Text.Wrap
                 }
 
@@ -914,19 +922,26 @@ Kirigami.ScrollablePage {
                                     .arg(menuPage.hasValue(receiptRow.receipt.target_display)
                                         ? qsTr(" · %1").arg(receiptRow.receipt.target_display) : "")
                                 font.bold: true
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                                 elide: Text.ElideRight
                             }
                             Label {
                                 Layout.fillWidth: true
                                 text: menuPage.displayText(receiptRow.receipt.message)
                                 wrapMode: Text.Wrap
+                                color: IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                             }
                             Label {
                                 Layout.fillWidth: true
                                 text: qsTr("Started %1 · finished %2")
                                     .arg(menuPage.formatTimestamp(receiptRow.receipt.started_at_ms))
                                     .arg(menuPage.formatTimestamp(receiptRow.receipt.finished_at_ms))
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                                 elide: Text.ElideRight
                             }
                         }
@@ -935,16 +950,15 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             objectName: "about-llmux-islands"
             Layout.fillWidth: true
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("About llmux Islands")
-                    level: 2
                 }
 
                 Kirigami.FormLayout {
@@ -974,7 +988,7 @@ Kirigami.ScrollablePage {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Button {
+                    IslandButton {
                         text: qsTr("Open source")
                         icon.name: "internet-services"
                         enabled: menuPage.hasValue(menuPage.aboutSourceUrl)
@@ -983,7 +997,7 @@ Kirigami.ScrollablePage {
                             JSON.stringify({ "url": menuPage.aboutSourceUrl })
                         )
                     }
-                    Button {
+                    IslandButton {
                         objectName: "open-releases"
                         text: qsTr("Releases")
                         icon.name: "system-software-update"
@@ -994,7 +1008,7 @@ Kirigami.ScrollablePage {
                         )
                     }
                     Item { Layout.fillWidth: true }
-                    Button {
+                    IslandButton {
                         text: qsTr("Quit Islands")
                         icon.name: "application-exit"
                         onClicked: menuPage.dispatchRequested("quit_requested", "{}")
@@ -1004,7 +1018,7 @@ Kirigami.ScrollablePage {
         }
     }
 
-    Dialog {
+    IslandDialog {
         id: eventEditor
         objectName: "event-editor"
         parent: Overlay.overlay
@@ -1070,28 +1084,28 @@ Kirigami.ScrollablePage {
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.smallSpacing
 
-            TextField {
+            IslandTextField {
                 id: eventIdField
                 Layout.fillWidth: true
                 placeholderText: qsTr("Event ID")
                 readOnly: eventEditor.editingExisting && eventEditor.originalId.length > 0
                 onTextEdited: eventEditor.validationMessage = ""
             }
-            TextField {
+            IslandTextField {
                 id: eventFromField
                 Layout.fillWidth: true
                 placeholderText: qsTr("From · YYYYMMDDHHMM or RFC 3339")
                 inputMethodHints: Qt.ImhNoPredictiveText
                 onTextEdited: eventEditor.validationMessage = ""
             }
-            TextField {
+            IslandTextField {
                 id: eventToField
                 Layout.fillWidth: true
                 placeholderText: qsTr("To · YYYYMMDDHHMM or RFC 3339")
                 inputMethodHints: Qt.ImhNoPredictiveText
                 onTextEdited: eventEditor.validationMessage = ""
             }
-            TextArea {
+            IslandTextArea {
                 id: eventContentField
                 Layout.fillWidth: true
                 Layout.preferredHeight: Kirigami.Units.gridUnit * 5
@@ -1099,7 +1113,7 @@ Kirigami.ScrollablePage {
                 wrapMode: TextEdit.Wrap
                 onTextChanged: eventEditor.validationMessage = ""
             }
-            Kirigami.InlineMessage {
+            IslandInlineMessage {
                 Layout.fillWidth: true
                 visible: eventEditor.validationMessage.length > 0
                 type: Kirigami.MessageType.Error
@@ -1108,11 +1122,11 @@ Kirigami.ScrollablePage {
             RowLayout {
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }
-                Button {
+                IslandButton {
                     text: qsTr("Cancel")
                     onClicked: eventEditor.close()
                 }
-                Button {
+                IslandButton {
                     text: eventEditor.editingExisting ? qsTr("Save") : qsTr("Create")
                     highlighted: true
                     onClicked: eventEditor.submit()
@@ -1121,7 +1135,7 @@ Kirigami.ScrollablePage {
         }
     }
 
-    Dialog {
+    IslandDialog {
         id: eventRemoveConfirmation
         objectName: "event-remove-confirmation"
         parent: Overlay.overlay
@@ -1148,7 +1162,7 @@ Kirigami.ScrollablePage {
         onRejected: menuPage.pendingEvent = ({})
     }
 
-    Dialog {
+    IslandDialog {
         id: channelChangeConfirmation
         objectName: "channel-change-confirmation"
         parent: Overlay.overlay

@@ -28,6 +28,128 @@ fn qml_shell_exposes_every_primary_surface() {
 }
 
 #[test]
+fn qml_visual_system_matches_the_macos_island_language_without_system_chrome() {
+    let theme = read("qml/IslandTheme.qml");
+    for marker in [
+        r##"panel: "#050505""##,
+        r##"surface: "#111111""##,
+        r##"primaryText: "#e6e6e6""##,
+        r##"secondaryText: "#8a8a8a""##,
+        r##"green: "#66bf73""##,
+        r##"amber: "#ffb300""##,
+        r##"red: "#ff4d4d""##,
+        r##"blue: "#6699ff""##,
+        r##"magenta: "#cc66cc""##,
+        "cardRadius: 10",
+        "providerAccent(provider)",
+        "quotaAccent(remaining, constraining, warningLevel)",
+        r#"monoFamily: "monospace""#,
+    ] {
+        assert!(
+            theme.contains(marker),
+            "missing macOS-derived token {marker}"
+        );
+    }
+
+    let build = read("build.rs");
+    assert!(
+        build.contains(r#"QmlFile::from("qml/IslandTheme.qml").singleton(true)"#),
+        "IslandTheme must be registered as a real QML singleton"
+    );
+    for component in [
+        "IslandCard.qml",
+        "IslandButton.qml",
+        "IslandTextField.qml",
+        "IslandComboBox.qml",
+        "IslandItemDelegate.qml",
+        "IslandSwitch.qml",
+        "IslandProgressBar.qml",
+        "IslandSegmentedControl.qml",
+        "IslandDialog.qml",
+    ] {
+        assert!(
+            build.contains(&format!(r#".qml_file("qml/{component}")"#)),
+            "QML module must register {component}"
+        );
+    }
+
+    let main = read("qml/Main.qml");
+    for marker in [
+        "color: semanticOpen ? IslandTheme.panel",
+        "palette.window: IslandTheme.panel",
+        "IslandSegmentedControl",
+        "color: IslandTheme.panel",
+        "border.color: IslandTheme.border",
+    ] {
+        assert!(main.contains(marker), "dark shell must contain {marker}");
+    }
+
+    for page in ["qml/Usage.qml", "qml/Statistics.qml", "qml/Menu.qml"] {
+        let source = read(page);
+        for marker in [
+            "padding: IslandTheme.pagePadding",
+            "background: Rectangle { color: IslandTheme.panel }",
+            "palette.windowText: IslandTheme.primaryText",
+        ] {
+            assert!(source.contains(marker), "{page} must contain {marker}");
+        }
+        for forbidden in [
+            "Kirigami.AbstractCard",
+            "Kirigami.InlineMessage",
+            "Kirigami.Separator",
+            "Kirigami.Theme.",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{page} must not leak bright system chrome through {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn production_surfaces_use_provider_quota_segment_and_receipt_hierarchy() {
+    let usage = read("qml/Usage.qml");
+    for marker in [
+        "IslandTheme.providerAccent(accountCard.account.provider)",
+        "IslandTheme.quotaAccent(",
+        "IslandProgressBar",
+        "accentColor: usagePage.gaugeColor(",
+        "IslandSegmentedControl",
+    ] {
+        assert!(usage.contains(marker), "Usage must contain {marker}");
+    }
+
+    let statistics = read("qml/Statistics.qml");
+    for marker in [
+        "property int selectedSection: 0",
+        "IslandSegmentedControl",
+        "IslandSectionLabel",
+        "font.family: IslandTheme.monoFamily",
+        "id: receiptEvidenceSection",
+    ] {
+        assert!(
+            statistics.contains(marker),
+            "Statistics must contain {marker}"
+        );
+    }
+
+    let menu = read("qml/Menu.qml");
+    for marker in [
+        "IslandCard",
+        "IslandButton",
+        "IslandComboBox",
+        "IslandSegmentedControl",
+        "IslandSwitch",
+        "IslandTextField",
+        "IslandDialog",
+        "font.family: IslandTheme.monoFamily",
+    ] {
+        assert!(menu.contains(marker), "Menu must contain {marker}");
+    }
+}
+
+#[test]
 fn qml_pages_normalize_qt_variant_lists_before_using_array_methods() {
     for page in ["qml/Usage.qml", "qml/Statistics.qml", "qml/Menu.qml"] {
         let source = read(page);

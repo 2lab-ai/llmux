@@ -8,6 +8,16 @@ import org.kde.kirigami as Kirigami
 Kirigami.ScrollablePage {
     id: usagePage
 
+    padding: IslandTheme.pagePadding
+    palette.window: IslandTheme.panel
+    palette.windowText: IslandTheme.primaryText
+    palette.text: IslandTheme.primaryText
+    palette.buttonText: IslandTheme.primaryText
+    palette.base: IslandTheme.field
+    palette.highlight: IslandTheme.amber
+    palette.highlightedText: IslandTheme.panel
+    background: Rectangle { color: IslandTheme.panel }
+
     property var uiState: ({})
     property var removeCandidate: ({})
     property int renderedGaugeRows: 0
@@ -201,11 +211,11 @@ Kirigami.ScrollablePage {
     function gaugeColor(gauge, account) {
         gauge = objectOrEmpty(gauge)
         account = objectOrEmpty(account)
-        if (gauge.constraining === true || account.warning_level === "critical")
-            return Kirigami.Theme.negativeTextColor
-        if (account.warning_level === "warning")
-            return Kirigami.Theme.neutralTextColor
-        return Kirigami.Theme.positiveTextColor
+        return IslandTheme.quotaAccent(
+            clampFraction(gauge.remaining_fraction),
+            gauge.constraining,
+            account.warning_level
+        )
     }
 
     function tokenExpirySummary(account) {
@@ -227,12 +237,12 @@ Kirigami.ScrollablePage {
     function statusBackground(account) {
         account = objectOrEmpty(account)
         if (account.paused === true)
-            return Kirigami.Theme.neutralBackgroundColor
+            return IslandTheme.amberTint
         if (account.healthy !== true || account.warning_level === "critical")
-            return Kirigami.Theme.negativeBackgroundColor
+            return IslandTheme.redTint
         if (account.warning_level === "warning")
-            return Kirigami.Theme.neutralBackgroundColor
-        return Kirigami.Theme.positiveBackgroundColor
+            return IslandTheme.amberTint
+        return IslandTheme.greenTint
     }
 
     function warningMessage(account) {
@@ -315,44 +325,48 @@ Kirigami.ScrollablePage {
     function receiptBackground(receipt) {
         receipt = objectOrEmpty(receipt)
         if (receipt.outcome === "failed")
-            return Kirigami.Theme.negativeBackgroundColor
+            return IslandTheme.redTint
         if (receipt.outcome === "cancelled" || receipt.outcome === "no_change")
-            return Kirigami.Theme.neutralBackgroundColor
-        return Kirigami.Theme.positiveBackgroundColor
+            return IslandTheme.amberTint
+        return IslandTheme.greenTint
     }
 
     ColumnLayout {
         id: usageContent
         width: usagePage.availableWidth
-        spacing: Kirigami.Units.largeSpacing
+        spacing: IslandTheme.sectionSpacing
 
         RowLayout {
             Layout.fillWidth: true
-            spacing: Kirigami.Units.smallSpacing
+            spacing: 8
 
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
 
-                Kirigami.Heading {
-                    text: qsTr("Account usage")
-                    level: 1
+                Label {
+                    text: qsTr("Usage")
+                    color: IslandTheme.primaryText
+                    font.pixelSize: 20
+                    font.weight: Font.DemiBold
                 }
                 Label {
                     Layout.fillWidth: true
                     text: qsTr("Quota, reset, credential health and in-flight state")
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
+                    font.pixelSize: 11
                     elide: Text.ElideRight
                 }
             }
 
-            Button {
+            IslandButton {
                 text: qsTr("Add account")
                 icon.name: "list-add"
+                highlighted: true
                 enabled: !usagePage.loginActive
                 onClicked: addDialog.open()
             }
-            Button {
+            IslandButton {
                 text: qsTr("Refresh")
                 icon.name: "view-refresh"
                 onClicked: usagePage.dispatchRequested(
@@ -365,7 +379,7 @@ Kirigami.ScrollablePage {
         Flow {
             Layout.fillWidth: true
             Layout.preferredHeight: childrenRect.height
-            spacing: Kirigami.Units.smallSpacing
+            spacing: 6
             visible: providerCounterRepeater.count > 0
 
             Repeater {
@@ -377,10 +391,12 @@ Kirigami.ScrollablePage {
                     required property var modelData
                     radius: height / 2
                     implicitWidth: providerCounterLabel.implicitWidth
-                            + Kirigami.Units.largeSpacing * 2
+                            + 20
                     implicitHeight: providerCounterLabel.implicitHeight
-                            + Kirigami.Units.smallSpacing
-                    color: Kirigami.Theme.alternateBackgroundColor
+                            + 10
+                    color: IslandTheme.surface
+                    border.color: IslandTheme.border
+                    border.width: 1
 
                     Label {
                         id: providerCounterLabel
@@ -389,12 +405,15 @@ Kirigami.ScrollablePage {
                                 .arg(usagePage.providerLabel(providerCounterChip.modelData.provider))
                                 .arg(providerCounterChip.modelData.count)
                         textFormat: Text.PlainText
+                        color: IslandTheme.secondaryText
+                        font.family: IslandTheme.monoFamily
+                        font.pixelSize: 10
                     }
                 }
             }
         }
 
-        Kirigami.InlineMessage {
+        IslandInlineMessage {
             objectName: "usage-offline-state"
             Layout.fillWidth: true
             visible: usagePage.isOffline
@@ -414,18 +433,18 @@ Kirigami.ScrollablePage {
             Label {
                 Layout.fillWidth: true
                 text: qsTr("Connecting to the llmux daemon…")
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
             }
         }
 
-        Kirigami.AbstractCard {
+        IslandCard {
             objectName: "usage-login-state"
             Layout.fillWidth: true
             visible: usagePage.login.phase !== undefined
                     && usagePage.login.phase !== "idle"
 
             contentItem: ColumnLayout {
-                spacing: Kirigami.Units.smallSpacing
+                spacing: 8
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -440,18 +459,20 @@ Kirigami.ScrollablePage {
                         implicitHeight: implicitWidth
                         visible: !usagePage.loginActive
                     }
-                    Kirigami.Heading {
+                    Label {
                         Layout.fillWidth: true
-                        level: 2
                         text: qsTr("%1 login").arg(
                             usagePage.providerLabel(usagePage.login.provider)
                         )
+                        color: IslandTheme.primaryText
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
                     }
                     Label {
                         text: usagePage.optionalText(usagePage.login.phase)
                         color: usagePage.login.phase === "error"
-                                ? Kirigami.Theme.negativeTextColor
-                                : Kirigami.Theme.disabledTextColor
+                                ? IslandTheme.red
+                                : IslandTheme.secondaryText
                         textFormat: Text.PlainText
                     }
                 }
@@ -463,8 +484,8 @@ Kirigami.ScrollablePage {
                     textFormat: Text.PlainText
                     color: usagePage.loginIsTerminal()
                             && usagePage.login.phase === "error"
-                            ? Kirigami.Theme.negativeTextColor
-                            : Kirigami.Theme.textColor
+                            ? IslandTheme.red
+                            : IslandTheme.primaryText
                 }
 
                 ColumnLayout {
@@ -479,7 +500,7 @@ Kirigami.ScrollablePage {
                         font.bold: true
                     }
 
-                    TextField {
+                    IslandTextField {
                         Layout.fillWidth: true
                         visible: usagePage.hasValue(usagePage.login.verification_uri)
                         text: usagePage.optionalText(usagePage.login.verification_uri)
@@ -488,7 +509,7 @@ Kirigami.ScrollablePage {
                         Accessible.name: qsTr("Verification URI")
                     }
 
-                    TextField {
+                    IslandTextField {
                         Layout.fillWidth: true
                         visible: usagePage.hasValue(usagePage.login.user_code)
                         text: usagePage.optionalText(usagePage.login.user_code)
@@ -503,7 +524,7 @@ Kirigami.ScrollablePage {
                     RowLayout {
                         Layout.fillWidth: true
 
-                        Button {
+                        IslandButton {
                             text: qsTr("Open verification page")
                             icon.name: "internet-services"
                             enabled: usagePage.isHttpUrl(usagePage.login.verification_uri)
@@ -512,7 +533,7 @@ Kirigami.ScrollablePage {
                                 JSON.stringify({ "url": usagePage.login.verification_uri })
                             )
                         }
-                        Button {
+                        IslandButton {
                             text: qsTr("Copy code")
                             icon.name: "edit-copy"
                             enabled: usagePage.hasValue(usagePage.login.user_code)
@@ -530,7 +551,7 @@ Kirigami.ScrollablePage {
                     visible: usagePage.loginActive
 
                     Item { Layout.fillWidth: true }
-                    Button {
+                    IslandButton {
                         text: usagePage.loginCancelling
                             ? qsTr("Cancelling…") : qsTr("Cancel login")
                         icon.name: "dialog-cancel"
@@ -558,19 +579,21 @@ Kirigami.ScrollablePage {
                 source: "user-identity"
                 implicitWidth: Kirigami.Units.iconSizes.huge
                 implicitHeight: implicitWidth
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.tertiaryText
             }
-            Kirigami.Heading {
+            Label {
                 Layout.alignment: Qt.AlignHCenter
                 text: qsTr("No accounts yet")
-                level: 2
+                color: IslandTheme.primaryText
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
             }
             Label {
                 Layout.alignment: Qt.AlignHCenter
                 text: qsTr("Add Claude, Codex, Grok, or an Anthropic API key.")
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
             }
-            Button {
+            IslandButton {
                 Layout.alignment: Qt.AlignHCenter
                 text: qsTr("Add account")
                 icon.name: "list-add"
@@ -587,7 +610,7 @@ Kirigami.ScrollablePage {
             Repeater {
                 model: usagePage.accounts
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: accountCard
                     required property var modelData
                     readonly property var account: usagePage.objectOrEmpty(modelData)
@@ -597,9 +620,13 @@ Kirigami.ScrollablePage {
 
                     Layout.fillWidth: true
                     opacity: account.paused === true ? 0.72 : 1
+                    interactive: true
+                    strokeColor: usagePage.accountIsCurrent(accountCard.account)
+                        ? IslandTheme.providerAccent(accountCard.account.provider)
+                        : IslandTheme.border
 
                     contentItem: ColumnLayout {
-                        spacing: Kirigami.Units.smallSpacing
+                        spacing: 9
 
                         RowLayout {
                             Layout.fillWidth: true
@@ -608,6 +635,7 @@ Kirigami.ScrollablePage {
                                 source: usagePage.providerIcon(accountCard.account.provider)
                                 implicitWidth: Kirigami.Units.iconSizes.medium
                                 implicitHeight: implicitWidth
+                                color: IslandTheme.providerAccent(accountCard.account.provider)
                             }
                             ColumnLayout {
                                 Layout.fillWidth: true
@@ -615,15 +643,19 @@ Kirigami.ScrollablePage {
 
                                 RowLayout {
                                     Layout.fillWidth: true
-                                    Kirigami.Heading {
+                                    Label {
                                         text: usagePage.providerLabel(accountCard.account.provider)
-                                        level: 2
+                                        color: IslandTheme.providerAccent(accountCard.account.provider)
+                                        font.pixelSize: 14
+                                        font.weight: Font.DemiBold
                                     }
                                     Label {
                                         visible: usagePage.accountIsCurrent(accountCard.account)
                                         text: qsTr("Current")
-                                        color: Kirigami.Theme.highlightedTextColor
+                                        color: IslandTheme.amber
                                         font.bold: true
+                                        font.family: IslandTheme.monoFamily
+                                        font.pixelSize: 10
                                     }
                                     Item { Layout.fillWidth: true }
                                 }
@@ -631,12 +663,14 @@ Kirigami.ScrollablePage {
                                     Layout.fillWidth: true
                                     text: usagePage.accountDisplay(accountCard.account)
                                     textFormat: Text.PlainText
-                                    color: Kirigami.Theme.disabledTextColor
+                                    color: IslandTheme.secondaryText
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 10
                                     elide: Text.ElideMiddle
                                 }
                             }
 
-                            ToolButton {
+                            IslandButton {
                                 id: accountActionsButton
                                 icon.name: "overflow-menu"
                                 text: qsTr("Account actions")
@@ -681,14 +715,14 @@ Kirigami.ScrollablePage {
                         Flow {
                             Layout.fillWidth: true
                             Layout.preferredHeight: childrenRect.height
-                            spacing: Kirigami.Units.smallSpacing
+                            spacing: 6
 
                             Rectangle {
                                 radius: height / 2
                                 implicitWidth: accountStatusLabel.implicitWidth
-                                        + Kirigami.Units.largeSpacing
+                                        + 16
                                 implicitHeight: accountStatusLabel.implicitHeight
-                                        + Kirigami.Units.smallSpacing
+                                        + 8
                                 color: usagePage.statusBackground(accountCard.account)
 
                                 Label {
@@ -696,6 +730,10 @@ Kirigami.ScrollablePage {
                                     anchors.centerIn: parent
                                     text: usagePage.optionalText(accountCard.account.status)
                                     textFormat: Text.PlainText
+                                    color: accountCard.account.healthy === true
+                                        ? IslandTheme.green : IslandTheme.amber
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 10
                                 }
                             }
                             Label {
@@ -707,18 +745,19 @@ Kirigami.ScrollablePage {
                                 text: accountCard.account.healthy === true
                                         ? qsTr("Healthy") : qsTr("Needs attention")
                                 color: accountCard.account.healthy === true
-                                        ? Kirigami.Theme.positiveTextColor
-                                        : Kirigami.Theme.negativeTextColor
+                                        ? IslandTheme.green
+                                        : IslandTheme.red
                             }
                             Label {
                                 text: usagePage.hasValue(accountCard.account.in_flight)
                                         ? qsTr("%1 in flight").arg(accountCard.account.in_flight)
                                         : qsTr("In flight: %1").arg(usagePage.unavailableText)
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
                             }
                         }
 
-                        Kirigami.InlineMessage {
+                        IslandInlineMessage {
                             Layout.fillWidth: true
                             visible: accountCard.account.warning_level === "warning"
                                     || accountCard.account.warning_level === "critical"
@@ -746,8 +785,8 @@ Kirigami.ScrollablePage {
                                 text: usagePage.tokenExpirySummary(accountCard.account)
                                 textFormat: Text.PlainText
                                 color: accountCard.tokenExpiry.state === "expired"
-                                        ? Kirigami.Theme.negativeTextColor
-                                        : Kirigami.Theme.disabledTextColor
+                                        ? IslandTheme.red
+                                        : IslandTheme.secondaryText
                                 elide: Text.ElideRight
                                 ToolTip.visible: tokenExpiryHover.hovered
                                 ToolTip.text: usagePage.tokenExpiryDetails(accountCard.account)
@@ -778,12 +817,16 @@ Kirigami.ScrollablePage {
                                     Label {
                                         text: usagePage.gaugeLabel(gaugeRow.gauge)
                                         font.bold: true
+                                        font.family: IslandTheme.monoFamily
+                                        font.pixelSize: 10
                                     }
                                     Label {
                                         visible: gaugeRow.gauge.constraining === true
                                         text: qsTr("Constraining")
-                                        color: Kirigami.Theme.negativeTextColor
+                                        color: IslandTheme.red
                                         font.bold: true
+                                        font.family: IslandTheme.monoFamily
+                                        font.pixelSize: 9
                                     }
                                     Item { Layout.fillWidth: true }
                                     Label {
@@ -792,16 +835,22 @@ Kirigami.ScrollablePage {
                                             gaugeRow.gauge,
                                             accountCard.account
                                         )
+                                        font.family: IslandTheme.monoFamily
+                                        font.pixelSize: 10
                                     }
                                 }
 
-                                ProgressBar {
+                                IslandProgressBar {
                                     Layout.fillWidth: true
                                     from: 0
                                     to: 1
                                     value: gaugeRow.gauge.available === true
                                             ? usagePage.clampFraction(gaugeRow.gauge.remaining_fraction)
                                             : 0
+                                    accentColor: usagePage.gaugeColor(
+                                        gaugeRow.gauge,
+                                        accountCard.account
+                                    )
                                     indeterminate: gaugeRow.gauge.available !== true
                                     Accessible.name: qsTr("%1 quota").arg(
                                         usagePage.gaugeLabel(gaugeRow.gauge)
@@ -813,13 +862,15 @@ Kirigami.ScrollablePage {
                                     Layout.fillWidth: true
                                     Label {
                                         text: usagePage.gaugeUsed(gaugeRow.gauge)
-                                        color: Kirigami.Theme.disabledTextColor
+                                        color: IslandTheme.secondaryText
+                                        font.family: IslandTheme.monoFamily
                                     }
                                     Item { Layout.fillWidth: true }
                                     Label {
                                         text: usagePage.gaugeReset(gaugeRow.gauge)
                                         textFormat: Text.PlainText
-                                        color: Kirigami.Theme.disabledTextColor
+                                        color: IslandTheme.secondaryText
+                                        font.family: IslandTheme.monoFamily
                                     }
                                 }
                             }
@@ -840,7 +891,7 @@ Kirigami.ScrollablePage {
                                     usagePage.optionalText(accountCard.account.busy_action)
                                 )
                                 textFormat: Text.PlainText
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
                             }
                         }
                     }
@@ -855,16 +906,15 @@ Kirigami.ScrollablePage {
             visible: usagePage.verificationReceipts.length > 0
             spacing: Kirigami.Units.smallSpacing
 
-            Kirigami.Separator { Layout.fillWidth: true }
-            Kirigami.Heading {
+            IslandSeparator { Layout.fillWidth: true }
+            IslandSectionLabel {
                 text: qsTr("Recent account results")
-                level: 2
             }
 
             Repeater {
                 model: usagePage.verificationReceipts
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: verificationReceiptCard
                     required property var modelData
                     readonly property var receipt: usagePage.objectOrEmpty(modelData)
@@ -895,12 +945,16 @@ Kirigami.ScrollablePage {
                                 text: usagePage.receiptSummary(verificationReceiptCard.receipt)
                                 textFormat: Text.PlainText
                                 font.bold: true
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 11
                                 elide: Text.ElideRight
                             }
                             Label {
                                 text: usagePage.receiptTiming(verificationReceiptCard.receipt)
                                 textFormat: Text.PlainText
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                             }
                         }
                         Label {
@@ -908,7 +962,9 @@ Kirigami.ScrollablePage {
                             text: usagePage.optionalText(verificationReceiptCard.receipt.message)
                             textFormat: Text.PlainText
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
+                            font.family: IslandTheme.monoFamily
+                            font.pixelSize: 10
                         }
                     }
                 }
@@ -916,7 +972,7 @@ Kirigami.ScrollablePage {
         }
     }
 
-    Dialog {
+    IslandDialog {
         id: removeDialog
         objectName: "remove-account-confirmation"
         modal: true
@@ -949,7 +1005,7 @@ Kirigami.ScrollablePage {
         }
     }
 
-    Dialog {
+    IslandDialog {
         id: addDialog
         objectName: "add-account-dialog"
         modal: true
@@ -1014,11 +1070,11 @@ Kirigami.ScrollablePage {
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.largeSpacing
 
-            ComboBox {
+            IslandSegmentedControl {
                 id: providerSelector
                 Layout.fillWidth: true
-                model: addDialog.providers
-                textRole: "label"
+                model: addDialog.providers.map(function(provider) { return provider.label })
+                onActivated: function(index) { currentIndex = index }
                 Accessible.name: qsTr("Account provider")
             }
 
@@ -1027,10 +1083,10 @@ Kirigami.ScrollablePage {
                 text: addDialog.selectedProvider.description
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
             }
 
-            TextField {
+            IslandTextField {
                 id: accountNameField
                 Layout.fillWidth: true
                 visible: addDialog.apiMode
@@ -1038,7 +1094,7 @@ Kirigami.ScrollablePage {
                 maximumLength: 120
             }
 
-            TextField {
+            IslandTextField {
                 id: apiKeyField
                 Layout.fillWidth: true
                 visible: addDialog.apiMode
@@ -1057,11 +1113,11 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
 
                 Item { Layout.fillWidth: true }
-                Button {
+                IslandButton {
                     text: qsTr("Cancel")
                     onClicked: addDialog.close()
                 }
-                Button {
+                IslandButton {
                     id: addButton
                     text: addDialog.apiMode ? qsTr("Add") : qsTr("Continue")
                     icon.name: addDialog.apiMode ? "list-add" : "go-next"

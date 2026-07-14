@@ -9,6 +9,7 @@ Kirigami.ScrollablePage {
     id: statisticsPage
 
     property var uiState: ({})
+    property int selectedSection: 0
     property int renderedHeatmapCells: 0
     property int renderedServingAccounts: 0
     property alias snapshotReceiptTarget: receiptEvidenceSection
@@ -25,6 +26,15 @@ Kirigami.ScrollablePage {
     readonly property real preferredContentHeight: statisticsContent.implicitHeight
 
     title: qsTr("Statistics")
+    padding: IslandTheme.pagePadding
+    palette.window: IslandTheme.panel
+    palette.windowText: IslandTheme.primaryText
+    palette.text: IslandTheme.primaryText
+    palette.buttonText: IslandTheme.primaryText
+    palette.base: IslandTheme.field
+    palette.highlight: IslandTheme.amber
+    palette.highlightedText: IslandTheme.panel
+    background: Rectangle { color: IslandTheme.panel }
 
     function arrayLikeLength(value) {
         if (Array.isArray(value))
@@ -177,6 +187,17 @@ Kirigami.ScrollablePage {
         return hasOwn(statistics, "health") ? String(health.length) : unavailableText
     }
 
+    function attentionAccountCount() {
+        var count = 0
+        for (var index = 0; index < health.length; index += 1) {
+            var account = objectOrEmpty(health[index])
+            if (account.healthy === false || account.paused === true
+                    || hasValue(account.blocked_reason))
+                count += 1
+        }
+        return count
+    }
+
     function renderedHeatmapCellCount() {
         return renderedHeatmapCells
     }
@@ -191,10 +212,10 @@ Kirigami.ScrollablePage {
 
     function verificationOutcomeColor(outcome) {
         switch (String(outcome)) {
-        case "succeeded": return Kirigami.Theme.positiveTextColor
-        case "failed": return Kirigami.Theme.negativeTextColor
-        case "cancelled": return Kirigami.Theme.neutralTextColor
-        default: return Kirigami.Theme.disabledTextColor
+        case "succeeded": return IslandTheme.green
+        case "failed": return IslandTheme.red
+        case "cancelled": return IslandTheme.amber
+        default: return IslandTheme.secondaryText
         }
     }
 
@@ -283,12 +304,12 @@ Kirigami.ScrollablePage {
 
     function receiptStatusColor(receipt) {
         if (receipt.kind === "in_flight")
-            return Kirigami.Theme.neutralBackgroundColor
+            return IslandTheme.amberTint
         if (receipt.error || (hasValue(receipt.status) && Number(receipt.status) >= 400))
-            return Kirigami.Theme.negativeBackgroundColor
+            return IslandTheme.redTint
         if (receipt.kind === "note")
-            return Kirigami.Theme.alternateBackgroundColor
-        return Kirigami.Theme.positiveBackgroundColor
+            return IslandTheme.surfaceRaised
+        return IslandTheme.greenTint
     }
 
     function receiptHeadline(receipt) {
@@ -339,30 +360,74 @@ Kirigami.ScrollablePage {
     ColumnLayout {
         id: statisticsContent
         width: statisticsPage.availableWidth
-        spacing: Kirigami.Units.largeSpacing
+        spacing: IslandTheme.sectionSpacing
 
-        Kirigami.Heading {
-            text: qsTr("Statistics")
-            level: 1
+        RowLayout {
+            Layout.fillWidth: true
+
+            Label {
+                text: qsTr("Statistics")
+                color: IslandTheme.primaryText
+                font.pixelSize: 20
+                font.weight: Font.DemiBold
+            }
+
+            Rectangle {
+                radius: height / 2
+                implicitWidth: statisticsConnectionLabel.implicitWidth + 18
+                implicitHeight: statisticsConnectionLabel.implicitHeight + 10
+                color: IslandTheme.greenTint
+                border.color: IslandTheme.green
+                border.width: 1
+
+                Label {
+                    id: statisticsConnectionLabel
+                    anchors.centerIn: parent
+                    text: qsTr("%1 accounts").arg(statisticsPage.accountCountText())
+                    color: IslandTheme.green
+                    font.family: IslandTheme.monoFamily
+                    font.pixelSize: 10
+                }
+            }
+
+            Item { Layout.fillWidth: true }
+        }
+
+        IslandSegmentedControl {
+            Layout.fillWidth: true
+            model: [qsTr("Overview"), qsTr("Models"), qsTr("Clients"), qsTr("Health")]
+            currentIndex: statisticsPage.selectedSection
+            onActivated: function(index) { statisticsPage.selectedSection = index }
+        }
+
+        IslandInlineMessage {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
+                && statisticsPage.attentionAccountCount() > 0
+            type: Kirigami.MessageType.Warning
+            text: qsTr("%1 account needs attention")
+                .arg(statisticsPage.attentionAccountCount())
         }
 
         ColumnLayout {
             objectName: "statistics-overview"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
                 Layout.fillWidth: true
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Overview")
-                    level: 2
                 }
                 Item { Layout.fillWidth: true }
                 Label {
                     text: qsTr("Model data: %1 · Cost: %2")
                             .arg(statisticsPage.qualityValue("model_usage"))
                             .arg(statisticsPage.qualityValue("cost"))
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
+                    font.family: IslandTheme.monoFamily
+                    font.pixelSize: 9
                     elide: Text.ElideRight
                 }
             }
@@ -382,30 +447,31 @@ Kirigami.ScrollablePage {
                         { "label": qsTr("Accounts"), "value": statisticsPage.accountCountText() }
                     ]
 
-                    delegate: Kirigami.AbstractCard {
+                    delegate: IslandCard {
                         id: overviewCard
                         required property var modelData
                         Layout.fillWidth: true
 
                         contentItem: ColumnLayout {
-                            spacing: 0
-                            Label {
+                            spacing: 4
+                            IslandSectionLabel {
                                 text: overviewCard.modelData.label
-                                color: Kirigami.Theme.disabledTextColor
                             }
-                            Kirigami.Heading {
+                            Label {
                                 text: overviewCard.modelData.value
-                                level: 2
+                                color: IslandTheme.primaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 21
+                                font.weight: Font.DemiBold
                             }
                         }
                     }
                 }
             }
 
-            Label {
+            IslandSectionLabel {
                 Layout.fillWidth: true
                 text: qsTr("Top models")
-                font.bold: true
             }
 
             Flow {
@@ -419,8 +485,10 @@ Kirigami.ScrollablePage {
                     delegate: Rectangle {
                         id: topModelChip
                         required property var modelData
-                        radius: Kirigami.Units.smallSpacing
-                        color: Kirigami.Theme.alternateBackgroundColor
+                        radius: height / 2
+                        color: IslandTheme.amberTint
+                        border.color: IslandTheme.amber
+                        border.width: 1
                         implicitWidth: topModelLabel.implicitWidth + Kirigami.Units.largeSpacing
                         implicitHeight: topModelLabel.implicitHeight + Kirigami.Units.smallSpacing * 2
 
@@ -431,6 +499,10 @@ Kirigami.ScrollablePage {
                                     + statisticsPage.optionalNumber(topModelChip.modelData.requests)
                             maximumLineCount: 1
                             elide: Text.ElideRight
+                            color: IslandTheme.amber
+                            font.family: IslandTheme.monoFamily
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
                         }
                     }
                 }
@@ -438,28 +510,31 @@ Kirigami.ScrollablePage {
                 Label {
                     visible: statisticsPage.models.length === 0
                     text: statisticsPage.unavailableText
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                 }
             }
         }
 
-        Kirigami.Separator { Layout.fillWidth: true }
+        IslandSeparator {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
+        }
 
         ColumnLayout {
             objectName: "statistics-heatmaps"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
                 Layout.fillWidth: true
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Token heatmap")
-                    level: 2
                 }
                 Item { Layout.fillWidth: true }
                 Label {
                     text: qsTr("Quality: %1").arg(statisticsPage.qualityValue("windowed"))
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                 }
             }
 
@@ -472,7 +547,7 @@ Kirigami.ScrollablePage {
                 Repeater {
                     model: ["24h", "72h"]
 
-                    delegate: Kirigami.AbstractCard {
+                    delegate: IslandCard {
                         id: heatmapCard
                         required property string modelData
                         readonly property var heatmap: statisticsPage.heatmapForWindow(modelData)
@@ -483,14 +558,13 @@ Kirigami.ScrollablePage {
                             spacing: Kirigami.Units.smallSpacing
                             RowLayout {
                                 Layout.fillWidth: true
-                                Kirigami.Heading {
+                                IslandSectionLabel {
                                     text: heatmapCard.modelData
-                                    level: 3
                                 }
                                 Item { Layout.fillWidth: true }
                                 Label {
                                     text: qsTr("%1 cells").arg(heatmapCard.cells.length)
-                                    color: Kirigami.Theme.disabledTextColor
+                                    color: IslandTheme.secondaryText
                                 }
                             }
 
@@ -502,9 +576,9 @@ Kirigami.ScrollablePage {
                                     required property var modelData
                                     Layout.fillWidth: true
                                     radius: Kirigami.Units.smallSpacing
-                                    color: Qt.rgba(Kirigami.Theme.highlightColor.r,
-                                                   Kirigami.Theme.highlightColor.g,
-                                                   Kirigami.Theme.highlightColor.b,
+                                    color: Qt.rgba(IslandTheme.amber.r,
+                                                   IslandTheme.amber.g,
+                                                   IslandTheme.amber.b,
                                                    statisticsPage.heatCellIntensity(modelData))
                                     implicitHeight: heatCellLayout.implicitHeight + Kirigami.Units.smallSpacing * 2
 
@@ -529,7 +603,7 @@ Kirigami.ScrollablePage {
                                             Label {
                                                 Layout.fillWidth: true
                                                 text: statisticsPage.optionalText(heatCell.modelData.account_display)
-                                                color: Kirigami.Theme.disabledTextColor
+                                                color: IslandTheme.secondaryText
                                                 elide: Text.ElideRight
                                             }
                                         }
@@ -541,7 +615,7 @@ Kirigami.ScrollablePage {
                                             text: qsTr("%1 req · %2 err")
                                                     .arg(statisticsPage.optionalNumber(heatCell.modelData.requests))
                                                     .arg(statisticsPage.optionalNumber(heatCell.modelData.errors))
-                                            color: Kirigami.Theme.disabledTextColor
+                                            color: IslandTheme.secondaryText
                                         }
                                     }
                                 }
@@ -553,7 +627,7 @@ Kirigami.ScrollablePage {
                                 text: qsTr("No %1 telemetry · %2")
                                         .arg(heatmapCard.modelData)
                                         .arg(statisticsPage.unavailableText)
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
                                 horizontalAlignment: Text.AlignHCenter
                             }
                         }
@@ -562,30 +636,33 @@ Kirigami.ScrollablePage {
             }
         }
 
-        Kirigami.Separator { Layout.fillWidth: true }
+        IslandSeparator {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 1
+        }
 
         ColumnLayout {
             objectName: "statistics-models"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 1
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
                 Layout.fillWidth: true
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Models")
-                    level: 2
                 }
                 Item { Layout.fillWidth: true }
                 Label {
                     text: qsTr("Cache: %1").arg(statisticsPage.qualityValue("cache"))
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
                 }
             }
 
             Repeater {
                 model: statisticsPage.models
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: modelCard
                     required property var modelData
                     readonly property var accounts: statisticsPage.arrayOrEmpty(modelData.accounts)
@@ -598,16 +675,19 @@ Kirigami.ScrollablePage {
                             ColumnLayout {
                                 Layout.fillWidth: true
                                 spacing: 0
-                                Kirigami.Heading {
+                                Label {
                                     Layout.fillWidth: true
                                     text: statisticsPage.modelTitle(modelCard.modelData)
-                                    level: 3
+                                    color: IslandTheme.primaryText
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 13
+                                    font.weight: Font.DemiBold
                                     elide: Text.ElideRight
                                 }
                                 Label {
                                     text: qsTr("Last use: %1")
                                             .arg(statisticsPage.optionalTime(modelCard.modelData.last_used_ms))
-                                    color: Kirigami.Theme.disabledTextColor
+                                    color: IslandTheme.secondaryText
                                 }
                             }
                             Label {
@@ -615,7 +695,7 @@ Kirigami.ScrollablePage {
                                         .arg(statisticsPage.optionalNumber(modelCard.modelData.in_flight))
                                 color: statisticsPage.hasValue(modelCard.modelData.in_flight)
                                         && Number(modelCard.modelData.in_flight) > 0
-                                        ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
+                                        ? IslandTheme.amber : IslandTheme.secondaryText
                             }
                         }
 
@@ -624,8 +704,8 @@ Kirigami.ScrollablePage {
                             columns: statisticsPage.width >= 760 ? 4 : 2
                             columnSpacing: Kirigami.Units.largeSpacing
                             Label { text: qsTr("Requests %1").arg(statisticsPage.optionalNumber(modelCard.modelData.requests)) }
-                            Label { text: qsTr("OK %1").arg(statisticsPage.optionalNumber(modelCard.modelData.ok)); color: Kirigami.Theme.positiveTextColor }
-                            Label { text: qsTr("Errors %1").arg(statisticsPage.optionalNumber(modelCard.modelData.errors)); color: Kirigami.Theme.negativeTextColor }
+                            Label { text: qsTr("OK %1").arg(statisticsPage.optionalNumber(modelCard.modelData.ok)); color: IslandTheme.green }
+                            Label { text: qsTr("Errors %1").arg(statisticsPage.optionalNumber(modelCard.modelData.errors)); color: IslandTheme.red }
                             Label { text: qsTr("Cost %1").arg(statisticsPage.optionalCurrency(modelCard.modelData.cost_usd)) }
                             Label { text: qsTr("Input %1").arg(statisticsPage.optionalNumber(modelCard.modelData.tokens_in)) }
                             Label { text: qsTr("Output %1").arg(statisticsPage.optionalNumber(modelCard.modelData.tokens_out)) }
@@ -660,7 +740,7 @@ Kirigami.ScrollablePage {
                                             .arg(statisticsPage.optionalNumber(servingAccount.modelData.requests))
                                             .arg(statisticsPage.optionalNumber(servingAccount.modelData.ok))
                                             .arg(statisticsPage.optionalNumber(servingAccount.modelData.errors))
-                                    color: Kirigami.Theme.disabledTextColor
+                                    color: IslandTheme.secondaryText
                                 }
                             }
                         }
@@ -668,7 +748,7 @@ Kirigami.ScrollablePage {
                         Label {
                             visible: modelCard.accounts.length === 0
                             text: qsTr("Serving account data: %1").arg(statisticsPage.unavailableText)
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
                         }
                     }
                 }
@@ -678,27 +758,30 @@ Kirigami.ScrollablePage {
                 visible: statisticsPage.models.length === 0
                 Layout.fillWidth: true
                 text: qsTr("Model telemetry is %1").arg(statisticsPage.unavailableText.toLowerCase())
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
                 horizontalAlignment: Text.AlignHCenter
             }
         }
 
-        Kirigami.Separator { Layout.fillWidth: true }
+        IslandSeparator {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 2
+        }
 
         ColumnLayout {
             objectName: "statistics-clients"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 2
             spacing: Kirigami.Units.smallSpacing
 
-            Kirigami.Heading {
+            IslandSectionLabel {
                 text: qsTr("Clients")
-                level: 2
             }
 
             Repeater {
                 model: statisticsPage.clients
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: clientCard
                     required property var modelData
                     Layout.fillWidth: true
@@ -718,7 +801,7 @@ Kirigami.ScrollablePage {
                             Label {
                                 text: qsTr("Last seen: %1")
                                         .arg(statisticsPage.optionalTime(clientCard.modelData.last_seen_ms))
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
                             }
                         }
                         Label { text: qsTr("%1 requests").arg(statisticsPage.optionalNumber(clientCard.modelData.requests)) }
@@ -726,7 +809,7 @@ Kirigami.ScrollablePage {
                         Label {
                             text: qsTr("%1 errors").arg(statisticsPage.optionalNumber(clientCard.modelData.errors))
                             color: statisticsPage.hasValue(clientCard.modelData.errors) && Number(clientCard.modelData.errors) > 0
-                                    ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
+                                    ? IslandTheme.red : IslandTheme.secondaryText
                         }
                         Label { text: statisticsPage.optionalCurrency(clientCard.modelData.cost_usd) }
                     }
@@ -737,27 +820,32 @@ Kirigami.ScrollablePage {
                 visible: statisticsPage.clients.length === 0
                 Layout.fillWidth: true
                 text: qsTr("Client telemetry is %1").arg(statisticsPage.unavailableText.toLowerCase())
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
                 horizontalAlignment: Text.AlignHCenter
             }
         }
 
-        Kirigami.Separator { Layout.fillWidth: true }
+        IslandSeparator {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
+                || statisticsPage.selectedSection === 3
+        }
 
         ColumnLayout {
             objectName: "statistics-health"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
+                || statisticsPage.selectedSection === 3
             spacing: Kirigami.Units.smallSpacing
 
-            Kirigami.Heading {
+            IslandSectionLabel {
                 text: qsTr("Health")
-                level: 2
             }
 
             Repeater {
                 model: statisticsPage.health
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: healthCard
                     required property var modelData
                     Layout.fillWidth: true
@@ -771,8 +859,8 @@ Kirigami.ScrollablePage {
                                 implicitHeight: healthName.implicitHeight
                                 radius: width / 2
                                 color: healthCard.modelData.healthy && !healthCard.modelData.paused
-                                        ? Kirigami.Theme.positiveTextColor
-                                        : Kirigami.Theme.negativeTextColor
+                                        ? IslandTheme.green
+                                        : IslandTheme.red
                             }
                             Label {
                                 id: healthName
@@ -790,7 +878,7 @@ Kirigami.ScrollablePage {
                             Label {
                                 visible: healthCard.modelData.paused === true
                                 text: qsTr("Paused")
-                                color: Kirigami.Theme.neutralTextColor
+                                color: IslandTheme.amber
                             }
                         }
 
@@ -812,50 +900,55 @@ Kirigami.ScrollablePage {
                 visible: statisticsPage.health.length === 0
                 Layout.fillWidth: true
                 text: qsTr("Health telemetry is %1").arg(statisticsPage.unavailableText.toLowerCase())
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
                 horizontalAlignment: Text.AlignHCenter
             }
         }
 
-        Kirigami.Separator { Layout.fillWidth: true }
+        IslandSeparator {
+            Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
+        }
 
         ColumnLayout {
             id: receiptEvidenceSection
             objectName: "statistics-activity-receipts"
             Layout.fillWidth: true
+            visible: statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
                 Layout.fillWidth: true
-                Kirigami.Heading {
+                IslandSectionLabel {
                     text: qsTr("Request receipts")
-                    level: 2
                 }
                 Item { Layout.fillWidth: true }
                 Label {
                     text: qsTr("%1 visible").arg(statisticsPage.activityReceipts.length)
-                    color: Kirigami.Theme.disabledTextColor
+                    color: IslandTheme.secondaryText
+                    font.family: IslandTheme.monoFamily
+                    font.pixelSize: 10
                 }
             }
 
             Label {
                 Layout.fillWidth: true
                 text: qsTr("Metadata only. Request and response content is never shown.")
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
                 wrapMode: Text.Wrap
             }
 
             Repeater {
                 model: statisticsPage.activityReceipts
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: receiptCard
                     required property var modelData
                     readonly property var receipt: statisticsPage.objectOrEmpty(modelData)
                     Layout.fillWidth: true
 
                     contentItem: ColumnLayout {
-                        spacing: Kirigami.Units.smallSpacing
+                        spacing: 6
                         RowLayout {
                             Layout.fillWidth: true
                             Rectangle {
@@ -868,6 +961,11 @@ Kirigami.ScrollablePage {
                                     id: receiptStatus
                                     anchors.centerIn: parent
                                     text: statisticsPage.receiptStatusText(receiptCard.receipt)
+                                    color: receiptCard.receipt.error
+                                        ? IslandTheme.red : IslandTheme.primaryText
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 9
+                                    font.weight: Font.DemiBold
                                 }
                             }
                             ColumnLayout {
@@ -877,20 +975,25 @@ Kirigami.ScrollablePage {
                                     Layout.fillWidth: true
                                     text: statisticsPage.receiptHeadline(receiptCard.receipt)
                                     font.bold: true
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 11
                                     elide: Text.ElideRight
                                 }
                                 Label {
                                     Layout.fillWidth: true
                                     text: statisticsPage.optionalText(receiptCard.receipt.receipt_id)
                                             + " · " + statisticsPage.optionalTime(receiptCard.receipt.occurred_at_ms)
-                                    color: Kirigami.Theme.disabledTextColor
-                                    font.family: "monospace"
+                                    color: IslandTheme.secondaryText
+                                    font.family: IslandTheme.monoFamily
+                                    font.pixelSize: 9
                                     elide: Text.ElideMiddle
                                 }
                             }
                             Label {
                                 text: statisticsPage.receiptTiming(receiptCard.receipt)
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                             }
                         }
 
@@ -898,7 +1001,9 @@ Kirigami.ScrollablePage {
                             visible: receiptCard.receipt.kind !== "note"
                             Layout.fillWidth: true
                             text: statisticsPage.receiptTarget(receiptCard.receipt)
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
+                            font.family: IslandTheme.monoFamily
+                            font.pixelSize: 10
                             elide: Text.ElideRight
                         }
 
@@ -910,26 +1015,40 @@ Kirigami.ScrollablePage {
 
                             Label {
                                 text: qsTr("Effort: %1").arg(statisticsPage.optionalText(receiptCard.receipt.effort))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: receiptCard.receipt.fast ? qsTr("Fast") : qsTr("Standard")
                                 color: receiptCard.receipt.fast
-                                        ? Kirigami.Theme.highlightColor : Kirigami.Theme.disabledTextColor
+                                        ? IslandTheme.amber : IslandTheme.secondaryText
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: qsTr("Input: %1").arg(statisticsPage.receiptTokenInput(receiptCard.receipt))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: qsTr("Output: %1").arg(statisticsPage.receiptTokenOutput(receiptCard.receipt))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: qsTr("Cache read: %1").arg(statisticsPage.receiptCacheRead(receiptCard.receipt))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: qsTr("Cache create: %1").arg(statisticsPage.receiptCacheCreation(receiptCard.receipt))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                             Label {
                                 text: qsTr("Cost: %1").arg(statisticsPage.optionalCurrency(receiptCard.receipt.cost_usd))
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 9
                             }
                         }
 
@@ -938,8 +1057,10 @@ Kirigami.ScrollablePage {
                             Layout.fillWidth: true
                             text: statisticsPage.optionalText(receiptCard.receipt.message)
                             color: receiptCard.receipt.error
-                                    ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                                    ? IslandTheme.red : IslandTheme.primaryText
                             wrapMode: Text.Wrap
+                            font.family: IslandTheme.monoFamily
+                            font.pixelSize: 10
                         }
                     }
                 }
@@ -950,25 +1071,24 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
                 text: qsTr("Request receipt telemetry is %1")
                         .arg(statisticsPage.unavailableText.toLowerCase())
-                color: Kirigami.Theme.disabledTextColor
+                color: IslandTheme.secondaryText
                 horizontalAlignment: Text.AlignHCenter
             }
 
-            Kirigami.Separator {
+            IslandSeparator {
                 visible: statisticsPage.verificationReceipts.length > 0
                 Layout.fillWidth: true
             }
 
-            Kirigami.Heading {
+            IslandSectionLabel {
                 visible: statisticsPage.verificationReceipts.length > 0
                 text: qsTr("Verification receipts")
-                level: 2
             }
 
             Repeater {
                 model: statisticsPage.verificationReceipts
 
-                delegate: Kirigami.AbstractCard {
+                delegate: IslandCard {
                     id: verificationCard
                     required property var modelData
                     readonly property var receipt: statisticsPage.objectOrEmpty(modelData)
@@ -997,6 +1117,8 @@ Kirigami.ScrollablePage {
                                     verificationCard.receipt.outcome
                                 )
                                 font.bold: true
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                                 elide: Text.ElideRight
                             }
                             Label {
@@ -1006,8 +1128,10 @@ Kirigami.ScrollablePage {
                                 ) + " · " + statisticsPage.optionalText(
                                     verificationCard.receipt.message
                                 )
-                                color: Kirigami.Theme.disabledTextColor
+                                color: IslandTheme.secondaryText
                                 wrapMode: Text.Wrap
+                                font.family: IslandTheme.monoFamily
+                                font.pixelSize: 10
                             }
                         }
 
@@ -1015,7 +1139,9 @@ Kirigami.ScrollablePage {
                             text: statisticsPage.optionalTime(
                                 verificationCard.receipt.finished_at_ms
                             )
-                            color: Kirigami.Theme.disabledTextColor
+                            color: IslandTheme.secondaryText
+                            font.family: IslandTheme.monoFamily
+                            font.pixelSize: 9
                         }
                     }
                 }

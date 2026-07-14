@@ -1,6 +1,6 @@
 #[cfg(feature = "gui")]
 fn main() {
-    use cxx_qt_build::{CxxQtBuilder, QmlModule};
+    use cxx_qt_build::{CxxQtBuilder, QmlFile, QmlModule};
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         panic!("the gui feature currently targets Linux desktop systems");
@@ -10,6 +10,21 @@ fn main() {
     let builder = CxxQtBuilder::new_qml_module(
         QmlModule::new("io.twolab.LlmuxIslands")
             .qml_file("qml/Main.qml")
+            .qml_file(QmlFile::from("qml/IslandTheme.qml").singleton(true))
+            .qml_file("qml/IslandCard.qml")
+            .qml_file("qml/IslandButton.qml")
+            .qml_file("qml/IslandCheckBox.qml")
+            .qml_file("qml/IslandComboBox.qml")
+            .qml_file("qml/IslandDialog.qml")
+            .qml_file("qml/IslandInlineMessage.qml")
+            .qml_file("qml/IslandItemDelegate.qml")
+            .qml_file("qml/IslandProgressBar.qml")
+            .qml_file("qml/IslandSectionLabel.qml")
+            .qml_file("qml/IslandSegmentedControl.qml")
+            .qml_file("qml/IslandSeparator.qml")
+            .qml_file("qml/IslandSwitch.qml")
+            .qml_file("qml/IslandTextArea.qml")
+            .qml_file("qml/IslandTextField.qml")
             .qml_file("qml/Usage.qml")
             .qml_file("qml/Statistics.qml")
             .qml_file("qml/Menu.qml"),

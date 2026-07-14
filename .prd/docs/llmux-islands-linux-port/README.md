@@ -51,3 +51,9 @@ clipboard, notification, sound, and quit commands remain in the thin shell.
 The older `.prd/11-llmux-islands-spec.md` and
 `.prd/12-llmux-islands-architecture.md` describe an earlier Claude/Codex-only
 plan. They remain historical input, not an inventory of the shipped app.
+
+The KDE production renderer owns a shared `IslandTheme` and custom QML control
+set derived from the macOS SwiftUI sources: black panel, translucent dark cards,
+provider/quota accents, amber segmented navigation, and monospaced activity and
+verification receipts. Platform-native integration remains Qt/Kirigami; bright
+system widget chrome is not part of the application surface.
