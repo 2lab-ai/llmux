@@ -9,8 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table,
+};
 use ratatui::Frame;
 
 use crate::dashboard::ModelUsageDoc;
@@ -175,7 +178,7 @@ pub(crate) fn draw(
     frame: &mut Frame,
     view: Option<&DashboardView>,
     chrome: &Chrome,
-    hits: &mut Option<ActivityChrome>,
+    hits: &mut Option<MainChrome>,
 ) {
     // No activity panel hit-targets until MAIN draws one this frame (cleared so
     // a stale layout from a previous frame can never mis-map a click).
@@ -212,6 +215,8 @@ pub(crate) fn draw(
         Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
         Overlay::Logs => draw_logs_overlay(frame, view),
         Overlay::Sessions => draw_sessions_overlay(frame, &ctx, chrome),
+        Overlay::Misc => draw_misc_overlay(frame, view),
+        Overlay::Config => draw_config_overlay(frame, view, chrome),
     }
 
     // The footer keybar is part of the chrome and reflects the active overlay /
@@ -281,7 +286,7 @@ fn draw_main(
     ctx: &FrameCtx,
     chrome: &Chrome,
     now: SystemTime,
-    hits: &mut Option<ActivityChrome>,
+    hits: &mut Option<MainChrome>,
 ) {
     let snapshot = &view.snapshot;
     // Event banner (config `events`): ONE line pinned to the very top while an
@@ -289,24 +294,42 @@ fn draw_main(
     // (unparseable, before `from`, or past `to`).
     let event_line = event_banner_line(&view.events, now);
     let banner_height = u16::from(event_line.is_some());
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    // Drag-set overrides (UI-3 U7/U8) replace the automatic heights; the
+    // clamp keeps a dragged pane from collapsing below border+header.
+    let table_height = chrome
+        .pane_heights
+        .accounts
+        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
+        .unwrap_or_else(|| (snapshot.accounts.len().max(1) as u16).saturating_add(2));
+    let middle_height = chrome
+        .pane_heights
+        .middle
+        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
+        .unwrap_or(8);
     // Compact model strip (req12): only when model data exists. 0 height (no
     // pane) otherwise, so the idle layout is unchanged.
     let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
     // +2 for the table's top border (title) and header row.
-    let strip_height = if strip_rows > 0 {
+    let auto_strip_height = if strip_rows > 0 {
         strip_rows as u16 + 2
     } else {
         0
     };
-    let [banner_area, header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
+    let strip_height = match chrome.pane_heights.strip {
+        // A drag override only applies while the strip exists at all.
+        Some(h) if auto_strip_height > 0 => h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT),
+        _ => auto_strip_height,
+    };
+    let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, groups_area, footer_area] =
         Layout::vertical([
             Constraint::Length(banner_height),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(table_height),
-            Constraint::Length(8),
+            Constraint::Length(middle_height),
             Constraint::Length(strip_height),
             Constraint::Min(3),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .areas(frame.area());
@@ -315,15 +338,215 @@ fn draw_main(
         frame.render_widget(Paragraph::new(line), banner_area);
     }
     draw_header(frame, header_area, view, chrome);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
+    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
     draw_middle(frame, middle_area, view, ctx, chrome);
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
     }
-    *hits = Some(draw_activity(frame, activity_area, view, chrome, now));
+    let activity = draw_activity(frame, activity_area, view, chrome, now);
+    // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
+    // pane above it. With no model strip the activity border resizes the
+    // middle pane instead.
+    let mut separators = vec![SeparatorHit {
+        y: middle_area.y,
+        pane: PaneId::Accounts,
+        pane_top: table_area.y,
+    }];
+    if strip_height > 0 {
+        separators.push(SeparatorHit {
+            y: strip_area.y,
+            pane: PaneId::Middle,
+            pane_top: middle_area.y,
+        });
+        separators.push(SeparatorHit {
+            y: activity_area.y,
+            pane: PaneId::Strip,
+            pane_top: strip_area.y,
+        });
+    } else {
+        separators.push(SeparatorHit {
+            y: activity_area.y,
+            pane: PaneId::Middle,
+            pane_top: middle_area.y,
+        });
+    }
+    let settings = draw_group_settings(frame, groups_area, view);
+    // The context menu (UI-3 U11) draws last so it floats over every pane.
+    let menu = chrome
+        .menu_anchor
+        .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
+        .map(|anchor| draw_context_menu(frame, view, ctx, chrome, anchor));
+    *hits = Some(MainChrome {
+        activity,
+        tabs,
+        separators,
+        account_rows,
+        menu,
+        settings,
+    });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
+}
+
+/// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
+/// group's live settings; clicking a highlighted segment ROTATES that
+/// setting (scheduler mode, codex model / effort / fast, grok effort).
+/// Effort `bypass` = the client's own value rides through (UI-3 U12).
+fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+    if area.height == 0 {
+        return Vec::new();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut hits: Vec<SettingHit> = Vec::new();
+    let mut x = area.x;
+    let push_plain = |spans: &mut Vec<Span<'static>>, x: &mut u16, text: String, style| {
+        let w = text.chars().count() as u16;
+        spans.push(Span::styled(text, style));
+        *x += w;
+    };
+    let clickable = Style::new()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+    let push_click = |spans: &mut Vec<Span<'static>>,
+                      hits: &mut Vec<SettingHit>,
+                      x: &mut u16,
+                      text: String,
+                      action: SettingAction| {
+        let w = text.chars().count() as u16;
+        hits.push(SettingHit {
+            area: Rect {
+                x: *x,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+            action,
+        });
+        spans.push(Span::styled(text, clickable));
+        *x += w;
+    };
+    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16| {
+        spans.push(Span::styled("  │  ", dim()));
+        *x += 5;
+    };
+
+    push_plain(&mut spans, &mut x, " sched ".into(), dim());
+    push_click(
+        &mut spans,
+        &mut hits,
+        &mut x,
+        view.select_params.mode.label().to_string(),
+        SettingAction::SchedMode,
+    );
+
+    let count = |g: BackendGroup| {
+        view.snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.group == g)
+            .count()
+    };
+    let claude_n = count(BackendGroup::Claude);
+    if claude_n > 0 {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "claude ".into(),
+            group_color(Some("claude")).add_modifier(Modifier::BOLD),
+        );
+        push_plain(&mut spans, &mut x, format!("{claude_n} acc"), dim());
+    }
+    if view.codex.available {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "codex ".into(),
+            group_color(Some("codex")).add_modifier(Modifier::BOLD),
+        );
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.codex.model.clone(),
+            SettingAction::CodexModel,
+        );
+        push_plain(&mut spans, &mut x, " effort:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
+            SettingAction::CodexEffort,
+        );
+        push_plain(&mut spans, &mut x, " fast:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            if view.codex.fast { "on" } else { "off" }.into(),
+            SettingAction::CodexFast,
+        );
+    }
+    if view.grok.available {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "grok ".into(),
+            group_color(Some("grok")).add_modifier(Modifier::BOLD),
+        );
+        push_plain(&mut spans, &mut x, "effort:".into(), dim());
+        push_click(
+            &mut spans,
+            &mut hits,
+            &mut x,
+            view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
+            SettingAction::GrokEffort,
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hits
+}
+
+/// The tab strip (UI-3 U6): one row of clickable surface names right under
+/// the header. The active surface renders reversed; every label's rect is
+/// returned for the mouse hit-test. Keyboard shortcuts keep working — the
+/// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut tabs: Vec<TabHit> = Vec::new();
+    let mut x = area.x + 1;
+    for (i, (label, overlay)) in TABS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", dim()));
+            x += 3;
+        }
+        let style = if *overlay == active {
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        let width = label.chars().count() as u16;
+        spans.push(Span::styled(*label, style));
+        tabs.push(TabHit {
+            area: Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            overlay: *overlay,
+        });
+        x += width;
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    tabs
 }
 
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
@@ -346,7 +569,7 @@ fn draw_accounts_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     frame.render_widget(title, header_area);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
@@ -371,13 +594,24 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     // token heatmap (issue #23). The heatmap height tracks the visible cells,
     // capped so the model table/drill-down above always keep room.
     let heatmap_height = heatmap_panel_height(view, chrome.stats_window, area.height);
-    let [table_area, body_area, heatmap_area] = Layout::vertical([
+    // Tokens-per-Day chart slice (UI-3 U14): shown whenever daily data exists
+    // and the overlay is tall enough to keep the model table readable.
+    let chart_height = if view.daily_usage.is_empty() || area.height < 31 {
+        0
+    } else {
+        DAILY_CHART_HEIGHT
+    };
+    let [table_area, chart_area, body_area, heatmap_area] = Layout::vertical([
         Constraint::Length(table_height),
+        Constraint::Length(chart_height),
         Constraint::Min(3),
         Constraint::Length(heatmap_height),
     ])
     .areas(area);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    if chart_height > 0 {
+        draw_daily_chart(frame, chart_area, view, ctx, chrome.chart_days);
+    }
+    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
     // of the stats body when there is client usage to show; otherwise the
     // models view keeps the whole body. The windowed heatmap (issue #23) always
@@ -395,6 +629,142 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
         draw_clients_compact(frame, clients_area, view);
     }
     draw_heatmap(frame, heatmap_area, view, chrome.stats_window);
+}
+
+/// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
+/// U14): border/title + plot rows + x-axis labels + legend line.
+const DAILY_CHART_HEIGHT: u16 = 13;
+/// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
+/// overlay — UI-3 U14 period selection).
+pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
+/// Max model lines plotted at once (top by window tokens); more would turn
+/// minimal into noise.
+const DAILY_CHART_SERIES: usize = 4;
+/// Line colors by rank — chosen to stay distinct on dark terminals and to
+/// echo the group hues used elsewhere.
+const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
+    [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
+
+/// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
+/// the selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]),
+/// modern-minimal — no grid, dim axes,
+/// a single legend line with colored dots. Data = the daily fold carried on
+/// the document (history filled by the persisted-request replay).
+fn draw_daily_chart(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chart_days: u64,
+) {
+    let chart_days = chart_days.clamp(2, 366);
+    let today = ctx
+        .now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    let start = today.saturating_sub(chart_days.saturating_sub(1));
+    // Rank models by window total, then build one (x=day-offset, y=tokens)
+    // series per top model, zero-filled across the whole span so a quiet day
+    // reads as a drop to zero, not a gap.
+    // Bounded on BOTH ends: a future-dated replay row (clock skew) must not
+    // index past the series (review R1 MUST-FIX 2).
+    let in_span = |r: &&crate::dashboard::DailyUsageDoc| r.day >= start && r.day <= today;
+    let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
+    for r in view.daily_usage.iter().filter(&in_span) {
+        *totals
+            .entry((r.group.as_str(), r.model.as_str()))
+            .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
+    }
+    let mut ranked: Vec<((&str, &str), u64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(DAILY_CHART_SERIES);
+    if ranked.is_empty() {
+        return;
+    }
+    let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
+    let days = chart_days as usize;
+    let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
+    for (s, serie) in series.iter_mut().enumerate() {
+        for (i, point) in serie.iter_mut().enumerate() {
+            point.0 = i as f64;
+        }
+        let _ = s;
+    }
+    let mut y_max = 0f64;
+    for r in view.daily_usage.iter().filter(&in_span) {
+        if let Some(idx) = ranked
+            .iter()
+            .position(|((g, m), _)| *g == r.group && *m == r.model)
+        {
+            let x = (r.day - start) as usize;
+            let y = (r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation) as f64;
+            series[idx][x].1 += y;
+            y_max = y_max.max(series[idx][x].1);
+        }
+    }
+    let y_max = y_max.max(1.0);
+
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .enumerate()
+        .map(|(i, data)| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(DAILY_CHART_COLORS[i]))
+                .data(data)
+        })
+        .collect();
+    let day_label = |d: u64| {
+        let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
+        let full = format::month_day_hm(at, 0);
+        full.split(' ').next().unwrap_or("").to_string()
+    };
+    let x_axis = Axis::default()
+        .bounds([0.0, (days - 1) as f64])
+        .labels(vec![
+            Span::styled(day_label(start), dim()),
+            Span::styled(day_label(start + chart_days / 2), dim()),
+            Span::styled(day_label(today), dim()),
+        ])
+        .style(dim());
+    let y_axis = Axis::default()
+        .bounds([0.0, y_max])
+        .labels(vec![
+            Span::styled("0", dim()),
+            Span::styled(format::human_count((y_max / 2.0) as u64), dim()),
+            Span::styled(format::human_count(y_max as u64), dim()),
+        ])
+        .style(dim());
+    let [plot_area, legend_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let chart = Chart::new(datasets)
+        .block(
+            Block::new()
+                .borders(Borders::TOP)
+                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
+        )
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+    frame.render_widget(chart, plot_area);
+    // Legend: ● model (share%) — one line, dim separators.
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (i, ((group, model), total)) in ranked.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
+        }
+        spans.push(Span::styled(
+            "● ".to_string(),
+            Style::new().fg(DAILY_CHART_COLORS[i]),
+        ));
+        spans.push(Span::raw(format!("{} ", abbrev_model(Some(group), model))));
+        spans.push(Span::styled(
+            format!("({:.1}%)", *total as f64 * 100.0 / grand as f64),
+            dim(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -682,12 +1052,250 @@ fn ms_to_systemtime(ms: u64) -> SystemTime {
 /// The rect a summoned overlay covers: the whole screen except the bottom two
 /// rows reserved for the footer keybar, so MAIN's footer slot is never double
 /// drawn and the keybar stays visible under the overlay.
+/// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
+/// keybindings and build/daemon facts. Read-only.
+fn draw_misc_overlay(frame: &mut Frame, view: &DashboardView) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let key = |k: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("   {k:<10}"), Style::new().fg(Color::Cyan)),
+            Span::raw(what),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
+        key("a g l s", "accounts / stats / logs / sessions"),
+        key("? c", "this surface / config"),
+        key("click", "tabs switch · activity row expands"),
+        key("wheel", "activity history"),
+        key("f m e", "codex fast / model / effort"),
+        key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("q Esc", "quit / back to dashboard"),
+        Line::default(),
+        Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw(format!("   llmux {}", view.display_version()))),
+        Line::from(Span::raw(format!(
+            "   daemon pid {} · port {} · up {}",
+            view.pid,
+            view.port,
+            format::countdown(view.uptime)
+        ))),
+    ];
+    let block = Block::new().borders(Borders::TOP).title(" misc ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Config overlay (`c`, UI-3 U6): the live daemon settings the dashboard
+/// document carries, each annotated with the key/surface that changes it.
+/// Read-only projection — mutations go through the same paths as always.
+fn draw_config_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let row = |label: &'static str, value: String, hint: &'static str| {
+        Line::from(vec![
+            Span::styled(format!(" {label:<16}"), dim()),
+            Span::raw(value),
+            Span::styled(format!("   {hint}"), dim()),
+        ])
+    };
+    let p = &view.select_params;
+    let quota = chrome.quota_display_override.unwrap_or(view.quota_display);
+    let lines = vec![
+        Line::from(Span::styled(
+            " scheduler",
+            dim().add_modifier(Modifier::BOLD),
+        )),
+        row("mode", p.mode.label().to_string(), "[S]"),
+        row(
+            "ceilings",
+            format!(
+                "5h {:.0}% · 7d {:.0}% · fbl {:.0}%",
+                p.five_hour_max * 100.0,
+                p.seven_day_max * 100.0,
+                p.fable_weekly_max * 100.0
+            ),
+            "config / [L] per-account",
+        ),
+        row(
+            "usage max age",
+            format!("{}s", p.usage_max_age.as_secs()),
+            "config",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" codex", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "model",
+            view.codex.model.clone(),
+            "[m] cycle · groups bar click",
+        ),
+        row(
+            "effort",
+            view.codex
+                .effort
+                .clone()
+                .unwrap_or_else(|| "bypass (client)".into()),
+            "[e] cycle",
+        ),
+        row(
+            "fast",
+            if view.codex.fast { "on" } else { "off" }.into(),
+            "[f] toggle",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" display", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "quota fill",
+            match quota {
+                crate::config::QuotaDisplay::Used => "used%".into(),
+                crate::config::QuotaDisplay::Remaining => "remaining%".into(),
+            },
+            "[u]",
+        ),
+        row(
+            "reset display",
+            if chrome.reset_absolute {
+                "absolute UTC"
+            } else {
+                "countdown"
+            }
+            .into(),
+            "[t]",
+        ),
+        row(
+            "email mask",
+            if view.email_anonymous { "on" } else { "off" }.into(),
+            "config email_anonymous",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "upstream",
+            view.upstream.clone().unwrap_or_else(|| "—".into()),
+            "config",
+        ),
+        row(
+            "config path",
+            view.config_path.clone().unwrap_or_else(|| "—".into()),
+            "[R] reload (local)",
+        ),
+    ];
+    let block = Block::new().borders(Borders::TOP).title(" config ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The right-click account context menu (UI-3 U11): a small floating list
+/// anchored at the click cell, clamped to the frame. Items mirror the key
+/// flows exactly: switch now (`Enter` in the switcher), pause/resume (`p`),
+/// set limit (`L`), delete (`r` + confirm). Returns the hit layout.
+fn draw_context_menu(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    anchor: (u16, u16),
+) -> MenuChrome {
+    let Mode::ContextMenu { idx, item } = chrome.mode else {
+        return MenuChrome::default();
+    };
+    // The PINNED account id governs what the menu says — the same identity
+    // execution acts on (review R2/R3). The explicit match keeps "no pin"
+    // (index fallback — keyboard-driven/test states) distinct from "pinned
+    // account VANISHED": a vanished pin must never fall back to whoever now
+    // occupies the row (execution would cancel while the menu named someone
+    // else) — it renders as gone instead.
+    let (target, gone) = match chrome.menu_account.as_deref() {
+        Some(name) => {
+            let found = view.snapshot.accounts.iter().find(|a| a.id.0 == name);
+            (found, found.is_none().then(|| name.to_string()))
+        }
+        None => (
+            ctx.order
+                .get(idx)
+                .and_then(|&i| view.snapshot.accounts.get(i)),
+            None,
+        ),
+    };
+    let paused = target.is_some_and(|a| a.paused);
+    let name = match (&gone, target) {
+        (Some(pinned), _) => format!(
+            "{} — gone",
+            row_account_name(pinned, ctx.mask, &view.domain_abbrev)
+        ),
+        (None, Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
+        (None, None) => "?".into(),
+    };
+    let items: [&str; 4] = [
+        "switch now",
+        if paused { "resume" } else { "pause" },
+        "set limit",
+        "delete",
+    ];
+    let width = (items
+        .iter()
+        .map(|i| i.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(name.chars().count() + 1) as u16
+        + 4)
+    .min(frame.area().width);
+    let height = items.len() as u16 + 1; // + title border row
+    let frame_area = frame.area();
+    let x = anchor
+        .0
+        .min(frame_area.right().saturating_sub(width))
+        .max(frame_area.x);
+    let y = anchor
+        .1
+        .saturating_add(1)
+        .min(frame_area.bottom().saturating_sub(height))
+        .max(frame_area.y);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let mut lines: Vec<Line> = Vec::with_capacity(items.len());
+    let mut rects: Vec<Rect> = Vec::with_capacity(items.len());
+    for (i, label) in items.iter().enumerate() {
+        let style = if i == item {
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(Span::styled(format!(" {label} "), style)));
+        rects.push(Rect {
+            x: area.x,
+            y: area.y + 1 + i as u16,
+            width: area.width,
+            height: 1,
+        });
+    }
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(format!(" {name} "));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    MenuChrome { area, items: rects }
+}
+
+/// Rows every overlay leaves visible at the top: header + tab strip (and the
+/// event banner when active). Keeping the tab row on screen is what makes its
+/// always-armed click targets legitimate (review R1 MUST-FIX 3: overlays used
+/// to paint over the tabs while their hit boxes stayed live — invisible
+/// navigation).
+const OVERLAY_TOP_RESERVED: u16 = 3;
+
 fn overlay_rect(area: Rect) -> Rect {
+    let top = OVERLAY_TOP_RESERVED.min(area.height);
     Rect {
         x: area.x,
-        y: area.y,
+        y: area.y + top,
         width: area.width,
-        height: area.height.saturating_sub(2),
+        height: area.height.saturating_sub(2).saturating_sub(top),
     }
 }
 
@@ -822,7 +1430,7 @@ fn draw_accounts(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) {
+) -> Vec<AccountRowHit> {
     let snapshot = &view.snapshot;
     let block = Block::new().borders(Borders::TOP).title(" accounts ");
     if snapshot.accounts.is_empty() {
@@ -832,7 +1440,7 @@ fn draw_accounts(
         )))
         .block(block);
         frame.render_widget(empty, area);
-        return;
+        return Vec::new();
     }
     let show_fable = view.show_fable_weekly;
     // The account column is a fixed `Length(name_width)` that fits the widest
@@ -897,9 +1505,10 @@ fn draw_accounts(
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
 
     let selected = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
-            Some(idx.min(ctx.order.len().saturating_sub(1)))
-        }
+        Mode::Select { idx }
+        | Mode::ConfirmRemove { idx }
+        | Mode::EditLimits { idx }
+        | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
         // NewLogin is a provider picker, not an account-row cursor.
         Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
     };
@@ -973,6 +1582,23 @@ fn draw_accounts(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(block);
     frame.render_widget(table, area);
+    // Row hit map (UI-3 U11): row `pos` renders at area.y + 2 + pos (top
+    // border/title + header row), one line high, full table width. Rows
+    // clipped by the pane height are not clickable.
+    ctx.order
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| area.y as usize + 2 + pos < area.bottom() as usize)
+        .map(|(pos, _)| AccountRowHit {
+            area: Rect {
+                x: area.x,
+                y: area.y + 2 + pos as u16,
+                width: area.width,
+                height: 1,
+            },
+            display_idx: pos,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,12 +1821,19 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
 /// could not paint a partial background. Only spaces + the caller's text are
 /// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
 /// `anim.rs` is untouched.
+///
+/// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
+/// the FIXED last bar column, independent of the centered `text`, so the
+/// time never shifts when the marker appears or disappears (Z 2026-07-15).
+/// A text long enough to reach that column loses its last char to the
+/// marker — the marker is the rarer, higher-signal fact.
 fn quota_bar_line(
     fill: f64,
     color: Color,
     text: &str,
     bold_chars: usize,
     width: usize,
+    marker: Option<char>,
 ) -> Line<'static> {
     let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
     let chars: Vec<char> = text.chars().collect();
@@ -1210,7 +1843,9 @@ fn quota_bar_line(
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
     for col in 0..width {
-        let ch = if col >= start && col < start + text_len {
+        let ch = if marker.is_some() && col == width.saturating_sub(1) {
+            marker.unwrap_or(' ')
+        } else if col >= start && col < start + text_len {
             chars[col - start]
         } else {
             ' '
@@ -1239,24 +1874,28 @@ fn quota_bar_line(
 }
 
 /// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`) plus the window display-state glyph when the value is not fresh
-/// (issue #33). The parked/over `!` is NOT here — it rides the percent label
-/// to the right of the bar, where it always lived. Returns `(text,
-/// bold_chars)` where `bold_chars` covers the FIRST countdown unit — the
-/// day/hour magnitude carries most of the signal, so it gets the emphasis.
-/// An expired window (no live reset) reads `0s` — honest and ASCII-narrow.
+/// (`7d 10h`), plus the window display-state glyph when the value is not
+/// fresh (issue #33) — returned SEPARATELY so the renderer can pin it to a
+/// fixed trailing column instead of appending it to the centered time (the
+/// append shifted the time sideways whenever the glyph came and went — Z
+/// 2026-07-15 "가운데 시간 표시 위치 고정"). The parked/over `!` is NOT here —
+/// it rides the percent label to the right of the bar, where it always
+/// lived. Returns `(text, bold_chars, marker)` where `bold_chars` covers the
+/// FIRST countdown unit — the day/hour magnitude carries most of the signal,
+/// so it gets the emphasis. An expired window (no live reset) reads `0s` —
+/// honest and ASCII-narrow.
 fn quota_bar_text(
     window: &QuotaWindow,
     now: SystemTime,
     display: WindowDisplayState,
     absolute: bool,
-) -> (String, usize) {
+) -> (String, usize, Option<char>) {
     let live = window
         .resets_at
         .duration_since(now)
         .ok()
         .filter(|rem| !rem.is_zero());
-    let (mut text, bold_chars) = match (absolute, live) {
+    let (text, bold_chars) = match (absolute, live) {
         // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
         (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
         (false, Some(rem)) => {
@@ -1272,11 +1911,8 @@ fn quota_bar_text(
         // Expired window: no live reset to point at in either mode.
         (_, None) => ("0s".to_string(), 2),
     };
-    if !matches!(display, WindowDisplayState::Populated) {
-        text.push(' ');
-        text.push(display.glyph());
-    }
-    (text, bold_chars)
+    let marker = (!matches!(display, WindowDisplayState::Populated)).then(|| display.glyph());
+    (text, bold_chars, marker)
 }
 
 /// Assemble one full quota gauge cell line: the countdown bar
@@ -1290,6 +1926,7 @@ fn quota_bar_text(
 /// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
 /// past threshold) stays keyed on USED utilization either way, as do the
 /// color bands.
+#[allow(clippy::too_many_arguments)]
 fn quota_cell_line(
     fill: f64,
     color: Color,
@@ -1297,12 +1934,13 @@ fn quota_cell_line(
     bold_chars: usize,
     over: bool,
     bar_width: usize,
+    marker: Option<char>,
 ) -> Line<'static> {
     let mut label = format::percent(fill);
     if over {
         label.push('!');
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width);
+    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width, marker);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
         format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
@@ -1354,9 +1992,9 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Used => utilization,
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
-    let (text, bold_chars) = quota_bar_text(window, now, display, reset_absolute);
+    let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
     Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width,
+        fill, color, &text, bold_chars, over, bar_width, marker,
     ))
 }
 
@@ -1436,9 +2074,10 @@ fn fable_gauge_cell(
             crate::config::QuotaDisplay::Used => utilization,
             crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
         };
-        let (text, bold_chars) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+        let (text, bold_chars, marker) =
+            quota_bar_text(&scoped.window, now, display, reset_absolute);
         Cell::from(quota_cell_line(
-            fill, color, &text, bold_chars, over, bar_width,
+            fill, color, &text, bold_chars, over, bar_width, marker,
         ))
     } else {
         // Compact narrow marker: `F` + the top countdown unit + critical `!`
@@ -1740,9 +2379,10 @@ fn draw_detail(
 ) {
     let snapshot = &view.snapshot;
     let pos = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
-            idx.min(ctx.order.len().saturating_sub(1))
-        }
+        Mode::Select { idx }
+        | Mode::ConfirmRemove { idx }
+        | Mode::EditLimits { idx }
+        | Mode::ContextMenu { idx, .. } => idx.min(ctx.order.len().saturating_sub(1)),
         // NewLogin keeps the detail pane on the current account.
         Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => snapshot
             .representative_current()
@@ -1947,6 +2587,117 @@ fn window_detail_line(
 /// stable [`ActivityKey`], and the absolute screen rows it occupies this frame
 /// (`y_start..y_start+height`). Recorded during [`draw_activity`] so the mouse
 /// handler can map a click to the entry without re-deriving the layout.
+/// The tab strip (UI-3 U6): label + which surface it opens. `Overlay::None`
+/// is the dashboard (MAIN) itself.
+pub(crate) const TABS: &[(&str, Overlay)] = &[
+    ("dashboard", Overlay::None),
+    ("accounts", Overlay::Accounts),
+    ("stats", Overlay::Stats),
+    ("logs", Overlay::Logs),
+    ("sessions", Overlay::Sessions),
+    ("misc", Overlay::Misc),
+    ("config", Overlay::Config),
+];
+
+/// One clickable tab label's rendered rect (UI-3 U6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabHit {
+    pub area: Rect,
+    pub overlay: Overlay,
+}
+
+/// Pure hit-test: which tab, if any, does the click at absolute `(col, row)`
+/// land on?
+pub(crate) fn hit_test_tabs(tabs: &[TabHit], col: u16, row: u16) -> Option<Overlay> {
+    tabs.iter()
+        .find(|t| {
+            row >= t.area.y && row < t.area.bottom() && col >= t.area.x && col < t.area.right()
+        })
+        .map(|t| t.overlay)
+}
+
+/// Minimum drag-set pane height (top border + one content row) and a sanity
+/// ceiling (UI-3 U7/U8) — the layout solver squeezes overflow anyway, this
+/// just keeps the override numbers honest.
+pub(crate) const PANE_MIN_HEIGHT: u16 = 3;
+pub(crate) const PANE_MAX_HEIGHT: u16 = 40;
+
+/// Which MAIN pane a drag-separator resizes (UI-3 U7/U8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneId {
+    Accounts,
+    Middle,
+    Strip,
+}
+
+/// One draggable separator: the top-border row `y` of the pane BELOW, whose
+/// drag resizes the pane starting at `pane_top` (UI-3 U7/U8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeparatorHit {
+    pub y: u16,
+    pub pane: PaneId,
+    pub pane_top: u16,
+}
+
+/// One accounts-table row's rendered rect + its DISPLAY index (selection
+/// order — the same index the switch/pause/limits/remove flows take).
+/// Right-click target map (UI-3 U11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountRowHit {
+    pub area: Rect,
+    pub display_idx: usize,
+}
+
+/// The rendered context menu's layout (UI-3 U11): the whole popup rect plus
+/// one row rect per item, for the click hit-test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MenuChrome {
+    pub area: Rect,
+    pub items: Vec<Rect>,
+}
+
+impl MenuChrome {
+    /// Which menu item a click lands on, if any.
+    pub(crate) fn hit_item(&self, col: u16, row: u16) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|r| row == r.y && col >= r.x && col < r.right())
+    }
+}
+
+/// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
+/// its segment cycles the setting to its next value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingAction {
+    SchedMode,
+    CodexModel,
+    CodexEffort,
+    CodexFast,
+    GrokEffort,
+}
+
+/// One clickable segment of the group-settings bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingHit {
+    pub area: Rect,
+    pub action: SettingAction,
+}
+
+/// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
+/// activity panel's rows plus the tab bar, the drag separators, the accounts
+/// rows (right-click), the group-settings bar, and the open context menu.
+/// Threaded back to the runtime the same way `ActivityChrome` alone used to
+/// be.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MainChrome {
+    pub activity: ActivityChrome,
+    pub tabs: Vec<TabHit>,
+    pub separators: Vec<SeparatorHit>,
+    pub account_rows: Vec<AccountRowHit>,
+    pub menu: Option<MenuChrome>,
+    pub settings: Vec<SettingHit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActivityHit {
     pub key: ActivityKey,
@@ -2013,7 +2764,6 @@ fn draw_activity(
             let mut spans = vec![
                 Span::styled(format!(" {glyph} "), Style::new().fg(color)),
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
-                Span::raw(format!("  {} {}", request.method, request.path)),
             ];
             // [group model effort fast] badge while in flight (issue #2, 2a).
             // All four are filled at routing time (req11) with the same
@@ -2031,7 +2781,7 @@ fn draw_activity(
             if let Some(account) = &request.account {
                 spans.push(Span::raw(format!(
                     " → {}",
-                    masked_name(account, view.email_anonymous)
+                    row_account_name(account, view.email_anonymous, &view.domain_abbrev)
                 )));
             }
             spans.push(Span::styled(
@@ -2067,10 +2817,18 @@ fn draw_activity(
                     .activity_key()
                     .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
                 let row_y = body_top.saturating_add(lines.len() as u16);
-                lines.push(completed_line(entry, expanded, view.email_anonymous));
+                lines.push(completed_line(
+                    entry,
+                    expanded,
+                    view.email_anonymous,
+                    &view.session_labels,
+                    &view.domain_abbrev,
+                ));
                 let mut height = 1u16;
                 if expanded {
-                    for detail in completed_detail_lines(entry, view.email_anonymous) {
+                    for detail in
+                        completed_detail_lines(entry, view.email_anonymous, &view.session_labels)
+                    {
                         if lines.len() >= capacity {
                             break;
                         }
@@ -2098,14 +2856,25 @@ fn draw_activity(
                 let (expanded, key) =
                     triage::run_toggle_key(run, chrome.expanded_activity.as_ref());
                 let row_y = body_top.saturating_add(lines.len() as u16);
-                lines.push(folded_run_line(run, expanded, view.email_anonymous));
+                lines.push(folded_run_line(
+                    run,
+                    expanded,
+                    view.email_anonymous,
+                    &view.domain_abbrev,
+                ));
                 let mut height = 1u16;
                 if expanded {
                     for entry in run {
                         if lines.len() >= capacity {
                             break;
                         }
-                        lines.push(completed_line(entry, false, view.email_anonymous));
+                        lines.push(completed_line(
+                            entry,
+                            false,
+                            view.email_anonymous,
+                            &view.session_labels,
+                            &view.domain_abbrev,
+                        ));
                         height = height.saturating_add(1);
                     }
                 }
@@ -2149,7 +2918,12 @@ fn draw_activity(
 /// account, group, model) key renders as `▸ HH:MM–HH:MM N× METHOD path
 /// [meta] → account (all 2xx)`. Click toggles the fold — expanding lists the
 /// member rows verbatim, so nothing is lost, only the default density.
-fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'static> {
+fn folded_run_line(
+    run: &[Completed],
+    expanded: bool,
+    mask: bool,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> Line<'static> {
     let marker = if expanded { '▾' } else { '▸' };
     let newest = &run[0];
     let oldest = &run[run.len() - 1];
@@ -2177,15 +2951,17 @@ fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'stati
     };
     let account = account
         .as_deref()
-        .map(|a| masked_name(a, mask))
+        .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
+    // method+path dropped from the folded row too (Z 2026-07-15) — the run's
+    // members carry it in their expanded detail.
+    let _ = (method, path);
     let mut spans = vec![
         stamp,
         Span::styled(
             format!("{}× ", run.len()),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("{method} {path}")),
     ];
     if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
     {
@@ -2198,7 +2974,13 @@ fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'stati
     Line::from(spans)
 }
 
-fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static> {
+fn completed_line(
+    entry: &Completed,
+    expanded: bool,
+    mask: bool,
+    session_labels: &std::collections::BTreeMap<String, String>,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
             method,
@@ -2211,15 +2993,22 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
             model,
             effort,
             fast,
+            user_id,
+            kind,
+            excerpt,
         } => {
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
                 dim(),
             );
+            // Same display form as the accounts table (Z 2026-07-15
+            // "똑같은 함수"): mask → strip the `group:` prefix → abbreviate
+            // the domain. The expanded detail keeps the FULL raw id (the
+            // fidelity surface, issue #70).
             let account = account
                 .as_deref()
-                .map(|a| masked_name(a, mask))
+                .map(|a| row_account_name(a, mask, abbrev))
                 .unwrap_or_else(|| "?".to_string());
             let status_style = if *status < 400 {
                 Style::new().fg(Color::Green)
@@ -2246,7 +3035,24 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
                     detail.push_str(&format!(", {}", format_cost(cost)));
                 }
             }
-            let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
+            let mut spans = vec![stamp];
+            // Message kind + input excerpt (TUI UI-3 U1): say WHAT the request
+            // was, right where the eye lands. `user` rows lead with the typed
+            // text; control rows lead with their kind tag.
+            if let Some(kind) = kind.as_deref() {
+                spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
+            }
+            if let Some(excerpt) = excerpt.as_deref() {
+                spans.push(Span::raw(format!(
+                    "\u{201c}{}\u{201d} ",
+                    truncate_chars(&masked_text(excerpt, mask), 12)
+                )));
+            }
+            // method+path intentionally NOT on the collapsed row (Z
+            // 2026-07-15 "쓸데 없는 데이터"): it is constant noise
+            // (`POST /v1/messages?beta=true`); the expanded detail's
+            // `request` line keeps the full form.
+            let _ = (method, path);
             // [group model effort fast] badge, when known (req7).
             if let Some(meta) =
                 activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
@@ -2257,6 +3063,16 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
             spans.push(Span::raw(format!(" → {account} (")));
             spans.push(Span::styled(status.to_string(), status_style));
             spans.push(Span::raw(format!(", {detail})")));
+            // Derived session title (U2), when this client id has one.
+            if let Some(label) = user_id.as_deref().and_then(|id| session_labels.get(id)) {
+                spans.push(Span::styled(
+                    format!(
+                        " \u{ab}{}\u{bb}",
+                        truncate_chars(&masked_text(label, mask), 16)
+                    ),
+                    dim().add_modifier(Modifier::ITALIC),
+                ));
+            }
             Line::from(spans)
         }
         CompletedBody::Note { text, error } => {
@@ -2276,7 +3092,11 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
 /// breakdown, and the per-component + total API-equivalent cost via
 /// [`crate::pricing`]. Empty for notes (never expandable). `mask` = the
 /// email-anonymous display setting (the account line renders aliased).
-fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
+fn completed_detail_lines(
+    entry: &Completed,
+    mask: bool,
+    session_labels: &std::collections::BTreeMap<String, String>,
+) -> Vec<Line<'static>> {
     let CompletedBody::Request {
         method,
         path,
@@ -2288,6 +3108,9 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
         model,
         effort,
         fast,
+        user_id,
+        kind,
+        excerpt,
     } = &entry.body
     else {
         return Vec::new();
@@ -2300,6 +3123,25 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
     };
     let mut lines = Vec::new();
     lines.push(indent("request", format!("{method} {path}")));
+    // The click-expanded input line (U3): the full stored excerpt on ONE line,
+    // as wide as the terminal (the Paragraph clips, never wraps — so the line
+    // is exactly "as long as fits").
+    if let Some(kind) = kind.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("       kind    ", dim()),
+            Span::styled(kind.to_string(), kind_style(kind)),
+        ]));
+    }
+    if let Some(excerpt) = excerpt.as_deref() {
+        lines.push(indent("input", masked_text(excerpt, mask)));
+    }
+    if let Some(uid) = user_id.as_deref() {
+        let label = session_labels
+            .get(uid)
+            .map(|l| format!(" \u{ab}{}\u{bb}", masked_text(l, mask)))
+            .unwrap_or_default();
+        lines.push(indent("client", format!("{uid}{label}")));
+    }
     lines.push(indent(
         "account",
         account
@@ -2389,6 +3231,29 @@ fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
         .iter()
         .find(|a| a.id.0 == account)
         .map(|a| a.group)
+}
+
+/// Style for a message-kind tag (TUI UI-3 U1): plain user turns read as the
+/// default text, security-monitor turns shout, the mechanical control turns
+/// (compact/title/suggest/count/…) stay dim so user rows dominate the eye.
+fn kind_style(kind: &str) -> Style {
+    match kind {
+        "user" => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        "security" => Style::new().fg(Color::Yellow),
+        "compact" | "summary" => Style::new().fg(Color::Blue),
+        "subagent" | "sdk" => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        _ => dim(),
+    }
+}
+
+/// Truncate to `max` chars (boundary-safe) with a `…` marker when clipped.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, unknown = gray.
@@ -3101,6 +3966,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" logs  "),
                     key("s"),
                     Span::raw(" sessions  "),
+                    key("?"),
+                    Span::raw(" misc  "),
+                    key("c"),
+                    Span::raw(" config  "),
                 ];
                 if attached {
                     spans.push(Span::styled("R disabled (attached)  ", dim()));
@@ -3167,6 +4036,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 key("q"),
                 Span::raw(" quit"),
             ]),
+            Overlay::Misc => Line::from(vec![
+                Span::raw(" misc — "),
+                key("?/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            Overlay::Config => Line::from(vec![
+                Span::raw(" config — "),
+                key("c/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
             // Sessions overlay (issue #34): navigation + back.
             Overlay::Sessions => Line::from(vec![
                 Span::raw(" sessions — "),
@@ -3220,6 +4103,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             Span::raw(" add  "),
             key("Esc"),
             Span::raw(" cancel"),
+        ]),
+        Mode::ContextMenu { .. } => Line::from(vec![
+            Span::raw(" "),
+            key("↑/k ↓/j"),
+            Span::raw(" move  "),
+            key("Enter/click"),
+            Span::raw(" run  "),
+            key("Esc"),
+            Span::raw(" close"),
         ]),
         Mode::ConfirmRemove { .. } => Line::from(vec![
             Span::raw(" "),
@@ -3292,7 +4184,10 @@ mod tests {
     fn view_with(model_usage: Vec<ModelUsageDoc>) -> DashboardView {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            grok: Default::default(),
+            daily_usage: Vec::new(),
             health: Default::default(),
+            session_labels: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,
@@ -3419,7 +4314,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
-        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16);
+        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None);
         let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 16, "cell is exactly bar-width wide");
         // First 8 columns reversed (the fill), the rest plain.
@@ -3434,9 +4329,40 @@ mod tests {
     }
 
     #[test]
+    fn quota_bar_time_position_is_fixed_regardless_of_marker() {
+        // Z 2026-07-15: the freshness marker (○/◑) used to be APPENDED to the
+        // centered time, shifting the time sideways whenever the marker came
+        // and went. Now the time centers identically and the marker owns the
+        // fixed last column.
+        let flat = |line: ratatui::text::Line| -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let without = flat(quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None));
+        let with = flat(quota_bar_line(
+            0.5,
+            Color::Green,
+            "7d 10h",
+            2,
+            16,
+            Some('○'),
+        ));
+        assert_eq!(
+            without.find("7d 10h"),
+            with.find("7d 10h"),
+            "time column must not move when the marker appears"
+        );
+        assert_eq!(
+            with.chars().last(),
+            Some('○'),
+            "marker pinned to last column"
+        );
+        assert_eq!(with.chars().count(), 16);
+    }
+
+    #[test]
     fn quota_bar_line_empty_and_full_fill() {
         for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
-            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16);
+            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16, None);
             let rev: usize = line
                 .spans
                 .iter()
@@ -3449,7 +4375,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_bolds_only_the_leading_unit() {
-        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16);
+        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16, None);
         let bold: String = line
             .spans
             .iter()
@@ -3464,6 +4390,10 @@ mod tests {
     /// overlay explicitly.
     fn chrome_overlay(overlay: Overlay) -> Chrome {
         Chrome {
+            pane_heights: Default::default(),
+            menu_anchor: None,
+            menu_account: None,
+            chart_days: 14,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -4083,6 +5013,9 @@ mod tests {
                 model: model.map(str::to_string),
                 effort: None,
                 fast: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
             },
         }
     }
@@ -4176,6 +5109,230 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_records_seven_hit_targets_and_hit_test_maps_labels() {
+        let view = view_with(Vec::new());
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let tabs = hits.expect("layout").tabs;
+        assert_eq!(tabs.len(), TABS.len(), "one hit target per tab");
+        for (hit, (label, overlay)) in tabs.iter().zip(TABS) {
+            assert_eq!(hit.overlay, *overlay);
+            assert_eq!(hit.area.width as usize, label.chars().count());
+            // A click anywhere on the label maps to its overlay.
+            assert_eq!(
+                hit_test_tabs(&tabs, hit.area.x, hit.area.y),
+                Some(*overlay),
+                "{label}"
+            );
+            assert_eq!(
+                hit_test_tabs(&tabs, hit.area.right() - 1, hit.area.y),
+                Some(*overlay),
+                "{label} right edge"
+            );
+        }
+        // The separator between the first two labels maps to nothing.
+        let gap_x = tabs[0].area.right() + 1;
+        assert_eq!(hit_test_tabs(&tabs, gap_x, tabs[0].area.y), None);
+        // A different row maps to nothing.
+        assert_eq!(
+            hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn daily_tokens_chart_renders_title_legend_and_series() {
+        use crate::dashboard::DailyUsageDoc;
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 86_400;
+        view.daily_usage = (0..7)
+            .flat_map(|d| {
+                vec![
+                    DailyUsageDoc {
+                        day: today - d,
+                        group: "claude".into(),
+                        model: "claude-fable-5".into(),
+                        tokens_in: 100_000 * (d + 1),
+                        tokens_out: 50_000,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                    DailyUsageDoc {
+                        day: today - d,
+                        group: "codex".into(),
+                        model: "gpt-5.6-sol".into(),
+                        tokens_in: 40_000,
+                        tokens_out: 10_000,
+                        cache_read: 0,
+                        cache_creation: 0,
+                    },
+                ]
+            })
+            .collect();
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(text.contains("tokens per day"), "chart title visible");
+        assert!(text.contains("fable-5"), "legend names the top model");
+        assert!(
+            text.contains("gpt-5.6-sol"),
+            "legend names the second model"
+        );
+        assert!(text.contains('%'), "legend carries shares");
+        // Empty data (or a short terminal) renders no chart, no panic.
+        view.daily_usage.clear();
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(!text.contains("tokens per day"));
+    }
+
+    #[test]
+    fn daily_chart_ignores_future_days_and_never_panics() {
+        use crate::dashboard::DailyUsageDoc;
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 86_400;
+        // One normal row + one FUTURE-dated row (clock skew in a replayed
+        // log). Rendering must not panic and must still draw the chart.
+        view.daily_usage = vec![
+            DailyUsageDoc {
+                day: today,
+                group: "claude".into(),
+                model: "claude-fable-5".into(),
+                tokens_in: 10_000,
+                tokens_out: 1_000,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+            DailyUsageDoc {
+                day: today + 30,
+                group: "claude".into(),
+                model: "claude-fable-5".into(),
+                tokens_in: 99_000,
+                tokens_out: 9_000,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(text.contains("tokens per day"), "chart still renders");
+    }
+
+    #[test]
+    fn tab_row_stays_visible_under_every_overlay() {
+        // Review R1 MUST-FIX 3: overlays used to paint over the tab strip
+        // while its click targets stayed armed. The overlay rect now starts
+        // below the tab row, so the labels must be visible from every
+        // surface.
+        let view = view_with(Vec::new());
+        for (_, overlay) in TABS {
+            let text = render(&view, &chrome_overlay(*overlay), 200, 40);
+            assert!(
+                text.contains("dashboard │ accounts"),
+                "tab strip visible under {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_settings_bar_renders_and_records_clickable_segments() {
+        let mut view = view_with(Vec::new());
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        view.codex.effort = None;
+        view.grok.available = true;
+        view.grok.effort = Some("high".into());
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let settings = hits.expect("layout").settings;
+        let actions: Vec<SettingAction> = settings.iter().map(|h| h.action).collect();
+        assert!(actions.contains(&SettingAction::SchedMode));
+        assert!(actions.contains(&SettingAction::CodexModel));
+        assert!(actions.contains(&SettingAction::CodexEffort));
+        assert!(actions.contains(&SettingAction::CodexFast));
+        assert!(actions.contains(&SettingAction::GrokEffort));
+        let text = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(text.contains("sched"), "scheduler segment visible");
+        assert!(text.contains("effort:bypass"), "codex bypass label visible");
+        assert!(text.contains("effort:high"), "grok effort value visible");
+    }
+
+    #[test]
+    fn context_menu_renders_from_pinned_identity_not_row_occupant() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, paused: bool| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![acct("claude:a@x.com", false), acct("claude:b@x.com", true)];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.mode = Mode::ContextMenu { idx: 0, item: 0 };
+        chrome.menu_anchor = Some((10, 6));
+        // Pin B while the display index points at row 0: the menu must name B
+        // and show B's paused state (resume), not the row occupant's.
+        chrome.menu_account = Some("claude:b@x.com".into());
+        let text = render(&view, &chrome, 200, 40);
+        assert!(text.contains("b@x.com"), "menu titled from the pinned id");
+        assert!(
+            text.contains("resume"),
+            "pause/resume label from the pinned id"
+        );
+        // A vanished pin renders as gone — never the row occupant.
+        chrome.menu_account = Some("claude:gone@x.com".into());
+        let text = render(&view, &chrome, 200, 40);
+        assert!(
+            text.contains("gone@x.com — gone"),
+            "vanished pin marked gone"
+        );
+        assert!(
+            !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
+            "no fallback to the row occupant"
+        );
+    }
+
+    #[test]
+    fn tab_bar_renders_all_labels_and_marks_the_active_surface() {
+        let view = view_with(Vec::new());
+        for (label, overlay) in TABS {
+            let text = render(&view, &chrome_overlay(*overlay), 200, 40);
+            assert!(text.contains(label), "{label} visible");
+        }
+        // Misc/config overlays render their surfaces.
+        let text = render(&view, &chrome_overlay(Overlay::Misc), 200, 40);
+        assert!(text.contains("keys"), "misc shows keybindings");
+        let text = render(&view, &chrome_overlay(Overlay::Config), 200, 40);
+        assert!(text.contains("scheduler"), "config shows scheduler block");
+        assert!(text.contains("quota fill"), "config shows display block");
+    }
+
+    #[test]
     fn click_expand_recorded_layout_round_trips_to_detail() {
         // Render once to capture the hit layout, find the row a click lands on,
         // set that key expanded, and re-render: the detail lines appear.
@@ -4198,7 +5355,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("activity layout recorded");
+        let layout = hits.expect("activity layout recorded").activity;
         assert!(!layout.hits.is_empty(), "the request row is a hit target");
         let hit = &layout.hits[0];
         // A click on the row's first line maps back to the same key.
@@ -4235,7 +5392,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout");
+        let layout = hits.expect("layout").activity;
         assert!(
             layout.hits.is_empty(),
             "a note line is not a clickable hit target"
@@ -4795,6 +5952,9 @@ mod tests {
                     model: Some("claude-opus-4-8".into()),
                     effort: None,
                     fast: false,
+                    user_id: None,
+                    kind: None,
+                    excerpt: None,
                 },
             },
             Completed {

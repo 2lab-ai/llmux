@@ -240,6 +240,11 @@ struct ForwardContext {
     /// from the request body once at entry (issue #32). `None` → the request is
     /// attributed to the `unknown` bucket. Counting only; never gates routing.
     user_id: Option<String>,
+    /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
+    /// at entry from the buffered body by [`crate::proxy::classify`]. Display
+    /// only; never gates routing.
+    kind: Option<String>,
+    excerpt: Option<String>,
     /// The backend group this request routes to, OR `None` when routing is
     /// disabled (the legacy single-slot / cross-group-overflow path). When
     /// `Some`, the scheduler is filtered to that group and the leased
@@ -380,6 +385,8 @@ impl ForwardContext {
             effort,
             fast,
             user_id: self.user_id.clone(),
+            kind: self.kind.clone(),
+            excerpt: self.excerpt.clone(),
         });
     }
 }
@@ -617,6 +624,8 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 fast: false,
                 // Body never read → no metering identity; metered as unknown.
                 user_id: None,
+                kind: None,
+                excerpt: None,
             });
             return error_response(status, error_type, &message);
         }
@@ -629,6 +638,9 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Keyless per-client metering identity (issue #32): parsed once from the
     // buffered body, same pattern as `model`. Counting only — never routes.
     let user_id = crate::routing::user_id_from_body(&body);
+    // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
+    // pattern; rides the RequestFinished event for the activity feed.
+    let classified = crate::proxy::classify::classify(&path_query, &body);
     let group = if state.config.routing.enabled {
         Some(state.classifier.classify(model.as_deref()))
     } else {
@@ -650,6 +662,8 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         started,
         model,
         user_id,
+        kind: Some(classified.kind.to_string()),
+        excerpt: classified.excerpt,
         group,
         served_by: None,
     };
@@ -1778,6 +1792,8 @@ async fn relay(
             fast,
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let kind = ctx.kind.clone();
+        let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
         // body + a tee of the bytes streamed to the client. The relay keeps TWO
         // observe-only buffers, both filled AFTER each chunk is forwarded (never
@@ -1844,6 +1860,8 @@ async fn relay(
                         effort,
                         fast,
                         user_id,
+                        kind,
+                        excerpt,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -2021,6 +2039,8 @@ async fn relay_translate(
             fast,
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let kind = ctx.kind.clone();
+        let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
         // body + a tee of the Anthropic-SSE bytes EMITTED to the client. The
         // relay keeps TWO observe-only buffers, both filled after each chunk is
@@ -2102,6 +2122,8 @@ async fn relay_translate(
                         effort,
                         fast,
                         user_id,
+                        kind,
+                        excerpt,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -2291,6 +2313,8 @@ mod tests {
             started: std::time::Instant::now(),
             model: Some(model.to_string()),
             user_id: None,
+            kind: None,
+            excerpt: None,
             group: Some(group),
             served_by: None,
         }
