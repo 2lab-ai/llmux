@@ -388,12 +388,17 @@ Kirigami.ScrollablePage {
                     text: qsTr("Appearance and notifications")
                 }
 
-                Kirigami.FormLayout {
+                GridLayout {
                     Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 16
+                    rowSpacing: 10
+
+                    IslandFieldLabel { text: qsTr("Screen") }
 
                     IslandComboBox {
                         id: screenSelector
-                        Kirigami.FormData.label: qsTr("Screen:")
+                        Layout.fillWidth: true
                         model: menuPage.screens
                         enabled: menuPage.screens.length > 0
                             && !menuPage.isOperationBusy("settings")
@@ -421,8 +426,8 @@ Kirigami.ScrollablePage {
                         }
                     }
 
+                    IslandFieldLabel { text: qsTr("Sound") }
                     RowLayout {
-                        Kirigami.FormData.label: qsTr("Sound:")
                         Layout.fillWidth: true
 
                         IslandComboBox {
@@ -474,8 +479,9 @@ Kirigami.ScrollablePage {
                         }
                     }
 
+                    IslandFieldLabel { text: qsTr("Privacy") }
                     IslandSwitch {
-                        Kirigami.FormData.label: qsTr("Privacy:")
+                        Layout.fillWidth: true
                         text: qsTr("Anonymize account email")
                         checked: menuPage.settings.email_anonymous === true
                         enabled: !menuPage.isOperationBusy("settings")
@@ -485,8 +491,9 @@ Kirigami.ScrollablePage {
                         )
                     }
 
+                    IslandFieldLabel { text: qsTr("Quota") }
                     IslandSwitch {
-                        Kirigami.FormData.label: qsTr("Quota:")
+                        Layout.fillWidth: true
                         text: qsTr("Show Fable weekly quota")
                         checked: menuPage.settings.show_fable_weekly === true
                         enabled: !menuPage.isOperationBusy("settings")
@@ -520,13 +527,18 @@ Kirigami.ScrollablePage {
                     }
                 }
 
-                Kirigami.FormLayout {
+                GridLayout {
                     Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 16
+                    rowSpacing: 10
+
+                    IslandFieldLabel { text: qsTr("Scheme") }
 
                     IslandComboBox {
                         id: connectionSchemeSelector
                         objectName: "connection-scheme-selector"
-                        Kirigami.FormData.label: qsTr("Scheme:")
+                        Layout.fillWidth: true
                         model: ["http", "https"]
                         currentIndex: menuPage.connectionSchemeDraft === "https" ? 1 : 0
                         enabled: !menuPage.isOperationBusy("settings")
@@ -536,9 +548,10 @@ Kirigami.ScrollablePage {
                         }
                     }
 
+                    IslandFieldLabel { text: qsTr("Host") }
                     IslandTextField {
                         id: connectionHostField
-                        Kirigami.FormData.label: qsTr("Host:")
+                        Layout.fillWidth: true
                         text: menuPage.endpointHost(menuPage.connection.endpoint_display)
                         placeholderText: qsTr("127.0.0.1")
                         enabled: !menuPage.isOperationBusy("settings")
@@ -546,9 +559,10 @@ Kirigami.ScrollablePage {
                         onTextEdited: menuPage.connectionValidationMessage = ""
                     }
 
+                    IslandFieldLabel { text: qsTr("Port") }
                     IslandTextField {
                         id: connectionPortField
-                        Kirigami.FormData.label: qsTr("Port:")
+                        Layout.fillWidth: true
                         text: menuPage.endpointPort(menuPage.connection.endpoint_display)
                         placeholderText: qsTr("3456")
                         enabled: !menuPage.isOperationBusy("settings")
@@ -557,9 +571,10 @@ Kirigami.ScrollablePage {
                         onTextEdited: menuPage.connectionValidationMessage = ""
                     }
 
+                    IslandFieldLabel { text: qsTr("API key") }
                     IslandTextField {
                         id: connectionApiKeyField
-                        Kirigami.FormData.label: qsTr("API key:")
+                        Layout.fillWidth: true
                         placeholderText: menuPage.settings.api_key_configured
                             ? qsTr("Configured · leave blank to keep")
                             : qsTr("Required for a remote daemon")
@@ -574,8 +589,12 @@ Kirigami.ScrollablePage {
                         }
                     }
 
+                    IslandFieldLabel {
+                        visible: menuPage.settings.api_key_configured === true
+                        text: qsTr("Stored key")
+                    }
                     IslandCheckBox {
-                        Kirigami.FormData.label: qsTr("Stored key:")
+                        Layout.fillWidth: true
                         text: qsTr("Clear the stored API key")
                         visible: menuPage.settings.api_key_configured === true
                         checked: menuPage.clearApiKeyRequested
@@ -809,31 +828,39 @@ Kirigami.ScrollablePage {
                     text: qsTr("Updates")
                 }
 
-                Kirigami.FormLayout {
+                GridLayout {
                     Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 16
+                    rowSpacing: 8
 
+                    IslandFieldLabel { text: qsTr("Installed version") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Installed version:")
                         text: menuPage.displayText(menuPage.maintenance.version)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("Latest version") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Latest version:")
                         text: menuPage.displayText(menuPage.maintenance.latest_version)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("Install owner") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Install owner:")
                         text: menuPage.displayText(menuPage.maintenance.install_owner)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("Update available") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Update available:")
                         text: menuPage.hasOwn(menuPage.maintenance, "update_available")
                             ? (menuPage.maintenance.update_available ? qsTr("Yes") : qsTr("No"))
                             : menuPage.unavailableText
+                        color: menuPage.maintenance.update_available === true
+                            ? IslandTheme.amber : IslandTheme.primaryText
                     }
 
+                    IslandFieldLabel { text: qsTr("Release channel") }
                     IslandSegmentedControl {
                         id: channelSelector
-                        Kirigami.FormData.label: qsTr("Release channel:")
                         Layout.fillWidth: true
                         model: ["stable", "preview"]
                         currentIndex: menuPage.currentChannel === "stable" ? 0
@@ -961,27 +988,36 @@ Kirigami.ScrollablePage {
                     text: qsTr("About llmux Islands")
                 }
 
-                Kirigami.FormLayout {
+                GridLayout {
                     Layout.fillWidth: true
+                    columns: 2
+                    columnSpacing: 16
+                    rowSpacing: 8
+
+                    IslandFieldLabel { text: qsTr("Islands version") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Islands version:")
                         objectName: "about-islands-version"
                         text: menuPage.displayText(menuPage.aboutIslandsVersion)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("Daemon version") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Daemon version:")
                         objectName: "about-daemon-version"
                         text: menuPage.displayText(menuPage.aboutDaemonVersion)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("License") }
                     Label {
-                        Kirigami.FormData.label: qsTr("License:")
                         objectName: "about-license"
                         text: menuPage.displayText(menuPage.aboutLicense)
+                        color: IslandTheme.primaryText
                     }
+                    IslandFieldLabel { text: qsTr("Source") }
                     Label {
-                        Kirigami.FormData.label: qsTr("Source:")
                         objectName: "about-source-url"
                         text: menuPage.displayText(menuPage.aboutSourceUrl)
+                        color: IslandTheme.secondaryText
+                        font.family: IslandTheme.monoFamily
                         elide: Text.ElideMiddle
                     }
                 }

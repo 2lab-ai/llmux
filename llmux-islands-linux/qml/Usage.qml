@@ -672,14 +672,14 @@ Kirigami.ScrollablePage {
 
                             IslandButton {
                                 id: accountActionsButton
-                                icon.name: "overflow-menu"
-                                text: qsTr("Account actions")
-                                display: AbstractButton.IconOnly
+                                text: "⋯"
+                                display: AbstractButton.TextOnly
+                                Accessible.name: qsTr("Account actions")
                                 enabled: !accountCard.busy
                                         && usagePage.hasValue(accountCard.account.id)
                                 onClicked: accountActions.open()
                                 ToolTip.visible: hovered
-                                ToolTip.text: text
+                                ToolTip.text: Accessible.name
 
                                 Menu {
                                     id: accountActions
