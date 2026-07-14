@@ -227,6 +227,7 @@ impl DashboardHub {
         HubView {
             last_switch: state.last_switch.clone(),
             poll_health: state.poll_health.clone(),
+            health: state.log.health_counts(now),
             in_flight: state.log.in_flight().to_vec(),
             completed: state.log.completed().take(ACTIVITY_TAIL).cloned().collect(),
             account_totals: state.log.totals_map(),
@@ -249,6 +250,10 @@ impl DashboardHub {
 pub(crate) struct HubView {
     pub last_switch: Option<LastSwitch>,
     pub poll_health: HashMap<String, PollHealth>,
+    /// Rolling 5-minute status-class counts for the header health verdict
+    /// (glance-triage). From the log's dedicated sample deque, NOT the
+    /// capacity-bounded completed ring.
+    pub health: super::tui::activity::HealthCounts,
     pub in_flight: Vec<InFlight>,
     /// Newest first (activity renders newest-top).
     pub completed: Vec<Completed>,
@@ -461,6 +466,12 @@ pub struct DashboardDoc {
     #[serde(default)]
     pub windowed: Vec<WindowedStatsDoc>,
     pub activity: ActivityDoc,
+    /// Rolling 5-minute status-class counts for the header health verdict
+    /// (glance-triage). Additive AND presence-preserving: `None` from an
+    /// older daemon means "no telemetry", which the verdict renders as an
+    /// unavailable err surface — never as a fabricated healthy 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthDoc>,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
     /// Live codex request settings (req8.1 — dashboard fast/model/effort).
@@ -771,6 +782,18 @@ pub struct PollerDoc {
     pub last_ok_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub next_at_ms: u64,
+}
+
+/// Rolling 5-minute status-class counts for the header health verdict
+/// (glance-triage). Mirrors [`crate::tui::activity::HealthCounts`] 1:1 so
+/// local and attach render the identical verdict.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct HealthDoc {
+    pub requests: u64,
+    pub errors: u64,
+    pub s429: u64,
+    pub s401: u64,
+    pub s5xx: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1480,6 +1503,13 @@ pub(crate) fn dashboard_doc(
         client_usage,
         windowed: windowed_docs(hub),
         activity,
+        health: Some(HealthDoc {
+            requests: hub.health.requests,
+            errors: hub.health.errors,
+            s429: hub.health.s429,
+            s401: hub.health.s401,
+            s5xx: hub.health.s5xx,
+        }),
         logs: hub
             .logs
             .iter()
