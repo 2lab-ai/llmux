@@ -3303,11 +3303,11 @@ fn cell_width(text: &str) -> usize {
 /// string measurement on context-sensitive sequences (VS16/ZWJ): chars are
 /// popped until the remainder plus the one-cell ellipsis fits (review R2).
 fn truncate_cells(text: &str, max: usize) -> String {
-    if cell_width(text) <= max {
-        return text.to_string();
-    }
     if max == 0 {
         return String::new();
+    }
+    if cell_width(text) <= max {
+        return text.to_string();
     }
     let budget = max - 1; // room for the ellipsis
     let mut out = text.to_string();
@@ -4971,12 +4971,19 @@ mod tests {
             ),
             // Fixed tokens eating the whole slot → the model token is
             // DROPPED (no stray one-cell ellipsis), the badge itself clips.
-            activity_meta(
-                Some("a-very-long-group-name-x"),
-                Some("some-model"),
-                Some("effort-that-overflows"),
-                true,
-            ),
+            {
+                let meta = activity_meta(
+                    Some("a-very-long-group-name-x"),
+                    Some("some-model"),
+                    Some("effort-that-overflows"),
+                    true,
+                );
+                assert!(
+                    !meta.contains("some-model"),
+                    "zero-budget model token is dropped, got {meta:?}"
+                );
+                meta
+            },
         ] {
             assert_eq!(
                 cell_width(&meta),
@@ -5012,6 +5019,14 @@ mod tests {
             activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).trim_end(),
             "[codex fast]"
         );
+    }
+
+    #[test]
+    fn truncate_cells_zero_budget_yields_empty(/* UI-4 R3 nice 1/2 */) {
+        assert_eq!(truncate_cells("some-model", 0), "");
+        assert_eq!(truncate_cells("", 0), "");
+        // Zero-width (combining-only) text also honors the exact contract.
+        assert_eq!(truncate_cells("\u{200d}", 0), "");
     }
 
     #[test]
