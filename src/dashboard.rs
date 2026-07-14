@@ -242,6 +242,8 @@ impl DashboardHub {
                 .map(|&w| (w, state.log.windowed_rows(w, now)))
                 .collect(),
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
+            session_labels: state.log.session_labels(),
+            daily_usage: state.log.daily_usage(),
         }
     }
 }
@@ -269,6 +271,11 @@ pub(crate) struct HubView {
     pub windowed: Vec<(StatsWindow, Vec<WindowedRow>)>,
     /// Oldest→newest (console renders the tail at the bottom).
     pub logs: Vec<LogLine>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → first
+    /// user-input excerpt.
+    pub session_labels: HashMap<String, String>,
+    /// Tokens-per-day chart rows (UI-3 U14).
+    pub daily_usage: Vec<DailyUsageDoc>,
 }
 
 /// Consume the activity-event and tracing-line channels into the hub. The
@@ -350,6 +357,8 @@ fn trace_event(event: &ActivityEvent) {
             effort,
             fast,
             user_id,
+            kind,
+            excerpt: _,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -373,6 +382,7 @@ fn trace_event(event: &ActivityEvent) {
                 effort = effort.as_deref().unwrap_or("-"),
                 fast = *fast,
                 client = user_id.as_deref().unwrap_or("unknown"),
+                kind = kind.as_deref().unwrap_or("-"),
                 "request finished"
             );
         }
@@ -472,12 +482,24 @@ pub struct DashboardDoc {
     /// unavailable err surface — never as a fabricated healthy 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthDoc>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → the first
+    /// plain user-input excerpt seen for it. Additive: absent in older docs →
+    /// empty map, rows just render without a session label.
+    #[serde(default)]
+    pub session_labels: BTreeMap<String, String>,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
     /// Live codex request settings (req8.1 — dashboard fast/model/effort).
     /// Additive: absent in docs written before this existed.
     #[serde(default)]
     pub codex: CodexSettingsDoc,
+    /// Live grok request settings (UI-3 U12 — group-settings bar effort
+    /// override). Additive: absent in older docs → unavailable.
+    #[serde(default)]
+    pub grok: GrokSettingsDoc,
+    /// Tokens-per-day chart rows (UI-3 U14), oldest first. Additive.
+    #[serde(default)]
+    pub daily_usage: Vec<DailyUsageDoc>,
     /// Live `email_anonymous` display setting. Account names in THIS document
     /// stay real (SSOT T1); the renderer masks at draw time when this is on,
     /// so an API flip reflects on the next frame/poll without restart — in
@@ -598,6 +620,34 @@ pub struct CodexSettingsDoc {
     pub available: bool,
     #[serde(default)]
     pub fast: bool,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// One (day, group, model) row of the Tokens-per-Day chart (UI-3 U14).
+/// `day` is epoch DAYS (UTC). Additive: absent in older docs → no chart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsageDoc {
+    pub day: u64,
+    pub group: String,
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
+}
+
+/// Live grok provider settings (UI-3 U12), mirroring [`CodexSettingsDoc`]:
+/// `available` is false when no grok account is configured; `effort` `None`
+/// = bypass (the client's `output_config.effort` rides through).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrokSettingsDoc {
+    #[serde(default)]
+    pub available: bool,
     #[serde(default)]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -959,6 +1009,10 @@ pub struct InFlightDoc {
     pub fast: bool,
 }
 
+// Request dwarfs Note by design (see `tui::activity::CompletedBody`): almost
+// every entry is a Request, so the boxed-variant fix would cost an allocation
+// per real entry.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompletedDoc {
@@ -988,6 +1042,21 @@ pub enum CompletedDoc {
         /// absent (→ `false`) in docs written before this field existed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fast: bool,
+        /// Client identity / message kind / input excerpt (TUI UI-3 U1/U2).
+        /// Additive: absent in docs written before these fields existed.
+        ///
+        /// PRIVACY: `excerpt` carries up to 400 chars of PROMPT TEXT into
+        /// this document and the persisted request log — the same class of
+        /// content the raw-io capture already stores verbatim, behind the
+        /// same boundary (loopback-only bind or `proxy.api_key`). The
+        /// renderer-side `email_anonymous` masking applies at DRAW time
+        /// only; it does not redact this wire field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excerpt: Option<String>,
     },
     Note {
         at_ms: u64,
@@ -1028,6 +1097,8 @@ pub struct DocMeta {
     pub refresh_ahead_secs: u64,
     pub evaluate_tick_secs: u64,
     pub codex: CodexSettingsDoc,
+    /// Live grok settings (UI-3 U12), same convention as `codex`.
+    pub grok: GrokSettingsDoc,
     /// Live `email_anonymous` display setting (see
     /// [`DashboardDoc::email_anonymous`]).
     pub email_anonymous: bool,
@@ -1411,6 +1482,9 @@ pub(crate) fn dashboard_doc(
                     model,
                     effort,
                     fast,
+                    user_id,
+                    kind,
+                    excerpt,
                 } => CompletedDoc::Request {
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
@@ -1436,6 +1510,9 @@ pub(crate) fn dashboard_doc(
                     model: model.clone(),
                     effort: effort.clone(),
                     fast: *fast,
+                    user_id: user_id.clone(),
+                    msg_kind: kind.clone(),
+                    excerpt: excerpt.clone(),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -1510,6 +1587,11 @@ pub(crate) fn dashboard_doc(
             s401: hub.health.s401,
             s5xx: hub.health.s5xx,
         }),
+        session_labels: hub
+            .session_labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         logs: hub
             .logs
             .iter()
@@ -1519,6 +1601,8 @@ pub(crate) fn dashboard_doc(
             })
             .collect(),
         codex: meta.codex.clone(),
+        grok: meta.grok.clone(),
+        daily_usage: hub.daily_usage.clone(),
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
@@ -1539,6 +1623,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let params = state.select_params();
     let hub = state.hub.view(now);
     let codex_shape = state.codex.shape();
+    let grok_shape = state.grok.shape();
     let meta = DocMeta {
         pid: std::process::id(),
         uptime_secs: state.started.elapsed().as_secs(),
@@ -1555,6 +1640,14 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             fast: codex_shape.fast,
             model: codex_shape.model,
             effort: codex_shape.effort,
+        },
+        grok: GrokSettingsDoc {
+            available: snapshot
+                .accounts
+                .iter()
+                .any(|a| a.group == crate::routing::BackendGroup::Grok),
+            model: grok_shape.model,
+            effort: grok_shape.effort,
         },
         // Pricing overrides from the live config's `[pricing]` section
         // (Feature D); empty → built-in default rate table.
@@ -1608,6 +1701,7 @@ mod tests {
 
     fn meta() -> DocMeta {
         DocMeta {
+            grok: GrokSettingsDoc::default(),
             pid: 4321,
             uptime_secs: 130,
             port: 3456,
@@ -1696,6 +1790,8 @@ mod tests {
                 effort: Some("high".into()),
                 fast: true,
                 user_id: Some("acct_seed".into()),
+                kind: None,
+                excerpt: None,
             },
             now() - Duration::from_secs(58),
         );
@@ -2460,6 +2556,8 @@ mod tests {
                     effort: None,
                     fast: false,
                     user_id: None,
+                    kind: None,
+                    excerpt: None,
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -2504,6 +2602,8 @@ mod tests {
             effort: None,
             fast: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 

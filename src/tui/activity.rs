@@ -62,6 +62,10 @@ pub(crate) struct InFlight {
 }
 
 /// Body of a completed log entry.
+// Request dwarfs Note by design: nearly every entry IS a Request (Notes are
+// rare operator lines), so boxing the common variant would trade one heap
+// allocation per real entry for slack in the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletedBody {
     Request {
@@ -78,6 +82,14 @@ pub(crate) enum CompletedBody {
         effort: Option<String>,
         /// Codex fast mode was in effect (always `false` for claude).
         fast: bool,
+        /// Keyless client identity (`metadata.user_id`) — keys the derived
+        /// session label shown on the row (TUI UI-3 U2).
+        user_id: Option<String>,
+        /// Message-kind token from `proxy::classify` ("user"/"compact"/…).
+        kind: Option<String>,
+        /// Cleaned input excerpt (bounded), shown truncated on the row and
+        /// in full on the click-expanded detail line.
+        excerpt: Option<String>,
     },
     Note {
         text: String,
@@ -129,6 +141,19 @@ impl Completed {
             CompletedBody::Note { .. } => None,
         }
     }
+}
+
+/// Days of per-day/per-model token history retained for the Tokens-per-Day
+/// chart (UI-3 U14).
+const DAILY_RETAIN_DAYS: u64 = 90;
+
+/// One (day, group, model) cell of the Tokens-per-Day chart (UI-3 U14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DailyTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
 }
 
 /// Per-account lifetime counters for the table's totals columns and the
@@ -615,6 +640,12 @@ pub(crate) struct PersistedRequest {
     /// `unknown` client bucket.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Message kind + input excerpt (TUI UI-3 U1). Additive: lines persisted
+    /// before these fields default to `None`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
 }
 
 impl PersistedRequest {
@@ -635,6 +666,8 @@ impl PersistedRequest {
             effort,
             fast,
             user_id,
+            kind,
+            excerpt,
         } = event
         else {
             return None;
@@ -658,6 +691,8 @@ impl PersistedRequest {
             effort: effort.clone(),
             fast: *fast,
             user_id: user_id.clone(),
+            kind: kind.clone(),
+            excerpt: excerpt.clone(),
         })
     }
 
@@ -678,6 +713,8 @@ impl PersistedRequest {
             effort: self.effort,
             fast: self.fast,
             user_id: self.user_id,
+            kind: self.kind,
+            excerpt: self.excerpt,
         };
         (event, ts)
     }
@@ -715,6 +752,15 @@ pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: S
 pub(crate) struct ActivityLog {
     capacity: usize,
     in_flight: Vec<InFlight>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → the first
+    /// plain user-input excerpt seen for it (≤48 chars). Insert-only, bounded
+    /// by [`MAX_CLIENTS`].
+    session_labels: HashMap<String, String>,
+    /// Tokens-per-day chart data (UI-3 U14): day (epoch days) → (group,
+    /// model) → summed token counts. Fed by the same RequestFinished fold
+    /// (startup replay of the persisted request log fills history), pruned to
+    /// [`DAILY_RETAIN_DAYS`].
+    daily: std::collections::BTreeMap<u64, HashMap<(String, String), DailyTokens>>,
     /// Front = newest (the log renders newest-top).
     completed: VecDeque<Completed>,
     totals: HashMap<String, Totals>,
@@ -914,6 +960,26 @@ impl ActivityLog {
             self.clients.entry(key).or_default().add(&totals);
         }
         self.windowed.merge_behind(history.windowed);
+        // Tokens-per-day buckets (UI-3 U14) merge BY DAY so history lands on
+        // its original days — same reasoning as the hourly buckets above.
+        for (day, cells) in history.daily {
+            let dst = self.daily.entry(day).or_default();
+            for (key, t) in cells {
+                let cell = dst.entry(key).or_default();
+                cell.input = cell.input.saturating_add(t.input);
+                cell.output = cell.output.saturating_add(t.output);
+                cell.cache_read = cell.cache_read.saturating_add(t.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(t.cache_creation);
+            }
+        }
+        // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
+        // replayed history for the same client; history fills the gaps under
+        // the same MAX_CLIENTS bound as the live fold.
+        for (uid, label) in history.session_labels {
+            if !self.session_labels.contains_key(&uid) && self.session_labels.len() < MAX_CLIENTS {
+                self.session_labels.insert(uid, label);
+            }
+        }
         merged
     }
 
@@ -957,6 +1023,33 @@ impl ActivityLog {
     /// Completed entries, newest first.
     pub(crate) fn completed(&self) -> impl Iterator<Item = &Completed> {
         self.completed.iter()
+    }
+
+    /// Derived session titles (TUI UI-3 U2): client id → first user-input
+    /// excerpt. Cloned for the dashboard document.
+    pub(crate) fn session_labels(&self) -> HashMap<String, String> {
+        self.session_labels.clone()
+    }
+
+    /// Tokens-per-day rows (UI-3 U14), oldest day first. Flattened for the
+    /// dashboard document.
+    pub(crate) fn daily_usage(&self) -> Vec<crate::dashboard::DailyUsageDoc> {
+        self.daily
+            .iter()
+            .flat_map(|(day, cells)| {
+                cells
+                    .iter()
+                    .map(move |((group, model), t)| crate::dashboard::DailyUsageDoc {
+                        day: *day,
+                        group: group.clone(),
+                        model: model.clone(),
+                        tokens_in: t.input,
+                        tokens_out: t.output,
+                        cache_read: t.cache_read,
+                        cache_creation: t.cache_creation,
+                    })
+            })
+            .collect()
     }
 
     /// Per-account totals lookup. The dashboard reads the whole map
@@ -1242,6 +1335,8 @@ impl ActivityLog {
                 effort,
                 fast,
                 user_id,
+                kind,
+                excerpt,
             } => {
                 let routed = self
                     .in_flight
@@ -1255,6 +1350,20 @@ impl ActivityLog {
                 // `unknown` bucket when absent), independent of routing — so
                 // pre-routing failures are attributed too, never dropped.
                 self.record_client(user_id.as_deref(), status, tokens);
+                // Session label (TUI UI-3 U2): the FIRST plain user-input
+                // excerpt seen for a client id becomes that session's derived
+                // title (nothing on the wire carries a real one). Bounded by
+                // MAX_CLIENTS via the same insert-guard as client buckets.
+                if let (Some(uid), Some("user"), Some(text)) =
+                    (user_id.as_deref(), kind.as_deref(), excerpt.as_deref())
+                {
+                    if !self.session_labels.contains_key(uid)
+                        && self.session_labels.len() < MAX_CLIENTS
+                    {
+                        self.session_labels
+                            .insert(uid.to_string(), text.chars().take(48).collect());
+                    }
+                }
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -1276,6 +1385,32 @@ impl ActivityLog {
                 // still increments the row's error count even with no tokens.
                 if let (Some(group), Some(model)) = (&group, &model) {
                     self.record_model(group, model, &account, status, tokens, &effort, &path, now);
+                    // Tokens-per-day chart fold (UI-3 U14). `now` is the event
+                    // fold time — the startup replay passes each record's
+                    // PERSISTED timestamp, so history lands on its real day.
+                    if let Some(t) = tokens {
+                        let day = now
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() / 86_400)
+                            .unwrap_or(0);
+                        let cell = self
+                            .daily
+                            .entry(day)
+                            .or_default()
+                            .entry((group.clone(), model.clone()))
+                            .or_default();
+                        cell.input = cell.input.saturating_add(t.input);
+                        cell.output = cell.output.saturating_add(t.output);
+                        cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+                        cell.cache_creation = cell
+                            .cache_creation
+                            .saturating_add(t.cache_creation.unwrap_or(0));
+                        // Keep exactly DAILY_RETAIN_DAYS buckets including
+                        // today (cutoff inclusive — the -1 avoids a 91-day
+                        // window, review R1 nice-to-have 2).
+                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
+                        self.daily.retain(|d, _| *d >= cutoff);
+                    }
                 }
                 self.push_health(now, status);
                 self.push(Completed {
@@ -1291,6 +1426,9 @@ impl ActivityLog {
                         model,
                         effort,
                         fast,
+                        user_id,
+                        kind,
+                        excerpt,
                     },
                 });
             }
@@ -1388,6 +1526,57 @@ impl ActivityLog {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hydration_merges_daily_buckets_and_session_labels_behind_live() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let day = |d: u64| UNIX_EPOCH + Duration::from_secs(d * 86_400 + 3600);
+        let finished =
+            |_ts: u64, tok_in: u64, uid: &str, excerpt: &str| ActivityEvent::RequestFinished {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(100),
+                tokens: Some(TokenCounts {
+                    input: tok_in,
+                    output: 10,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("claude".into()),
+                model: Some("claude-fable-5".into()),
+                effort: None,
+                fast: false,
+                user_id: Some(uid.into()),
+                kind: Some("user".into()),
+                excerpt: Some(excerpt.into()),
+            };
+        let _ = day;
+        let mut live = ActivityLog::new(16);
+        live.apply(finished(0, 100, "s1", "live first input"), day(20_000));
+        let mut history = ActivityLog::new(16);
+        history.apply(finished(0, 40, "s1", "old input"), day(19_999));
+        history.apply(finished(0, 70, "s2", "history session"), day(19_998));
+        live.merge_history_behind(history);
+        let daily = live.daily_usage();
+        // Three distinct days, each with its own bucket — history landed on
+        // its ORIGINAL days.
+        assert_eq!(daily.len(), 3);
+        assert!(daily.iter().any(|r| r.day == 19_998 && r.tokens_in == 70));
+        assert!(daily.iter().any(|r| r.day == 20_000 && r.tokens_in == 100));
+        // Live label wins for s1; history fills s2.
+        let labels = live.session_labels();
+        assert_eq!(
+            labels.get("s1").map(String::as_str),
+            Some("live first input")
+        );
+        assert_eq!(
+            labels.get("s2").map(String::as_str),
+            Some("history session")
+        );
+    }
     use super::*;
 
     fn at(secs: u64) -> SystemTime {
@@ -1436,6 +1625,8 @@ mod tests {
             effort: None,
             fast: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1465,6 +1656,8 @@ mod tests {
             effort: effort.map(str::to_string),
             fast: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1493,6 +1686,8 @@ mod tests {
             effort: None,
             fast: false,
             user_id: user_id.map(str::to_string),
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -2403,6 +2598,8 @@ mod tests {
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),
+            kind: None,
+            excerpt: None,
         }
     }
 

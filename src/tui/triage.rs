@@ -534,6 +534,9 @@ mod tests {
 
     fn view_with(snapshot: PoolSnapshot, health: HealthCounts) -> DashboardView {
         DashboardView {
+            session_labels: Default::default(),
+            grok: Default::default(),
+            daily_usage: Vec::new(),
             version: "llmux test".into(),
             pid: 1,
             uptime: Duration::from_secs(1),
@@ -658,6 +661,9 @@ mod tests {
                 model: Some("opus".into()),
                 effort: None,
                 fast: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
             },
         }
     }

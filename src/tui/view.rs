@@ -40,6 +40,9 @@ pub(crate) struct DashboardView {
     pub in_flight: Vec<InFlight>,
     /// Newest first.
     pub completed: Vec<Completed>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → first
+    /// user-input excerpt, carried from the document.
+    pub session_labels: std::collections::BTreeMap<String, String>,
     /// Oldest→newest tail.
     pub logs: Vec<LogLine>,
     /// Per-(group, model) usage rows (req1-20), already sorted by total tokens.
@@ -55,6 +58,10 @@ pub(crate) struct DashboardView {
     pub windowed: Vec<crate::dashboard::WindowedStatsDoc>,
     /// Live codex settings (req8.1): shown + toggled from the dashboard.
     pub codex: crate::dashboard::CodexSettingsDoc,
+    /// Live grok settings (UI-3 U12): shown + cycled from the group bar.
+    pub grok: crate::dashboard::GrokSettingsDoc,
+    /// Tokens-per-day chart rows (UI-3 U14), straight from the document.
+    pub daily_usage: Vec<crate::dashboard::DailyUsageDoc>,
     /// Live `email_anonymous` display setting (SSOT E4): when on, every
     /// draw-time surface that shows an account email renders it through
     /// [`crate::demo::alias_always`] / [`crate::demo::mask_email_text`]
@@ -286,6 +293,9 @@ impl DashboardView {
                     model,
                     effort,
                     fast,
+                    user_id,
+                    msg_kind,
+                    excerpt,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -312,6 +322,9 @@ impl DashboardView {
                         model: model.clone(),
                         effort: effort.clone(),
                         fast: *fast,
+                        user_id: user_id.clone(),
+                        kind: msg_kind.clone(),
+                        excerpt: excerpt.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -333,6 +346,9 @@ impl DashboardView {
             .collect();
 
         Self {
+            session_labels: doc.session_labels.clone(),
+            grok: doc.grok.clone(),
+            daily_usage: doc.daily_usage.clone(),
             version: doc.version.clone(),
             pid: doc.pid,
             uptime: Duration::from_secs(doc.uptime_secs),

@@ -74,8 +74,15 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5.5-codex",
     "gpt-5-codex",
 ];
-/// Reasoning-effort levels cycled with `e`; "" = unset (backend default).
-const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+/// Reasoning-effort levels cycled with `e` (and the group-settings bar);
+/// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
+/// U12). A concrete value OVERRIDES every request. `max` is native on the
+/// gpt-5.6 family and clamps to `xhigh` on older models.
+const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
+/// Values are the config superset (`none|low|medium|high`) — per-model
+/// clamping happens at request time in the provider.
+const GROK_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
 
 /// One-line summary of codex settings for the status bar.
 fn codex_status_line(c: &CodexSettingsDoc) -> String {
@@ -83,7 +90,7 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
         "codex {} · fast {} · effort {}",
         c.model,
         if c.fast { "on" } else { "off" },
-        c.effort.as_deref().unwrap_or("default"),
+        c.effort.as_deref().unwrap_or("bypass"),
     )
 }
 
@@ -220,6 +227,13 @@ pub(crate) enum Mode {
     EditLimits {
         idx: usize,
     },
+    /// Right-click context menu on an accounts row (UI-3 U11): `idx` is the
+    /// display row, `item` the highlighted menu entry. The anchor cell lives
+    /// in [`App::menu_anchor`] (Mode stays `Copy`).
+    ContextMenu {
+        idx: usize,
+        item: usize,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -244,6 +258,22 @@ pub(crate) enum Overlay {
     /// Session timeline (issue #34): persisted raw-io grouped by
     /// `metadata.user_id` into confidence-labeled per-session aggregates.
     Sessions,
+    /// Everything-else surface (UI-3 U6 "기타"): keybindings, build info,
+    /// daemon facts — the glance answers that fit no other tab.
+    Misc,
+    /// Read-only config surface (UI-3 U6): the live daemon settings the
+    /// dashboard knows (scheduler / codex / display), with their toggles.
+    Config,
+}
+
+/// Session-local pane-height overrides (UI-3 U7/U8): `None` = the pane's
+/// automatic height (content-derived / fixed). Set by dragging the separator
+/// row (the NEXT pane's top border) with the mouse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PaneHeights {
+    pub accounts: Option<u16>,
+    pub middle: Option<u16>,
+    pub strip: Option<u16>,
 }
 
 /// UI-local state the renderer needs besides the data view: cursor, panes,
@@ -288,6 +318,17 @@ pub(crate) struct Chrome {
     /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
     /// Rendered raw in the footer (percent ceilings are not secrets).
     pub limits_input: String,
+    /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
+    /// layout.
+    pub pane_heights: PaneHeights,
+    /// Anchor cell of the open right-click context menu (UI-3 U11).
+    pub menu_anchor: Option<(u16, u16)>,
+    /// The pinned account id the open context menu targets — the SINGLE
+    /// source of truth for both the menu's rendering and its execution
+    /// (display indexes reorder every frame; review R2 MUST-FIX).
+    pub menu_account: Option<String>,
+    /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
+    pub chart_days: u64,
 }
 
 /// Attach-mode banner state.
@@ -353,6 +394,10 @@ struct Remote {
     /// Account name queued for removal (`r` confirm), performed by the event
     /// loop via `POST /llmux/remove-account`.
     pending_remove: Option<String>,
+    /// Grok effort change queued by the group-settings bar (UI-3 U12),
+    /// performed by the event loop via `POST /llmux/grok`. Inner `None` =
+    /// clear to bypass.
+    pending_grok: Option<Option<String>>,
 }
 
 /// One message from the remote fetch task.
@@ -381,6 +426,36 @@ struct App {
     /// panel rect + the clickable request rows. Recorded by the event loop after
     /// each `draw`, read by the mouse handler to map a click to an entry.
     activity_chrome: ui::ActivityChrome,
+    /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
+    /// one rect per tab label. Same record/read cycle as `activity_chrome`.
+    tab_chrome: Vec<ui::TabHit>,
+    /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
+    /// top-border row of a pane, dragging it resizes the pane ABOVE it.
+    separator_chrome: Vec<ui::SeparatorHit>,
+    /// Session-local pane-height overrides set by separator drags.
+    pane_heights: PaneHeights,
+    /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
+    chart_days: u64,
+    /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
+    /// right-click target map.
+    account_row_chrome: Vec<ui::AccountRowHit>,
+    /// The rendered context menu's hit layout (UI-3 U11), when open.
+    menu_chrome: Option<ui::MenuChrome>,
+    /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
+    setting_chrome: Vec<ui::SettingHit>,
+    /// Anchor cell of the open context menu (col, row).
+    menu_anchor: Option<(u16, u16)>,
+    /// The REAL account id the open context menu targets, captured at open
+    /// time. Display indexes reorder every frame (selection order follows
+    /// live quota state), so actions re-resolve this name to the CURRENT
+    /// display row at execution — a reorder between open and click can never
+    /// retarget another account (review R1 MUST-FIX 6).
+    menu_account: Option<String>,
+    /// Whether the limits editor was opened FROM the context menu (then it
+    /// exits to Normal, not back into the switcher).
+    limits_from_menu: bool,
+    /// The separator currently being dragged, if any (mouse button held).
+    drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -432,6 +507,17 @@ impl App {
             activity_scroll: 0,
             expanded_activity: None,
             activity_chrome: ui::ActivityChrome::default(),
+            tab_chrome: Vec::new(),
+            separator_chrome: Vec::new(),
+            pane_heights: PaneHeights::default(),
+            chart_days: 14,
+            account_row_chrome: Vec::new(),
+            menu_chrome: None,
+            menu_anchor: None,
+            menu_account: None,
+            setting_chrome: Vec::new(),
+            limits_from_menu: false,
+            drag: None,
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
@@ -481,6 +567,10 @@ impl App {
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
+            pane_heights: self.pane_heights,
+            menu_anchor: self.menu_anchor,
+            menu_account: self.menu_account.clone(),
+            chart_days: self.chart_days,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -546,6 +636,9 @@ impl App {
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
+            Mode::ContextMenu { idx, item } => {
+                return self.on_key_context_menu(key.code, idx, item, view)
+            }
             Mode::Normal => {}
         }
         // Otherwise (Mode::Normal): the active overlay, if any, gets the key;
@@ -556,6 +649,8 @@ impl App {
             Overlay::Stats => self.on_key_stats(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
+            Overlay::Misc => self.on_key_misc(key.code),
+            Overlay::Config => self.on_key_config(key.code),
         }
     }
 
@@ -571,12 +666,102 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
-        // Only MAIN (no overlay, no pending mode interaction) gets the mouse.
+        // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
+        // interaction is pending — the tab bar is how the mouse navigates.
+        if self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
+                self.open_tab(tab, view);
+                return true;
+            }
+        }
+        // An open context menu (UI-3 U11) owns the mouse: click an item to
+        // run it, click anywhere else to dismiss.
+        if let Mode::ContextMenu { idx, .. } = self.mode {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+            ) {
+                match self
+                    .menu_chrome
+                    .as_ref()
+                    .and_then(|m| m.hit_item(mouse.column, mouse.row))
+                {
+                    Some(item) => self.run_menu_item(idx, item, view),
+                    None => self.close_menu(),
+                }
+                return true;
+            }
+            return false;
+        }
+        // Right-click on an accounts row opens its context menu (UI-3 U11).
+        if self.overlay == Overlay::None
+            && self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+        {
+            if let Some(idx) = self
+                .account_row_chrome
+                .iter()
+                .find(|r| {
+                    mouse.row == r.area.y
+                        && mouse.column >= r.area.x
+                        && mouse.column < r.area.right()
+                })
+                .map(|r| r.display_idx)
+            {
+                // Pin the REAL account id now; display indexes reorder.
+                self.menu_account = view.and_then(|v| {
+                    let order = v.display_order(SystemTime::now());
+                    order
+                        .get(idx)
+                        .and_then(|&i| v.snapshot.accounts.get(i))
+                        .map(|a| a.id.0.clone())
+                });
+                self.mode = Mode::ContextMenu { idx, item: 0 };
+                self.menu_anchor = Some((mouse.column, mouse.row));
+                return true;
+            }
+            return false;
+        }
+        // Otherwise only MAIN (no overlay, no pending mode interaction) gets
+        // the mouse.
         if self.overlay != Overlay::None || self.mode != Mode::Normal {
             return false;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Separator rows first (UI-3 U7/U8): press starts a drag.
+                if let Some(sep) = self
+                    .separator_chrome
+                    .iter()
+                    .find(|s| s.y == mouse.row)
+                    .copied()
+                {
+                    self.drag = Some(sep);
+                    return true;
+                }
+                // Group-settings bar (UI-3 U9/U10): click a segment to
+                // rotate that setting.
+                if let Some(action) = self
+                    .setting_chrome
+                    .iter()
+                    .find(|h| {
+                        mouse.row == h.area.y
+                            && mouse.column >= h.area.x
+                            && mouse.column < h.area.right()
+                    })
+                    .map(|h| h.action)
+                {
+                    match action {
+                        ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
+                        ui::SettingAction::CodexModel => self.cycle_codex_model(view),
+                        ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
+                        ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
+                        ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                    }
+                    return true;
+                }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
                     Some(key) => {
                         self.toggle_expand(key);
@@ -584,6 +769,30 @@ impl App {
                     }
                     None => false,
                 }
+            }
+            // Dragging a held separator resizes the pane above it: the pane's
+            // new height is the pointer row minus the pane's top row, clamped
+            // so a pane can never collapse below its border+header.
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(sep) = self.drag else { return false };
+                let height = mouse
+                    .row
+                    .saturating_sub(sep.pane_top)
+                    .clamp(ui::PANE_MIN_HEIGHT, ui::PANE_MAX_HEIGHT);
+                let slot = match sep.pane {
+                    ui::PaneId::Accounts => &mut self.pane_heights.accounts,
+                    ui::PaneId::Middle => &mut self.pane_heights.middle,
+                    ui::PaneId::Strip => &mut self.pane_heights.strip,
+                };
+                if *slot == Some(height) {
+                    return false;
+                }
+                *slot = Some(height);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag.take();
+                false
             }
             // Wheel up = into history, down = toward the live tail — same
             // direction as the ↑/↓ keys (a nice-to-have bonus).
@@ -619,6 +828,16 @@ impl App {
             KeyCode::Char('g') | KeyCode::Esc => self.overlay = Overlay::None,
             // Cycle the heatmap window 24h ↔ 72h (issue #23).
             KeyCode::Char('w') => self.stats_window = self.stats_window.next(),
+            // Cycle the tokens-per-day chart span (UI-3 U14).
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.chart_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.chart_days = spans[next];
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
             KeyCode::PageUp => self.move_model_cursor(-10, len),
@@ -636,6 +855,117 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
             _ => {}
+        }
+    }
+
+    /// Number of context-menu entries (UI-3 U11): switch now / pause·resume /
+    /// set limit / delete.
+    const MENU_ITEMS: usize = 4;
+
+    /// Key handling for the context menu (UI-3 U11): ↑↓ move, Enter runs the
+    /// highlighted entry, Esc (or any other key) dismisses.
+    fn on_key_context_menu(
+        &mut self,
+        code: KeyCode,
+        idx: usize,
+        item: usize,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: item.saturating_sub(1),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: (item + 1).min(Self::MENU_ITEMS - 1),
+                };
+            }
+            KeyCode::Enter => self.run_menu_item(idx, item, view),
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Dismiss the context menu.
+    fn close_menu(&mut self) {
+        self.mode = Mode::Normal;
+        self.menu_anchor = None;
+        self.menu_account = None;
+    }
+
+    /// Run one context-menu entry against the account PINNED at menu-open
+    /// time. The display index is re-resolved from the pinned account id at
+    /// execution (rows reorder as live quota state changes); a vanished
+    /// account aborts with a status instead of acting on whoever moved into
+    /// the row. Every action reuses the exact key-flow path (switch / pause /
+    /// limits editor / remove confirm), so local and attach behave
+    /// identically.
+    fn run_menu_item(&mut self, fallback_idx: usize, item: usize, view: Option<&DashboardView>) {
+        let pinned = self.menu_account.clone();
+        self.close_menu();
+        let idx = match (&pinned, view) {
+            (Some(name), Some(v)) => {
+                let order = v.display_order(SystemTime::now());
+                match order
+                    .iter()
+                    .position(|&i| v.snapshot.accounts.get(i).is_some_and(|a| a.id.0 == *name))
+                {
+                    Some(pos) => pos,
+                    None => {
+                        self.set_status(format!("{name} is gone — menu action cancelled"));
+                        return;
+                    }
+                }
+            }
+            _ => fallback_idx,
+        };
+        match item {
+            0 => self.try_manual_switch(idx, view),
+            1 => self.toggle_pause_selected(idx, view),
+            2 => {
+                self.limits_from_menu = true;
+                self.open_limits_editor(idx, view);
+            }
+            // Destructive delete keeps its confirm gate (y/N) — never silent.
+            3 => self.mode = Mode::ConfirmRemove { idx },
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Misc overlay (`?`, UI-3 U6). `?`/`Esc` closes.
+    fn on_key_misc(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Config overlay (`c`, UI-3 U6). `c`/`Esc` closes.
+    fn on_key_config(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Open the surface a tab click selected (UI-3 U6). Stats and Sessions go
+    /// through their openers (the guard / the background load); the rest are
+    /// plain overlay switches. Clicking the active tab returns to MAIN.
+    fn open_tab(&mut self, tab: Overlay, view: Option<&DashboardView>) {
+        if tab == self.overlay {
+            self.overlay = Overlay::None;
+            return;
+        }
+        match tab {
+            Overlay::None => self.overlay = Overlay::None,
+            Overlay::Stats => self.open_stats(view),
+            Overlay::Sessions => self.open_sessions(),
+            other => self.overlay = other,
         }
     }
 
@@ -721,6 +1051,9 @@ impl App {
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
+            // Misc (keys/build facts) + Config surfaces (UI-3 U6).
+            KeyCode::Char('?') => self.overlay = Overlay::Misc,
+            KeyCode::Char('c') => self.overlay = Overlay::Config,
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -941,6 +1274,71 @@ impl App {
         }
     }
 
+    /// Cycle the grok effort override (UI-3 U12): bypass → none → low →
+    /// medium → high → bypass. Local mode applies + persists in-process;
+    /// attach mode queues `POST /llmux/grok`.
+    fn cycle_grok_effort(&mut self, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        if !view.grok.available {
+            self.set_status("grok: no grok account".into());
+            return;
+        }
+        let cur = view.grok.effort.as_deref().unwrap_or("");
+        let next = GROK_EFFORTS
+            .iter()
+            .position(|e| *e == cur)
+            .map(|i| (i + 1) % GROK_EFFORTS.len())
+            .unwrap_or(0);
+        let effort = (!GROK_EFFORTS[next].is_empty()).then(|| GROK_EFFORTS[next].to_string());
+        let label = effort.clone().unwrap_or_else(|| "bypass".to_string());
+        match &mut self.backend {
+            Backend::Local(state) => {
+                let mut shape = state.grok.shape();
+                shape.effort = effort.clone();
+                state.grok.set_shape(shape);
+                if let Some(path) = &state.config_path {
+                    let _ = crate::config::update_path(path, |c| {
+                        c.grok.reasoning_effort = effort.clone();
+                    });
+                }
+                self.set_status(format!("grok effort: {label}"));
+            }
+            Backend::Remote(remote) => {
+                remote.pending_grok = Some(effort);
+                self.set_status(format!("grok effort → {label}…"));
+            }
+        }
+    }
+
+    fn take_pending_grok(&mut self) -> Option<Option<String>> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_grok.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote grok effort change (`POST /llmux/grok`).
+    /// `None` clears to bypass (the endpoint's "unset" form).
+    async fn perform_remote_grok(&mut self, effort: Option<String>) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/grok", remote.base_url);
+        let label = effort.as_deref().unwrap_or("bypass").to_string();
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "reasoning_effort": effort.as_deref().unwrap_or("unset"),
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("grok effort: {label}"),
+            Ok(response) => format!("grok effort change failed: {}", response.status()),
+            Err(err) => format!("grok effort change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
     /// Apply a codex settings change: locally in-process, or queued for the
     /// event loop to POST in attach mode.
     fn set_codex(&mut self, new: CodexSettingsDoc) {
@@ -1078,14 +1476,22 @@ impl App {
             }
             KeyCode::Esc => {
                 self.add_input.clear();
-                self.mode = Mode::Select { idx };
+                self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                    Mode::Normal
+                } else {
+                    Mode::Select { idx }
+                };
             }
             KeyCode::Enter => {
                 let raw = std::mem::take(&mut self.add_input);
                 match parse_limits_input(&raw) {
                     Ok(limits) => {
                         self.apply_limits_selected(idx, view, limits);
-                        self.mode = Mode::Select { idx };
+                        self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                            Mode::Normal
+                        } else {
+                            Mode::Select { idx }
+                        };
                     }
                     Err(err) => {
                         // Keep editing — restore the text so it can be fixed.
@@ -1185,7 +1591,7 @@ impl App {
     /// row (glance-triage atom 3) — the same model `ui::draw_activity`
     /// windows by — so the offset can never strand past the last row.
     fn scroll_activity(&mut self, delta: i64, view: Option<&DashboardView>) {
-        let len = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
+        let len: usize = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
         let max = len.saturating_sub(1) as i64;
         let next = (self.activity_scroll as i64).saturating_add(delta);
         self.activity_scroll = next.clamp(0, max) as usize;
@@ -1744,6 +2150,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_mode: None,
         pending_add: None,
         pending_remove: None,
+        pending_grok: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
     restore_terminal();
@@ -1864,6 +2271,10 @@ async fn event_loop(
             app.perform_remote_remove(name).await;
             redraw = true;
         }
+        if let Some(effort) = app.take_pending_grok() {
+            app.perform_remote_grok(effort).await;
+            redraw = true;
+        }
         // A new browser login needs the RAW terminal back: the OAuth flow
         // prints prompts and may read a pasted code from stdin, which would
         // corrupt the alternate-screen TUI. Suspend (restore the terminal),
@@ -1886,7 +2297,13 @@ async fn event_loop(
             // left-click in the next input drain maps to the right entry.
             let mut hits = None;
             terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome, &mut hits))?;
-            app.activity_chrome = hits.unwrap_or_default();
+            let main = hits.unwrap_or_default();
+            app.activity_chrome = main.activity;
+            app.tab_chrome = main.tabs;
+            app.separator_chrome = main.separators;
+            app.account_row_chrome = main.account_rows;
+            app.menu_chrome = main.menu;
+            app.setting_chrome = main.settings;
         }
     }
 }
@@ -2032,6 +2449,7 @@ mod tests {
             pending_mode: None,
             pending_add: None,
             pending_remove: None,
+            pending_grok: None,
         })))
     }
 
@@ -2156,6 +2574,320 @@ mod tests {
                 "MAIN expansion survives the round-trip"
             );
         }
+    }
+
+    /// UI-3 U6: tab clicks switch surfaces from ANY overlay; clicking the
+    /// active tab returns to MAIN; text-entry modes keep the mouse out.
+    #[test]
+    fn tab_click_switches_overlay_and_active_tab_toggles_back() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.tab_chrome = vec![
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 1,
+                    y: 2,
+                    width: 9,
+                    height: 1,
+                },
+                overlay: Overlay::None,
+            },
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 13,
+                    y: 2,
+                    width: 8,
+                    height: 1,
+                },
+                overlay: Overlay::Config,
+            },
+        ];
+        let click = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Click config tab from MAIN → Config opens.
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::Config);
+        // Tab clicks still work WITH an overlay open: click dashboard → MAIN.
+        assert!(app.on_mouse(click(2, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // Clicking the active tab toggles back to MAIN too.
+        app.overlay = Overlay::Config;
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // A pending text-entry mode keeps the mouse out entirely.
+        app.mode = Mode::AddKey;
+        assert!(!app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// UI-3 U7/U8: pressing a separator row arms a drag; dragging resizes the
+    /// pane above it (clamped); release disarms.
+    #[test]
+    fn separator_drag_resizes_the_pane_above() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.separator_chrome = vec![ui::SeparatorHit {
+            y: 10,
+            pane: ui::PaneId::Accounts,
+            pane_top: 3,
+        }];
+        let ev = |kind, row| MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Press on the separator row arms the drag.
+        assert!(app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 10), None));
+        assert!(app.drag.is_some());
+        // Dragging to row 15 → accounts height 15 - 3 = 12.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 15), None));
+        assert_eq!(app.pane_heights.accounts, Some(12));
+        // Clamped at the minimum: dragging above the pane top.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 2), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+        // Release disarms; further drags do nothing.
+        app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 2), None);
+        assert!(app.drag.is_none());
+        assert!(!app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 20), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+    }
+
+    /// UI-3 U11: right-click on an accounts row opens the context menu; the
+    /// items drive the SAME flows as the keys (pause queues the POST, set
+    /// limit opens the editor, delete opens the y/N confirm); Esc closes.
+    #[test]
+    fn right_click_menu_runs_the_account_flows() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = stats_view_with_account();
+        let row_rect = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 1,
+        };
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // pause (item 1): queues the remote pause POST.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
+        assert!(app.menu_anchor.is_some());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "menu closed after running");
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:me@example.com".into(), true))
+        );
+
+        // set limit (item 2): opens the limits editor; Esc exits to Normal
+        // (not into the switcher) because the menu opened it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // delete (item 3): opens the destructive confirm, never silent.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::End), Some(&view)); // unknown key → closes
+        assert_eq!(app.mode, Mode::Normal, "unknown key dismisses");
+        assert!(app.on_mouse(rclick, Some(&view)));
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Down), Some(&view));
+        }
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+
+        // Click outside the open menu dismisses it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_chrome = Some(ui::MenuChrome {
+            area: ratatui::layout::Rect {
+                x: 10,
+                y: 6,
+                width: 14,
+                height: 5,
+            },
+            items: vec![],
+        });
+        let lclick_outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 70,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(lclick_outside, Some(&view)));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// UI-3 U9/U10/U12: clicking a group-settings segment rotates that
+    /// setting; the codex effort cycle now includes `max`; the grok effort
+    /// cycle queues the `POST /llmux/grok` change with bypass in the loop.
+    #[test]
+    fn settings_bar_click_rotates_settings() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut view = stats_view_with_account();
+        view.grok.available = true;
+        view.grok.effort = None; // bypass
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        view.codex.effort = Some("xhigh".into());
+        let mut app = remote_app();
+        app.setting_chrome = vec![
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 30,
+                    width: 10,
+                    height: 1,
+                },
+                action: ui::SettingAction::CodexEffort,
+            },
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 20,
+                    y: 30,
+                    width: 6,
+                    height: 1,
+                },
+                action: ui::SettingAction::GrokEffort,
+            },
+        ];
+        let click = |x: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        };
+        // codex effort: xhigh → max (the new top of the cycle).
+        assert!(app.on_mouse(click(3), Some(&view)));
+        assert_eq!(
+            app.take_pending_codex().map(|c| c.effort),
+            Some(Some("max".to_string())),
+            "xhigh cycles to max"
+        );
+        // grok effort: bypass → none (first concrete value), queued for the
+        // grok endpoint.
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(Some("none".to_string())));
+        // Cycling from the top of the grok list wraps back to bypass.
+        view.grok.effort = Some("high".into());
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(None), "high wraps to bypass");
+    }
+
+    /// Review R2 regression: rows reorder between menu-open and click — the
+    /// action must land on the PINNED account, and a vanished pin aborts.
+    #[test]
+    fn menu_action_follows_pinned_account_across_reorder() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let acct = |name: &str| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 5,
+                width: 80,
+                height: 1,
+            },
+            display_idx: 0,
+        }];
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.menu_account.as_deref(), Some("claude:a@x.com"));
+
+        // Reorder: `a` moves to display row 1. Running pause (item 1) must
+        // still act on `a`, not on whoever now sits at row 0.
+        view.snapshot.accounts.swap(0, 1);
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:a@x.com".into(), true)),
+            "action follows the pinned account across the reorder"
+        );
+
+        // A pinned account that VANISHED aborts with a status, acts on no one.
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_account = Some("claude:gone@x.com".into());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            None,
+            "vanished pin acts on no one"
+        );
+        assert!(app.status_line().is_some_and(|s| s.contains("gone")));
+    }
+
+    /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
+    #[test]
+    fn misc_and_config_keys_round_trip() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('?'), None);
+        assert_eq!(app.overlay, Overlay::Misc);
+        app.on_key_misc(KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key_main(KeyCode::Char('c'), None);
+        assert_eq!(app.overlay, Overlay::Config);
+        app.on_key_config(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     /// `a` opens the Accounts overlay; `Esc` returns to MAIN.
@@ -2507,7 +3239,10 @@ mod tests {
         use crate::scheduler::PoolSnapshot;
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            grok: Default::default(),
+            daily_usage: Vec::new(),
             health: Default::default(),
+            session_labels: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,

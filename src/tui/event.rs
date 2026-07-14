@@ -107,6 +107,15 @@ pub enum ActivityEvent {
         /// `unknown` bucket. This is purely for *counting* requests/tokens per
         /// client — it never gates the request and is not a credential.
         user_id: Option<String>,
+        /// Message-kind classification (TUI UI-3 U1): a short stable token
+        /// ("user" / "compact" / "security" / "count" / …) from
+        /// [`crate::proxy::classify`], decided once at forward entry. `None`
+        /// only for pre-classification failures (body never read).
+        kind: Option<String>,
+        /// Cleaned excerpt of the newest human-relevant input (bounded to
+        /// [`crate::proxy::classify::EXCERPT_MAX_CHARS`]); `None` when the
+        /// turn carried no text (tool-result-only) or the body never parsed.
+        excerpt: Option<String>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {
