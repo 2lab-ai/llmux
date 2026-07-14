@@ -70,6 +70,10 @@ struct IslandUsageView: View {
             stateMessage(icon: "tray", title: "No accounts yet", detail: "add one with the + button", tint: .white.opacity(0.35))
         } else {
             ScrollView(.vertical, showsIndicators: false) {
+                if !model.attention.isEmpty {
+                    NeedsAttentionSection(items: model.attention)
+                        .padding(.bottom, 8)
+                }
                 UsageAccountTileGrid(
                     tiles: model.tiles,
                     columns: columns,
@@ -102,6 +106,50 @@ struct IslandUsageView: View {
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.06)))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// exception-beacon: the open panel's first screen when (and only when) the
+/// beacon has something to say — the SAME resolver output as the closed chip,
+/// so what you glanced is what you get. Healthy state renders nothing (no
+/// section, no divider) and the tile grid below keeps full legibility (no
+/// dim — comparing healthy accounts' quota is a real workflow).
+private struct NeedsAttentionSection: View {
+    let items: [GlanceAttention]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("NEEDS ATTENTION")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(Color(red: 1.0, green: 0.72, blue: 0.28))
+            ForEach(items) { item in
+                HStack(spacing: 8) {
+                    EmailPixelized(
+                        isActive: AppSettings.emailAnonymousEnabled,
+                        cacheKey: item.account
+                    ) {
+                        Text(item.account)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Text(item.reason)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.75))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let detail = item.detail {
+                        Text(detail)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.45))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
     }
 }
 

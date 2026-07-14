@@ -194,6 +194,7 @@ struct NotchView: View {
                     claudeCount: usageModel.claudeInFlight,
                     codexCount: usageModel.codexInFlight,
                     grokCount: usageModel.grokInFlight,
+                    signal: usageModel.glance,
                     active: isVisible
                 )
                 .frame(minWidth: closedNotchSize.width - 20)

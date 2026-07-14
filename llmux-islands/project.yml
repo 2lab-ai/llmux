@@ -46,6 +46,9 @@ targets:
     sources:
       - path: LlmuxIslandsTests
       - path: LlmuxIslands/Llmux/LlmuxStatus.swift
+      # exception-beacon: pure resolver (signal priority, thresholds,
+      # tie-breaks, debounce) — Foundation-only by design.
+      - path: LlmuxIslands/Llmux/GlanceSignal.swift
       - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
       # Foundation-only `llmux` CLI output parsing (CLIParse / ReleaseChannel /
       # UpdateOutcome). The Process-spawning CLIRunner lives here too but is
