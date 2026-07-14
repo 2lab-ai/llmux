@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="island" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#171a22"/>
+      <stop offset="1" stop-color="#050609"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="18" width="112" height="92" rx="36" fill="url(#island)"/>
+  <circle cx="42" cy="64" r="11" fill="#7aa2f7"/>
+  <circle cx="64" cy="64" r="11" fill="#9ece6a"/>
+  <circle cx="86" cy="64" r="11" fill="#bb9af7"/>
+  <path d="M37 88h54" fill="none" stroke="#c0caf5" stroke-width="7" stroke-linecap="round"/>
+</svg>

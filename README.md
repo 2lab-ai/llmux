@@ -51,7 +51,7 @@ llmux breaks the chain by standardizing on one harness and making the account/mo
 - **Model catalog API**: `GET /models` and `GET /llmux/models` — curated ids, aliases, efforts, `max_context`, group. See [docs/models.md](docs/models.md).
 - **Detached daemon + live TUI dashboard** for quota windows (incl. Fable weekly / Grok rate-limit gauges), account health, routing, and manual switch.
 - **Calendar usage & cost tab** (2026-07-15): hourly / daily / monthly buckets × model with all four token classes and API-equivalent USD cost, ledger-aligned amounts, replayed from the persisted request history — `U` in the dashboard. See [docs/operational-reference.md](docs/operational-reference.md#usage-tab-calendar-usage--cost).
-- **llmux Islands**, a native macOS menu-bar/notch companion for glanceable usage and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md).
+- **llmux Islands**, a native macOS menu-bar/notch companion plus an Arch Linux/KDE Qt/Kirigami port for glanceable usage, request receipts, and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md), [the Linux build guide](llmux-islands-linux/README.md), and [the cross-platform design/evidence dossier](.prd/docs/llmux-islands-linux-port/README.md).
 - **Stable + preview channels** via Homebrew (`llmux` / `llmux-preview`), with `llmux channel` and `llmux update`.
 
 ## Install
@@ -64,6 +64,17 @@ Optional native macOS companion:
 
 ```bash
 brew install 2lab-ai/tap/llmux-islands
+```
+
+The native KDE companion currently ships as a source build and Arch
+`PKGBUILD`; it is not advertised as a stable repository package yet:
+
+```bash
+sudo pacman -S --needed base-devel cargo clang gtk3 kirigami layer-shell-qt \
+  libcanberra libnotify qqc2-desktop-style qt6-base qt6-declarative qt6-svg \
+  qt6-tools qt6-wayland rust
+cd llmux-islands-linux
+QMAKE=/usr/bin/qmake6 cargo build --release --locked
 ```
 
 Rolling preview channel:

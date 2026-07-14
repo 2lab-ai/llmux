@@ -1,0 +1,30 @@
+{
+  "version": "llmux 0.2.10",
+  "pid": 7,
+  "uptime_secs": 5,
+  "port": 3456,
+  "current": null,
+  "upstream": "https://api.anthropic.com",
+  "config_path": null,
+  "select_params": {
+    "five_hour_max": 0.9,
+    "seven_day_max": 0.99,
+    "usage_max_age_secs": 600
+  },
+  "refresh_ahead_secs": 25200,
+  "evaluate_tick_secs": 60,
+  "accounts": [],
+  "scheduler": { "last_switch": null, "next_in_line": null, "next_eval_in_secs": 60 },
+  "poller": [],
+  "totals": {
+    "requests": 0,
+    "ok": 0,
+    "errors": 0,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "rpm_5m": 0.0,
+    "in_flight": 0
+  },
+  "activity": { "in_flight": [], "completed": [] },
+  "logs": []
+}

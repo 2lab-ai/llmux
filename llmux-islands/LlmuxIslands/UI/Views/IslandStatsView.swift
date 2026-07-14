@@ -63,6 +63,8 @@ struct IslandStatsView: View {
                     dashboard: dashboard,
                     tiles: model.tiles,
                     now: now,
+                    activityReceipts: model.activityReceipts,
+                    verificationReceipts: model.verificationReceipts,
                     onRemoveAccount: { name in Task { await model.remove(name) } }
                 )
                 .padding(.bottom, 4)
@@ -71,7 +73,7 @@ struct IslandStatsView: View {
         } else if case .offline = model.connection {
             stateMessage(icon: "bolt.horizontal.circle",
                          title: "llmux not reachable",
-                         detail: "start the daemon: llmux run  (:3456)",
+                         detail: "check the configured llmux endpoint and credentials",
                          tint: TerminalColors.red.opacity(0.85))
         } else {
             stateMessage(icon: "chart.bar",

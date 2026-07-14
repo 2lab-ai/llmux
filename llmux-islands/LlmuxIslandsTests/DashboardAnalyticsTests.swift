@@ -103,7 +103,8 @@ final class DashboardAnalyticsTests: XCTestCase {
     }
 
     func testHealthSummaryAuthFailedOnStatusRecords() throws {
-        // The status-fallback path (old daemons) applies the same rule.
+        // Pure legacy-DTO parity; the live adapter delegates this derivation
+        // to Rust after normalizing the status document.
         let json = """
         [{"name": "claude:a@example.com", "type": "oauth", "status": "auth_failed"},
          {"name": "claude:b@example.com", "type": "oauth", "status": "active",

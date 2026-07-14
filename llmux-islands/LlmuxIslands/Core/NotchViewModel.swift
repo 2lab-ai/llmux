@@ -22,6 +22,17 @@ enum NotchOpenReason {
     case usageAlert
     case boot
     case unknown
+
+    var sharedCoreValue: String {
+        switch self {
+        case .click: return "click"
+        case .hover: return "hover"
+        case .notification: return "notification"
+        case .usageAlert: return "usage_alert"
+        case .boot: return "boot"
+        case .unknown: return "click"
+        }
+    }
 }
 
 enum NotchContentType: Equatable {
@@ -33,6 +44,14 @@ enum NotchContentType: Equatable {
         switch self {
         case .usage: return "usage"
         case .stats: return "stats"
+        case .menu: return "menu"
+        }
+    }
+
+    var sharedCoreValue: String {
+        switch self {
+        case .usage: return "usage"
+        case .stats: return "statistics"
         case .menu: return "menu"
         }
     }
@@ -140,11 +159,17 @@ class NotchViewModel: ObservableObject {
 
     private func observeSelectors() {
         screenSelector.$isPickerExpanded
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                self?.reportWindowMetrics()
+            }
             .store(in: &cancellables)
 
         soundSelector.$isPickerExpanded
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                self?.reportWindowMetrics()
+            }
             .store(in: &cancellables)
 
         // Re-evaluate `openedSize` whenever the account count changes so the
@@ -152,7 +177,10 @@ class NotchViewModel: ObservableObject {
         IslandUsageModel.shared.$tiles
             .map(\.count)
             .removeDuplicates()
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+                self?.reportWindowMetrics()
+            }
             .store(in: &cancellables)
     }
 
@@ -256,6 +284,13 @@ class NotchViewModel: ObservableObject {
     func notchOpen(reason: NotchOpenReason = .unknown) {
         openReason = reason
         status = .opened
+        let size = openedSize
+        Task {
+            await IslandUsageModel.shared.nativeWindowOpened(
+                reason: reason.sharedCoreValue,
+                size: size
+            )
+        }
     }
 
     func notchClose() {
@@ -265,6 +300,7 @@ class NotchViewModel: ObservableObject {
         status = .closed
         lastNonMenuContentType = .usage
         contentType = .usage
+        Task { await IslandUsageModel.shared.nativeWindowClosed() }
     }
 
     /// Open the island and keep it open for screen recording (demo mode). With
@@ -287,16 +323,19 @@ class NotchViewModel: ObservableObject {
     func toggleMenu() {
         if contentType == .menu {
             contentType = lastNonMenuContentType == .menu ? .usage : lastNonMenuContentType
+            reportNavigation()
             return
         }
 
         lastNonMenuContentType = contentType
         contentType = .menu
+        reportNavigation()
     }
 
     func showUsage() {
         lastNonMenuContentType = .usage
         contentType = .usage
+        reportNavigation()
     }
 
     /// Open the Statistics panel (issue #68 v2) — reached only through the
@@ -305,6 +344,20 @@ class NotchViewModel: ObservableObject {
     func showStats() {
         lastNonMenuContentType = .stats
         contentType = .stats
+        reportNavigation()
+    }
+
+    private func reportNavigation() {
+        let navigation = contentType.sharedCoreValue
+        let size = openedSize
+        Task {
+            await IslandUsageModel.shared.nativeNavigationSelected(navigation, size: size)
+        }
+    }
+
+    private func reportWindowMetrics() {
+        let size = openedSize
+        Task { await IslandUsageModel.shared.nativeWindowMetricsChanged(size: size) }
     }
 
     /// Perform boot animation: expand briefly then collapse
