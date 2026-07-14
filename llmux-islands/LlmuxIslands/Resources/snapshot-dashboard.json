@@ -1,0 +1,186 @@
+{
+  "version": "llmux 0.2.16 (preview fixture)",
+  "pid": 42,
+  "uptime_secs": 120,
+  "port": 3456,
+  "current": "alice@example.com",
+  "current_by_group": {
+    "claude": "alice@example.com",
+    "codex": "codex@example.com"
+  },
+  "upstream": "https://api.anthropic.com",
+  "config_path": "/home/test/.config/llmux.json",
+  "select_params": {
+    "five_hour_max": 0.9,
+    "seven_day_max": 0.99,
+    "fable_weekly_max": 0.98,
+    "usage_max_age_secs": 600
+  },
+  "refresh_ahead_secs": 25200,
+  "evaluate_tick_secs": 60,
+  "accounts": [
+    {
+      "name": "alice@example.com",
+      "type": "oauth",
+      "status": "ready",
+      "order": 1,
+      "blocked": null,
+      "healthy": true,
+      "five_hour": {
+        "utilization": 0.25,
+        "resets_at": 2000000000,
+        "resets_in_secs": 3600,
+        "fetched_at_ms": 1700000000000,
+        "source": "poll"
+      },
+      "seven_day": {
+        "utilization": 0.8,
+        "resets_at": 2000003600,
+        "resets_in_secs": 7200,
+        "fetched_at_ms": 1700000000000,
+        "source": "headers"
+      },
+      "fable_weekly": {
+        "utilization": 0.97,
+        "resets_at": 2000007200,
+        "resets_in_secs": 10800,
+        "severity": "critical",
+        "is_active": true,
+        "constraining": true
+      },
+      "scoped_limits": [],
+      "cooldown_until": null,
+      "cooldown_source": null,
+      "in_flight": 2,
+      "token_expires_at_ms": 1700003600000,
+      "last_refresh_ms": 1700000000000,
+      "paused": false,
+      "totals": { "requests": 10, "input_tokens": 100, "output_tokens": 40 },
+      "session": { "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 },
+      "future_account_field": "ignored"
+    },
+    {
+      "name": "codex@example.com",
+      "type": "codex",
+      "status": "paused",
+      "order": 2,
+      "blocked": "paused",
+      "healthy": true,
+      "five_hour": null,
+      "seven_day": null,
+      "cooldown_until": null,
+      "cooldown_source": null,
+      "in_flight": 1,
+      "token_expires_at_ms": null,
+      "last_refresh_ms": null,
+      "paused": true,
+      "totals": { "requests": 5, "input_tokens": 50, "output_tokens": 20 },
+      "session": { "requests": 1, "ok": 0, "errors": 1, "tokens_in": 10, "tokens_out": 4 }
+    }
+  ],
+  "scheduler": {
+    "last_switch": null,
+    "next_in_line": "codex@example.com",
+    "next_eval_in_secs": 30
+  },
+  "poller": [],
+  "totals": {
+    "requests": 15,
+    "ok": 14,
+    "errors": 1,
+    "tokens_in": 150,
+    "tokens_out": 60,
+    "rpm_5m": 3.0,
+    "in_flight": 3,
+    "cost_usd": 0.42
+  },
+  "model_usage": [
+    {
+      "group": "claude",
+      "model": "claude-sonnet-4-5",
+      "requests": 2,
+      "ok": 2,
+      "errors": 0,
+      "tokens_in": 20,
+      "tokens_out": 8,
+      "last_used_ms": 1700000000000,
+      "in_flight": 1,
+      "accounts": [
+        { "name": "alice@example.com", "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 }
+      ],
+      "efforts": [],
+      "endpoints": [],
+      "cost_usd": 0.21
+    }
+  ],
+  "client_usage": [
+    { "client": "codex-client", "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 }
+  ],
+  "windowed": [
+    {
+      "window": "24h",
+      "window_secs": 86400,
+      "cells": [
+        {
+          "group": "claude",
+          "model": "claude-sonnet-4-5",
+          "account": "alice@example.com",
+          "requests": 2,
+          "ok": 2,
+          "errors": 0,
+          "tokens_in": 20,
+          "tokens_out": 8,
+          "tokens": 28
+        }
+      ]
+    }
+  ],
+  "activity": {
+    "in_flight": [
+      {
+        "id": 99,
+        "method": "POST",
+        "path": "/v1/messages?api_key=must-not-leak",
+        "account": "alice@example.com",
+        "started_at_ms": 1700000000000,
+        "group": "claude",
+        "model": "claude-sonnet-4-5",
+        "effort": "high",
+        "fast": false
+      }
+    ],
+    "completed": [
+      {
+        "kind": "request",
+        "at_ms": 1700000001000,
+        "method": "POST",
+        "path": "/v1/messages?authorization=Bearer-secret",
+        "account": "alice@example.com",
+        "status": 200,
+        "duration_ms": 1200,
+        "tokens": { "input": 10, "output": 4, "cache_read": 3 },
+        "cost_usd": 0.02,
+        "group": "claude",
+        "model": "claude-sonnet-4-5",
+        "effort": "high",
+        "fast": false
+      },
+      {
+        "kind": "note",
+        "at_ms": 1700000002000,
+        "text": "account alice@example.com failed with HTTP 503",
+        "error": true
+      }
+    ]
+  },
+  "logs": [],
+  "email_anonymous": true,
+  "show_fable_weekly": true,
+  "data_quality": {
+    "model_usage": "hydrated activity/runtime",
+    "windowed": "best effort",
+    "cost": "API-equivalent estimate",
+    "cache": "missing fields shown as unavailable"
+  },
+  "future_top_level": { "ignored": true }
+}

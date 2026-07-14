@@ -10,6 +10,13 @@ use llmux_islands_macos_bridge::{
 use serde_json::{json, Value};
 
 const DASHBOARD: &[u8] = include_bytes!("../../llmux-islands-core/fixtures/dashboard-current.json");
+const SNAPSHOT_DASHBOARD: &[u8] =
+    include_bytes!("../../llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json");
+
+#[test]
+fn app_snapshot_dashboard_is_the_validated_shared_contract_fixture() {
+    assert_eq!(SNAPSHOT_DASHBOARD, DASHBOARD);
+}
 
 struct Handle(*mut LlmuxIslandsBridge);
 
