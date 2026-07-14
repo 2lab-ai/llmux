@@ -265,7 +265,7 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "captureTarget.grabToImage",
         "result.saveToFile(outputPath)",
         "Qt.exit(2)",
-        "if (!controller.snapshotMode)",
+        "if (!controller.snapshotMode && !controller.smokeMode)",
         "running: !controller.smokeMode && !controller.snapshotMode",
         "Snapshot run timed out",
         "snapshotCaptureAttempts >= 50",
