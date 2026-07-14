@@ -46,7 +46,7 @@ core with thin per-provider adapters.
 | grok-4.5 | ctx 500K, max_out 65536, thinking `low/medium/high`, zero **not** allowed | registry models.json:2425-2443 |
 | grok-build-0.1 | fast coding model, ctx 256K, no thinking levels | models.json:2413-2423 |
 | Quota exhaustion | HTTP 429 body `code`/`error` contains `free-usage-exhausted` → 24h rolling window | xai_executor.go:2521-2545 |
-| No usage headers/endpoint | grok exposes no `x-codex-*`-style quota headers and no `/api/oauth/usage` equivalent (none found in CLIProxyAPI) | xai_executor.go (absence) |
+| No usage endpoint; passive headers DO exist | no `/api/oauth/usage` equivalent (probed live: /v1/{usage,rate_limits,quota,me} 404; grok.com/rest/rate-limits 403 for OAuth2 tokens; absent from CLIProxyAPI and official grok CLI 0.2.101 binary). **Correction 2026-07-14**: 200 responses DO carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` headers (live capture: 900 req / 15M tok, no reset header) — the original "no passive quota headers" claim was wrong | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
 
@@ -136,9 +136,12 @@ core with thin per-provider adapters.
   dashboard tracks per-(group, model). Add pricing entry `GROK_4_5 {input 2.0, output
   6.0, cache_read 0.5, cache_creation 0.0}` + `group == "grok"` unknown-model fallback
   (src/pricing.rs builtin table, pricing.rs:58-100).
-- Quota windows: grok has **no** active usage endpoint and **no** passive quota headers
-  → 5h/7d gauges stay empty ("—"), same rendering path as an accountless slot. A
-  `free-usage-exhausted` park shows the existing cooldown/reset countdown UI.
+- Quota windows (**revised 2026-07-14**, post-ship): grok has no active usage endpoint,
+  but 200 responses carry `x-ratelimit-{limit,remaining}-{requests,tokens}` burst headers
+  (RPM/TPM-shaped, no reset). These feed the 5h slot via the standard-bucket path with an
+  estimated 60s reset horizon (`headers::STANDARD_RESET_FALLBACK`), grok accounts only.
+  The 7d gauge stays empty. A `free-usage-exhausted` park shows the existing
+  cooldown/reset countdown UI.
 - Surfaces: `llmux status` (client+server), TUI account table + activity log (model +
   effort recorded via grok `effective_request_meta` mirror), `/llmux/status` JSON
   (`group: "grok"`), islands: `UsageProvider.grok` + provider icon (new `grok` asset;
