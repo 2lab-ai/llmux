@@ -239,6 +239,13 @@ fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
     pinned.to_string()
 }
 
+/// The per-model thinking-level table, for the model catalog
+/// (`src/catalog.rs`). Exposes [`GROK_THINKING_LEVELS`] without duplicating
+/// the effort lists there.
+pub(crate) fn thinking_levels_catalog() -> &'static [(&'static str, &'static [&'static str])] {
+    GROK_THINKING_LEVELS
+}
+
 /// Thinking levels for `model`, when it is a known reasoning model.
 fn thinking_levels(model: &str) -> Option<&'static [&'static str]> {
     let m = model.to_ascii_lowercase();
