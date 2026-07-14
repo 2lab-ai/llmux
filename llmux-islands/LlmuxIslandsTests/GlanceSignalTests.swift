@@ -148,6 +148,34 @@ final class GlanceSignalTests: XCTestCase {
         XCTAssertTrue(output.attention.isEmpty)
     }
 
+    func testNonOperationalStatusesNeverPromoteTheirQuota() {
+        // A cooldown/unknown/paused account may carry a real window, but its
+        // quota is not an actionable beacon — never LIMIT, never lowQuota.
+        XCTAssertEqual(
+            resolve([record("cooling", status: "cooldown", fiveHour: 1.0)]).signal,
+            .none
+        )
+        XCTAssertEqual(
+            resolve([record("weird", status: "mystery", fiveHour: 0.97)]).signal,
+            .none
+        )
+        var paused = record("paused", fiveHour: 0.95)
+        paused = LlmuxAccountRecord(
+            name: paused.name, type: paused.type, group: paused.group,
+            status: paused.status, fiveHour: paused.fiveHour, sevenDay: paused.sevenDay,
+            fableWeekly: nil, inFlight: 0, tokenExpiresAtMs: nil, paused: true
+        )
+        XCTAssertEqual(resolve([paused]).signal, .none)
+    }
+
+    func testAttentionRowsAlwaysCarryAnAction() {
+        // LIMIT with no reset time still tells the user what to do.
+        let noReset = resolve([record("gone", fiveHour: 1.0)])
+        XCTAssertEqual(noReset.attention.first?.detail, "reset unknown — rotate accounts")
+        let degraded = resolve([record("a", status: "degraded")], degradedStreak: 1)
+        XCTAssertEqual(degraded.attention.first?.detail, "reported by daemon — check llmux logs")
+    }
+
     // MARK: display-name mapping (demo mode)
 
     func testDisplayNameMapsAttentionAndSignalAccounts() {
