@@ -1,0 +1,82 @@
+[
+  {
+    "file": "01-cli-main-agent-grok-4.5.system.txt",
+    "bytes": 15323,
+    "sha256_12": "88b6bc82a20f",
+    "source_capture": "grok_agent.system.txt",
+    "model": "grok-4.5",
+    "n_tools": 203,
+    "kind": "agent_full",
+    "cc_version": "2.1.207.4d8"
+  },
+  {
+    "file": "02-security-monitor.system.txt",
+    "bytes": 106210,
+    "sha256_12": "6e82875ad821",
+    "source_capture": "grok_monitor.system.txt",
+    "model": "grok-4.5",
+    "n_tools": 0,
+    "kind": "monitor",
+    "cc_version": "2.1.207.899"
+  },
+  {
+    "file": "03-sdk-exec-summary.system.txt",
+    "bytes": 873,
+    "sha256_12": "0822a2fe5b55",
+    "source_capture": "gpt_compact.system.txt",
+    "model": "gpt-5.6-sol",
+    "n_tools": 0,
+    "kind": "compact",
+    "cc_version": "2.1.111.0c3"
+  },
+  {
+    "file": "04-sdk-slack-bot-gpt-5.6-sol.system.txt",
+    "bytes": 10732,
+    "sha256_12": "59ad00dc0a82",
+    "source_capture": "gpt_agent.system.txt",
+    "model": "gpt-5.6-sol",
+    "n_tools": 88,
+    "kind": "agent_full",
+    "cc_version": "2.1.111.0c3"
+  },
+  {
+    "file": "05-cli-subagent-dual-reviewer-gpt-5.6-sol.system.txt",
+    "bytes": 5807,
+    "sha256_12": "eb2c01416054",
+    "source_capture": "gpt_reviewer.system.txt",
+    "model": null,
+    "n_tools": 1,
+    "kind": null,
+    "cc_version": "2.1.207.fcf"
+  },
+  {
+    "file": "06-completion-auditor.system.txt",
+    "bytes": 1802,
+    "sha256_12": "2c47251acac0",
+    "source_capture": "gpt_completion_audit.system.txt",
+    "model": null,
+    "n_tools": 0,
+    "kind": null,
+    "cc_version": "2.1.111.402"
+  },
+  {
+    "file": "07-cli-subagent-persona-gpt-5.6-sol.system.txt",
+    "bytes": 4845,
+    "sha256_12": "a965481cfe86",
+    "source_capture": "gpt_claude_code_agent.system.txt",
+    "model": null,
+    "n_tools": 183,
+    "kind": null,
+    "cc_version": "2.1.207.a97"
+  },
+  {
+    "file": "08-cli-or-sdk-cli-agent-claude-haiku.system.txt",
+    "bytes": 27747,
+    "sha256_12": "ca524613f2b4",
+    "source_capture": "claude_agent.system.txt",
+    "model": "claude-haiku-4-5-20251001",
+    "n_tools": 146,
+    "kind": "agent_full",
+    "cc_version": "2.1.208.188"
+  }
+]

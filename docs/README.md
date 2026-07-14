@@ -1,22 +1,27 @@
 # llmux docs
 
-This directory holds user-facing guides that are too detailed for the repository front page.
+User-facing guides that are too detailed for the repository front page.
 
-Start at the root [README](../README.md) for the high-level product story and quick start. Use these docs when you need exact commands, config keys, backend behavior, or app-specific setup.
+Start at the root [README](../README.md) for the product story and quick start.
+Agent/contributor rules: [AGENTS.md](../AGENTS.md) (SSOT). Doc ownership after
+features: [rules/documents.md](../rules/documents.md).
 
 ## Guides
 
-- [Operational reference](operational-reference.md) — command table, TUI keys, daemon/dashboard behavior, install variants, scheduling policy, model routing details, Codex backend behavior, and development commands.
-- [Configuration](configuration.md) — config file location, proxy settings, scheduler knobs, model routing options, Codex request shaping, account types, and email-anonymous mode.
-- [FAQ](faq.md) — context-window workarounds and common usage questions, including the `gpt-5.5` → Claude 1M compact → `gpt-5.5[1m]` flow.
-- [llmux Islands](llmux-islands.md) — native macOS menu-bar/notch app for glanceable account usage, floating island activity, demo capture, and email-anonymous mode.
+- [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex backend, install variants.
+- [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, Codex shaping, account types, email-anonymous mode.
+- [Models](models.md) — catalog, aliases, `max_context`, group routing.
+- [FAQ](faq.md) — context-window workarounds (including `gpt-*` → Claude 1M `/compact` → back).
+- [llmux Islands](llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, recording.
+- [System prompts (multi-model)](system-prompts/README.md) — **real captured system-prompt bodies** under [`system-prompts/samples/`](system-prompts/samples/) (CLI agent, 106k monitor, gpt SDK bot, compact, reviewer, auditor). Not a taxonomy essay.
 
-## Source-of-truth design notes
+## Design notes (not how-to)
 
-Product and architecture decisions live in `.prd/`:
+- [Grok provider STV notes](grok/) — `spec.md` / `trace.md` design artifacts for the grok backend; not a user guide.
+- Product/architecture decisions live in [`.prd/`](../.prd/):
 
-- [Product spec](../.prd/01-spec.md)
-- [Architecture](../.prd/02-architecture.md)
-- [Scheduler perishability model](../.prd/09-scheduler-perishability.md)
-- [llmux Islands spec](../.prd/11-llmux-islands-spec.md)
-- [llmux Islands architecture](../.prd/12-llmux-islands-architecture.md)
+  - [Product spec](../.prd/01-spec.md)
+  - [Architecture](../.prd/02-architecture.md)
+  - [Scheduler perishability](../.prd/09-scheduler-perishability.md)
+  - [llmux Islands spec](../.prd/11-llmux-islands-spec.md)
+  - [llmux Islands architecture](../.prd/12-llmux-islands-architecture.md)
