@@ -205,7 +205,11 @@ enum SnapshotMode {
         let viewModel = makeViewModel()
         viewModel.contentType = .menu
         let url = dir.appendingPathComponent("menu.png")
-        try writeHosted(view: NotchMenuView(viewModel: viewModel), size: viewModel.openedSize, to: url)
+        // The live panel is intentionally scrollable at `openedSize`. Evidence
+        // needs the complete surface, including Accessibility/About/GitHub/Quit,
+        // so give the same ScrollView enough height to lay out every row.
+        let fullMenuSize = CGSize(width: viewModel.openedSize.width, height: 820)
+        try writeHosted(view: NotchMenuView(viewModel: viewModel), size: fullMenuSize, to: url)
         return [url.path]
     }
 
