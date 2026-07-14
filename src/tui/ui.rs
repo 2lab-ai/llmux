@@ -291,15 +291,31 @@ fn draw_main(
     // (unparseable, before `from`, or past `to`).
     let event_line = event_banner_line(&view.events, now);
     let banner_height = u16::from(event_line.is_some());
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    // Drag-set overrides (UI-3 U7/U8) replace the automatic heights; the
+    // clamp keeps a dragged pane from collapsing below border+header.
+    let table_height = chrome
+        .pane_heights
+        .accounts
+        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
+        .unwrap_or_else(|| (snapshot.accounts.len().max(1) as u16).saturating_add(2));
+    let middle_height = chrome
+        .pane_heights
+        .middle
+        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
+        .unwrap_or(8);
     // Compact model strip (req12): only when model data exists. 0 height (no
     // pane) otherwise, so the idle layout is unchanged.
     let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
     // +2 for the table's top border (title) and header row.
-    let strip_height = if strip_rows > 0 {
+    let auto_strip_height = if strip_rows > 0 {
         strip_rows as u16 + 2
     } else {
         0
+    };
+    let strip_height = match chrome.pane_heights.strip {
+        // A drag override only applies while the strip exists at all.
+        Some(h) if auto_strip_height > 0 => h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT),
+        _ => auto_strip_height,
     };
     let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, footer_area] =
         Layout::vertical([
@@ -307,7 +323,7 @@ fn draw_main(
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(table_height),
-            Constraint::Length(8),
+            Constraint::Length(middle_height),
             Constraint::Length(strip_height),
             Constraint::Min(3),
             Constraint::Length(2),
@@ -325,7 +341,37 @@ fn draw_main(
         draw_models_strip(frame, strip_area, view, now);
     }
     let activity = draw_activity(frame, activity_area, view, chrome, now);
-    *hits = Some(MainChrome { activity, tabs });
+    // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
+    // pane above it. With no model strip the activity border resizes the
+    // middle pane instead.
+    let mut separators = vec![SeparatorHit {
+        y: middle_area.y,
+        pane: PaneId::Accounts,
+        pane_top: table_area.y,
+    }];
+    if strip_height > 0 {
+        separators.push(SeparatorHit {
+            y: strip_area.y,
+            pane: PaneId::Middle,
+            pane_top: middle_area.y,
+        });
+        separators.push(SeparatorHit {
+            y: activity_area.y,
+            pane: PaneId::Strip,
+            pane_top: strip_area.y,
+        });
+    } else {
+        separators.push(SeparatorHit {
+            y: activity_area.y,
+            pane: PaneId::Middle,
+            pane_top: middle_area.y,
+        });
+    }
+    *hits = Some(MainChrome {
+        activity,
+        tabs,
+        separators,
+    });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
@@ -2163,13 +2209,37 @@ pub(crate) fn hit_test_tabs(tabs: &[TabHit], col: u16, row: u16) -> Option<Overl
         .map(|t| t.overlay)
 }
 
+/// Minimum drag-set pane height (top border + one content row) and a sanity
+/// ceiling (UI-3 U7/U8) — the layout solver squeezes overflow anyway, this
+/// just keeps the override numbers honest.
+pub(crate) const PANE_MIN_HEIGHT: u16 = 3;
+pub(crate) const PANE_MAX_HEIGHT: u16 = 40;
+
+/// Which MAIN pane a drag-separator resizes (UI-3 U7/U8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneId {
+    Accounts,
+    Middle,
+    Strip,
+}
+
+/// One draggable separator: the top-border row `y` of the pane BELOW, whose
+/// drag resizes the pane starting at `pane_top` (UI-3 U7/U8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeparatorHit {
+    pub y: u16,
+    pub pane: PaneId,
+    pub pane_top: u16,
+}
+
 /// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
-/// activity panel's rows plus the tab bar. Threaded back to the runtime the
-/// same way `ActivityChrome` alone used to be.
+/// activity panel's rows plus the tab bar and the drag separators. Threaded
+/// back to the runtime the same way `ActivityChrome` alone used to be.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MainChrome {
     pub activity: ActivityChrome,
     pub tabs: Vec<TabHit>,
+    pub separators: Vec<SeparatorHit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3831,6 +3901,7 @@ mod tests {
     /// overlay explicitly.
     fn chrome_overlay(overlay: Overlay) -> Chrome {
         Chrome {
+            pane_heights: Default::default(),
             frame: 0,
             mode: Mode::Normal,
             overlay,
