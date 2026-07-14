@@ -1,0 +1,204 @@
+# Grok provider — vertical traces
+
+> The Trace is the Source of Truth (STV). Code behaves as written here; divergence found
+> during implementation updates THIS file first (Delta log at bottom). Line refs to
+> existing code are master @ 7f1dbec; new code is named by target file.
+
+## T1 — CLI registration: `llmux login --grok`
+
+1. **Entry** — CLI `llmux login --grok` (`src/cli/login.rs::run`, new `--grok` arm
+   beside `--codex` at login.rs:12-20). No daemon required.
+2. **Input** — none (interactive). Env: network to `auth.x.ai`.
+3. **Layer flow** —
+   `LoginArgs.grok=true` → `login_grok()` →
+   `auth::grok::discover(client)` GET `https://auth.x.ai/.well-known/openid-configuration`
+   → `Discovery{device_authorization_endpoint, token_endpoint}` (https + host ∈ x.ai
+   enforced) →
+   `auth::grok::request_device_code(client, discovery)` POST form
+   `client_id=b1a00492-…&scope=openid profile email offline_access grok-cli:access api:access`
+   → `DeviceCode{device_code, user_code, verification_uri_complete, expires_in, interval}` →
+   print URL+code, best-effort `open` →
+   `auth::grok::poll_token(client, token_endpoint, device_code)` POST form
+   `grant_type=urn:ietf:params:oauth:grant-type:device_code` every `interval`s
+   (authorization_pending → continue; slow_down → interval+5s; expired_token/access_denied
+   → terminal error) →
+   `TokenResponse{access_token, refresh_token, id_token, expires_in}` →
+   `email = jwt_claims(id_token).email` →
+   `AccountConfig{ name: "grok:{email}", credential: AccountCredential::Grok{
+     access_token, refresh_token, expires_at_ms: now+expires_in*1000,
+     token_endpoint, last_refresh_ms } }` →
+   `config::update_path(path, upsert)` (same upsert-by-name the codex flow uses,
+   login.rs:170-185).
+4. **Side effects** — `~/.config/llmux.json` gains/updates one account; running daemon
+   unaffected until restart or `/llmux/inject-account` (unchanged behavior, parity with
+   `--codex`).
+5. **Errors** — discovery non-200 / non-x.ai host → CliError printed; poll timeout
+   (min(30min, expires_in)) → "device code expired"; access_denied → "authorization
+   denied". No partial config writes (upsert is read-merge-write).
+6. **Output** — stdout `Added grok account "grok:{email}"` (or `Updated …`), exit 0.
+
+## T2 — Islands registration: daemon-run device flow
+
+1. **Entry** — `POST /llmux/login/start` `{"provider":"grok"}` (server.rs:775 route,
+   loopback/api-key gated).
+2. **Input** — provider string; parsed by `LoginProvider::parse` — new arm
+   `"grok"|"xai"|"x-ai" → Grok` (proxy/login.rs:34-39).
+3. **Layer flow** —
+   `login_start_endpoint` → `LoginRegistry.start(Grok)` (single-slot, 409 when busy —
+   unchanged) → spawned task: discovery → device code →
+   **registry phase gains the URL**: `LoginPhase::Pending{ verification_uri:
+   Some(verification_uri_complete), user_code: Some(user_code) }` (struct-variant
+   extension; Claude/Codex flows leave both `None`) →
+   poll loop (as T1) → on success `AccountConfig` → **inject into the LIVE pool** +
+   persist (same path the daemon-run codex login uses, server.rs:376-381) →
+   `LoginPhase::Done{account}`.
+   Islands: `LlmuxClient.startLogin(provider:"grok")` → poll
+   `GET /llmux/login/status` → when `verification_uri` non-nil and not yet opened →
+   `NSWorkspace.open(url)` once → keep polling → Done → refresh status.
+4. **Side effects** — config file + live pool gain `grok:{email}`; one browser tab.
+5. **Errors** — busy: 409 `{error:"login already pending"}`; poll terminal errors →
+   `LoginPhase::Error{message}` (token-free); islands shows message, offers retry;
+   cancel endpoint aborts the poll task (existing semantics).
+6. **Output** — `login/status` `{state, phase:"done", account:"grok:{email}",
+   verification_uri?, user_code?}`.
+
+## T3 — Chat request: Claude Code `/model grok-4.5` (happy path)
+
+1. **Entry** — `POST /v1/messages` (Anthropic Messages, SSE), proxy client auth as
+   today (forward.rs entry).
+2. **Input** — Messages body: `model:"grok-4.5"`, `messages[]`, optional `system`,
+   `tools[]`, `stream:true`, optional `output_config.effort` (Claude Agent SDK).
+   Validation unchanged (existing body parse).
+3. **Layer flow** (transformation arrows) —
+   `body.model "grok-4.5"` → `Classifier::classify` (routing.rs; builtin
+   `Prefix("grok")`) → `BackendGroup::Grok` →
+   `resolve_group` (forward.rs:1136; on_empty fallback order Claude→Codex→Grok when
+   empty) → scheduler `select(group=Grok)` — pool filter
+   `BackendGroup::from_kind("grok")` (scheduler/mod.rs:675) → leased
+   `AccountCredential::Grok{access_token, …}` (refresh first when
+   `expires_at_ms - now < REFRESH_AHEAD_MS` via `refresh_credential` new Grok arm →
+   `auth::grok::refresh_at(client, token_endpoint, refresh_token)`) →
+   provider dispatch (forward.rs:726-770 → 3-way match) → `state.grok.build_request`:
+   `body.model` → `responses::resolve_upstream_model(requested, shape.model,
+   flavor.model_passthrough = starts_with("grok-"))` → `"grok-4.5"` (verbatim) ·
+   `body.output_config.effort` → `responses::resolve_effort(…, clamp: none|minimal→low,
+   xhigh|max|ultra→high)` → e.g. `"high"` ·
+   `messages[]` → `responses::messages_to_input` → Responses `input[]` ·
+   `system` + folded system-role msgs → `instructions` ·
+   `tools[]` → `responses::tools_to_functions` →
+   upstream JSON `{model:"grok-4.5", instructions, input, tools,
+   parallel_tool_calls:true, store:false, stream:true, prompt_cache_key:session_id,
+   reasoning:{effort:"high"}}` (NO `include`, NO `service_tier`) →
+   headers: `Authorization: Bearer {access_token}`, `Accept: text/event-stream`,
+   `x-grok-conv-id: {session_id}`, and (upstream == official cli-chat-proxy) identity
+   trio `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 0.2.93` /
+   `User-Agent: xai-grok-workspace/0.2.93` →
+   `POST https://cli-chat-proxy.grok.com/v1/responses` →
+   Responses SSE → `responses::SseTransform` (shared, currently proxy/sse.rs path) →
+   Anthropic SSE events → client. `client_model` override applies to the reported
+   model name if configured (parity codex.rs:41-49).
+4. **Side effects** — activity log row `(group=grok, model=grok-4.5, effort=high)` via
+   grok `effective_request_meta`; `StreamUsage{input, output, cached}` → dashboard
+   token/cost accumulation (pricing: grok-4.5 rates); scheduler in-flight counters.
+5. **Errors** — no grok account & on_empty=error → 503 relay_error (existing shape);
+   upstream 401 → refresh-once-then-fail (existing credential path); upstream 429 →
+   T5; upstream 4xx/5xx passthrough as today; malformed SSE → existing SSE error
+   handling (unchanged core).
+6. **Output** — Anthropic SSE (`message_start` … `message_stop`) or non-stream JSON;
+   `usage` populated from Responses `response.completed.usage`.
+7. **Observability** — `grok.trace=true` mirrors `codex.trace` raw-io capture
+   (proxy/raw_io.rs path), same file naming with `grok` tag.
+
+## T4 — Live model/effort switch (dashboard/islands/CLI)
+
+1. **Entry** — `POST /llmux/grok` (new route beside `/llmux/codex`, server.rs:775 chain,
+   same auth gate).
+2. **Input** — `{"default_model"?: string, "reasoning_effort"?: string}` — partial;
+   empty/`"unset"` effort clears; unknown fields rejected by serde deny? (parity: codex
+   struct ignores unknown — keep identical semantics).
+3. **Layer flow** — deserialize → `state.grok.shape()` → merge → validate effort ∈
+   {low, medium, high, "" (clear)} (invalid → 400; note: codex endpoint does NOT
+   validate — grok validates because the clamp set is closed; recorded as intentional
+   asymmetry) → `state.grok.set_shape(…)` (RwLock write) →
+   `config::update_path(c.grok.default_model = …, c.grok.reasoning_effort = …)`.
+4. **Side effects** — next request uses the new shape; config persisted.
+5. **Errors** — config write failure → 200 with live-applied + log warn (parity codex
+   best-effort persist, server.rs:1119-1127).
+6. **Output** — `{ok:true, default_model, reasoning_effort}`.
+   Islands: settings pane grok row calls this endpoint (LlmuxClient new method).
+
+## T5 — Quota exhaustion: 429 free-usage-exhausted
+
+1. **Entry** — upstream response inside T3 step "POST …/responses".
+2. **Input** — HTTP 429, body JSON with `code` or `error` containing
+   `free-usage-exhausted` / `included free usage`.
+3. **Layer flow** — forward.rs upstream-error path → new grok arm in the retry_after
+   resolution (forward.rs:1347 kind match): body substring match →
+   `retry_after = Some(24h)` → scheduler parks the account until now+24h (existing
+   park/cooldown machinery — the same path a `Retry-After` header takes) → selection
+   moves to the next grok account; all parked → on_empty semantics (503 or fallback).
+4. **Side effects** — account window state marked limited w/ reset ts; activity event
+   (existing rate-limit event kind).
+5. **Errors** — generic 429 without the marker → existing backoff (no 24h park).
+6. **Output** — client sees retry-on-next-account (transparent) or 503 when the pool is
+   exhausted (existing behavior).
+
+## T6 — Stats & status surfaces
+
+1. **Entry** — `GET /llmux/status` (daemon JSON), `llmux status` CLI, islands poller.
+2. **Input** — none.
+3. **Layer flow** — pool snapshot → per-account `{name:"grok:{email}", type:"grok",
+   group:"grok", in_flight, five_hour:null, seven_day:null, parked_until?}` →
+   CLI table renders the grok rows with "—" gauges (existing accountless-gauge glyph);
+   TUI groups by `BackendGroup::as_str` (adds "grok" bucket);
+   islands `LlmuxStatus.group == "grok"` → `UsageProvider.grok` →
+   `IslandUsageModel.inFlightCounts` returns `(claude, codex, grok)` → closed label
+   `[icon]{n}` triple → tiles/analytics keyed by provider case.
+4. **Side effects** — none (read-only).
+5. **Errors** — old islands + new daemon: unknown `group:"grok"` string previously fell
+   back to `.claude` (IslandUsageModel.provider(of:) checks `== "codex"`); acceptable
+   during upgrade window. New islands + old daemon: no `"grok"` groups appear — UI
+   renders as today (fixtures excluded).
+6. **Output** — status JSON extended additively; no field removed or re-typed.
+
+## Contract tests (RED first; file: tests/ + unit tests beside code)
+
+| # | Kind | Asserts | Source trace |
+|---|---|---|---|
+| C1 | Contract | Messages body w/ model grok-4.5 + output_config.effort=xhigh → upstream JSON: model verbatim, reasoning.effort="high" (clamped), NO include/service_tier, store:false | T3 §3 |
+| C2 | Contract | model "gpt-5.6-sol" routes Codex; "grok-4.5" routes Grok; "claude-…" routes Claude; unmatched → default_group | T3 §3 |
+| C3 | Contract | grok headers: Bearer + conv-id + identity trio on official upstream; identity trio ABSENT on custom upstream | T3 §3 |
+| C4 | Sad | effort "none" → "low"; "ultra" → "high"; invalid effort string → shape effort fallback | T3 §3 |
+| C5 | Happy | device-code poll: pending→pending→success sequence yields TokenData; slow_down grows interval | T1 §3 (mock server) |
+| C6 | Sad | poll access_denied → terminal error, no config write | T1 §5 |
+| C7 | Contract | AccountCredential::Grok serde round-trip in llmux.json; upsert-by-name idempotent | T1 §3-4 |
+| C8 | Contract | refresh_credential Grok arm posts form grant to stored token_endpoint; new tokens persisted | T3 §3 |
+| C9 | Sad | 429 + free-usage-exhausted body → retry_after 24h park; generic 429 → no explicit park | T5 |
+| C10 | Contract | POST /llmux/grok partial update + persist; invalid effort → 400 | T4 |
+| C11 | Contract | /llmux/login/start grok → status carries verification_uri while pending | T2 |
+| C12 | Regression | ENTIRE existing codex test suite green with codex.rs as adapter (no behavioral diff) | R5 |
+| C13 | Contract | status JSON: grok account row shape (group/type/gauges null) | T6 |
+| C14 | Contract | pricing: (grok, grok-4.5) → 2.0/6.0/0.5/0.0; (grok, unknown) → grok fallback | T6 §4 |
+
+Swift (islands) — unit-light per repo convention: provider(of:) mapping test if a test
+target exists for it; otherwise receipt = snapshot/live capture.
+
+## Implementation status
+
+| Unit | Status |
+|---|---|
+| responses core extraction (C12) | NOT STARTED |
+| routing 3rd group (C2) | NOT STARTED |
+| config schema + credential (C7) | NOT STARTED |
+| auth::grok device flow (C5, C6) | NOT STARTED |
+| provider grok adapter (C1, C3, C4) | NOT STARTED |
+| forward dispatch + refresh + 429 (C8, C9) | NOT STARTED |
+| server endpoints (C10, C11) | NOT STARTED |
+| pricing + status (C13, C14) | NOT STARTED |
+| CLI login --grok | NOT STARTED |
+| islands Swift surfaces | NOT STARTED |
+| live receipt | NOT STARTED |
+
+## Trace deviations (Delta log)
+
+(none yet)
