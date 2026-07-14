@@ -2732,7 +2732,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        assert_eq!(models.len(), 5 + 6 + 5);
+        // 11 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 12);
 
         let by_id = |id: &str| {
             models
@@ -2740,7 +2741,8 @@ mod tests {
                 .find(|m| m["id"] == id)
                 .unwrap_or_else(|| panic!("{id} present"))
         };
-        // The live pin (grok-4.3) carries the "grok" alias; 4.5 does not.
+        // The live pin (grok-4.3) carries the "grok" alias via a synthesized
+        // row; the curated grok-4.5 does not.
         assert_eq!(by_id("grok-4.3")["aliases"], serde_json::json!(["grok"]));
         assert_eq!(by_id("grok-4.5")["aliases"], serde_json::json!([]));
         // Static codex alias and context survive serialization.
