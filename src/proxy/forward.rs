@@ -681,7 +681,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     let params = state.select_params();
     let snapshot = state.pool.snapshot();
     let accounts = snapshot.accounts.len();
-    let max_switches = accounts.max(1);
+    // Claude Code's per-session "quota" status ping (classify kind `quota`)
+    // gets ONE attempt, no pool sweep and no grace park (Z 2026-07-15,
+    // startup-set bug): the ratelimit headers it wants are per-account anyway,
+    // so failing over 9 accounts for a status probe only fanned one client
+    // ping into a 429 row per account on every session start.
+    let status_probe = ctx.kind.as_deref() == Some("quota");
+    let max_switches = if status_probe { 0 } else { accounts.max(1) };
     let mut switches = 0usize;
     let mut same_account_waits = 0u32;
     // In-request grace parks when the pool is only cooldown-blocked and
@@ -759,8 +765,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     // to EXHAUST_PARK_BUDGET. Budget spent or recovery not
                     // imminent → the same transient 502 as the switch-cap
                     // exit below, so the client retries promptly instead of
-                    // honoring a bogus half-hour retry-after.
-                    if should_park_exhausted(min_expiry, exhaust_parked) {
+                    // honoring a bogus half-hour retry-after. A status probe
+                    // never parks — the harness wants an answer now, not in
+                    // ~5s, and it retries on its own cadence anyway.
+                    if !status_probe && should_park_exhausted(min_expiry, exhaust_parked) {
                         exhaust_parked += min_expiry;
                         exhaust_parks += 1;
                         tokio::time::sleep(min_expiry).await;

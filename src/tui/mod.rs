@@ -292,6 +292,11 @@ pub(crate) struct Chrome {
     /// method + path + status) so it survives new rows prepending — never a
     /// list index.
     pub expanded_activity: Option<activity::ActivityKey>,
+    /// The folded `count` run (if any) currently click-opened (UI-5). Distinct
+    /// from `expanded_activity` so a member row inside an open run can show
+    /// its OWN detail without the click reading as "collapse the group"
+    /// (Z 2026-07-15). Keyed by any member's `ActivityKey`.
+    pub expanded_run: Option<activity::ActivityKey>,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -422,6 +427,18 @@ struct App {
     /// The click-expanded activity entry (Feature B), keyed by stable identity
     /// so it survives new rows prepending. `None` = nothing expanded.
     expanded_activity: Option<activity::ActivityKey>,
+    /// The click-opened folded `count` run (UI-5), keyed by any member's
+    /// stable identity. Separate from `expanded_activity` (see `Chrome`).
+    expanded_run: Option<activity::ActivityKey>,
+    /// Older completed entries hydrated from the persisted activity log
+    /// (`activity.jsonl`) once the operator scrolls near the end of the live
+    /// window (UI-5 infinite scroll, Z 2026-07-15). Newest-first; merged
+    /// strictly-older-than-live at render time. `None` = not loaded yet.
+    history_completed: Option<Vec<activity::Completed>>,
+    /// True while the background history load is in flight.
+    history_loading: bool,
+    /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
+    history_tx: Option<mpsc::Sender<Vec<activity::Completed>>>,
     /// The activity panel's hit-test layout from the LAST rendered frame: the
     /// panel rect + the clickable request rows. Recorded by the event loop after
     /// each `draw`, read by the mouse handler to map a click to an entry.
@@ -506,6 +523,10 @@ impl App {
             overlay: Overlay::None,
             activity_scroll: 0,
             expanded_activity: None,
+            expanded_run: None,
+            history_completed: None,
+            history_loading: false,
+            history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
             separator_chrome: Vec::new(),
@@ -541,7 +562,7 @@ impl App {
     /// Build the view-model for one frame. `None` only in remote mode before
     /// the first document arrives.
     fn view(&self, now: SystemTime) -> Option<DashboardView> {
-        match &self.backend {
+        let mut view = match &self.backend {
             // The event banner rides the dashboard document from the daemon's
             // live event holder, so both backends get it through `from_doc` —
             // no local-only special case.
@@ -549,6 +570,36 @@ impl App {
                 state, now,
             ))),
             Backend::Remote(remote) => remote.doc.as_ref().map(DashboardView::from_doc),
+        }?;
+        self.extend_with_history(&mut view);
+        Some(view)
+    }
+
+    /// Append lazily-hydrated history behind the live window (UI-5 infinite
+    /// scroll): only entries strictly OLDER than the oldest live row (the
+    /// persisted tail overlaps the live ring — the timestamp cut dedupes),
+    /// and only as many as the current scroll depth can reach plus one page,
+    /// so the per-frame clone stays bounded by how deep the operator actually
+    /// scrolled rather than the whole persisted file.
+    fn extend_with_history(&self, view: &mut DashboardView) {
+        if let Some(history) = &self.history_completed {
+            extend_completed_with_history(&mut view.completed, history, self.activity_scroll);
+        }
+    }
+
+    /// Kick off the one-shot background hydration of the persisted activity
+    /// log for infinite scroll (UI-5). Read+parse+replay is blocking IO/CPU
+    /// over a multi-MB file → blocking pool, result over `history_tx`
+    /// (mirrors `open_sessions`). Idempotent: no-op while loading or loaded.
+    fn request_history(&mut self) {
+        if self.history_loading || self.history_completed.is_some() {
+            return;
+        }
+        self.history_loading = true;
+        if let Some(tx) = self.history_tx.clone() {
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.blocking_send(load_history());
+            });
         }
     }
 
@@ -559,6 +610,7 @@ impl App {
             overlay: self.overlay,
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
+            expanded_run: self.expanded_run.clone(),
             model_cursor: self.model_cursor,
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
@@ -763,9 +815,23 @@ impl App {
                     return true;
                 }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
-                    Some(key) => {
+                    Some(ui::ActivityClick::Entry(key)) => {
                         self.toggle_expand(key);
                         true
+                    }
+                    Some(ui::ActivityClick::RunToggle(key)) => {
+                        self.toggle_run(key);
+                        true
+                    }
+                    // Run-header body: expand-only — an open group is closed by
+                    // its marker, never by a stray body click (Z 2026-07-15).
+                    Some(ui::ActivityClick::RunExpand(key)) => {
+                        if self.expanded_run.as_ref() == Some(&key) {
+                            false
+                        } else {
+                            self.expanded_run = Some(key);
+                            true
+                        }
                     }
                     None => false,
                 }
@@ -816,6 +882,16 @@ impl App {
             self.expanded_activity = None;
         } else {
             self.expanded_activity = Some(key);
+        }
+    }
+
+    /// Toggle the click-opened folded `count` run by any member's stable key
+    /// (UI-5): the marker opens a closed group and closes an open one.
+    fn toggle_run(&mut self, key: activity::ActivityKey) {
+        if self.expanded_run.as_ref() == Some(&key) {
+            self.expanded_run = None;
+        } else {
+            self.expanded_run = Some(key);
         }
     }
 
@@ -1590,11 +1666,17 @@ impl App {
     /// clamped to `[0, rendered_rows - 1]`. The unit is the FOLDED render
     /// row (glance-triage atom 3) — the same model `ui::draw_activity`
     /// windows by — so the offset can never strand past the last row.
+    /// Scrolling near the end of what's loaded arms the background history
+    /// hydration (UI-5 infinite scroll), after which the clamp ceiling grows
+    /// as [`Self::extend_with_history`] pages more rows in.
     fn scroll_activity(&mut self, delta: i64, view: Option<&DashboardView>) {
         let len: usize = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
         let max = len.saturating_sub(1) as i64;
         let next = (self.activity_scroll as i64).saturating_add(delta);
         self.activity_scroll = next.clamp(0, max) as usize;
+        if delta > 0 && (self.activity_scroll as i64) >= max.saturating_sub(HISTORY_ARM_MARGIN) {
+            self.request_history();
+        }
     }
 
     fn on_key_select(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
@@ -2202,6 +2284,10 @@ async fn event_loop(
     // the read+parse+fold never blocks this select (it once froze the TUI ~10s).
     let (sess_tx, mut sess_rx) = mpsc::channel::<Vec<crate::session::Session>>(4);
     app.sessions_tx = Some(sess_tx);
+    // Infinite-scroll history hydration (UI-5): the one-shot blocking load of
+    // `activity.jsonl` delivers here, same pattern as the sessions channel.
+    let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<activity::Completed>>(1);
+    app.history_tx = Some(hist_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -2240,6 +2326,13 @@ async fn event_loop(
             Some(sessions) = sess_rx.recv() => {
                 app.sessions = sessions;
                 app.sessions_loading = false;
+                true
+            }
+            // The background history load finished (UI-5 infinite scroll) —
+            // scrolling past the live window now pages these rows in.
+            Some(history) = hist_rx.recv() => {
+                app.history_completed = Some(history);
+                app.history_loading = false;
                 true
             }
         };
@@ -2356,6 +2449,67 @@ fn apply_event(
 /// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
 /// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
 /// metadata each record carries is folded; no prompt content is retained.
+/// How many rows past the current scroll depth [`App::extend_with_history`]
+/// keeps materialized, and how close to the loaded end the scroll must get
+/// before [`App::request_history`] arms (UI-5 infinite scroll).
+const HISTORY_PAGE: usize = 300;
+const HISTORY_ARM_MARGIN: i64 = 40;
+
+/// Ceiling on hydrated history entries — far beyond any real scrolling
+/// session, purely a memory backstop against a huge persisted file.
+const HISTORY_CAP: usize = 100_000;
+
+/// Pure merge for [`App::extend_with_history`] (unit-tested): append history
+/// rows behind the live newest-first list — only entries strictly OLDER than
+/// the oldest live row (the persisted tail overlaps the live ring; the
+/// timestamp cut dedupes), and only up to `scroll + HISTORY_PAGE` total rows,
+/// so the per-frame clone is bounded by how deep the operator actually
+/// scrolled rather than the whole persisted file. At the live tail
+/// (`scroll == 0`) nothing is appended.
+fn extend_completed_with_history(
+    completed: &mut Vec<activity::Completed>,
+    history: &[activity::Completed],
+    scroll: usize,
+) {
+    if scroll == 0 {
+        return;
+    }
+    let needed = scroll.saturating_add(HISTORY_PAGE);
+    if completed.len() >= needed {
+        return;
+    }
+    let oldest = completed.last().map(|c| c.at);
+    let take = needed - completed.len();
+    completed.extend(
+        history
+            .iter()
+            .filter(|c| oldest.is_none_or(|o| c.at < o))
+            .take(take)
+            .cloned(),
+    );
+}
+
+/// Blocking read+replay of the persisted activity log
+/// (`$XDG_STATE_HOME/llmux/activity.jsonl`) into a newest-first completed
+/// list for the infinite-scroll history (UI-5). Reuses the same
+/// `PersistedRequest` replay the daemon boots with, so schema/versioning
+/// tolerance is identical. Missing state dir / file → empty. NOTE: resolves
+/// the LOCAL state path — attaching to a daemon on another host yields
+/// nothing (that host's file isn't here); remote history paging is the
+/// sqlite/storage follow-up issue.
+fn load_history() -> Vec<activity::Completed> {
+    let Some(path) = crate::cli::daemon::activity_log_path() else {
+        return Vec::new();
+    };
+    let mut log = activity::ActivityLog::new(HISTORY_CAP);
+    // Unbounded replay (`up_to = u64::MAX`): unlike daemon boot hydration
+    // there is no concurrent-append double-count here — the ring is a
+    // point-in-time snapshot and the strictly-older merge cut dedupes any
+    // overlap with live rows.
+    let _ = log.load_persisted_prefix(&path, u64::MAX);
+    log.completed().cloned().collect()
+}
+
 fn load_sessions() -> Vec<crate::session::Session> {
     let Some(path) = crate::cli::daemon::raw_io_path() else {
         return Vec::new();
@@ -3129,6 +3283,7 @@ mod tests {
                 key: key.clone(),
                 y_start: 6,
                 height: 1,
+                kind: ui::ActivityHitKind::Entry,
             }],
         };
         key
@@ -3145,6 +3300,65 @@ mod tests {
         // Click it again → collapses (re-click toggles).
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 6), None);
         assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn run_header_marker_toggles_and_body_expands_only(/* UI-5, Z 2026-07-15 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::RunHeader { expanded: false };
+        // Marker-zone click (col < RUN_MARKER_ZONE) → opens the run.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Marker click again → closes.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
+        assert_eq!(app.expanded_run, None);
+        // Body click → opens.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 6), None);
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Body click while open → does NOT collapse (only the marker closes).
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 6), None);
+        assert!(!changed, "body click on an open run is a no-op");
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Entry detail state is untouched throughout.
+        assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn extend_completed_with_history_pages_older_rows(/* UI-5 infinite scroll */) {
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        // Live window: newest-first 100..90; history overlaps (100..90) then
+        // continues older (89..1).
+        let live: Vec<_> = (91..=100).rev().map(note).collect();
+        let history: Vec<_> = (1..=100).rev().map(note).collect();
+
+        // At the live tail nothing is appended.
+        let mut completed = live.clone();
+        extend_completed_with_history(&mut completed, &history, 0);
+        assert_eq!(completed.len(), live.len());
+
+        // Scrolled: appends only entries STRICTLY older than the live oldest
+        // (the overlap dedupes by timestamp) up to scroll + HISTORY_PAGE.
+        let mut completed = live.clone();
+        extend_completed_with_history(&mut completed, &history, 5);
+        assert!(completed.len() <= 5 + HISTORY_PAGE);
+        assert_eq!(
+            completed[live.len()].at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(90),
+            "first appended row is the newest strictly-older history entry"
+        );
+        // No duplicates across the seam.
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            completed.iter().all(|c| seen.insert(c.at)),
+            "live+history merge must not duplicate the overlap"
+        );
     }
 
     #[test]

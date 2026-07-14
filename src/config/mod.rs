@@ -151,8 +151,24 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
         enabled: false,
         per_account_cooldown_secs: 3600,
         sweep_secs: 0,
+        // Field postdates the pre-#45 era; absent from old files, it always
+        // deserializes to its serde default — include that value here so the
+        // legacy triple still reads as "unset".
+        stale_after_secs: 900,
     };
-    if config.proxy.idle_probe == LEGACY_IDLE_PROBE_DEFAULT {
+    // Same migration for the #45-era always-on default (enabled, 3600, 3600):
+    // users who never touched the block carry exactly it, and would otherwise
+    // stay pinned to the hourly cadence instead of the 15-min cold-refresh
+    // defaults (Z 2026-07-15).
+    const LEGACY_IDLE_PROBE_HOURLY_DEFAULT: IdleProbeConfig = IdleProbeConfig {
+        enabled: true,
+        per_account_cooldown_secs: 3600,
+        sweep_secs: 3600,
+        stale_after_secs: 900,
+    };
+    if config.proxy.idle_probe == LEGACY_IDLE_PROBE_DEFAULT
+        || config.proxy.idle_probe == LEGACY_IDLE_PROBE_HOURLY_DEFAULT
+    {
         config.proxy.idle_probe = IdleProbeConfig::default();
     }
     // Demo mode: swap account identities for stable fakes at the source so every
@@ -917,8 +933,12 @@ mod tests {
         // must load enabled with an hourly sweep.
         let defaults = IdleProbeConfig::default();
         assert!(defaults.enabled, "probing on by default");
-        assert_eq!(defaults.per_account_cooldown_secs, 3600);
-        assert_eq!(defaults.sweep_secs, 3600, "hourly sweep by default");
+        assert_eq!(defaults.per_account_cooldown_secs, 900);
+        assert_eq!(defaults.sweep_secs, 900, "15-min sweep by default");
+        assert_eq!(
+            defaults.stale_after_secs, 900,
+            "stale windows re-probe by default (Z 2026-07-15 cold-refresh)"
+        );
 
         let parsed: IdleProbeConfig = serde_json::from_str("{}").expect("empty block parses");
         assert_eq!(parsed, defaults, "missing fields load always-on");
@@ -946,7 +966,27 @@ mod tests {
             "legacy triple upgrades to always-on"
         );
         assert!(loaded.proxy.idle_probe.enabled);
-        assert_eq!(loaded.proxy.idle_probe.sweep_secs, 3600);
+        assert_eq!(loaded.proxy.idle_probe.sweep_secs, 900);
+    }
+
+    #[test]
+    fn legacy_idle_probe_hourly_default_upgrades_to_cold_refresh() {
+        // A config written by a #45-era build for a user who never touched the
+        // block carries EXACTLY the old always-on hourly quadruple — also
+        // indistinguishable from "unset", so it adopts the 15-min cold-refresh
+        // defaults (Z 2026-07-15) instead of pinning the hourly cadence.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "proxy": { "idle_probe": {
+                "enabled": true, "per_account_cooldown_secs": 3600, "sweep_secs": 3600 } } }"#,
+        )
+        .expect("write");
+
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(loaded.proxy.idle_probe, IdleProbeConfig::default());
+        assert_eq!(loaded.proxy.idle_probe.sweep_secs, 900);
     }
 
     #[test]
@@ -969,6 +1009,7 @@ mod tests {
                 enabled: false,
                 per_account_cooldown_secs: 7200,
                 sweep_secs: 0,
+                stale_after_secs: 900,
             },
             "an explicit non-default opt-out is kept verbatim"
         );

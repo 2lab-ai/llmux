@@ -25,7 +25,7 @@ use crate::scheduler::window::{
 };
 use crate::scheduler::{select, AccountSnapshot};
 
-use super::activity::{ActivityKey, Completed, CompletedBody};
+use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
@@ -2700,11 +2700,35 @@ pub(crate) struct MainChrome {
     pub settings: Vec<SettingHit>,
 }
 
+/// What kind of row a hit rect belongs to, deciding what a click does
+/// (UI-5): plain entries (singles AND expanded run members) toggle their
+/// detail lines; a folded-run HEADER splits by column — the leading marker
+/// toggles the fold, the body only ever expands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityHitKind {
+    Entry,
+    RunHeader { expanded: bool },
+}
+
+/// The resolved meaning of one activity click (UI-5), returned by
+/// [`hit_test_activity`] so the mouse handler stays a dumb dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivityClick {
+    /// Toggle this entry's detail lines (single rows and run member rows).
+    Entry(ActivityKey),
+    /// Toggle the folded run open/closed (click on the `▸`/`▾` marker).
+    RunToggle(ActivityKey),
+    /// Click on a run header's body: expand when collapsed; while expanded it
+    /// does NOT collapse (Z 2026-07-15 — only the marker closes a group).
+    RunExpand(ActivityKey),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActivityHit {
     pub key: ActivityKey,
     pub y_start: u16,
     pub height: u16,
+    pub kind: ActivityHitKind,
 }
 
 /// The activity panel's rendered layout for one frame: the panel rect plus the
@@ -2716,24 +2740,110 @@ pub(crate) struct ActivityChrome {
     pub hits: Vec<ActivityHit>,
 }
 
-/// Pure hit-test (unit-tested): which activity entry, if any, does the click at
-/// absolute `(col, row)` land on? `None` when the click is outside the panel,
-/// on the title border, or on a non-request line. Used by the mouse handler.
+/// Width of the leading `▸`/`▾` marker zone on a folded-run header — clicks in
+/// these leftmost panel columns toggle the fold; clicks past them are body
+/// clicks (expand-only). Covers `" ▸ "` plus one slack cell.
+const RUN_MARKER_ZONE: u16 = 4;
+
+/// Pure hit-test (unit-tested): what does the click at absolute `(col, row)`
+/// mean? `None` when the click is outside the panel, on the title border, or
+/// on a non-request line. Used by the mouse handler.
 pub(crate) fn hit_test_activity(
     chrome: &ActivityChrome,
     col: u16,
     row: u16,
-) -> Option<ActivityKey> {
+) -> Option<ActivityClick> {
     let area = chrome.area;
     // Outside the panel rect → not ours.
     if col < area.x || col >= area.right() || row < area.y || row >= area.bottom() {
         return None;
     }
-    chrome
+    let hit = chrome
         .hits
         .iter()
-        .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))
-        .map(|hit| hit.key.clone())
+        .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
+    Some(match hit.kind {
+        ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
+        ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
+            ActivityClick::RunToggle(hit.key.clone())
+        }
+        ActivityHitKind::RunHeader { .. } => ActivityClick::RunExpand(hit.key.clone()),
+    })
+}
+
+/// Per-frame column widths for the activity rows (Z 2026-07-15 "최대 넓이"):
+/// each column is padded to the WIDEST value visible this frame, so every row
+/// lines up, and the input excerpt takes whatever is left of the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowMetrics {
+    /// Panel width in cells — the excerpt budget is derived from it.
+    width: u16,
+    /// `[model effort]` badge slot.
+    meta_w: usize,
+    /// Duration column (`3.1s`).
+    dur_w: usize,
+    /// Token column (`269tok`).
+    tok_w: usize,
+    /// Cost column (`$0.0079`).
+    cost_w: usize,
+}
+
+/// Hard cap on the meta badge slot — group/model/effort ride in from request
+/// bodies, so a hostile body must not push the whole table off-screen.
+const META_W_MAX: usize = 32;
+
+impl RowMetrics {
+    /// Measure the visible rows. `completed` is the already-windowed slice the
+    /// frame will render (plus slack); in-flight rows share the meta slot.
+    fn measure(width: u16, in_flight: &[InFlight], completed: &[&Completed]) -> Self {
+        let mut m = RowMetrics {
+            width,
+            meta_w: 0,
+            dur_w: 4,
+            tok_w: 6,
+            cost_w: 7,
+        };
+        for request in in_flight {
+            let meta = activity_meta_body(
+                request.group.as_deref(),
+                request.model.as_deref(),
+                request.effort.as_deref(),
+            );
+            m.meta_w = m.meta_w.max(cell_width(&meta));
+        }
+        for entry in completed {
+            let CompletedBody::Request {
+                duration,
+                tokens,
+                group,
+                model,
+                effort,
+                ..
+            } = &entry.body
+            else {
+                continue;
+            };
+            let meta = activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref());
+            m.meta_w = m.meta_w.max(cell_width(&meta));
+            m.dur_w = m.dur_w.max(format::elapsed_secs(*duration).len());
+            if let Some(tokens) = tokens {
+                m.tok_w = m
+                    .tok_w
+                    .max(format!("{}tok", format::human_count(tokens.total())).len());
+                if let (Some(group), Some(model)) = (group, model) {
+                    let cost = crate::pricing::cost_usd(
+                        group,
+                        model,
+                        tokens,
+                        &std::collections::HashMap::new(),
+                    );
+                    m.cost_w = m.cost_w.max(format_cost(cost).len());
+                }
+            }
+        }
+        m.meta_w = m.meta_w.min(META_W_MAX);
+        m
+    }
 }
 
 fn draw_activity(
@@ -2748,6 +2858,27 @@ fn draw_activity(
 
     let anim_frame = chrome.frame;
     let mut lines: Vec<Line> = Vec::with_capacity(capacity);
+    // Fold BEFORE measuring so the metrics cover exactly the rows this frame
+    // can show (plus expansion slack).
+    let rows = triage::collapse_completed(&view.completed);
+    let total = rows.len();
+    let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
+    let visible: Vec<&Completed> = rows
+        .iter()
+        .skip(scroll)
+        .take(capacity.saturating_add(8))
+        .flat_map(|row| match row {
+            ActivityRow::Single(idx) => vec![&view.completed[*idx]],
+            ActivityRow::Run { start, len } => {
+                view.completed[*start..*start + *len].iter().collect()
+            }
+        })
+        .collect();
+    let metrics = if chrome.activity_scroll == 0 {
+        RowMetrics::measure(area.width, in_flight, &visible)
+    } else {
+        RowMetrics::measure(area.width, &[], &visible)
+    };
     // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
     // while scrolled into history they'd steal rows from the page being read.
     if chrome.activity_scroll == 0 {
@@ -2767,18 +2898,19 @@ fn draw_activity(
                 Span::styled(format!(" {glyph} "), Style::new().fg(color)),
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
             ];
-            // [group model effort fast] badge while in flight (issue #2, 2a).
-            // All four are filled at routing time (req11) with the same
-            // per-request values the finish will record, so the running badge
-            // reads exactly like its eventual completed row. Fixed-width slot
-            // (UI-4 V5) — blank when nothing is known yet.
+            // `[model effort]` badge while in flight (issue #2, 2a): filled at
+            // routing time (req11) with the same per-request values the finish
+            // will record, so the running badge reads exactly like its
+            // eventual completed row. Padded to the frame's shared meta slot.
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                activity_meta(
-                    request.group.as_deref(),
-                    request.model.as_deref(),
-                    request.effort.as_deref(),
-                    request.fast,
+                pad_cells(
+                    &activity_meta_body(
+                        request.group.as_deref(),
+                        request.model.as_deref(),
+                        request.effort.as_deref(),
+                    ),
+                    metrics.meta_w,
                 ),
                 group_color(request.group.as_deref()),
             ));
@@ -2801,13 +2933,10 @@ fn draw_activity(
     // hit list records the absolute screen rows each entry owns so the click
     // handler maps a (col,row) back to its stable key. Paragraph renders line 0
     // at `area.y + 1` (the title takes the top border row).
-    // glance-triage atom 3: fold runs of ≥FOLD_MIN consecutive same-key
-    // completed-2xx entries into one counted row so the success wall stops
-    // drowning exceptions. Non-2xx / notes / control events never fold;
-    // scrolling walks RENDER rows (a folded run is one step of history).
-    let rows = triage::collapse_completed(&view.completed);
-    let total = rows.len();
-    let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
+    // glance-triage atom 3 (narrowed, Z 2026-07-15): fold runs of ≥FOLD_MIN
+    // consecutive same-key `count` probes into one counted row — count_tokens
+    // is the only traffic allowed to group; everything else renders 1:1.
+    // Scrolling walks RENDER rows (a folded run is one step of history).
     let body_top = area.y.saturating_add(1);
     let mut hits: Vec<ActivityHit> = Vec::new();
     for row in rows.iter().skip(scroll) {
@@ -2827,6 +2956,7 @@ fn draw_activity(
                     view.email_anonymous,
                     &view.session_labels,
                     &view.domain_abbrev,
+                    &metrics,
                 ));
                 let mut height = 1u16;
                 if expanded {
@@ -2846,48 +2976,76 @@ fn draw_activity(
                         key,
                         y_start: row_y,
                         height,
+                        kind: ActivityHitKind::Entry,
                     });
                 }
             }
             ActivityRow::Run { start, len } => {
                 let run = &view.completed[*start..*start + *len];
-                // Expansion matches ANY member (not just the oldest), so a
-                // tail run on a FULL ring — whose oldest member is evicted on
-                // every append — stays expanded until the clicked member
-                // itself ages out. The whole block is ONE hit; the toggle key
-                // echoes the matched member while expanded so the next click
-                // collapses instead of re-keying.
-                let (expanded, key) =
-                    triage::run_toggle_key(run, chrome.expanded_activity.as_ref());
+                // Fold expansion matches ANY member (not just the oldest), so
+                // a tail run on a FULL ring — whose oldest member is evicted
+                // on every append — stays expanded until the clicked member
+                // itself ages out. The header is its OWN one-row hit (the
+                // marker toggles the fold); expanded members each get an
+                // Entry hit so clicking one opens ITS detail instead of
+                // collapsing the group (Z 2026-07-15).
+                let (expanded, key) = triage::run_toggle_key(run, chrome.expanded_run.as_ref());
                 let row_y = body_top.saturating_add(lines.len() as u16);
                 lines.push(folded_run_line(
                     run,
                     expanded,
                     view.email_anonymous,
                     &view.domain_abbrev,
+                    &metrics,
                 ));
-                let mut height = 1u16;
+                if let Some(key) = key {
+                    hits.push(ActivityHit {
+                        key,
+                        y_start: row_y,
+                        height: 1,
+                        kind: ActivityHitKind::RunHeader { expanded },
+                    });
+                }
                 if expanded {
                     for entry in run {
                         if lines.len() >= capacity {
                             break;
                         }
+                        let member_expanded = entry
+                            .activity_key()
+                            .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
+                        let member_y = body_top.saturating_add(lines.len() as u16);
                         lines.push(completed_line(
                             entry,
-                            false,
+                            member_expanded,
                             view.email_anonymous,
                             &view.session_labels,
                             &view.domain_abbrev,
+                            &metrics,
                         ));
-                        height = height.saturating_add(1);
+                        let mut member_height = 1u16;
+                        if member_expanded {
+                            for detail in completed_detail_lines(
+                                entry,
+                                view.email_anonymous,
+                                &view.session_labels,
+                            ) {
+                                if lines.len() >= capacity {
+                                    break;
+                                }
+                                lines.push(detail);
+                                member_height = member_height.saturating_add(1);
+                            }
+                        }
+                        if let Some(key) = entry.activity_key() {
+                            hits.push(ActivityHit {
+                                key,
+                                y_start: member_y,
+                                height: member_height,
+                                kind: ActivityHitKind::Entry,
+                            });
+                        }
                     }
-                }
-                if let Some(key) = key {
-                    hits.push(ActivityHit {
-                        key,
-                        y_start: row_y,
-                        height,
-                    });
                 }
             }
         }
@@ -2913,40 +3071,48 @@ fn draw_activity(
     ActivityChrome { area, hits }
 }
 
-/// The one-line activity row. For request entries a leading marker shows the
-/// expand state (`▸` collapsed / `▾` expanded); notes keep the plain indent.
-/// `mask` applies the email-anonymous display setting: the account name and
-/// any email embedded in a note ("switch a@x → b@y") render aliased.
-/// One folded activity row (glance-triage atom 3): a run of ≥FOLD_MIN
-/// consecutive completed-2xx entries with the identical (method, path,
-/// account, group, model) key renders as `▸ HH:MM–HH:MM N× METHOD path
-/// [meta] → account (all 2xx)`. Click toggles the fold — expanding lists the
-/// member rows verbatim, so nothing is lost, only the default density.
+/// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
+const ACTIVITY_EMAIL_W: usize = 10;
+
+/// Pad `text` with trailing spaces to exactly `width` display cells,
+/// `…`-clipping first when it is too wide.
+fn pad_cells(text: &str, width: usize) -> String {
+    let clipped = truncate_cells(text, width);
+    let pad = width.saturating_sub(cell_width(&clipped));
+    format!("{clipped}{}", " ".repeat(pad))
+}
+
+/// Right-align `text` in `width` display cells (numeric columns).
+fn pad_cells_left(text: &str, width: usize) -> String {
+    let clipped = truncate_cells(text, width);
+    let pad = width.saturating_sub(cell_width(&clipped));
+    format!("{}{clipped}", " ".repeat(pad))
+}
+
+/// One folded activity row (glance-triage atom 3, narrowed to `count` runs):
+/// `▸ HH:MM:SS count 33× [meta] email → (all 2xx)` — the START time only
+/// (Z 2026-07-15), the run size riding the type column. The marker toggles
+/// the fold; the body expands it.
 fn folded_run_line(
     run: &[Completed],
     expanded: bool,
     mask: bool,
     abbrev: &std::collections::BTreeMap<String, String>,
+    m: &RowMetrics,
 ) -> Line<'static> {
     let marker = if expanded { '▾' } else { '▸' };
-    let newest = &run[0];
     let oldest = &run[run.len() - 1];
     let stamp = Span::styled(
-        format!(
-            " {marker} {}–{}  ",
-            format::clock_hms_utc(oldest.at),
-            format::clock_hms_utc(newest.at)
-        ),
+        format!(" {marker} {}  ", format::clock_hms_utc(oldest.at)),
         dim(),
     );
+    let newest = &run[0];
     let CompletedBody::Request {
-        method,
-        path,
         account,
         group,
         model,
         effort,
-        fast,
+        kind,
         ..
     } = &newest.body
     else {
@@ -2957,24 +3123,25 @@ fn folded_run_line(
         .as_deref()
         .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
-    // method+path dropped from the folded row too (Z 2026-07-15) — the run's
-    // members carry it in their expanded detail.
-    let _ = (method, path);
-    let mut spans = vec![
+    let kind = kind.as_deref().unwrap_or("count");
+    let spans = vec![
         stamp,
+        Span::styled(format!("{kind:<8} "), kind_style(kind)),
         Span::styled(
             format!("{}× ", run.len()),
             Style::new().add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            pad_cells(
+                &activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref()),
+                m.meta_w,
+            ),
+            group_color(group.as_deref()),
+        ),
+        Span::raw(format!(" {} → (", pad_cells(&account, ACTIVITY_EMAIL_W))),
+        Span::styled("all 2xx", Style::new().fg(Color::Green)),
+        Span::raw(")"),
     ];
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast),
-        group_color(group.as_deref()),
-    ));
-    spans.push(Span::raw(format!(" → {account} (")));
-    spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
-    spans.push(Span::raw(")"));
     Line::from(spans)
 }
 
@@ -2984,6 +3151,7 @@ fn completed_line(
     mask: bool,
     session_labels: &std::collections::BTreeMap<String, String>,
     abbrev: &std::collections::BTreeMap<String, String>,
+    m: &RowMetrics,
 ) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
@@ -2996,11 +3164,15 @@ fn completed_line(
             group,
             model,
             effort,
-            fast,
+            fast: _,
             user_id,
             kind,
             excerpt,
         } => {
+            // Row layout (Z 2026-07-15): every column padded to the frame's
+            // max width so rows line up, and the input excerpt LAST, spending
+            // whatever terminal width remains:
+            //   ▸ HH:MM:SS kind [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
@@ -3008,8 +3180,8 @@ fn completed_line(
             );
             // Same display form as the accounts table (Z 2026-07-15
             // "똑같은 함수"): mask → strip the `group:` prefix → abbreviate
-            // the domain. The expanded detail keeps the FULL raw id (the
-            // fidelity surface, issue #70).
+            // the domain, then clip to the 10-cell email column. The expanded
+            // detail keeps the FULL raw id (the fidelity surface, issue #70).
             let account = account
                 .as_deref()
                 .map(|a| row_account_name(a, mask, abbrev))
@@ -3019,54 +3191,56 @@ fn completed_line(
             } else {
                 Style::new().fg(Color::Red)
             };
-            let mut detail = format::elapsed_secs(*duration);
-            if let Some(tokens) = tokens {
-                detail.push_str(&format!(", {} tok", format::human_count(tokens.total())));
-                // Always show the API-equivalent cost ($) inline (item #4). The
-                // render path holds no config overrides, so pass an empty map =
-                // the built-in default rate table. Cost is shown only when this
-                // request's (group, model) is known; an unknown/zero-rate model
-                // yields $0.0000. NOTE: the view-model's per-entry tokens carry
-                // only input+output (cache detail rides the model rows), so this
-                // is the input+output cost — consistent with the tok count above.
-                if let (Some(group), Some(model)) = (group, model) {
-                    let cost = crate::pricing::cost_usd(
-                        group,
-                        model,
-                        tokens,
-                        &std::collections::HashMap::new(),
-                    );
-                    detail.push_str(&format!(", {}", format_cost(cost)));
-                }
-            }
-            let mut spans = vec![stamp];
-            // Message kind + input excerpt (TUI UI-3 U1): say WHAT the request
-            // was, right where the eye lands. `user` rows lead with the typed
-            // text; control rows lead with their kind tag.
-            if let Some(kind) = kind.as_deref() {
-                spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
-            }
-            if let Some(excerpt) = excerpt.as_deref() {
-                spans.push(Span::raw(format!(
-                    "\u{201c}{}\u{201d} ",
-                    truncate_chars(&masked_text(excerpt, mask), 12)
-                )));
-            }
             // method+path intentionally NOT on the collapsed row (Z
             // 2026-07-15 "쓸데 없는 데이터"): it is constant noise
             // (`POST /v1/messages?beta=true`); the expanded detail's
             // `request` line keeps the full form.
             let _ = (method, path);
-            // [group model effort fast] badge — a fixed-width slot even when
-            // nothing is known, so `→ account` lines up (UI-4 V5, req7).
-            spans.push(Span::raw(" "));
+            let (tok, cost) = match tokens {
+                Some(tokens) => {
+                    let tok = format!("{}tok", format::human_count(tokens.total()));
+                    // API-equivalent cost via the built-in default rate table
+                    // (the render path holds no config overrides). Priced only
+                    // when (group, model) is known.
+                    let cost = match (group, model) {
+                        (Some(group), Some(model)) => format_cost(crate::pricing::cost_usd(
+                            group,
+                            model,
+                            tokens,
+                            &std::collections::HashMap::new(),
+                        )),
+                        _ => "—".to_string(),
+                    };
+                    (tok, cost)
+                }
+                None => ("—".to_string(), "—".to_string()),
+            };
+            let mut spans = vec![stamp];
             spans.push(Span::styled(
-                activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast),
+                format!("{:<8} ", kind.as_deref().unwrap_or("")),
+                kind_style(kind.as_deref().unwrap_or("")),
+            ));
+            spans.push(Span::styled(
+                pad_cells(
+                    &activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref()),
+                    m.meta_w,
+                ),
                 group_color(group.as_deref()),
             ));
-            spans.push(Span::raw(format!(" → {account} (")));
-            spans.push(Span::styled(status.to_string(), status_style));
-            spans.push(Span::raw(format!(", {detail})")));
+            spans.push(Span::raw(format!(
+                " {} → ",
+                pad_cells(&account, ACTIVITY_EMAIL_W)
+            )));
+            spans.push(Span::styled(format!("{status:>3}"), status_style));
+            spans.push(Span::styled(
+                format!(
+                    " {} {}",
+                    pad_cells_left(&format::elapsed_secs(*duration), m.dur_w),
+                    pad_cells_left(&tok, m.tok_w),
+                ),
+                dim(),
+            ));
+            spans.push(Span::raw(format!(" {}", pad_cells_left(&cost, m.cost_w))));
             // Derived session title (U2), when this client id has one.
             if let Some(label) = user_id.as_deref().and_then(|id| session_labels.get(id)) {
                 spans.push(Span::styled(
@@ -3076,6 +3250,18 @@ fn completed_line(
                     ),
                     dim().add_modifier(Modifier::ITALIC),
                 ));
+            }
+            // Input excerpt LAST, filling the rest of the panel width.
+            if let Some(excerpt) = excerpt.as_deref() {
+                let consumed: usize = spans.iter().map(|s| cell_width(&s.content)).sum();
+                // 1 leading space + a pair of quotes.
+                let budget = (m.width as usize).saturating_sub(consumed + 3);
+                if budget > 0 {
+                    spans.push(Span::raw(format!(
+                        " \u{201c}{}\u{201d}",
+                        truncate_cells(&masked_text(excerpt, mask), budget)
+                    )));
+                }
             }
             Line::from(spans)
         }
@@ -3244,7 +3430,7 @@ fn kind_style(kind: &str) -> Style {
     match kind {
         "user" => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         "security" => Style::new().fg(Color::Yellow),
-        "compact" | "summary" => Style::new().fg(Color::Blue),
+        "compact" | "summary" | "recap" => Style::new().fg(Color::Blue),
         "subagent" | "sdk" => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
         _ => dim(),
     }
@@ -3283,12 +3469,6 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Fixed display width of the [`activity_meta`] badge slot (UI-4 V5): every
-/// activity row spends exactly this many CELLS on the badge, so the
-/// `→ account` column lines up. Sized for the widest routine content —
-/// `[claude sonnet-4-5 medium]`.
-const ACTIVITY_META_WIDTH: usize = 26;
-
 /// Display-cell width of `text` — ratatui's own column accounting
 /// (`unicode-width`), NOT the char count: group/model/effort ride in from
 /// request bodies, so wide/combining input must not shift the badge column.
@@ -3318,59 +3498,25 @@ fn truncate_cells(text: &str, max: usize) -> String {
     out
 }
 
-/// Compose the fixed-width `[group model effort fast]` badge for an activity
-/// line (UI-4 V5/V6). The model token shows only OUTSIDE the codex/grok
-/// groups: those serve a config-pinned backend model (`gpt-*`/`grok-*`) that
-/// just repeats the group label on every row (Z 2026-07-15 "백엔드 모델 출력
-/// x") — the expanded detail's `model` line keeps the full served id. The
-/// effort token is dropped when unknown (`None`, empty, or `"-"`); `fast`
-/// appears only when codex fast mode was on. The model token spends only the
-/// CELLS the other tokens leave over in the slot — nothing is clipped while
-/// the whole badge fits. Rows with no meta at all get an all-blank slot of
-/// the same width, so alignment survives mixed history. All measuring is in
-/// display cells ([`cell_width`]), never chars. Examples:
-/// `[claude fable-5 low]`, `[codex max fast]`, `[grok high]`.
-fn activity_meta(
-    group: Option<&str>,
-    model: Option<&str>,
-    effort: Option<&str>,
-    fast: bool,
-) -> String {
+/// Compose the UNPADDED `[model effort]` badge body for an activity line
+/// (Z 2026-07-15): the group WORD is gone (the badge is already group-colored
+/// and the group repeated on every row was noise — `claude opus-4-8[1m]` →
+/// `opus-4-8[1m]`, `codex gpt-5.6-sol` → `gpt-5.6-sol`), the model shows for
+/// EVERY group, the effort token is dropped when unknown (`None`, empty, or
+/// `"-"`), and the `fast` token is dropped entirely (the expanded detail's
+/// `model` line keeps it). Callers pad the result to the frame's shared
+/// [`RowMetrics::meta_w`] so the columns line up at the widest visible badge.
+fn activity_meta_body(group: Option<&str>, model: Option<&str>, effort: Option<&str>) -> String {
     // Treat "-"/empty effort as unknown (the fold stamps unknown as "none"/"-").
     let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
-    // Backend-served models are hidden (V6); a model under an UNKNOWN group
-    // still shows — it is the client-requested id from the request body.
-    let model = model
-        .filter(|_| !matches!(group, Some("codex") | Some("grok")))
-        .map(|m| abbrev_model(group, m));
-    let fixed: Vec<&str> = [group, effort, fast.then_some("fast")]
-        .into_iter()
-        .flatten()
-        .collect();
-    let mut parts: Vec<String> = fixed.iter().map(|p| p.to_string()).collect();
-    if let Some(m) = model {
-        // Dynamic budget: the slot minus brackets, the fixed tokens, and one
-        // separator per join — the model is clipped ONLY when the completed
-        // badge would overflow the slot. A zero budget drops the token
-        // entirely rather than leaving a stray one-cell ellipsis.
-        let others: usize = fixed.iter().map(|p| cell_width(p)).sum();
-        let seps = fixed.len(); // one space joins the model to each side used
-        let budget = ACTIVITY_META_WIDTH.saturating_sub(2 + others + seps);
-        let clipped = truncate_cells(m, budget);
-        if !clipped.is_empty() {
-            let insert_at = usize::from(group.is_some()); // model follows group
-            parts.insert(insert_at, clipped);
-        }
+    let model = model.map(|m| abbrev_model(group, m));
+    let parts: Vec<&str> = [model, effort].into_iter().flatten().collect();
+    if parts.is_empty() {
+        return String::new();
     }
-    let body = if parts.is_empty() {
-        String::new()
-    } else {
-        format!("[{}]", parts.join(" "))
-    };
-    // Belt-and-braces: unvalidated effort/group strings could still overflow.
-    let body = truncate_cells(&body, ACTIVITY_META_WIDTH);
-    let pad = ACTIVITY_META_WIDTH.saturating_sub(cell_width(&body));
-    format!("{body}{}", " ".repeat(pad))
+    // Belt-and-braces cap: model/effort ride in from request bodies, so a
+    // hostile value must not blow the shared column past the panel.
+    truncate_cells(&format!("[{}]", parts.join(" ")), META_W_MAX)
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -4452,6 +4598,7 @@ mod tests {
             status_line: None,
             activity_scroll: 0,
             expanded_activity: None,
+            expanded_run: None,
             model_cursor: 0,
             stats_window: super::super::activity::StatsWindow::default(),
             sessions: Vec::new(),
@@ -4878,146 +5025,73 @@ mod tests {
     }
 
     #[test]
-    fn activity_meta_abbreviates_claude_prefix_only(/* issue #2, 2b */) {
-        // Claude models drop the redundant `claude-` prefix.
+    fn activity_meta_body_drops_group_word_and_vendor_prefix(/* Z 2026-07-15 */) {
+        // Claude models drop the redundant `claude-` prefix AND the group
+        // word: `claude opus-4-8[1m]` → `opus-4-8[1m]`.
         assert_eq!(
-            activity_meta(Some("claude"), Some("claude-opus-4-8"), None, false).trim_end(),
-            "[claude opus-4-8]"
+            activity_meta_body(Some("claude"), Some("claude-opus-4-8[1m]"), None),
+            "[opus-4-8[1m]]"
         );
-        // Codex/grok rows HIDE the served backend model (UI-4 V6): it is
-        // config-pinned and repeats the group label on every row.
+        // Codex/grok rows now SHOW their served model, minus the group word.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high"), false).trim_end(),
-            "[codex high]"
-        );
-        assert_eq!(
-            activity_meta(Some("grok"), Some("grok-4.5"), Some("high"), false).trim_end(),
-            "[grok high]"
-        );
-        // A claude model without the prefix, and unknown groups, pass through
-        // (an unknown group's model is the client-requested id — shown).
-        assert_eq!(
-            activity_meta(Some("claude"), Some("opus-4-8"), None, false).trim_end(),
-            "[claude opus-4-8]"
+            activity_meta_body(Some("codex"), Some("gpt-5.6-sol"), Some("high")),
+            "[gpt-5.6-sol high]"
         );
         assert_eq!(
-            activity_meta(None, Some("claude-haiku-4-5"), None, false).trim_end(),
-            "[claude-haiku-4-5]",
-            "no group → no claude- stripping; whole badge fits, so no clip"
+            activity_meta_body(Some("grok"), Some("grok-4.5"), Some("high")),
+            "[grok-4.5 high]"
         );
-        // The model is clipped ONLY when the completed badge would overflow
-        // the slot — and to exactly the cells the other tokens leave over.
+        // No group → no claude- stripping (the id is the client-requested one).
         assert_eq!(
-            activity_meta(
-                Some("claude"),
-                Some("claude-haiku-4-5-20251001"),
-                Some("medium"),
-                false
-            )
-            .trim_end(),
-            "[claude haiku-4-5… medium]"
+            activity_meta_body(None, Some("claude-haiku-4-5"), None),
+            "[claude-haiku-4-5]"
         );
-        // Nothing known → an all-blank slot of the same fixed width.
-        assert_eq!(
-            activity_meta(None, None, None, false),
-            " ".repeat(ACTIVITY_META_WIDTH)
-        );
+        // Nothing known → empty body (the caller pads the shared slot).
+        assert_eq!(activity_meta_body(None, None, None), "");
     }
 
     #[test]
-    fn activity_meta_is_fixed_width(/* UI-4 V5 */) {
+    fn activity_meta_body_caps_hostile_width_and_pads_via_pad_cells() {
+        // Belt-and-braces: a hostile model id cannot exceed the cap…
+        let hostile = activity_meta_body(Some("claude"), Some(&"x".repeat(100)), Some("high"));
+        assert!(cell_width(&hostile) <= META_W_MAX);
+        // …including wide (CJK) + context-sensitive sequences (VS16/ZWJ) —
+        // the contract is display CELLS, not chars.
         for meta in [
-            activity_meta(Some("claude"), Some("claude-fable-5"), Some("high"), false),
-            activity_meta(
-                Some("claude"),
-                Some("claude-sonnet-4-5"),
-                Some("medium"),
-                false,
-            ),
-            // Overflowing model → clipped back to exactly the slot.
-            activity_meta(
-                Some("claude"),
-                Some("claude-haiku-4-5-20251001"),
-                Some("medium"),
-                false,
-            ),
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true),
-            activity_meta(Some("grok"), Some("grok-4.5"), None, false),
-            activity_meta(None, None, None, false),
-            // Wide (CJK) metadata still occupies exactly the slot — the
-            // contract is display CELLS, not chars (review MUST-FIX 1).
-            activity_meta(
-                Some("claude"),
-                Some("모델-한글-이름-아주-긴-경우"),
-                Some("high"),
-                false,
-            ),
-            activity_meta(Some("한글그룹"), None, Some("높음"), false),
-            // Context-sensitive sequences (VS16 emoji presentation, ZWJ
-            // families, skin-tone modifiers) — truncation re-measures the
-            // WHOLE string with the same accounting as the final padding,
-            // so these cannot shift the column either (review R2).
-            activity_meta(
+            activity_meta_body(Some("claude"), Some("모델-한글-이름-아주-긴-경우"), Some("high")),
+            activity_meta_body(
                 Some("claude"),
                 Some("☂\u{fe0f}-model-\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-\u{1f44d}\u{1f3fd}-very-long-tail"),
                 Some("high"),
-                false,
             ),
-            activity_meta(
-                Some("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"),
-                None,
-                Some("☂\u{fe0f}\u{1f44d}\u{1f3fd}"),
-                false,
-            ),
-            // Fixed tokens eating the whole slot → the model token is
-            // DROPPED (no stray one-cell ellipsis), the badge itself clips.
-            {
-                let meta = activity_meta(
-                    Some("a-very-long-group-name-x"),
-                    Some("some-model"),
-                    Some("effort-that-overflows"),
-                    true,
-                );
-                assert!(
-                    !meta.contains("some-model"),
-                    "zero-budget model token is dropped, got {meta:?}"
-                );
-                meta
-            },
         ] {
-            assert_eq!(
-                cell_width(&meta),
-                ACTIVITY_META_WIDTH,
-                "badge {meta:?} must occupy the fixed slot"
-            );
+            assert!(cell_width(&meta) <= META_W_MAX, "badge {meta:?} within cap");
+        }
+        // And the caller-side padding lands every body on the shared width.
+        for body in ["", "[opus-4-8 low]", "[gpt-5.6-sol max]"] {
+            assert_eq!(cell_width(&pad_cells(body, 20)), 20);
         }
     }
 
     #[test]
-    fn activity_meta_appends_effort_and_fast_space_separated() {
-        // Effort + fast render as bare space-separated tokens (no `·`).
+    fn activity_meta_body_effort_rules(/* fast token removed, Z 2026-07-15 */) {
+        // Effort renders as a bare space-separated token; `fast` never shows.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true).trim_end(),
-            "[codex max fast]"
+            activity_meta_body(Some("codex"), Some("gpt-5.6-sol"), Some("max")),
+            "[gpt-5.6-sol max]"
         );
-        // Claude never fast; effort shows when known.
         assert_eq!(
-            activity_meta(Some("claude"), Some("fable-5"), Some("low"), false).trim_end(),
-            "[claude fable-5 low]"
+            activity_meta_body(Some("claude"), Some("fable-5"), Some("low")),
+            "[fable-5 low]"
         );
         // Unknown effort ("-"/empty) is omitted — no trailing token.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("-"), false).trim_end(),
-            "[codex]"
+            activity_meta_body(Some("codex"), Some("gpt-5.6-sol"), Some("-")),
+            "[gpt-5.6-sol]"
         );
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some(""), false).trim_end(),
-            "[codex]"
-        );
-        // Fast with unknown effort still appends only the fast token.
-        assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).trim_end(),
-            "[codex fast]"
+            activity_meta_body(Some("codex"), Some("gpt-5.6-sol"), Some("")),
+            "[gpt-5.6-sol]"
         );
     }
 
@@ -5109,8 +5183,8 @@ mod tests {
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         assert!(
-            text.contains("[claude opus-4-8]"),
-            "in-flight badge without effort/fast is [group model] only"
+            text.contains("[opus-4-8]"),
+            "in-flight badge without effort is [model] only — no group word (Z 2026-07-15)"
         );
         assert!(
             !text.contains("claude-opus-4-8"),
@@ -5135,16 +5209,75 @@ mod tests {
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
-        // Scope the absence check to the activity ROW — other surfaces (the
-        // models strip, group-settings bar, expanded detail) intentionally
-        // keep the served id (SSOT V6 covers activity rows only).
-        let row = text
-            .lines()
-            .find(|l| l.contains("[codex max fast]"))
-            .expect("in-flight badge carries effort + fast");
+        // Z 2026-07-15: the served model now SHOWS on activity rows (group
+        // word dropped instead), and the `fast` token is gone from the badge.
         assert!(
-            !row.contains("gpt-5.6-sol"),
-            "the served backend model is hidden on the activity row (UI-4 V6), got: {row}"
+            text.contains("[gpt-5.6-sol max]"),
+            "in-flight badge is [model effort], no group word, no fast token"
+        );
+        assert!(
+            !text.contains("[codex max fast]") && !text.contains("max fast]"),
+            "the fast token no longer rides the badge"
+        );
+    }
+
+    #[test]
+    fn completed_row_layout_puts_excerpt_last_at_full_width(/* Z 2026-07-15 */) {
+        // Row contract: time · kind · [model effort] · email(10) → status
+        // dur tok $ … "excerpt", with the excerpt LAST and spending the rest
+        // of the panel width.
+        let mut view = view_with(Vec::new());
+        view.completed = vec![Completed {
+            at: UNIX_EPOCH + Duration::from_millis(1_000),
+            body: CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages?beta=true".into(),
+                account: Some("claude:someone@example.com".into()),
+                status: 200,
+                duration: Duration::from_millis(3_100),
+                tokens: Some(super::super::TokenCounts {
+                    input: 100,
+                    output: 169,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: Some("high".into()),
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
+            },
+        }];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
+        let row = rows
+            .iter()
+            .find(|l| l.contains("[opus-4-8 high]"))
+            .expect("activity row rendered with the [model effort] badge");
+        // Column order: kind before badge, badge before email, email before
+        // status block, excerpt last.
+        let pos = |needle: &str| row.find(needle).unwrap_or(usize::MAX);
+        assert!(pos("user") < pos("[opus-4-8 high]"), "kind → badge: {row}");
+        assert!(
+            pos("[opus-4-8 high]") < pos("someone@e"),
+            "badge → email: {row}"
+        );
+        // The email column clips to 10 cells (`someone@e…`).
+        assert!(pos("someone@e") < pos("200"), "email → status: {row}");
+        // The excerpt (opening quote) comes after the status block. Wide CJK
+        // chars render with buffer filler cells ("고 쳐 줘"), so compare the
+        // space-stripped row for content checks.
+        assert!(
+            pos("200") < pos("\u{201c}"),
+            "status block → excerpt last: {row}"
+        );
+        assert!(row.contains("269tok"), "token column: {row}");
+        assert!(row.contains('$'), "cost column: {row}");
+        let flat: String = row.chars().filter(|c| *c != ' ').collect();
+        assert!(
+            flat.contains("마지막이다"),
+            "excerpt not clipped at the old 12-char cap: {row}"
         );
     }
 
@@ -5298,7 +5431,8 @@ mod tests {
             path: "/b".into(),
             status: 200,
         };
-        // Entry 1 occupies rows 11..14 (expanded: 3 rows), entry 2 is row 14.
+        // Entry 1 occupies rows 11..14 (expanded: 3 rows), entry 2 is a
+        // folded-run HEADER on row 14.
         let chrome = ActivityChrome {
             area,
             hits: vec![
@@ -5306,19 +5440,34 @@ mod tests {
                     key: k1.clone(),
                     y_start: 11,
                     height: 3,
+                    kind: ActivityHitKind::Entry,
                 },
                 ActivityHit {
                     key: k2.clone(),
                     y_start: 14,
                     height: 1,
+                    kind: ActivityHitKind::RunHeader { expanded: false },
                 },
             ],
         };
         // Clicks within entry 1's row span (any of 11,12,13) map to k1.
-        assert_eq!(hit_test_activity(&chrome, 5, 11), Some(k1.clone()));
-        assert_eq!(hit_test_activity(&chrome, 5, 13), Some(k1));
-        // Row 14 → entry 2.
-        assert_eq!(hit_test_activity(&chrome, 5, 14), Some(k2));
+        assert_eq!(
+            hit_test_activity(&chrome, 5, 11),
+            Some(ActivityClick::Entry(k1.clone()))
+        );
+        assert_eq!(
+            hit_test_activity(&chrome, 5, 13),
+            Some(ActivityClick::Entry(k1))
+        );
+        // Run header row 14: the marker zone toggles, the body expands.
+        assert_eq!(
+            hit_test_activity(&chrome, RUN_MARKER_ZONE - 1, 14),
+            Some(ActivityClick::RunToggle(k2.clone()))
+        );
+        assert_eq!(
+            hit_test_activity(&chrome, RUN_MARKER_ZONE, 14),
+            Some(ActivityClick::RunExpand(k2))
+        );
         // The title/border row (y=10) and below the last entry map to nothing.
         assert_eq!(hit_test_activity(&chrome, 5, 10), None);
         assert_eq!(hit_test_activity(&chrome, 5, 15), None);
@@ -5580,7 +5729,7 @@ mod tests {
         // A click on the row's first line maps back to the same key.
         assert_eq!(
             hit_test_activity(&layout, layout.area.x + 1, hit.y_start),
-            Some(key.clone())
+            Some(ActivityClick::Entry(key.clone()))
         );
 
         // Now render expanded and confirm the detail lines show.
