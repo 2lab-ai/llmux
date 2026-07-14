@@ -73,6 +73,22 @@ pub async fn list(args: AccountsArgs, remote: Option<String>) -> Result<(), CliE
                     );
                 }
             }
+            AccountCredential::Grok {
+                subject,
+                expires_at_ms,
+                ..
+            } => {
+                println!("  [{}] {} (grok)", i + 1, account.name);
+                if args.verbose {
+                    if !subject.is_empty() {
+                        println!("       Subject: {subject}");
+                    }
+                    println!(
+                        "       Token: {}",
+                        describe_expiry(*expires_at_ms, now_ms())
+                    );
+                }
+            }
         }
     }
     Ok(())

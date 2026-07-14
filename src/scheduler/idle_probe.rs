@@ -149,6 +149,12 @@ impl<P: Prober> IdleProber<P> {
         let Some(credential) = self.pool.credential(account) else {
             return false;
         };
+        // Grok accounts NEVER produce window data (no quota headers, no
+        // usage endpoint — docs/grok/spec.md §R3), so `probe_eligible`'s
+        // "no window" test would re-probe them forever. Spend nothing.
+        if matches!(credential, AccountCredential::Grok { .. }) {
+            return false;
+        }
         if !self.try_acquire(account, now) {
             return false;
         }

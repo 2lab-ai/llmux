@@ -3,6 +3,7 @@
 
 pub mod codex;
 pub mod credentials;
+pub mod grok;
 pub mod oauth;
 pub mod profile;
 
@@ -46,4 +47,8 @@ pub enum AuthError {
     /// the codex provider cannot work without.
     #[error("codex auth data invalid: {0}")]
     CodexAuth(&'static str),
+    /// An xAI discovery/device/token response lacked or malformed a field
+    /// the grok flow cannot work without.
+    #[error("grok auth data invalid: {0}")]
+    GrokAuth(&'static str),
 }

@@ -114,6 +114,7 @@ fn default_name(config: &Config, credential: &AccountCredential) -> String {
         AccountCredential::Oauth { .. } => "account-",
         AccountCredential::Apikey { .. } => "api-",
         AccountCredential::Codex { .. } => "codex-",
+        AccountCredential::Grok { .. } => "grok-",
     };
     let mut n = config
         .accounts

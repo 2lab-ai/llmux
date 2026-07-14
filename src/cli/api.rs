@@ -41,6 +41,11 @@ pub async fn run(args: ApiArgs) -> Result<(), CliError> {
             .get(&url)
             .header("authorization", format!("Bearer {access_token}"))
             .header("chatgpt-account-id", account_id),
+        // Debug GETs with a grok credential: plain Bearer; the caller is
+        // expected to pass a full grok backend URL.
+        AccountCredential::Grok { access_token, .. } => client
+            .get(&url)
+            .header("authorization", format!("Bearer {access_token}")),
     };
 
     let response = request

@@ -1940,6 +1940,7 @@ fn draw_activity(
             let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
                 Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
                 Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
+                Some(BackendGroup::Grok) => (anim::block_spin(anim_frame), Color::Yellow),
                 None => (anim::braille_spin(anim_frame), Color::DarkGray),
             };
             let mut spans = vec![
@@ -2236,6 +2237,7 @@ fn group_color(group: Option<&str>) -> Style {
     match group {
         Some("codex") => Style::new().fg(Color::Cyan),
         Some("claude") => Style::new().fg(Color::Magenta),
+        Some("grok") => Style::new().fg(Color::Yellow),
         _ => dim(),
     }
 }
