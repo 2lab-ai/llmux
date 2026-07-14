@@ -1628,7 +1628,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
