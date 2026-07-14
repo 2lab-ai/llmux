@@ -244,6 +244,12 @@ pub(crate) enum Overlay {
     /// Session timeline (issue #34): persisted raw-io grouped by
     /// `metadata.user_id` into confidence-labeled per-session aggregates.
     Sessions,
+    /// Everything-else surface (UI-3 U6 "기타"): keybindings, build info,
+    /// daemon facts — the glance answers that fit no other tab.
+    Misc,
+    /// Read-only config surface (UI-3 U6): the live daemon settings the
+    /// dashboard knows (scheduler / codex / display), with their toggles.
+    Config,
 }
 
 /// UI-local state the renderer needs besides the data view: cursor, panes,
@@ -381,6 +387,9 @@ struct App {
     /// panel rect + the clickable request rows. Recorded by the event loop after
     /// each `draw`, read by the mouse handler to map a click to an entry.
     activity_chrome: ui::ActivityChrome,
+    /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
+    /// one rect per tab label. Same record/read cycle as `activity_chrome`.
+    tab_chrome: Vec<ui::TabHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -432,6 +441,7 @@ impl App {
             activity_scroll: 0,
             expanded_activity: None,
             activity_chrome: ui::ActivityChrome::default(),
+            tab_chrome: Vec::new(),
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
@@ -556,6 +566,8 @@ impl App {
             Overlay::Stats => self.on_key_stats(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
+            Overlay::Misc => self.on_key_misc(key.code),
+            Overlay::Config => self.on_key_config(key.code),
         }
     }
 
@@ -571,7 +583,18 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
-        // Only MAIN (no overlay, no pending mode interaction) gets the mouse.
+        // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
+        // interaction is pending — the tab bar is how the mouse navigates.
+        if self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
+                self.open_tab(tab, view);
+                return true;
+            }
+        }
+        // Otherwise only MAIN (no overlay, no pending mode interaction) gets
+        // the mouse.
         if self.overlay != Overlay::None || self.mode != Mode::Normal {
             return false;
         }
@@ -636,6 +659,40 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
             _ => {}
+        }
+    }
+
+    /// Key handling for the Misc overlay (`?`, UI-3 U6). `?`/`Esc` closes.
+    fn on_key_misc(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Config overlay (`c`, UI-3 U6). `c`/`Esc` closes.
+    fn on_key_config(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Open the surface a tab click selected (UI-3 U6). Stats and Sessions go
+    /// through their openers (the guard / the background load); the rest are
+    /// plain overlay switches. Clicking the active tab returns to MAIN.
+    fn open_tab(&mut self, tab: Overlay, view: Option<&DashboardView>) {
+        if tab == self.overlay {
+            self.overlay = Overlay::None;
+            return;
+        }
+        match tab {
+            Overlay::None => self.overlay = Overlay::None,
+            Overlay::Stats => self.open_stats(view),
+            Overlay::Sessions => self.open_sessions(),
+            other => self.overlay = other,
         }
     }
 
@@ -721,6 +778,9 @@ impl App {
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
+            // Misc (keys/build facts) + Config surfaces (UI-3 U6).
+            KeyCode::Char('?') => self.overlay = Overlay::Misc,
+            KeyCode::Char('c') => self.overlay = Overlay::Config,
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -1886,7 +1946,9 @@ async fn event_loop(
             // left-click in the next input drain maps to the right entry.
             let mut hits = None;
             terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome, &mut hits))?;
-            app.activity_chrome = hits.unwrap_or_default();
+            let main = hits.unwrap_or_default();
+            app.activity_chrome = main.activity;
+            app.tab_chrome = main.tabs;
         }
     }
 }
@@ -2156,6 +2218,68 @@ mod tests {
                 "MAIN expansion survives the round-trip"
             );
         }
+    }
+
+    /// UI-3 U6: tab clicks switch surfaces from ANY overlay; clicking the
+    /// active tab returns to MAIN; text-entry modes keep the mouse out.
+    #[test]
+    fn tab_click_switches_overlay_and_active_tab_toggles_back() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.tab_chrome = vec![
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 1,
+                    y: 2,
+                    width: 9,
+                    height: 1,
+                },
+                overlay: Overlay::None,
+            },
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 13,
+                    y: 2,
+                    width: 8,
+                    height: 1,
+                },
+                overlay: Overlay::Config,
+            },
+        ];
+        let click = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Click config tab from MAIN → Config opens.
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::Config);
+        // Tab clicks still work WITH an overlay open: click dashboard → MAIN.
+        assert!(app.on_mouse(click(2, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // Clicking the active tab toggles back to MAIN too.
+        app.overlay = Overlay::Config;
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // A pending text-entry mode keeps the mouse out entirely.
+        app.mode = Mode::AddKey;
+        assert!(!app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
+    #[test]
+    fn misc_and_config_keys_round_trip() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('?'), None);
+        assert_eq!(app.overlay, Overlay::Misc);
+        app.on_key_misc(KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key_main(KeyCode::Char('c'), None);
+        assert_eq!(app.overlay, Overlay::Config);
+        app.on_key_config(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     /// `a` opens the Accounts overlay; `Esc` returns to MAIN.

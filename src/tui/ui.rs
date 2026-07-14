@@ -175,7 +175,7 @@ pub(crate) fn draw(
     frame: &mut Frame,
     view: Option<&DashboardView>,
     chrome: &Chrome,
-    hits: &mut Option<ActivityChrome>,
+    hits: &mut Option<MainChrome>,
 ) {
     // No activity panel hit-targets until MAIN draws one this frame (cleared so
     // a stale layout from a previous frame can never mis-map a click).
@@ -212,6 +212,8 @@ pub(crate) fn draw(
         Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
         Overlay::Logs => draw_logs_overlay(frame, view),
         Overlay::Sessions => draw_sessions_overlay(frame, &ctx, chrome),
+        Overlay::Misc => draw_misc_overlay(frame, view),
+        Overlay::Config => draw_config_overlay(frame, view, chrome),
     }
 
     // The footer keybar is part of the chrome and reflects the active overlay /
@@ -281,7 +283,7 @@ fn draw_main(
     ctx: &FrameCtx,
     chrome: &Chrome,
     now: SystemTime,
-    hits: &mut Option<ActivityChrome>,
+    hits: &mut Option<MainChrome>,
 ) {
     let snapshot = &view.snapshot;
     // Event banner (config `events`): ONE line pinned to the very top while an
@@ -299,9 +301,10 @@ fn draw_main(
     } else {
         0
     };
-    let [banner_area, header_area, table_area, middle_area, strip_area, activity_area, footer_area] =
+    let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, footer_area] =
         Layout::vertical([
             Constraint::Length(banner_height),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(table_height),
             Constraint::Length(8),
@@ -315,15 +318,54 @@ fn draw_main(
         frame.render_widget(Paragraph::new(line), banner_area);
     }
     draw_header(frame, header_area, view, chrome);
+    let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
     draw_accounts(frame, table_area, view, ctx, chrome);
     draw_middle(frame, middle_area, view, ctx, chrome);
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
     }
-    *hits = Some(draw_activity(frame, activity_area, view, chrome, now));
+    let activity = draw_activity(frame, activity_area, view, chrome, now);
+    *hits = Some(MainChrome { activity, tabs });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
     let _ = footer_area;
+}
+
+/// The tab strip (UI-3 U6): one row of clickable surface names right under
+/// the header. The active surface renders reversed; every label's rect is
+/// returned for the mouse hit-test. Keyboard shortcuts keep working — the
+/// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut tabs: Vec<TabHit> = Vec::new();
+    let mut x = area.x + 1;
+    for (i, (label, overlay)) in TABS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", dim()));
+            x += 3;
+        }
+        let style = if *overlay == active {
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        let width = label.chars().count() as u16;
+        spans.push(Span::styled(*label, style));
+        tabs.push(TabHit {
+            area: Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            overlay: *overlay,
+        });
+        x += width;
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    tabs
 }
 
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
@@ -682,6 +724,138 @@ fn ms_to_systemtime(ms: u64) -> SystemTime {
 /// The rect a summoned overlay covers: the whole screen except the bottom two
 /// rows reserved for the footer keybar, so MAIN's footer slot is never double
 /// drawn and the keybar stays visible under the overlay.
+/// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
+/// keybindings and build/daemon facts. Read-only.
+fn draw_misc_overlay(frame: &mut Frame, view: &DashboardView) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let key = |k: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("   {k:<10}"), Style::new().fg(Color::Cyan)),
+            Span::raw(what),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
+        key("a g l s", "accounts / stats / logs / sessions"),
+        key("? c", "this surface / config"),
+        key("click", "tabs switch · activity row expands"),
+        key("wheel", "activity history"),
+        key("f m e", "codex fast / model / effort"),
+        key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("q Esc", "quit / back to dashboard"),
+        Line::default(),
+        Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw(format!("   llmux {}", view.display_version()))),
+        Line::from(Span::raw(format!(
+            "   daemon pid {} · port {} · up {}",
+            view.pid,
+            view.port,
+            format::countdown(view.uptime)
+        ))),
+    ];
+    let block = Block::new().borders(Borders::TOP).title(" misc ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Config overlay (`c`, UI-3 U6): the live daemon settings the dashboard
+/// document carries, each annotated with the key/surface that changes it.
+/// Read-only projection — mutations go through the same paths as always.
+fn draw_config_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let row = |label: &'static str, value: String, hint: &'static str| {
+        Line::from(vec![
+            Span::styled(format!(" {label:<16}"), dim()),
+            Span::raw(value),
+            Span::styled(format!("   {hint}"), dim()),
+        ])
+    };
+    let p = &view.select_params;
+    let quota = chrome.quota_display_override.unwrap_or(view.quota_display);
+    let lines = vec![
+        Line::from(Span::styled(
+            " scheduler",
+            dim().add_modifier(Modifier::BOLD),
+        )),
+        row("mode", p.mode.label().to_string(), "[S]"),
+        row(
+            "ceilings",
+            format!(
+                "5h {:.0}% · 7d {:.0}% · fbl {:.0}%",
+                p.five_hour_max * 100.0,
+                p.seven_day_max * 100.0,
+                p.fable_weekly_max * 100.0
+            ),
+            "config / [L] per-account",
+        ),
+        row(
+            "usage max age",
+            format!("{}s", p.usage_max_age.as_secs()),
+            "config",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" codex", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "model",
+            view.codex.model.clone(),
+            "[m] cycle · groups bar click",
+        ),
+        row(
+            "effort",
+            view.codex
+                .effort
+                .clone()
+                .unwrap_or_else(|| "bypass (client)".into()),
+            "[e] cycle",
+        ),
+        row(
+            "fast",
+            if view.codex.fast { "on" } else { "off" }.into(),
+            "[f] toggle",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" display", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "quota fill",
+            match quota {
+                crate::config::QuotaDisplay::Used => "used%".into(),
+                crate::config::QuotaDisplay::Remaining => "remaining%".into(),
+            },
+            "[u]",
+        ),
+        row(
+            "reset display",
+            if chrome.reset_absolute {
+                "absolute UTC"
+            } else {
+                "countdown"
+            }
+            .into(),
+            "[t]",
+        ),
+        row(
+            "email mask",
+            if view.email_anonymous { "on" } else { "off" }.into(),
+            "config email_anonymous",
+        ),
+        Line::default(),
+        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
+        row(
+            "upstream",
+            view.upstream.clone().unwrap_or_else(|| "—".into()),
+            "config",
+        ),
+        row(
+            "config path",
+            view.config_path.clone().unwrap_or_else(|| "—".into()),
+            "[R] reload (local)",
+        ),
+    ];
+    let block = Block::new().borders(Borders::TOP).title(" config ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn overlay_rect(area: Rect) -> Rect {
     Rect {
         x: area.x,
@@ -1960,6 +2134,44 @@ fn window_detail_line(
 /// stable [`ActivityKey`], and the absolute screen rows it occupies this frame
 /// (`y_start..y_start+height`). Recorded during [`draw_activity`] so the mouse
 /// handler can map a click to the entry without re-deriving the layout.
+/// The tab strip (UI-3 U6): label + which surface it opens. `Overlay::None`
+/// is the dashboard (MAIN) itself.
+pub(crate) const TABS: &[(&str, Overlay)] = &[
+    ("dashboard", Overlay::None),
+    ("accounts", Overlay::Accounts),
+    ("stats", Overlay::Stats),
+    ("logs", Overlay::Logs),
+    ("sessions", Overlay::Sessions),
+    ("misc", Overlay::Misc),
+    ("config", Overlay::Config),
+];
+
+/// One clickable tab label's rendered rect (UI-3 U6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabHit {
+    pub area: Rect,
+    pub overlay: Overlay,
+}
+
+/// Pure hit-test: which tab, if any, does the click at absolute `(col, row)`
+/// land on?
+pub(crate) fn hit_test_tabs(tabs: &[TabHit], col: u16, row: u16) -> Option<Overlay> {
+    tabs.iter()
+        .find(|t| {
+            row >= t.area.y && row < t.area.bottom() && col >= t.area.x && col < t.area.right()
+        })
+        .map(|t| t.overlay)
+}
+
+/// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
+/// activity panel's rows plus the tab bar. Threaded back to the runtime the
+/// same way `ActivityChrome` alone used to be.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MainChrome {
+    pub activity: ActivityChrome,
+    pub tabs: Vec<TabHit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActivityHit {
     pub key: ActivityKey,
@@ -3206,6 +3418,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" logs  "),
                     key("s"),
                     Span::raw(" sessions  "),
+                    key("?"),
+                    Span::raw(" misc  "),
+                    key("c"),
+                    Span::raw(" config  "),
                 ];
                 if attached {
                     spans.push(Span::styled("R disabled (attached)  ", dim()));
@@ -3268,6 +3484,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             Overlay::Logs => Line::from(vec![
                 Span::raw(" logs — "),
                 key("l/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            Overlay::Misc => Line::from(vec![
+                Span::raw(" misc — "),
+                key("?/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            Overlay::Config => Line::from(vec![
+                Span::raw(" config — "),
+                key("c/Esc"),
                 Span::raw(" back  "),
                 key("q"),
                 Span::raw(" quit"),
@@ -4316,6 +4546,57 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_records_seven_hit_targets_and_hit_test_maps_labels() {
+        let view = view_with(Vec::new());
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let chrome = chrome_overlay(Overlay::None);
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let tabs = hits.expect("layout").tabs;
+        assert_eq!(tabs.len(), TABS.len(), "one hit target per tab");
+        for (hit, (label, overlay)) in tabs.iter().zip(TABS) {
+            assert_eq!(hit.overlay, *overlay);
+            assert_eq!(hit.area.width as usize, label.chars().count());
+            // A click anywhere on the label maps to its overlay.
+            assert_eq!(
+                hit_test_tabs(&tabs, hit.area.x, hit.area.y),
+                Some(*overlay),
+                "{label}"
+            );
+            assert_eq!(
+                hit_test_tabs(&tabs, hit.area.right() - 1, hit.area.y),
+                Some(*overlay),
+                "{label} right edge"
+            );
+        }
+        // The separator between the first two labels maps to nothing.
+        let gap_x = tabs[0].area.right() + 1;
+        assert_eq!(hit_test_tabs(&tabs, gap_x, tabs[0].area.y), None);
+        // A different row maps to nothing.
+        assert_eq!(
+            hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_bar_renders_all_labels_and_marks_the_active_surface() {
+        let view = view_with(Vec::new());
+        for (label, overlay) in TABS {
+            let text = render(&view, &chrome_overlay(*overlay), 200, 40);
+            assert!(text.contains(label), "{label} visible");
+        }
+        // Misc/config overlays render their surfaces.
+        let text = render(&view, &chrome_overlay(Overlay::Misc), 200, 40);
+        assert!(text.contains("keys"), "misc shows keybindings");
+        let text = render(&view, &chrome_overlay(Overlay::Config), 200, 40);
+        assert!(text.contains("scheduler"), "config shows scheduler block");
+        assert!(text.contains("quota fill"), "config shows display block");
+    }
+
+    #[test]
     fn click_expand_recorded_layout_round_trips_to_detail() {
         // Render once to capture the hit layout, find the row a click lands on,
         // set that key expanded, and re-render: the detail lines appear.
@@ -4338,7 +4619,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("activity layout recorded");
+        let layout = hits.expect("activity layout recorded").activity;
         assert!(!layout.hits.is_empty(), "the request row is a hit target");
         let hit = &layout.hits[0];
         // A click on the row's first line maps back to the same key.
@@ -4375,7 +4656,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout");
+        let layout = hits.expect("layout").activity;
         assert!(
             layout.hits.is_empty(),
             "a note line is not a clickable hit target"
