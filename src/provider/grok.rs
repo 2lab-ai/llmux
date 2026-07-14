@@ -353,6 +353,63 @@ pub fn is_valid_config_effort(effort: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_effort_overrides_request_and_unset_bypasses_with_clamp() {
+        use serde_json::json;
+        // BYPASS (no configured effort): the client's output_config.effort
+        // rides through, clamped into the model's level set — `max` on
+        // grok-4.5 (low|medium|high) → high.
+        let body = json!({
+            "model": "grok-4.5",
+            "output_config": { "effort": "max" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let bypass = GrokShape {
+            model: "grok-4.5".into(),
+            client_model: None,
+            effort: None,
+        };
+        let (_, effort) = effective_request_meta(&body, &bypass);
+        assert_eq!(
+            effort.as_deref(),
+            Some("high"),
+            "bypass rides through + clamps"
+        );
+
+        // CONFIGURED effort OVERRIDES the request (UI-3 U12 flip): request
+        // says max, config says low → low goes upstream.
+        let pinned = GrokShape {
+            model: "grok-4.5".into(),
+            client_model: None,
+            effort: Some("low".into()),
+        };
+        let (_, effort) = effective_request_meta(&body, &pinned);
+        assert_eq!(
+            effort.as_deref(),
+            Some("low"),
+            "configured effort overrides"
+        );
+        let (upstream, _) = translate_request_with(&body, "sess", &pinned).expect("translate");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "low",
+            "override reaches the wire"
+        );
+
+        // Configured `none` on a model whose level set lacks `none`
+        // (grok-4.5) clamps to low — never an invalid wire value.
+        let none_pin = GrokShape {
+            model: "grok-4.5".into(),
+            client_model: None,
+            effort: Some("none".into()),
+        };
+        let (_, effort) = effective_request_meta(&body, &none_pin);
+        assert_eq!(
+            effort.as_deref(),
+            Some("low"),
+            "none clamps into the level set"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

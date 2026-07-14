@@ -323,6 +323,8 @@ pub(crate) struct Chrome {
     pub pane_heights: PaneHeights,
     /// Anchor cell of the open right-click context menu (UI-3 U11).
     pub menu_anchor: Option<(u16, u16)>,
+    /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
+    pub chart_days: u64,
 }
 
 /// Attach-mode banner state.
@@ -428,6 +430,8 @@ struct App {
     separator_chrome: Vec<ui::SeparatorHit>,
     /// Session-local pane-height overrides set by separator drags.
     pane_heights: PaneHeights,
+    /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
+    chart_days: u64,
     /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
@@ -437,6 +441,12 @@ struct App {
     setting_chrome: Vec<ui::SettingHit>,
     /// Anchor cell of the open context menu (col, row).
     menu_anchor: Option<(u16, u16)>,
+    /// The REAL account id the open context menu targets, captured at open
+    /// time. Display indexes reorder every frame (selection order follows
+    /// live quota state), so actions re-resolve this name to the CURRENT
+    /// display row at execution — a reorder between open and click can never
+    /// retarget another account (review R1 MUST-FIX 6).
+    menu_account: Option<String>,
     /// Whether the limits editor was opened FROM the context menu (then it
     /// exits to Normal, not back into the switcher).
     limits_from_menu: bool,
@@ -496,10 +506,12 @@ impl App {
             tab_chrome: Vec::new(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
+            chart_days: 14,
             account_row_chrome: Vec::new(),
             menu_chrome: None,
-            setting_chrome: Vec::new(),
             menu_anchor: None,
+            menu_account: None,
+            setting_chrome: Vec::new(),
             limits_from_menu: false,
             drag: None,
             model_cursor: 0,
@@ -553,6 +565,7 @@ impl App {
             reset_absolute: self.reset_absolute,
             pane_heights: self.pane_heights,
             menu_anchor: self.menu_anchor,
+            chart_days: self.chart_days,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -692,6 +705,14 @@ impl App {
                 })
                 .map(|r| r.display_idx)
             {
+                // Pin the REAL account id now; display indexes reorder.
+                self.menu_account = view.and_then(|v| {
+                    let order = v.display_order(SystemTime::now());
+                    order
+                        .get(idx)
+                        .and_then(|&i| v.snapshot.accounts.get(i))
+                        .map(|a| a.id.0.clone())
+                });
                 self.mode = Mode::ContextMenu { idx, item: 0 };
                 self.menu_anchor = Some((mouse.column, mouse.row));
                 return true;
@@ -802,6 +823,16 @@ impl App {
             KeyCode::Char('g') | KeyCode::Esc => self.overlay = Overlay::None,
             // Cycle the heatmap window 24h ↔ 72h (issue #23).
             KeyCode::Char('w') => self.stats_window = self.stats_window.next(),
+            // Cycle the tokens-per-day chart span (UI-3 U14).
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.chart_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.chart_days = spans[next];
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
             KeyCode::PageUp => self.move_model_cursor(-10, len),
@@ -857,13 +888,35 @@ impl App {
     fn close_menu(&mut self) {
         self.mode = Mode::Normal;
         self.menu_anchor = None;
+        self.menu_account = None;
     }
 
-    /// Run one context-menu entry against the display row `idx`. Every action
-    /// reuses the exact key-flow path (switch / pause / limits editor /
-    /// remove confirm), so local and attach behave identically.
-    fn run_menu_item(&mut self, idx: usize, item: usize, view: Option<&DashboardView>) {
+    /// Run one context-menu entry against the account PINNED at menu-open
+    /// time. The display index is re-resolved from the pinned account id at
+    /// execution (rows reorder as live quota state changes); a vanished
+    /// account aborts with a status instead of acting on whoever moved into
+    /// the row. Every action reuses the exact key-flow path (switch / pause /
+    /// limits editor / remove confirm), so local and attach behave
+    /// identically.
+    fn run_menu_item(&mut self, fallback_idx: usize, item: usize, view: Option<&DashboardView>) {
+        let pinned = self.menu_account.clone();
         self.close_menu();
+        let idx = match (&pinned, view) {
+            (Some(name), Some(v)) => {
+                let order = v.display_order(SystemTime::now());
+                match order
+                    .iter()
+                    .position(|&i| v.snapshot.accounts.get(i).is_some_and(|a| a.id.0 == *name))
+                {
+                    Some(pos) => pos,
+                    None => {
+                        self.set_status(format!("{name} is gone — menu action cancelled"));
+                        return;
+                    }
+                }
+            }
+            _ => fallback_idx,
+        };
         match item {
             0 => self.try_manual_switch(idx, view),
             1 => self.toggle_pause_selected(idx, view),

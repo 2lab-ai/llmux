@@ -1044,6 +1044,13 @@ pub enum CompletedDoc {
         fast: bool,
         /// Client identity / message kind / input excerpt (TUI UI-3 U1/U2).
         /// Additive: absent in docs written before these fields existed.
+        ///
+        /// PRIVACY: `excerpt` carries up to 400 chars of PROMPT TEXT into
+        /// this document and the persisted request log — the same class of
+        /// content the raw-io capture already stores verbatim, behind the
+        /// same boundary (loopback-only bind or `proxy.api_key`). The
+        /// renderer-side `email_anonymous` masking applies at DRAW time
+        /// only; it does not redact this wire field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

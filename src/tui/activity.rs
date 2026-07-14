@@ -1405,7 +1405,10 @@ impl ActivityLog {
                         cell.cache_creation = cell
                             .cache_creation
                             .saturating_add(t.cache_creation.unwrap_or(0));
-                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS);
+                        // Keep exactly DAILY_RETAIN_DAYS buckets including
+                        // today (cutoff inclusive — the -1 avoids a 91-day
+                        // window, review R1 nice-to-have 2).
+                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
                         self.daily.retain(|d, _| *d >= cutoff);
                     }
                 }
