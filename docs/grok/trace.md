@@ -19,11 +19,11 @@
    → `DeviceCode{device_code, user_code, verification_uri_complete, expires_in, interval}` →
    print URL+code, best-effort `open` →
    `auth::grok::poll_token(client, token_endpoint, device_code)` POST form
-   `grant_type=urn:ietf:params:oauth:grant-type:device_code` every `interval`s
-   (authorization_pending → continue; slow_down → interval+5s; expired_token/access_denied
-   → terminal error) →
+   `grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code={…}&client_id={ClientID}`
+   every `interval`s (authorization_pending → continue; slow_down → interval+5s;
+   expired_token/access_denied → terminal error) →
    `TokenResponse{access_token, refresh_token, id_token, expires_in}` →
-   `email = jwt_claims(id_token).email` →
+   `email = jwt_claims(id_token).email` (fallback `sub`, then epoch-ms) →
    `AccountConfig{ name: "grok:{email}", credential: AccountCredential::Grok{
      access_token, refresh_token, expires_at_ms: now+expires_in*1000,
      token_endpoint, last_refresh_ms } }` →
@@ -47,8 +47,10 @@
    `login_start_endpoint` → `LoginRegistry.start(Grok)` (single-slot, 409 when busy —
    unchanged) → spawned task: discovery → device code →
    **registry phase gains the URL**: `LoginPhase::Pending{ verification_uri:
-   Some(verification_uri_complete), user_code: Some(user_code) }` (struct-variant
-   extension; Claude/Codex flows leave both `None`) →
+   Some(verification_uri_complete — fallback plain verification_uri when the
+   `_complete` variant is absent), user_code: Some(user_code) }` (struct-variant
+   extension; Claude/Codex flows leave both `None`; islands shows `user_code` beside
+   the opened page so the plain-URI fallback stays usable) →
    poll loop (as T1) → on success `AccountConfig` → **inject into the LIVE pool** +
    persist (same path the daemon-run codex login uses, server.rs:376-381) →
    `LoginPhase::Done{account}`.
@@ -88,7 +90,11 @@
    `tools[]` → `responses::tools_to_functions` →
    upstream JSON `{model:"grok-4.5", instructions, input, tools,
    parallel_tool_calls:true, store:false, stream:true, prompt_cache_key:session_id,
-   reasoning:{effort:"high"}}` (NO `include`, NO `service_tier`) →
+   reasoning:{effort:"high"}}` (NO `include`, NO `service_tier`; `reasoning` OMITTED
+   entirely for models outside the thinking-levels table, e.g. grok-build-0.1;
+   `session_id` = per-process `uuid_v4()`, one per `GrokProvider` instance — same
+   stability contract as codex's `prompt_cache_key`, codex.rs:79-83; it is NOT
+   per-conversation) →
    headers: `Authorization: Bearer {access_token}`, `Accept: text/event-stream`,
    `x-grok-conv-id: {session_id}`, and (upstream == official cli-chat-proxy) identity
    trio `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 0.2.93` /
@@ -122,26 +128,31 @@
    asymmetry) → `state.grok.set_shape(…)` (RwLock write) →
    `config::update_path(c.grok.default_model = …, c.grok.reasoning_effort = …)`.
 4. **Side effects** — next request uses the new shape; config persisted.
-5. **Errors** — config write failure → 200 with live-applied + log warn (parity codex
-   best-effort persist, server.rs:1119-1127).
-6. **Output** — `{ok:true, default_model, reasoning_effort}`.
+5. **Errors** — config write failure → 200 with live-applied, `persisted:false` in the
+   body + log warn (improves on codex's silent best-effort, server.rs:1119-1127;
+   documented asymmetry — codex endpoint unchanged in v1).
+6. **Output** — `{ok:true, default_model, reasoning_effort, persisted:bool}`.
    Islands: settings pane grok row calls this endpoint (LlmuxClient new method).
 
 ## T5 — Quota exhaustion: 429 free-usage-exhausted
 
 1. **Entry** — upstream response inside T3 step "POST …/responses".
-2. **Input** — HTTP 429, body JSON with `code` or `error` containing
-   `free-usage-exhausted` / `included free usage`.
-3. **Layer flow** — forward.rs upstream-error path → new grok arm in the retry_after
-   resolution (forward.rs:1347 kind match): body substring match →
-   `retry_after = Some(24h)` → scheduler parks the account until now+24h (existing
-   park/cooldown machinery — the same path a `Retry-After` header takes) → selection
-   moves to the next grok account; all parked → on_empty semantics (503 or fallback).
-4. **Side effects** — account window state marked limited w/ reset ts; activity event
-   (existing rate-limit event kind).
-5. **Errors** — generic 429 without the marker → existing backoff (no 24h park).
-6. **Output** — client sees retry-on-next-account (transparent) or 503 when the pool is
-   exhausted (existing behavior).
+2. **Input** — HTTP 429; possibly a `Retry-After` header; body JSON possibly with
+   `code`/`error` containing `free-usage-exhausted` / `included free usage`.
+3. **Layer flow** — forward.rs upstream-error path → precedence: (1) `Retry-After`
+   header present → existing generic handling, UNTOUCHED; (2) else marker match in
+   body → new grok arm in the retry_after resolution (forward.rs:1347 kind match):
+   `retry_after = Some(24h)` as an **estimated probe-not-before** (the 429 does not
+   carry the true rolling-window reset; 24h is xAI's advertised window) → scheduler
+   parks the account (same machinery a Retry-After header takes) → selection moves to
+   the next grok account. **All grok accounts parked ≠ empty group**: the request
+   stays in-group and takes the existing all-limited behavior (identical to the claude
+   group today) — `on_empty_group` fires only at zero CONFIGURED accounts (spec §R5).
+4. **Side effects** — account window state marked limited w/ estimated reset ts
+   (surfaces render as estimate); activity event (existing rate-limit event kind).
+5. **Errors** — generic 429 without header or marker → existing backoff (no 24h park).
+6. **Output** — client sees retry-on-next-account (transparent) or the in-group
+   all-limited response when the pool is exhausted (existing behavior).
 
 ## T6 — Stats & status surfaces
 
@@ -166,19 +177,23 @@
 | # | Kind | Asserts | Source trace |
 |---|---|---|---|
 | C1 | Contract | Messages body w/ model grok-4.5 + output_config.effort=xhigh → upstream JSON: model verbatim, reasoning.effort="high" (clamped), NO include/service_tier, store:false | T3 §3 |
-| C2 | Contract | model "gpt-5.6-sol" routes Codex; "grok-4.5" routes Grok; "claude-…" routes Claude; unmatched → default_group | T3 §3 |
+| C2 | Contract | model "gpt-5.6-sol" routes Codex; "grok-4.5" routes Grok; "claude-…" routes Claude; unmatched → default_group; non-empty `routing.grok_models` REPLACES builtin grok rules | T3 §3 |
+| C2b | Contract | on_empty_group="fallback": zero configured grok accounts + grok model → fixed-order fallback (Claude first configured wins) + serving provider's own model rewrite applies; group with only PARKED accounts does NOT fall back | T3 §3, T5 |
 | C3 | Contract | grok headers: Bearer + conv-id + identity trio on official upstream; identity trio ABSENT on custom upstream | T3 §3 |
-| C4 | Sad | effort "none" → "low"; "ultra" → "high"; invalid effort string → shape effort fallback | T3 §3 |
-| C5 | Happy | device-code poll: pending→pending→success sequence yields TokenData; slow_down grows interval | T1 §3 (mock server) |
+| C4 | Sad | effort "none" → "low" (grok-4.5, zero disallowed); "ultra" → "high"; invalid effort string → shape effort fallback; model outside thinking table (grok-build-0.1) → NO reasoning field even with effort configured | T3 §3 |
+| C5 | Happy | device-code poll: form carries grant_type+device_code+client_id; pending→pending→success yields TokenData; slow_down grows interval | T1 §3 (mock server) |
 | C6 | Sad | poll access_denied → terminal error, no config write | T1 §5 |
 | C7 | Contract | AccountCredential::Grok serde round-trip in llmux.json; upsert-by-name idempotent | T1 §3-4 |
-| C8 | Contract | refresh_credential Grok arm posts form grant to stored token_endpoint; new tokens persisted | T3 §3 |
-| C9 | Sad | 429 + free-usage-exhausted body → retry_after 24h park; generic 429 → no explicit park | T5 |
-| C10 | Contract | POST /llmux/grok partial update + persist; invalid effort → 400 | T4 |
-| C11 | Contract | /llmux/login/start grok → status carries verification_uri while pending | T2 |
-| C12 | Regression | ENTIRE existing codex test suite green with codex.rs as adapter (no behavioral diff) | R5 |
+| C8 | Contract | refresh_credential Grok arm: form grant_type=refresh_token+client_id to stored token_endpoint; response WITH refresh_token rotates it, WITHOUT keeps old; expires_at_ms+last_refresh_ms updated in same swap; invalid_grant → Permanent | T3 §3, spec §R1 |
+| C9 | Sad | 429 + marker body (no Retry-After) → 24h estimated park; 429 + Retry-After header → header wins; generic 429 → no explicit park | T5 |
+| C10 | Contract | POST /llmux/grok partial update + persist (response carries persisted:true/false); invalid effort → 400 | T4 |
+| C11 | Contract | /llmux/login/start grok → status carries verification_uri (+user_code) while pending; _complete absent → plain URI fallback | T2 |
+| C12 | Regression | ENTIRE existing codex test suite green with codex.rs as adapter (no behavioral diff), at the extraction commit itself | R5 |
 | C13 | Contract | status JSON: grok account row shape (group/type/gauges null) | T6 |
 | C14 | Contract | pricing: (grok, grok-4.5) → 2.0/6.0/0.5/0.0; (grok, unknown) → grok fallback | T6 §4 |
+| C15 | Contract | client `stream:false` through grok: upstream SSE aggregated to one Anthropic JSON response w/ usage (same path codex takes today) | T3 §3/§6 |
+| C16 | Contract | flavor-parameterized translation: system folding, tools_to_functions, tool_use/tool_result round trip, SSE→Anthropic events, usage extraction — asserted under the GROK flavor (not only codex) | T3 §3, R5 |
+| C17 | Regression | pre-grok config (no grok fields) parses + round-trips byte-stable; additive-only guarantee | spec §Compatibility |
 
 Swift (islands) — unit-light per repo convention: provider(of:) mapping test if a test
 target exists for it; otherwise receipt = snapshot/live capture.
