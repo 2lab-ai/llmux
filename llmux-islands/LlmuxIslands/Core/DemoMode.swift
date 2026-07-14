@@ -30,6 +30,7 @@ enum DemoMode {
     struct ForcedInFlight: Equatable {
         var claude: Int?
         var codex: Int?
+        var grok: Int?
     }
 
     static let forcedInFlight: ForcedInFlight? =
@@ -49,6 +50,7 @@ enum DemoMode {
             switch pair[0].trimmingCharacters(in: .whitespaces).lowercased() {
             case "claude": forced.claude = value
             case "codex": forced.codex = value
+            case "grok": forced.grok = value
             default: break
             }
         }
