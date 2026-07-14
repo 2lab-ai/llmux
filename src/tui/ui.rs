@@ -1199,23 +1199,32 @@ fn draw_context_menu(
         return MenuChrome::default();
     };
     // The PINNED account id governs what the menu says — the same identity
-    // execution acts on (review R2: rendering from the live display index
-    // could name account B while the click acted on pinned A after a
-    // reorder). The index is only the fallback when no pin exists (tests /
-    // keyboard-driven states).
-    let target = chrome
-        .menu_account
-        .as_deref()
-        .and_then(|name| view.snapshot.accounts.iter().find(|a| a.id.0 == name))
-        .or_else(|| {
+    // execution acts on (review R2/R3). The explicit match keeps "no pin"
+    // (index fallback — keyboard-driven/test states) distinct from "pinned
+    // account VANISHED": a vanished pin must never fall back to whoever now
+    // occupies the row (execution would cancel while the menu named someone
+    // else) — it renders as gone instead.
+    let (target, gone) = match chrome.menu_account.as_deref() {
+        Some(name) => {
+            let found = view.snapshot.accounts.iter().find(|a| a.id.0 == name);
+            (found, found.is_none().then(|| name.to_string()))
+        }
+        None => (
             ctx.order
                 .get(idx)
-                .and_then(|&i| view.snapshot.accounts.get(i))
-        });
+                .and_then(|&i| view.snapshot.accounts.get(i)),
+            None,
+        ),
+    };
     let paused = target.is_some_and(|a| a.paused);
-    let name = target
-        .map(|a| row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev))
-        .unwrap_or_else(|| "?".into());
+    let name = match (&gone, target) {
+        (Some(pinned), _) => format!(
+            "{} — gone",
+            row_account_name(pinned, ctx.mask, &view.domain_abbrev)
+        ),
+        (None, Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
+        (None, None) => "?".into(),
+    };
     let items: [&str; 4] = [
         "switch now",
         if paused { "resume" } else { "pause" },
@@ -5258,6 +5267,54 @@ mod tests {
         assert!(text.contains("sched"), "scheduler segment visible");
         assert!(text.contains("effort:bypass"), "codex bypass label visible");
         assert!(text.contains("effort:high"), "grok effort value visible");
+    }
+
+    #[test]
+    fn context_menu_renders_from_pinned_identity_not_row_occupant() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, paused: bool| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![acct("claude:a@x.com", false), acct("claude:b@x.com", true)];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.mode = Mode::ContextMenu { idx: 0, item: 0 };
+        chrome.menu_anchor = Some((10, 6));
+        // Pin B while the display index points at row 0: the menu must name B
+        // and show B's paused state (resume), not the row occupant's.
+        chrome.menu_account = Some("claude:b@x.com".into());
+        let text = render(&view, &chrome, 200, 40);
+        assert!(text.contains("b@x.com"), "menu titled from the pinned id");
+        assert!(
+            text.contains("resume"),
+            "pause/resume label from the pinned id"
+        );
+        // A vanished pin renders as gone — never the row occupant.
+        chrome.menu_account = Some("claude:gone@x.com".into());
+        let text = render(&view, &chrome, 200, 40);
+        assert!(
+            text.contains("gone@x.com — gone"),
+            "vanished pin marked gone"
+        );
+        assert!(
+            !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
+            "no fallback to the row occupant"
+        );
     }
 
     #[test]
