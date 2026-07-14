@@ -66,6 +66,7 @@ fn qml_visual_system_matches_the_macos_island_language_without_system_chrome() {
         "IslandProgressBar.qml",
         "IslandSegmentedControl.qml",
         "IslandDialog.qml",
+        "IslandFieldLabel.qml",
     ] {
         assert!(
             build.contains(&format!(r#".qml_file("qml/{component}")"#)),
@@ -147,6 +148,50 @@ fn production_surfaces_use_provider_quota_segment_and_receipt_hierarchy() {
     ] {
         assert!(menu.contains(marker), "Menu must contain {marker}");
     }
+}
+
+#[test]
+fn offscreen_snapshot_controls_keep_labels_and_account_actions_visible() {
+    let field_label = read("qml/IslandFieldLabel.qml");
+    for marker in [
+        "color: IslandTheme.secondaryText",
+        "font.family: IslandTheme.monoFamily",
+        "horizontalAlignment: Text.AlignRight",
+    ] {
+        assert!(
+            field_label.contains(marker),
+            "dark form label must contain {marker}"
+        );
+    }
+
+    let menu = read("qml/Menu.qml");
+    assert!(
+        menu.matches("IslandFieldLabel").count() >= 18,
+        "every production settings row needs an explicit visible field label"
+    );
+    for forbidden in ["Kirigami.FormLayout", "Kirigami.FormData"] {
+        assert!(
+            !menu.contains(forbidden),
+            "offscreen menu must not inherit invisible system form chrome through {forbidden}"
+        );
+    }
+
+    let usage = read("qml/Usage.qml");
+    for marker in [
+        "id: accountActionsButton",
+        "text: \"⋯\"",
+        "display: AbstractButton.TextOnly",
+        "Accessible.name: qsTr(\"Account actions\")",
+    ] {
+        assert!(
+            usage.contains(marker),
+            "account action fallback must contain {marker}"
+        );
+    }
+    assert!(
+        !usage.contains("icon.name: \"overflow-menu\""),
+        "account actions must not depend on an offscreen icon theme"
+    );
 }
 
 #[test]

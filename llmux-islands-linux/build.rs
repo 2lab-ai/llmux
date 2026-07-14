@@ -16,6 +16,7 @@ fn main() {
             .qml_file("qml/IslandCheckBox.qml")
             .qml_file("qml/IslandComboBox.qml")
             .qml_file("qml/IslandDialog.qml")
+            .qml_file("qml/IslandFieldLabel.qml")
             .qml_file("qml/IslandInlineMessage.qml")
             .qml_file("qml/IslandItemDelegate.qml")
             .qml_file("qml/IslandProgressBar.qml")
