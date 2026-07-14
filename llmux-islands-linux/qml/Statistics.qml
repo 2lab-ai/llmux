@@ -11,6 +11,7 @@ Kirigami.ScrollablePage {
     property var uiState: ({})
     property int renderedHeatmapCells: 0
     property int renderedServingAccounts: 0
+    property alias snapshotReceiptTarget: receiptEvidenceSection
     readonly property var statistics: objectOrEmpty(uiState.statistics)
     readonly property var overview: objectOrEmpty(statistics.overview)
     readonly property var models: arrayOrEmpty(statistics.models)
@@ -18,6 +19,7 @@ Kirigami.ScrollablePage {
     readonly property var health: arrayOrEmpty(statistics.health)
     readonly property var heatmaps: arrayOrEmpty(statistics.heatmaps)
     readonly property var activityReceipts: arrayOrEmpty(statistics.activity_receipts)
+    readonly property var verificationReceipts: arrayOrEmpty(uiState.verification_receipts)
     readonly property var dataQuality: objectOrEmpty(statistics.data_quality)
     readonly property string unavailableText: qsTr("Unavailable")
     readonly property real preferredContentHeight: statisticsContent.implicitHeight
@@ -181,6 +183,19 @@ Kirigami.ScrollablePage {
 
     function renderedServingAccountCount() {
         return renderedServingAccounts
+    }
+
+    function renderedVerificationReceiptCount() {
+        return verificationReceipts.length
+    }
+
+    function verificationOutcomeColor(outcome) {
+        switch (String(outcome)) {
+        case "succeeded": return Kirigami.Theme.positiveTextColor
+        case "failed": return Kirigami.Theme.negativeTextColor
+        case "cancelled": return Kirigami.Theme.neutralTextColor
+        default: return Kirigami.Theme.disabledTextColor
+        }
     }
 
     function qualityValue(key) {
@@ -805,6 +820,7 @@ Kirigami.ScrollablePage {
         Kirigami.Separator { Layout.fillWidth: true }
 
         ColumnLayout {
+            id: receiptEvidenceSection
             objectName: "statistics-activity-receipts"
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
@@ -936,6 +952,73 @@ Kirigami.ScrollablePage {
                         .arg(statisticsPage.unavailableText.toLowerCase())
                 color: Kirigami.Theme.disabledTextColor
                 horizontalAlignment: Text.AlignHCenter
+            }
+
+            Kirigami.Separator {
+                visible: statisticsPage.verificationReceipts.length > 0
+                Layout.fillWidth: true
+            }
+
+            Kirigami.Heading {
+                visible: statisticsPage.verificationReceipts.length > 0
+                text: qsTr("Verification receipts")
+                level: 2
+            }
+
+            Repeater {
+                model: statisticsPage.verificationReceipts
+
+                delegate: Kirigami.AbstractCard {
+                    id: verificationCard
+                    required property var modelData
+                    readonly property var receipt: statisticsPage.objectOrEmpty(modelData)
+                    Layout.fillWidth: true
+
+                    contentItem: RowLayout {
+                        spacing: Kirigami.Units.largeSpacing
+
+                        Rectangle {
+                            radius: width / 2
+                            implicitWidth: Kirigami.Units.smallSpacing
+                            implicitHeight: implicitWidth
+                            color: statisticsPage.verificationOutcomeColor(
+                                verificationCard.receipt.outcome
+                            )
+                        }
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Label {
+                                Layout.fillWidth: true
+                                text: statisticsPage.optionalText(
+                                    verificationCard.receipt.operation
+                                ) + " · " + statisticsPage.optionalText(
+                                    verificationCard.receipt.outcome
+                                )
+                                font.bold: true
+                                elide: Text.ElideRight
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: statisticsPage.optionalText(
+                                    verificationCard.receipt.target_display
+                                ) + " · " + statisticsPage.optionalText(
+                                    verificationCard.receipt.message
+                                )
+                                color: Kirigami.Theme.disabledTextColor
+                                wrapMode: Text.Wrap
+                            }
+                        }
+
+                        Label {
+                            text: statisticsPage.optionalTime(
+                                verificationCard.receipt.finished_at_ms
+                            )
+                            color: Kirigami.Theme.disabledTextColor
+                        }
+                    }
+                }
             }
         }
     }

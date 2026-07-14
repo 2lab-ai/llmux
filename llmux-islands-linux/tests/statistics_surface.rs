@@ -21,6 +21,7 @@ fn renderer_consumes_the_canonical_statistics_contract() {
         "statistics.health",
         "statistics.heatmaps",
         "statistics.activity_receipts",
+        "uiState.verification_receipts",
         "statistics.data_quality",
     ] {
         assert!(qml.contains(field), "renderer must consume {field}");
@@ -54,6 +55,14 @@ fn every_statistics_surface_has_an_explicit_renderer() {
 
     for quality_key in ["model_usage", "windowed", "cost", "cache"] {
         assert!(qml.contains(quality_key), "missing qualifier {quality_key}");
+    }
+
+    for marker in [
+        "property alias snapshotReceiptTarget: receiptEvidenceSection",
+        "function renderedVerificationReceiptCount()",
+        "Verification receipts",
+    ] {
+        assert!(qml.contains(marker), "missing receipt evidence marker {marker}");
     }
 }
 

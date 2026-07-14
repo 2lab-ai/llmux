@@ -343,7 +343,7 @@ Kirigami.ApplicationWindow {
     }
 
     function selectSnapshotSurface(name) {
-        selectSurface(name === "receipts" ? "usage" : name)
+        selectSurface(name === "receipts" ? "statistics" : name)
     }
 
     function failSnapshot(message) {
