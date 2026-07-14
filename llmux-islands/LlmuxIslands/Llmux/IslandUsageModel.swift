@@ -37,6 +37,16 @@ final class IslandUsageModel: ObservableObject {
     @Published var windowed: [LlmuxDashboardWindowed] = []
     @Published var activity: LlmuxDashboardActivity?
 
+    /// exception-beacon: the ONE worst exception the closed label shows
+    /// (offline > AUTH N > LIMIT N > low-quota > debounced degraded > none)
+    /// and the open panel's NEEDS ATTENTION rows — both from the same
+    /// [`GlanceResolver`] run, so the two surfaces can never disagree.
+    @Published var glance: GlanceSignal = .none
+    @Published var attention: [GlanceAttention] = []
+    /// Consecutive polls with an explicit degraded account (closed-chip
+    /// debounce; resets to 0 the moment no account reports degraded).
+    private var degradedStreak = 0
+
     /// U11/U13 health count: `auth_failed` accounts + accounts over 90% quota
     /// (`DashboardHealth.Summary.total`). Drives the banner AND the closed
     /// pill's `⚠N` badge; computed on BOTH poll paths so old daemons get the
@@ -113,6 +123,7 @@ final class IslandUsageModel: ObservableObject {
         grokInFlight = DemoMode.forcedInFlight?.grok ?? counts.grok
         applyServerEmailAnonymous(dash.emailAnonymous)
         healthWarningCount = DashboardHealth.summary(dash.accounts).total
+        updateGlance(records: records, offline: false)
         dashboard = dash
         totals = dash.totals
         modelUsage = dash.modelUsage
@@ -139,6 +150,7 @@ final class IslandUsageModel: ObservableObject {
         grokInFlight = DemoMode.forcedInFlight?.grok ?? counts.grok
             applyServerEmailAnonymous(status.emailAnonymous)
             healthWarningCount = DashboardHealth.summary(records: status.accounts).total
+            updateGlance(records: status.accounts, offline: false)
             connection = .online
             dashboard = nil
             totals = nil
@@ -148,7 +160,30 @@ final class IslandUsageModel: ObservableObject {
             activity = nil
         } catch {
             connection = .offline(error.localizedDescription)
+            updateGlance(records: [], offline: true)
         }
+    }
+
+    /// Run the beacon resolver over one poll's records (both poll paths and
+    /// the offline fallback). Demo mode maps account names onto the same
+    /// stable fakes the tiles use, so an attention row never leaks a real
+    /// email into a recording.
+    private func updateGlance(records: [LlmuxAccountRecord], offline: Bool) {
+        if !offline, records.contains(where: { $0.status == "degraded" }) {
+            degradedStreak += 1
+        } else {
+            degradedStreak = 0
+        }
+        let output = GlanceResolver.resolve(
+            records: records,
+            offline: offline,
+            degradedStreak: degradedStreak,
+            displayName: { index, name in
+                DemoMode.isActive ? DemoMode.fakeEmail(index: index) : name
+            }
+        )
+        glance = output.signal
+        attention = output.attention
     }
 
     /// Fold the daemon's `email_anonymous` (if it reports one) into local
