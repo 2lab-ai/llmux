@@ -59,9 +59,11 @@ const WIDE_TABLE_AT: u16 = 150;
 const NAME_COL_MAX: u16 = 20;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
-/// Rows shown in the always-visible compact model strip (req12). Width of its
-/// token-share mini-bar.
-const MODEL_STRIP_ROWS: usize = 3;
+/// Default rows shown in the always-visible compact model strip (req12; Z
+/// 2026-07-15 UI-4 V1: 3 → 5). This sets only the AUTO pane height — the
+/// strip renders as many rows as its area holds, so dragging the pane
+/// taller (U8) reveals more (UI-4 V2). Width of its token-share mini-bar.
+const MODEL_STRIP_ROWS: usize = 5;
 const MODEL_BAR_WIDTH: usize = 10;
 /// Rows shown in the compact per-client attribution panel in the stats overlay
 /// (issue #32) — the top N clients by request count.
@@ -2768,16 +2770,18 @@ fn draw_activity(
             // [group model effort fast] badge while in flight (issue #2, 2a).
             // All four are filled at routing time (req11) with the same
             // per-request values the finish will record, so the running badge
-            // reads exactly like its eventual completed row.
-            if let Some(meta) = activity_meta(
-                request.group.as_deref(),
-                request.model.as_deref(),
-                request.effort.as_deref(),
-                request.fast,
-            ) {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(meta, group_color(request.group.as_deref())));
-            }
+            // reads exactly like its eventual completed row. Fixed-width slot
+            // (UI-4 V5) — blank when nothing is known yet.
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                activity_meta(
+                    request.group.as_deref(),
+                    request.model.as_deref(),
+                    request.effort.as_deref(),
+                    request.fast,
+                ),
+                group_color(request.group.as_deref()),
+            ));
             if let Some(account) = &request.account {
                 spans.push(Span::raw(format!(
                     " → {}",
@@ -2963,11 +2967,11 @@ fn folded_run_line(
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
-    {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(meta, group_color(group.as_deref())));
-    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast),
+        group_color(group.as_deref()),
+    ));
     spans.push(Span::raw(format!(" → {account} (")));
     spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
     spans.push(Span::raw(")"));
@@ -3053,13 +3057,13 @@ fn completed_line(
             // (`POST /v1/messages?beta=true`); the expanded detail's
             // `request` line keeps the full form.
             let _ = (method, path);
-            // [group model effort fast] badge, when known (req7).
-            if let Some(meta) =
-                activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
-            {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(meta, group_color(group.as_deref())));
-            }
+            // [group model effort fast] badge — a fixed-width slot even when
+            // nothing is known, so `→ account` lines up (UI-4 V5, req7).
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast),
+                group_color(group.as_deref()),
+            ));
             spans.push(Span::raw(format!(" → {account} (")));
             spans.push(Span::styled(status.to_string(), status_style));
             spans.push(Span::raw(format!(", {detail})")));
@@ -3279,37 +3283,94 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Compose the space-separated `[group model effort fast]` badge for an
-/// activity line, or `None` when nothing is known. The model id is abbreviated
-/// via [`abbrev_model`]; the effort token is dropped when unknown (`None`,
-/// empty, or `"-"`) and the `fast` token appears only when codex fast mode was
-/// on — so there are never trailing spaces. Examples:
-/// `[codex gpt-5.6-sol max fast]`, `[claude fable-5 low]`, `[codex gpt-5.5]`.
+/// Fixed display width of the [`activity_meta`] badge slot (UI-4 V5): every
+/// activity row spends exactly this many CELLS on the badge, so the
+/// `→ account` column lines up. Sized for the widest routine content —
+/// `[claude sonnet-4-5 medium]`.
+const ACTIVITY_META_WIDTH: usize = 26;
+
+/// Display-cell width of `text` — ratatui's own column accounting
+/// (`unicode-width`), NOT the char count: group/model/effort ride in from
+/// request bodies, so wide/combining input must not shift the badge column.
+fn cell_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// `…`-clip `text` to at most `max` display CELLS (the cell-aware sibling of
+/// [`truncate_chars`]). `max == 0` yields the empty string. The bound is
+/// enforced by WHOLE-STRING re-measurement with the same [`cell_width`] the
+/// caller pads with — never by summing per-char widths, which disagrees with
+/// string measurement on context-sensitive sequences (VS16/ZWJ): chars are
+/// popped until the remainder plus the one-cell ellipsis fits (review R2).
+fn truncate_cells(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if cell_width(text) <= max {
+        return text.to_string();
+    }
+    let budget = max - 1; // room for the ellipsis
+    let mut out = text.to_string();
+    while !out.is_empty() && cell_width(&out) > budget {
+        out.pop();
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Compose the fixed-width `[group model effort fast]` badge for an activity
+/// line (UI-4 V5/V6). The model token shows only OUTSIDE the codex/grok
+/// groups: those serve a config-pinned backend model (`gpt-*`/`grok-*`) that
+/// just repeats the group label on every row (Z 2026-07-15 "백엔드 모델 출력
+/// x") — the expanded detail's `model` line keeps the full served id. The
+/// effort token is dropped when unknown (`None`, empty, or `"-"`); `fast`
+/// appears only when codex fast mode was on. The model token spends only the
+/// CELLS the other tokens leave over in the slot — nothing is clipped while
+/// the whole badge fits. Rows with no meta at all get an all-blank slot of
+/// the same width, so alignment survives mixed history. All measuring is in
+/// display cells ([`cell_width`]), never chars. Examples:
+/// `[claude fable-5 low]`, `[codex max fast]`, `[grok high]`.
 fn activity_meta(
     group: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
     fast: bool,
-) -> Option<String> {
+) -> String {
     // Treat "-"/empty effort as unknown (the fold stamps unknown as "none"/"-").
     let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
-    if group.is_none() && model.is_none() && effort.is_none() && !fast {
-        return None;
-    }
-    let mut parts: Vec<&str> = Vec::new();
-    if let Some(g) = group {
-        parts.push(g);
-    }
+    // Backend-served models are hidden (V6); a model under an UNKNOWN group
+    // still shows — it is the client-requested id from the request body.
+    let model = model
+        .filter(|_| !matches!(group, Some("codex") | Some("grok")))
+        .map(|m| abbrev_model(group, m));
+    let fixed: Vec<&str> = [group, effort, fast.then_some("fast")]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut parts: Vec<String> = fixed.iter().map(|p| p.to_string()).collect();
     if let Some(m) = model {
-        parts.push(abbrev_model(group, m));
+        // Dynamic budget: the slot minus brackets, the fixed tokens, and one
+        // separator per join — the model is clipped ONLY when the completed
+        // badge would overflow the slot. A zero budget drops the token
+        // entirely rather than leaving a stray one-cell ellipsis.
+        let others: usize = fixed.iter().map(|p| cell_width(p)).sum();
+        let seps = fixed.len(); // one space joins the model to each side used
+        let budget = ACTIVITY_META_WIDTH.saturating_sub(2 + others + seps);
+        let clipped = truncate_cells(m, budget);
+        if !clipped.is_empty() {
+            let insert_at = usize::from(group.is_some()); // model follows group
+            parts.insert(insert_at, clipped);
+        }
     }
-    if let Some(e) = effort {
-        parts.push(e);
-    }
-    if fast {
-        parts.push("fast");
-    }
-    Some(format!("[{}]", parts.join(" ")))
+    let body = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", parts.join(" "))
+    };
+    // Belt-and-braces: unvalidated effort/group strings could still overflow.
+    let body = truncate_cells(&body, ACTIVITY_META_WIDTH);
+    let pad = ACTIVITY_META_WIDTH.saturating_sub(cell_width(&body));
+    format!("{body}{}", " ".repeat(pad))
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -3462,7 +3523,12 @@ fn model_name_cells(m: &ModelUsageDoc, active: bool) -> (Cell<'static>, Cell<'st
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
 /// drop the bar so the column set stays readable (req29).
 fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: SystemTime) {
-    let rows_data: Vec<&ModelUsageDoc> = view.model_usage.iter().take(MODEL_STRIP_ROWS).collect();
+    // Fill the pane: rows follow the AREA height (border + header take 2), so
+    // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
+    // instead of 5 rows + dead space (UI-4 V2).
+    let visible = (area.height.saturating_sub(2)) as usize;
+    let rows_data: Vec<&ModelUsageDoc> = view.model_usage.iter().take(visible).collect();
+    let shown = rows_data.len();
     let max_total = view
         .model_usage
         .iter()
@@ -3536,7 +3602,8 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
     // daemons) — same visible-qualifier contract as the heatmap's
     // "(best-effort)" title.
     let title = format!(
-        " models — top {} by tokens — {} (g: all) ",
+        " models — top {} of {} by tokens — {} (g: all) ",
+        shown,
         view.model_usage.len(),
         view.data_quality.model_usage
     );
@@ -3950,27 +4017,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
         Mode::Normal => match chrome.overlay {
-            // MAIN: summon overlays + codex + scroll. `a`/`g`/`l` open the
-            // Accounts/Stats/Logs overlays where the detail/model/log surfaces
-            // (and the add/remove/login affordances) now live (issue #5).
+            // MAIN: the tab bar owns surface navigation by click (UI-3 U6),
+            // so the per-overlay summon keys are no longer advertised here
+            // (UI-4 V4 — the `a`/`g`/`l`/`s`/`?`/`c` BINDINGS still work).
+            // The `f`/`m`/`e` codex toggles are likewise covered by the
+            // clickable group-settings bar (U9/U10), so their hint is gone
+            // too (UI-4 V7).
             Overlay::None => {
-                let mut spans = vec![
-                    Span::raw(" "),
-                    key("q"),
-                    Span::raw(" quit  "),
-                    key("a"),
-                    Span::raw(" accounts  "),
-                    key("g"),
-                    Span::raw(" stats  "),
-                    key("l"),
-                    Span::raw(" logs  "),
-                    key("s"),
-                    Span::raw(" sessions  "),
-                    key("?"),
-                    Span::raw(" misc  "),
-                    key("c"),
-                    Span::raw(" config  "),
-                ];
+                let mut spans = vec![Span::raw(" "), key("q"), Span::raw(" quit  ")];
                 if attached {
                     spans.push(Span::styled("R disabled (attached)  ", dim()));
                 } else {
@@ -3978,8 +4032,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     spans.push(Span::raw(" reload  "));
                 }
                 spans.extend([
-                    key("f/m/e"),
-                    Span::raw(" codex  "),
                     key("u"),
                     Span::raw(" used/left  "),
                     key("t"),
@@ -4829,54 +4881,214 @@ mod tests {
     fn activity_meta_abbreviates_claude_prefix_only(/* issue #2, 2b */) {
         // Claude models drop the redundant `claude-` prefix.
         assert_eq!(
-            activity_meta(Some("claude"), Some("claude-opus-4-8"), None, false).as_deref(),
-            Some("[claude opus-4-8]")
+            activity_meta(Some("claude"), Some("claude-opus-4-8"), None, false).trim_end(),
+            "[claude opus-4-8]"
         );
-        // Codex/gpt models are unchanged.
+        // Codex/grok rows HIDE the served backend model (UI-4 V6): it is
+        // config-pinned and repeats the group label on every row.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high"), false).as_deref(),
-            Some("[codex gpt-5.5 high]")
-        );
-        // A claude model without the prefix, and unknown groups, pass through.
-        assert_eq!(
-            activity_meta(Some("claude"), Some("opus-4-8"), None, false).as_deref(),
-            Some("[claude opus-4-8]")
+            activity_meta(Some("codex"), Some("gpt-5.5"), Some("high"), false).trim_end(),
+            "[codex high]"
         );
         assert_eq!(
-            activity_meta(None, Some("claude-haiku-4-5"), None, false).as_deref(),
-            Some("[claude-haiku-4-5]"),
-            "no group → no claude- stripping"
+            activity_meta(Some("grok"), Some("grok-4.5"), Some("high"), false).trim_end(),
+            "[grok high]"
         );
-        // Nothing known → no badge.
-        assert_eq!(activity_meta(None, None, None, false), None);
+        // A claude model without the prefix, and unknown groups, pass through
+        // (an unknown group's model is the client-requested id — shown).
+        assert_eq!(
+            activity_meta(Some("claude"), Some("opus-4-8"), None, false).trim_end(),
+            "[claude opus-4-8]"
+        );
+        assert_eq!(
+            activity_meta(None, Some("claude-haiku-4-5"), None, false).trim_end(),
+            "[claude-haiku-4-5]",
+            "no group → no claude- stripping; whole badge fits, so no clip"
+        );
+        // The model is clipped ONLY when the completed badge would overflow
+        // the slot — and to exactly the cells the other tokens leave over.
+        assert_eq!(
+            activity_meta(
+                Some("claude"),
+                Some("claude-haiku-4-5-20251001"),
+                Some("medium"),
+                false
+            )
+            .trim_end(),
+            "[claude haiku-4-5… medium]"
+        );
+        // Nothing known → an all-blank slot of the same fixed width.
+        assert_eq!(
+            activity_meta(None, None, None, false),
+            " ".repeat(ACTIVITY_META_WIDTH)
+        );
+    }
+
+    #[test]
+    fn activity_meta_is_fixed_width(/* UI-4 V5 */) {
+        for meta in [
+            activity_meta(Some("claude"), Some("claude-fable-5"), Some("high"), false),
+            activity_meta(
+                Some("claude"),
+                Some("claude-sonnet-4-5"),
+                Some("medium"),
+                false,
+            ),
+            // Overflowing model → clipped back to exactly the slot.
+            activity_meta(
+                Some("claude"),
+                Some("claude-haiku-4-5-20251001"),
+                Some("medium"),
+                false,
+            ),
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true),
+            activity_meta(Some("grok"), Some("grok-4.5"), None, false),
+            activity_meta(None, None, None, false),
+            // Wide (CJK) metadata still occupies exactly the slot — the
+            // contract is display CELLS, not chars (review MUST-FIX 1).
+            activity_meta(
+                Some("claude"),
+                Some("모델-한글-이름-아주-긴-경우"),
+                Some("high"),
+                false,
+            ),
+            activity_meta(Some("한글그룹"), None, Some("높음"), false),
+            // Context-sensitive sequences (VS16 emoji presentation, ZWJ
+            // families, skin-tone modifiers) — truncation re-measures the
+            // WHOLE string with the same accounting as the final padding,
+            // so these cannot shift the column either (review R2).
+            activity_meta(
+                Some("claude"),
+                Some("☂\u{fe0f}-model-\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-\u{1f44d}\u{1f3fd}-very-long-tail"),
+                Some("high"),
+                false,
+            ),
+            activity_meta(
+                Some("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"),
+                None,
+                Some("☂\u{fe0f}\u{1f44d}\u{1f3fd}"),
+                false,
+            ),
+            // Fixed tokens eating the whole slot → the model token is
+            // DROPPED (no stray one-cell ellipsis), the badge itself clips.
+            {
+                let meta = activity_meta(
+                    Some("a-very-long-group-name-x"),
+                    Some("some-model"),
+                    Some("effort-that-overflows"),
+                    true,
+                );
+                assert!(
+                    !meta.contains("some-model"),
+                    "zero-budget model token is dropped, got {meta:?}"
+                );
+                meta
+            },
+        ] {
+            assert_eq!(
+                cell_width(&meta),
+                ACTIVITY_META_WIDTH,
+                "badge {meta:?} must occupy the fixed slot"
+            );
+        }
     }
 
     #[test]
     fn activity_meta_appends_effort_and_fast_space_separated() {
         // Effort + fast render as bare space-separated tokens (no `·`).
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true).as_deref(),
-            Some("[codex gpt-5.6-sol max fast]")
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true).trim_end(),
+            "[codex max fast]"
         );
         // Claude never fast; effort shows when known.
         assert_eq!(
-            activity_meta(Some("claude"), Some("fable-5"), Some("low"), false).as_deref(),
-            Some("[claude fable-5 low]")
+            activity_meta(Some("claude"), Some("fable-5"), Some("low"), false).trim_end(),
+            "[claude fable-5 low]"
         );
-        // Unknown effort ("-"/empty) is omitted — no trailing space.
+        // Unknown effort ("-"/empty) is omitted — no trailing token.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("-"), false).as_deref(),
-            Some("[codex gpt-5.6-sol]")
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("-"), false).trim_end(),
+            "[codex]"
         );
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some(""), false).as_deref(),
-            Some("[codex gpt-5.6-sol]")
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some(""), false).trim_end(),
+            "[codex]"
         );
         // Fast with unknown effort still appends only the fast token.
         assert_eq!(
-            activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).as_deref(),
-            Some("[codex gpt-5.6-sol fast]")
+            activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).trim_end(),
+            "[codex fast]"
         );
+    }
+
+    #[test]
+    fn truncate_cells_zero_budget_yields_empty(/* UI-4 R3 nice 1/2 */) {
+        assert_eq!(truncate_cells("some-model", 0), "");
+        assert_eq!(truncate_cells("", 0), "");
+        // Zero-width (combining-only) text also honors the exact contract.
+        assert_eq!(truncate_cells("\u{200d}", 0), "");
+    }
+
+    #[test]
+    fn expanded_detail_keeps_the_full_served_backend_model(/* UI-4 V6 */) {
+        // The compact row hides the codex/grok served id; the expanded
+        // detail is the fidelity surface and MUST keep it.
+        let entry = completed_request(1_000, Some("codex"), Some("gpt-5.6-sol"), 10, 5, 200);
+        let lines = completed_detail_lines(&entry, false, &Default::default());
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("codex gpt-5.6-sol"),
+            "expanded detail keeps the full served id, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn models_strip_fills_its_pane_height(/* UI-4 V1/V2 */) {
+        let docs: Vec<ModelUsageDoc> = (0..7)
+            .map(|i| model_row("claude", &format!("m-{i}"), 1_000 - i as u64, 10))
+            .collect();
+        let view = view_with(docs);
+        // Assertions pin the actual rendered rows (last visible + first
+        // hidden model id), not just the title's self-reported count.
+        // Default auto height shows MODEL_STRIP_ROWS rows.
+        let text = render(&view, &chrome_overlay(Overlay::None), 220, 50);
+        assert!(
+            text.contains(" models — top 5 of 7 by tokens"),
+            "default strip shows 5 rows"
+        );
+        assert!(text.contains("m-4"), "5th row rendered at default height");
+        assert!(!text.contains("m-5"), "6th row hidden at default height");
+        // Drag-expanded pane (border + header + 7): every row fits.
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(9);
+        let text = render(&view, &chrome, 220, 50);
+        assert!(
+            text.contains(" models — top 7 of 7 by tokens"),
+            "a taller pane reveals more rows"
+        );
+        assert!(
+            text.contains("m-6"),
+            "last row rendered when dragged taller"
+        );
+        // Shrunk to the drag minimum (border + header + 1).
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(PANE_MIN_HEIGHT);
+        let text = render(&view, &chrome, 220, 50);
+        assert!(
+            text.contains(" models — top 1 of 7 by tokens"),
+            "the minimum pane still renders one row"
+        );
+        assert!(text.contains("m-0"), "first row rendered at minimum height");
+        assert!(!text.contains("m-1"), "second row hidden at minimum height");
     }
 
     #[test]
@@ -4923,9 +5135,16 @@ mod tests {
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        // Scope the absence check to the activity ROW — other surfaces (the
+        // models strip, group-settings bar, expanded detail) intentionally
+        // keep the served id (SSOT V6 covers activity rows only).
+        let row = text
+            .lines()
+            .find(|l| l.contains("[codex max fast]"))
+            .expect("in-flight badge carries effort + fast");
         assert!(
-            text.contains("[codex gpt-5.6-sol max fast]"),
-            "in-flight badge carries effort + fast, got:\n{text}"
+            !row.contains("gpt-5.6-sol"),
+            "the served backend model is hidden on the activity row (UI-4 V6), got: {row}"
         );
     }
 
