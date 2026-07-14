@@ -30,6 +30,18 @@ pub(crate) fn uuid_v4() -> String {
     )
 }
 
+/// The human-readable message of an `error` value in EITHER wire shape:
+/// the OpenAI object (`{"message": …}`) or the xAI plain string.
+fn error_message_any_shape(error: &Value) -> Option<String> {
+    if let Some(s) = error.as_str() {
+        return Some(s.to_string());
+    }
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Adapter-resolved knobs for one upstream Responses body. The adapter owns
 /// model + effort RESOLUTION (per-request pass-through, clamping); this module
 /// owns the translation.
@@ -913,27 +925,24 @@ impl SseTransform for ResponsesSseConverter {
                 self.complete(&mut out, value.get("response"));
             }
             "response.failed" => {
+                // `error` may be the OpenAI object shape ({message}) or the
+                // xAI string shape (external review N4; same class as the
+                // HTTP-error condense fix — never flatten a string error to
+                // a generic message).
                 let message = value
                     .get("response")
                     .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("upstream response failed")
-                    .to_string();
+                    .and_then(error_message_any_shape)
+                    .unwrap_or_else(|| "upstream response failed".to_string());
                 self.fail(&mut out, &message);
             }
             "error" => {
                 let message = value
                     .get("message")
                     .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("error")
-                            .and_then(|e| e.get("message"))
-                            .and_then(Value::as_str)
-                    })
-                    .unwrap_or("upstream error")
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| value.get("error").and_then(error_message_any_shape))
+                    .unwrap_or_else(|| "upstream error".to_string());
                 self.fail(&mut out, &message);
             }
             // in_progress / content_part / output_text.done / reasoning

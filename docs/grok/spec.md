@@ -154,8 +154,11 @@ with thin per-provider adapters.
   `codex.default_model = "gpt-5.6-sol"`, `~/.config/llmux.json`).
 - Live shape control: `POST /llmux/grok {default_model?, reasoning_effort?}` — same
   contract as `POST /llmux/codex` (server.rs:1089-1140): partial update, apply live,
-  persist via `config::update_path`. Islands settings pane gains a grok row (model +
-  effort; no fast toggle).
+  persist via `config::update_path`. **Islands settings row: descoped for v1**
+  (consensus re-approval round 4) — islands has no codex settings row either
+  (`POST /llmux/codex` is TUI-dashboard/CLI-only), so a grok-only row would exceed
+  codex parity; the islands asks in the user requirements are registration (R2) and
+  stats (R3), both delivered. A settings row for BOTH providers is follow-up work.
 - Config: new `config.grok` section `{upstream, default_model, reasoning_effort,
   client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.5`, null, null, false).
 
@@ -222,7 +225,8 @@ with thin per-provider adapters.
   ignore harmlessly via `#[serde(default)]`) from `~/.config/llmux.json`, then run the
   old binary. `llmux accounts remove <name>` on the NEW binary is the supported path.
 - Contract test (C17): a pre-grok config (no grok fields) parses and round-trips
-  byte-stable under the new binary — additive-only guarantee.
+  VALUE-stable under the new binary (the new default `grok` section is serialized;
+  old binaries ignore it) — additive-only guarantee, semantic not byte-level.
 - Islands↔daemon version skew: additive JSON only; old islands renders grok accounts
   as claude-group (existing `== "codex"` check) during upgrade windows — cosmetic,
   accepted.

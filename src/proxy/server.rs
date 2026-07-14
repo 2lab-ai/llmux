@@ -1683,6 +1683,7 @@ async fn run_login(
                     .await
                     .map_err(|e| e.to_string())?;
             crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint)
+                .map_err(|e| e.to_string())?
         }
     };
     state

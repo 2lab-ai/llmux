@@ -202,7 +202,7 @@ async fn login_grok() -> Result<(), CliError> {
     oauth::open_browser(device.open_url());
     println!("Waiting for authorization (Ctrl-C to abort)...");
     let bundle = crate::auth::grok::poll_token(&client, &discovery.token_endpoint, &device).await?;
-    let account = crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint);
+    let account = crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint)?;
 
     let final_name = account.name.clone();
     let mut outcome = Upsert::Added;

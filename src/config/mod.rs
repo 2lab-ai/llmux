@@ -377,7 +377,10 @@ mod tests {
         assert_eq!(config.accounts[0].credential.account_uuid(), Some("sub-1"));
     }
 
-    // ---- C17: pre-grok config parses and round-trips byte-stable ----
+    // ---- C17: pre-grok config parses and round-trips VALUE-stable ----
+    // (Not byte-stable: the new binary serializes the default `grok` section;
+    // old binaries ignore unknown sections. The additive guarantee is
+    // semantic — no field lost, no meaning changed.)
     #[test]
     fn c17_pre_grok_config_round_trips_without_grok_fields() {
         // A config written before grok existed: no `grok` section, no
