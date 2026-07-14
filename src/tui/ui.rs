@@ -1198,10 +1198,20 @@ fn draw_context_menu(
     let Mode::ContextMenu { idx, item } = chrome.mode else {
         return MenuChrome::default();
     };
-    let target = ctx
-        .order
-        .get(idx)
-        .and_then(|&i| view.snapshot.accounts.get(i));
+    // The PINNED account id governs what the menu says — the same identity
+    // execution acts on (review R2: rendering from the live display index
+    // could name account B while the click acted on pinned A after a
+    // reorder). The index is only the fallback when no pin exists (tests /
+    // keyboard-driven states).
+    let target = chrome
+        .menu_account
+        .as_deref()
+        .and_then(|name| view.snapshot.accounts.iter().find(|a| a.id.0 == name))
+        .or_else(|| {
+            ctx.order
+                .get(idx)
+                .and_then(|&i| view.snapshot.accounts.get(i))
+        });
     let paused = target.is_some_and(|a| a.paused);
     let name = target
         .map(|a| row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev))
@@ -2745,7 +2755,6 @@ fn draw_activity(
             let mut spans = vec![
                 Span::styled(format!(" {glyph} "), Style::new().fg(color)),
                 Span::styled(format::clock_hms_utc(request.started_at), dim()),
-                Span::raw(format!("  {} {}", request.method, request.path)),
             ];
             // [group model effort fast] badge while in flight (issue #2, 2a).
             // All four are filled at routing time (req11) with the same
@@ -2763,7 +2772,7 @@ fn draw_activity(
             if let Some(account) = &request.account {
                 spans.push(Span::raw(format!(
                     " → {}",
-                    masked_name(account, view.email_anonymous)
+                    row_account_name(account, view.email_anonymous, &view.domain_abbrev)
                 )));
             }
             spans.push(Span::styled(
@@ -2804,6 +2813,7 @@ fn draw_activity(
                     expanded,
                     view.email_anonymous,
                     &view.session_labels,
+                    &view.domain_abbrev,
                 ));
                 let mut height = 1u16;
                 if expanded {
@@ -2837,7 +2847,12 @@ fn draw_activity(
                 let (expanded, key) =
                     triage::run_toggle_key(run, chrome.expanded_activity.as_ref());
                 let row_y = body_top.saturating_add(lines.len() as u16);
-                lines.push(folded_run_line(run, expanded, view.email_anonymous));
+                lines.push(folded_run_line(
+                    run,
+                    expanded,
+                    view.email_anonymous,
+                    &view.domain_abbrev,
+                ));
                 let mut height = 1u16;
                 if expanded {
                     for entry in run {
@@ -2849,6 +2864,7 @@ fn draw_activity(
                             false,
                             view.email_anonymous,
                             &view.session_labels,
+                            &view.domain_abbrev,
                         ));
                         height = height.saturating_add(1);
                     }
@@ -2893,7 +2909,12 @@ fn draw_activity(
 /// account, group, model) key renders as `▸ HH:MM–HH:MM N× METHOD path
 /// [meta] → account (all 2xx)`. Click toggles the fold — expanding lists the
 /// member rows verbatim, so nothing is lost, only the default density.
-fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'static> {
+fn folded_run_line(
+    run: &[Completed],
+    expanded: bool,
+    mask: bool,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> Line<'static> {
     let marker = if expanded { '▾' } else { '▸' };
     let newest = &run[0];
     let oldest = &run[run.len() - 1];
@@ -2921,15 +2942,17 @@ fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'stati
     };
     let account = account
         .as_deref()
-        .map(|a| masked_name(a, mask))
+        .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
+    // method+path dropped from the folded row too (Z 2026-07-15) — the run's
+    // members carry it in their expanded detail.
+    let _ = (method, path);
     let mut spans = vec![
         stamp,
         Span::styled(
             format!("{}× ", run.len()),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("{method} {path}")),
     ];
     if let Some(meta) = activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
     {
@@ -2947,6 +2970,7 @@ fn completed_line(
     expanded: bool,
     mask: bool,
     session_labels: &std::collections::BTreeMap<String, String>,
+    abbrev: &std::collections::BTreeMap<String, String>,
 ) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
@@ -2969,9 +2993,13 @@ fn completed_line(
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
                 dim(),
             );
+            // Same display form as the accounts table (Z 2026-07-15
+            // "똑같은 함수"): mask → strip the `group:` prefix → abbreviate
+            // the domain. The expanded detail keeps the FULL raw id (the
+            // fidelity surface, issue #70).
             let account = account
                 .as_deref()
-                .map(|a| masked_name(a, mask))
+                .map(|a| row_account_name(a, mask, abbrev))
                 .unwrap_or_else(|| "?".to_string());
             let status_style = if *status < 400 {
                 Style::new().fg(Color::Green)
@@ -3011,7 +3039,11 @@ fn completed_line(
                     truncate_chars(&masked_text(excerpt, mask), 12)
                 )));
             }
-            spans.push(Span::styled(format!("{method} {path}"), dim()));
+            // method+path intentionally NOT on the collapsed row (Z
+            // 2026-07-15 "쓸데 없는 데이터"): it is constant noise
+            // (`POST /v1/messages?beta=true`); the expanded detail's
+            // `request` line keeps the full form.
+            let _ = (method, path);
             // [group model effort fast] badge, when known (req7).
             if let Some(meta) =
                 activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
@@ -4351,6 +4383,7 @@ mod tests {
         Chrome {
             pane_heights: Default::default(),
             menu_anchor: None,
+            menu_account: None,
             chart_days: 14,
             frame: 0,
             mode: Mode::Normal,
