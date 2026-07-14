@@ -31,6 +31,9 @@ clipboard, notification, sound, and quit commands remain in the thin shell.
   flows, compatibility, and implementation map.
 - [trace.md](trace.md) — seven-section vertical traces, test derivation,
   implementation status, and verification matrix.
+- [visual-receipts/](visual-receipts/) — eight full-surface and receipt-detail
+  PNGs captured from the macOS and KDE production renderers, with source-run
+  provenance and SHA-256 checksums.
 
 ## Scope status
 
@@ -39,10 +42,10 @@ clipboard, notification, sound, and quit commands remain in the thin shell.
 | Current implementation audit | Complete |
 | Port architecture and platform mapping | Complete |
 | Shared Rust semantic core and UI schema | Implemented and tested |
-| KDE Usage, Statistics, Menu, tray, and window shell | Implemented and Arch smoke-verified |
+| KDE Usage, Statistics, Menu, tray, and window shell | Implemented, Arch smoke-verified, and visually inspected |
 | Settings, events, autostart, notifications, and maintenance receipts | Implemented |
-| Arch packaging and CI recipe | Implemented and clean-container verified |
-| macOS adoption of the core | Implemented through the versioned JSON/C ABI boundary |
+| Arch packaging and CI recipe | Clean-container build, package, install, binary smoke, and screenshot verified |
+| macOS adoption of the core | Implemented through the versioned JSON/C ABI boundary, Xcode-tested, and visually inspected |
 | Stable release/tag | Explicitly out of scope without a user release gate |
 
 The older `.prd/11-llmux-islands-spec.md` and
