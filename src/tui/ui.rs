@@ -2067,10 +2067,17 @@ fn draw_activity(
                     .activity_key()
                     .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(&k));
                 let row_y = body_top.saturating_add(lines.len() as u16);
-                lines.push(completed_line(entry, expanded, view.email_anonymous));
+                lines.push(completed_line(
+                    entry,
+                    expanded,
+                    view.email_anonymous,
+                    &view.session_labels,
+                ));
                 let mut height = 1u16;
                 if expanded {
-                    for detail in completed_detail_lines(entry, view.email_anonymous) {
+                    for detail in
+                        completed_detail_lines(entry, view.email_anonymous, &view.session_labels)
+                    {
                         if lines.len() >= capacity {
                             break;
                         }
@@ -2105,7 +2112,12 @@ fn draw_activity(
                         if lines.len() >= capacity {
                             break;
                         }
-                        lines.push(completed_line(entry, false, view.email_anonymous));
+                        lines.push(completed_line(
+                            entry,
+                            false,
+                            view.email_anonymous,
+                            &view.session_labels,
+                        ));
                         height = height.saturating_add(1);
                     }
                 }
@@ -2198,7 +2210,12 @@ fn folded_run_line(run: &[Completed], expanded: bool, mask: bool) -> Line<'stati
     Line::from(spans)
 }
 
-fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static> {
+fn completed_line(
+    entry: &Completed,
+    expanded: bool,
+    mask: bool,
+    session_labels: &std::collections::BTreeMap<String, String>,
+) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
             method,
@@ -2211,6 +2228,9 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
             model,
             effort,
             fast,
+            user_id,
+            kind,
+            excerpt,
         } => {
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
@@ -2246,7 +2266,20 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
                     detail.push_str(&format!(", {}", format_cost(cost)));
                 }
             }
-            let mut spans = vec![stamp, Span::raw(format!("{method} {path}"))];
+            let mut spans = vec![stamp];
+            // Message kind + input excerpt (TUI UI-3 U1): say WHAT the request
+            // was, right where the eye lands. `user` rows lead with the typed
+            // text; control rows lead with their kind tag.
+            if let Some(kind) = kind.as_deref() {
+                spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
+            }
+            if let Some(excerpt) = excerpt.as_deref() {
+                spans.push(Span::raw(format!(
+                    "\u{201c}{}\u{201d} ",
+                    truncate_chars(&masked_text(excerpt, mask), 12)
+                )));
+            }
+            spans.push(Span::styled(format!("{method} {path}"), dim()));
             // [group model effort fast] badge, when known (req7).
             if let Some(meta) =
                 activity_meta(group.as_deref(), model.as_deref(), effort.as_deref(), *fast)
@@ -2257,6 +2290,16 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
             spans.push(Span::raw(format!(" → {account} (")));
             spans.push(Span::styled(status.to_string(), status_style));
             spans.push(Span::raw(format!(", {detail})")));
+            // Derived session title (U2), when this client id has one.
+            if let Some(label) = user_id.as_deref().and_then(|id| session_labels.get(id)) {
+                spans.push(Span::styled(
+                    format!(
+                        " \u{ab}{}\u{bb}",
+                        truncate_chars(&masked_text(label, mask), 16)
+                    ),
+                    dim().add_modifier(Modifier::ITALIC),
+                ));
+            }
             Line::from(spans)
         }
         CompletedBody::Note { text, error } => {
@@ -2276,7 +2319,11 @@ fn completed_line(entry: &Completed, expanded: bool, mask: bool) -> Line<'static
 /// breakdown, and the per-component + total API-equivalent cost via
 /// [`crate::pricing`]. Empty for notes (never expandable). `mask` = the
 /// email-anonymous display setting (the account line renders aliased).
-fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
+fn completed_detail_lines(
+    entry: &Completed,
+    mask: bool,
+    session_labels: &std::collections::BTreeMap<String, String>,
+) -> Vec<Line<'static>> {
     let CompletedBody::Request {
         method,
         path,
@@ -2288,6 +2335,9 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
         model,
         effort,
         fast,
+        user_id,
+        kind,
+        excerpt,
     } = &entry.body
     else {
         return Vec::new();
@@ -2300,6 +2350,25 @@ fn completed_detail_lines(entry: &Completed, mask: bool) -> Vec<Line<'static>> {
     };
     let mut lines = Vec::new();
     lines.push(indent("request", format!("{method} {path}")));
+    // The click-expanded input line (U3): the full stored excerpt on ONE line,
+    // as wide as the terminal (the Paragraph clips, never wraps — so the line
+    // is exactly "as long as fits").
+    if let Some(kind) = kind.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("       kind    ", dim()),
+            Span::styled(kind.to_string(), kind_style(kind)),
+        ]));
+    }
+    if let Some(excerpt) = excerpt.as_deref() {
+        lines.push(indent("input", masked_text(excerpt, mask)));
+    }
+    if let Some(uid) = user_id.as_deref() {
+        let label = session_labels
+            .get(uid)
+            .map(|l| format!(" \u{ab}{}\u{bb}", masked_text(l, mask)))
+            .unwrap_or_default();
+        lines.push(indent("client", format!("{uid}{label}")));
+    }
     lines.push(indent(
         "account",
         account
@@ -2389,6 +2458,29 @@ fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
         .iter()
         .find(|a| a.id.0 == account)
         .map(|a| a.group)
+}
+
+/// Style for a message-kind tag (TUI UI-3 U1): plain user turns read as the
+/// default text, security-monitor turns shout, the mechanical control turns
+/// (compact/title/suggest/count/…) stay dim so user rows dominate the eye.
+fn kind_style(kind: &str) -> Style {
+    match kind {
+        "user" => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        "security" => Style::new().fg(Color::Yellow),
+        "compact" | "summary" => Style::new().fg(Color::Blue),
+        "subagent" | "sdk" => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        _ => dim(),
+    }
+}
+
+/// Truncate to `max` chars (boundary-safe) with a `…` marker when clipped.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, unknown = gray.
@@ -3293,6 +3385,7 @@ mod tests {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
             health: Default::default(),
+            session_labels: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,
@@ -4083,6 +4176,9 @@ mod tests {
                 model: model.map(str::to_string),
                 effort: None,
                 fast: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
             },
         }
     }
@@ -4795,6 +4891,9 @@ mod tests {
                     model: Some("claude-opus-4-8".into()),
                     effort: None,
                     fast: false,
+                    user_id: None,
+                    kind: None,
+                    excerpt: None,
                 },
             },
             Completed {

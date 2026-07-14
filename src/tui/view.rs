@@ -40,6 +40,9 @@ pub(crate) struct DashboardView {
     pub in_flight: Vec<InFlight>,
     /// Newest first.
     pub completed: Vec<Completed>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → first
+    /// user-input excerpt, carried from the document.
+    pub session_labels: std::collections::BTreeMap<String, String>,
     /// Oldest→newest tail.
     pub logs: Vec<LogLine>,
     /// Per-(group, model) usage rows (req1-20), already sorted by total tokens.
@@ -286,6 +289,9 @@ impl DashboardView {
                     model,
                     effort,
                     fast,
+                    user_id,
+                    msg_kind,
+                    excerpt,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -312,6 +318,9 @@ impl DashboardView {
                         model: model.clone(),
                         effort: effort.clone(),
                         fast: *fast,
+                        user_id: user_id.clone(),
+                        kind: msg_kind.clone(),
+                        excerpt: excerpt.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -333,6 +342,7 @@ impl DashboardView {
             .collect();
 
         Self {
+            session_labels: doc.session_labels.clone(),
             version: doc.version.clone(),
             pid: doc.pid,
             uptime: Duration::from_secs(doc.uptime_secs),
