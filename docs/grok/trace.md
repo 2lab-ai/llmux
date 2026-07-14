@@ -118,7 +118,7 @@
 7. **Observability** — `grok.trace=true` mirrors `codex.trace` raw-io capture
    (proxy/raw_io.rs path), same file naming with `grok` tag.
 
-## T4 — Live model/effort switch (dashboard/islands/CLI)
+## T4 — Live model/effort switch (TUI dashboard / CLI / daemon API)
 
 1. **Entry** — `POST /llmux/grok` (new route beside `/llmux/codex`, server.rs:775 chain,
    same auth gate).
@@ -135,7 +135,9 @@
    body + log warn (improves on codex's silent best-effort, server.rs:1119-1127;
    documented asymmetry — codex endpoint unchanged in v1).
 6. **Output** — `{ok:true, default_model, reasoning_effort, persisted:bool}`.
-   Islands: settings pane grok row calls this endpoint (LlmuxClient new method).
+   Callers: the CLI/daemon HTTP API and the TUI dashboard. An islands settings
+   row is v1-descoped (spec §R4) — islands has no codex settings row either, so
+   this endpoint has no islands caller in v1.
 
 ## T5 — Quota exhaustion: 429 free-usage-exhausted
 
@@ -196,7 +198,7 @@
 | C14 | Contract | pricing: (grok, grok-4.5) → 2.0/6.0/0.5/0.0; (grok, unknown) → grok fallback | T6 §4 |
 | C15 | Contract | client `stream:false` through grok: upstream SSE aggregated to one Anthropic JSON response w/ usage (same path codex takes today) | T3 §3/§6 |
 | C16 | Contract | flavor-parameterized translation: system folding, tools_to_functions, tool_use/tool_result round trip, SSE→Anthropic events, usage extraction — asserted under the GROK flavor (not only codex) | T3 §3, R5 |
-| C17 | Regression | pre-grok config (no grok fields) parses + round-trips byte-stable; additive-only guarantee | spec §Compatibility |
+| C17 | Regression | pre-grok config (no grok fields) parses + round-trips VALUE-stable (new default grok section serializes; old binaries ignore it) — additive-only guarantee | spec §Compatibility |
 
 Swift (islands) — unit-light per repo convention: provider(of:) mapping test if a test
 target exists for it; otherwise receipt = snapshot/live capture.
@@ -215,8 +217,9 @@ target exists for it; otherwise receipt = snapshot/live capture.
 | pricing (C14) | GREEN |
 | CLI login --grok | built (device-flow units green; interactive path = live receipt) |
 | islands Swift surfaces | built (swiftc -parse clean; type-check = preview CI) |
-| status JSON grok row (C13) | via kind-driven group serialization (server.rs:1116) + C7; live receipt confirms |
-| live receipt | NOT STARTED |
+| status JSON grok row (C13) | GREEN — kind-driven group serialization (server.rs:1116) + C7 serde; structurally confirmed on the scratch daemon (`group:"grok"`, `type:"grok"`, gauges null) |
+| live receipt (mock upstream) | DONE 2026-07-14 — scratch daemon :3499, 2-turn tool-call e2e vs mock Responses, wire-shape capture (C1/C3/C4/C15/C16), live shape switch/persist (C10), 429→24.0h park (T5); real auth.x.ai device-code mint (C11). Caught+fixed a real defect (condense_error_body, 26aaf98) |
+| live receipt (real cli-chat-proxy.grok.com) | NOT STARTED — merge-blocking, needs an authorized grok account (device-flow approval) |
 
 ## Trace deviations (Delta log)
 
