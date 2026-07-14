@@ -92,9 +92,10 @@ pub(crate) struct DashboardView {
     /// and nothing when none is active.
     pub events: Vec<crate::config::EventBanner>,
     /// Rolling 5-minute status-class counts for the header health verdict
-    /// (glance-triage), carried on the document. All-zero from an older
-    /// daemon → the verdict falls back to account/poller state alone.
-    pub health: super::activity::HealthCounts,
+    /// (glance-triage), carried on the document. `None` from an older daemon
+    /// = no telemetry: the verdict skips storm detection and renders the err
+    /// surface as unavailable — never a fabricated healthy zero.
+    pub health: Option<super::activity::HealthCounts>,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -375,13 +376,13 @@ impl DashboardView {
             // a `POST /llmux/events` reflects on the next document. Absent →
             // empty (no banner).
             events: doc.events.clone(),
-            health: super::activity::HealthCounts {
-                requests: doc.health.requests,
-                errors: doc.health.errors,
-                s429: doc.health.s429,
-                s401: doc.health.s401,
-                s5xx: doc.health.s5xx,
-            },
+            health: doc.health.as_ref().map(|h| super::activity::HealthCounts {
+                requests: h.requests,
+                errors: h.errors,
+                s429: h.s429,
+                s401: h.s401,
+                s5xx: h.s5xx,
+            }),
         }
     }
 

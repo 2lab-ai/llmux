@@ -467,10 +467,11 @@ pub struct DashboardDoc {
     pub windowed: Vec<WindowedStatsDoc>,
     pub activity: ActivityDoc,
     /// Rolling 5-minute status-class counts for the header health verdict
-    /// (glance-triage). Additive: absent in docs from an older daemon → all
-    /// zero, and the verdict renders from account/poller state alone.
-    #[serde(default)]
-    pub health: HealthDoc,
+    /// (glance-triage). Additive AND presence-preserving: `None` from an
+    /// older daemon means "no telemetry", which the verdict renders as an
+    /// unavailable err surface — never as a fabricated healthy 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthDoc>,
     /// Tracing tail, oldest→newest.
     pub logs: Vec<LogLineDoc>,
     /// Live codex request settings (req8.1 — dashboard fast/model/effort).
@@ -1502,13 +1503,13 @@ pub(crate) fn dashboard_doc(
         client_usage,
         windowed: windowed_docs(hub),
         activity,
-        health: HealthDoc {
+        health: Some(HealthDoc {
             requests: hub.health.requests,
             errors: hub.health.errors,
             s429: hub.health.s429,
             s401: hub.health.s401,
             s5xx: hub.health.s5xx,
-        },
+        }),
         logs: hub
             .logs
             .iter()

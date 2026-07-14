@@ -783,10 +783,14 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chr
             }
         }
         None => {
-            let health = view.health;
             spans.push(Span::styled("healthy", Style::new().fg(color)));
+            // An old daemon sends no health telemetry: say the err surface
+            // is unavailable — never a fabricated healthy zero.
+            let err = view
+                .health
+                .map_or("—".to_string(), |h| h.errors.to_string());
             spans.push(Span::styled(
-                format!(" · {:.1} req/m · {} err/5m", view.rpm_5m, health.errors),
+                format!(" · {:.1} req/m · {err} err/5m", view.rpm_5m),
                 dim(),
             ));
         }
@@ -988,16 +992,32 @@ fn account_row<'a>(
     let gate = select::eligibility(account, params, now, ctx.headers_only);
 
     // Urgency marker (glance-triage atom 2): tiers 0–1 (exhausted /
-    // auth-broken) carry a leading `!` — a text signal that survives
-    // no-truecolor panels; the cursor/current markers still win the cell.
-    let marker = match (cursor, is_current) {
-        (true, _) => Span::styled(">", Style::new().fg(Color::Cyan)),
-        (false, true) => Span::styled("►", Style::new().fg(Color::Green)),
-        (false, false) if triage::urgent(account, gate) => Span::styled(
-            "!",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        (false, false) => Span::raw(" "),
+    // auth-broken) ALWAYS carry a `!` — a text signal that survives
+    // no-truecolor panels and is never displaced by the cursor (`>`) or
+    // current (`►`) glyph; the 2-wide cell holds both.
+    let urgent = triage::urgent(account, gate);
+    let marker = {
+        let lead = match (cursor, is_current) {
+            (true, _) => ">",
+            (false, true) => "►",
+            (false, false) => "",
+        };
+        let text = match (lead, urgent) {
+            ("", true) => "!".to_string(),
+            ("", false) => " ".to_string(),
+            (lead, true) => format!("{lead}!"),
+            (lead, false) => lead.to_string(),
+        };
+        let style = if urgent {
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if cursor {
+            Style::new().fg(Color::Cyan)
+        } else if is_current {
+            Style::new().fg(Color::Green)
+        } else {
+            Style::new()
+        };
+        Span::styled(text, style)
     };
     let name = if is_current {
         Span::styled(
@@ -2067,9 +2087,12 @@ fn draw_activity(
             }
             ActivityRow::Run { start, len } => {
                 let run = &view.completed[*start..*start + *len];
-                // The run's stable identity = its NEWEST member's key; the
-                // whole block is ONE hit, so a click toggles the fold.
-                let key = run[0].activity_key();
+                // The run's stable identity = its OLDEST member's key: the
+                // newest end grows with fresh traffic (a newest-keyed run
+                // would collapse on every refresh), the oldest survives until
+                // the ring drops it. The whole block is ONE hit, so a click
+                // toggles the fold.
+                let key = run[run.len() - 1].activity_key();
                 let expanded = key
                     .as_ref()
                     .is_some_and(|k| chrome.expanded_activity.as_ref() == Some(k));

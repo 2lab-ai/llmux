@@ -141,27 +141,30 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
         });
     }
 
-    // 2. Storms over the rolling 5m window (dedicated deque, never the
-    //    capacity-bounded ring — MUST-FIX 3).
-    let health = view.health;
-    if health.s429 >= STORM_MIN_EVENTS {
-        conditions.push(Condition {
-            level: VerdictLevel::Fail,
-            text: format!("429 STORM ×{}/5m", health.s429),
-            account: None,
-        });
-    } else if health.s5xx >= STORM_MIN_EVENTS {
-        conditions.push(Condition {
-            level: VerdictLevel::Fail,
-            text: format!("5xx STORM ×{}/5m", health.s5xx),
-            account: None,
-        });
-    } else if health.errors >= ERROR_STORM_MIN && health.errors * 2 >= health.requests {
-        conditions.push(Condition {
-            level: VerdictLevel::Fail,
-            text: format!("ERROR STORM ×{}/5m", health.errors),
-            account: None,
-        });
+    // 2. Storms over the rolling 5m window (dedicated per-second buckets,
+    //    never the capacity-bounded ring — MUST-FIX 3). An old daemon sends
+    //    no health telemetry (`None`): storm detection is UNAVAILABLE then,
+    //    not "0 errors" — the header renders the err surface as `—`.
+    if let Some(health) = view.health {
+        if health.s429 >= STORM_MIN_EVENTS {
+            conditions.push(Condition {
+                level: VerdictLevel::Fail,
+                text: format!("429 STORM ×{}/5m", health.s429),
+                account: None,
+            });
+        } else if health.s5xx >= STORM_MIN_EVENTS {
+            conditions.push(Condition {
+                level: VerdictLevel::Fail,
+                text: format!("5xx STORM ×{}/5m", health.s5xx),
+                account: None,
+            });
+        } else if health.errors >= ERROR_STORM_MIN && health.errors * 2 >= health.requests {
+            conditions.push(Condition {
+                level: VerdictLevel::Fail,
+                text: format!("ERROR STORM ×{}/5m", health.errors),
+                account: None,
+            });
+        }
     }
 
     // 3. Exhausted / quota-critical accounts (worst utilization first).
@@ -270,7 +273,9 @@ pub(crate) fn intervention_order(
 /// One renderable activity row after folding: either a single entry or a run
 /// of ≥[`FOLD_MIN`] consecutive same-key completed-2xx entries. Indices point
 /// into the newest-first `completed` slice; a run's `start` is its NEWEST
-/// entry (the run key / click target).
+/// entry. The run's stable CLICK identity is its OLDEST member — the newest
+/// end grows with fresh traffic, the oldest survives until the ring drops it,
+/// so an expanded run stays expanded across refreshes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActivityRow {
     Single(usize),
@@ -449,10 +454,16 @@ mod tests {
 
     #[test]
     fn cold_unknown_sorts_below_ready_and_paused() {
+        // cold = an oauth account whose usage sample went STALE (UsageStale
+        // gate) — distinct from "ready" (eligible, just no 5h sample yet).
         let mut cold = account("cold");
-        cold.five_hour = None;
+        cold.five_hour = Some(QuotaWindow {
+            utilization: 0.10,
+            resets_at: now() + Duration::from_secs(3600),
+            fetched_at: now() - Duration::from_secs(700), // > usage_max_age 600
+            source: WindowSource::UsagePoll,
+        });
         cold.seven_day = None;
-        cold.credential_kind = "apikey"; // apikey with no data = ready tier
         let ready = {
             let mut a = account("ready");
             a.five_hour = None;
@@ -464,13 +475,29 @@ mod tests {
         paused.paused = true;
         let known = account("known");
         let snapshot = pool(vec![cold, ready, paused, known]);
-        let ids = ordered_ids(&snapshot);
-        assert_eq!(ids[0], "known");
-        let pos = |id: &str| ids.iter().position(|x| x == id).unwrap();
-        assert!(pos("paused") > pos("ready"));
+        assert_eq!(
+            ordered_ids(&snapshot),
+            vec!["known", "ready", "paused", "cold"],
+            "known usage > ready > paused > cold/stale, each its own tier"
+        );
     }
 
     // ---- verdict ----
+
+    #[test]
+    fn old_daemon_without_health_never_claims_a_storm_verdict() {
+        // `None` health = no telemetry (old daemon): storm detection is
+        // unavailable, and account/poller conditions still work.
+        let mut exhausted = account("exhausted");
+        exhausted.five_hour = Some(window(0.97));
+        let verdict = health_verdict(&view_without_health(pool(vec![exhausted])), now());
+        assert_eq!(verdict.level(), VerdictLevel::Warn);
+        assert!(verdict
+            .headline()
+            .expect("condition")
+            .text
+            .contains("QUOTA CRITICAL"));
+    }
 
     fn view_with(snapshot: PoolSnapshot, health: HealthCounts) -> DashboardView {
         DashboardView {
@@ -502,8 +529,14 @@ mod tests {
             quota_display: Default::default(),
             data_quality: Default::default(),
             events: Vec::new(),
-            health,
+            health: Some(health),
         }
+    }
+
+    fn view_without_health(snapshot: PoolSnapshot) -> DashboardView {
+        let mut view = view_with(snapshot, HealthCounts::default());
+        view.health = None;
+        view
     }
 
     #[test]
