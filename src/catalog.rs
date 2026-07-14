@@ -11,23 +11,20 @@
 //! live pin, mirroring [`crate::provider::grok`]'s bare-`grok` routing.
 //!
 //! Sources (evidence gathered 2026-07-14):
+//! - Claude rows: user-curated 2026-07-14 (Claude Code model picker; `[1m]`
+//!   suffix marks the 1M-context variant ids). The effort menus are the Claude
+//!   Code `/effort` levels, applied per the user contract — llmux itself does
+//!   NOT shape claude requests (bare names still merely ROUTE to the group),
+//!   these values are advertised metadata for clients.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol/terra`
-//!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh. The
-//!   `gpt-5.5-codex` / `gpt-5-codex` ids are absent from the current
-//!   models.json (legacy passthrough) — context unknown (null), effort menu
-//!   the documented low..xhigh floor.
-//! - Grok context windows / names: the live `cli-chat-proxy` `/v1/models`
-//!   probe 2026-07-14 (`grok-4.5` ctx 500000; `grok-composer-2.5-fast` ctx
-//!   200000). `grok-build-0.1` ctx 256000 from `docs/grok/spec.md`. Grok
-//!   effort menus come from [`crate::provider::grok::thinking_levels_catalog`]
-//!   (models with no thinking support get an empty menu). `grok-4.3` /
-//!   `grok-3-mini` context windows are not published → null.
-//! - Claude context windows: the Anthropic subscription standard 200000 for
-//!   each id. `claude-fable-5` is nominal/unverified (flagged in
-//!   `docs/models.md`). llmux does not shape claude requests, so their effort
-//!   menus are empty and they carry no aliases (bare names like `opus` ROUTE
-//!   but are never resolved to a concrete id).
+//!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh.
+//! - Grok context window / name: the live `cli-chat-proxy` `/v1/models` probe
+//!   2026-07-14 (`grok-4.5` ctx 500000). Grok effort menus come from
+//!   [`crate::provider::grok::thinking_levels_catalog`] (models with no
+//!   thinking support get an empty menu). The curated grok set is just
+//!   `grok-4.5`; any other `grok-*` id passes through at request time and
+//!   synthesizes a null-metadata row when pinned.
 
 use std::borrow::Cow;
 
@@ -54,67 +51,69 @@ pub struct ModelEntry {
     pub group: &'static str,
 }
 
+/// Claude effort menu — the Claude Code `/effort` levels, per the user
+/// contract (llmux does not shape claude requests; this is client metadata).
+const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 // ---- codex effort menus (openai/codex models.json, 2026-07-14) ----
 const CODEX_EFFORTS_SOL_TERRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS_LUNA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
 
-const CLAUDE_CONTEXT: u64 = 200_000;
-
 /// The known model catalog in canonical group order (`claude < codex < grok`).
 /// `grok_pin` / `codex_pin` are the live provider model slugs; the entry whose
 /// id equals `grok_pin` additionally advertises the `"grok"` family alias.
 ///
-/// When `grok_pin` matches no curated grok id (a config can pin ANY `grok-*`
-/// slug, e.g. `grok-code-fast-1`), a synthesized row is appended after the
-/// curated grok entries so the `"grok"` alias always has an owner: id = the
-/// pin, name = the pin verbatim, efforts from the thinking-level lookup (else
-/// empty), context null. `codex_pin` is unused for aliasing (a model-less
-/// codex request uses the pin directly, which is not an alias) — accepted for
-/// symmetry / future use.
+/// The curated grok set is just `grok-4.5`; when `grok_pin` is anything else (a
+/// config can pin ANY `grok-*` slug, e.g. `grok-code-fast-1`), a synthesized
+/// row is appended after the curated grok entry so the `"grok"` alias always
+/// has an owner: id = the pin, name = the pin verbatim, efforts from the
+/// thinking-level lookup (else empty), context null. `codex_pin` is unused for
+/// aliasing (a model-less codex request uses the pin directly, which is not an
+/// alias) — accepted for symmetry / future use.
 pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
     let mut entries = Vec::new();
 
-    // ---- claude (pass-through; no aliases, no shaped efforts) ----
-    for (id, name) in [
-        ("claude-fable-5", "Claude Fable 5"),
-        ("claude-opus-4-8", "Claude Opus 4.8"),
-        ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-        ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
-        ("claude-haiku-4-5", "Claude Haiku 4.5"),
+    // ---- claude (user-curated 2026-07-14) ----
+    for (id, aliases, name, ctx) in [
+        (
+            "claude-fable-5[1m]",
+            &["fable"][..],
+            "Claude Fable 5",
+            1_000_000u64,
+        ),
+        (
+            "claude-opus-4-8[1m]",
+            &["opus"][..],
+            "Claude Opus 4.8",
+            1_000_000,
+        ),
+        ("claude-opus-4-6[1m]", &[][..], "Claude Opus 4.6", 1_000_000),
+        (
+            "claude-sonnet-5[1m]",
+            &["sonnet"][..],
+            "Claude Sonnet 5 [1M]",
+            1_000_000,
+        ),
+        ("claude-sonnet-5", &[][..], "Claude Sonnet 5", 200_000),
+        (
+            "claude-haiku-4-5",
+            &["haiku"][..],
+            "Claude Haiku 4.5",
+            200_000,
+        ),
     ] {
         entries.push(ModelEntry {
             id: Cow::Borrowed(id),
-            aliases: Vec::new(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
             name: Cow::Borrowed(name),
-            efforts: &[],
-            max_context: Some(CLAUDE_CONTEXT),
+            efforts: CLAUDE_EFFORTS,
+            max_context: Some(ctx),
             group: "claude",
         });
     }
 
     // ---- codex ----
-    entries.push(codex_entry(
-        "gpt-5.5",
-        "GPT-5.5",
-        CODEX_EFFORTS_GPT55,
-        Some(272_000),
-        Vec::new(),
-    ));
-    entries.push(codex_entry(
-        "gpt-5.5-codex",
-        "GPT-5.5-Codex",
-        CODEX_EFFORTS_GPT55,
-        None,
-        Vec::new(),
-    ));
-    entries.push(codex_entry(
-        "gpt-5-codex",
-        "GPT-5-Codex",
-        CODEX_EFFORTS_GPT55,
-        None,
-        Vec::new(),
-    ));
     entries.push(codex_entry(
         "gpt-5.6-sol",
         "GPT-5.6-Sol",
@@ -136,30 +135,28 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
         Some(372_000),
         vec!["luna".into()],
     ));
+    entries.push(codex_entry(
+        "gpt-5.5",
+        "GPT-5.5",
+        CODEX_EFFORTS_GPT55,
+        Some(272_000),
+        Vec::new(),
+    ));
 
-    // ---- grok (curated) ----
-    let mut pin_owned = false;
-    for (id, name, ctx) in [
-        ("grok-4.5", "Grok 4.5", Some(500_000)),
-        ("grok-4.3", "Grok 4.3", None),
-        ("grok-3-mini", "Grok 3 Mini", None),
-        ("grok-composer-2.5-fast", "Composer 2.5", Some(200_000)),
-        ("grok-build-0.1", "Grok Build 0.1", Some(256_000)),
-    ] {
-        let mut aliases = Vec::new();
-        if id == grok_pin {
-            aliases.push("grok".to_string());
-            pin_owned = true;
-        }
-        entries.push(ModelEntry {
-            id: Cow::Borrowed(id),
-            aliases,
-            name: Cow::Borrowed(name),
-            efforts: grok_efforts(id),
-            max_context: ctx,
-            group: "grok",
-        });
-    }
+    // ---- grok (curated: grok-4.5 only) ----
+    let pin_owned = grok_pin == "grok-4.5";
+    entries.push(ModelEntry {
+        id: Cow::Borrowed("grok-4.5"),
+        aliases: if pin_owned {
+            vec!["grok".to_string()]
+        } else {
+            Vec::new()
+        },
+        name: Cow::Borrowed("Grok 4.5"),
+        efforts: grok_efforts("grok-4.5"),
+        max_context: Some(500_000),
+        group: "grok",
+    });
 
     // ---- grok (synthesized out-of-catalog pin) ----
     // The provider forwards any `grok-*` id verbatim, so a pin outside the
@@ -219,11 +216,32 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_all_groups_in_canonical_order() {
+    fn catalog_matches_user_contract_11_entries() {
+        // The pinned (curated) case: exactly 11 rows, claude ids in order.
         let entries = catalog("grok-4.5", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 5 + 6 + 5);
+        assert_eq!(entries.len(), 11);
+        let claude_ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "claude")
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(
+            claude_ids,
+            vec![
+                "claude-fable-5[1m]",
+                "claude-opus-4-8[1m]",
+                "claude-opus-4-6[1m]",
+                "claude-sonnet-5[1m]",
+                "claude-sonnet-5",
+                "claude-haiku-4-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_groups_in_canonical_order() {
+        let entries = catalog("grok-4.5", "gpt-5.6-sol");
         let groups: Vec<&str> = entries.iter().map(|e| e.group).collect();
-        // claude block, then codex block, then grok block.
         let first_codex = groups.iter().position(|g| *g == "codex").unwrap();
         let first_grok = groups.iter().position(|g| *g == "grok").unwrap();
         assert!(groups[..first_codex].iter().all(|g| *g == "claude"));
@@ -231,6 +249,34 @@ mod tests {
             .iter()
             .all(|g| *g == "codex"));
         assert!(groups[first_grok..].iter().all(|g| *g == "grok"));
+    }
+
+    #[test]
+    fn claude_entries_carry_curated_efforts_and_context() {
+        let entries = catalog("grok-4.5", "gpt-5.6-sol");
+        for e in entries.iter().filter(|e| e.group == "claude") {
+            assert_eq!(
+                e.efforts,
+                &["low", "medium", "high", "xhigh", "max"],
+                "{}: Claude Code effort levels",
+                e.id
+            );
+        }
+        // Curated aliases and 1M-vs-standard context windows.
+        assert_eq!(find(&entries, "claude-fable-5[1m]").aliases, vec!["fable"]);
+        assert_eq!(find(&entries, "claude-opus-4-8[1m]").aliases, vec!["opus"]);
+        assert!(find(&entries, "claude-opus-4-6[1m]").aliases.is_empty());
+        assert_eq!(
+            find(&entries, "claude-sonnet-5[1m]").aliases,
+            vec!["sonnet"]
+        );
+        assert!(find(&entries, "claude-sonnet-5").aliases.is_empty());
+        assert_eq!(find(&entries, "claude-haiku-4-5").aliases, vec!["haiku"]);
+        assert_eq!(
+            find(&entries, "claude-sonnet-5[1m]").max_context,
+            Some(1_000_000)
+        );
+        assert_eq!(find(&entries, "claude-sonnet-5").max_context, Some(200_000));
     }
 
     #[test]
@@ -243,20 +289,21 @@ mod tests {
 
     #[test]
     fn grok_family_alias_follows_the_pin() {
+        // Curated pin owns the alias directly.
         let pinned = catalog("grok-4.5", "gpt-5.6-sol");
         assert_eq!(find(&pinned, "grok-4.5").aliases, vec!["grok".to_string()]);
-        assert!(find(&pinned, "grok-4.3").aliases.is_empty());
 
+        // Out-of-catalog pin: alias moves to the synthesized row.
         let pinned = catalog("grok-4.3", "gpt-5.6-sol");
-        assert_eq!(find(&pinned, "grok-4.3").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
+        assert_eq!(find(&pinned, "grok-4.3").aliases, vec!["grok".to_string()]);
     }
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 16.
+        // A curated pin: no synthesized row, alias on the static row, count 11.
         let entries = catalog("grok-4.5", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 11);
         let owners: Vec<&str> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -270,7 +317,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 17);
+        assert_eq!(entries.len(), 12);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -280,9 +327,22 @@ mod tests {
         assert_eq!(synth.id, "grok-code-fast-1");
         assert_eq!(synth.name, "grok-code-fast-1");
         assert_eq!(synth.max_context, None);
+        assert_eq!(synth.efforts, &[] as &[&str], "unknown id → no efforts");
         assert_eq!(synth.group, "grok");
-        // Appended after the curated grok rows (last entry).
+        // Appended after the curated grok row (last entry).
         assert_eq!(entries.last().unwrap().id, "grok-code-fast-1");
+    }
+
+    #[test]
+    fn synthesized_pin_keeps_known_thinking_levels() {
+        // A known reasoner pinned outside the curated set still gets its effort
+        // menu from the thinking-level lookup, even though metadata is null.
+        let entries = catalog("grok-4.3", "gpt-5.6-sol");
+        assert_eq!(entries.len(), 12);
+        let synth = find(&entries, "grok-4.3");
+        assert_eq!(synth.efforts, &["none", "low", "medium", "high"]);
+        assert_eq!(synth.max_context, None);
+        assert_eq!(synth.aliases, vec!["grok".to_string()]);
     }
 
     #[test]
@@ -295,12 +355,20 @@ mod tests {
     }
 
     #[test]
-    fn claude_entries_have_no_efforts_or_aliases() {
+    fn dropped_ids_are_absent() {
         let entries = catalog("grok-4.5", "gpt-5.6-sol");
-        for e in entries.iter().filter(|e| e.group == "claude") {
-            assert!(e.efforts.is_empty(), "{}: no shaped efforts", e.id);
-            assert!(e.aliases.is_empty(), "{}: no aliases", e.id);
-            assert_eq!(e.max_context, Some(200_000));
+        for gone in [
+            "gpt-5.5-codex",
+            "gpt-5-codex",
+            "grok-4.3",
+            "grok-3-mini",
+            "grok-build-0.1",
+            "grok-composer-2.5-fast",
+        ] {
+            assert!(
+                !entries.iter().any(|e| e.id == gone),
+                "{gone} must not be curated"
+            );
         }
     }
 
