@@ -156,12 +156,19 @@ so codex and grok share one Responses-API core with thin per-provider adapters.
   `/model grok-4.5` + effort high ≙ how `gpt-5.6-sol` is used today (live config
   `codex.default_model = "gpt-5.6-sol"`, `~/.config/llmux.json`).
 - Live shape control: `POST /llmux/grok {default_model?, reasoning_effort?}` — same
-  contract as `POST /llmux/codex` (server.rs:1089-1140): partial update, apply live,
-  persist via `config::update_path`. **Islands settings row: descoped for v1**
-  (consensus re-approval round 4) — islands has no codex settings row either
-  (`POST /llmux/codex` is TUI-dashboard/CLI-only), so a grok-only row would exceed
-  codex parity; the islands asks in the user requirements are registration (R2) and
-  stats (R3), both delivered. A settings row for BOTH providers is follow-up work.
+  request/persist contract as `POST /llmux/codex` (server.rs:1089-1140): partial
+  update, apply live, persist via `config::update_path`. This is the **daemon HTTP
+  API** control (callable directly / by scripts). **Interactive callers are v1-descoped
+  and accurately scoped** (consensus round 4):
+  - The **TUI `f`/`m`/`e` grok control** (mirroring codex's `perform_remote_codex` at
+    tui/mod.rs:1160 + `CodexSettingsDoc`) is NOT in this PR — it needs a parallel
+    `GrokSettingsDoc` in the dashboard document and the keybind wiring, a bounded
+    follow-up. codex keeps its TUI control; grok's is the endpoint only in v1.
+  - The **islands settings row** is likewise descoped (islands has no codex row
+    either; `POST /llmux/codex` is TUI/HTTP-only).
+  The stated R4 requirement — Claude Code `/model grok-4.5` switching "like gpt-5.6" —
+  is delivered by the routing path above (verified in the live receipt), independent
+  of these interactive control surfaces.
 - Config: new `config.grok` section `{upstream, default_model, reasoning_effort,
   client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.5`, null, null, false).
 
