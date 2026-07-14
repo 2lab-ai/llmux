@@ -812,7 +812,10 @@ Kirigami.ApplicationWindow {
         publishScreenInventory()
         publishDesktopCapabilities()
         applySelectedScreen()
-        if (!controller.snapshotMode)
+        // A smoke run proves that the native/QML shell can load. It must not
+        // start daemon or dashboard worker threads that can race Qt teardown
+        // when the short-lived offscreen process exits.
+        if (!controller.snapshotMode && !controller.smokeMode)
             controller.dispatch("app_started", "{}")
     }
 
