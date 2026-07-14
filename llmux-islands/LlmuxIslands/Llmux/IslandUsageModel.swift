@@ -234,6 +234,15 @@ final class IslandUsageModel: ObservableObject {
         }
     }
 
+    /// Installs a state produced by the real Rust bridge for offscreen visual
+    /// evidence. The environment gate keeps this path unreachable in a normal
+    /// app launch; snapshot mode still exercises the production projection and
+    /// receipt renderers instead of maintaining a second UI-only fixture.
+    func installSnapshotFixtureState(_ state: SharedUiState) {
+        guard SnapshotMode.isActive else { return }
+        apply(state)
+    }
+
     private func semanticRuntime(for client: LlmuxClient) throws -> SharedUiCoreRuntime {
         // A cleared remote credential is still a valid saved configuration.
         // The semantic state must exist so it can report unauthenticated; the

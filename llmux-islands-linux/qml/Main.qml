@@ -16,12 +16,15 @@ Kirigami.ApplicationWindow {
     readonly property string selectedSurface: uiState.navigation || "usage"
     readonly property int totalInFlight: inFlightTotal(windowState.provider_in_flight)
     readonly property bool trayNeedsAttention: healthNeedsAttention()
+    readonly property bool trayAvailable: trayLoader.item !== null
+        && trayLoader.item.available === true
     readonly property bool semanticOpen: windowState.open === true
     readonly property int preferredWindowWidth: semanticOpen
         ? (controller.snapshotMode ? 960 : expandedPreferredWidth()) : 260
     readonly property int preferredWindowContentHeight: semanticOpen
-        ? (controller.snapshotMode ? 760 : expandedPreferredContentHeight()) : 44
-    readonly property var snapshotSurfaces: ["usage", "statistics", "menu"]
+        ? (controller.snapshotMode ? snapshotPreferredContentHeight()
+                                   : expandedPreferredContentHeight()) : 44
+    readonly property var snapshotSurfaces: ["usage", "statistics", "receipts", "menu"]
     property bool surfaceConfigured: false
     property bool noTrayFallback: false
     property bool bootPresentationStarted: false
@@ -77,7 +80,7 @@ Kirigami.ApplicationWindow {
     }
 
     function publishDesktopCapabilities() {
-        var trayAvailable = tray.available
+        var trayAvailable = root.trayAvailable
         routeDispatch("desktop_capabilities_changed", {
             "tray_available": trayAvailable,
             // This shell delivers native notification UI through the Qt tray
@@ -139,6 +142,19 @@ Kirigami.ApplicationWindow {
         var headerHeight = finiteMetric(expandedHeader.implicitHeight, 52)
         var available = selectedScreenDimension("height", 720) - 32
         return Math.max(360, Math.min(available, pageHeight + headerHeight + 32))
+    }
+
+    function snapshotPreferredContentHeight() {
+        var name = snapshotIndex >= 0 ? snapshotSurfaces[snapshotIndex] : selectedSurface
+        if (name === "receipts")
+            return 760
+        var pageHeight = surfaceLoader.item === null
+            || surfaceLoader.item === undefined ? 0
+            : Number(surfaceLoader.item.preferredContentHeight)
+        if (!isFinite(pageHeight) || pageHeight <= 0)
+            return 760
+        var headerHeight = finiteMetric(expandedHeader.implicitHeight, 52)
+        return Math.max(760, Math.min(2160, Math.ceil(pageHeight) + headerHeight + 32))
     }
 
     function dispatchPreferredWindowMetrics() {
@@ -322,8 +338,12 @@ Kirigami.ApplicationWindow {
             return
         snapshotIndex = 0
         requestOpen("boot")
-        selectSurface(snapshotSurfaces[snapshotIndex])
+        selectSnapshotSurface(snapshotSurfaces[snapshotIndex])
         snapshotCaptureTimer.restart()
+    }
+
+    function selectSnapshotSurface(name) {
+        selectSurface(name === "receipts" ? "usage" : name)
     }
 
     function failSnapshot(message) {
@@ -344,7 +364,7 @@ Kirigami.ApplicationWindow {
         if (!controller.snapshotMode || snapshotCaptureBusy || snapshotIndex < 0)
             return
         if (!semanticOpen || surfaceLoader.status !== Loader.Ready
-                || width !== 960 || height !== 760) {
+                || width !== 960 || height !== preferredWindowContentHeight) {
             snapshotCaptureAttempts += 1
             if (snapshotCaptureAttempts >= 50) {
                 failSnapshot(qsTr("Snapshot surface did not become ready"))
@@ -368,8 +388,16 @@ Kirigami.ApplicationWindow {
             failSnapshot(qsTr("Statistics snapshot rendered incomplete nested data"))
             return
         }
+        if (surface === "receipts"
+                && snapshotSurfaceCount("renderedVerificationReceiptCount") < 1) {
+            snapshotCaptureBusy = false
+            failSnapshot(qsTr("Receipt snapshot rendered no verification receipt"))
+            return
+        }
         var outputPath = controller.snapshotDir + "/" + surface + ".png"
-        snapshotTarget.grabToImage(function(result) {
+        var captureTarget = surface === "receipts"
+            ? surfaceLoader.item.snapshotReceiptTarget : snapshotTarget
+        var saveResult = function(result) {
             var saved = result !== null && result.saveToFile(outputPath)
             snapshotCaptureBusy = false
             if (!saved) {
@@ -384,9 +412,13 @@ Kirigami.ApplicationWindow {
                 Qt.exit(0)
                 return
             }
-            selectSurface(snapshotSurfaces[snapshotIndex])
+            selectSnapshotSurface(snapshotSurfaces[snapshotIndex])
             snapshotCaptureTimer.restart()
-        }, Qt.size(960, 760))
+        }
+        if (surface === "receipts")
+            captureTarget.grabToImage(saveResult)
+        else
+            captureTarget.grabToImage(saveResult, Qt.size(960, height))
     }
 
     function automaticPollAllowed() {
@@ -402,7 +434,8 @@ Kirigami.ApplicationWindow {
             dispatchError = qsTr("Invalid notification payload")
             return
         }
-        if (tray.available) {
+        var tray = trayLoader.item
+        if (tray !== null && tray.available) {
             tray.showMessage(
                 String(message.title || qsTr("llmux Islands")),
                 String(message.body || ""),
@@ -468,51 +501,64 @@ Kirigami.ApplicationWindow {
         }
     }
 
-    Platform.SystemTrayIcon {
-        id: tray
-        visible: available && !controller.smokeMode && !controller.snapshotMode
-        tooltip: root.trayTooltip()
-        // Qt's portable tray API does not expose StatusNotifierItem status.
-        // A theme warning icon plus explicit tooltip/menu text is the honest
-        // cross-desktop attention representation available here.
-        icon.name: root.trayNeedsAttention ? "dialog-warning" : "io.twolab.LlmuxIslands"
-        icon.source: root.trayNeedsAttention
-            ? "" : "qrc:/icons/io.twolab.LlmuxIslands.svg"
+    // Headless smoke tests and deterministic snapshot runs must never create a
+    // native tray backend. Qt's tray object owns platform resources even while
+    // invisible, and destroying those resources during a headless shutdown is
+    // not reliable across Qt/platform-plugin combinations.
+    Loader {
+        id: trayLoader
+        active: !controller.smokeMode && !controller.snapshotMode
+        sourceComponent: trayComponent
+    }
 
-        onActivated: function(reason) {
-            if (reason === Platform.SystemTrayIcon.Trigger
-                    || reason === Platform.SystemTrayIcon.DoubleClick
-                    || reason === Platform.SystemTrayIcon.MiddleClick) {
-                root.routeDispatch("tray_activated", {})
-            }
-        }
+    Component {
+        id: trayComponent
 
-        onMessageClicked: root.requestOpen("notification")
+        Platform.SystemTrayIcon {
+            visible: available
+            tooltip: root.trayTooltip()
+            // Qt's portable tray API does not expose StatusNotifierItem status.
+            // A theme warning icon plus explicit tooltip/menu text is the honest
+            // cross-desktop attention representation available here.
+            icon.name: root.trayNeedsAttention ? "dialog-warning" : "io.twolab.LlmuxIslands"
+            icon.source: root.trayNeedsAttention
+                ? "" : "qrc:/icons/io.twolab.LlmuxIslands.svg"
 
-        menu: Platform.Menu {
-            Platform.MenuItem {
-                text: root.trayStatusText()
-                enabled: false
+            onActivated: function(reason) {
+                if (reason === Platform.SystemTrayIcon.Trigger
+                        || reason === Platform.SystemTrayIcon.DoubleClick
+                        || reason === Platform.SystemTrayIcon.MiddleClick) {
+                    root.routeDispatch("tray_activated", {})
+                }
             }
-            Platform.MenuItem {
-                text: qsTr("Providers: %1 · Total: %2")
-                    .arg(root.providerInFlightSummary(true))
-                    .arg(root.totalInFlight)
-                enabled: false
-            }
-            Platform.MenuSeparator {}
-            Platform.MenuItem {
-                text: root.semanticOpen ? qsTr("Close") : qsTr("Open")
-                onTriggered: root.routeDispatch("tray_activated", {})
-            }
-            Platform.MenuItem {
-                text: qsTr("Refresh")
-                onTriggered: root.routeDispatch("refresh_requested", { "source": "manual" })
-            }
-            Platform.MenuSeparator {}
-            Platform.MenuItem {
-                text: qsTr("Quit")
-                onTriggered: root.routeDispatch("quit_requested", {})
+
+            onMessageClicked: root.requestOpen("notification")
+
+            menu: Platform.Menu {
+                Platform.MenuItem {
+                    text: root.trayStatusText()
+                    enabled: false
+                }
+                Platform.MenuItem {
+                    text: qsTr("Providers: %1 · Total: %2")
+                        .arg(root.providerInFlightSummary(true))
+                        .arg(root.totalInFlight)
+                    enabled: false
+                }
+                Platform.MenuSeparator {}
+                Platform.MenuItem {
+                    text: root.semanticOpen ? qsTr("Close") : qsTr("Open")
+                    onTriggered: root.routeDispatch("tray_activated", {})
+                }
+                Platform.MenuItem {
+                    text: qsTr("Refresh")
+                    onTriggered: root.routeDispatch("refresh_requested", { "source": "manual" })
+                }
+                Platform.MenuSeparator {}
+                Platform.MenuItem {
+                    text: qsTr("Quit")
+                    onTriggered: root.routeDispatch("quit_requested", {})
+                }
             }
         }
     }
@@ -692,7 +738,7 @@ Kirigami.ApplicationWindow {
         id: trayFallbackTimer
         interval: 250
         repeat: false
-        onTriggered: root.synchronizeTrayFallback(tray.available)
+        onTriggered: root.synchronizeTrayFallback(root.trayAvailable)
     }
 
     Timer {
@@ -700,7 +746,7 @@ Kirigami.ApplicationWindow {
         interval: 1000
         repeat: false
         onTriggered: root.routeDispatch("boot_close_elapsed", {
-            "tray_available": tray.available && !root.noTrayFallback
+            "tray_available": root.trayAvailable && !root.noTrayFallback
         })
     }
 

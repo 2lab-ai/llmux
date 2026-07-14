@@ -14,8 +14,16 @@ struct IslandStatsView: View {
     @ObservedObject var viewModel: NotchViewModel
 
     @State private var section: StatsSection = .overview
-    @State private var now = Date()
+    @State private var now: Date
+    private let snapshotNow: Date?
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    init(model: IslandUsageModel, viewModel: NotchViewModel, snapshotNow: Date? = nil) {
+        self.model = model
+        self.viewModel = viewModel
+        self.snapshotNow = snapshotNow
+        _now = State(initialValue: snapshotNow ?? Date())
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -23,7 +31,9 @@ struct IslandStatsView: View {
             StatsSegmentedControl(selection: $section)
             content
         }
-        .onReceive(clock) { now = $0 }
+        .onReceive(clock) {
+            if snapshotNow == nil { now = $0 }
+        }
     }
 
     private var header: some View {

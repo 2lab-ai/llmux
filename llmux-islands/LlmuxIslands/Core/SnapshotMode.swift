@@ -238,21 +238,20 @@ enum SnapshotMode {
         // model) keying), and zero/absent cache + client cost fields
         // (omitted, never `—`).
         let model = IslandUsageModel.shared
-        model.tiles = fixtureTiles()
-        model.connection = .online
-        let dashboard = try fixtureDashboard()
-        model.dashboard = dashboard
-        model.totals = dashboard.totals
-        model.modelUsage = dashboard.modelUsage
-        model.clientUsage = dashboard.clientUsage
-        model.windowed = dashboard.windowed
-        model.activity = dashboard.activity
-        model.healthWarningCount = DashboardHealth.summary(dashboard.accounts).total
+        let fixture = fixtureDashboard()
+        try installCanonicalStatsFixture(fixture, into: model)
+        guard let dashboard = model.dashboard else {
+            throw SharedUiCoreError.invalidOutput
+        }
 
         let viewModel = makeViewModel()
         viewModel.contentType = .stats
         let url = dir.appendingPathComponent("stats.png")
-        try writeHosted(view: IslandStatsView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        try writeHosted(
+            view: IslandStatsView(model: model, viewModel: viewModel, snapshotNow: fixture.now),
+            size: viewModel.openedSize,
+            to: url
+        )
         var written = [url.path]
 
         // Each section rendered directly at its content height so every block
@@ -266,7 +265,12 @@ enum SnapshotMode {
         for (section, name, height) in sections {
             let sectionURL = dir.appendingPathComponent(name)
             let view = StatsSectionContent(
-                section: section, dashboard: dashboard, tiles: model.tiles, now: Date()
+                section: section,
+                dashboard: dashboard,
+                tiles: model.tiles,
+                now: fixture.now,
+                activityReceipts: model.activityReceipts,
+                verificationReceipts: model.verificationReceipts
             )
             try writeHosted(
                 view: view
@@ -277,17 +281,105 @@ enum SnapshotMode {
             )
             written.append(sectionURL.path)
         }
+
+        // A readable zoom uses the exact production receipt components. The
+        // full Statistics screenshot above establishes surrounding context;
+        // this artifact makes request metadata and the post-write readback
+        // outcome legible in a PR at normal browser zoom.
+        let receiptsURL = dir.appendingPathComponent("receipts-detail.png")
+        let receipts = VStack(alignment: .leading, spacing: 10) {
+            StatsSectionLabel("recent activity")
+            UsageCanonicalActivityReceiptList(receipts: model.activityReceipts, now: fixture.now)
+            StatsSectionLabel("verification receipts")
+            UsageVerificationReceiptList(receipts: model.verificationReceipts, now: fixture.now)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        try writeHosted(
+            view: receipts,
+            size: CGSize(width: 560, height: 260),
+            to: receiptsURL
+        )
+        written.append(receiptsURL.path)
         return written
+    }
+
+    private struct StatsFixture {
+        let now: Date
+        let nowMs: UInt64
+        let dashboardJSON: Data
+    }
+
+    /// Hydrate and mutate the real shared reducer so both receipt families in
+    /// the screenshot come from the same bridge path as the live app.
+    @MainActor
+    private static func installCanonicalStatsFixture(
+        _ fixture: StatsFixture,
+        into model: IslandUsageModel
+    ) throws {
+        let runtime = try SharedUiCoreRuntime(configuration: .init(
+            endpointDisplay: "http://127.0.0.1:3456",
+            remote: false,
+            authenticated: true,
+            apiKeyConfigured: false,
+            selectedScreenID: "snapshot-display",
+            soundID: "default",
+            showFableWeekly: true,
+            presentation: "regular"
+        ))
+        let refresh = try runtime.dispatch([
+            "type": "refresh_requested",
+            "source": "startup",
+        ])
+        guard let initialRequestID = refresh.effects.compactMap(\.dashboardRequestID).first else {
+            throw SharedUiCoreError.invalidOutput
+        }
+        _ = try runtime.applyDashboard(
+            requestID: initialRequestID,
+            dashboardJSON: fixture.dashboardJSON,
+            receivedAtMs: fixture.nowMs
+        )
+
+        let operationID = "snapshot-settings-readback"
+        _ = try runtime.dispatch([
+            "type": "operation_started",
+            "id": operationID,
+            "request": [
+                "kind": "persist_show_fable",
+                "enabled": true,
+            ],
+            "target_display": "Fable weekly quota",
+            "started_at_ms": fixture.nowMs + 100,
+        ])
+        let finished = try runtime.dispatch([
+            "type": "operation_finished",
+            "id": operationID,
+            "outcome": "succeeded",
+            "message": "Preference saved and verified by daemon readback",
+            "finished_at_ms": fixture.nowMs + 150,
+        ])
+        guard let readbackRequestID = finished.effects.compactMap(\.dashboardRequestID).first else {
+            throw SharedUiCoreError.invalidOutput
+        }
+        let readback = try runtime.applyDashboard(
+            requestID: readbackRequestID,
+            dashboardJSON: fixture.dashboardJSON,
+            receivedAtMs: fixture.nowMs + 200
+        )
+        model.installSnapshotFixtureState(readback.state)
     }
 
     /// Compact dashboard document in the daemon's wire shape (see
     /// `DashboardFixtures` in the test target for the full captured form).
-    /// Timestamps are computed off `Date()` so "ago" columns render sanely.
-    private static func fixtureDashboard() throws -> LlmuxDashboard {
-        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+    /// Timestamps use one fixed clock so "ago" columns and PNG pixels are
+    /// stable across local and CI captures.
+    private static func fixtureDashboard() -> StatsFixture {
+        let now = Date(timeIntervalSince1970: 1_784_092_800)
+        let nowMs = UInt64(now.timeIntervalSince1970 * 1000)
         let json = """
         {
           "version": "llmux snapshot-fixture", "port": 3456, "uptime_secs": 935,
+          "email_anonymous": true, "show_fable_weekly": true,
           "current": "claude:demo-1@example.com",
           "accounts": [
             {"name": "claude:demo-1@example.com", "type": "oauth", "status": "active",
@@ -352,7 +444,12 @@ enum SnapshotMode {
           }
         }
         """
-        return try JSONDecoder().decode(LlmuxDashboard.self, from: Data(json.utf8))
+        let dashboardJSON = Data(json.utf8)
+        return StatsFixture(
+            now: now,
+            nowMs: nowMs,
+            dashboardJSON: dashboardJSON
+        )
     }
 
     /// Plausible 16" laptop geometry so `openedSize` matches the app.
