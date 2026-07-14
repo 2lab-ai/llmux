@@ -421,12 +421,18 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "sha256sum",
         "SHA256SUMS",
         "QML warning:",
+        "./target/debug/llmux-islands-linux --smoke-test",
+        "./target/debug/llmux-islands-linux --snapshot-dir",
     ] {
         assert!(
             docker.contains(marker),
             "Arch snapshot receipt must contain {marker}"
         );
     }
+    assert!(
+        !docker.contains("cargo run --locked -- --smoke-test"),
+        "Arch smoke verification must execute the binary built in the prior layer"
+    );
 }
 
 #[test]
