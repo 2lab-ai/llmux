@@ -30,10 +30,11 @@ pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
 const MAX_IN_FLIGHT: usize = 64;
 /// Rolling window the header health verdict aggregates over (glance-triage).
 pub(crate) const HEALTH_WINDOW: Duration = Duration::from_secs(300);
-/// Hard length bound on the health sample deque: at 5 minutes retention this
-/// only matters in a pathological storm (>66 req/s sustained); the bound keeps
-/// memory finite while still counting far past [`LOG_CAPACITY`].
-const HEALTH_EVENT_CAP: usize = 20_000;
+/// One bucket per second of [`HEALTH_WINDOW`] (+1 for the partial current
+/// second): the aggregation is EXACT for any request rate at fixed memory —
+/// a raw per-event deque with a length cap would silently shorten the time
+/// window during a storm, exactly when accuracy matters.
+const HEALTH_BUCKET_CAP: usize = HEALTH_WINDOW.as_secs() as usize + 1;
 /// Age after which an in-flight row is presumed finished and swept, even if no
 /// `RequestFinished` event ever arrived (the event was dropped on a full
 /// activity channel). Real requests finish in well under 90s per the daemon
@@ -733,12 +734,13 @@ pub(crate) struct ActivityLog {
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
     windowed: WindowedBuckets,
-    /// Dedicated (timestamp, status) samples for the header health verdict
-    /// (glance-triage MUST-FIX 3): the verdict window must NEVER be derived
-    /// from the `completed` ring — [`LOG_CAPACITY`] truncation would undercount
-    /// a storm exactly when accuracy matters most. Back = newest; pruned to
-    /// [`HEALTH_WINDOW`] on every push.
-    health: VecDeque<(SystemTime, u16)>,
+    /// Per-second health buckets for the header health verdict (glance-triage
+    /// MUST-FIX 3): the verdict window must NEVER be derived from the
+    /// `completed` ring — [`LOG_CAPACITY`] truncation would undercount a storm
+    /// exactly when accuracy matters most. Back = newest second; pruned to
+    /// [`HEALTH_WINDOW`] on every push, at most [`HEALTH_BUCKET_CAP`] entries
+    /// regardless of request rate.
+    health: VecDeque<(u64, HealthCounts)>,
 }
 
 /// Status-class counts over the last [`HEALTH_WINDOW`], feeding the header
@@ -752,6 +754,30 @@ pub(crate) struct HealthCounts {
     pub s429: u64,
     pub s401: u64,
     pub s5xx: u64,
+}
+
+impl HealthCounts {
+    /// Fold one finished request's status into the counts.
+    fn add_status(&mut self, status: u16) {
+        self.requests += 1;
+        if status >= 400 {
+            self.errors += 1;
+        }
+        match status {
+            429 => self.s429 += 1,
+            401 => self.s401 += 1,
+            500..=599 => self.s5xx += 1,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &HealthCounts) {
+        self.requests += other.requests;
+        self.errors += other.errors;
+        self.s429 += other.s429;
+        self.s401 += other.s401;
+        self.s5xx += other.s5xx;
+    }
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1311,14 +1337,28 @@ impl ActivityLog {
         self.completed.truncate(self.capacity);
     }
 
-    /// Record one finished request into the health window and prune samples
-    /// that have aged out (or overflow the hard cap).
+    /// Record one finished request into its per-second health bucket and
+    /// prune buckets that have aged out of [`HEALTH_WINDOW`].
     fn push_health(&mut self, at: SystemTime, status: u16) {
-        self.health.push_back((at, status));
-        let cutoff = at.checked_sub(HEALTH_WINDOW);
+        let sec = at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match self.health.back_mut() {
+            // Same (or out-of-order, sub-second reordering) second: fold into
+            // the newest bucket — delivery is chronological, so this only
+            // ever merges same/adjacent-second arrivals.
+            Some((bucket_sec, counts)) if *bucket_sec >= sec => counts.add_status(status),
+            _ => {
+                let mut counts = HealthCounts::default();
+                counts.add_status(status);
+                self.health.push_back((sec, counts));
+            }
+        }
+        let newest = self.health.back().map(|&(sec, _)| sec).unwrap_or(0);
+        let horizon = newest.saturating_sub(HEALTH_WINDOW.as_secs());
         while let Some(&(front, _)) = self.health.front() {
-            let aged = cutoff.is_some_and(|cutoff| front < cutoff);
-            if aged || self.health.len() > HEALTH_EVENT_CAP {
+            if front < horizon || self.health.len() > HEALTH_BUCKET_CAP {
                 self.health.pop_front();
             } else {
                 break;
@@ -1328,26 +1368,21 @@ impl ActivityLog {
 
     /// Status-class counts over the last [`HEALTH_WINDOW`] ending at `now`.
     /// Reads filter by time (pruning happens on push), so a quiet log still
-    /// ages out: a sample counts only while `now - HEALTH_WINDOW <= at`.
+    /// ages out: a bucket counts only while `now - HEALTH_WINDOW <= at`.
     pub(crate) fn health_counts(&self, now: SystemTime) -> HealthCounts {
-        let cutoff = now.checked_sub(HEALTH_WINDOW);
-        let mut counts = HealthCounts::default();
-        for &(at, status) in self.health.iter().rev() {
-            if cutoff.is_some_and(|cutoff| at < cutoff) {
+        let now_sec = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = now_sec.saturating_sub(HEALTH_WINDOW.as_secs());
+        let mut total = HealthCounts::default();
+        for &(sec, counts) in self.health.iter().rev() {
+            if sec < horizon {
                 break;
             }
-            counts.requests += 1;
-            if status >= 400 {
-                counts.errors += 1;
-            }
-            match status {
-                429 => counts.s429 += 1,
-                401 => counts.s401 += 1,
-                500..=599 => counts.s5xx += 1,
-                _ => {}
-            }
+            total.merge(&counts);
         }
-        counts
+        total
     }
 }
 
