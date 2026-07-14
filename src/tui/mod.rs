@@ -587,12 +587,29 @@ impl App {
         }
     }
 
+    /// Whether infinite-scroll hydration may read the LOCAL `activity.jsonl`
+    /// (review M1): the file belongs to THIS host's daemon, so it is the
+    /// right history for the in-process backend and for a LOOPBACK attach
+    /// (the standard `llmux` → localhost:3456 topology — same machine, same
+    /// state file). Attached to a daemon on another host, the local file is a
+    /// DIFFERENT daemon's activity — splicing it under the remote live rows
+    /// would show wrong data, so hydration stays off until the remote paging
+    /// endpoint exists (issue #107).
+    fn history_is_local(&self) -> bool {
+        match &self.backend {
+            Backend::Local(_) => true,
+            Backend::Remote(remote) => base_url_is_loopback(&remote.base_url),
+        }
+    }
+
     /// Kick off the one-shot background hydration of the persisted activity
     /// log for infinite scroll (UI-5). Read+parse+replay is blocking IO/CPU
     /// over a multi-MB file → blocking pool, result over `history_tx`
-    /// (mirrors `open_sessions`). Idempotent: no-op while loading or loaded.
+    /// (mirrors `open_sessions`). Idempotent: no-op while loading or loaded,
+    /// and refused entirely for a cross-host attach (see
+    /// [`Self::history_is_local`]).
     fn request_history(&mut self) {
-        if self.history_loading || self.history_completed.is_some() {
+        if self.history_loading || self.history_completed.is_some() || !self.history_is_local() {
             return;
         }
         self.history_loading = true;
@@ -2459,6 +2476,34 @@ const HISTORY_ARM_MARGIN: i64 = 40;
 /// session, purely a memory backstop against a huge persisted file.
 const HISTORY_CAP: usize = 100_000;
 
+/// True when an attach base URL points at THIS machine (review M1): host is
+/// `localhost` or a loopback IP (v4 `127.0.0.0/8`, v6 `::1`, bracketed or
+/// not). No `url`-crate dependency — the accepted inputs are the daemon
+/// base URLs llmux itself builds (`http://host:port`). Unparseable → false
+/// (fail closed: no local-history splice under an unknown remote).
+fn base_url_is_loopback(base_url: &str) -> bool {
+    let rest = match base_url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => base_url,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip :port — for bracketed IPv6 the bracket closes the host; for
+    // everything else the LAST ':' starts the port (bare IPv6 has many).
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        match authority.rsplit_once(':') {
+            // `a:b:c` with multiple ':' and no brackets = a bare IPv6 host.
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => h,
+            _ => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Pure merge for [`App::extend_with_history`] (unit-tested): append history
 /// rows behind the live newest-first list — only entries strictly OLDER than
 /// the oldest live row (the persisted tail overlaps the live ring; the
@@ -3322,6 +3367,37 @@ mod tests {
         assert_eq!(app.expanded_run.as_ref(), Some(&key));
         // Entry detail state is untouched throughout.
         assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn history_hydration_refused_for_cross_host_attach(/* review M1 */) {
+        // Loopback attach (the standard `llmux` → localhost:3456 topology)
+        // shares this machine's state file → allowed.
+        for url in [
+            "http://localhost:3456",
+            "http://127.0.0.1:3456",
+            "http://[::1]:3456",
+            "http://127.9.9.9:3456/path",
+        ] {
+            assert!(base_url_is_loopback(url), "{url} is this machine");
+        }
+        // A daemon on another host has a DIFFERENT activity.jsonl — splicing
+        // the local file under its live rows would show wrong data.
+        for url in [
+            "http://oudwood-512:3456",
+            "http://100.98.240.111:3456",
+            "http://[2001:db8::1]:3456",
+            "not a url",
+        ] {
+            assert!(!base_url_is_loopback(url), "{url} is another host");
+        }
+        // And the App-level gate wires it up: a cross-host remote never arms.
+        let mut app = remote_app();
+        if let Backend::Remote(remote) = &mut app.backend {
+            remote.base_url = "http://oudwood-512:3456".into();
+        }
+        app.request_history();
+        assert!(!app.history_loading, "cross-host attach must not hydrate");
     }
 
     #[test]
