@@ -335,7 +335,7 @@ fn draw_main(
     }
     draw_header(frame, header_area, view, chrome);
     let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
     draw_middle(frame, middle_area, view, ctx, chrome);
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, now);
@@ -367,10 +367,17 @@ fn draw_main(
             pane_top: middle_area.y,
         });
     }
+    // The context menu (UI-3 U11) draws last so it floats over every pane.
+    let menu = chrome
+        .menu_anchor
+        .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
+        .map(|anchor| draw_context_menu(frame, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
         activity,
         tabs,
         separators,
+        account_rows,
+        menu,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -434,7 +441,7 @@ fn draw_accounts_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )));
     frame.render_widget(title, header_area);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
@@ -465,7 +472,7 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
         Constraint::Length(heatmap_height),
     ])
     .areas(area);
-    draw_accounts(frame, table_area, view, ctx, chrome);
+    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
     // of the stats body when there is client usage to show; otherwise the
     // models view keeps the whole body. The windowed heatmap (issue #23) always
@@ -902,6 +909,85 @@ fn draw_config_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome)
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The right-click account context menu (UI-3 U11): a small floating list
+/// anchored at the click cell, clamped to the frame. Items mirror the key
+/// flows exactly: switch now (`Enter` in the switcher), pause/resume (`p`),
+/// set limit (`L`), delete (`r` + confirm). Returns the hit layout.
+fn draw_context_menu(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    anchor: (u16, u16),
+) -> MenuChrome {
+    let Mode::ContextMenu { idx, item } = chrome.mode else {
+        return MenuChrome::default();
+    };
+    let target = ctx
+        .order
+        .get(idx)
+        .and_then(|&i| view.snapshot.accounts.get(i));
+    let paused = target.is_some_and(|a| a.paused);
+    let name = target
+        .map(|a| row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev))
+        .unwrap_or_else(|| "?".into());
+    let items: [&str; 4] = [
+        "switch now",
+        if paused { "resume" } else { "pause" },
+        "set limit",
+        "delete",
+    ];
+    let width = (items
+        .iter()
+        .map(|i| i.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(name.chars().count() + 1) as u16
+        + 4)
+    .min(frame.area().width);
+    let height = items.len() as u16 + 1; // + title border row
+    let frame_area = frame.area();
+    let x = anchor
+        .0
+        .min(frame_area.right().saturating_sub(width))
+        .max(frame_area.x);
+    let y = anchor
+        .1
+        .saturating_add(1)
+        .min(frame_area.bottom().saturating_sub(height))
+        .max(frame_area.y);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let mut lines: Vec<Line> = Vec::with_capacity(items.len());
+    let mut rects: Vec<Rect> = Vec::with_capacity(items.len());
+    for (i, label) in items.iter().enumerate() {
+        let style = if i == item {
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(Span::styled(format!(" {label} "), style)));
+        rects.push(Rect {
+            x: area.x,
+            y: area.y + 1 + i as u16,
+            width: area.width,
+            height: 1,
+        });
+    }
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(format!(" {name} "));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    MenuChrome { area, items: rects }
+}
+
 fn overlay_rect(area: Rect) -> Rect {
     Rect {
         x: area.x,
@@ -1042,7 +1128,7 @@ fn draw_accounts(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) {
+) -> Vec<AccountRowHit> {
     let snapshot = &view.snapshot;
     let block = Block::new().borders(Borders::TOP).title(" accounts ");
     if snapshot.accounts.is_empty() {
@@ -1052,7 +1138,7 @@ fn draw_accounts(
         )))
         .block(block);
         frame.render_widget(empty, area);
-        return;
+        return Vec::new();
     }
     let show_fable = view.show_fable_weekly;
     // The account column is a fixed `Length(name_width)` that fits the widest
@@ -1117,9 +1203,10 @@ fn draw_accounts(
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
 
     let selected = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
-            Some(idx.min(ctx.order.len().saturating_sub(1)))
-        }
+        Mode::Select { idx }
+        | Mode::ConfirmRemove { idx }
+        | Mode::EditLimits { idx }
+        | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
         // NewLogin is a provider picker, not an account-row cursor.
         Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
     };
@@ -1193,6 +1280,23 @@ fn draw_accounts(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(block);
     frame.render_widget(table, area);
+    // Row hit map (UI-3 U11): row `pos` renders at area.y + 2 + pos (top
+    // border/title + header row), one line high, full table width. Rows
+    // clipped by the pane height are not clickable.
+    ctx.order
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| area.y as usize + 2 + pos < area.bottom() as usize)
+        .map(|(pos, _)| AccountRowHit {
+            area: Rect {
+                x: area.x,
+                y: area.y + 2 + pos as u16,
+                width: area.width,
+                height: 1,
+            },
+            display_idx: pos,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1973,9 +2077,10 @@ fn draw_detail(
 ) {
     let snapshot = &view.snapshot;
     let pos = match chrome.mode {
-        Mode::Select { idx } | Mode::ConfirmRemove { idx } | Mode::EditLimits { idx } => {
-            idx.min(ctx.order.len().saturating_sub(1))
-        }
+        Mode::Select { idx }
+        | Mode::ConfirmRemove { idx }
+        | Mode::EditLimits { idx }
+        | Mode::ContextMenu { idx, .. } => idx.min(ctx.order.len().saturating_sub(1)),
         // NewLogin keeps the detail pane on the current account.
         Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => snapshot
             .representative_current()
@@ -2232,14 +2337,43 @@ pub(crate) struct SeparatorHit {
     pub pane_top: u16,
 }
 
+/// One accounts-table row's rendered rect + its DISPLAY index (selection
+/// order — the same index the switch/pause/limits/remove flows take).
+/// Right-click target map (UI-3 U11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountRowHit {
+    pub area: Rect,
+    pub display_idx: usize,
+}
+
+/// The rendered context menu's layout (UI-3 U11): the whole popup rect plus
+/// one row rect per item, for the click hit-test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MenuChrome {
+    pub area: Rect,
+    pub items: Vec<Rect>,
+}
+
+impl MenuChrome {
+    /// Which menu item a click lands on, if any.
+    pub(crate) fn hit_item(&self, col: u16, row: u16) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|r| row == r.y && col >= r.x && col < r.right())
+    }
+}
+
 /// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
-/// activity panel's rows plus the tab bar and the drag separators. Threaded
-/// back to the runtime the same way `ActivityChrome` alone used to be.
+/// activity panel's rows plus the tab bar, the drag separators, the accounts
+/// rows (right-click), and the open context menu. Threaded back to the
+/// runtime the same way `ActivityChrome` alone used to be.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MainChrome {
     pub activity: ActivityChrome,
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
+    pub account_rows: Vec<AccountRowHit>,
+    pub menu: Option<MenuChrome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3626,6 +3760,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             key("Esc"),
             Span::raw(" cancel"),
         ]),
+        Mode::ContextMenu { .. } => Line::from(vec![
+            Span::raw(" "),
+            key("↑/k ↓/j"),
+            Span::raw(" move  "),
+            key("Enter/click"),
+            Span::raw(" run  "),
+            key("Esc"),
+            Span::raw(" close"),
+        ]),
         Mode::ConfirmRemove { .. } => Line::from(vec![
             Span::raw(" "),
             key("↑/k ↓/j"),
@@ -3902,6 +4045,7 @@ mod tests {
     fn chrome_overlay(overlay: Overlay) -> Chrome {
         Chrome {
             pane_heights: Default::default(),
+            menu_anchor: None,
             frame: 0,
             mode: Mode::Normal,
             overlay,
