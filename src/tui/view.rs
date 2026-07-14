@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dashboard::{CompletedDoc, DashboardDoc, WindowDoc};
 use crate::logging::LogLine;
-use crate::scheduler::select::{self, SelectParams};
+use crate::scheduler::select::SelectParams;
 use crate::scheduler::window::{LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource};
 use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 
@@ -91,6 +91,10 @@ pub(crate) struct DashboardView {
     /// active banner (`from <= now < to`) with the earliest `to` as one line,
     /// and nothing when none is active.
     pub events: Vec<crate::config::EventBanner>,
+    /// Rolling 5-minute status-class counts for the header health verdict
+    /// (glance-triage), carried on the document. All-zero from an older
+    /// daemon → the verdict falls back to account/poller state alone.
+    pub health: super::activity::HealthCounts,
 }
 
 fn ms_time(ms: u64) -> SystemTime {
@@ -371,14 +375,24 @@ impl DashboardView {
             // a `POST /llmux/events` reflects on the next document. Absent →
             // empty (no banner).
             events: doc.events.clone(),
+            health: super::activity::HealthCounts {
+                requests: doc.health.requests,
+                errors: doc.health.errors,
+                s429: doc.health.s429,
+                s401: doc.health.s401,
+                s5xx: doc.health.s5xx,
+            },
         }
     }
 
     /// Display order of the accounts table: indices into `snapshot.accounts`
-    /// in the scheduler's preference order — same pure function the
-    /// scheduler itself ranks with.
+    /// in INTERVENTION order (glance-triage atom 2) — exhausted, then
+    /// auth-broken, then known usage descending, then ready, then paused,
+    /// then cold/unknown; stable (config index) within a tier. The same list
+    /// drives the render AND every row cursor (switch/remove/limits), so a
+    /// click can never mis-target.
     pub(crate) fn display_order(&self, now: SystemTime) -> Vec<usize> {
-        select::selection_order(&self.snapshot, &self.select_params, now)
+        super::triage::intervention_order(&self.snapshot, &self.select_params, now)
     }
 
     pub(crate) fn totals_for(&self, account: &str) -> Totals {
@@ -639,7 +653,7 @@ mod tests {
         // The pure scheduler functions run on the rebuilt snapshot: the
         // parked account gates exactly like it does server-side.
         assert_eq!(
-            select::eligibility(b, &view.select_params, now(), false),
+            crate::scheduler::select::eligibility(b, &view.select_params, now(), false),
             Some(crate::scheduler::select::IneligibleReason::CoolingDown)
         );
         assert_eq!(view.display_order(now()), vec![0, 1]);
