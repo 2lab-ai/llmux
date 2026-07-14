@@ -316,6 +316,36 @@ pub fn heuristic_degraded_mode(
     !any_eligible && any_heuristic_only
 }
 
+/// Count of in-group accounts this request could lease IF the transient
+/// heuristic cooldowns were ignored — i.e. how many accounts a retry-after-less
+/// 429 burst can sweep before the pool is genuinely out of candidates. Counts
+/// via [`gate_scoped`] with `heuristic_degraded = true`, so paused / auth-dead /
+/// real-quota (5h/7d) / RetryAfter-parked accounts are naturally excluded (they
+/// still gate in degraded mode) — only the Heuristic cooldown is looked through.
+///
+/// The forward loop uses this to detect "I have now 429-swept every candidate in
+/// this request" and pace instead of hammer: [`heuristic_degraded_mode`] keeps
+/// handing out leases THROUGH the heuristic cooldown gate, so for a non-Fable
+/// burst the pool never reaches `Exhausted` and the #83 grace-park budget path is
+/// unreachable (2026-07-13T23:01Z incident: one opus-4-8 request swept 8 accounts
+/// 13× in ~8s and 502'd the client while the upstream burst cleared ~20-30s
+/// later). `headers_only` mirrors what the degraded selection path sees.
+pub fn degraded_candidate_count(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+    now: SystemTime,
+) -> usize {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    snapshot
+        .accounts
+        .iter()
+        .filter(|account| in_group(account, group))
+        .filter(|account| gate_scoped(account, params, now, headers_only, true, scope).is_none())
+        .count()
+}
+
 /// Whether an account is in the selection scope: every account when `group`
 /// is `None` (routing off), only same-group accounts when `Some`.
 fn in_group(account: &AccountSnapshot, group: Option<BackendGroup>) -> bool {
