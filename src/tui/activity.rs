@@ -62,6 +62,10 @@ pub(crate) struct InFlight {
 }
 
 /// Body of a completed log entry.
+// Request dwarfs Note by design: nearly every entry IS a Request (Notes are
+// rare operator lines), so boxing the common variant would trade one heap
+// allocation per real entry for slack in the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletedBody {
     Request {
@@ -78,6 +82,14 @@ pub(crate) enum CompletedBody {
         effort: Option<String>,
         /// Codex fast mode was in effect (always `false` for claude).
         fast: bool,
+        /// Keyless client identity (`metadata.user_id`) — keys the derived
+        /// session label shown on the row (TUI UI-3 U2).
+        user_id: Option<String>,
+        /// Message-kind token from `proxy::classify` ("user"/"compact"/…).
+        kind: Option<String>,
+        /// Cleaned input excerpt (bounded), shown truncated on the row and
+        /// in full on the click-expanded detail line.
+        excerpt: Option<String>,
     },
     Note {
         text: String,
@@ -615,6 +627,12 @@ pub(crate) struct PersistedRequest {
     /// `unknown` client bucket.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Message kind + input excerpt (TUI UI-3 U1). Additive: lines persisted
+    /// before these fields default to `None`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
 }
 
 impl PersistedRequest {
@@ -635,6 +653,8 @@ impl PersistedRequest {
             effort,
             fast,
             user_id,
+            kind,
+            excerpt,
         } = event
         else {
             return None;
@@ -658,6 +678,8 @@ impl PersistedRequest {
             effort: effort.clone(),
             fast: *fast,
             user_id: user_id.clone(),
+            kind: kind.clone(),
+            excerpt: excerpt.clone(),
         })
     }
 
@@ -678,6 +700,8 @@ impl PersistedRequest {
             effort: self.effort,
             fast: self.fast,
             user_id: self.user_id,
+            kind: self.kind,
+            excerpt: self.excerpt,
         };
         (event, ts)
     }
@@ -715,6 +739,10 @@ pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: S
 pub(crate) struct ActivityLog {
     capacity: usize,
     in_flight: Vec<InFlight>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → the first
+    /// plain user-input excerpt seen for it (≤48 chars). Insert-only, bounded
+    /// by [`MAX_CLIENTS`].
+    session_labels: HashMap<String, String>,
     /// Front = newest (the log renders newest-top).
     completed: VecDeque<Completed>,
     totals: HashMap<String, Totals>,
@@ -957,6 +985,12 @@ impl ActivityLog {
     /// Completed entries, newest first.
     pub(crate) fn completed(&self) -> impl Iterator<Item = &Completed> {
         self.completed.iter()
+    }
+
+    /// Derived session titles (TUI UI-3 U2): client id → first user-input
+    /// excerpt. Cloned for the dashboard document.
+    pub(crate) fn session_labels(&self) -> HashMap<String, String> {
+        self.session_labels.clone()
     }
 
     /// Per-account totals lookup. The dashboard reads the whole map
@@ -1242,6 +1276,8 @@ impl ActivityLog {
                 effort,
                 fast,
                 user_id,
+                kind,
+                excerpt,
             } => {
                 let routed = self
                     .in_flight
@@ -1255,6 +1291,20 @@ impl ActivityLog {
                 // `unknown` bucket when absent), independent of routing — so
                 // pre-routing failures are attributed too, never dropped.
                 self.record_client(user_id.as_deref(), status, tokens);
+                // Session label (TUI UI-3 U2): the FIRST plain user-input
+                // excerpt seen for a client id becomes that session's derived
+                // title (nothing on the wire carries a real one). Bounded by
+                // MAX_CLIENTS via the same insert-guard as client buckets.
+                if let (Some(uid), Some("user"), Some(text)) =
+                    (user_id.as_deref(), kind.as_deref(), excerpt.as_deref())
+                {
+                    if !self.session_labels.contains_key(uid)
+                        && self.session_labels.len() < MAX_CLIENTS
+                    {
+                        self.session_labels
+                            .insert(uid.to_string(), text.chars().take(48).collect());
+                    }
+                }
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -1291,6 +1341,9 @@ impl ActivityLog {
                         model,
                         effort,
                         fast,
+                        user_id,
+                        kind,
+                        excerpt,
                     },
                 });
             }
@@ -1436,6 +1489,8 @@ mod tests {
             effort: None,
             fast: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1465,6 +1520,8 @@ mod tests {
             effort: effort.map(str::to_string),
             fast: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1493,6 +1550,8 @@ mod tests {
             effort: None,
             fast: false,
             user_id: user_id.map(str::to_string),
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -2403,6 +2462,8 @@ mod tests {
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),
+            kind: None,
+            excerpt: None,
         }
     }
 

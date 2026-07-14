@@ -1185,7 +1185,7 @@ impl App {
     /// row (glance-triage atom 3) — the same model `ui::draw_activity`
     /// windows by — so the offset can never strand past the last row.
     fn scroll_activity(&mut self, delta: i64, view: Option<&DashboardView>) {
-        let len = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
+        let len: usize = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
         let max = len.saturating_sub(1) as i64;
         let next = (self.activity_scroll as i64).saturating_add(delta);
         self.activity_scroll = next.clamp(0, max) as usize;
@@ -2508,6 +2508,7 @@ mod tests {
         DashboardView {
             version: "llmux 0.0 (test)".into(),
             health: Default::default(),
+            session_labels: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,
