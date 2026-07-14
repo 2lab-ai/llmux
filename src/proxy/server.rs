@@ -953,6 +953,8 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/login/status", get(login_status_endpoint))
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
         .route("/llmux/shutdown", post(shutdown))
+        .route("/models", get(models_endpoint))
+        .route("/llmux/models", get(models_endpoint))
         .route("/v1/oauth/token", post(oauth_token_relay))
         .fallback(forward_any)
         .layer(axum::middleware::from_fn_with_state(
@@ -1374,6 +1376,27 @@ async fn grok_config_endpoint(
             "persisted": persisted,
         })
         .to_string(),
+    )
+        .into_response()
+}
+
+/// `GET /models` and `GET /llmux/models` — the catalog of KNOWN models: a
+/// curated set (id / display name / effort menu / context window / group) plus
+/// the one live bit, grok's family alias `"grok"` resolving to the current grok
+/// pin. Not an exhaustive list of everything routable — arbitrary `grok-*` ids
+/// still pass through at request time, and an out-of-catalog pin surfaces as a
+/// synthesized null-metadata row (see [`crate::catalog`]). Same payload on both
+/// paths.
+///
+/// Registering root `/models` reserves a path that previously fell through to
+/// the upstream proxy fallback; Anthropic exposes no root `/models`, and
+/// `/v1/models` is untouched (still proxied), so nothing regresses.
+async fn models_endpoint(State(state): State<AppState>) -> Response {
+    let models = crate::catalog::catalog(&state.grok.model(), &state.codex.model());
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "models": models }).to_string(),
     )
         .into_response()
 }
@@ -2691,6 +2714,96 @@ mod tests {
             "xhigh not in grok superset"
         );
         assert_eq!(state.grok.model(), "grok-4.3");
+    }
+
+    // ---- GET /models and /llmux/models ----
+    #[tokio::test]
+    async fn models_endpoint_returns_catalog_with_live_grok_pin_alias() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("keep")]);
+
+        // Pin grok to 4.3 so the family alias must follow the live pin.
+        let mut shape = state.grok.shape();
+        shape.model = "grok-4.3".into();
+        state.grok.set_shape(shape);
+
+        let response = models_endpoint(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 5 + 6 + 5);
+
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("{id} present"))
+        };
+        // The live pin (grok-4.3) carries the "grok" alias; 4.5 does not.
+        assert_eq!(by_id("grok-4.3")["aliases"], serde_json::json!(["grok"]));
+        assert_eq!(by_id("grok-4.5")["aliases"], serde_json::json!([]));
+        // Static codex alias and context survive serialization.
+        assert_eq!(
+            by_id("gpt-5.6-sol")["aliases"],
+            serde_json::json!(["sol", "gpt-5.6"])
+        );
+        assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
+    }
+
+    #[tokio::test]
+    async fn models_routes_registered_and_v1_models_still_proxies() {
+        // Drive the REAL router on an ephemeral loopback port. Zero accounts,
+        // so the proxy fallback answers `/v1/models` with an error
+        // synchronously (no upstream network call) — proving that path is NOT
+        // intercepted by the catalog handler.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // Both catalog paths → 200 with byte-identical bodies.
+        let r1 = client
+            .get(format!("{base}/models"))
+            .send()
+            .await
+            .expect("GET /models");
+        assert_eq!(r1.status(), reqwest::StatusCode::OK);
+        let b1 = r1.text().await.expect("body");
+        let r2 = client
+            .get(format!("{base}/llmux/models"))
+            .send()
+            .await
+            .expect("GET /llmux/models");
+        assert_eq!(r2.status(), reqwest::StatusCode::OK);
+        let b2 = r2.text().await.expect("body");
+        assert_eq!(b1, b2, "both paths serve identical catalog bodies");
+        assert!(b1.contains("\"models\""), "catalog shape present");
+        assert!(b1.contains("gpt-5.6-sol"), "curated ids present");
+
+        // `/v1/models` is not intercepted: it reaches the proxy fallback, which
+        // with no accounts returns an error — never the catalog shape.
+        let rv = client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .expect("GET /v1/models");
+        let bv = rv.text().await.expect("body");
+        assert!(
+            !bv.contains("gpt-5.6-sol"),
+            "/v1/models must reach the fallback, not return the catalog"
+        );
     }
 
     // ---- C11: login status carries device-flow verification fields ----
