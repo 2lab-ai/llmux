@@ -125,13 +125,15 @@ fn parsed_https_host(raw: &str) -> Option<String> {
 /// off-boundary host would otherwise resend the body there. The daemon's
 /// shared client is already `Policy::none()` (server.rs); this is the
 /// constructor the CLI paths use so every grok token call is redirect-safe.
-/// Falls back to the default client only if the builder somehow fails
-/// (it does not in practice).
+/// FAILS CLOSED (external review round 4): `ClientBuilder::build` only errors
+/// on a static TLS/resolver init fault, never at runtime — but a security
+/// control must never silently degrade to a redirect-FOLLOWING client, so a
+/// build failure aborts rather than falls back to the default policy.
 pub fn oauth_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("no-redirect reqwest client for grok OAuth (fail closed)")
 }
 
 /// Resolve the xAI OAuth endpoints via OIDC discovery.

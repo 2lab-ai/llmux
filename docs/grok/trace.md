@@ -46,11 +46,12 @@
 3. **Layer flow** —
    `login_start_endpoint` → `LoginRegistry.start(Grok)` (single-slot, 409 when busy —
    unchanged) → spawned task: discovery → device code →
-   **registry phase gains the URL**: `LoginPhase::Pending{ verification_uri:
-   Some(verification_uri_complete — fallback plain verification_uri when the
-   `_complete` variant is absent), user_code: Some(user_code) }` (struct-variant
-   extension; Claude/Codex flows leave both `None`; islands shows `user_code` beside
-   the opened page so the plain-URI fallback stays usable) →
+   **registry publishes the URL** via `LoginRegistry::set_verification(state,
+   verification_uri_complete — or plain verification_uri when `_complete` is absent,
+   user_code)`, stored as `LoginJob` fields (NOT a `LoginPhase::Pending` payload —
+   the phase stays a unit variant; see Delta log). Claude/Codex flows never call it,
+   so their status carries neither field; islands shows `user_code` beside the link
+   so the plain-URI fallback stays usable →
    poll loop (as T1) → on success `AccountConfig` → **inject into the LIVE pool** +
    persist (same path the daemon-run codex login uses, server.rs:376-381) →
    `LoginPhase::Done{account}`.
@@ -109,7 +110,9 @@
 4. **Side effects** — activity log row `(group=grok, model=grok-4.5, effort=high)` via
    grok `effective_request_meta`; `StreamUsage{input, output, cached}` → dashboard
    token/cost accumulation (pricing: grok-4.5 rates); scheduler in-flight counters.
-5. **Errors** — no grok account & on_empty=error → 503 relay_error (existing shape);
+5. **Errors** — no grok account & on_empty=error → 404 not_found_error (the existing
+   `resolve_group` contract, forward.rs:1136 — a clean Anthropic-shaped not-found, NOT
+   a 503);
    upstream 401 → refresh-once-then-fail (existing credential path); upstream 429 →
    T5; upstream 4xx/5xx passthrough as today; malformed SSE → existing SSE error
    handling (unchanged core).
@@ -118,7 +121,7 @@
 7. **Observability** — `grok.trace=true` mirrors `codex.trace` raw-io capture
    (proxy/raw_io.rs path), same file naming with `grok` tag.
 
-## T4 — Live model/effort switch (TUI dashboard / CLI / daemon API)
+## T4 — Live model/effort switch (daemon HTTP API; interactive callers v1-descoped)
 
 1. **Entry** — `POST /llmux/grok` (new route beside `/llmux/codex`, server.rs:775 chain,
    same auth gate).
@@ -135,9 +138,10 @@
    body + log warn (improves on codex's silent best-effort, server.rs:1119-1127;
    documented asymmetry — codex endpoint unchanged in v1).
 6. **Output** — `{ok:true, default_model, reasoning_effort, persisted:bool}`.
-   Callers: the CLI/daemon HTTP API and the TUI dashboard. An islands settings
-   row is v1-descoped (spec §R4) — islands has no codex settings row either, so
-   this endpoint has no islands caller in v1.
+   Caller in v1: the daemon HTTP API only (direct/script). The TUI `f/m/e`-style
+   grok control (codex parity, tui/mod.rs:1160) and the islands settings row are
+   v1-descoped (spec §R4) — neither exists in this PR. The core R4 switch
+   (Claude Code `/model grok-4.5`) is the routing path in T3, not this endpoint.
 
 ## T5 — Quota exhaustion: 429 free-usage-exhausted
 
