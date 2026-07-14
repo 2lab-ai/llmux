@@ -536,6 +536,7 @@ mod tests {
         DashboardView {
             session_labels: Default::default(),
             grok: Default::default(),
+            daily_usage: Vec::new(),
             version: "llmux test".into(),
             pid: 1,
             uptime: Duration::from_secs(1),
