@@ -252,6 +252,16 @@ pub(crate) enum Overlay {
     Config,
 }
 
+/// Session-local pane-height overrides (UI-3 U7/U8): `None` = the pane's
+/// automatic height (content-derived / fixed). Set by dragging the separator
+/// row (the NEXT pane's top border) with the mouse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PaneHeights {
+    pub accounts: Option<u16>,
+    pub middle: Option<u16>,
+    pub strip: Option<u16>,
+}
+
 /// UI-local state the renderer needs besides the data view: cursor, panes,
 /// spinner frame, status line, attach banner.
 pub(crate) struct Chrome {
@@ -294,6 +304,9 @@ pub(crate) struct Chrome {
     /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
     /// Rendered raw in the footer (percent ceilings are not secrets).
     pub limits_input: String,
+    /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
+    /// layout.
+    pub pane_heights: PaneHeights,
 }
 
 /// Attach-mode banner state.
@@ -390,6 +403,13 @@ struct App {
     /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
     /// one rect per tab label. Same record/read cycle as `activity_chrome`.
     tab_chrome: Vec<ui::TabHit>,
+    /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
+    /// top-border row of a pane, dragging it resizes the pane ABOVE it.
+    separator_chrome: Vec<ui::SeparatorHit>,
+    /// Session-local pane-height overrides set by separator drags.
+    pane_heights: PaneHeights,
+    /// The separator currently being dragged, if any (mouse button held).
+    drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -442,6 +462,9 @@ impl App {
             expanded_activity: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
+            separator_chrome: Vec::new(),
+            pane_heights: PaneHeights::default(),
+            drag: None,
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
@@ -491,6 +514,7 @@ impl App {
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
+            pane_heights: self.pane_heights,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -600,6 +624,16 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Separator rows first (UI-3 U7/U8): press starts a drag.
+                if let Some(sep) = self
+                    .separator_chrome
+                    .iter()
+                    .find(|s| s.y == mouse.row)
+                    .copied()
+                {
+                    self.drag = Some(sep);
+                    return true;
+                }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
                     Some(key) => {
                         self.toggle_expand(key);
@@ -607,6 +641,30 @@ impl App {
                     }
                     None => false,
                 }
+            }
+            // Dragging a held separator resizes the pane above it: the pane's
+            // new height is the pointer row minus the pane's top row, clamped
+            // so a pane can never collapse below its border+header.
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(sep) = self.drag else { return false };
+                let height = mouse
+                    .row
+                    .saturating_sub(sep.pane_top)
+                    .clamp(ui::PANE_MIN_HEIGHT, ui::PANE_MAX_HEIGHT);
+                let slot = match sep.pane {
+                    ui::PaneId::Accounts => &mut self.pane_heights.accounts,
+                    ui::PaneId::Middle => &mut self.pane_heights.middle,
+                    ui::PaneId::Strip => &mut self.pane_heights.strip,
+                };
+                if *slot == Some(height) {
+                    return false;
+                }
+                *slot = Some(height);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag.take();
+                false
             }
             // Wheel up = into history, down = toward the live tail — same
             // direction as the ↑/↓ keys (a nice-to-have bonus).
@@ -1949,6 +2007,7 @@ async fn event_loop(
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
+            app.separator_chrome = main.separators;
         }
     }
 }
@@ -2266,6 +2325,39 @@ mod tests {
         app.mode = Mode::AddKey;
         assert!(!app.on_mouse(click(14, 2), None));
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// UI-3 U7/U8: pressing a separator row arms a drag; dragging resizes the
+    /// pane above it (clamped); release disarms.
+    #[test]
+    fn separator_drag_resizes_the_pane_above() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.separator_chrome = vec![ui::SeparatorHit {
+            y: 10,
+            pane: ui::PaneId::Accounts,
+            pane_top: 3,
+        }];
+        let ev = |kind, row| MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Press on the separator row arms the drag.
+        assert!(app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 10), None));
+        assert!(app.drag.is_some());
+        // Dragging to row 15 → accounts height 15 - 3 = 12.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 15), None));
+        assert_eq!(app.pane_heights.accounts, Some(12));
+        // Clamped at the minimum: dragging above the pane top.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 2), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+        // Release disarms; further drags do nothing.
+        app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 2), None);
+        assert!(app.drag.is_none());
+        assert!(!app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 20), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
