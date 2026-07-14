@@ -10,9 +10,10 @@
 
 Add **Grok (xAI) as a third backend group** to llmux — alongside `claude` and `codex` —
 serving Anthropic Messages API clients (Claude Code) from a Grok subscription account via
-xAI's Responses API, with registration, stats, and live model/effort switching exposed in
-both the CLI and llmux-islands. Refactor so codex and grok share one Responses-API core
-with thin per-provider adapters.
+xAI's Responses API. Registration and stats are exposed in both the CLI and
+llmux-islands; live model/effort switching is exposed via the CLI/daemon API and the TUI
+dashboard (`POST /llmux/grok`) — an islands settings row is v1-descoped (§R4). Refactor
+so codex and grok share one Responses-API core with thin per-provider adapters.
 
 ## Why this is safe to build on the codex skeleton (evidence)
 
@@ -122,8 +123,10 @@ with thin per-provider adapters.
   `LoginProvider` gains `Grok` (aliases `grok|xai|x-ai`, proxy/login.rs:22-47).
   Device flow has no browser callback; the daemon must surface the verification URL to
   the GUI: `GET /llmux/login/status` response gains optional `verification_uri` (the
-  `_complete` variant) + `user_code` while pending. Islands opens the URL and keeps
-  polling until Done/Error. (Additive fields — older clients ignore them.)
+  `_complete` variant) + `user_code` while pending. The DAEMON best-effort opens the URL
+  host-side (parity with the PKCE flows); islands renders the clickable link + user code
+  (covers remote daemons without double-tabbing local ones) and keeps polling until
+  Done/Error. (Additive fields — older clients ignore them.)
 
 ### R3. Stats & usage display (CLI + islands)
 
@@ -282,8 +285,8 @@ Rust (`llmux`):
 Swift (`llmux-islands/LlmuxIslands`):
 - `Llmux/LlmuxStatus.swift` — type/group `grok`
 - `Llmux/IslandUsageModel.swift` — grok in-flight, provider(of:)
-- `Llmux/LlmuxClient.swift` — grok config setter, login provider string
-- `Llmux/LlmuxDashboard.swift` — grok settings row
+- `Llmux/LlmuxClient.swift` — login status verification fields (grok config setter:
+  descoped with the settings row, §R4)
 - `Dashboard/UsageModelTypes.swift`, `UsageTiles.swift`, `DashboardAnalytics.swift`
 - `UI/Components/UsageProviderIcon.swift` — grok icon + fallback
 - `UI/Views/NotchClosedLabelView.swift`, `IslandUsageView.swift` — third group + login

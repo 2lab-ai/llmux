@@ -76,52 +76,47 @@ impl GrokDeviceCode {
 
 /// Validate an endpoint returned by xAI discovery: https and a hostname that
 /// is exactly `x.ai` or a `.x.ai` label-boundary suffix (mirrors CLIProxyAPI
-/// `ValidateOAuthEndpoint`, xai.go:47-64).
+/// `ValidateOAuthEndpoint`, xai.go:47-64). Parsed with `reqwest::Url` — the
+/// EXACT parser the outgoing request will use — so a crafted authority
+/// (`https://evil.example\@auth.x.ai/…` and friends) cannot read differently
+/// here than on the wire (external review round 2).
 fn validate_endpoint(raw: &str, field: &'static str) -> Result<String, AuthError> {
     let raw = raw.trim();
-    if raw.is_empty() {
-        return Err(AuthError::GrokAuth(field));
+    match parsed_https_host(raw) {
+        Some(host) if host == "x.ai" || host.ends_with(".x.ai") => Ok(raw.to_string()),
+        _ => Err(AuthError::GrokAuth(field)),
     }
-    let Some(host) = https_host(raw) else {
-        return Err(AuthError::GrokAuth(field));
-    };
-    if host != "x.ai" && !host.ends_with(".x.ai") {
-        return Err(AuthError::GrokAuth(field));
-    }
-    Ok(raw.to_string())
 }
 
 /// Whether a persisted refresh endpoint may receive the refresh token:
-/// the x.ai boundary (https) or loopback (any scheme the client accepts —
-/// http://127.0.0.1 / http://localhost — used by tests and local mocks).
+/// the x.ai boundary (https) or loopback (http(s)://127.0.0.1 / localhost /
+/// [::1] — used by tests and local mocks; loopback cannot exfiltrate
+/// off-host).
 fn refresh_endpoint_allowed(raw: &str) -> bool {
     if validate_endpoint(raw, "token_endpoint").is_ok() {
         return true;
     }
-    let host = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .map(|rest| {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let host = authority.rsplit('@').next().unwrap_or(authority);
-            host.split(':').next().unwrap_or(host).to_ascii_lowercase()
-        })
-        .unwrap_or_default();
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
+    let Ok(url) = reqwest::Url::parse(raw.trim()) else {
+        return false;
+    };
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+    matches!(
+        url.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    )
 }
 
-/// Hostname of an `https://` URL (lowercased; userinfo and port stripped).
-/// `None` for any other scheme — https is required, so that suffices. Kept
-/// dependency-free (no `url` crate in the tree).
-fn https_host(raw: &str) -> Option<String> {
-    let rest = raw.strip_prefix("https://")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() {
+/// Hostname of an `https://` URL via `reqwest::Url` (lowercased by the
+/// parser; userinfo and port never leak into the host). `None` for any other
+/// scheme or an unparseable value.
+fn parsed_https_host(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    if url.scheme() != "https" {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+    url.host_str().map(str::to_string)
 }
 
 /// Resolve the xAI OAuth endpoints via OIDC discovery.
@@ -512,6 +507,17 @@ mod tests {
         assert!(validate_endpoint("http://auth.x.ai/token", "f").is_err());
         assert!(validate_endpoint("https://auth.example.com/token", "f").is_err());
         assert!(validate_endpoint("", "f").is_err());
+        // Authority-confusion vectors (external review round 2): whatever
+        // reqwest::Url decides the host is, it must not be x.ai for these.
+        assert!(
+            validate_endpoint(r"https://evil.example\@auth.x.ai/token", "f").is_err()
+                || reqwest::Url::parse(r"https://evil.example\@auth.x.ai/token")
+                    .map(|u| u.host_str() == Some("auth.x.ai"))
+                    .unwrap_or(false),
+            "backslash authority parses the same way the transport will"
+        );
+        assert!(validate_endpoint("https://auth.x.ai@evil.example/token", "f").is_err());
+        assert!(validate_endpoint("https://auth.x.ai.evil.example/token", "f").is_err());
     }
 
     #[test]
@@ -721,9 +727,14 @@ mod tests {
         assert!(refresh_endpoint_allowed("https://auth.x.ai/oauth/token"));
         assert!(refresh_endpoint_allowed("http://127.0.0.1:3498/token"));
         assert!(refresh_endpoint_allowed("http://localhost:8080/token"));
+        assert!(refresh_endpoint_allowed("http://[::1]:8080/token"));
         assert!(!refresh_endpoint_allowed("https://evil.example.com/token"));
         assert!(!refresh_endpoint_allowed("https://evil-x.ai/token"));
         assert!(!refresh_endpoint_allowed("http://10.0.0.5/token"));
+        assert!(!refresh_endpoint_allowed("ftp://127.0.0.1/token"));
+        assert!(!refresh_endpoint_allowed(
+            "http://localhost.evil.example/token"
+        ));
     }
 
     #[test]

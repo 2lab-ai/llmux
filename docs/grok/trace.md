@@ -55,8 +55,10 @@
    persist (same path the daemon-run codex login uses, server.rs:376-381) →
    `LoginPhase::Done{account}`.
    Islands: `LlmuxClient.startLogin(provider:"grok")` → poll
-   `GET /llmux/login/status` → when `verification_uri` non-nil and not yet opened →
-   `NSWorkspace.open(url)` once → keep polling → Done → refresh status.
+   `GET /llmux/login/status` → when `verification_uri` non-nil → render the clickable
+   link + `user_code` in the login progress view (the daemon already opened the page
+   host-side; a second client-side open would double-tab local setups — the link
+   covers remote daemons) → keep polling → Done → refresh status.
 4. **Side effects** — config file + live pool gain `grok:{email}`; one browser tab.
 5. **Errors** — busy: 409 `{error:"login already pending"}`; poll terminal errors →
    `LoginPhase::Error{message}` (token-free); islands shows message, offers retry;
