@@ -192,7 +192,9 @@ async fn login_codex() -> Result<(), CliError> {
 /// code, best-effort opens the browser, then polls the token endpoint.
 async fn login_grok() -> Result<(), CliError> {
     crate::config::load_or_init()?;
-    let client = reqwest::Client::new();
+    // No-redirect client: the poll POST returns the refresh token, so a
+    // redirect to an off-boundary host must never resend it (review round 3).
+    let client = crate::auth::grok::oauth_http_client();
 
     println!("Starting xAI (Grok) device-code login...");
     let discovery = crate::auth::grok::discover(&client).await?;

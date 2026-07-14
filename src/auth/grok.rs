@@ -119,6 +119,21 @@ fn parsed_https_host(raw: &str) -> Option<String> {
     url.host_str().map(str::to_string)
 }
 
+/// A reqwest client for grok OAuth calls with redirects DISABLED (external
+/// review round 3): the device-poll and refresh POSTs carry secrets (the
+/// minted refresh token / the refresh token itself), and a 307/308 to an
+/// off-boundary host would otherwise resend the body there. The daemon's
+/// shared client is already `Policy::none()` (server.rs); this is the
+/// constructor the CLI paths use so every grok token call is redirect-safe.
+/// Falls back to the default client only if the builder somehow fails
+/// (it does not in practice).
+pub fn oauth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
+
 /// Resolve the xAI OAuth endpoints via OIDC discovery.
 pub async fn discover(client: &reqwest::Client) -> Result<GrokDiscovery, AuthError> {
     let response = client
@@ -507,14 +522,23 @@ mod tests {
         assert!(validate_endpoint("http://auth.x.ai/token", "f").is_err());
         assert!(validate_endpoint("https://auth.example.com/token", "f").is_err());
         assert!(validate_endpoint("", "f").is_err());
-        // Authority-confusion vectors (external review round 2): whatever
-        // reqwest::Url decides the host is, it must not be x.ai for these.
-        assert!(
-            validate_endpoint(r"https://evil.example\@auth.x.ai/token", "f").is_err()
-                || reqwest::Url::parse(r"https://evil.example\@auth.x.ai/token")
-                    .map(|u| u.host_str() == Some("auth.x.ai"))
-                    .unwrap_or(false),
-            "backslash authority parses the same way the transport will"
+        // Authority-confusion vectors (external review round 2/3): assert the
+        // EXACT host reqwest::Url resolves AND the validation result, so a
+        // future parser behavior change fails this test loudly rather than
+        // silently widening the boundary.
+        let backslash = r"https://evil.example\@auth.x.ai/token";
+        let parsed_host = reqwest::Url::parse(backslash)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
+        // Whatever host it parses to, validation agrees: allowed IFF the host
+        // is on the x.ai boundary.
+        let on_boundary = parsed_host
+            .as_deref()
+            .is_some_and(|h| h == "x.ai" || h.ends_with(".x.ai"));
+        assert_eq!(
+            validate_endpoint(backslash, "f").is_ok(),
+            on_boundary,
+            "validation must track the transport's parsed host {parsed_host:?}"
         );
         assert!(validate_endpoint("https://auth.x.ai@evil.example/token", "f").is_err());
         assert!(validate_endpoint("https://auth.x.ai.evil.example/token", "f").is_err());
