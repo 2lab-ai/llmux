@@ -596,7 +596,7 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     let heatmap_height = heatmap_panel_height(view, chrome.stats_window, area.height);
     // Tokens-per-Day chart slice (UI-3 U14): shown whenever daily data exists
     // and the overlay is tall enough to keep the model table readable.
-    let chart_height = if view.daily_usage.is_empty() || area.height < 34 {
+    let chart_height = if view.daily_usage.is_empty() || area.height < 31 {
         0
     } else {
         DAILY_CHART_HEIGHT
@@ -609,7 +609,7 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
     ])
     .areas(area);
     if chart_height > 0 {
-        draw_daily_chart(frame, chart_area, view, ctx);
+        draw_daily_chart(frame, chart_area, view, ctx, chrome.chart_days);
     }
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
@@ -634,8 +634,9 @@ fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, c
 /// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
 /// U14): border/title + plot rows + x-axis labels + legend line.
 const DAILY_CHART_HEIGHT: u16 = 13;
-/// Days the Tokens-per-Day chart plots.
-const DAILY_CHART_DAYS: u64 = 14;
+/// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
+/// overlay — UI-3 U14 period selection).
+pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
 /// Max model lines plotted at once (top by window tokens); more would turn
 /// minimal into noise.
 const DAILY_CHART_SERIES: usize = 4;
@@ -645,21 +646,32 @@ const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
     [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
 
 /// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
-/// the trailing [`DAILY_CHART_DAYS`], modern-minimal — no grid, dim axes,
+/// the selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]),
+/// modern-minimal — no grid, dim axes,
 /// a single legend line with colored dots. Data = the daily fold carried on
 /// the document (history filled by the persisted-request replay).
-fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
+fn draw_daily_chart(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chart_days: u64,
+) {
+    let chart_days = chart_days.clamp(2, 366);
     let today = ctx
         .now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0);
-    let start = today.saturating_sub(DAILY_CHART_DAYS.saturating_sub(1));
+    let start = today.saturating_sub(chart_days.saturating_sub(1));
     // Rank models by window total, then build one (x=day-offset, y=tokens)
     // series per top model, zero-filled across the whole span so a quiet day
     // reads as a drop to zero, not a gap.
+    // Bounded on BOTH ends: a future-dated replay row (clock skew) must not
+    // index past the series (review R1 MUST-FIX 2).
+    let in_span = |r: &&crate::dashboard::DailyUsageDoc| r.day >= start && r.day <= today;
     let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
-    for r in view.daily_usage.iter().filter(|r| r.day >= start) {
+    for r in view.daily_usage.iter().filter(&in_span) {
         *totals
             .entry((r.group.as_str(), r.model.as_str()))
             .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
@@ -671,7 +683,7 @@ fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &F
         return;
     }
     let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
-    let days = DAILY_CHART_DAYS as usize;
+    let days = chart_days as usize;
     let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
     for (s, serie) in series.iter_mut().enumerate() {
         for (i, point) in serie.iter_mut().enumerate() {
@@ -680,7 +692,7 @@ fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &F
         let _ = s;
     }
     let mut y_max = 0f64;
-    for r in view.daily_usage.iter().filter(|r| r.day >= start) {
+    for r in view.daily_usage.iter().filter(&in_span) {
         if let Some(idx) = ranked
             .iter()
             .position(|((g, m), _)| *g == r.group && *m == r.model)
@@ -713,7 +725,7 @@ fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &F
         .bounds([0.0, (days - 1) as f64])
         .labels(vec![
             Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + DAILY_CHART_DAYS / 2), dim()),
+            Span::styled(day_label(start + chart_days / 2), dim()),
             Span::styled(day_label(today), dim()),
         ])
         .style(dim());
@@ -731,7 +743,7 @@ fn draw_daily_chart(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &F
         .block(
             Block::new()
                 .borders(Borders::TOP)
-                .title(format!(" tokens per day — last {DAILY_CHART_DAYS}d ")),
+                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
         )
         .x_axis(x_axis)
         .y_axis(y_axis);
@@ -1251,12 +1263,20 @@ fn draw_context_menu(
     MenuChrome { area, items: rects }
 }
 
+/// Rows every overlay leaves visible at the top: header + tab strip (and the
+/// event banner when active). Keeping the tab row on screen is what makes its
+/// always-armed click targets legitimate (review R1 MUST-FIX 3: overlays used
+/// to paint over the tabs while their hit boxes stayed live — invisible
+/// navigation).
+const OVERLAY_TOP_RESERVED: u16 = 3;
+
 fn overlay_rect(area: Rect) -> Rect {
+    let top = OVERLAY_TOP_RESERVED.min(area.height);
     Rect {
         x: area.x,
-        y: area.y,
+        y: area.y + top,
         width: area.width,
-        height: area.height.saturating_sub(2),
+        height: area.height.saturating_sub(2).saturating_sub(top),
     }
 }
 
@@ -4331,6 +4351,7 @@ mod tests {
         Chrome {
             pane_heights: Default::default(),
             menu_anchor: None,
+            chart_days: 14,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -5126,6 +5147,57 @@ mod tests {
         view.daily_usage.clear();
         let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
         assert!(!text.contains("tokens per day"));
+    }
+
+    #[test]
+    fn daily_chart_ignores_future_days_and_never_panics() {
+        use crate::dashboard::DailyUsageDoc;
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 86_400;
+        // One normal row + one FUTURE-dated row (clock skew in a replayed
+        // log). Rendering must not panic and must still draw the chart.
+        view.daily_usage = vec![
+            DailyUsageDoc {
+                day: today,
+                group: "claude".into(),
+                model: "claude-fable-5".into(),
+                tokens_in: 10_000,
+                tokens_out: 1_000,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+            DailyUsageDoc {
+                day: today + 30,
+                group: "claude".into(),
+                model: "claude-fable-5".into(),
+                tokens_in: 99_000,
+                tokens_out: 9_000,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
+        assert!(text.contains("tokens per day"), "chart still renders");
+    }
+
+    #[test]
+    fn tab_row_stays_visible_under_every_overlay() {
+        // Review R1 MUST-FIX 3: overlays used to paint over the tab strip
+        // while its click targets stayed armed. The overlay rect now starts
+        // below the tab row, so the labels must be visible from every
+        // surface.
+        let view = view_with(Vec::new());
+        for (_, overlay) in TABS {
+            let text = render(&view, &chrome_overlay(*overlay), 200, 40);
+            assert!(
+                text.contains("dashboard │ accounts"),
+                "tab strip visible under {overlay:?}"
+            );
+        }
     }
 
     #[test]
