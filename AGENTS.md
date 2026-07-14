@@ -51,9 +51,10 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
 - **A stable release requires a version bump.** The release workflow fails if the `v*` tag
   ≠ `Cargo.toml` version, and the last version's tag already exists. Pick the next version
   *with the user*.
-- **The brew tap does not auto-bump.** `2lab-ai/homebrew-tap`'s `bump.yml` runs on
-  `workflow_dispatch` or a 6h schedule. For a prompt brew update, `gh workflow run bump.yml
-  --repo 2lab-ai/homebrew-tap`, wait for it, then `brew update && brew upgrade`.
+- **Brew tap bump is release-driven.** Preview/stable publish should dispatch
+  `2lab-ai/homebrew-tap` `bump.yml` (auto when TAP_DISPATCH_TOKEN is wired). If
+  the formula is still stale, `gh workflow run bump.yml --repo 2lab-ai/homebrew-tap`,
+  wait, then `brew update && brew upgrade`.
 - **Local hot-deploy gotcha.** The Cellar binary is read-only (`r-xr-xr-x`), so `cp` over it
   fails — `rm -f "$(readlink -f /opt/homebrew/bin/llmux)"` first, then `cp`, `chmod 755`,
   then `llmux restart`. A later `brew upgrade` overwrites a hot-deployed dev binary.
