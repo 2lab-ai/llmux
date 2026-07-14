@@ -4,8 +4,8 @@ use std::{collections::BTreeSet, env, fmt, time::Duration};
 
 use llmux_islands_core::{
     Action, ClientConfig, ClientError, DaemonClient, DeriveOptions, Effect, EventDraft,
-    LocalSettingsChange, MaintenanceCommand, Navigation, OpenReason, OperationRequest,
-    Presentation, Provider, RefreshSource, ReleaseChannel, SecretString, UiState,
+    LocalSettingsChange, MaintenanceCommand, Navigation, OpenReason, OperationOutcome,
+    OperationRequest, Presentation, Provider, RefreshSource, ReleaseChannel, SecretString, UiState,
 };
 use serde_json::{json, Value};
 
@@ -211,6 +211,41 @@ impl ControllerModel {
                 request_id,
                 document: Box::new(document),
                 received_at_ms: now_ms,
+            });
+        }
+
+        // Snapshot fixtures carry one completed typed operation so the visual
+        // evidence proves that mutation verification receipts are rendered.
+        // The mandatory post-write fetch is completed with the same checked-in,
+        // privacy-safe daemon document.
+        let operation_id = "snapshot-settings-readback".to_string();
+        model.core.reduce(Action::OperationStarted {
+            id: operation_id.clone(),
+            request: OperationRequest::PersistLocalSettings {
+                change: LocalSettingsChange::ShowFable { enabled: true },
+            },
+            target_display: Some("Fable weekly quota".to_string()),
+            started_at_ms: now_ms + 100,
+        });
+        let readback_request_id = model
+            .core
+            .reduce(Action::OperationFinished {
+                id: operation_id,
+                outcome: OperationOutcome::Succeeded,
+                message: "Preference saved and verified by daemon readback".to_string(),
+                finished_at_ms: now_ms + 150,
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::FetchDashboard { request_id } => Some(request_id),
+                _ => None,
+            });
+        if let Some(request_id) = readback_request_id {
+            let document = serde_json::from_str(DASHBOARD_FIXTURE)?;
+            model.core.reduce(Action::DashboardReceived {
+                request_id,
+                document: Box::new(document),
+                received_at_ms: now_ms + 200,
             });
         }
         Ok(model)

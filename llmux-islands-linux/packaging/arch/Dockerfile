@@ -67,13 +67,19 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
          signature="$(od -An -tx1 -N8 "$file" | tr -d ' \n')"; \
          test "$signature" = "89504e470d0a1a0a"; \
          dimensions="$(od -An -tx1 -j16 -N8 "$file" | tr -d ' \n')"; \
-         test "$dimensions" = "000003c0000002f8"; \
+         case "$dimensions" in 000003c0*) ;; *) exit 1;; esac; \
          hash="$(sha256sum "$file" | cut -d ' ' -f 1)"; \
          case " $hashes " in *" $hash "*) exit 1;; esac; \
          hashes="$hashes $hash"; \
        done \
+    && receipt="/tmp/llmux-islands-snapshots/receipts.png" \
+    && test -s "$receipt" \
+    && test "$(wc -c < "$receipt")" -gt 8000 \
+    && test "$(od -An -tx1 -N8 "$receipt" | tr -d ' \n')" = "89504e470d0a1a0a" \
+    && receipt_hash="$(sha256sum "$receipt" | cut -d ' ' -f 1)" \
+    && case " $hashes " in *" $receipt_hash "*) exit 1;; esac \
     && cd /tmp/llmux-islands-snapshots \
-    && sha256sum usage.png statistics.png menu.png > SHA256SUMS
+    && sha256sum usage.png statistics.png receipts.png menu.png > SHA256SUMS
 
 # Exercise the real PKGBUILD against this exact checkout. makepkg refuses to
 # run as root, so commit the minimal Docker context and build as an unprivileged

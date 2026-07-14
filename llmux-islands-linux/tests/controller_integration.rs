@@ -71,6 +71,14 @@ fn fixture_is_a_dashboard_doc_projected_to_canonical_ui_state_without_secrets() 
         state.pointer("/settings/maintenance/source_url"),
         Some(&Value::String("https://github.com/2lab-ai/llmux".into()))
     );
+    assert_eq!(
+        state.pointer("/verification_receipts/0/id"),
+        Some(&Value::String("snapshot-settings-readback".into()))
+    );
+    assert_eq!(
+        state.pointer("/verification_receipts/0/outcome"),
+        Some(&Value::String("succeeded".into()))
+    );
     assert!(state.get("selected_surface").is_none());
     assert!(!state_json.contains(secret));
     assert!(!format!("{config:?}").contains(secret));

@@ -11,6 +11,7 @@ Kirigami.ScrollablePage {
     property var uiState: ({})
     property var removeCandidate: ({})
     property int renderedGaugeRows: 0
+    property alias snapshotReceiptTarget: verificationReceiptSection
     readonly property var usage: objectOrEmpty(uiState.usage)
     readonly property var settings: objectOrEmpty(uiState.settings)
     readonly property var connection: objectOrEmpty(uiState.connection)
@@ -158,6 +159,10 @@ Kirigami.ScrollablePage {
 
     function renderedGaugeCount() {
         return renderedGaugeRows
+    }
+
+    function renderedVerificationReceiptCount() {
+        return verificationReceipts.length
     }
 
     function gaugeLabel(gauge) {
@@ -844,6 +849,7 @@ Kirigami.ScrollablePage {
         }
 
         ColumnLayout {
+            id: verificationReceiptSection
             objectName: "usage-verification-receipts"
             Layout.fillWidth: true
             visible: usagePage.verificationReceipts.length > 0

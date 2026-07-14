@@ -134,6 +134,8 @@ fn kde_tray_contract_wires_activation_refresh_and_quit() {
     let main = read("qml/Main.qml");
     for marker in [
         "Platform.SystemTrayIcon",
+        "id: trayLoader",
+        "active: !controller.smokeMode && !controller.snapshotMode",
         "surfaceConfigured",
         "trayFallbackTimer",
         "onActivated",
@@ -205,8 +207,8 @@ fn normal_startup_presents_boot_for_one_second_without_closing_no_tray_fallback(
         "id: startupBootCloseTimer",
         "interval: 1000",
         "boot_close_elapsed",
-        "tray.available && !root.noTrayFallback",
-        "root.synchronizeTrayFallback(tray.available)",
+        "root.trayAvailable && !root.noTrayFallback",
+        "root.synchronizeTrayFallback(root.trayAvailable)",
     ] {
         assert!(
             main.contains(marker),
@@ -234,7 +236,7 @@ fn tray_fallback_tracks_runtime_availability_without_a_qt_change_signal() {
 }
 
 #[test]
-fn explicit_snapshot_cli_renders_and_saves_all_three_fixture_surfaces() {
+fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
     let main = read("src/main.rs");
     let controller = read("src/controller.rs");
     let qml = read("qml/Main.qml");
@@ -259,18 +261,22 @@ fn explicit_snapshot_cli_renders_and_saves_all_three_fixture_surfaces() {
         );
     }
     for marker in [
-        "snapshotSurfaces: [\"usage\", \"statistics\", \"menu\"]",
-        "snapshotTarget.grabToImage",
+        "snapshotSurfaces: [\"usage\", \"statistics\", \"receipts\", \"menu\"]",
+        "captureTarget.grabToImage",
         "result.saveToFile(outputPath)",
         "Qt.exit(2)",
         "if (!controller.snapshotMode)",
         "running: !controller.smokeMode && !controller.snapshotMode",
         "Snapshot run timed out",
         "snapshotCaptureAttempts >= 50",
+        "function snapshotPreferredContentHeight()",
+        "Math.ceil(pageHeight) + headerHeight + 32",
         "function snapshotSurfaceCount(name)",
         "snapshotSurfaceCount(\"renderedGaugeCount\") < 1",
         "snapshotSurfaceCount(\"renderedHeatmapCellCount\") < 1",
         "snapshotSurfaceCount(\"renderedServingAccountCount\") < 1",
+        "snapshotSurfaceCount(\"renderedVerificationReceiptCount\") < 1",
+        "surfaceLoader.item.snapshotReceiptTarget",
     ] {
         assert!(
             qml.contains(marker),
@@ -280,8 +286,9 @@ fn explicit_snapshot_cli_renders_and_saves_all_three_fixture_surfaces() {
     for marker in [
         "--snapshot-dir",
         "89504e470d0a1a0a",
-        "000003c0000002f8",
+        "000003c0*",
         "test \"$size\" -gt 20000",
+        "receipts.png",
         "sha256sum",
         "SHA256SUMS",
         "QML warning:",
@@ -315,7 +322,12 @@ fn qt_tray_owns_notification_ui_while_canberra_preserves_sound() {
     let main = read("qml/Main.qml");
     let controller = read("src/controller.rs");
 
-    for marker in ["show_notification", "tray.showMessage", "onMessageClicked"] {
+    for marker in [
+        "show_notification",
+        "trayLoader.item",
+        "tray.showMessage",
+        "onMessageClicked",
+    ] {
         assert!(
             main.contains(marker),
             "native notification shell must contain {marker}"

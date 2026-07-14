@@ -509,7 +509,7 @@ fn null_invalid_utf8_oversized_inputs_and_double_free_are_bounded() {
     // SAFETY: invalid_error was returned by the failed call.
     assert!(!unsafe { take_string(&mut invalid_error) }.contains("ff"));
 
-    let one_byte = [b'{'];
+    let one_byte = *b"{";
     // SAFETY: Oversize is rejected before the library dereferences the input.
     let status = unsafe {
         llmux_islands_bridge_dispatch(
