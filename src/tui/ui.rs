@@ -3284,13 +3284,39 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
 }
 
 /// Fixed display width of the [`activity_meta`] badge slot (UI-4 V5): every
-/// activity row spends exactly this many cells on the badge, so the
+/// activity row spends exactly this many CELLS on the badge, so the
 /// `→ account` column lines up. Sized for the widest routine content —
-/// `[claude sonnet-4-5 medium]` — with the model token clipped at
-/// [`META_MODEL_MAX`] chars so an exotic id cannot blow the column.
+/// `[claude sonnet-4-5 medium]`.
 const ACTIVITY_META_WIDTH: usize = 26;
-/// Max chars of the model token inside the badge before `…`-clipping.
-const META_MODEL_MAX: usize = 12;
+
+/// Display-cell width of `text` — ratatui's own column accounting
+/// (`unicode-width`), NOT the char count: group/model/effort ride in from
+/// request bodies, so wide/combining input must not shift the badge column.
+fn cell_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// `…`-clip `text` to at most `max` display CELLS (the cell-aware sibling of
+/// [`truncate_chars`]). The ellipsis itself counts one cell; a char that
+/// would straddle the boundary is dropped rather than overflowed.
+fn truncate_cells(text: &str, max: usize) -> String {
+    if cell_width(text) <= max {
+        return text.to_string();
+    }
+    let budget = max.saturating_sub(1); // room for the ellipsis
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out.push('\u{2026}');
+    out
+}
 
 /// Compose the fixed-width `[group model effort fast]` badge for an activity
 /// line (UI-4 V5/V6). The model token shows only OUTSIDE the codex/grok
@@ -3298,10 +3324,12 @@ const META_MODEL_MAX: usize = 12;
 /// just repeats the group label on every row (Z 2026-07-15 "백엔드 모델 출력
 /// x") — the expanded detail's `model` line keeps the full served id. The
 /// effort token is dropped when unknown (`None`, empty, or `"-"`); `fast`
-/// appears only when codex fast mode was on. The result is space-padded (and
-/// `…`-clipped) to [`ACTIVITY_META_WIDTH`]; rows with no meta at all get an
-/// all-blank slot of the same width, so alignment survives mixed history.
-/// Examples: `[claude fable-5 low]`, `[codex max fast]`, `[grok high]`.
+/// appears only when codex fast mode was on. The model token spends only the
+/// CELLS the other tokens leave over in the slot — nothing is clipped while
+/// the whole badge fits. Rows with no meta at all get an all-blank slot of
+/// the same width, so alignment survives mixed history. All measuring is in
+/// display cells ([`cell_width`]), never chars. Examples:
+/// `[claude fable-5 low]`, `[codex max fast]`, `[grok high]`.
 fn activity_meta(
     group: Option<&str>,
     model: Option<&str>,
@@ -3310,33 +3338,35 @@ fn activity_meta(
 ) -> String {
     // Treat "-"/empty effort as unknown (the fold stamps unknown as "none"/"-").
     let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(g) = group {
-        parts.push(g.to_string());
-    }
     // Backend-served models are hidden (V6); a model under an UNKNOWN group
     // still shows — it is the client-requested id from the request body.
-    if !matches!(group, Some("codex") | Some("grok")) {
-        if let Some(m) = model {
-            parts.push(truncate_chars(abbrev_model(group, m), META_MODEL_MAX));
-        }
-    }
-    if let Some(e) = effort {
-        parts.push(e.to_string());
-    }
-    if fast {
-        parts.push("fast".to_string());
+    let model = model
+        .filter(|_| !matches!(group, Some("codex") | Some("grok")))
+        .map(|m| abbrev_model(group, m));
+    let fixed: Vec<&str> = [group, effort, fast.then_some("fast")]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut parts: Vec<String> = fixed.iter().map(|p| p.to_string()).collect();
+    if let Some(m) = model {
+        // Dynamic budget: the slot minus brackets, the fixed tokens, and one
+        // separator per join — the model is clipped ONLY when the completed
+        // badge would overflow the slot.
+        let others: usize = fixed.iter().map(|p| cell_width(p)).sum();
+        let seps = fixed.len(); // one space joins the model to each side used
+        let budget = ACTIVITY_META_WIDTH.saturating_sub(2 + others + seps);
+        let insert_at = usize::from(group.is_some()); // model follows group
+        parts.insert(insert_at, truncate_cells(m, budget));
     }
     let body = if parts.is_empty() {
         String::new()
     } else {
         format!("[{}]", parts.join(" "))
     };
-    format!(
-        "{:<width$}",
-        truncate_chars(&body, ACTIVITY_META_WIDTH),
-        width = ACTIVITY_META_WIDTH
-    )
+    // Belt-and-braces: unvalidated effort/group strings could still overflow.
+    let body = truncate_cells(&body, ACTIVITY_META_WIDTH);
+    let pad = ACTIVITY_META_WIDTH.saturating_sub(cell_width(&body));
+    format!("{body}{}", " ".repeat(pad))
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -4868,8 +4898,20 @@ mod tests {
         );
         assert_eq!(
             activity_meta(None, Some("claude-haiku-4-5"), None, false).trim_end(),
-            "[claude-haik…]",
-            "no group → no claude- stripping; clipped at META_MODEL_MAX"
+            "[claude-haiku-4-5]",
+            "no group → no claude- stripping; whole badge fits, so no clip"
+        );
+        // The model is clipped ONLY when the completed badge would overflow
+        // the slot — and to exactly the cells the other tokens leave over.
+        assert_eq!(
+            activity_meta(
+                Some("claude"),
+                Some("claude-haiku-4-5-20251001"),
+                Some("medium"),
+                false
+            )
+            .trim_end(),
+            "[claude haiku-4-5… medium]"
         );
         // Nothing known → an all-blank slot of the same fixed width.
         assert_eq!(
@@ -4888,12 +4930,28 @@ mod tests {
                 Some("medium"),
                 false,
             ),
+            // Overflowing model → clipped back to exactly the slot.
+            activity_meta(
+                Some("claude"),
+                Some("claude-haiku-4-5-20251001"),
+                Some("medium"),
+                false,
+            ),
             activity_meta(Some("codex"), Some("gpt-5.6-sol"), Some("max"), true),
             activity_meta(Some("grok"), Some("grok-4.5"), None, false),
             activity_meta(None, None, None, false),
+            // Wide (CJK) metadata still occupies exactly the slot — the
+            // contract is display CELLS, not chars (review MUST-FIX 1).
+            activity_meta(
+                Some("claude"),
+                Some("모델-한글-이름-아주-긴-경우"),
+                Some("high"),
+                false,
+            ),
+            activity_meta(Some("한글그룹"), None, Some("높음"), false),
         ] {
             assert_eq!(
-                meta.chars().count(),
+                cell_width(&meta),
                 ACTIVITY_META_WIDTH,
                 "badge {meta:?} must occupy the fixed slot"
             );
@@ -4925,6 +4983,58 @@ mod tests {
         assert_eq!(
             activity_meta(Some("codex"), Some("gpt-5.6-sol"), None, true).trim_end(),
             "[codex fast]"
+        );
+    }
+
+    #[test]
+    fn expanded_detail_keeps_the_full_served_backend_model(/* UI-4 V6 */) {
+        // The compact row hides the codex/grok served id; the expanded
+        // detail is the fidelity surface and MUST keep it.
+        let entry = completed_request(1_000, Some("codex"), Some("gpt-5.6-sol"), 10, 5, 200);
+        let lines = completed_detail_lines(&entry, false, &Default::default());
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("codex gpt-5.6-sol"),
+            "expanded detail keeps the full served id, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn models_strip_fills_its_pane_height(/* UI-4 V1/V2 */) {
+        let docs: Vec<ModelUsageDoc> = (0..7)
+            .map(|i| model_row("claude", &format!("m-{i}"), 1_000 - i as u64, 10))
+            .collect();
+        let view = view_with(docs);
+        // Default auto height shows MODEL_STRIP_ROWS rows.
+        let text = render(&view, &chrome_overlay(Overlay::None), 220, 50);
+        assert!(
+            text.contains(" models — top 5 of 7 by tokens"),
+            "default strip shows 5 rows"
+        );
+        // Drag-expanded pane (border + header + 7): every row fits.
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(9);
+        let text = render(&view, &chrome, 220, 50);
+        assert!(
+            text.contains(" models — top 7 of 7 by tokens"),
+            "a taller pane reveals more rows"
+        );
+        // Shrunk to the drag minimum (border + header + 1).
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(PANE_MIN_HEIGHT);
+        let text = render(&view, &chrome, 220, 50);
+        assert!(
+            text.contains(" models — top 1 of 7 by tokens"),
+            "the minimum pane still renders one row"
         );
     }
 
@@ -4972,13 +5082,16 @@ mod tests {
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
+        // Scope the absence check to the activity ROW — other surfaces (the
+        // models strip, group-settings bar, expanded detail) intentionally
+        // keep the served id (SSOT V6 covers activity rows only).
+        let row = text
+            .lines()
+            .find(|l| l.contains("[codex max fast]"))
+            .expect("in-flight badge carries effort + fast");
         assert!(
-            text.contains("[codex max fast]"),
-            "in-flight badge carries effort + fast, got:\n{text}"
-        );
-        assert!(
-            !text.contains("gpt-5.6-sol"),
-            "the served backend model is hidden on activity rows (UI-4 V6)"
+            !row.contains("gpt-5.6-sol"),
+            "the served backend model is hidden on the activity row (UI-4 V6), got: {row}"
         );
     }
 

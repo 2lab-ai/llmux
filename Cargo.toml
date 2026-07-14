@@ -34,6 +34,9 @@ tokio-stream = "0.1.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "1.2.1"
+# Display-cell width for the fixed-width activity badge (UI-4 V5) — must
+# match ratatui's own column accounting (already in the tree via ratatui).
+unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 # Local UTC offset for the dashboard's absolute reset times (localtime_r);
