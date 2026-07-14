@@ -238,12 +238,15 @@ target exists for it; otherwise receipt = snapshot/live capture.
   opens it host-side (parity with the PKCE flows); a second client-side open
   would double-tab local setups. Instead the login progress view shows the
   clickable link + user code, which also covers the remote-daemon case.
-- MODIFIED (implementation, 2026-07-14): spec §R4's "islands settings pane
-  gains a grok row" is deferred — islands has NO codex settings row either
-  (`POST /llmux/codex` is dashboard/CLI-only today), so a grok-only row would
-  exceed codex parity and the user requirements (R2 registration + R3 stats
-  are the islands asks). `POST /llmux/grok` exists for the TUI dashboard/CLI;
-  an islands settings row for BOTH providers is future work.
+- MODIFIED (implementation, 2026-07-14): interactive callers for the live
+  model/effort override are v1-descoped. `POST /llmux/grok` exists as the
+  **daemon HTTP API** only in v1 (direct/script). The TUI `f/m/e`-style grok
+  control (codex parity, tui/mod.rs:1160 + a parallel `GrokSettingsDoc`) and
+  an islands settings row are NOT in this PR — codex keeps its TUI control,
+  grok's is the endpoint alone. Rationale: the user's islands asks are R2
+  registration + R3 stats (both delivered); the core R4 switch is the
+  Claude Code `/model grok-4.5` routing path (T3), independent of these
+  surfaces. Follow-up: a TUI/islands control panel for BOTH providers.
 - MODIFIED (implementation, 2026-07-14): grok raw-io/trace rides the same
   `codex-trace.jsonl` file (T3 §7 "grok tag" = the model field identifies the
   provider); a separate file would fork the trace reader for no diagnostic

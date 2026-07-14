@@ -11,9 +11,11 @@
 Add **Grok (xAI) as a third backend group** to llmux — alongside `claude` and `codex` —
 serving Anthropic Messages API clients (Claude Code) from a Grok subscription account via
 xAI's Responses API. Registration and stats are exposed in both the CLI and
-llmux-islands; live model/effort switching is exposed via the CLI/daemon API and the TUI
-dashboard (`POST /llmux/grok`) — an islands settings row is v1-descoped (§R4). Refactor
-so codex and grok share one Responses-API core with thin per-provider adapters.
+llmux-islands; the core model-switch requirement (R4) is Claude Code `/model grok-4.5`
+routing. A live daemon-side model/effort override is exposed via the **daemon HTTP API**
+(`POST /llmux/grok`); interactive callers for it (the TUI `f/m/e` control, an islands
+settings row) are v1-descoped (§R4). Refactor so codex and grok share one Responses-API
+core with thin per-provider adapters.
 
 ## Why this is safe to build on the codex skeleton (evidence)
 
