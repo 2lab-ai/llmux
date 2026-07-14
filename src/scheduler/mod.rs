@@ -409,7 +409,11 @@ impl PoolState {
     /// are present, the most-constrained standard (API-key) bucket is
     /// recorded into the 5h slot so API-key accounts get proactive
     /// scheduling too (the token bucket's short reset horizon means the
-    /// reading expires quickly and degrades back to cold).
+    /// reading expires quickly and degrades back to cold). grok's
+    /// cli-chat-proxy buckets carry no reset, so a reset-less standard
+    /// reading gets an estimated `STANDARD_RESET_FALLBACK` horizon — but ONLY
+    /// for Grok accounts, since the `x-ratelimit-*` names are provider-generic
+    /// and other groups must keep the strict both-fields-required behavior.
     pub fn record_headers(
         &mut self,
         account: &AccountId,
@@ -437,7 +441,21 @@ impl PoolState {
             );
         }
         if parsed.five_hour.is_none() && parsed.seven_day.is_none() {
-            if let Some(reading) = parsed.standard.and_then(|s| s.as_window_reading()) {
+            // The `x-ratelimit-*` fallback names are provider-generic, so a
+            // codex/anthropic response carrying them without a reset would
+            // otherwise get a synthetic-horizon window. Gate the reset-less
+            // fallback to Grok accounts (grok's cli-chat-proxy sends no
+            // reset); every other group keeps the strict both-fields-required
+            // behavior — a reset-less reading is dropped.
+            let is_grok = BackendGroup::from_kind(acct.credential.kind()) == BackendGroup::Grok;
+            let reading = parsed.standard.and_then(|s| {
+                if is_grok {
+                    s.as_window_reading_with_fallback_reset(now + headers::STANDARD_RESET_FALLBACK)
+                } else {
+                    s.as_window_reading()
+                }
+            });
+            if let Some(reading) = reading {
                 recorded |= AccountState::merge_window(
                     &mut acct.five_hour,
                     reading,
@@ -1290,6 +1308,20 @@ mod tests {
         }
     }
 
+    fn grok_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Grok {
+                subject: format!("sub-{name}"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
+                token_endpoint: String::new(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
     fn id(s: &str) -> AccountId {
         AccountId(s.to_string())
     }
@@ -1374,6 +1406,70 @@ mod tests {
         let window = state.accounts[0].five_hour.unwrap();
         assert!((window.utilization - 0.80).abs() < 1e-9);
         assert_eq!(window.resets_at, at(NOW_SECS + 60));
+    }
+
+    fn reset_less_grok_standard() -> ParsedRateLimitHeaders {
+        // grok shape: limit/remaining with no reset (900 limit / 720 remaining
+        // → utilization 0.20).
+        ParsedRateLimitHeaders {
+            standard: Some(headers::StandardRateLimit {
+                requests_limit: Some(900),
+                requests_remaining: Some(720),
+                requests_reset: None,
+                tokens_limit: None,
+                tokens_remaining: None,
+                tokens_reset: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reset_less_standard_headers_use_fallback_horizon_for_grok_only() {
+        // grok account: reset-less reading gets the estimated
+        // STANDARD_RESET_FALLBACK horizon from now.
+        let parsed = reset_less_grok_standard();
+        let mut state = PoolState::from_accounts(&[grok_account("g")]);
+        state.record_headers(&id("g"), &parsed, now());
+        let window = state.accounts[0].five_hour.unwrap();
+        assert!((window.utilization - 0.20).abs() < 1e-9);
+        assert_eq!(window.resets_at, now() + headers::STANDARD_RESET_FALLBACK);
+
+        // codex / oauth accounts: the provider-generic names must NOT inject a
+        // synthetic-horizon window — a reset-less reading is dropped.
+        for account in [codex_account("cx"), oauth_account("o")] {
+            let name = account.name.clone();
+            let mut state = PoolState::from_accounts(&[account]);
+            state.record_headers(&id(&name), &parsed, now());
+            assert!(
+                state.accounts[0].five_hour.is_none(),
+                "{name}: reset-less standard reading must be dropped for non-grok"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_x_ratelimit_capture_parses_and_records_via_record_headers() {
+        // End-to-end: exact 2026-07-14 cli-chat-proxy.grok.com capture (HTTP
+        // 200) through headers::parse then record_headers on a grok account.
+        let mut headers_map = http::HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-limit-tokens", "15000000"),
+            ("x-ratelimit-remaining-tokens", "15000000"),
+            ("x-ratelimit-limit-requests", "900"),
+            ("x-ratelimit-remaining-requests", "900"),
+        ] {
+            headers_map.insert(
+                name.parse::<http::HeaderName>().unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let parsed = headers::parse(&headers_map);
+        let mut state = PoolState::from_accounts(&[grok_account("g")]);
+        state.record_headers(&id("g"), &parsed, now());
+        let window = state.accounts[0].five_hour.unwrap();
+        assert_eq!(window.utilization, 0.0);
+        assert_eq!(window.resets_at, now() + headers::STANDARD_RESET_FALLBACK);
     }
 
     #[test]
