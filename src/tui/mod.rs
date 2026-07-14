@@ -323,6 +323,10 @@ pub(crate) struct Chrome {
     pub pane_heights: PaneHeights,
     /// Anchor cell of the open right-click context menu (UI-3 U11).
     pub menu_anchor: Option<(u16, u16)>,
+    /// The pinned account id the open context menu targets — the SINGLE
+    /// source of truth for both the menu's rendering and its execution
+    /// (display indexes reorder every frame; review R2 MUST-FIX).
+    pub menu_account: Option<String>,
     /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
     pub chart_days: u64,
 }
@@ -565,6 +569,7 @@ impl App {
             reset_absolute: self.reset_absolute,
             pane_heights: self.pane_heights,
             menu_anchor: self.menu_anchor,
+            menu_account: self.menu_account.clone(),
             chart_days: self.chart_days,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
@@ -2800,6 +2805,75 @@ mod tests {
         view.grok.effort = Some("high".into());
         assert!(app.on_mouse(click(22), Some(&view)));
         assert_eq!(app.take_pending_grok(), Some(None), "high wraps to bypass");
+    }
+
+    /// Review R2 regression: rows reorder between menu-open and click — the
+    /// action must land on the PINNED account, and a vanished pin aborts.
+    #[test]
+    fn menu_action_follows_pinned_account_across_reorder() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let acct = |name: &str| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 5,
+                width: 80,
+                height: 1,
+            },
+            display_idx: 0,
+        }];
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.menu_account.as_deref(), Some("claude:a@x.com"));
+
+        // Reorder: `a` moves to display row 1. Running pause (item 1) must
+        // still act on `a`, not on whoever now sits at row 0.
+        view.snapshot.accounts.swap(0, 1);
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:a@x.com".into(), true)),
+            "action follows the pinned account across the reorder"
+        );
+
+        // A pinned account that VANISHED aborts with a status, acts on no one.
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_account = Some("claude:gone@x.com".into());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            None,
+            "vanished pin acts on no one"
+        );
+        assert!(app.status_line().is_some_and(|s| s.contains("gone")));
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
