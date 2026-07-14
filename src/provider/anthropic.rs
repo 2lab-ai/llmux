@@ -65,6 +65,11 @@ pub fn inject_credential(
         // A codex credential must never leak to the Anthropic upstream —
         // the proxy routes codex accounts through the codex provider before
         // this point; reaching here is a routing bug.
+        AccountCredential::Grok { .. } => {
+            return Err(ProviderError::Auth(
+                "grok credential cannot authenticate against the anthropic provider".into(),
+            ));
+        }
         AccountCredential::Codex { .. } => {
             return Err(ProviderError::Auth(
                 "codex credential cannot authenticate against the anthropic provider".into(),

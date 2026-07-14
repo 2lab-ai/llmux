@@ -25,6 +25,10 @@ pub enum LoginProvider {
     Claude,
     /// ChatGPT (Codex) subscription — `auth::codex` PKCE flow.
     Codex,
+    /// xAI Grok subscription — `auth::grok` RFC 8628 device-code flow (no
+    /// localhost callback; the daemon polls while the user approves in the
+    /// browser).
+    Grok,
 }
 
 impl LoginProvider {
@@ -34,6 +38,7 @@ impl LoginProvider {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" | "oauth" | "anthropic" => Some(Self::Claude),
             "codex" | "chatgpt" | "openai" => Some(Self::Codex),
+            "grok" | "xai" | "x-ai" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -43,6 +48,7 @@ impl LoginProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
         }
     }
 }
@@ -67,6 +73,12 @@ impl LoginPhase {
 struct LoginJob {
     state: String,
     phase: LoginPhase,
+    /// Device-code verification URL + user code (grok flow only): published
+    /// once the device code is minted so the GUI can open the page while the
+    /// daemon polls (docs/grok/spec.md §R2, C11). `None` for the PKCE flows
+    /// (their browser opens daemon-side).
+    verification_uri: Option<String>,
+    user_code: Option<String>,
     /// Spawn handle, kept only so `cancel` can abort the browser/callback wait.
     /// Cleared once the job reaches a terminal phase.
     handle: Option<JoinHandle<()>>,
@@ -99,6 +111,8 @@ impl LoginRegistry {
         *guard = Some(LoginJob {
             state,
             phase: LoginPhase::Pending,
+            verification_uri: None,
+            user_code: None,
             handle: None,
         });
         true
@@ -137,6 +151,29 @@ impl LoginRegistry {
             .as_ref()
             .filter(|j| j.state == state)
             .map(|j| j.phase.clone())
+    }
+
+    /// Publish the device-code verification URL (+ user code) for a pending
+    /// login — only if the slot still holds THIS `state` pending, mirroring
+    /// [`Self::finish`]'s cancel-wins contract.
+    pub fn set_verification(&self, state: &str, uri: String, user_code: String) {
+        let mut guard = self.lock();
+        if let Some(job) = guard.as_mut() {
+            if job.state == state && job.phase.is_pending() {
+                job.verification_uri = Some(uri);
+                job.user_code = Some(user_code);
+            }
+        }
+    }
+
+    /// Verification URL + user code published for the login keyed by `state`
+    /// (grok device flow), `(None, None)` otherwise.
+    pub fn verification(&self, state: &str) -> (Option<String>, Option<String>) {
+        let guard = self.lock();
+        match guard.as_ref().filter(|j| j.state == state) {
+            Some(job) => (job.verification_uri.clone(), job.user_code.clone()),
+            None => (None, None),
+        }
     }
 
     /// Cancel the pending login keyed by `state`. Aborts the spawned task and

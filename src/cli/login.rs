@@ -1,4 +1,4 @@
-//! `llmux login [--api | --codex]` — add an account.
+//! `llmux login [--api | --codex | --grok]` — add an account.
 
 use crate::auth::{codex, oauth, profile};
 use crate::config::{AccountConfig, AccountCredential, Config, Upsert};
@@ -9,8 +9,11 @@ use super::{prompt_line, CliError, LoginArgs};
 /// upsert into config by `account_uuid` (FR2 dedup).
 /// `--api` path: prompt for an API key, store as an apikey account.
 /// `--codex` path: ChatGPT OAuth browser flow → upsert a Codex account.
+/// `--grok` path: xAI device-code flow → upsert a Grok account.
 pub async fn run(args: LoginArgs) -> Result<(), CliError> {
-    if args.codex {
+    if args.grok {
+        login_grok().await
+    } else if args.codex {
         login_codex().await
     } else if args.api {
         login_api().await
@@ -179,6 +182,37 @@ async fn login_codex() -> Result<(), CliError> {
     match outcome {
         Upsert::Added => println!("Added codex account {final_name:?}"),
         Upsert::Updated => println!("Updated codex account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// `--grok`: run the xAI device-code flow (docs/grok/spec.md T1) and upsert
+/// a Grok account. No localhost callback: prints the verification URL + user
+/// code, best-effort opens the browser, then polls the token endpoint.
+async fn login_grok() -> Result<(), CliError> {
+    crate::config::load_or_init()?;
+    let client = reqwest::Client::new();
+
+    println!("Starting xAI (Grok) device-code login...");
+    let discovery = crate::auth::grok::discover(&client).await?;
+    let device = crate::auth::grok::request_device_code(&client, &discovery).await?;
+    println!("Open:  {}", device.open_url());
+    println!("Code:  {}", device.user_code);
+    oauth::open_browser(device.open_url());
+    println!("Waiting for authorization (Ctrl-C to abort)...");
+    let bundle = crate::auth::grok::poll_token(&client, &discovery.token_endpoint, &device).await?;
+    let account = crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint);
+
+    let final_name = account.name.clone();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        outcome = config.upsert_account(account.clone());
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added grok account {final_name:?}"),
+        Upsert::Updated => println!("Updated grok account {final_name:?}"),
     }
     println!("Saved to {}", crate::config::config_path()?.display());
     Ok(())
