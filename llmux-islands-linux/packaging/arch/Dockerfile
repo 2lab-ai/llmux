@@ -55,8 +55,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     timeout 20s cargo run --locked -- --smoke-test
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/llmux-islands-linux/target \
-    snapshot_log="$(timeout 40s cargo run --locked -- --snapshot-dir /tmp/llmux-islands-snapshots 2>&1)" \
+    snapshot_status=0 \
+    && snapshot_log="$(timeout 40s cargo run --locked -- --snapshot-dir /tmp/llmux-islands-snapshots 2>&1)" \
+       || snapshot_status="$?" \
     && printf '%s\n' "$snapshot_log" \
+    && test "$snapshot_status" -eq 0 \
     && if printf '%s\n' "$snapshot_log" | grep -Fq 'QML warning:'; then exit 1; fi \
     && hashes='' \
     && for surface in usage statistics menu; do \

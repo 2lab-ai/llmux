@@ -347,6 +347,7 @@ Kirigami.ApplicationWindow {
     }
 
     function failSnapshot(message) {
+        console.error("Snapshot failure: " + message)
         dispatchError = message
         quitRequested = true
         controller.exitHeadless(2)
