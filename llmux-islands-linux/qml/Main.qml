@@ -349,7 +349,7 @@ Kirigami.ApplicationWindow {
     function failSnapshot(message) {
         dispatchError = message
         quitRequested = true
-        Qt.exit(2)
+        controller.exitHeadless(2)
     }
 
     function snapshotSurfaceCount(name) {
@@ -409,7 +409,7 @@ Kirigami.ApplicationWindow {
             snapshotCaptureAttempts = 0
             if (snapshotIndex >= snapshotSurfaces.length) {
                 root.quitRequested = true
-                Qt.exit(0)
+                controller.exitHeadless(0)
                 return
             }
             selectSnapshotSurface(snapshotSurfaces[snapshotIndex])
@@ -804,7 +804,7 @@ Kirigami.ApplicationWindow {
         repeat: false
         onTriggered: {
             root.quitRequested = true
-            Qt.quit()
+            controller.exitHeadless(0)
         }
     }
 
