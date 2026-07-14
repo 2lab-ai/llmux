@@ -40,6 +40,10 @@ pub struct Config {
     /// OpenAI Codex backend endpoints (used only by `type: "codex"` accounts).
     #[serde(default)]
     pub codex: CodexConfig,
+    /// xAI Grok backend endpoints (used only by `type: "grok"` accounts).
+    /// Additive (`#[serde(default)]`): pre-grok configs load with defaults.
+    #[serde(default)]
+    pub grok: GrokConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Model→backend-group routing (default: disabled — exactly today's
@@ -230,6 +234,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             upstream: default_upstream(),
             codex: CodexConfig::default(),
+            grok: GrokConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),
@@ -324,12 +329,19 @@ pub struct RoutingConfig {
     /// Models routed to the codex group (empty → builtin codex rules).
     #[serde(default)]
     pub codex_models: Vec<String>,
+    /// Models routed to the grok group (empty → builtin grok rules).
+    /// Additive: pre-grok configs load with the builtin `grok` prefix rule.
+    #[serde(default)]
+    pub grok_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.
     #[serde(default = "default_routing_group")]
     pub default_group: String,
-    /// What to do when the matched group has no eligible/configured account:
-    /// `"error"` (default) returns a clean 404 not_found_error; `"fallback"`
-    /// falls back to the other group's normal selection.
+    /// What to do when the matched group has ZERO CONFIGURED accounts
+    /// (parked/limited accounts still count as configured): `"error"`
+    /// (default) returns a clean 404 not_found_error; `"fallback"` tries the
+    /// remaining groups in the fixed `Claude → Codex → Grok` order and the
+    /// first group with ≥1 configured account serves the request under its
+    /// own provider semantics (docs/grok/spec.md §R5).
     #[serde(default = "default_on_empty_group")]
     pub on_empty_group: String,
 }
@@ -340,6 +352,7 @@ impl Default for RoutingConfig {
             enabled: true,
             claude_models: Vec::new(),
             codex_models: Vec::new(),
+            grok_models: Vec::new(),
             default_group: default_routing_group(),
             on_empty_group: default_on_empty_group(),
         }
@@ -405,6 +418,49 @@ impl Default for CodexConfig {
             fast: false,
             reasoning_effort: None,
             trace: true,
+        }
+    }
+}
+
+/// xAI Grok backend endpoints + request defaults (docs/grok/spec.md §R1/§R4).
+/// The chat upstream defaults to the Grok-CLI chat proxy (the subscription
+/// path); the OAuth endpoints are discovered via OIDC at login time and the
+/// token endpoint is persisted PER ACCOUNT (`AccountCredential::Grok`), so no
+/// token URL lives here. No `fast` — xAI has no service tier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrokConfig {
+    /// Base URL the Responses request is POSTed to (`{upstream}/responses`).
+    /// The Grok-CLI identity headers are only attached when this is the
+    /// official cli-chat-proxy host (docs/grok/spec.md §R1).
+    #[serde(default = "default_grok_upstream")]
+    pub upstream: String,
+    /// Model slug the grok provider requests upstream when the client's
+    /// requested model is not grok-shaped. Settable from `POST /llmux/grok`.
+    #[serde(default = "default_grok_model")]
+    pub default_model: String,
+    /// When set, llmux reports THIS model name to the client instead of the
+    /// real grok model (same contract as `codex.client_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_model: Option<String>,
+    /// Reasoning effort default: superset `none|low|medium|high`; the
+    /// per-model clamp happens at request time (docs/grok/spec.md §R1).
+    /// `None` → omit `reasoning` and let the backend default (high) apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Append a JSON-line trace of every grok request/response, mirroring
+    /// `codex.trace`. Default `false` (flip on while diagnosing).
+    #[serde(default)]
+    pub trace: bool,
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_grok_upstream(),
+            default_model: default_grok_model(),
+            client_model: None,
+            reasoning_effort: None,
+            trace: false,
         }
     }
 }
@@ -652,6 +708,31 @@ pub enum AccountCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_refresh_ms: Option<u64>,
     },
+    /// xAI Grok subscription (device-code OAuth against auth.x.ai,
+    /// docs/grok/spec.md §R1). Served by the grok provider.
+    ///
+    /// NOTE downgrade contract: a config containing this variant does not
+    /// parse under pre-grok binaries (internally-tagged enum) — remove
+    /// `grok:*` accounts before downgrading (spec §Compatibility & rollback).
+    Grok {
+        /// `sub` claim from the id_token; dedup key across logins.
+        /// Empty string = unknown.
+        #[serde(default)]
+        subject: String,
+        access_token: String,
+        refresh_token: String,
+        /// Access-token expiry, epoch milliseconds. `0` = unknown.
+        expires_at_ms: u64,
+        /// OAuth token endpoint resolved via OIDC discovery at login time and
+        /// persisted so refreshes don't re-discover (CLIProxyAPI parity).
+        /// Empty string → re-discover on the next refresh.
+        #[serde(default)]
+        token_endpoint: String,
+        /// Epoch ms of the last successful token refresh; see the `Oauth`
+        /// variant's field of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_refresh_ms: Option<u64>,
+    },
 }
 
 impl AccountCredential {
@@ -661,6 +742,7 @@ impl AccountCredential {
             Self::Oauth { .. } => "oauth",
             Self::Apikey { .. } => "apikey",
             Self::Codex { .. } => "codex",
+            Self::Grok { .. } => "grok",
         }
     }
 
@@ -674,6 +756,9 @@ impl AccountCredential {
             }
             | Self::Codex {
                 last_refresh_ms, ..
+            }
+            | Self::Grok {
+                last_refresh_ms, ..
             } => *last_refresh_ms,
             Self::Apikey { .. } => None,
         }
@@ -686,6 +771,7 @@ impl AccountCredential {
         match self {
             Self::Oauth { account_uuid, .. } if !account_uuid.is_empty() => Some(account_uuid),
             Self::Codex { account_id, .. } if !account_id.is_empty() => Some(account_id),
+            Self::Grok { subject, .. } if !subject.is_empty() => Some(subject),
             _ => None,
         }
     }
@@ -776,6 +862,13 @@ impl Config {
                 expires_at_ms: exp,
                 last_refresh_ms: lr,
                 ..
+            }
+            | AccountCredential::Grok {
+                access_token: at,
+                refresh_token: rt,
+                expires_at_ms: exp,
+                last_refresh_ms: lr,
+                ..
             } => {
                 *at = access_token.to_string();
                 if let Some(new_rt) = refresh_token {
@@ -810,6 +903,19 @@ fn default_codex_token_url() -> String {
 /// Must stay in sync with `provider::codex::CODEX_MODEL`.
 fn default_codex_model() -> String {
     "gpt-5.6-sol".to_string()
+}
+
+/// Default grok chat upstream: the Grok-CLI chat proxy (subscription path,
+/// CLIProxyAPI `internal/auth/xai/types.go:13`). Must stay in sync with
+/// `provider::grok::GROK_CHAT_PROXY_UPSTREAM`.
+fn default_grok_upstream() -> String {
+    "https://cli-chat-proxy.grok.com/v1".to_string()
+}
+
+/// Default grok model slug. Must stay in sync with
+/// `provider::grok::GROK_MODEL`.
+fn default_grok_model() -> String {
+    "grok-4.5".to_string()
 }
 
 fn default_port() -> u16 {

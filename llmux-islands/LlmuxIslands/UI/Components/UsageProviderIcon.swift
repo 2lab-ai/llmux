@@ -45,6 +45,11 @@ private final class UsageProviderIconCache {
         case .codex:
             resourceName = "codex"
             resourceExtension = "svg"
+        case .grok:
+            // No bundled asset yet — UsageProviderIcon falls back to the
+            // "G" letter glyph until one lands in assets/.
+            resourceName = "grok"
+            resourceExtension = "svg"
         case .gemini:
             resourceName = "gemini"
             resourceExtension = "png"

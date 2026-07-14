@@ -25,6 +25,8 @@ struct NotchClosedLabelView: View {
     let claudeCount: Int
     /// Σ in-flight sessions over Codex accounts — drives `{m}`.
     let codexCount: Int
+    /// Σ in-flight sessions over Grok accounts — drives `{k}`.
+    let grokCount: Int
     /// Whether the island is actually on screen (NotchView's `isVisible`). On
     /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
     /// 30fps timeline paused then instead of animating an invisible view.
@@ -41,11 +43,12 @@ struct NotchClosedLabelView: View {
     /// How high the mascot hops, in points ("살짝").
     private static let jumpHeight: CGFloat = 3
 
-    /// Hue offsets so the two providers don't share the exact same color.
+    /// Hue offsets so the providers don't share the exact same color.
     static let claudeHueSeed: Double = 0
     static let codexHueSeed: Double = 0.35
+    static let grokHueSeed: Double = 0.7
 
-    private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 }
+    private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 || grokCount > 0 }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !(isAnimating && active))) { timeline in
@@ -53,9 +56,11 @@ struct NotchClosedLabelView: View {
             NotchClosedLabelContent(
                 claudeCount: claudeCount,
                 codexCount: codexCount,
+                grokCount: grokCount,
                 jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
                 claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
-                codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed)
+                codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed),
+                grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed)
             )
         }
     }
@@ -106,12 +111,15 @@ struct NotchClosedLabelView: View {
 struct NotchClosedLabelContent: View {
     let claudeCount: Int
     let codexCount: Int
+    let grokCount: Int
     /// Mascot vertical offset in points (≤ 0 while airborne).
     let jumpOffset: CGFloat
     /// 0..<1 rainbow hue for the claude `[icon]{n}` group.
     let claudeHue: Double
     /// 0..<1 rainbow hue for the codex `[icon]{m}` group.
     let codexHue: Double
+    /// 0..<1 rainbow hue for the grok `[icon]{k}` group.
+    let grokHue: Double
 
     var body: some View {
         HStack(spacing: 8) {
@@ -132,6 +140,9 @@ struct NotchClosedLabelContent: View {
             }
             if codexCount > 0 {
                 providerGroup(.codex, count: codexCount, hue: codexHue)
+            }
+            if grokCount > 0 {
+                providerGroup(.grok, count: grokCount, hue: grokHue)
             }
         }
     }

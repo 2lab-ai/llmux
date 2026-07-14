@@ -345,6 +345,63 @@ mod tests {
         }
     }
 
+    fn grok_account_fixture(name: &str, subject: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Grok {
+                subject: subject.to_string(),
+                access_token: "at-g".to_string(),
+                refresh_token: "rt-g".to_string(),
+                expires_at_ms: 1_900_000_000_000,
+                token_endpoint: "https://auth.x.ai/token".to_string(),
+                last_refresh_ms: Some(1_750_000_000_000),
+            },
+        }
+    }
+
+    // ---- C7: grok credential serde round-trip + upsert dedup ----
+    #[test]
+    fn c7_grok_credential_round_trips_and_dedups() {
+        let account = grok_account_fixture("grok:a@b.c", "sub-1");
+        let json = serde_json::to_string(&account).expect("serialize");
+        assert!(json.contains(r#""type":"grok""#), "{json}");
+        let back: AccountConfig = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, account);
+
+        let mut config = Config::default();
+        assert_eq!(config.upsert_account(account.clone()), Upsert::Added);
+        // Same name → update, not duplicate.
+        assert_eq!(config.upsert_account(account), Upsert::Updated);
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].credential.kind(), "grok");
+        assert_eq!(config.accounts[0].credential.account_uuid(), Some("sub-1"));
+    }
+
+    // ---- C17: pre-grok config parses and round-trips VALUE-stable ----
+    // (Not byte-stable: the new binary serializes the default `grok` section;
+    // old binaries ignore unknown sections. The additive guarantee is
+    // semantic — no field lost, no meaning changed.)
+    #[test]
+    fn c17_pre_grok_config_round_trips_without_grok_fields() {
+        // A config written before grok existed: no `grok` section, no
+        // `routing.grok_models`, codex + oauth accounts only.
+        let raw = r#"{
+  "version": 1,
+  "routing": { "enabled": true, "default_group": "claude" },
+  "accounts": [
+    { "name": "a", "type": "apikey", "api_key": "sk-1" }
+  ]
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("pre-grok config parses");
+        assert_eq!(config.grok.default_model, "grok-4.5", "defaults fill in");
+        assert!(config.routing.grok_models.is_empty());
+        // Round-trip: serialize → parse → identical value (additive-only).
+        let round: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("round trip");
+        assert_eq!(round, config);
+    }
+
     pub(crate) fn oauth_account(name: &str, uuid: &str) -> AccountConfig {
         AccountConfig {
             name: name.to_string(),

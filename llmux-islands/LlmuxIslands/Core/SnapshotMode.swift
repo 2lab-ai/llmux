@@ -165,7 +165,7 @@ enum SnapshotMode {
             let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
             let url = dir.appendingPathComponent(name)
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .wallClock(t)
+                claudeCount: claude, codexCount: codex, grokCount: 0, clock: .wallClock(t)
             )
             try renderLabel(view, to: url)
             return [url.path]
@@ -175,7 +175,7 @@ enum SnapshotMode {
         for (index, phase) in phases.enumerated() {
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, clock: .phase(phase)
+                claudeCount: claude, codexCount: codex, grokCount: 0, clock: .phase(phase)
             )
             try renderLabel(view, to: url)
             written.append(url.path)
@@ -492,6 +492,7 @@ struct ClosedIslandSnapshotView: View {
 
     let claudeCount: Int
     let codexCount: Int
+    let grokCount: Int
     let clock: Clock
 
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
@@ -510,10 +511,12 @@ struct ClosedIslandSnapshotView: View {
         NotchClosedLabelContent(
             claudeCount: claudeCount,
             codexCount: codexCount,
+            grokCount: grokCount,
             // Deterministic frames render the mascot grounded.
             jumpOffset: 0,
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
-            codexHue: hue(seed: NotchClosedLabelView.codexHueSeed)
+            codexHue: hue(seed: NotchClosedLabelView.codexHueSeed),
+            grokHue: hue(seed: NotchClosedLabelView.grokHueSeed)
         )
         .frame(minWidth: Self.closedNotchSize.width - 20)
         .frame(height: max(24, Self.closedNotchSize.height))
