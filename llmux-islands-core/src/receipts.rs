@@ -64,6 +64,7 @@ pub(crate) fn from_activity_with_account_privacy(
                 model,
                 effort,
                 fast,
+                ..
             } => {
                 let safe_path = sanitize_path(path);
                 let base_receipt_id = format!(
