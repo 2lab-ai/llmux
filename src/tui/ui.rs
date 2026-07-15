@@ -2279,23 +2279,10 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         ))
         .centered(),
     };
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(dim())
-        .title(Span::styled(
-            modal.title.clone(),
-            Style::new().add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(hint);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let mut chrome = RawModalChrome::default();
-    if inner.height < 2 || inner.width == 0 {
-        return chrome;
-    }
-
-    // Action buttons over the top border, right-aligned (UI-8): rendered as an
-    // exact-rect Paragraph so the recorded hit rects are authoritative.
+    // Action buttons ride the top border, right-aligned (UI-8). Reserve their
+    // width FIRST and clip the title to what's left (+ a 1-cell gap) so the
+    // buttons — the requested interactive affordance — never overwrite the
+    // title on a narrow (~80-col) terminal; the title degrades instead.
     const BUTTONS: [RawButton; 5] = [
         RawButton::Copy,
         RawButton::CopyCurl,
@@ -2306,7 +2293,32 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     let btn_w = |b: RawButton| b.label().len() as u16 + 2; // " label "
     let total: u16 = BUTTONS.iter().map(|b| btn_w(*b)).sum::<u16>() + (BUTTONS.len() as u16 - 1);
     let border_row_w = area.width.saturating_sub(2);
-    if total <= border_row_w {
+    let buttons_fit = total <= border_row_w;
+    let title_budget = if buttons_fit {
+        border_row_w.saturating_sub(total + 1)
+    } else {
+        border_row_w
+    };
+    let title = truncate_cells(&modal.title, usize::from(title_budget));
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(dim())
+        .title(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(hint);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut chrome = RawModalChrome::default();
+    if inner.height < 2 || inner.width == 0 {
+        return chrome;
+    }
+
+    // Rendered as an exact-rect Paragraph so the recorded hit rects are
+    // authoritative.
+    if buttons_fit {
         let mut x = area.x + 1 + border_row_w - total;
         let mut spans: Vec<Span<'static>> = Vec::new();
         let row_area = Rect {
