@@ -327,15 +327,15 @@ repository build gate.
 | Rust protocol/reducer core | Verified through T4 HTTP/effect boundary | 46 contract/fixture/reducer/HTTP tests cover state, routes, HTTPS/auth, redirects, privacy handles and free-text masking, window lifecycle, cancellation/deadline races, bounded retry, refresh ordering, receipts, and typed effects |
 | T4 settings/events/autostart | Verified at adapter boundary | Daemon settings/events plus private atomic settings, symlink-safe idempotent XDG autostart, validation, and terminal receipts |
 | KDE Qt/QML shell | Verified in clean Arch container | Usage, Statistics, Menu, tray, canonical controller, semantic dispatch, static QML resource registration, and bounded offscreen smoke all execute |
-| macOS C ABI | Verified at native caller boundary | Eleven Rust ABI tests cover every action/effect family, request correlation, opaque ids, secrets, platform-state persistence, invalid buffers, panic containment, and ownership; a target-14 C caller links and runs with linker warnings fatal, and its load command reports `minos 14.0` |
-| macOS SwiftUI/AppKit shell | Shared-core runtime integrated | Strict schema decoder, C ABI ownership wrapper, canonical projections, executor effects, hardened endpoint policy, and Xcode build integration; macOS CI is the authoritative full build because this development host has Command Line Tools but not Xcode |
+| macOS C ABI | Verified at native caller boundary | Twelve Rust ABI tests cover every action/effect family, request correlation, opaque ids, secrets, platform-state persistence, invalid buffers, panic containment, and ownership; a target-14 C caller links and runs with linker warnings fatal, and its load command reports `minos 14.0` |
+| macOS SwiftUI/AppKit shell | Verified in macOS CI | Strict schema decoder, C ABI ownership wrapper, canonical projections, executor effects, hardened endpoint policy, Xcode build integration, tests, and original production-renderer captures pass |
 | Tray/layer-shell/notifications | Verified at adapter/build boundary with platform fallbacks | Qt `SystemTrayIcon` with Plasma StatusNotifierItem backend and native message activation, LayerShellQt Wayland, positioned X11, regular fallback, freedesktop sound |
 | Arch maintenance/package | Verified fail-closed | Pacman instruction-only, absolute Linuxbrew delegation, protected checksum primitive, and an unprivileged `makepkg` release build followed by package installation and installed-binary smoke in the clean Arch image |
-| Native presentation boundary | Implemented; visual CI receipt pending | macOS view/model/snapshot/project files are restored to the `57df760` boundary; Linux token tests cover 24px gutters, 32px controls, 8px peer gaps, equal-width data cells, and 104px+16px forms |
-| Runtime parity | Local contract verification complete; clean-platform re-verification pending | GitHub Actions remains authoritative for Xcode/XCTest, Qt/QML, Arch packaging, smoke, and final renderer captures; local commands are capped at `-j 2` and do not use Docker |
+| Native presentation boundary | Verified with visual CI receipts | macOS's four required files are byte-identical to the `57df760` captures; Linux's seven inspected files show the 24px gutters, 32px controls, 8px peer/action gaps, equal-width data cells, 104px+16px forms, and Linux-only Advanced hierarchy |
+| Runtime parity | Verified locally and on clean-platform CI | Local checks used `-j 2` without Docker; GitHub Actions passed Xcode/XCTest, Qt/QML, clean Arch packaging/install/smoke, both renderer captures, and general Ubuntu/macOS checks at `7c321ff` |
 
 Verification receipt (2026-07-14): the shared core passes 46 contract, fixture,
-reducer, and HTTP tests; the macOS bridge passes eleven ABI tests plus its native
+reducer, and HTTP tests; the macOS bridge passes twelve ABI tests plus its native
 C smoke executable; the Linux crate passed 85 tests both locally and in a fresh
 Arch container before the alignment contract was added. The current workspace
 baseline passes 845 unit tests and 38 E2E tests (one ignored by design).
@@ -353,12 +353,16 @@ component bindings. Full Xcode/XCTest and Qt renderer verification remain
 CI-authoritative because this host has Command Line Tools but no Qt installation
 or full Xcode.
 
-The clean Arch gate is configured to produce seven real captures: Usage and
-Usage Advanced, Statistics and Statistics Advanced, Settings and Settings
-Advanced, plus a receipt-detail crop. The macOS gate requires its original
-Usage, Statistics, and Menu full-surface proofs plus a receipt-detail crop, and
-may include supporting Statistics crops. Each artifact carries `SHA256SUMS`;
-final run-specific hashes and inspected PNGs belong in `visual-receipts/`.
+Final T6 CI receipt (2026-07-15): [Islands parity run
+29397360302](https://github.com/2lab-ai/llmux/actions/runs/29397360302)
+passed semantic core, macOS shared-core shell, and clean Arch KDE shell at
+`7c321ff908ce6ed4d544d2c76a2f30130cb3ea9a`. [General CI run
+29397360254](https://github.com/2lab-ai/llmux/actions/runs/29397360254)
+also passed on Ubuntu and macOS. Both artifact manifests were verified. The
+four macOS required PNGs exactly match the historical pre-renewal SHA-256
+values, and the seven KDE PNGs were inspected at original resolution for
+complete chrome, geometry, disclosure hierarchy, receipts, and masking. The
+final dimensions and hashes are recorded in `visual-receipts/README.md`.
 
 ## Required file map
 
