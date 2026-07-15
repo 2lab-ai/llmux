@@ -1388,7 +1388,14 @@ impl App {
             // only bodies/headers. Local mode targets this process's own
             // listen port; attach mode the daemon it is attached to.
             let base_url = match &self.backend {
-                Backend::Local(state) => format!("http://localhost:{}", state.config.proxy.port),
+                Backend::Local(state) => {
+                    // The ACTUAL listener port, not `config.proxy.port` — a
+                    // `port = 0` config binds an OS-assigned port stored here,
+                    // so the curl target must read `bound_port` or it would
+                    // say `localhost:0`.
+                    let port = state.bound_port.load(std::sync::atomic::Ordering::Relaxed);
+                    format!("http://localhost:{port}")
+                }
                 Backend::Remote(remote) => remote.base_url.clone(),
             };
             self.pending_raw = Some(RawFetchReq {
