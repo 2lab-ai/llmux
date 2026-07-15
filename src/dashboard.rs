@@ -327,8 +327,19 @@ pub async fn fold(
 /// the old non-TTY event drain).
 fn trace_event(event: &ActivityEvent) {
     match event {
-        ActivityEvent::RequestStarted { id, method, path } => {
-            tracing::debug!(id, %method, %path, "request started");
+        ActivityEvent::RequestStarted {
+            id,
+            method,
+            path,
+            kind,
+        } => {
+            tracing::debug!(
+                id,
+                %method,
+                %path,
+                kind = kind.as_deref().unwrap_or("-"),
+                "request started"
+            );
         }
         ActivityEvent::RequestRouted {
             id,
@@ -518,6 +529,14 @@ pub struct DashboardDoc {
     /// here). Additive: absent in docs from an older daemon → false.
     #[serde(default)]
     pub email_anonymous: bool,
+    /// Config `tui_effects`: whether the TUI plays the cosmetic effort-token
+    /// rainbow marquee and headline-model name gradient. Carried here so BOTH
+    /// TUI backends honor the config setting (local builds the doc in-process;
+    /// attach receives it here), same convention as `email_anonymous` /
+    /// `show_fable_weekly`. Additive: absent in docs from an older daemon →
+    /// the client defaults effects ON.
+    #[serde(default = "default_true")]
+    pub tui_effects: bool,
     /// Whether the TUI should render the model-scoped "Fable" weekly gauge in
     /// the accounts table (fable-usage U9a — config `show_fable_weekly`,
     /// default ON). The scoped data itself is ALWAYS emitted (`fable_weekly` /
@@ -1052,6 +1071,11 @@ pub struct InFlightDoc {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// Message-kind classification, known at start time (TUI UI-6 item 1) so
+    /// the attached in-flight row shows the same `kind` column as a completed
+    /// row. Additive: absent in docs written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 // Request dwarfs Note by design (see `tui::activity::CompletedBody`): almost
@@ -1147,6 +1171,9 @@ pub struct DocMeta {
     /// Live `email_anonymous` display setting (see
     /// [`DashboardDoc::email_anonymous`]).
     pub email_anonymous: bool,
+    /// Config `tui_effects`: whether the TUI plays cosmetic animations. See
+    /// [`DashboardDoc::tui_effects`].
+    pub tui_effects: bool,
     /// Config `show_fable_weekly` (fable-usage U9a): whether the TUI renders
     /// the Fable weekly gauge. See [`DashboardDoc::show_fable_weekly`].
     pub show_fable_weekly: bool,
@@ -1509,6 +1536,7 @@ pub(crate) fn dashboard_doc(
                 model: r.model.clone(),
                 effort: r.effort.clone(),
                 fast: r.fast,
+                kind: r.kind.clone(),
             })
             .collect(),
         completed: hub
@@ -1676,6 +1704,7 @@ pub(crate) fn dashboard_doc(
         daily_usage: hub.daily_usage.clone(),
         usage_stats,
         email_anonymous: meta.email_anonymous,
+        tui_effects: meta.tui_effects,
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
         quota_display: meta.quota_display,
@@ -1729,6 +1758,9 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         email_anonymous: state
             .email_anonymous
             .load(std::sync::atomic::Ordering::Relaxed),
+        // Config-file display gate, same convention as show_fable_weekly: no
+        // runtime toggle / endpoint, so read the loaded config snapshot.
+        tui_effects: state.config.tui_effects,
         // Config-file gate (fable-usage U9a). No runtime toggle / endpoint by
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
@@ -1789,6 +1821,7 @@ mod tests {
             },
             pricing_overrides: HashMap::new(),
             email_anonymous: false,
+            tui_effects: true,
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::Used,
@@ -1840,6 +1873,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                kind: None,
             },
             now() - Duration::from_secs(60),
         );
@@ -1872,6 +1906,7 @@ mod tests {
                 id: 2,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                kind: None,
             },
             now() - Duration::from_secs(3),
         );

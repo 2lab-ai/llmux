@@ -53,6 +53,13 @@ pub enum ActivityEvent {
         id: u64,
         method: String,
         path: String,
+        /// Message-kind classification (TUI UI-6 item 1), so the in-flight row
+        /// can render the same `kind` column as its eventual completed row and
+        /// the columns line up. Emitted after the body is buffered + classified
+        /// (mirrors `RequestFinished.kind`); `None` only when the body never
+        /// parsed. See the finish doc above: a start dropped before classify
+        /// still renders complete off the `RequestFinished`.
+        kind: Option<String>,
     },
     /// The scheduler leased an account for request `id`. Carries the served
     /// `(group, model, effort, fast)` identity decided at lease time so the

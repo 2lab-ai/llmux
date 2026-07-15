@@ -582,11 +582,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| parts.uri.path().to_string());
-    state.emit(ActivityEvent::RequestStarted {
-        id: activity_id,
-        method: parts.method.to_string(),
-        path: path_query.clone(),
-    });
+    // NOTE: RequestStarted is emitted AFTER the body is buffered + classified
+    // (below), not here, so the in-flight row carries its `kind` column and
+    // lines up with completed rows (TUI UI-6 item 1). Safe: a body-read failure
+    // early-returns with only a RequestFinished (which renders complete on its
+    // own), so no start is ever left dangling.
     let body = match axum::body::to_bytes(body, state.config.proxy.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
@@ -646,6 +646,14 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     } else {
         None
     };
+    // Now that the body is classified, announce the in-flight row WITH its kind
+    // so its `kind` column aligns with the completed rows (TUI UI-6 item 1).
+    state.emit(ActivityEvent::RequestStarted {
+        id: activity_id,
+        method: parts.method.to_string(),
+        path: path_query.clone(),
+        kind: Some(classified.kind.to_string()),
+    });
     let mut ctx = ForwardContext {
         method: parts.method,
         path_query,
