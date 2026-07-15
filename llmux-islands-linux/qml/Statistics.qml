@@ -1141,7 +1141,10 @@ Kirigami.ScrollablePage {
                         Flow {
                             visible: receiptCard.receipt.kind !== "note"
                             Layout.fillWidth: true
-                            Layout.preferredHeight: visible ? childrenRect.height : 0
+                            // Invisible layout children are excluded by ColumnLayout.
+                            // Referencing `visible` from preferredHeight creates a
+                            // QQuickLayoutAttached binding loop during offscreen capture.
+                            Layout.preferredHeight: childrenRect.height
                             spacing: Kirigami.Units.smallSpacing
 
                             Label {

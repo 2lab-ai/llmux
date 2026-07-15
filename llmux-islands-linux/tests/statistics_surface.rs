@@ -212,6 +212,17 @@ fn common_statistics_path_has_summary_and_accounts_with_local_advanced_details()
 }
 
 #[test]
+fn receipt_metadata_flow_does_not_bind_layout_height_to_visibility() {
+    let qml = read("qml/Statistics.qml");
+
+    assert!(qml.contains("Layout.preferredHeight: childrenRect.height"));
+    assert!(
+        !qml.contains("Layout.preferredHeight: visible ? childrenRect.height : 0"),
+        "visibility-dependent preferredHeight creates a QQuickLayoutAttached binding loop"
+    );
+}
+
+#[test]
 fn test_contract_tracks_the_checked_in_schema_names() {
     let schema = read("../llmux-islands-core/contract/ui-contract.schema.json");
     for field in [
