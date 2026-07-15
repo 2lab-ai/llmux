@@ -295,6 +295,7 @@ impl DashboardView {
             .iter()
             .map(|entry| match entry {
                 CompletedDoc::Request {
+                    id,
                     at_ms,
                     method,
                     path,
@@ -316,6 +317,7 @@ impl DashboardView {
                 } => Completed {
                     at: ms_time(*at_ms),
                     body: CompletedBody::Request {
+                        id: *id,
                         method: method.clone(),
                         path: path.clone(),
                         account: account.clone(),

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
@@ -949,6 +949,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/llmux/status", get(status))
         .route("/llmux/dashboard", get(dashboard_endpoint))
+        .route("/llmux/raw-io", get(raw_io_endpoint))
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
         .route("/llmux/grok", post(grok_config_endpoint))
@@ -1242,6 +1243,53 @@ async fn dashboard_endpoint(State(state): State<AppState>) -> Response {
         Err(err) => relay_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("dashboard serialize failed: {err}"),
+        ),
+    }
+}
+
+/// Query for [`raw_io_endpoint`]: the activity id plus the entry's completion
+/// timestamp (epoch ms) — the pair [`crate::proxy::raw_io::find_record`] needs
+/// to identify ONE record across daemon restarts (ids are per-process).
+#[derive(serde::Deserialize)]
+struct RawIoQuery {
+    id: u64,
+    at_ms: u64,
+}
+
+/// `GET /llmux/raw-io?id=&at_ms=` — the raw request/response record for one
+/// activity entry (TUI UI-7 raw viewer; the attach client has no local file).
+/// Sits behind the same proxy-api-key gate as every route. 404 when capture is
+/// disabled, the record was pruned, or the id+timestamp pair matches nothing.
+/// The backwards scan runs on a blocking thread — the log can be tens of GB.
+async fn raw_io_endpoint(State(state): State<AppState>, Query(q): Query<RawIoQuery>) -> Response {
+    let path = state
+        .config
+        .raw_io
+        .enabled
+        .then(|| state.raw_io_path.clone())
+        .flatten();
+    let record = tokio::task::spawn_blocking(move || {
+        crate::proxy::raw_io::find_record(path.as_deref(), q.id, q.at_ms)
+    })
+    .await
+    .ok()
+    .flatten();
+    match record {
+        Some(record) => match serde_json::to_string(&record) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(err) => relay_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("raw-io serialize failed: {err}"),
+            ),
+        },
+        None => relay_error(
+            StatusCode::NOT_FOUND,
+            "no raw-io record for this request (capture disabled, pruned, or unknown id)",
         ),
     }
 }

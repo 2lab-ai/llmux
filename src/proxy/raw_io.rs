@@ -129,7 +129,21 @@ pub struct RawIoRecord {
     pub request_body: String,
     /// Response body delivered to the client (bounded + truncation-marked).
     pub response_body: String,
+    /// Inbound client request headers, in wire order, SENSITIVE VALUES
+    /// REDACTED at capture time (see `forward::redacted_header_pairs`).
+    /// Additive: `None` on records written before headers were captured —
+    /// the raw viewer renders that as "not captured", distinct from `Some([])`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Vec<(String, String)>>,
+    /// Response headers delivered to the client (upstream's, post-sanitize),
+    /// same redaction + additive semantics as `request_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Vec<(String, String)>>,
 }
+
+/// Captured header pairs (wire order, values already redacted by the caller);
+/// `None` = headers not captured (pre-headers record or caller had none).
+pub type HeaderPairs = Option<Vec<(String, String)>>;
 
 impl RawIoRecord {
     /// Build a record from raw bytes, clipping each body to `max_body_bytes`
@@ -149,6 +163,8 @@ impl RawIoRecord {
         request_body: &[u8],
         response_body: &[u8],
         max_body_bytes: usize,
+        request_headers: HeaderPairs,
+        response_headers: HeaderPairs,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -160,6 +176,8 @@ impl RawIoRecord {
             status,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body(response_body, max_body_bytes),
+            request_headers,
+            response_headers,
         }
     }
 }
@@ -252,6 +270,8 @@ pub fn capture(
     request_body: &[u8],
     response_body: &[u8],
     max_body_bytes: usize,
+    request_headers: HeaderPairs,
+    response_headers: HeaderPairs,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
@@ -266,6 +286,8 @@ pub fn capture(
         request_body,
         response_body,
         max_body_bytes,
+        request_headers,
+        response_headers,
     );
     append(path, &record);
 }
@@ -291,6 +313,8 @@ impl RawIoRecord {
         response_kept: &[u8],
         response_total: usize,
         max_body_bytes: usize,
+        request_headers: HeaderPairs,
+        response_headers: HeaderPairs,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -302,6 +326,8 @@ impl RawIoRecord {
             status,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body_streamed(response_kept, response_total),
+            request_headers,
+            response_headers,
         }
     }
 }
@@ -323,6 +349,8 @@ pub fn capture_streamed(
     response_kept: &[u8],
     response_total: usize,
     max_body_bytes: usize,
+    request_headers: HeaderPairs,
+    response_headers: HeaderPairs,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
@@ -338,8 +366,98 @@ pub fn capture_streamed(
         response_kept,
         response_total,
         max_body_bytes,
+        request_headers,
+        response_headers,
     );
     append(path, &record);
+}
+
+/// How far a record's capture timestamp may sit from the activity entry's
+/// completion timestamp and still be "the same request" ([`find_record`]).
+/// Capture and finish happen on the same host within milliseconds of each
+/// other; 5 minutes absorbs any fold/flush lag while keeping id collisions
+/// from OTHER daemon runs (the activity id is a per-process counter that
+/// resets on restart) out of the match.
+const FIND_TS_WINDOW_MS: u64 = 300_000;
+
+/// Find the raw-io record for activity `id` completed around `at_ms`, reading
+/// the log BACKWARDS from the end (clicks land on recent entries; the file can
+/// be tens of GB, so a forward scan would read all of it for every lookup).
+///
+/// Records are appended in capture-time order, so the scan early-exits once it
+/// walks past `at_ms - FIND_TS_WINDOW_MS` — nothing earlier can qualify. The
+/// id alone is NOT unique across daemon restarts (per-process counter); the
+/// timestamp window disambiguates. Corrupt/foreign lines are skipped. Strictly
+/// best-effort and read-only: any IO error yields `None`, never a panic.
+pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Option<RawIoRecord> {
+    let path = path?;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // Cheap pre-filter fragment: a matching line MUST contain `"id":<id>,`
+    // (field-named JSON, serde writes no spaces). Avoids parsing every line.
+    let needle = format!("\"id\":{id},");
+    let floor = at_ms.saturating_sub(FIND_TS_WINDOW_MS);
+    let ceil = at_ms.saturating_add(FIND_TS_WINDOW_MS);
+
+    const CHUNK: u64 = 256 * 1024;
+    let mut reader = file;
+    let mut pos = len;
+    // Bytes of the (possibly partial) line carried over from the newer chunk.
+    let mut carry: Vec<u8> = Vec::new();
+    while pos > 0 {
+        let take = CHUNK.min(pos);
+        pos -= take;
+        let mut buf = vec![0u8; usize::try_from(take).ok()?];
+        reader.seek(std::io::SeekFrom::Start(pos)).ok()?;
+        std::io::Read::read_exact(&mut reader, &mut buf).ok()?;
+        buf.extend_from_slice(&carry);
+        // Everything before the FIRST newline may be a partial line whose head
+        // lives in the next-older chunk — carry it over (unless at file start).
+        let first_nl = buf.iter().position(|&b| b == b'\n');
+        let (head, complete) = match first_nl {
+            Some(i) if pos > 0 => buf.split_at(i + 1),
+            _ => (&[][..], &buf[..]),
+        };
+        for line in complete.split(|&b| b == b'\n').rev() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if !text.contains(&needle) {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<RawIoRecord>(text.trim()) else {
+                continue;
+            };
+            if record.id != id || record.v != RECORD_VERSION {
+                continue;
+            }
+            if record.ts_ms >= floor && record.ts_ms <= ceil {
+                return Some(record);
+            }
+            if record.ts_ms < floor {
+                // Append order: everything further back is older still.
+                return None;
+            }
+        }
+        // Time-based early exit even when no id matched in this chunk: parse
+        // the OLDEST complete line here (one parse per 256 KiB); if it is
+        // already before the window, everything further back is older still.
+        if let Some(oldest) = complete
+            .split(|&b| b == b'\n')
+            .find(|l| !l.is_empty())
+            .and_then(|l| std::str::from_utf8(l).ok())
+            .and_then(|t| serde_json::from_str::<RawIoRecord>(t.trim()).ok())
+        {
+            if oldest.ts_ms < floor {
+                return None;
+            }
+        }
+        carry = head.to_vec();
+    }
+    None
 }
 
 /// Prune the raw-io log to a retention window, best-effort.
@@ -536,6 +654,8 @@ mod tests {
             br#"{"model":"m","messages":[]}"#,
             br#"{"id":"msg_1"}"#,
             RESPONSE_CAP_BYTES,
+            Some(vec![("content-type".into(), "application/json".into())]),
+            Some(vec![("request-id".into(), "req_1".into())]),
         )
     }
 
@@ -578,6 +698,8 @@ mod tests {
             big.as_bytes(),
             b"resp",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
         );
         assert!(
             record.request_body.contains("…[truncated 500 bytes]"),
@@ -605,6 +727,8 @@ mod tests {
             exact.as_bytes(),
             b"",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
         );
         assert_eq!(record.request_body.len(), RESPONSE_CAP_BYTES);
         assert!(!record.request_body.contains("truncated"));
@@ -625,6 +749,8 @@ mod tests {
             body.as_bytes(),
             b"",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
         );
         // The stored prefix (before the marker) must be valid UTF-8 by
         // construction (String), and must not include a partial '€'.
@@ -654,6 +780,8 @@ mod tests {
             body.as_bytes(),
             body.as_bytes(),
             32,
+            None,
+            None,
         );
         assert!(
             record.request_body.contains("…[truncated 68 bytes]"),
@@ -666,7 +794,7 @@ mod tests {
             record.response_body
         );
         // And a body under the override is kept whole.
-        let small = RawIoRecord::new(1, 0, None, None, None, None, b"hi", b"hi", 32);
+        let small = RawIoRecord::new(1, 0, None, None, None, None, b"hi", b"hi", 32, None, None);
         assert_eq!(small.request_body, "hi");
         assert_eq!(small.response_body, "hi");
     }
@@ -686,6 +814,8 @@ mod tests {
             kept,
             kept.len(),
             RESPONSE_CAP_BYTES,
+            None,
+            None,
         );
         assert_eq!(record.response_body, String::from_utf8_lossy(kept));
         assert!(!record.response_body.contains("truncated"));
@@ -709,6 +839,8 @@ mod tests {
             kept,
             total,
             10, // cap (matches what the relay retained)
+            None,
+            None,
         );
         assert_eq!(
             record.response_body, "0123456789…[truncated 990 bytes]",
@@ -799,6 +931,58 @@ mod tests {
     #[test]
     fn prune_with_none_path_is_a_noop() {
         prune(None, 90, now_ms());
+    }
+
+    #[test]
+    fn find_record_matches_id_within_the_ts_window() {
+        let path = tmp_path("find");
+        // Two daemon runs reuse id 5: an old run at day 1 and a fresh run at
+        // day 2. Another id sits between them.
+        let day = MS_PER_DAY;
+        append(Some(&path), &rec(5, day));
+        append(Some(&path), &rec(9, day + 500_000));
+        append(Some(&path), &rec(5, 2 * day));
+
+        // Looked up near its own completion time, each run's record wins.
+        let new = find_record(Some(&path), 5, 2 * day + 1_000).expect("newest id-5");
+        assert_eq!(new.ts_ms, 2 * day);
+        let old = find_record(Some(&path), 5, day + 1_000).expect("oldest id-5");
+        assert_eq!(old.ts_ms, day);
+        // Headers written at capture time come back intact.
+        assert_eq!(
+            new.request_headers.as_deref(),
+            Some(&[("content-type".to_string(), "application/json".to_string())][..])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_record_misses_unknown_id_or_out_of_window() {
+        let path = tmp_path("find-miss");
+        append(Some(&path), &rec(5, MS_PER_DAY));
+        // Unknown id.
+        assert!(find_record(Some(&path), 6, MS_PER_DAY).is_none());
+        // Same id, completion time far outside the ±5 min window.
+        assert!(find_record(Some(&path), 5, 3 * MS_PER_DAY).is_none());
+        // Disabled capture (no path) is a silent miss.
+        assert!(find_record(None, 5, MS_PER_DAY).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_header_records_still_parse_with_headers_absent() {
+        // A line written before the header fields existed must deserialize
+        // with `None` headers (additive schema), and find_record must return it.
+        let path = tmp_path("pre-header");
+        let line = format!(
+            "{{\"v\":1,\"ts_ms\":{},\"id\":3,\"request_body\":\"{{}}\",\"response_body\":\"ok\"}}",
+            MS_PER_DAY
+        );
+        std::fs::write(&path, format!("{line}\n")).expect("write");
+        let record = find_record(Some(&path), 3, MS_PER_DAY).expect("old line found");
+        assert_eq!(record.request_headers, None);
+        assert_eq!(record.response_headers, None);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The common restart (nothing out of window) must be read-only: no temp

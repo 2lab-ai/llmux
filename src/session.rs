@@ -295,6 +295,11 @@ mod tests {
             status: Some(200),
             request_body,
             response_body,
+            request_headers: Some(vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-api-key".into(), "•••redacted".into()),
+            ]),
+            response_headers: Some(vec![("request-id".into(), format!("req_{id}"))]),
         }
     }
 

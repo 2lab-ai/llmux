@@ -30,7 +30,7 @@ use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, InputModal, Mode, Overlay};
+use super::{anim, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState, RawTab};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -234,6 +234,16 @@ pub(crate) fn draw(
         }
     }
 
+    // The raw request/response viewer (UI-7) draws over everything but the
+    // footer — same layering contract as the input modal (the two are never
+    // open at once: each swallows the clicks that could open the other).
+    if let Some(modal) = &chrome.raw_modal {
+        let max_scroll = draw_raw_modal(frame, modal);
+        if let Some(hits) = hits.as_mut() {
+            hits.raw_modal_max_scroll = Some(max_scroll);
+        }
+    }
+
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
     let footer_area = Rect {
@@ -401,6 +411,7 @@ fn draw_main(
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
+        raw_modal_max_scroll: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -1771,6 +1782,410 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
         .scroll((scroll, 0));
     frame.render_widget(para, area);
     Some(max_scroll)
+}
+
+// ---------------------------------------------------------------------------
+// Raw request/response viewer (UI-7): a CDT-style modal over MAIN with
+// Request/Response tabs — general metadata, headers, and the FULL captured
+// body, JSON pretty-printed with syntax highlighting.
+// ---------------------------------------------------------------------------
+
+/// Prebuilt, immutable content of the raw viewer — one `Vec<Line>` per tab,
+/// built ONCE off the UI thread when the raw-io record arrives (a body can be
+/// 8 MiB; per-frame construction would stutter the render loop). The modal
+/// holds it behind an `Arc` so the per-frame `Chrome` clone stays cheap.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawContent {
+    /// Request tab: general section + request headers + request body.
+    pub request: Vec<Line<'static>>,
+    /// Response tab: status + response headers + response body.
+    pub response: Vec<Line<'static>>,
+}
+
+/// Hard wrap applied to raw body lines at build time (cells are clipped by the
+/// Paragraph anyway; the wrap bounds the cost of cloning the VISIBLE slice per
+/// frame — a truncated non-JSON stream body can be one single 8 MiB line).
+const RAW_LINE_WRAP: usize = 2048;
+
+/// Section header line (`── request headers ──` style) for the raw viewer.
+fn raw_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("── {title} ──"),
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One `name: value` header line (name cyan, value plain — CDT's palette).
+fn raw_header_line(name: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{name}: "), Style::new().fg(Color::Cyan)),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// Header block for one side of the exchange: each captured pair, or a single
+/// dim placeholder when the record predates header capture.
+fn raw_header_lines(headers: Option<&[(String, String)]>) -> Vec<Line<'static>> {
+    match headers {
+        Some(pairs) if !pairs.is_empty() => {
+            pairs.iter().map(|(n, v)| raw_header_line(n, v)).collect()
+        }
+        Some(_) => vec![Line::from(Span::styled("(no headers)", dim()))],
+        None => vec![Line::from(Span::styled(
+            "(not captured — record predates header capture)",
+            dim(),
+        ))],
+    }
+}
+
+/// Highlight one line of (pretty-printed) JSON into styled spans: keys cyan,
+/// string values green, numbers yellow, `true`/`false`/`null` magenta,
+/// punctuation dim. Pretty-printed JSON never splits a string across lines
+/// (escapes keep them single-line), so a per-line pass is lossless. Scanning
+/// is byte-based but only ever splits at ASCII bytes — always char-safe.
+fn highlight_json_line(line: &str) -> Line<'static> {
+    let bytes = line.as_bytes();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let end = i.min(bytes.len());
+                let is_key = line[end..].trim_start().starts_with(':');
+                let color = if is_key { Color::Cyan } else { Color::Green };
+                spans.push(Span::styled(
+                    line[start..end].to_string(),
+                    Style::new().fg(color),
+                ));
+            }
+            b'0'..=b'9' | b'-' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                spans.push(Span::styled(
+                    line[start..i].to_string(),
+                    Style::new().fg(Color::Yellow),
+                ));
+            }
+            b't' | b'f' | b'n' => {
+                let rest = &line[i..];
+                match ["true", "false", "null"]
+                    .iter()
+                    .find(|k| rest.starts_with(*k))
+                {
+                    Some(k) => {
+                        spans.push(Span::styled(
+                            (*k).to_string(),
+                            Style::new().fg(Color::Magenta),
+                        ));
+                        i += k.len();
+                    }
+                    None => {
+                        spans.push(Span::raw(rest[..1].to_string()));
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                // Whitespace, punctuation, and any non-ASCII bytes: batch until
+                // the next token start. ASCII stops are always char boundaries.
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && !matches!(bytes[i], b'"' | b'0'..=b'9' | b'-' | b't' | b'f' | b'n')
+                {
+                    i += 1;
+                }
+                spans.push(Span::styled(line[start..i].to_string(), dim()));
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// Hard-wrap a single logical line into `RAW_LINE_WRAP`-char chunks on char
+/// boundaries (continuation chunks lose highlighting context by design — they
+/// only occur on machine-generated monster lines).
+fn wrap_raw_line(line: &str) -> Vec<&str> {
+    if line.len() <= RAW_LINE_WRAP {
+        return vec![line];
+    }
+    let mut chunks = Vec::new();
+    let mut rest = line;
+    while rest.len() > RAW_LINE_WRAP {
+        let mut end = RAW_LINE_WRAP;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            break; // pathological; emit whole remainder below
+        }
+        chunks.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    chunks.push(rest);
+    chunks
+}
+
+/// Render a captured body as styled lines. A body that parses as ONE JSON
+/// document is pretty-printed and highlighted (the CDT "preview" view). An
+/// SSE / plain-text body keeps its own lines; `data: {json}` SSE lines get
+/// their payload highlighted inline. Anything else renders plain.
+pub(crate) fn raw_body_lines(body: &str) -> Vec<Line<'static>> {
+    if body.is_empty() {
+        return vec![Line::from(Span::styled("(empty body)", dim()))];
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+            return pretty
+                .lines()
+                .flat_map(|l| {
+                    wrap_raw_line(l)
+                        .into_iter()
+                        .map(highlight_json_line)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
+    }
+    body.lines()
+        .flat_map(|line| {
+            wrap_raw_line(line)
+                .into_iter()
+                .map(|chunk| {
+                    if let Some(rest) = chunk.strip_prefix("data: ") {
+                        if serde_json::from_str::<serde_json::Value>(rest).is_ok() {
+                            let mut spans = vec![Span::styled("data: ".to_string(), dim())];
+                            spans.extend(highlight_json_line(rest).spans);
+                            return Line::from(spans);
+                        }
+                    }
+                    Line::from(Span::raw(chunk.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// General-metadata lines for the raw viewer's Request tab, built at OPEN time
+/// from the activity entry (the raw-io record repeats only a subset). Mirrors
+/// CDT's "General" block. `id == 0` marks a pre-UI-7 entry with no raw link.
+pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
+    let CompletedBody::Request {
+        id,
+        method,
+        path,
+        account,
+        status,
+        duration,
+        group,
+        model,
+        effort,
+        fast,
+        user_id,
+        kind,
+        ..
+    } = &entry.body
+    else {
+        return Vec::new();
+    };
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label:<12}"), Style::new().fg(Color::Cyan)),
+            Span::raw(value),
+        ])
+    };
+    let status_color = if *status < 400 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    let model_label = match (group.as_deref(), model.as_deref()) {
+        (Some(g), Some(m)) => format!("{g} {m}"),
+        (Some(g), None) => g.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "—".to_string(),
+    };
+    let effort_label = effort
+        .as_deref()
+        .map(|e| format!(" · effort {e}"))
+        .unwrap_or_default();
+    let fast_label = if *fast { " · fast" } else { "" };
+    let mut lines = vec![
+        raw_section("general"),
+        field("request", format!("{method} {path}")),
+        Line::from(vec![
+            Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+            Span::styled(status.to_string(), Style::new().fg(status_color)),
+            Span::styled(
+                format!("  ·  {} elapsed", format::elapsed_secs(*duration)),
+                dim(),
+            ),
+        ]),
+        field("time", format!("{} UTC", format::clock_hms_utc(entry.at))),
+        field("id", format!("#{id}")),
+        field("model", format!("{model_label}{effort_label}{fast_label}")),
+        field("account", account.as_deref().unwrap_or("?").to_string()),
+    ];
+    if let Some(kind) = kind.as_deref() {
+        lines.push(field("kind", kind.to_string()));
+    }
+    if let Some(uid) = user_id.as_deref() {
+        lines.push(field("client", uid.to_string()));
+    }
+    lines
+}
+
+/// Build the full per-tab content from a fetched raw-io record + the general
+/// lines the opener captured from the entry. Runs OFF the UI thread.
+pub(crate) fn raw_content_from_record(
+    general: Vec<Line<'static>>,
+    record: &crate::proxy::raw_io::RawIoRecord,
+) -> RawContent {
+    let mut request = general;
+    request.push(Line::default());
+    request.push(raw_section("request headers"));
+    request.extend(raw_header_lines(record.request_headers.as_deref()));
+    request.push(Line::default());
+    request.push(raw_section(&format!(
+        "request body · {} bytes",
+        record.request_body.len()
+    )));
+    request.extend(raw_body_lines(&record.request_body));
+
+    let mut response = vec![raw_section("response")];
+    response.push(Line::from(vec![
+        Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+        Span::raw(
+            record
+                .status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".into()),
+        ),
+    ]));
+    response.push(Line::default());
+    response.push(raw_section("response headers"));
+    response.extend(raw_header_lines(record.response_headers.as_deref()));
+    response.push(Line::default());
+    response.push(raw_section(&format!(
+        "response body · {} bytes",
+        record.response_body.len()
+    )));
+    response.extend(raw_body_lines(&record.response_body));
+
+    RawContent { request, response }
+}
+
+/// Draw the raw request/response viewer (UI-7): a near-full-screen modal with
+/// a Request/Response tab bar, the prebuilt content scrolled by whole lines.
+/// Returns the max scroll for the ACTIVE tab so the runtime can clamp.
+fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> u16 {
+    let area = centered_rect(frame.area(), 94, 92);
+    frame.render_widget(Clear, area);
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(dim())
+        .title(Span::styled(
+            modal.title.clone(),
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::from(Span::styled(
+                " ←→/tab switch · ↑↓ scroll · pgup/pgdn · esc close ",
+                dim(),
+            ))
+            .centered(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 || inner.width == 0 {
+        return 0;
+    }
+
+    // Tab bar (row 0) + a blank spacer, then the content viewport.
+    let tab = |label: &str, active: bool| {
+        if active {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {label} "), dim())
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::raw(" "),
+        tab("Request", modal.tab == RawTab::Request),
+        Span::raw(" "),
+        tab("Response", modal.tab == RawTab::Response),
+    ]);
+    frame.render_widget(Paragraph::new(tabs), Rect { height: 1, ..inner });
+
+    let viewport = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    let lines: &[Line<'static>] = match &modal.state {
+        RawModalState::Loading => {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {} loading raw record…", anim::braille_spin(modal.spin)),
+                    Style::new().fg(Color::Yellow),
+                ))),
+                viewport,
+            );
+            return 0;
+        }
+        RawModalState::Failed(msg) => {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {msg}"),
+                    Style::new().fg(Color::Red),
+                )))
+                .wrap(Wrap { trim: false }),
+                viewport,
+            );
+            return 0;
+        }
+        RawModalState::Ready(content) => match modal.tab {
+            RawTab::Request => &content.request,
+            RawTab::Response => &content.response,
+        },
+    };
+    let max_scroll = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(viewport.height);
+    let scroll = usize::from(modal.scroll.min(max_scroll));
+    let visible: Vec<Line<'static>> = lines
+        .iter()
+        .skip(scroll)
+        .take(usize::from(viewport.height))
+        .cloned()
+        .collect();
+    frame.render_widget(Paragraph::new(visible), viewport);
+    max_scroll
 }
 
 /// Attach-mode pre-first-document screen: identity + a "connecting…" /
@@ -3176,6 +3591,10 @@ pub(crate) struct MainChrome {
     /// visible inner height) so the runtime can clamp its stored offset; `None`
     /// means no modal was open OR its entry aged out of the ring (→ close it).
     pub input_modal_max_scroll: Option<u16>,
+    /// Same clamp feedback for the raw request/response viewer (UI-7). Unlike
+    /// the input modal, `None` only means "no raw modal drawn this frame" —
+    /// the raw modal owns its content and never closes on entry aging.
+    pub raw_modal_max_scroll: Option<u16>,
 }
 
 /// What kind of row a hit rect belongs to, deciding what a click does
@@ -3192,6 +3611,10 @@ pub(crate) enum ActivityHitKind {
     /// one-row hit, layered ABOVE the entry's block hit, so clicking exactly
     /// this line opens the full-text modal instead of collapsing the entry.
     InputLine,
+    /// The `🔍 request` detail line of an expanded entry (UI-7): clicking it
+    /// opens the raw request/response viewer (CDT-style tabs) instead of
+    /// collapsing the entry. Same layering as `InputLine`.
+    RawLine,
 }
 
 /// The resolved meaning of one activity click (UI-5), returned by
@@ -3208,6 +3631,9 @@ pub(crate) enum ActivityClick {
     /// Click on an entry's `🔍 input` detail line (UI-6 item 3): open the
     /// full-text modal for that entry.
     OpenInput(ActivityKey),
+    /// Click on an entry's `🔍 request` detail line (UI-7): open the raw
+    /// request/response viewer for that entry.
+    OpenRaw(ActivityKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3251,6 +3677,7 @@ pub(crate) fn hit_test_activity(
         .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
     Some(match hit.kind {
         ActivityHitKind::InputLine => ActivityClick::OpenInput(hit.key.clone()),
+        ActivityHitKind::RawLine => ActivityClick::OpenRaw(hit.key.clone()),
         ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
         ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
             ActivityClick::RunToggle(hit.key.clone())
@@ -3482,6 +3909,7 @@ fn draw_activity(
                 }
                 // Only request rows are clickable (notes have no key).
                 if let Some(key) = entry.activity_key() {
+                    push_raw_line_hit(&mut hits, &key, entry, row_y, height);
                     push_input_line_hit(&mut hits, &key, entry, row_y, height);
                     hits.push(ActivityHit {
                         key,
@@ -3553,6 +3981,7 @@ fn draw_activity(
                             }
                         }
                         if let Some(key) = entry.activity_key() {
+                            push_raw_line_hit(&mut hits, &key, entry, member_y, member_height);
                             push_input_line_hit(&mut hits, &key, entry, member_y, member_height);
                             hits.push(ActivityHit {
                                 key,
@@ -3682,6 +4111,7 @@ fn completed_line(
 ) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
+            id: _,
             method,
             path,
             account,
@@ -3831,6 +4261,7 @@ fn completed_detail_lines(
     session_labels: &std::collections::BTreeMap<String, String>,
 ) -> Vec<Line<'static>> {
     let CompletedBody::Request {
+        id: _,
         method,
         path,
         account,
@@ -3855,7 +4286,13 @@ fn completed_detail_lines(
         ])
     };
     let mut lines = Vec::new();
-    lines.push(indent("request", format!("{method} {path}")));
+    // The `🔍` marks this line as CLICKABLE — it opens the raw request/response
+    // viewer (UI-7): full bodies + headers + metadata, CDT-style tabs. Same
+    // emoji affordance as the `🔍 input` line below.
+    lines.push(Line::from(vec![
+        Span::styled("     🔍 request ", dim()),
+        Span::raw(format!("{method} {path}")),
+    ]));
     // The click-expanded input line (U3): the full stored excerpt on ONE line,
     // as wide as the terminal (the Paragraph clips, never wraps — so the line
     // is exactly "as long as fits").
@@ -3985,6 +4422,29 @@ fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
 /// `row_y` is the entry's main row; detail lines follow it, so the input line
 /// sits at `row_y + 1 + offset`, and `offset + 1 < height` (height counts the
 /// main row plus rendered detail lines) proves it is on screen.
+/// Register the one-row `RawLine` hit for `entry`'s `🔍 request` detail line
+/// (UI-7), when the entry is expanded AND that line survived the panel's line
+/// budget. The request line is ALWAYS the first detail line (offset 0), so it
+/// sits at `row_y + 1`; `height > 1` proves at least one detail line rendered.
+/// Pushed BEFORE the block-level `Entry` hit so first-match resolves the row
+/// to "open the raw viewer" — same layering as [`push_input_line_hit`].
+fn push_raw_line_hit(
+    hits: &mut Vec<ActivityHit>,
+    key: &ActivityKey,
+    entry: &Completed,
+    row_y: u16,
+    height: u16,
+) {
+    if matches!(entry.body, CompletedBody::Request { .. }) && height > 1 {
+        hits.push(ActivityHit {
+            key: key.clone(),
+            y_start: row_y.saturating_add(1),
+            height: 1,
+            kind: ActivityHitKind::RawLine,
+        });
+    }
+}
+
 fn push_input_line_hit(
     hits: &mut Vec<ActivityHit>,
     key: &ActivityKey,
@@ -5447,6 +5907,7 @@ mod tests {
             usage_gran: Default::default(),
             usage_scroll: 0,
             input_modal: None,
+            raw_modal: None,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -6403,6 +6864,93 @@ mod tests {
     }
 
     #[test]
+    fn raw_request_line_and_hit_open_the_raw_viewer(/* UI-7 */) {
+        let entry = completed_request(1_000, Some("claude"), Some("opus"), 10, 5, 200);
+        let key = entry.activity_key().expect("request key");
+        // The first detail line carries the clickable magnifier + method/path.
+        let lines = completed_detail_lines(&entry, false, &Default::default());
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            first.contains("🔍 request"),
+            "magnifier sits left of request: {first:?}"
+        );
+        assert!(first.contains("POST /v1/messages"));
+        // The hit registers on the request line's row (first detail line) and
+        // resolves to OpenRaw.
+        let mut hits = Vec::new();
+        push_raw_line_hit(&mut hits, &key, &entry, 5, 4);
+        assert_eq!(hits[0].kind, ActivityHitKind::RawLine);
+        assert_eq!((hits[0].y_start, hits[0].height), (6, 1));
+        let chrome = ActivityChrome {
+            area: Rect::new(0, 0, 80, 20),
+            hits,
+        };
+        assert_eq!(
+            hit_test_activity(&chrome, 10, 6),
+            Some(ActivityClick::OpenRaw(key.clone()))
+        );
+        // A collapsed entry (height 1: no detail lines rendered) registers none.
+        let mut none = Vec::new();
+        push_raw_line_hit(&mut none, &key, &entry, 5, 1);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn raw_body_lines_pretty_print_and_highlight_json(/* UI-7 */) {
+        let lines = raw_body_lines(r#"{"model":"opus","n":42,"ok":true,"nil":null}"#);
+        assert!(lines.len() > 4, "pretty print splits onto multiple lines");
+        let all: Vec<(String, Option<Color>)> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| (s.content.to_string(), s.style.fg)))
+            .collect();
+        let fg_of = |needle: &str| {
+            all.iter()
+                .find(|(c, _)| c.contains(needle))
+                .and_then(|(_, f)| *f)
+        };
+        assert_eq!(fg_of("\"model\""), Some(Color::Cyan), "keys cyan");
+        assert_eq!(fg_of("\"opus\""), Some(Color::Green), "string values green");
+        assert_eq!(fg_of("42"), Some(Color::Yellow), "numbers yellow");
+        assert_eq!(fg_of("true"), Some(Color::Magenta), "booleans magenta");
+        assert_eq!(fg_of("null"), Some(Color::Magenta), "null magenta");
+        let text: String = all.iter().map(|(c, _)| c.as_str()).collect::<String>();
+        assert!(
+            text.contains("\"model\": \"opus\""),
+            "content survives: {text}"
+        );
+    }
+
+    #[test]
+    fn raw_body_lines_highlight_sse_data_payloads_inline(/* UI-7 */) {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: ping\ndata: not-json";
+        let lines = raw_body_lines(body);
+        assert_eq!(lines.len(), 5, "SSE keeps its own lines");
+        assert!(
+            lines[1].spans.len() > 2,
+            "a json `data:` payload splits into styled spans"
+        );
+        assert_eq!(
+            lines[4].spans.len(),
+            1,
+            "a non-json `data:` line stays one raw span"
+        );
+    }
+
+    #[test]
+    fn wrap_raw_line_bounds_monster_lines_on_char_boundaries(/* UI-7 */) {
+        let big = "x".repeat(RAW_LINE_WRAP * 2 + 10);
+        let chunks = wrap_raw_line(&big);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= RAW_LINE_WRAP));
+        // Multi-byte chars are never split mid-scalar.
+        let uni = "€".repeat(RAW_LINE_WRAP);
+        for chunk in wrap_raw_line(&uni) {
+            assert!(chunk.len() <= RAW_LINE_WRAP);
+            assert!(chunk.chars().all(|c| c == '€'), "no torn scalars");
+        }
+    }
+
+    #[test]
     fn truncate_cells_zero_budget_yields_empty(/* UI-4 R3 nice 1/2 */) {
         assert_eq!(truncate_cells("some-model", 0), "");
         assert_eq!(truncate_cells("", 0), "");
@@ -6566,6 +7114,7 @@ mod tests {
         let row = |out: u64| Completed {
             at: UNIX_EPOCH + Duration::from_millis(1_000),
             body: CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("codex:me@example.com".into()),
@@ -6617,6 +7166,7 @@ mod tests {
         view.completed = vec![Completed {
             at: UNIX_EPOCH + Duration::from_millis(1_000),
             body: CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages?beta=true".into(),
                 account: Some("claude:someone@example.com".into()),
@@ -6738,6 +7288,7 @@ mod tests {
         Completed {
             at: UNIX_EPOCH + Duration::from_millis(at_ms),
             body: CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("a@x.com".into()),
@@ -7892,6 +8443,7 @@ mod tests {
             Completed {
                 at: UNIX_EPOCH + Duration::from_millis(2),
                 body: CompletedBody::Request {
+                    id: 1,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
                     account: Some(LEAK.into()),
