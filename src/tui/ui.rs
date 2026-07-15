@@ -3936,8 +3936,14 @@ pub(crate) enum ActivityHitKind {
     InputLine,
     /// The `🔍 request` detail line of an expanded entry (UI-7): clicking it
     /// opens the raw request/response viewer (CDT-style tabs) instead of
-    /// collapsing the entry. Same layering as `InputLine`.
-    RawLine,
+    /// collapsing the entry. Same layering as `InputLine`. Carries the
+    /// entry's activity `id` so the opener selects THIS row, not the first
+    /// entry sharing its (id-less) [`ActivityKey`] — two requests completing
+    /// in the same millisecond with the same method/path/status collide on
+    /// the key alone.
+    RawLine {
+        id: u64,
+    },
 }
 
 /// The resolved meaning of one activity click (UI-5), returned by
@@ -3955,8 +3961,9 @@ pub(crate) enum ActivityClick {
     /// full-text modal for that entry.
     OpenInput(ActivityKey),
     /// Click on an entry's `🔍 request` detail line (UI-7): open the raw
-    /// request/response viewer for that entry.
-    OpenRaw(ActivityKey),
+    /// request/response viewer for that entry. The `id` pins the exact row
+    /// (the key alone is ambiguous under a same-ms collision).
+    OpenRaw(ActivityKey, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4000,7 +4007,7 @@ pub(crate) fn hit_test_activity(
         .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
     Some(match hit.kind {
         ActivityHitKind::InputLine => ActivityClick::OpenInput(hit.key.clone()),
-        ActivityHitKind::RawLine => ActivityClick::OpenRaw(hit.key.clone()),
+        ActivityHitKind::RawLine { id } => ActivityClick::OpenRaw(hit.key.clone(), id),
         ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
         ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
             ActivityClick::RunToggle(hit.key.clone())
@@ -4767,13 +4774,15 @@ fn push_raw_line_hit(
     row_y: u16,
     height: u16,
 ) {
-    if matches!(entry.body, CompletedBody::Request { .. }) && height > 1 {
-        hits.push(ActivityHit {
-            key: key.clone(),
-            y_start: row_y.saturating_add(1),
-            height: 1,
-            kind: ActivityHitKind::RawLine,
-        });
+    if let CompletedBody::Request { id, .. } = &entry.body {
+        if height > 1 {
+            hits.push(ActivityHit {
+                key: key.clone(),
+                y_start: row_y.saturating_add(1),
+                height: 1,
+                kind: ActivityHitKind::RawLine { id: *id },
+            });
+        }
     }
 }
 
@@ -7509,7 +7518,13 @@ mod tests {
         // resolves to OpenRaw.
         let mut hits = Vec::new();
         push_raw_line_hit(&mut hits, &key, &entry, 5, 4);
-        assert_eq!(hits[0].kind, ActivityHitKind::RawLine);
+        // The hit carries the entry's activity id so the opener can pin the
+        // exact row under a same-ms ActivityKey collision (MUST-FIX).
+        let eid = match &entry.body {
+            CompletedBody::Request { id, .. } => *id,
+            _ => unreachable!("seeded a request"),
+        };
+        assert_eq!(hits[0].kind, ActivityHitKind::RawLine { id: eid });
         assert_eq!((hits[0].y_start, hits[0].height), (6, 1));
         let chrome = ActivityChrome {
             area: Rect::new(0, 0, 80, 20),
@@ -7517,7 +7532,7 @@ mod tests {
         };
         assert_eq!(
             hit_test_activity(&chrome, 10, 6),
-            Some(ActivityClick::OpenRaw(key.clone()))
+            Some(ActivityClick::OpenRaw(key.clone(), eid))
         );
         // A collapsed entry (height 1: no detail lines rendered) registers none.
         let mut none = Vec::new();
