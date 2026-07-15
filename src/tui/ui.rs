@@ -948,11 +948,11 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(tokens_out)),
                 Cell::from(format::human_count(cache_read)),
                 Cell::from(format::human_count(cache_creation)),
-                Cell::from(format!(
-                    "{}{}",
-                    format_cost(cost),
-                    if bucket_unpriced { "+?" } else { "" }
-                )),
+                usage_cost_cell(
+                    Some(cost),
+                    UsageCostTier::Total,
+                    if bucket_unpriced { "+?" } else { "" },
+                ),
             ])
             .style(Style::new().add_modifier(Modifier::BOLD)),
         );
@@ -977,11 +977,7 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(m.cache_creation)),
                 // "no rate known" renders as an explicit dash — a fabricated
                 // $0.0000 would read as "free" (review R1 MUST-FIX 3).
-                Cell::from(if m.priced {
-                    format_cost(m.cost_usd)
-                } else {
-                    "—".to_string()
-                }),
+                usage_cost_cell(m.priced.then_some(m.cost_usd), UsageCostTier::Detail, ""),
             ]));
         }
     }
@@ -997,7 +993,7 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
     let table = Table::new(trows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
@@ -1013,6 +1009,89 @@ fn usage_row_tokens(r: &&crate::dashboard::UsageStatDoc) -> u64 {
         .saturating_add(r.tokens_out)
         .saturating_add(r.cache_read)
         .saturating_add(r.cache_creation)
+}
+
+/// Which display tier a Usage-table cost amount belongs to (ledger polish):
+/// bucket totals read at full strength, per-model detail rows a tier darker
+/// so the eye lands on the totals first (weight-hierarchy).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UsageCostTier {
+    Total,
+    Detail,
+}
+
+/// Width of the integer part of a Usage cost amount ("999,999" — six years
+/// of this daemon's heaviest month fits). Fixing this width is what anchors
+/// the DECIMAL POINT to one column for every row (number-tabular): amounts
+/// align like a ledger instead of drifting with their magnitude.
+const USAGE_COST_INT_WIDTH: usize = 7;
+/// `$` + integer part + `.` + up to 4 fraction digits + `+?` marker.
+const USAGE_COST_COL_WIDTH: u16 = (1 + USAGE_COST_INT_WIDTH as u16) + 1 + 4 + 2;
+
+/// One Usage-table cost cell (usage-stats ledger polish). `None` = no rate
+/// known → an explicit `—` at the ones column, never a fabricated $0.
+///
+/// Financial-display conventions, adapted to the terminal:
+/// - the decimal point sits at a FIXED column (integer part right-aligned in
+///   [`USAGE_COST_INT_WIDTH`], with thousands separators) so a column of
+///   amounts scans like a ledger;
+/// - digits ABOVE the point carry the emphasis, digits BELOW it render a
+///   tier dimmer (the eye reads dollars first, cents on demand), and the
+///   `$` sign is quieter than both;
+/// - sub-dollar amounts keep 4 fraction digits (per-request costs stay
+///   legible), dollar-plus amounts keep 2 — the point column never moves.
+fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell<'static> {
+    let (int_style, frac_style) = match tier {
+        UsageCostTier::Total => (Style::new(), Style::new().fg(Color::DarkGray)),
+        UsageCostTier::Detail => (
+            Style::new().fg(Color::DarkGray),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ),
+    };
+    let sign_style = frac_style;
+    let Some(cost) = cost else {
+        // The dash lands where the ones digit would be, keeping the empty
+        // cell aligned with the ledger column.
+        return Cell::from(Line::from(vec![
+            Span::raw(" ".repeat(1 + USAGE_COST_INT_WIDTH - 1)),
+            Span::styled("—", frac_style),
+        ]));
+    };
+    // Integer arithmetic on the rounded sub-units so a carry can't produce
+    // an 11-character fraction (0.99999 must render $1.00, not $0.10000).
+    let cost = cost.max(0.0);
+    let (dollars, frac) = if cost < 0.995 {
+        let tenths_of_mill = (cost * 10_000.0).round() as u64;
+        (
+            tenths_of_mill / 10_000,
+            format!(".{:04}", tenths_of_mill % 10_000),
+        )
+    } else {
+        let cents = (cost * 100.0).round() as u64;
+        (cents / 100, format!(".{:02}", cents % 100))
+    };
+    let int_part = group_thousands(dollars);
+    Cell::from(Line::from(vec![
+        Span::raw(" ".repeat(USAGE_COST_INT_WIDTH.saturating_sub(int_part.len()))),
+        Span::styled("$", sign_style),
+        Span::styled(int_part, int_style),
+        Span::styled(format!("{frac}{marker}"), frac_style),
+    ]))
+}
+
+/// `1234567` → `"1,234,567"` — plain thousands grouping for ledger integer
+/// parts ([`format::human_count`] compresses to `1.2M`, which a cost column
+/// must not do).
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
@@ -5016,11 +5095,25 @@ mod tests {
                 r.priced = false;
                 r
             },
+            // A thousands-magnitude bucket (LAST so day rows stay bucket-
+            // adjacent, as the document guarantees): the ledger column must
+            // render a comma separator AND keep its decimal point on the
+            // same column as the small amounts (usage-cost ledger polish).
+            usage_row(
+                "day",
+                19_998,
+                "2024-10-02",
+                "claude",
+                "opus-x",
+                10,
+                10,
+                1_234.499,
+            ),
         ];
         let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
         assert!(text.contains("usage — daily"), "title shows granularity");
-        assert!(text.contains("2 buckets"), "title counts day buckets only");
-        assert!(text.contains("$2.50"), "title sums the day costs");
+        assert!(text.contains("3 buckets"), "title counts day buckets only");
+        assert!(text.contains("$1237.00"), "title sums the day costs");
         assert!(
             text.contains("(+unpriced)"),
             "title qualifies unpriced usage"
@@ -5036,6 +5129,26 @@ mod tests {
         );
         assert!(text.contains("misc/mystery"), "unpriced model row rendered");
         assert!(!text.contains("10-04 09h"), "hourly rows stay out of daily");
+
+        // Ledger polish (usage-cost): thousands separator + the decimal
+        // point anchored to ONE column for every amount, whatever its
+        // magnitude — and the unpriced dash sits in the same column.
+        assert!(text.contains("$1,234.50"), "thousands separator rendered");
+        let dot_col = |needle: &str| {
+            let line = text
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("line with {needle:?}"));
+            line.char_indices()
+                .filter(|(_, c)| *c == '.')
+                .map(|(i, _)| i)
+                .next_back()
+                .unwrap_or_else(|| panic!("cost dot in {needle:?} line"))
+        };
+        let small = dot_col("codex/gpt-5.5"); // $0.50 detail row
+        assert_eq!(dot_col("$1.25"), small, "detail amounts align");
+        assert_eq!(dot_col("$1,234.50"), small, "comma amount aligns");
+        assert_eq!(dot_col("$0.7500+?"), small, "marker doesn't shift the dot");
     }
 
     /// With no usage rows for the selected granularity the overlay shows the
