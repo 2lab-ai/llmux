@@ -59,6 +59,15 @@ fn qml_visual_system_uses_the_inverted_openai_reference_without_system_chrome() 
         );
     }
 
+    let button = read("qml/IslandButton.qml");
+    assert_eq!(
+        button
+            .matches("color: !control.enabled ? IslandTheme.disabledText")
+            .count(),
+        2,
+        "disabled checked buttons must keep both icon and text visible on the black surface"
+    );
+
     let build = read("build.rs");
     assert!(
         build.contains(r#"QmlFile::from("qml/IslandTheme.qml").singleton(true)"#),

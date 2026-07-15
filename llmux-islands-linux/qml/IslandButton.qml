@@ -29,7 +29,8 @@ Button {
                 ? control.icon.source : control.icon.name
             implicitWidth: 14
             implicitHeight: 14
-            color: control.destructive ? IslandTheme.red
+            color: !control.enabled ? IslandTheme.disabledText
+                : control.destructive ? IslandTheme.red
                 : control.highlighted || control.checked
                     ? IslandTheme.panel : IslandTheme.secondaryText
         }
@@ -37,7 +38,8 @@ Button {
         Label {
             visible: control.display !== AbstractButton.IconOnly
             text: control.text
-            color: control.destructive ? IslandTheme.red
+            color: !control.enabled ? IslandTheme.disabledText
+                : control.destructive ? IslandTheme.red
                 : control.highlighted || control.checked
                     ? IslandTheme.panel : IslandTheme.primaryText
             font.pixelSize: 12
