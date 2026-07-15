@@ -324,9 +324,14 @@ pub(crate) struct Chrome {
     /// Folded session timeline for the Sessions overlay (issue #34), snapshotted
     /// from the persisted raw-io log when the overlay was opened. Empty otherwise.
     pub sessions: Vec<crate::session::Session>,
-    /// True while a background `load_sessions` is in flight (issue: `s` froze the
-    /// TUI ~10s). The overlay shows a spinner instead of the table/empty hint.
+    /// True while a background `stream_sessions` load is in flight (issue: `s`
+    /// froze the TUI ~10s). The overlay shows a full-screen spinner only while
+    /// this is set AND no partial has arrived yet; once partials land the table
+    /// renders with a `loading… N%` title until the final delivery clears this.
     pub sessions_loading: bool,
+    /// Percent of the raw-io file consumed by the in-flight streaming load
+    /// (`bytes_read*100/file_len`), shown in the overlay title. 100 at rest.
+    pub sessions_pct: u8,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
     /// `Some` in attach mode.
@@ -358,6 +363,21 @@ pub(crate) struct Chrome {
     /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
     /// recent at the top).
     pub usage_scroll: usize,
+    /// The click-opened input-text modal (UI-6 item 3), or `None` when closed.
+    /// Drawn last over MAIN; its content is looked up from `view.completed` by
+    /// the stored key every frame, so it works identically in local and attach
+    /// mode and closes gracefully when the entry ages out of the ring.
+    pub input_modal: Option<InputModal>,
+}
+
+/// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
+/// entry's STABLE identity (never a list index — rows prepend) plus the vertical
+/// scroll offset in wrapped lines; the excerpt text itself is re-read from
+/// `view.completed` each frame, so nothing goes stale and no wire field is added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputModal {
+    pub key: activity::ActivityKey,
+    pub scroll: u16,
 }
 
 /// Attach-mode banner state.
@@ -448,6 +468,19 @@ struct App {
     overlay: Overlay,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
+    /// Viewport anchor for UI-6 item 4: the newest completed REQUEST's stable
+    /// identity as of the last rendered frame, plus the render-row index it sat
+    /// at THEN (`last_top_row`). Notes carry no key yet occupy their own render
+    /// row, so the newest keyed request can sit at row ≥1 — the anchor's index
+    /// must therefore be a DELTA (`new_index - last_top_row`), not an absolute,
+    /// or a leading note would bump the offset every idle tick (runaway). When
+    /// new entries prepend while scrolled into history, the anchor's new render
+    /// row minus its seeded row = the prepend count; bumping the offset by that
+    /// keeps the page under the cursor put. Robust at ring capacity (append
+    /// evicts oldest → folded-row COUNT is flat, so a length delta would be
+    /// dead). `None` = no keyed frame observed yet.
+    last_top_key: Option<activity::ActivityKey>,
+    last_top_row: usize,
     /// The click-expanded activity entry (Feature B), keyed by stable identity
     /// so it survives new rows prepending. `None` = nothing expanded.
     expanded_activity: Option<activity::ActivityKey>,
@@ -512,13 +545,18 @@ struct App {
     /// A point-in-time snapshot — re-opening re-reads the file. Empty otherwise.
     sessions: Vec<crate::session::Session>,
     /// True while the background load kicked off by `open_sessions` is running
-    /// (read+parse+fold of the multi-MB raw-io log). Cleared when the loaded
-    /// timeline arrives over `sessions_tx`. Drives the overlay loading spinner.
+    /// (streaming read+parse+fold of the multi-MB raw-io log). Cleared when the
+    /// final (`done`) partial arrives over `sessions_tx`. Drives the overlay
+    /// loading spinner (while empty) and the `loading… N%` title (once filling).
     sessions_loading: bool,
+    /// Percent of the raw-io file the in-flight streaming load has consumed,
+    /// carried on each partial and shown in the overlay title. 100 at rest.
+    sessions_pct: u8,
     /// Sender handed to the `spawn_blocking` load task by `open_sessions`; the
-    /// event loop owns the receiver and applies the result. `None` only in unit
-    /// tests that never run `event_loop` (they drive overlay state directly).
-    sessions_tx: Option<mpsc::Sender<Vec<crate::session::Session>>>,
+    /// event loop owns the receiver and applies each progressive partial. `None`
+    /// only in unit tests that never run `event_loop` (they drive overlay state
+    /// directly).
+    sessions_tx: Option<mpsc::Sender<SessionsLoad>>,
     /// Cursor row in the Sessions overlay's session list.
     session_cursor: usize,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
@@ -545,6 +583,10 @@ struct App {
     /// the granularity changes so a deep hourly scroll can't strand the
     /// monthly table past its last row.
     usage_scroll: usize,
+    /// The click-opened input-text modal (UI-6 item 3); `None` when closed. The
+    /// scroll offset is clamped after each draw against the wrapped line count
+    /// the render pass reports (`MainChrome::input_modal_max_scroll`).
+    input_modal: Option<InputModal>,
 }
 
 impl App {
@@ -557,6 +599,8 @@ impl App {
             status: None,
             overlay: Overlay::None,
             activity_scroll: 0,
+            last_top_key: None,
+            last_top_row: 0,
             expanded_activity: None,
             expanded_run: None,
             history_completed: None,
@@ -579,6 +623,7 @@ impl App {
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
             sessions_loading: false,
+            sessions_pct: 100,
             sessions_tx: None,
             session_cursor: 0,
             add_input: String::new(),
@@ -586,6 +631,7 @@ impl App {
             quota_display_override: None,
             usage_gran: activity::UsageGran::default(),
             usage_scroll: 0,
+            input_modal: None,
             reset_absolute: false,
         }
     }
@@ -623,6 +669,72 @@ impl App {
         if let Some(history) = &self.history_completed {
             extend_completed_with_history(&mut view.completed, history, self.history_take);
         }
+    }
+
+    /// Keep a scrolled-into-history viewport anchored when new completed entries
+    /// arrive (UI-6 item 4). Rows are newest-first and the scroll window counts
+    /// render rows from the newest, so a freshly prepended entry would slide the
+    /// page the operator is reading down. While `activity_scroll > 0`, locate
+    /// the row that carries last frame's anchor key in THIS frame's folded rows:
+    /// its new index MINUS the index it was seeded at (`last_top_row`) is the
+    /// number of rows prepended above it, so bumping the offset by that delta
+    /// leaves the same rows under the cursor. The delta (not the absolute index)
+    /// is essential: a Note occupies its own render row but has no key, so the
+    /// newest keyed request can sit at row ≥1 — an absolute bump would then add
+    /// that offset on every idle redraw tick (runaway). Robust at ring capacity,
+    /// where each append evicts the oldest and the folded-row COUNT never
+    /// changes. Key not found (evicted / edge) → leave the offset alone. At
+    /// `scroll == 0` we keep live-tail (no bump) AND skip the fold — re-seeding
+    /// the anchor needs only the cheap leading scan. Called once per rendered
+    /// frame, before `chrome()` snapshots the offset.
+    fn preserve_scroll_on_new_activity(&mut self, view: &DashboardView) {
+        if self.activity_scroll > 0 {
+            if let Some(anchor) = self.last_top_key.clone() {
+                let rows = triage::collapse_completed(&view.completed);
+                if let Some(new_index) = Self::render_row_of_key(&view.completed, &rows, &anchor) {
+                    let prepended = new_index.saturating_sub(self.last_top_row);
+                    if prepended > 0 {
+                        let ceiling = rows.len().saturating_sub(1);
+                        self.activity_scroll =
+                            self.activity_scroll.saturating_add(prepended).min(ceiling);
+                    }
+                }
+            }
+        }
+        // Re-seed to the newest keyed (request) entry and the render row it now
+        // occupies. That row index is exactly the count of leading Note entries
+        // ahead of the first request (Notes are unfoldable 1:1 rows and any run
+        // fold sits BELOW the first request), so no second fold is needed.
+        match view
+            .completed
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| c.activity_key().map(|k| (k, i)))
+        {
+            Some((key, row)) => {
+                self.last_top_key = Some(key);
+                self.last_top_row = row;
+            }
+            None => {
+                self.last_top_key = None;
+                self.last_top_row = 0;
+            }
+        }
+    }
+
+    /// The index of the render row containing `key`, or `None` if no row does.
+    /// For a folded run, ANY member matching counts (the run is one render row).
+    fn render_row_of_key(
+        completed: &[activity::Completed],
+        rows: &[triage::ActivityRow],
+        key: &activity::ActivityKey,
+    ) -> Option<usize> {
+        rows.iter().position(|row| match row {
+            triage::ActivityRow::Single(i) => completed[*i].activity_key().as_ref() == Some(key),
+            triage::ActivityRow::Run { start, len } => completed[*start..*start + *len]
+                .iter()
+                .any(|c| c.activity_key().as_ref() == Some(key)),
+        })
     }
 
     /// Grow the materialized-history window (`history_take`) until the FOLDED
@@ -710,6 +822,7 @@ impl App {
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
             sessions_loading: self.sessions_loading,
+            sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
@@ -720,6 +833,7 @@ impl App {
             chart_days: self.chart_days,
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
+            input_modal: self.input_modal.clone(),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -776,6 +890,13 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // The input modal (UI-6 item 3), when open, swallows every key beneath
+        // it: Esc/q/Enter close it, the arrows/PgUp/PgDn scroll it. It sits
+        // above overlays and modes so a stray key never leaks to MAIN.
+        if self.input_modal.is_some() {
+            self.on_key_input_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -816,6 +937,17 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
+        // The input modal (UI-6 item 3), when open, owns the mouse: the wheel
+        // scrolls it (clamped after draw) and every click is swallowed so it
+        // can't reach a row beneath the modal.
+        if let Some(modal) = self.input_modal.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(1),
+                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(1),
+                _ => {}
+            }
+            return true;
+        }
         // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
         // interaction is pending — the tab bar is how the mouse navigates.
         if self.mode == Mode::Normal
@@ -931,6 +1063,12 @@ impl App {
                     return true;
                 }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
+                    // Clicking the `🔍 input` detail line opens the full-text
+                    // modal instead of collapsing the entry (UI-6 item 3).
+                    Some(ui::ActivityClick::OpenInput(key)) => {
+                        self.open_input_modal(key);
+                        true
+                    }
                     Some(ui::ActivityClick::Entry(key)) => {
                         self.toggle_expand(key);
                         true
@@ -998,6 +1136,32 @@ impl App {
             self.expanded_activity = None;
         } else {
             self.expanded_activity = Some(key);
+        }
+    }
+
+    /// Open the full-input modal (UI-6 item 3) on the clicked entry's stable
+    /// key, scrolled to the top. Re-opening on the same key resets the scroll.
+    fn open_input_modal(&mut self, key: activity::ActivityKey) {
+        self.input_modal = Some(InputModal { key, scroll: 0 });
+    }
+
+    /// Key handling while the input modal is open (UI-6 item 3). Esc/q/Enter
+    /// close it; the arrows/PgUp/PgDn adjust the scroll offset (over-scroll is
+    /// clamped after the next draw against the wrapped line count). Every other
+    /// key is swallowed so nothing leaks to MAIN beneath the modal.
+    fn on_key_input_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.input_modal.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.input_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            _ => {}
         }
     }
 
@@ -1244,23 +1408,25 @@ impl App {
     /// overlay immediately with a loading spinner. The read+parse+fold is blocking
     /// IO/CPU over a multi-MB log, so running it inline inside the async event
     /// loop froze the whole TUI ~10s — it now runs on the blocking pool and the
-    /// loaded timeline arrives over `sessions_tx`, mirroring the remote-fetch
-    /// pattern. A missing/unreadable file folds to an empty timeline (the overlay
-    /// then shows the empty hint). The snapshot is point-in-time — re-opening
-    /// re-reads the file.
+    /// timeline arrives over `sessions_tx` as a stream of progressive partials
+    /// (`stream_sessions`), mirroring the remote-fetch pattern. Each partial
+    /// replaces `sessions`, so the table fills in as the file is read rather than
+    /// appearing all-at-once at the end. A missing/unreadable file delivers a
+    /// single empty, done partial (the overlay then shows the empty hint). The
+    /// snapshot is point-in-time — re-opening re-reads the file from scratch.
     fn open_sessions(&mut self) {
         self.overlay = Overlay::Sessions;
         self.session_cursor = 0;
         if self.sessions_loading {
-            return; // a load is already in flight
+            return; // a load is already in flight — no second reader (reopen guard)
         }
         self.sessions_loading = true;
+        self.sessions_pct = 0;
         if let Some(tx) = self.sessions_tx.clone() {
             // read + parse + fold is blocking IO/CPU → off the runtime onto the
             // blocking pool so the event loop keeps rendering and taking input.
             tokio::task::spawn_blocking(move || {
-                let sessions = load_sessions();
-                let _ = tx.blocking_send(sessions);
+                stream_sessions(&tx);
             });
         }
         // No tx (only in unit tests that never run `event_loop`) → stays in the
@@ -2443,7 +2609,7 @@ async fn event_loop(
     // Sessions overlay (`s`) loads the persisted raw-io log on the blocking pool
     // and delivers the folded timeline here — mirrors the remote fetch channel so
     // the read+parse+fold never blocks this select (it once froze the TUI ~10s).
-    let (sess_tx, mut sess_rx) = mpsc::channel::<Vec<crate::session::Session>>(4);
+    let (sess_tx, mut sess_rx) = mpsc::channel::<SessionsLoad>(4);
     app.sessions_tx = Some(sess_tx);
     // Infinite-scroll history hydration (UI-5): the one-shot blocking load of
     // `activity.jsonl` delivers here, same pattern as the sessions channel.
@@ -2482,11 +2648,14 @@ async fn event_loop(
                 }
                 true
             }
-            // The background session load finished — swap in the folded timeline
-            // and drop the loading state so the overlay shows the table/hint.
-            Some(sessions) = sess_rx.recv() => {
-                app.sessions = sessions;
-                app.sessions_loading = false;
+            // A progressive session-load partial arrived — replace the timeline
+            // with the fold-so-far and keep `sessions_loading` until the final
+            // (`done`) partial, so the overlay fills in and its title tracks the
+            // read progress instead of appearing all-at-once at the end.
+            Some(load) = sess_rx.recv() => {
+                app.sessions = load.sessions;
+                app.sessions_pct = load.pct;
+                app.sessions_loading = !load.done;
                 true
             }
             // The background history load finished (UI-5 infinite scroll) —
@@ -2551,6 +2720,11 @@ async fn event_loop(
         }
         if redraw {
             let view = app.view(SystemTime::now());
+            // Anchor a scrolled-into-history viewport against newly arrived rows
+            // (UI-6 item 4) before `chrome()` snapshots the scroll offset.
+            if let Some(view) = view.as_ref() {
+                app.preserve_scroll_on_new_activity(view);
+            }
             let chrome = app.chrome();
             // Capture the activity panel's hit-test layout from this frame so a
             // left-click in the next input drain maps to the right entry.
@@ -2563,6 +2737,20 @@ async fn event_loop(
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
             app.setting_chrome = main.settings;
+            // Reconcile the input modal (UI-6 item 3) against what the frame
+            // could actually render: `Some(max)` clamps the scroll to the
+            // wrapped line count, `None` means the entry aged out of the ring
+            // (lookup failed) so the modal closes gracefully.
+            if app.input_modal.is_some() {
+                match main.input_modal_max_scroll {
+                    Some(max) => {
+                        if let Some(modal) = app.input_modal.as_mut() {
+                            modal.scroll = modal.scroll.min(max);
+                        }
+                    }
+                    None => app.input_modal = None,
+                }
+            }
         }
     }
 }
@@ -2625,6 +2813,9 @@ const HISTORY_PAGE: usize = 300;
 const HISTORY_CHUNK: usize = 512;
 const HISTORY_GROW_CHUNKS: usize = 4;
 const HISTORY_ARM_MARGIN: i64 = 40;
+
+/// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
+const MODAL_PAGE: u16 = 10;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
 /// session, purely a memory backstop against a huge persisted file.
@@ -2704,19 +2895,97 @@ fn load_history() -> Vec<activity::Completed> {
     log.completed().cloned().collect()
 }
 
-fn load_sessions() -> Vec<crate::session::Session> {
+/// One progressive delivery from the streaming session loader
+/// (`stream_sessions`). Each carries the fold of ALL records read so far (fold
+/// is pure and cheap, so re-folding the accumulator per chunk is fine), a `pct`
+/// of the file consumed for the overlay title, and `done` on the final (EOF)
+/// delivery so the receiver drops the loading state.
+struct SessionsLoad {
+    sessions: Vec<crate::session::Session>,
+    done: bool,
+    pct: u8,
+}
+
+/// Records accumulated between folds. Large enough that the per-chunk re-fold
+/// of the whole accumulator stays negligible (fold is a single linear pass)
+/// while partials still arrive often enough to feel progressive on a multi-MB
+/// log.
+const SESSIONS_CHUNK_RECORDS: usize = 4096;
+
+/// `bytes_read*100/file_len`, clamped to `0..=100`; 100 for an empty/unknown
+/// file so the title never shows a bogus overshoot.
+fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
+    if file_len == 0 {
+        return 100;
+    }
+    (bytes_read.saturating_mul(100) / file_len).min(100) as u8
+}
+
+/// Streaming, progressive variant of the session load: reads the persisted
+/// raw-io log line by line, accumulating parsed records, and every
+/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
+/// and delivers a partial over `tx`. The final partial carries `done = true`.
+/// A missing/unreadable file delivers a single empty, done partial so the
+/// overlay's loading state always clears. Runs on the blocking pool.
+fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
+    let send_empty_done = || {
+        let _ = tx.blocking_send(SessionsLoad {
+            sessions: Vec::new(),
+            done: true,
+            pct: 100,
+        });
+    };
     let Some(path) = crate::cli::daemon::raw_io_path() else {
-        return Vec::new();
+        send_empty_done();
+        return;
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let Ok(file) = std::fs::File::open(&path) else {
+        send_empty_done();
+        return;
     };
-    let records: Vec<crate::proxy::raw_io::RawIoRecord> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    crate::session::fold_sessions(&records)
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = std::io::BufReader::new(file);
+    let mut records: Vec<crate::proxy::raw_io::RawIoRecord> = Vec::new();
+    let mut line = String::new();
+    let mut bytes_read: u64 = 0;
+    let mut since_fold: usize = 0;
+    loop {
+        line.clear();
+        // `read_line` keeps the newline so `bytes_read` tracks real file offset
+        // for an accurate `pct`.
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => break, // EOF
+            Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
+            Err(_) => break, // truncated/unreadable tail → fold what we have
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
+            records.push(rec);
+            since_fold += 1;
+        }
+        if since_fold >= SESSIONS_CHUNK_RECORDS {
+            since_fold = 0;
+            let partial = SessionsLoad {
+                sessions: crate::session::fold_sessions(&records),
+                done: false,
+                pct: sessions_load_pct(bytes_read, file_len),
+            };
+            // Receiver gone (overlay closed / app exiting) → stop early.
+            if tx.blocking_send(partial).is_err() {
+                return;
+            }
+        }
+    }
+    // Final fold at EOF — always delivered (even for an empty file) so the
+    // loading state clears.
+    let _ = tx.blocking_send(SessionsLoad {
+        sessions: crate::session::fold_sessions(&records),
+        done: true,
+        pct: 100,
+    });
 }
 
 /// Parse the limits-editor input: comma/space-separated percents in order
@@ -3383,10 +3652,26 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Sessions);
         assert!(app.sessions_loading, "overlay enters the loading state");
         assert_eq!(app.session_cursor, 0);
+        assert_eq!(app.sessions_pct, 0, "progress resets to 0 on a fresh open");
         assert!(
             app.sessions.is_empty(),
             "no tx under test → load not kicked off, sessions stay empty"
         );
+    }
+
+    /// `pct = bytes_read*100/file_len`, clamped, with an empty/unknown file
+    /// pinned to 100 so the title never overshoots or divides by zero.
+    #[test]
+    fn sessions_load_pct_clamps_and_guards_empty() {
+        assert_eq!(
+            sessions_load_pct(0, 0),
+            100,
+            "empty file → 100, no div-by-0"
+        );
+        assert_eq!(sessions_load_pct(0, 200), 0, "nothing read yet → 0%");
+        assert_eq!(sessions_load_pct(100, 200), 50, "half read → 50%");
+        assert_eq!(sessions_load_pct(200, 200), 100, "fully read → 100%");
+        assert_eq!(sessions_load_pct(300, 200), 100, "overshoot clamps to 100");
     }
 
     /// Reopening while a load is still in flight is a no-op guard, not a second
@@ -3579,6 +3864,59 @@ mod tests {
     }
 
     #[test]
+    fn click_input_line_opens_modal_and_swallows_mouse_beneath(/* UI-6 item 3 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        // Make the seeded hit the 🔍 input detail line.
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::InputLine;
+        // Click it → opens the modal on that key WITHOUT expanding the row.
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
+        assert!(changed, "opening the modal warrants a redraw");
+        assert_eq!(app.input_modal.as_ref().map(|m| &m.key), Some(&key));
+        assert_eq!(
+            app.expanded_activity, None,
+            "the input click does not expand"
+        );
+        // A click beneath is now swallowed: nothing toggles, the modal stays.
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::Entry;
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
+        assert!(changed, "the modal consumes the click (redraw)");
+        assert_eq!(
+            app.expanded_activity, None,
+            "no row toggles beneath the modal"
+        );
+        assert!(app.input_modal.is_some(), "the modal stays open");
+    }
+
+    #[test]
+    fn input_modal_keys_scroll_and_close(/* UI-6 item 3 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.open_input_modal(key);
+        // Arrows adjust the offset (clamped post-draw against the render pass).
+        app.on_key(press(KeyCode::Down), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, 1);
+        app.on_key(press(KeyCode::Up), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, 0);
+        app.on_key(press(KeyCode::PageDown), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, MODAL_PAGE);
+        // Any other key is swallowed — MAIN's activity scroll must not move.
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(
+            app.activity_scroll, before,
+            "keys don't leak beneath the modal"
+        );
+        assert!(
+            app.input_modal.is_some(),
+            "an unbound key keeps the modal open"
+        );
+        // Esc closes.
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.input_modal.is_none(), "esc closes the modal");
+    }
+
+    #[test]
     fn history_hydration_refused_for_cross_host_attach(/* review M1 */) {
         // Loopback attach (the standard `llmux` → localhost:3456 topology)
         // shares this machine's state file → allowed.
@@ -3749,6 +4087,171 @@ mod tests {
         assert_eq!(app.activity_scroll, 0, "wheel down returns to the tail");
     }
 
+    /// UI-6 item 4: while scrolled into history (`scroll > 0`), a freshly
+    /// arrived completed entry prepends (newest-first) and would slide the page
+    /// being read down. The offset must auto-bump by the prepended render-row
+    /// count so the row under the cursor stays put — including AT RING CAPACITY,
+    /// where each append evicts the oldest and the folded-row COUNT never
+    /// changes (a length delta would be dead there). At `scroll == 0` it must
+    /// NOT bump (live-tail is preserved).
+    #[test]
+    fn new_activity_does_not_shift_a_scrolled_viewport() {
+        let req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                // Non-`count` kind → every entry renders 1:1 (no folding), so
+                // render row k maps to `completed[k]`.
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let mut app = remote_app();
+        let mut view = empty_view();
+        // Newest-first: secs 10 down to 1 → 10 distinct render rows.
+        view.completed = (1..=10).rev().map(req).collect();
+        assert_eq!(
+            triage::collapse_completed(&view.completed).len(),
+            10,
+            "precondition: 10 distinct render rows"
+        );
+
+        // --- Below capacity: append GROWS the list. ------------------------
+        // Operator scrolls 3 rows in; this frame records the newest-key anchor.
+        app.activity_scroll = 3;
+        app.preserve_scroll_on_new_activity(&view);
+        // The row currently at the top of the visible page.
+        let anchored_key = view.completed[3].activity_key();
+        // A new request lands (prepends as the newest row) and the next frame
+        // observes it: the offset bumps by the one prepended render row.
+        view.completed.insert(0, req(11));
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "below capacity: offset bumped by one row"
+        );
+        assert_eq!(
+            view.completed[app.activity_scroll].activity_key(),
+            anchored_key,
+            "below capacity: the row under the cursor stayed in place"
+        );
+
+        // --- At ring capacity: append EVICTS the oldest, len stays FLAT. ----
+        app.activity_scroll = 3;
+        app.preserve_scroll_on_new_activity(&view);
+        let anchored_key = view.completed[3].activity_key();
+        let before_len = triage::collapse_completed(&view.completed).len();
+        view.completed.insert(0, req(100)); // newest arrives
+        view.completed.pop(); // oldest evicted (ring full)
+        assert_eq!(
+            triage::collapse_completed(&view.completed).len(),
+            before_len,
+            "precondition: at capacity the folded render-row count is flat"
+        );
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "at capacity: key anchor bumps offset even though len is flat"
+        );
+        assert_eq!(
+            view.completed[app.activity_scroll].activity_key(),
+            anchored_key,
+            "at capacity: the row under the cursor stayed in place"
+        );
+
+        // --- Live tail (scroll == 0) never bumps. --------------------------
+        app.activity_scroll = 0;
+        app.preserve_scroll_on_new_activity(&view);
+        view.completed.insert(0, req(200));
+        view.completed.pop();
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(app.activity_scroll, 0, "live tail is not bumped");
+    }
+
+    /// UI-6 item 4 regression: a Note occupies its own render row but has no
+    /// key, so the newest KEYED request sits at row ≥1. An ABSOLUTE-index bump
+    /// would add that offset on every idle redraw tick (no new arrivals) →
+    /// runaway to the ceiling in ~1-2s. The DELTA anchor must hold the offset
+    /// steady with no arrivals, then bump by exactly the prepended-row count
+    /// when a real request lands above the note.
+    #[test]
+    fn leading_note_does_not_runaway_a_scrolled_viewport() {
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        let req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let top_key =
+            |v: &DashboardView, row: usize| match triage::collapse_completed(&v.completed)[row] {
+                triage::ActivityRow::Single(i) => v.completed[i].activity_key(),
+                triage::ActivityRow::Run { start, .. } => v.completed[start].activity_key(),
+            };
+
+        let mut app = remote_app();
+        let mut view = empty_view();
+        // Newest-first: a Note on top (render row 0, no key), then 9 requests →
+        // 10 render rows. The newest KEYED request is at render row 1.
+        view.completed = std::iter::once(note(100))
+            .chain((1..=9).rev().map(req))
+            .collect();
+        app.activity_scroll = 3;
+
+        // Many idle redraw ticks, NO new arrivals: the offset must NOT drift
+        // (this is exactly what the absolute-index bump got wrong).
+        for _ in 0..5 {
+            app.preserve_scroll_on_new_activity(&view);
+            assert_eq!(
+                app.activity_scroll, 3,
+                "idle ticks with a leading note must not drift the offset"
+            );
+        }
+        let anchored_key = top_key(&view, 3);
+
+        // A real request now lands as the newest entry (the note is pushed down
+        // to render row 1): exactly one new render row prepended → offset += 1.
+        view.completed.insert(0, req(200));
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "note-then-request arrival bumps by exactly the one new render row"
+        );
+        assert_eq!(
+            top_key(&view, app.activity_scroll),
+            anchored_key,
+            "the row under the cursor stayed in place"
+        );
+    }
+
     fn stats_view() -> DashboardView {
         let mut v = empty_view();
         v.model_usage = vec![crate::dashboard::ModelUsageDoc {
@@ -3836,6 +4339,7 @@ mod tests {
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
+            tui_effects: true,
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),

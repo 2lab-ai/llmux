@@ -58,6 +58,9 @@ pub(crate) struct InFlight {
     pub effort: Option<String>,
     /// Codex fast mode in effect (always `false` for claude).
     pub fast: bool,
+    /// Message-kind classification, known at start time (TUI UI-6 item 1) so
+    /// the in-flight row renders the same `kind` column as its completed row.
+    pub kind: Option<String>,
     pub started_at: SystemTime,
 }
 
@@ -1623,7 +1626,12 @@ impl ActivityLog {
         // stale threshold is presumed finished before we fold the next event.
         self.prune_stale_in_flight(now);
         match event {
-            ActivityEvent::RequestStarted { id, method, path } => {
+            ActivityEvent::RequestStarted {
+                id,
+                method,
+                path,
+                kind,
+            } => {
                 if self.in_flight.len() >= MAX_IN_FLIGHT {
                     let lost = self.in_flight.remove(0);
                     self.push_note(
@@ -1644,6 +1652,7 @@ impl ActivityLog {
                     model: None,
                     effort: None,
                     fast: false,
+                    kind,
                     started_at: now,
                 });
             }
@@ -1941,6 +1950,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            kind: None,
         }
     }
 

@@ -14,10 +14,14 @@
 //! user turn) or `other` — the classifier must never fail the request.
 
 /// Cap on the stored excerpt (chars). The collapsed activity row shows ~a
-/// dozen chars; the click-expanded row shows one line as wide as the
-/// terminal — 400 chars covers any realistic width without bloating the
-/// activity channel / dashboard document.
-pub const EXCERPT_MAX_CHARS: usize = 400;
+/// dozen chars and the click-expanded row width-clips to the terminal, but the
+/// click-opened input modal (Feature B, UI-6 item 3) shows the FULL stored
+/// excerpt — so the cap doubles as the modal's content budget. 4000 chars is
+/// still a bounded hostile-input cap: an adversarial body cannot blow memory or
+/// the activity/dashboard document (persisted lines grow ~4KB max), while the
+/// modal can show a realistic prompt in full. Row/session-label rendering
+/// truncates independently, so this only governs stored/modal length.
+pub const EXCERPT_MAX_CHARS: usize = 4000;
 
 /// Classified request kind + input excerpt. `kind` is a short stable token
 /// (≤8 chars) rendered directly by the TUI; `excerpt` is the cleaned text of

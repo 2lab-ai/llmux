@@ -12,9 +12,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -29,7 +30,7 @@ use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, Mode, Overlay};
+use super::{anim, Chrome, InputModal, Mode, Overlay};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -222,6 +223,17 @@ pub(crate) fn draw(
         Overlay::Config => draw_config_overlay(frame, view, chrome),
     }
 
+    // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
+    // centered, scrollable full-text box. Its max-scroll (or a close signal
+    // when the entry aged out) rides back on the hit record so the runtime can
+    // clamp/close. Drawn before the footer so the `q`/`esc` hint stays visible.
+    if let Some(modal) = &chrome.input_modal {
+        let max_scroll = draw_input_modal(frame, view, modal);
+        if let Some(hits) = hits.as_mut() {
+            hits.input_modal_max_scroll = max_scroll;
+        }
+    }
+
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
     let footer_area = Rect {
@@ -345,7 +357,7 @@ fn draw_main(
     let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
     draw_middle(frame, middle_area, view, ctx, chrome);
     if strip_height > 0 {
-        draw_models_strip(frame, strip_area, view, now);
+        draw_models_strip(frame, strip_area, view, ctx, now);
     }
     let activity = draw_activity(frame, activity_area, view, chrome, now);
     // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
@@ -387,6 +399,8 @@ fn draw_main(
         account_rows,
         menu,
         settings,
+        // Filled in by `draw` after the modal (if any) renders over MAIN.
+        input_modal_max_scroll: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -1144,11 +1158,13 @@ fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
 fn draw_sessions_overlay(frame: &mut Frame, ctx: &FrameCtx, chrome: &Chrome) {
     let area = overlay_rect(frame.area());
     frame.render_widget(Clear, area);
-    // The load runs on the blocking pool (it reads + folds the multi-MB raw-io
-    // log); show a spinner while it is in flight rather than freezing or flashing
-    // a stale/empty table. Stale `sessions` from a prior open can coexist on
-    // reopen — prefer the spinner while loading.
-    if chrome.sessions_loading {
+    // The load runs on the blocking pool and streams progressive partials. Show
+    // the full-screen spinner ONLY while loading AND no partial has arrived yet
+    // (sessions still empty); once the table has content it renders below with a
+    // `loading… N%` title (see `draw_sessions_table`) so the user watches it fill
+    // in rather than staring at a spinner. On reopen, a prior open's `sessions`
+    // stay visible (with the loading title) until the first fresh partial lands.
+    if chrome.sessions_loading && chrome.sessions.is_empty() {
         let glyph = anim::braille_spin(chrome.frame);
         let loading = Paragraph::new(Line::from(vec![
             Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
@@ -1233,7 +1249,17 @@ fn draw_sessions_table(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
         Constraint::Length(10),
         Constraint::Length(9),
     ];
-    let title = format!(" sessions — {} of {total} ", cursor + 1);
+    // While a progressive load is still streaming, append the read progress so
+    // the growing table reads as "filling in", not stalled.
+    let title = if chrome.sessions_loading {
+        format!(
+            " sessions — {} of {total} — loading… {}% ",
+            cursor + 1,
+            chrome.sessions_pct
+        )
+    } else {
+        format!(" sessions — {} of {total} ", cursor + 1)
+    };
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
@@ -1594,6 +1620,157 @@ fn overlay_rect(area: Rect) -> Rect {
         width: area.width,
         height: area.height.saturating_sub(2).saturating_sub(top),
     }
+}
+
+/// A rect centered in `area` at `pct_w`%/`pct_h`% of its size (UI-6 item 3
+/// modal). Clamped so it never exceeds `area`.
+fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let width = ((area.width as u32 * pct_w as u32) / 100).min(area.width as u32) as u16;
+    let height = ((area.height as u32 * pct_h as u32) / 100).min(area.height as u32) as u16;
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Number of terminal rows `text` occupies when wrapped at `width` cells to
+/// match ratatui's `Wrap { trim: false }`: greedy word wrap, whitespace is
+/// rendered (leading/interior spaces occupy cells, never dropped from the width
+/// tally), over-wide words hard-split, explicit newlines honored. Used to bound
+/// the input modal's scroll (UI-6 item 3).
+///
+/// INVARIANT: this NEVER underestimates the row count. Ratatui trims trailing
+/// whitespace on wrapped rows, which we may charge — so we can overshoot by a
+/// row or two, but never undershoot. That direction matters: an underestimate
+/// would shrink `max_scroll`, letting the post-draw clamp cut off the tail of a
+/// long/indented prompt (operator can't reach "전체 input"); an overestimate at
+/// most leaves a blank overscroll row while the tail stays reachable.
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let width = (width as usize).max(1);
+    let mut rows = 0usize;
+    for source in text.split('\n') {
+        rows += wrap_rows(source, width);
+    }
+    rows.max(1)
+}
+
+/// Rows one newline-free `source` string wraps into at `width` cells. Iterates
+/// GRAPHEME CLUSTERS (the unit ratatui measures/renders), grouping non-space
+/// clusters into words and treating each space as its own 1-cell token, so that
+/// EVERY cell — including leading indentation — is charged, then greedily packs
+/// them, hard-splitting any token too wide for a full row. Empty string counts
+/// as 1 row.
+fn wrap_rows(source: &str, width: usize) -> usize {
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    let mut word = String::new();
+    for g in source.graphemes(true) {
+        if g == " " {
+            if !word.is_empty() {
+                place_token(&word, width, &mut rows, &mut col);
+                word.clear();
+            }
+            // Each space is its own 1-cell token — leading/interior spaces
+            // occupy width exactly as `Wrap { trim: false }` renders them.
+            place_token(" ", width, &mut rows, &mut col);
+        } else {
+            word.push_str(g);
+        }
+    }
+    if !word.is_empty() {
+        place_token(&word, width, &mut rows, &mut col);
+    }
+    rows
+}
+
+/// Place one token (a word or a single space) into the greedy wrap accounting,
+/// advancing `rows`/`col`. A token that overflows the current row moves to a
+/// fresh one; a token wider than a whole row hard-splits by GRAPHEME CLUSTER
+/// using str-based cell width — the identical basis ratatui measures with — so
+/// a multi-scalar cluster (a 2-cell CJK glyph, an emoji + VS16) is never split
+/// mid-cluster and never mis-measured by summing scalar widths.
+fn place_token(token: &str, width: usize, rows: &mut usize, col: &mut usize) {
+    let w = cell_width(token);
+    if w == 0 {
+        return;
+    }
+    if *col + w <= width {
+        *col += w;
+        return;
+    }
+    // Does not fit on the current row: break to a fresh one first.
+    if *col > 0 {
+        *rows += 1;
+        *col = 0;
+    }
+    if w <= width {
+        *col = w;
+        return;
+    }
+    // Token wider than a full row: hard-split, charging each cluster's cell width.
+    for g in token.graphemes(true) {
+        let cw = cell_width(g);
+        if cw == 0 {
+            continue;
+        }
+        if *col + cw > width {
+            *rows += 1;
+            *col = 0;
+        }
+        *col += cw;
+    }
+}
+
+/// Draw the click-opened input-text modal (UI-6 item 3): a centered, bordered,
+/// scrollable box showing an entry's FULL stored excerpt. The content is looked
+/// up from `view.completed` by the modal's stable key EVERY frame, so it renders
+/// identically in local and attach mode and needs no extra wire field. Returns
+/// `Some(max_scroll)` (wrapped line count minus the visible inner height) when
+/// the entry was found and drawn, or `None` when it has aged out of the ring —
+/// the caller then closes the modal. `Clear` blanks the rect first, so nothing
+/// beneath shows through.
+fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal) -> Option<u16> {
+    // Look up the clicked entry by its stable key; a miss = it aged out → close.
+    let entry = view
+        .completed
+        .iter()
+        .find(|c| c.activity_key().as_ref() == Some(&modal.key))?;
+    let CompletedBody::Request { kind, excerpt, .. } = &entry.body else {
+        return None;
+    };
+    let excerpt = excerpt.as_deref()?;
+
+    let area = centered_rect(frame.area(), 80, 80);
+    frame.render_widget(Clear, area);
+
+    let title = format!(
+        " 🔍 input — {} · {} ",
+        kind.as_deref().unwrap_or("?"),
+        format::clock_hms_utc(entry.at),
+    );
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(dim())
+        .title(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
+    let inner = block.inner(area);
+
+    let text = masked_text(excerpt, view.email_anonymous);
+    let total = wrapped_line_count(&text, inner.width) as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = modal.scroll.min(max_scroll);
+
+    let para = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
+    Some(max_scroll)
 }
 
 /// Attach-mode pre-first-document screen: identity + a "connecting…" /
@@ -2994,6 +3171,11 @@ pub(crate) struct MainChrome {
     pub account_rows: Vec<AccountRowHit>,
     pub menu: Option<MenuChrome>,
     pub settings: Vec<SettingHit>,
+    /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some(max)`
+    /// is the largest valid scroll offset (wrapped line count minus the modal's
+    /// visible inner height) so the runtime can clamp its stored offset; `None`
+    /// means no modal was open OR its entry aged out of the ring (→ close it).
+    pub input_modal_max_scroll: Option<u16>,
 }
 
 /// What kind of row a hit rect belongs to, deciding what a click does
@@ -3003,7 +3185,13 @@ pub(crate) struct MainChrome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityHitKind {
     Entry,
-    RunHeader { expanded: bool },
+    RunHeader {
+        expanded: bool,
+    },
+    /// The `🔍 input` detail line of an expanded entry (UI-6 item 3). Its own
+    /// one-row hit, layered ABOVE the entry's block hit, so clicking exactly
+    /// this line opens the full-text modal instead of collapsing the entry.
+    InputLine,
 }
 
 /// The resolved meaning of one activity click (UI-5), returned by
@@ -3017,6 +3205,9 @@ pub(crate) enum ActivityClick {
     /// Click on a run header's body: expand when collapsed; while expanded it
     /// does NOT collapse (Z 2026-07-15 — only the marker closes a group).
     RunExpand(ActivityKey),
+    /// Click on an entry's `🔍 input` detail line (UI-6 item 3): open the
+    /// full-text modal for that entry.
+    OpenInput(ActivityKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3059,6 +3250,7 @@ pub(crate) fn hit_test_activity(
         .iter()
         .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
     Some(match hit.kind {
+        ActivityHitKind::InputLine => ActivityClick::OpenInput(hit.key.clone()),
         ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
         ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
             ActivityClick::RunToggle(hit.key.clone())
@@ -3203,24 +3395,32 @@ fn draw_activity(
                 None => (anim::braille_spin(anim_frame), Color::DarkGray),
             };
             let mut spans = vec![
+                // Mirror the completed row's stamp spacing (`▸ HH:MM:SS  `):
+                // spinner+2 spaces so the following `kind` column lines up.
                 Span::styled(format!(" {glyph} "), Style::new().fg(color)),
-                Span::styled(format::clock_hms_utc(request.started_at), dim()),
+                Span::styled(
+                    format!("{}  ", format::clock_hms_utc(request.started_at)),
+                    dim(),
+                ),
             ];
+            // `kind` column (TUI UI-6 item 1): same `{:<8} ` slot the completed
+            // row uses, so the meta/email columns align across in-flight and
+            // completed rows. Unknown kind → 8 blank cells (alignment holds).
+            let kind = request.kind.as_deref().unwrap_or("");
+            spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
             // `[model effort]` badge while in flight (issue #2, 2a): filled at
             // routing time (req11) with the same per-request values the finish
             // will record, so the running badge reads exactly like its
             // eventual completed row. Padded to the frame's shared meta slot.
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                pad_cells(
-                    &activity_meta_body(
-                        request.group.as_deref(),
-                        request.model.as_deref(),
-                        request.effort.as_deref(),
-                    ),
-                    metrics.meta_w,
+            spans.extend(pad_spans(
+                activity_meta_spans(
+                    request.group.as_deref(),
+                    request.model.as_deref(),
+                    request.effort.as_deref(),
+                    anim_frame,
+                    view.tui_effects,
                 ),
-                group_color(request.group.as_deref()),
+                metrics.meta_w,
             ));
             if let Some(account) = &request.account {
                 spans.push(Span::raw(format!(
@@ -3265,6 +3465,8 @@ fn draw_activity(
                     &view.session_labels,
                     &view.domain_abbrev,
                     &metrics,
+                    anim_frame,
+                    view.tui_effects,
                 ));
                 let mut height = 1u16;
                 if expanded {
@@ -3280,6 +3482,7 @@ fn draw_activity(
                 }
                 // Only request rows are clickable (notes have no key).
                 if let Some(key) = entry.activity_key() {
+                    push_input_line_hit(&mut hits, &key, entry, row_y, height);
                     hits.push(ActivityHit {
                         key,
                         y_start: row_y,
@@ -3305,6 +3508,8 @@ fn draw_activity(
                     view.email_anonymous,
                     &view.domain_abbrev,
                     &metrics,
+                    anim_frame,
+                    view.tui_effects,
                 ));
                 if let Some(key) = key {
                     hits.push(ActivityHit {
@@ -3330,6 +3535,8 @@ fn draw_activity(
                             &view.session_labels,
                             &view.domain_abbrev,
                             &metrics,
+                            anim_frame,
+                            view.tui_effects,
                         ));
                         let mut member_height = 1u16;
                         if member_expanded {
@@ -3346,6 +3553,7 @@ fn draw_activity(
                             }
                         }
                         if let Some(key) = entry.activity_key() {
+                            push_input_line_hit(&mut hits, &key, entry, member_y, member_height);
                             hits.push(ActivityHit {
                                 key,
                                 y_start: member_y,
@@ -3407,6 +3615,8 @@ fn folded_run_line(
     mask: bool,
     abbrev: &std::collections::BTreeMap<String, String>,
     m: &RowMetrics,
+    frame: usize,
+    effects_on: bool,
 ) -> Line<'static> {
     let marker = if expanded { '▾' } else { '▸' };
     let oldest = &run[run.len() - 1];
@@ -3432,27 +3642,34 @@ fn folded_run_line(
         .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
     let kind = kind.as_deref().unwrap_or("count");
-    let spans = vec![
+    let mut spans = vec![
         stamp,
         Span::styled(format!("{kind:<8} "), kind_style(kind)),
         Span::styled(
             format!("{}× ", run.len()),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            pad_cells(
-                &activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref()),
-                m.meta_w,
-            ),
-            group_color(group.as_deref()),
-        ),
-        Span::raw(format!(" {} → (", pad_cells(&account, ACTIVITY_EMAIL_W))),
-        Span::styled("all 2xx", Style::new().fg(Color::Green)),
-        Span::raw(")"),
     ];
+    spans.extend(pad_spans(
+        activity_meta_spans(
+            group.as_deref(),
+            model.as_deref(),
+            effort.as_deref(),
+            frame,
+            effects_on,
+        ),
+        m.meta_w,
+    ));
+    spans.push(Span::raw(format!(
+        " {} → (",
+        pad_cells(&account, ACTIVITY_EMAIL_W)
+    )));
+    spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
+    spans.push(Span::raw(")"));
     Line::from(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn completed_line(
     entry: &Completed,
     expanded: bool,
@@ -3460,6 +3677,8 @@ fn completed_line(
     session_labels: &std::collections::BTreeMap<String, String>,
     abbrev: &std::collections::BTreeMap<String, String>,
     m: &RowMetrics,
+    frame: usize,
+    effects_on: bool,
 ) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
@@ -3504,36 +3723,42 @@ fn completed_line(
             // (`POST /v1/messages?beta=true`); the expanded detail's
             // `request` line keeps the full form.
             let _ = (method, path);
-            let (tok, cost) = match tokens {
+            let (tok, cost, cost_usd) = match tokens {
                 Some(tokens) => {
                     let tok = format!("{}tok", format::human_count(tokens.total()));
                     // API-equivalent cost via the built-in default rate table
                     // (the render path holds no config overrides). Priced only
                     // when (group, model) is known.
-                    let cost = match (group, model) {
-                        (Some(group), Some(model)) => format_cost(crate::pricing::cost_usd(
-                            group,
-                            model,
-                            tokens,
-                            &std::collections::HashMap::new(),
-                        )),
-                        _ => "—".to_string(),
+                    let (cost, cost_usd) = match (group, model) {
+                        (Some(group), Some(model)) => {
+                            let usd = crate::pricing::cost_usd(
+                                group,
+                                model,
+                                tokens,
+                                &std::collections::HashMap::new(),
+                            );
+                            (format_cost(usd), Some(usd))
+                        }
+                        _ => ("—".to_string(), None),
                     };
-                    (tok, cost)
+                    (tok, cost, cost_usd)
                 }
-                None => ("—".to_string(), "—".to_string()),
+                None => ("—".to_string(), "—".to_string(), None),
             };
             let mut spans = vec![stamp];
             spans.push(Span::styled(
                 format!("{:<8} ", kind.as_deref().unwrap_or("")),
                 kind_style(kind.as_deref().unwrap_or("")),
             ));
-            spans.push(Span::styled(
-                pad_cells(
-                    &activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref()),
-                    m.meta_w,
+            spans.extend(pad_spans(
+                activity_meta_spans(
+                    group.as_deref(),
+                    model.as_deref(),
+                    effort.as_deref(),
+                    frame,
+                    effects_on,
                 ),
-                group_color(group.as_deref()),
+                m.meta_w,
             ));
             spans.push(Span::raw(format!(
                 " {} → ",
@@ -3548,7 +3773,17 @@ fn completed_line(
                 ),
                 dim(),
             ));
-            spans.push(Span::raw(format!(" {}", pad_cells_left(&cost, m.cost_w))));
+            // Cost ≥ $1 shouts (TUI UI-6 item 5): the color boundary matches
+            // format_cost's 2dp boundary. Below $1 (or unpriced) renders plain.
+            let cost_cell = format!(" {}", pad_cells_left(&cost, m.cost_w));
+            if cost_usd.is_some_and(|usd| usd >= 1.0) {
+                spans.push(Span::styled(
+                    cost_cell,
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw(cost_cell));
+            }
             // Derived session title (U2), when this client id has one.
             if let Some(label) = user_id.as_deref().and_then(|id| session_labels.get(id)) {
                 spans.push(Span::styled(
@@ -3631,7 +3866,14 @@ fn completed_detail_lines(
         ]));
     }
     if let Some(excerpt) = excerpt.as_deref() {
-        lines.push(indent("input", masked_text(excerpt, mask)));
+        // The `🔍` marks this line as CLICKABLE — it opens the full-text modal
+        // (UI-6 item 3). Emoji is safe here (the detail line owns its whole row,
+        // unlike the aligned table columns where wide/ambiguous glyphs break the
+        // grid). The collapsed row still width-clips; the modal shows it in full.
+        lines.push(Line::from(vec![
+            Span::styled("       🔍 input ", dim()),
+            Span::raw(masked_text(excerpt, mask)),
+        ]));
     }
     if let Some(uid) = user_id.as_deref() {
         let label = session_labels
@@ -3721,6 +3963,47 @@ fn completed_detail_lines(
     lines
 }
 
+/// Row offset (0-based, within [`completed_detail_lines`]) of the clickable
+/// `🔍 input` detail line for `entry`, or `None` when the entry stores no
+/// excerpt. MUST track the line order emitted above (request, [kind], input, …)
+/// — the UI-6 item-3 modal hit is anchored off it, so any reordering of those
+/// leading lines must update this in lock-step.
+fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
+    let CompletedBody::Request { kind, excerpt, .. } = &entry.body else {
+        return None;
+    };
+    excerpt.as_ref()?;
+    // Lines before `input`: always `request` (1), plus `kind` when present.
+    Some(1 + u16::from(kind.is_some()))
+}
+
+/// Register the one-row `InputLine` hit for `entry`'s `🔍 input` detail line,
+/// but only when that line was actually rendered this frame (the entry is
+/// expanded AND the line was not clipped by the panel's line budget). Pushed
+/// BEFORE the caller's block-level `Entry` hit so `hit_test_activity`'s
+/// first-match resolves this exact row to "open the modal" (UI-6 item 3).
+/// `row_y` is the entry's main row; detail lines follow it, so the input line
+/// sits at `row_y + 1 + offset`, and `offset + 1 < height` (height counts the
+/// main row plus rendered detail lines) proves it is on screen.
+fn push_input_line_hit(
+    hits: &mut Vec<ActivityHit>,
+    key: &ActivityKey,
+    entry: &Completed,
+    row_y: u16,
+    height: u16,
+) {
+    if let Some(offset) = completed_input_line_offset(entry) {
+        if offset + 1 < height {
+            hits.push(ActivityHit {
+                key: key.clone(),
+                y_start: row_y.saturating_add(1).saturating_add(offset),
+                height: 1,
+                kind: ActivityHitKind::InputLine,
+            });
+        }
+    }
+}
+
 /// Backend group of the account named `account` in the current snapshot, for
 /// coloring/animating its in-flight rows. `None` if not found (pre-routing).
 fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
@@ -3777,6 +4060,131 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
+/// Full rainbow the `max` effort token cycles through (TUI UI-6 item 6): the
+/// per-char fg is `palette[(char_idx + frame) % len]`, so the band appears to
+/// slide one cell per animation tick — a deliberately loud marker for the top
+/// effort. Gated on `tui_effects`; off → a static [`Color::LightMagenta`] bold.
+const EFFORT_MAX_RAINBOW: [Color; 6] = [
+    Color::Red,
+    Color::Yellow,
+    Color::Green,
+    Color::Cyan,
+    Color::Blue,
+    Color::Magenta,
+];
+
+/// Headline-model name gradients (TUI UI-6 item 7): a marquee within each
+/// group's OWN color family (distinct from item 6's full rainbow), keyed on
+/// group. Claude/magenta family for `fable-5*`, codex/cyan family for
+/// `gpt-5.6-sol*`. Gated on `tui_effects`; off → a static bold group color.
+const CLAUDE_GRADIENT: [Color; 4] = [
+    Color::Magenta,
+    Color::LightMagenta,
+    Color::White,
+    Color::LightMagenta,
+];
+const CODEX_GRADIENT: [Color; 4] = [
+    Color::Cyan,
+    Color::LightCyan,
+    Color::White,
+    Color::LightCyan,
+];
+
+/// Per-character marquee color: index `palette` by char position plus the
+/// shared animation `frame`, so the palette appears to slide one cell per tick.
+fn marquee_color(palette: &[Color], char_idx: usize, frame: usize) -> Color {
+    palette[(char_idx + frame) % palette.len()]
+}
+
+/// The animated group-family gradient palette for a model whose abbreviated
+/// slug marks it a HEADLINE model (`fable-5*` / `gpt-5.6-sol*`), or `None` for
+/// ordinary models (which keep their flat group color). Detection runs on the
+/// [`abbrev_model`] slug so it matches whether the caller renders the raw id
+/// (models strip) or the already-abbreviated badge slug (activity badge).
+fn model_gradient_palette(group: Option<&str>, model: &str) -> Option<&'static [Color]> {
+    let slug = abbrev_model(group, model);
+    if slug.starts_with("fable-5") || slug.starts_with("gpt-5.6-sol") {
+        Some(match group {
+            Some("codex") => &CODEX_GRADIENT,
+            _ => &CLAUDE_GRADIENT,
+        })
+    } else {
+        None
+    }
+}
+
+/// Render `text` as a headline-model name (TUI UI-6 item 7): an animated
+/// per-char group-family gradient when `effects_on` and the slug is a headline
+/// model, a static bold group color when effects are off, and a plain
+/// group-colored single span for ordinary models. The concatenated span text
+/// is always exactly `text` (the per-char split is style-only).
+fn model_name_spans(
+    group: Option<&str>,
+    text: &str,
+    frame: usize,
+    effects_on: bool,
+) -> Vec<Span<'static>> {
+    match model_gradient_palette(group, text) {
+        Some(pal) if effects_on => text
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                Span::styled(
+                    c.to_string(),
+                    Style::new()
+                        .fg(marquee_color(pal, i, frame))
+                        .add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect(),
+        Some(_) => vec![Span::styled(
+            text.to_string(),
+            group_color(group).add_modifier(Modifier::BOLD),
+        )],
+        None => vec![Span::styled(text.to_string(), group_color(group))],
+    }
+}
+
+/// Render the effort token with its per-level styling (TUI UI-6 item 6):
+/// `xhigh` → a static [`Color::LightRed`] bold (distinct, animation-free);
+/// `max` → the rainbow marquee when `effects_on`, else a static
+/// [`Color::LightMagenta`] bold; every other effort inherits the group color.
+/// The concatenated span text is always exactly `effort`.
+fn effort_spans(
+    group: Option<&str>,
+    effort: &str,
+    frame: usize,
+    effects_on: bool,
+) -> Vec<Span<'static>> {
+    match effort {
+        "xhigh" => vec![Span::styled(
+            effort.to_string(),
+            Style::new()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )],
+        "max" if effects_on => effort
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                Span::styled(
+                    c.to_string(),
+                    Style::new()
+                        .fg(marquee_color(&EFFORT_MAX_RAINBOW, i, frame))
+                        .add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect(),
+        "max" => vec![Span::styled(
+            effort.to_string(),
+            Style::new()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )],
+        _ => vec![Span::styled(effort.to_string(), group_color(group))],
+    }
+}
+
 /// Display-cell width of `text` — ratatui's own column accounting
 /// (`unicode-width`), NOT the char count: group/model/effort ride in from
 /// request bodies, so wide/combining input must not shift the badge column.
@@ -3825,6 +4233,72 @@ fn activity_meta_body(group: Option<&str>, model: Option<&str>, effort: Option<&
     // Belt-and-braces cap: model/effort ride in from request bodies, so a
     // hostile value must not blow the shared column past the panel.
     truncate_cells(&format!("[{}]", parts.join(" ")), META_W_MAX)
+}
+
+/// Styled multi-span form of [`activity_meta_body`] (TUI UI-6 items 6/7): the
+/// SAME `[model effort]` text — same abbreviation, same effort filtering, same
+/// [`META_W_MAX`] cap and `…`-clip — but the model and effort tokens carry
+/// per-level styling (headline-model gradient, effort marquee) instead of one
+/// flat group color. Callers pad the result with [`pad_spans`] to the frame's
+/// shared `meta_w`. The concatenated span text is byte-identical to what
+/// `activity_meta_body` (still the width-measuring SSOT) returns, so the two
+/// never disagree on column widths; in the rare hostile-width case that trips
+/// the cap the badge degrades to a single clipped span (text stays identical,
+/// only the per-char styling is dropped).
+fn activity_meta_spans(
+    group: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    frame: usize,
+    effects_on: bool,
+) -> Vec<Span<'static>> {
+    // Same filtering as activity_meta_body so the parts match exactly.
+    let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
+    let model_slug = model.map(|m| abbrev_model(group, m));
+    // Ordered inner parts — exactly the set activity_meta_body joins with a
+    // single space; each may itself be several per-char spans.
+    let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
+    if let Some(m) = model_slug {
+        parts.push(model_name_spans(group, m, frame, effects_on));
+    }
+    if let Some(e) = effort {
+        parts.push(effort_spans(group, e, frame, effects_on));
+    }
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let base = group_color(group);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("[", base)];
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ", base));
+        }
+        spans.extend(part);
+    }
+    spans.push(Span::styled("]", base));
+    // Enforce the identical cap by WHOLE-STRING re-measurement (matching
+    // activity_meta_body): a hostile assembly collapses to the same single
+    // `…`-clipped span so the text never diverges from the width SSOT.
+    let raw: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    if cell_width(&raw) <= META_W_MAX {
+        spans
+    } else {
+        vec![Span::styled(truncate_cells(&raw, META_W_MAX), base)]
+    }
+}
+
+/// Right-pad a multi-span badge to `width` display CELLS by the SUM of its span
+/// cell widths (never char count) — the multi-span analogue of [`pad_cells`],
+/// so the styled `[model effort]` badge lines up with the plain-padded columns
+/// around it. The badge text is capped at [`META_W_MAX`] and `width` is the
+/// frame's max badge width, so a trailing blank span always fills the gap.
+fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let used: usize = spans.iter().map(|s| cell_width(s.content.as_ref())).sum();
+    let pad = width.saturating_sub(used);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -3945,38 +4419,65 @@ fn model_is_recent(last_used_ms: u64, now: SystemTime) -> bool {
 /// Leading marker for a model row: a group-colored working spinner while it has
 /// in-flight traffic (req11), a `●` when recently used (req15), else blank.
 fn model_active_marker(m: &ModelUsageDoc, now: SystemTime, frame: usize) -> Span<'static> {
+    // A LEADING space inside the 2-cell marker column for every variant (TUI
+    // UI-6 item 2b): the glyph sits in the 2nd cell so the marker breathes one
+    // cell right of the border while the column stays aligned.
     if m.in_flight > 0 {
         let glyph = if m.group == "codex" {
             anim::block_spin(frame)
         } else {
             anim::braille_spin(frame)
         };
-        Span::styled(glyph.to_string(), group_color(Some(m.group.as_str())))
+        Span::styled(format!(" {glyph}"), group_color(Some(m.group.as_str())))
     } else if model_is_recent(m.last_used_ms, now) {
-        Span::styled("●", Style::new().fg(Color::Green))
+        Span::styled(" ●", Style::new().fg(Color::Green))
     } else {
-        Span::raw(" ")
+        Span::raw("  ")
     }
 }
 
-/// A `GROUP model` label pair, group-colored, model bold when active.
-fn model_name_cells(m: &ModelUsageDoc, active: bool) -> (Cell<'static>, Cell<'static>) {
+/// A `GROUP model` label pair, group-colored, model bold when active. Headline
+/// models (`fable-5*` / `gpt-5.6-sol*`) render the same animated group-family
+/// gradient as the activity badge (TUI UI-6 item 7), gated on `effects_on`;
+/// ordinary models keep the plain bold-when-active name.
+fn model_name_cells(
+    m: &ModelUsageDoc,
+    active: bool,
+    frame: usize,
+    effects_on: bool,
+) -> (Cell<'static>, Cell<'static>) {
     let group = Cell::from(Span::styled(
         m.group.to_uppercase(),
         group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
     ));
-    let name_style = if active {
-        Style::new().add_modifier(Modifier::BOLD)
+    let name_cell = if model_gradient_palette(Some(m.group.as_str()), &m.model).is_some() {
+        Cell::from(Line::from(model_name_spans(
+            Some(m.group.as_str()),
+            &m.model,
+            frame,
+            effects_on,
+        )))
     } else {
-        Style::new()
+        let name_style = if active {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        Cell::from(Span::styled(m.model.clone(), name_style))
     };
-    (group, Cell::from(Span::styled(m.model.clone(), name_style)))
+    (group, name_cell)
 }
 
 /// Always-visible compact strip: the top models by total tokens, each with a
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
 /// drop the bar so the column set stays readable (req29).
-fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: SystemTime) {
+fn draw_models_strip(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    now: SystemTime,
+) {
     // Fill the pane: rows follow the AREA height (border + header take 2), so
     // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
     // instead of 5 rows + dead space (UI-4 V2).
@@ -3991,11 +4492,14 @@ fn draw_models_strip(frame: &mut Frame, area: Rect, view: &DashboardView, now: S
         .unwrap_or(0)
         .max(1);
     let wide = area.width >= SIDE_BY_SIDE_AT;
-    let frame_n = 0; // strip markers don't need to animate per draw tick
+    // The strip marker rides the SAME shared animation frame as the rest of the
+    // board (TUI UI-6 item 2a) — it was frozen at 0 before, so in-flight strip
+    // spinners never turned.
+    let frame_n = ctx.frame;
 
     let rows = rows_data.into_iter().map(|m| {
         let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-        let (group_cell, name_cell) = model_name_cells(m, active);
+        let (group_cell, name_cell) = model_name_cells(m, active, frame_n, view.tui_effects);
         let share = model_total(m) as f64 / max_total as f64;
         let mut cells = vec![
             Cell::from(model_active_marker(m, now, frame_n)),
@@ -4123,7 +4627,7 @@ fn draw_models_table(
         .map(|(i, m)| {
             let idx = start + i;
             let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-            let (group_cell, name_cell) = model_name_cells(m, active);
+            let (group_cell, name_cell) = model_name_cells(m, active, ctx.frame, view.tui_effects);
             let ok_err = Line::from(vec![
                 Span::styled(format::human_count(m.ok), Style::new().fg(Color::Green)),
                 Span::raw("/"),
@@ -4739,6 +5243,7 @@ mod tests {
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
+            tui_effects: true,
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
@@ -4915,6 +5420,7 @@ mod tests {
             chart_days: 14,
             usage_gran: Default::default(),
             usage_scroll: 0,
+            input_modal: None,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -4926,6 +5432,7 @@ mod tests {
             stats_window: super::super::activity::StatsWindow::default(),
             sessions: Vec::new(),
             sessions_loading: false,
+            sessions_pct: 100,
             session_cursor: 0,
             add_input_len: 0,
             quota_display_override: None,
@@ -5025,6 +5532,7 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             effort: None,
             fast: false,
+            kind: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -5486,11 +5994,12 @@ mod tests {
         assert!(text.contains("no sessions yet"), "empty hint shown");
     }
 
-    /// While the background load is in flight the overlay shows the loading
-    /// indicator — NOT the empty "no sessions yet" hint, even with empty
-    /// `sessions` — so the user sees progress instead of a frozen/empty screen.
+    /// The full-screen spinner shows ONLY while loading AND no partial has
+    /// arrived yet (empty `sessions`) — never the empty "no sessions yet" hint —
+    /// so the user sees progress instead of a frozen/empty screen. Once partials
+    /// land the table takes over (see the two tests below).
     #[test]
-    fn sessions_overlay_loading_shows_spinner_not_empty_hint() {
+    fn sessions_overlay_loading_shows_spinner_only_when_empty() {
         let view = view_with(Vec::new());
         let mut chrome = chrome_overlay(Overlay::Sessions);
         chrome.sessions_loading = true;
@@ -5499,6 +6008,60 @@ mod tests {
         assert!(
             !text.contains("no sessions yet"),
             "empty hint suppressed while loading"
+        );
+    }
+
+    /// A single non-empty session for the progressive-load render tests.
+    fn one_session() -> crate::session::Session {
+        crate::session::Session {
+            user_id: Some("u-active".into()),
+            requests: 12,
+            tokens_in: 3400,
+            tokens_out: 1200,
+            models: vec!["claude-sonnet-4".into()],
+            accounts: vec!["acct-a".into()],
+            account_rotations: 0,
+            first_ms: 1_000_000,
+            last_ms: 1_600_000,
+            confidence: crate::session::Confidence::High,
+        }
+    }
+
+    /// A progressive partial (loading is still true but `sessions` is non-empty)
+    /// renders the TABLE — not the spinner — with the `loading… N%` progress in
+    /// the title, so the user watches the timeline fill in.
+    #[test]
+    fn sessions_overlay_partial_renders_table_with_loading_title() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions_loading = true;
+        chrome.sessions_pct = 42;
+        chrome.sessions = vec![one_session()];
+        let text = render(&view, &chrome, 160, 30);
+        assert!(
+            text.contains("loading… 42%"),
+            "table title carries the read progress"
+        );
+        assert!(text.contains("u-active"), "table (not spinner) is rendered");
+        assert!(
+            !text.contains("loading sessions"),
+            "full-screen spinner suppressed once a partial has arrived"
+        );
+    }
+
+    /// The final delivery clears the loading state: the table renders WITHOUT the
+    /// `loading…` title suffix.
+    #[test]
+    fn sessions_overlay_final_delivery_clears_loading_title() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions_loading = false;
+        chrome.sessions = vec![one_session()];
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("u-active"), "table rendered");
+        assert!(
+            !text.contains("loading…"),
+            "loading title gone once the load is done"
         );
     }
 
@@ -5714,6 +6277,96 @@ mod tests {
     }
 
     #[test]
+    fn strip_marker_animates_and_carries_the_leading_space(/* UI-6 item 2 */) {
+        let now = SystemTime::now();
+        let mut m = model_row("claude", "claude-opus-4-8", 100, 50);
+        m.in_flight = 1;
+        // 2a: the in-flight marker rides the shared frame — frozen at 0 before.
+        let f0 = model_active_marker(&m, now, 0).content.into_owned();
+        let f3 = model_active_marker(&m, now, 3).content.into_owned();
+        assert_ne!(f0, f3, "in-flight strip marker must animate with the frame");
+        // 2b: every variant reserves a LEADING space so the glyph sits one cell
+        // right of the border while the 2-cell column stays aligned.
+        assert!(
+            f0.starts_with(' ') && f0.chars().count() == 2,
+            "spinner: {f0:?}"
+        );
+        let mut codex = model_row("codex", "gpt-5.6-sol", 100, 50);
+        codex.in_flight = 2;
+        let cx = model_active_marker(&codex, now, 1).content.into_owned();
+        assert!(
+            cx.starts_with(' ') && cx.chars().count() == 2,
+            "codex spin: {cx:?}"
+        );
+        // Idle (never used) marker is the 2-cell blank, still leading-spaced.
+        let idle = model_active_marker(&model_row("claude", "x", 1, 1), now, 0)
+            .content
+            .into_owned();
+        assert_eq!(idle, "  ", "idle marker fills the 2-cell column");
+    }
+
+    #[test]
+    fn max_effort_badge_spans_cycle_when_on_and_are_static_when_off(/* UI-6 item 6 */) {
+        let fg = |spans: &[Span]| spans.iter().map(|s| s.style.fg).collect::<Vec<_>>();
+        let text = |spans: &[Span]| spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        // A plain (non-headline) model isolates the effort token from the name
+        // gradient, so a color change can only come from the `max` marquee.
+        // Effects ON: `max` is one span per char and the palette slides with
+        // the frame, so consecutive frames differ.
+        let f0 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 0, true);
+        let f1 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 1, true);
+        assert_ne!(fg(&f0), fg(&f1), "max marquee must cycle across frames");
+        // The assembled TEXT stays byte-identical to the width-measuring SSOT.
+        assert_eq!(
+            text(&f0),
+            activity_meta_body(Some("codex"), Some("gpt-5.5"), Some("max"))
+        );
+        // Effects OFF: static — every frame renders the same distinct color.
+        let off0 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 0, false);
+        let off9 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 9, false);
+        assert_eq!(fg(&off0), fg(&off9), "effects off ⇒ static color");
+        assert!(
+            off0.iter().any(|s| s.style.fg == Some(Color::LightMagenta)),
+            "off-state max is the distinct static LightMagenta"
+        );
+        // xhigh is a static distinct color regardless of the frame (a plain
+        // non-headline model isolates the effort token from the name gradient).
+        let xh_on = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("xhigh"), 0, true);
+        let xh_off = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("xhigh"), 5, true);
+        assert_eq!(fg(&xh_on), fg(&xh_off), "xhigh never animates");
+        assert!(xh_on.iter().any(|s| s.style.fg == Some(Color::LightRed)));
+    }
+
+    #[test]
+    fn fable5_name_spans_use_the_group_gradient_when_on(/* UI-6 item 7 */) {
+        let fg = |spans: &[Span]| spans.iter().map(|s| s.style.fg).collect::<Vec<_>>();
+        // A headline model splits into per-char spans, all from the claude
+        // (magenta) family, and the palette slides with the frame.
+        let on0 = model_name_spans(Some("claude"), "fable-5", 0, true);
+        let on1 = model_name_spans(Some("claude"), "fable-5", 1, true);
+        assert!(on0.len() > 1, "gradient splits the name per char");
+        assert!(
+            on0.iter()
+                .all(|s| CLAUDE_GRADIENT.contains(&s.style.fg.unwrap())),
+            "fable-5 uses the claude/magenta family"
+        );
+        assert_ne!(fg(&on0), fg(&on1), "gradient marquee shifts with the frame");
+        // Codex headline models use the cyan family.
+        let codex = model_name_spans(Some("codex"), "gpt-5.6-sol", 0, true);
+        assert!(codex
+            .iter()
+            .all(|s| CODEX_GRADIENT.contains(&s.style.fg.unwrap())));
+        // Effects OFF: a single static bold group-colored span.
+        let off = model_name_spans(Some("claude"), "fable-5", 0, false);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].style.fg, Some(Color::Magenta));
+        assert!(off[0].style.add_modifier.contains(Modifier::BOLD));
+        // Ordinary models stay a single plain group span (no gradient) even on.
+        let plain = model_name_spans(Some("claude"), "opus-4-8", 0, true);
+        assert_eq!(plain.len(), 1);
+    }
+
+    #[test]
     fn truncate_cells_zero_budget_yields_empty(/* UI-4 R3 nice 1/2 */) {
         assert_eq!(truncate_cells("some-model", 0), "");
         assert_eq!(truncate_cells("", 0), "");
@@ -5797,6 +6450,7 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             effort: None,
             fast: false,
+            kind: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -5824,6 +6478,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             effort: Some("max".into()),
             fast: true,
+            kind: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -5837,6 +6492,84 @@ mod tests {
             !text.contains("[codex max fast]") && !text.contains("max fast]"),
             "the fast token no longer rides the badge"
         );
+    }
+
+    #[test]
+    fn in_flight_row_shows_the_kind_column(/* UI-6 item 1 */) {
+        // The running row carries the same `kind` column as a completed row so
+        // the meta/email columns line up across both — `kind` before the badge.
+        let mut view = view_with(Vec::new());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 3,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
+            kind: Some("compact".into()),
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
+        let row = rows
+            .iter()
+            .find(|l| l.contains("[opus-4-8]"))
+            .expect("in-flight row rendered");
+        assert!(
+            row.find("compact").unwrap_or(usize::MAX)
+                < row.find("[opus-4-8]").unwrap_or(usize::MAX),
+            "kind → badge order on the in-flight row: {row}"
+        );
+    }
+
+    #[test]
+    fn activity_cost_at_or_above_one_dollar_is_yellow_bold(/* UI-6 item 5 */) {
+        // A row costing ≥ $1 shouts (Yellow + BOLD); below $1 stays plain. The
+        // color boundary matches `format_cost`'s 2dp boundary.
+        let row = |out: u64| Completed {
+            at: UNIX_EPOCH + Duration::from_millis(1_000),
+            body: CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("codex:me@example.com".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: Some(super::super::TokenCounts {
+                    input: 0,
+                    output: out,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let cost_span = |entry: &Completed| {
+            let m = RowMetrics::measure(200, &[], &[entry]);
+            completed_line(entry, false, false, &labels, &abbrev, &m, 0, true)
+                .spans
+                .into_iter()
+                .find(|s| s.content.contains('$'))
+                .expect("a cost span with a $ amount")
+        };
+
+        // 1M output tokens on gpt-5.5 = $30.00 ≥ $1 → Yellow + BOLD.
+        let pricey = cost_span(&row(1_000_000));
+        assert_eq!(pricey.style.fg, Some(Color::Yellow));
+        assert!(pricey.style.add_modifier.contains(Modifier::BOLD));
+
+        // 1k output tokens = $0.03 < $1 → plain.
+        let cheap = cost_span(&row(1_000));
+        assert_ne!(cheap.style.fg, Some(Color::Yellow));
+        assert!(!cheap.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -5988,6 +6721,200 @@ mod tests {
                 excerpt: None,
             },
         }
+    }
+
+    /// A completed request carrying `kind` + `excerpt`, for the UI-6 item-3
+    /// input-modal tests.
+    fn completed_with_excerpt(kind: Option<&str>, excerpt: &str) -> Completed {
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            kind: k,
+            excerpt: x,
+            ..
+        } = &mut entry.body
+        {
+            *k = kind.map(str::to_string);
+            *x = Some(excerpt.to_string());
+        }
+        entry
+    }
+
+    #[test]
+    fn input_line_offset_tracks_kind_presence(/* UI-6 item 3 */) {
+        // request, kind, input → the input line is the 3rd detail row (offset 2).
+        assert_eq!(
+            completed_input_line_offset(&completed_with_excerpt(Some("user"), "hi")),
+            Some(2)
+        );
+        // request, input → offset 1 when no kind line precedes it.
+        assert_eq!(
+            completed_input_line_offset(&completed_with_excerpt(None, "hi")),
+            Some(1)
+        );
+        // No excerpt → the entry has no clickable input line.
+        assert_eq!(
+            completed_input_line_offset(&completed_request(
+                1,
+                Some("claude"),
+                Some("claude-opus-4-8"),
+                1,
+                1,
+                200
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn wrapped_line_count_wraps_words_and_hard_splits(/* UI-6 item 3 */) {
+        // Three short words fit one 12-cell line.
+        assert_eq!(wrapped_line_count("aa bb cc", 12), 1);
+        // Two 6-cell words + a short one spill to a second line.
+        assert_eq!(wrapped_line_count("aaaaaa bbbbbb cc", 12), 2);
+        // Explicit newlines always break.
+        assert_eq!(wrapped_line_count("line1\nline2", 40), 2);
+        // A word wider than the line hard-splits across rows.
+        assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_charges_leading_whitespace(/* UI-6 item 3 MUST-FIX */) {
+        // Leading indentation occupies cells: "    " fills the 4-cell row, so the
+        // "x" wraps to a second row (ratatui `Wrap { trim: false }` renders the
+        // spaces). The old estimator dropped leading spaces and returned 1.
+        assert_eq!(wrapped_line_count("    x", 4), 2);
+        // A multi-line indented block = per-line manual cell math:
+        //   "    x"  → "    " (row) + "x" (row)        = 2 rows
+        //   "  yy"   → "  yy" is 4 cells, fits one row  = 1 row
+        assert_eq!(wrapped_line_count("    x\n  yy", 4), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_accounts_wide_chars(/* UI-6 item 3 MUST-FIX */) {
+        // 가 = 2 cells; at width 4 only two fit per row, so 5 of them need 3
+        // rows. Integer cell-width division would have said 2 (undercount).
+        assert_eq!(wrapped_line_count(&"가".repeat(5), 4), 3);
+        // Odd width where a 2-cell glyph cannot straddle the edge: width 3 holds
+        // exactly one 가 per row (2+2 > 3), so 3 가 = 3 rows.
+        assert_eq!(wrapped_line_count(&"가".repeat(3), 3), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_measures_multi_scalar_graphemes(/* UI-6 item 3 R2 MUST-FIX */) {
+        // "❤\u{FE0F}" (heart + VS16) is ONE grapheme that ratatui renders 2 cells
+        // wide; summing scalar widths (1 + 0) would undercount it as 1. Measured
+        // per cluster, 5 of them at width 4 = 2 clusters/row → 3 rows.
+        let heart = "\u{2764}\u{FE0F}".repeat(5);
+        assert_eq!(cell_width("\u{2764}\u{FE0F}"), 2, "VS16 cluster is 2 cells");
+        assert_eq!(wrapped_line_count(&heart, 4), 3);
+    }
+
+    #[test]
+    fn input_modal_tail_reachable_at_max_scroll(/* UI-6 item 3 MUST-FIX */) {
+        // Operator contract "전체 input을 볼 수 있도록": scrolling to the reported
+        // max must bring the LAST line of an indented, multi-line prompt on
+        // screen. A too-small max (leading-space undercount) would strand it.
+        let mut lines: Vec<String> = (0..40).map(|i| format!("    indented line {i}")).collect();
+        lines.push("    TAILMARKER_LAST".to_string());
+        let excerpt = lines.join("\n");
+        let entry = completed_with_excerpt(Some("user"), &excerpt);
+        let key = key_of(&entry);
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+
+        // First render: read back the reported max scroll for this modal size.
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.input_modal = Some(InputModal {
+            key: key.clone(),
+            scroll: 0,
+        });
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let max = hits
+            .expect("layout")
+            .input_modal_max_scroll
+            .expect("modal drawn");
+
+        // Scroll to the reported max and re-render: the tail line is on screen.
+        chrome.input_modal = Some(InputModal { key, scroll: max });
+        let text = render(&view, &chrome, 60, 24);
+        assert!(
+            text.contains("TAILMARKER_LAST"),
+            "the last prompt line must be reachable at max scroll (max={max})"
+        );
+    }
+
+    #[test]
+    fn clicking_input_line_opens_modal_showing_full_excerpt(/* UI-6 item 3 */) {
+        // A long excerpt that wraps well past one row proves the modal shows the
+        // FULL stored text, not the width-clipped activity row.
+        let excerpt = "가".repeat(600);
+        let entry = completed_with_excerpt(Some("user"), &excerpt);
+        let key = key_of(&entry);
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+
+        // Expand the entry and capture the hit layout: the input detail line is
+        // its OWN hit that resolves to OpenInput (not Entry).
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded_activity = Some(key.clone());
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let layout = hits.expect("layout recorded").activity;
+        let input_hit = layout
+            .hits
+            .iter()
+            .find(|h| h.kind == ActivityHitKind::InputLine)
+            .expect("the 🔍 input line is its own hit target");
+        assert_eq!(
+            hit_test_activity(&layout, layout.area.x + 8, input_hit.y_start),
+            Some(ActivityClick::OpenInput(key.clone())),
+            "clicking the input line opens the modal, never collapses the row"
+        );
+
+        // Open the modal and render: the box, its scroll/esc footer, and the
+        // excerpt text are all on screen.
+        chrome.input_modal = Some(InputModal { key, scroll: 0 });
+        let text = render(&view, &chrome, 200, 40);
+        assert!(
+            text.contains("scroll"),
+            "modal footer shows the scroll hint"
+        );
+        assert!(
+            text.contains("esc close"),
+            "modal footer shows the close hint"
+        );
+        assert!(text.contains('가'), "modal renders the excerpt text");
+    }
+
+    #[test]
+    fn input_modal_signals_close_when_entry_aged_out(/* UI-6 item 3 */) {
+        // A modal keyed to an entry no longer in `view.completed` draws nothing
+        // and reports `None` max-scroll → the runtime closes it gracefully.
+        let missing = key_of(&completed_with_excerpt(Some("user"), "gone"));
+        let view = view_with(Vec::new()); // empty ring
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.input_modal = Some(InputModal {
+            key: missing,
+            scroll: 0,
+        });
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        assert_eq!(
+            hits.expect("layout").input_modal_max_scroll,
+            None,
+            "aged-out entry yields the close signal"
+        );
     }
 
     #[test]
@@ -6922,6 +7849,7 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             effort: None,
             fast: false,
+            kind: None,
             started_at: UNIX_EPOCH,
         }];
         view.completed = vec![

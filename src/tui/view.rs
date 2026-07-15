@@ -73,6 +73,12 @@ pub(crate) struct DashboardView {
     /// paths (switch/remove target names) still address the pool correctly —
     /// masking happens strictly at the render sites in `ui.rs`.
     pub email_anonymous: bool,
+    /// Whether the TUI plays cosmetic animations (config `tui_effects`, carried
+    /// on the document, default ON): the effort-token rainbow marquee (`max`)
+    /// and the headline-model name gradient (`fable-5*`/`gpt-5.6-sol*`). When
+    /// off those tokens keep a distinct STATIC color+bold; working spinners
+    /// animate regardless (they predate this knob). Render-only gate.
+    pub tui_effects: bool,
     /// Whether the accounts table renders the model-scoped "Fable" weekly gauge
     /// (fable-usage U9a — config `show_fable_weekly`, default ON). Carried on
     /// the view so the one shared renderer honors it in both TUI backends;
@@ -277,6 +283,9 @@ impl DashboardView {
                 model: r.model.clone(),
                 effort: r.effort.clone(),
                 fast: r.fast,
+                // Kind rides the wire too (TUI UI-6 item 1) so the attached
+                // in-flight row shows the same aligned `kind` column.
+                kind: r.kind.clone(),
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -388,6 +397,7 @@ impl DashboardView {
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
+            tui_effects: doc.tui_effects,
             show_fable_weekly: doc.show_fable_weekly,
             domain_abbrev: doc.domain_abbrev.clone(),
             quota_display: doc.quota_display,
