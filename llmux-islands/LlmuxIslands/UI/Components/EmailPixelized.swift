@@ -28,7 +28,22 @@ struct EmailPixelized<Content: View>: View {
     /// Snapshot invalidation key: pass the rendered string so a changed email
     /// re-renders the mosaic.
     let cacheKey: String
+    /// Privacy-safe fallback retained in the accessibility tree while the
+    /// visible email glyphs are mosaiced.
+    let accessibilityLabel: String
     @ViewBuilder let content: () -> Content
+
+    init(
+        isActive: Bool,
+        cacheKey: String,
+        accessibilityLabel: String = "Private account",
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.isActive = isActive
+        self.cacheKey = cacheKey
+        self.accessibilityLabel = accessibilityLabel
+        self.content = content
+    }
 
     var body: some View {
         if isActive {
@@ -39,7 +54,8 @@ struct EmailPixelized<Content: View>: View {
                         PixelizedSnapshot(size: proxy.size, cacheKey: cacheKey, content: content)
                     }
                 )
-                .accessibilityHidden(true)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibilityLabel)
         } else {
             content()
         }

@@ -1,0 +1,6 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons">
+    <file alias="io.twolab.LlmuxIslands.svg">icons/io.twolab.LlmuxIslands.svg</file>
+  </qresource>
+</RCC>

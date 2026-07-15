@@ -15,7 +15,33 @@ The app does not read `~/.config/llmux.json`, does not touch provider credential
 Llmux Islands [mascot] [Claude activity] [Codex activity]
 ```
 
-Activity counters are hidden when the count is zero. When one or more sessions are active, the indicator animates with a rainbow loop; the mascot makes a small jump whose speed scales with activity up to the capped high-activity state.
+Activity counters are hidden when the count is zero. When one or more sessions
+are active, the indicator animates with a rainbow loop; the mascot makes a
+small jump whose speed scales with activity up to the capped high-activity
+state.
+
+## Native presentation boundaries
+
+The shells share semantic state and behavior, not a cross-platform widget tree.
+
+- macOS retains the shipped SwiftUI/AppKit presentation from before the UI
+  renewal: the colored quota mosaic, rounded account tiles, Statistics surface,
+  and native menu hierarchy. Receipt metadata remains available in Statistics.
+- KDE uses a black canvas, white opacity tiers, square controls, and equal-width
+  data grids. Buttons, fields, selectors, switches, and labels follow one 32px
+  control row and the exact 4/8px alignment rhythm documented in the port's
+  `design.md`.
+
+On KDE, credential metadata, secondary quota windows, analytics detail, request
+receipts, daemon configuration, events, maintenance, diagnostics, and build
+metadata live in a labelled, local-only **Advanced** disclosure. Offline,
+authentication, warning, failure, and destructive-confirmation states are
+never hidden there. macOS intentionally keeps its original information
+hierarchy rather than copying this Linux disclosure.
+
+Privacy masking, actions, and receipts come from the shared Rust UI state on
+both platforms. Opening Linux Advanced does not dispatch an action, touch the
+daemon, or persist state.
 
 ## Requirements
 

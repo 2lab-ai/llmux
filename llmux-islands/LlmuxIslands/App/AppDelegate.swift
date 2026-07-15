@@ -39,9 +39,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Task { @MainActor in
-            // Make the app self-sufficient: start the local llmux daemon in the
-            // background if it isn't already running, then begin polling it.
-            await DaemonLauncher.ensureRunning()
+            // `app_started` is the single startup input. Its Rust effects
+            // ensure a configured loopback HTTP daemon before the first
+            // dashboard request, while remote configurations skip local
+            // process work.
             IslandUsageModel.shared.start()
         }
     }

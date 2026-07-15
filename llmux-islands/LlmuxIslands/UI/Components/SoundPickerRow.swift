@@ -73,8 +73,10 @@ struct SoundPickerRow: View {
                                 if let soundName = sound.soundName {
                                     NSSound(named: soundName)?.play()
                                 }
-                                selectedSound = sound
-                                AppSettings.notificationSound = sound
+                                Task {
+                                    await IslandUsageModel.shared.selectSound(sound)
+                                    selectedSound = AppSettings.notificationSound
+                                }
                             }
                         }
                     }

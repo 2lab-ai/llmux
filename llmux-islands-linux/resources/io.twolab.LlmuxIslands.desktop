@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=llmux Islands
+GenericName=LLM proxy dashboard
+Comment=Monitor and control llmux accounts and request receipts
+Exec=llmux-islands-linux
+Icon=io.twolab.LlmuxIslands
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=io.twolab.LlmuxIslands
+X-KDE-FormFactor=desktop

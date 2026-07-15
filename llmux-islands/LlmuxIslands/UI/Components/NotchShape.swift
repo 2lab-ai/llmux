@@ -114,6 +114,7 @@ struct NotchShape: Shape {
     }
 }
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview {
     VStack(spacing: 20) {
         // Closed state
@@ -129,3 +130,4 @@ struct NotchShape: Shape {
     .padding(20)
     .background(Color.gray.opacity(0.3))
 }
+#endif
