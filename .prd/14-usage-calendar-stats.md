@@ -12,8 +12,11 @@ The dashboard answered "which model is consuming quota" cumulatively
 (`.prd/10-model-usage-dashboard.md`) and over trailing 24h/72h windows, but not
 the operator's billing-shaped question: **what did each model cost per hour /
 day / month, read like a ledger** (the Anthropic Console usage page, in the
-TUI). The data already existed — `activity.jsonl` persists every finished
-request (ts, group, model, four token classes) with no retention limit.
+TUI). The data already existed — `activity.jsonl` keeps a best-effort record
+of finished requests (ts, group, model, four token classes) with no retention
+limit; the append runs on the CONSUMER side of the lossy `try_send` activity
+channel (`DashboardHub::apply_event`), so a dropped event is absent from both
+the live fold and the file.
 
 ## Decisions
 
