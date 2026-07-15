@@ -560,7 +560,7 @@ pub struct IdleProbeConfig {
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
     /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
-    /// (issue #45), seconds. Default 3600 (hourly — one tick per default
+    /// (issue #45), seconds. Default 900 (15 min — one tick per default
     /// cooldown). `0` disables the sweep entirely; the probe then stays purely
     /// on-demand. When `> 0` and `enabled = true`, a background task probes
     /// every cold account every `sweep_secs` seconds, reusing the same
@@ -569,6 +569,17 @@ pub struct IdleProbeConfig {
     /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
     #[serde(default = "default_idle_probe_sweep_secs")]
     pub sweep_secs: u64,
+    /// Age (seconds) past which an account's freshest 5h/7d observation counts
+    /// as STALE and the account becomes probe-eligible again (Z 2026-07-15:
+    /// cold subscriptions must keep refreshing, not freeze at their last
+    /// reading). Before this knob an account was probed only while it had NO
+    /// window at all, so one successful probe froze its display forever unless
+    /// real traffic or the oauth poller touched it — codex/apikey accounts
+    /// have no poller, so their gauges went permanently stale. Default 900
+    /// (15 min). `0` disables staleness re-probing (windowless-only, the old
+    /// behavior).
+    #[serde(default = "default_idle_probe_stale_after_secs")]
+    pub stale_after_secs: u64,
 }
 
 impl Default for IdleProbeConfig {
@@ -577,6 +588,7 @@ impl Default for IdleProbeConfig {
             enabled: default_true(),
             per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
             sweep_secs: default_idle_probe_sweep_secs(),
+            stale_after_secs: default_idle_probe_stale_after_secs(),
         }
     }
 }
@@ -964,18 +976,26 @@ fn default_refresh_ahead_secs() -> u64 {
     7 * 3600
 }
 
-/// Default per-account idle-probe cooldown: 1 hour. Conservative — an idle
-/// account is probed at most once an hour even when probing is enabled.
+/// Default per-account idle-probe cooldown: 15 min — one probe per tick of
+/// the default sweep, so cold gauges refresh continuously (Z 2026-07-15)
+/// while cost stays bounded at four 1-token probes per account per hour.
 fn default_idle_probe_cooldown_secs() -> u64 {
-    3600
+    900
 }
 
-/// Default idle-probe timer-sweep cadence: hourly (issue #45's always-on
-/// mandate) — one tick per default `per_account_cooldown_secs`, so the steady
-/// state is at most one 1-token probe per cold account per hour, and none once
-/// the account has a window.
+/// Default idle-probe timer-sweep cadence: 15 min (issue #45's always-on
+/// mandate, tightened for the staleness re-probe) — one tick per default
+/// `per_account_cooldown_secs`, so the steady state is at most one 1-token
+/// probe per cold account per tick.
 fn default_idle_probe_sweep_secs() -> u64 {
-    3600
+    900
+}
+
+/// Default idle-probe staleness horizon: 15 min. An account whose freshest
+/// window observation is older than this is probed again on the next
+/// sweep/on-demand trigger, so cold subscriptions keep live gauges.
+fn default_idle_probe_stale_after_secs() -> u64 {
+    900
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).
