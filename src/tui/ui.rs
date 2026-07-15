@@ -886,18 +886,20 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
     }
 
     // Period totals for the title: every bucket of the selected granularity,
-    // all four token classes (same reasoning as `model_total`). Unpriced rows
-    // contribute no cost — the total is qualified so it can't read as "all
-    // traffic priced" when a rate is missing (review R1 MUST-FIX 3).
+    // all four token classes (same reasoning as `model_total`). Rows without
+    // a USABLE cost (unpriced — or an invalid amount from a pathological
+    // pricing override, review R2) contribute nothing to the sum and QUALIFY
+    // it, so a total can never read as "all traffic priced" while it
+    // silently dropped (or was reduced by) a component.
     let total_cost: f64 = buckets
         .iter()
         .flat_map(|(_, _, g)| g.iter())
-        .map(|r| r.cost_usd)
+        .filter_map(|r| usage_cost_valid(r))
         .sum();
     let any_unpriced = buckets
         .iter()
         .flat_map(|(_, _, g)| g.iter())
-        .any(|r| !r.priced);
+        .any(|r| usage_cost_valid(r).is_none());
     let total_tokens: u64 = buckets
         .iter()
         .flat_map(|(_, _, g)| g.iter())
@@ -924,18 +926,23 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         // ONE accumulator pass per bucket (review CR): six parallel `.sum()`
         // sweeps were six lines nothing forced to stay in step with the
         // columns rendered below them.
+        // A row without a USABLE cost (unpriced, or an invalid amount) adds
+        // nothing to the bucket total and flips the `+?` qualifier — a
+        // negative component must not silently reduce a total that then
+        // reads as fully priced (review R2 MUST-FIX).
         let (requests, tokens_in, tokens_out, cache_read, cache_creation, cost, bucket_unpriced) =
             group.iter().fold(
                 (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, false),
                 |(req, ti, to, cr, cc, cost, unpriced), r| {
+                    let valid = usage_cost_valid(r);
                     (
                         req.saturating_add(r.requests),
                         ti.saturating_add(r.tokens_in),
                         to.saturating_add(r.tokens_out),
                         cr.saturating_add(r.cache_read),
                         cc.saturating_add(r.cache_creation),
-                        cost + r.cost_usd,
-                        unpriced || !r.priced,
+                        cost + valid.unwrap_or(0.0),
+                        unpriced || valid.is_none(),
                     )
                 },
             );
@@ -948,11 +955,11 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(tokens_out)),
                 Cell::from(format::human_count(cache_read)),
                 Cell::from(format::human_count(cache_creation)),
-                Cell::from(format!(
-                    "{}{}",
-                    format_cost(cost),
-                    if bucket_unpriced { "+?" } else { "" }
-                )),
+                usage_cost_cell(
+                    Some(cost),
+                    UsageCostTier::Total,
+                    if bucket_unpriced { "+?" } else { "" },
+                ),
             ])
             .style(Style::new().add_modifier(Modifier::BOLD)),
         );
@@ -975,13 +982,10 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(m.tokens_out)),
                 Cell::from(format::human_count(m.cache_read)),
                 Cell::from(format::human_count(m.cache_creation)),
-                // "no rate known" renders as an explicit dash — a fabricated
-                // $0.0000 would read as "free" (review R1 MUST-FIX 3).
-                Cell::from(if m.priced {
-                    format_cost(m.cost_usd)
-                } else {
-                    "—".to_string()
-                }),
+                // "no rate known" (or an invalid amount) renders as an
+                // explicit dash — a fabricated $0.0000 would read as "free"
+                // (review R1 MUST-FIX 3 / R2 MUST-FIX).
+                usage_cost_cell(usage_cost_valid(m), UsageCostTier::Detail, ""),
             ]));
         }
     }
@@ -997,7 +1001,7 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
     let table = Table::new(trows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
@@ -1013,6 +1017,115 @@ fn usage_row_tokens(r: &&crate::dashboard::UsageStatDoc) -> u64 {
         .saturating_add(r.tokens_out)
         .saturating_add(r.cache_read)
         .saturating_add(r.cache_creation)
+}
+
+/// A usage row's cost when it is USABLE for display arithmetic: priced AND
+/// finite AND non-negative (a pathological config `pricing` override can
+/// push a negative rate through the doc build). `None` = the row renders
+/// the honesty dash AND every aggregate that would have included it carries
+/// the `+?` / `(+unpriced)` qualifier — validated per COMPONENT, before
+/// aggregation, so an invalid term can't hide inside a plausible-looking
+/// sum (review R2 MUST-FIX).
+fn usage_cost_valid(r: &crate::dashboard::UsageStatDoc) -> Option<f64> {
+    (r.priced && r.cost_usd.is_finite() && r.cost_usd >= 0.0).then_some(r.cost_usd)
+}
+
+/// Which display tier a Usage-table cost amount belongs to (ledger polish):
+/// bucket totals read at full strength, per-model detail rows a tier darker
+/// so the eye lands on the totals first (weight-hierarchy).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UsageCostTier {
+    Total,
+    Detail,
+}
+
+/// Width of the integer part of a Usage cost amount ("999,999" — six years
+/// of this daemon's heaviest month fits). Fixing this width is what anchors
+/// the DECIMAL POINT to one column for every row (number-tabular): amounts
+/// align like a ledger instead of drifting with their magnitude.
+const USAGE_COST_INT_WIDTH: usize = 7;
+/// `$` + integer part + `.` + up to 4 fraction digits + `+?` marker.
+const USAGE_COST_COL_WIDTH: u16 = (1 + USAGE_COST_INT_WIDTH as u16) + 1 + 4 + 2;
+
+/// One Usage-table cost cell (usage-stats ledger polish). `None` = no rate
+/// known → an explicit `—` at the ones column, never a fabricated $0.
+///
+/// Financial-display conventions, adapted to the terminal:
+/// - the decimal point sits at a FIXED column (integer part right-aligned in
+///   [`USAGE_COST_INT_WIDTH`], with thousands separators) so a column of
+///   amounts scans like a ledger;
+/// - digits ABOVE the point carry the emphasis, digits BELOW it render a
+///   tier dimmer (the eye reads dollars first, cents on demand), and the
+///   `$` sign is quieter than both;
+/// - sub-dollar amounts keep 4 fraction digits (per-request costs stay
+///   legible), dollar-plus amounts keep 2 — the point column never moves.
+fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell<'static> {
+    let (int_style, frac_style) = match tier {
+        UsageCostTier::Total => (Style::new(), Style::new().fg(Color::DarkGray)),
+        UsageCostTier::Detail => (
+            Style::new().fg(Color::DarkGray),
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        ),
+    };
+    // The `$` sign sits at the QUIETEST tier — never louder than the
+    // fraction (on Detail rows the fraction is already at the floor, so
+    // they share it).
+    let sign_style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    // No rate known — or an INVALID amount (negative / non-finite, reachable
+    // through a pathological config `pricing` override) — renders as the
+    // explicit dash: invalid data must never dress up as a credible $0
+    // (review R1 MUST-FIX, same honesty contract as `priced: false`). The
+    // dash lands where the ones digit would be, keeping the ledger column.
+    let cost = cost.filter(|c| c.is_finite() && *c >= 0.0);
+    let Some(cost) = cost else {
+        return Cell::from(Line::from(vec![
+            Span::raw(" ".repeat(1 + USAGE_COST_INT_WIDTH - 1)),
+            Span::styled("—", frac_style),
+        ]));
+    };
+    let (int_part, frac) = usage_cost_parts(cost);
+    Cell::from(Line::from(vec![
+        Span::raw(" ".repeat(USAGE_COST_INT_WIDTH.saturating_sub(int_part.len()))),
+        Span::styled("$", sign_style),
+        Span::styled(int_part, int_style),
+        Span::styled(format!("{frac}{marker}"), frac_style),
+    ]))
+}
+
+/// Split a non-negative cost into its grouped integer part and its fraction
+/// string. Integer arithmetic on the rounded sub-units so a carry can't
+/// produce an 11-character fraction (0.99999 must render `("1", ".00")`,
+/// not `("0", ".10000")`); sub-dollar amounts keep 4 fraction digits,
+/// dollar-plus amounts 2. Grouped integers past [`USAGE_COST_INT_WIDTH`]
+/// keep rendering, merely unaligned — alignment is guaranteed up to
+/// $999,999 per bucket.
+fn usage_cost_parts(cost: f64) -> (String, String) {
+    let (dollars, frac) = if cost < 0.995 {
+        let tenths_of_mill = (cost * 10_000.0).round() as u64;
+        (
+            tenths_of_mill / 10_000,
+            format!(".{:04}", tenths_of_mill % 10_000),
+        )
+    } else {
+        let cents = (cost * 100.0).round() as u64;
+        (cents / 100, format!(".{:02}", cents % 100))
+    };
+    (group_thousands(dollars), frac)
+}
+
+/// `1234567` → `"1,234,567"` — plain thousands grouping for ledger integer
+/// parts ([`format::human_count`] compresses to `1.2M`, which a cost column
+/// must not do).
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
@@ -5016,11 +5129,25 @@ mod tests {
                 r.priced = false;
                 r
             },
+            // A thousands-magnitude bucket (LAST so day rows stay bucket-
+            // adjacent, as the document guarantees): the ledger column must
+            // render a comma separator AND keep its decimal point on the
+            // same column as the small amounts (usage-cost ledger polish).
+            usage_row(
+                "day",
+                19_998,
+                "2024-10-02",
+                "claude",
+                "opus-x",
+                10,
+                10,
+                1_234.499,
+            ),
         ];
         let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
         assert!(text.contains("usage — daily"), "title shows granularity");
-        assert!(text.contains("2 buckets"), "title counts day buckets only");
-        assert!(text.contains("$2.50"), "title sums the day costs");
+        assert!(text.contains("3 buckets"), "title counts day buckets only");
+        assert!(text.contains("$1237.00"), "title sums the day costs");
         assert!(
             text.contains("(+unpriced)"),
             "title qualifies unpriced usage"
@@ -5036,6 +5163,157 @@ mod tests {
         );
         assert!(text.contains("misc/mystery"), "unpriced model row rendered");
         assert!(!text.contains("10-04 09h"), "hourly rows stay out of daily");
+
+        // Ledger polish (usage-cost): thousands separator + the decimal
+        // point anchored to ONE column for every amount, whatever its
+        // magnitude — and the unpriced dash sits in the same column.
+        assert!(text.contains("$1,234.50"), "thousands separator rendered");
+        let dot_col = |needle: &str| {
+            let line = text
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("line with {needle:?}"));
+            line.char_indices()
+                .filter(|(_, c)| *c == '.')
+                .map(|(i, _)| i)
+                .next_back()
+                .unwrap_or_else(|| panic!("cost dot in {needle:?} line"))
+        };
+        let small = dot_col("codex/gpt-5.5"); // $0.50 detail row
+        assert_eq!(dot_col("$1.25"), small, "detail amounts align");
+        assert_eq!(dot_col("$1,234.50"), small, "comma amount aligns");
+        assert_eq!(dot_col("$0.7500+?"), small, "marker doesn't shift the dot");
+    }
+
+    /// Ledger number splitting (usage-cost polish): carry-safe rounding,
+    /// the sub-dollar 4-digit fraction, and thousands grouping.
+    #[test]
+    fn usage_cost_parts_carry_grouping_and_subdollar_precision() {
+        assert_eq!(usage_cost_parts(0.99999), ("1".into(), ".00".into()));
+        assert_eq!(usage_cost_parts(0.0076), ("0".into(), ".0076".into()));
+        assert_eq!(usage_cost_parts(0.0), ("0".into(), ".0000".into()));
+        assert_eq!(usage_cost_parts(1.25), ("1".into(), ".25".into()));
+        assert_eq!(usage_cost_parts(1_234.499), ("1,234".into(), ".50".into()));
+        assert_eq!(
+            usage_cost_parts(1_234_567.891),
+            ("1,234,567".into(), ".89".into())
+        );
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+    }
+
+    /// An invalid amount (negative rate via a pathological config `pricing`
+    /// override, or non-finite) must render the honesty dash, never a
+    /// credible-looking $0 — and in a MIXED bucket it must not reduce the
+    /// bucket/title totals, which instead carry the `+?` / `(+unpriced)`
+    /// qualifiers (review R2 MUST-FIX: validated per component, before
+    /// aggregation).
+    #[test]
+    fn usage_overlay_invalid_cost_renders_dash_and_qualifies_totals() {
+        let mut view = view_with(vec![]);
+        let mut neg = usage_row("day", 20_000, "2024-10-04", "claude", "neg-x", 10, 5, -0.42);
+        neg.priced = true;
+        view.usage_stats = vec![
+            usage_row("day", 20_000, "2024-10-04", "claude", "ok-x", 20, 10, 1.0),
+            neg,
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(text.contains("claude/neg-x"), "invalid row rendered");
+        assert!(
+            !text.contains("$0.0000") && !text.contains("$0.58"),
+            "negative component neither dresses up as free nor nets the sum"
+        );
+        assert!(
+            text.contains("$1.00+?"),
+            "bucket total = valid components only, qualified"
+        );
+        assert!(
+            text.contains("(+unpriced)"),
+            "title total qualified by the invalid component"
+        );
+        let model_line = text
+            .lines()
+            .find(|l| l.contains("claude/neg-x"))
+            .expect("model line");
+        assert!(model_line.contains('—'), "invalid cost renders the dash");
+    }
+
+    /// The ledger style tiers survive rendering (review R2 nice-to-have —
+    /// the one-time ANSI capture can't catch regressions): `$` at the
+    /// quietest tier on both rows; total-row integer digits at full
+    /// strength with a DarkGray fraction; detail-row integer digits
+    /// DarkGray with a DIM fraction.
+    #[test]
+    fn usage_cost_cells_carry_style_tiers() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![usage_row(
+            "day",
+            20_000,
+            "2024-10-04",
+            "claude",
+            "opus-x",
+            1_000,
+            200,
+            994.99,
+        )];
+        let chrome = chrome_overlay(Overlay::Usage);
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let w = 160usize;
+        let text_row = |y: usize| {
+            (0..w)
+                .map(|x| buf.content()[y * w + x].symbol())
+                .collect::<String>()
+        };
+        let style_at = |x: usize, y: usize| buf.content()[y * w + x].style();
+        let mut total_y = None;
+        let mut detail_y = None;
+        for y in 0..30 {
+            let t = text_row(y);
+            if t.contains("1 models") {
+                total_y = Some(y);
+            }
+            if t.contains("claude/opus-x") {
+                detail_y = Some(y);
+            }
+        }
+        let (total_y, detail_y) = (total_y.expect("total row"), detail_y.expect("detail row"));
+        // These rows are pure ASCII, so byte columns == cell columns.
+        let dollar = |y: usize| text_row(y).find('$').expect("dollar column");
+        let dot = |y: usize| text_row(y).rfind('.').expect("cost dot");
+
+        for y in [total_y, detail_y] {
+            let s = style_at(dollar(y), y);
+            assert_eq!(s.fg, Some(Color::DarkGray), "$ color, row {y}");
+            assert!(s.add_modifier.contains(Modifier::DIM), "$ dim, row {y}");
+        }
+        let t_int = style_at(dollar(total_y) + 1, total_y);
+        assert_ne!(
+            t_int.fg,
+            Some(Color::DarkGray),
+            "total integer digits at full strength"
+        );
+        let t_frac = style_at(dot(total_y) + 1, total_y);
+        assert_eq!(t_frac.fg, Some(Color::DarkGray), "total fraction darker");
+        assert!(!t_frac.add_modifier.contains(Modifier::DIM));
+        let d_int = style_at(dollar(detail_y) + 1, detail_y);
+        assert_eq!(
+            d_int.fg,
+            Some(Color::DarkGray),
+            "detail integer a tier down"
+        );
+        assert!(!d_int.add_modifier.contains(Modifier::DIM));
+        let d_frac = style_at(dot(detail_y) + 1, detail_y);
+        assert_eq!(d_frac.fg, Some(Color::DarkGray), "detail fraction darkest");
+        assert!(
+            d_frac.add_modifier.contains(Modifier::DIM),
+            "detail fraction dim"
+        );
     }
 
     /// With no usage rows for the selected granularity the overlay shows the
