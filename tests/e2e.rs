@@ -1599,6 +1599,100 @@ async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Respons
     request.send().await.expect("dashboard reachable")
 }
 
+/// A driven request is captured to raw-io (bodies + headers with credential
+/// values redacted) and `GET /llmux/raw-io?id=&at_ms=` serves it back — the
+/// raw request/response viewer's data path (TUI UI-7), proven end to end:
+/// forward capture → jsonl → backwards lookup → endpoint.
+#[tokio::test]
+async fn raw_io_endpoint_serves_the_captured_exchange() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok_with(
+        r#"{"id":"msg_raw","type":"message","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        (0.20, 3_600),
+        (0.20, 12 * 3_600),
+    ));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"model":"claude-opus-4-8"}"#).await;
+    assert_eq!(response.status(), 200);
+
+    // Read the completed entry's (id, at_ms) — the raw-io correlation pair the
+    // TUI clicks with — off the dashboard document.
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"]
+                .as_u64()
+                .expect("completed entries carry the id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "the completed doc entry carries a live activity id");
+
+    // The endpoint returns the captured exchange for that (id, at_ms) pair.
+    let raw: serde_json::Value = client
+        .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable")
+        .error_for_status()
+        .expect("raw-io 200")
+        .json()
+        .await
+        .expect("raw-io json");
+    assert_eq!(raw["id"].as_u64(), Some(id));
+    assert!(
+        raw["request_body"]
+            .as_str()
+            .expect("request body")
+            .contains("claude-opus-4-8"),
+        "verbatim request body served: {raw}"
+    );
+    assert!(
+        raw["response_body"]
+            .as_str()
+            .expect("response body")
+            .contains("msg_raw"),
+        "response body as delivered to the client: {raw}"
+    );
+    // Request headers captured in wire order; the client credential value is
+    // REDACTED while its name stays visible.
+    let req_headers = raw["request_headers"].as_array().expect("request headers");
+    let header = |n: &str| {
+        req_headers
+            .iter()
+            .find(|p| p[0] == n)
+            .map(|p| p[1].as_str().unwrap().to_string())
+    };
+    assert_eq!(header("content-type").as_deref(), Some("application/json"));
+    assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+    assert_eq!(header("x-api-key").as_deref(), Some("•••redacted"));
+    assert!(
+        raw["response_headers"].as_array().is_some(),
+        "response headers captured: {raw}"
+    );
+
+    // An unknown id (or an id from another daemon run's window) is a 404.
+    let miss = client
+        .get(proxy.url(&format!("/llmux/raw-io?id=777777&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable");
+    assert_eq!(miss.status(), 404);
+}
+
 /// The dashboard endpoint serves a status superset: accounts in selection
 /// order, the meta fields (version/pid/port/uptime/upstream/config_path),
 /// the activity tail (a driven request shows up as completed), the scheduler

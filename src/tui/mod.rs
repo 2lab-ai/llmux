@@ -368,6 +368,10 @@ pub(crate) struct Chrome {
     /// the stored key every frame, so it works identically in local and attach
     /// mode and closes gracefully when the entry ages out of the ring.
     pub input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7), or `None` when
+    /// closed. Content-owning (cheap to clone — the body lines sit behind an
+    /// `Arc`), drawn last like the input modal.
+    pub raw_modal: Option<RawModal>,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -378,6 +382,54 @@ pub(crate) struct Chrome {
 pub(crate) struct InputModal {
     pub key: activity::ActivityKey,
     pub scroll: u16,
+}
+
+/// Which tab of the raw request/response viewer (UI-7) is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawTab {
+    Request,
+    Response,
+}
+
+/// Content state of the raw viewer: the fetch is asynchronous (a backwards
+/// scan of a possibly-huge `raw-io.jsonl`, or an HTTP round-trip in attach
+/// mode), so the modal opens Loading and resolves to Ready/Failed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RawModalState {
+    Loading,
+    Failed(String),
+    /// Prebuilt per-tab lines behind an `Arc` — `Chrome` is cloned every
+    /// frame, and a Ready body can be megabytes of styled lines.
+    Ready(std::sync::Arc<ui::RawContent>),
+}
+
+/// The click-opened raw request/response viewer (UI-7). Unlike [`InputModal`]
+/// it owns its content (fetched once) — it never goes stale and survives the
+/// entry aging out of the activity ring.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawModal {
+    pub key: activity::ActivityKey,
+    pub title: String,
+    pub tab: RawTab,
+    pub scroll: u16,
+    /// Animation frame for the Loading spinner (advances with the shared tick).
+    pub spin: usize,
+    pub state: RawModalState,
+}
+
+/// A queued raw-record fetch: the clicked entry's stable key (its `at_ms` is
+/// the timestamp half of the raw-io lookup), the activity id, and the general
+/// metadata lines prebuilt from the entry at open time.
+struct RawFetchReq {
+    key: activity::ActivityKey,
+    id: u64,
+    general: Vec<ratatui::text::Line<'static>>,
+}
+
+/// Result of a background raw fetch, delivered on the raw channel.
+struct RawLoad {
+    key: activity::ActivityKey,
+    result: Result<std::sync::Arc<ui::RawContent>, String>,
 }
 
 /// Attach-mode banner state.
@@ -587,6 +639,14 @@ struct App {
     /// scroll offset is clamped after each draw against the wrapped line count
     /// the render pass reports (`MainChrome::input_modal_max_scroll`).
     input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7); `None` when closed.
+    raw_modal: Option<RawModal>,
+    /// A queued raw-record fetch, drained by the event loop into a background
+    /// task (same pattern as the other `pending_*` remote ops).
+    pending_raw: Option<RawFetchReq>,
+    /// Sender the background raw fetch delivers its [`RawLoad`] on; installed
+    /// by the event loop (mirrors `sessions_tx`).
+    raw_tx: Option<mpsc::Sender<RawLoad>>,
 }
 
 impl App {
@@ -632,6 +692,9 @@ impl App {
             usage_gran: activity::UsageGran::default(),
             usage_scroll: 0,
             input_modal: None,
+            raw_modal: None,
+            pending_raw: None,
+            raw_tx: None,
             reset_absolute: false,
         }
     }
@@ -834,6 +897,12 @@ impl App {
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
             input_modal: self.input_modal.clone(),
+            // The Loading spinner rides the shared frame counter (set here so
+            // the stored modal itself never needs a per-tick mutation).
+            raw_modal: self.raw_modal.clone().map(|mut m| {
+                m.spin = self.frame;
+                m
+            }),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -897,6 +966,11 @@ impl App {
             self.on_key_input_modal(key.code);
             return;
         }
+        // The raw viewer (UI-7) swallows keys the same way when open.
+        if self.raw_modal.is_some() {
+            self.on_key_raw_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -944,6 +1018,15 @@ impl App {
             match mouse.kind {
                 MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(1),
                 MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(1),
+                _ => {}
+            }
+            return true;
+        }
+        // The raw viewer (UI-7) owns the mouse the same way when open.
+        if let Some(modal) = self.raw_modal.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(3),
                 _ => {}
             }
             return true;
@@ -1069,6 +1152,12 @@ impl App {
                         self.open_input_modal(key);
                         true
                     }
+                    // Clicking the `🔍 request` detail line opens the raw
+                    // request/response viewer (UI-7).
+                    Some(ui::ActivityClick::OpenRaw(key)) => {
+                        self.open_raw_modal(key, view);
+                        true
+                    }
                     Some(ui::ActivityClick::Entry(key)) => {
                         self.toggle_expand(key);
                         true
@@ -1163,6 +1252,179 @@ impl App {
             KeyCode::End => modal.scroll = u16::MAX,
             _ => {}
         }
+    }
+
+    /// Open the raw request/response viewer (UI-7) on the clicked entry: build
+    /// the title + general metadata from the entry NOW (it may age out of the
+    /// ring while we fetch), queue the background raw-io lookup, and show the
+    /// modal in its Loading state. An entry from a pre-UI-7 daemon (`id == 0`)
+    /// fails immediately — there is no raw correlation key to look up.
+    fn open_raw_modal(&mut self, key: activity::ActivityKey, view: Option<&DashboardView>) {
+        let entry = view.and_then(|v| {
+            v.completed
+                .iter()
+                .find(|c| c.activity_key().as_ref() == Some(&key))
+                .cloned()
+        });
+        let Some(entry) = entry else {
+            return; // row vanished between draw and click — nothing to open
+        };
+        let activity::CompletedBody::Request { id, .. } = entry.body else {
+            return;
+        };
+        let title = format!(
+            " 🔍 raw — {} {} · {} · {} ",
+            key.method,
+            key.path,
+            key.status,
+            format::clock_hms_utc(entry.at),
+        );
+        let state = if id == 0 {
+            RawModalState::Failed(
+                "no raw link: this entry was recorded by a daemon predating the raw viewer"
+                    .to_string(),
+            )
+        } else {
+            self.pending_raw = Some(RawFetchReq {
+                key: key.clone(),
+                id,
+                general: ui::raw_general_lines(&entry),
+            });
+            RawModalState::Loading
+        };
+        self.raw_modal = Some(RawModal {
+            key,
+            title,
+            tab: RawTab::Request,
+            scroll: 0,
+            spin: 0,
+            state,
+        });
+    }
+
+    /// Key handling while the raw viewer is open (UI-7): Esc/q/Enter close,
+    /// ←/→/Tab/h/l switch tabs (scroll resets — the tabs have independent
+    /// lengths), arrows/PgUp/PgDn/Home/End scroll. Everything else is
+    /// swallowed so nothing leaks beneath the modal.
+    fn on_key_raw_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.raw_modal = None,
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
+                modal.tab = match modal.tab {
+                    RawTab::Request => RawTab::Response,
+                    RawTab::Response => RawTab::Request,
+                };
+                modal.scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    /// Drain the queued raw fetch (event-loop side of [`Self::open_raw_modal`]).
+    fn take_pending_raw(&mut self) -> Option<RawFetchReq> {
+        self.pending_raw.take()
+    }
+
+    /// Resolve a delivered raw load into the open modal. Ignored when the modal
+    /// was closed or re-targeted while the fetch ran (stale delivery).
+    fn apply_raw_load(&mut self, load: RawLoad) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            if modal.key == load.key && matches!(modal.state, RawModalState::Loading) {
+                modal.state = match load.result {
+                    Ok(content) => RawModalState::Ready(content),
+                    Err(msg) => RawModalState::Failed(msg),
+                };
+            }
+        }
+    }
+
+    /// Spawn the background raw-record fetch for `req` and deliver the result
+    /// on the raw channel (never blocks the event loop — the local path is a
+    /// backwards file scan on the blocking pool, the attach path an HTTP GET to
+    /// `GET /llmux/raw-io`). Content lines are built in the task too: a Ready
+    /// body can be megabytes.
+    fn spawn_raw_fetch(&mut self, req: RawFetchReq) {
+        let Some(tx) = self.raw_tx.clone() else {
+            return;
+        };
+        let RawFetchReq { key, id, general } = req;
+        let at_ms = key.at_ms;
+        enum Source {
+            Local(Option<std::path::PathBuf>),
+            Remote {
+                client: reqwest::Client,
+                url: String,
+                api_key: Option<String>,
+            },
+        }
+        let source = match &self.backend {
+            Backend::Local(state) => Source::Local(
+                state
+                    .config
+                    .raw_io
+                    .enabled
+                    .then(|| state.raw_io_path.clone())
+                    .flatten(),
+            ),
+            Backend::Remote(remote) => Source::Remote {
+                client: remote.client.clone(),
+                url: format!("{}/llmux/raw-io?id={id}&at_ms={at_ms}", remote.base_url),
+                api_key: remote.api_key.clone(),
+            },
+        };
+        tokio::spawn(async move {
+            let not_found = || {
+                "no raw-io record for this request (capture disabled, pruned, or the daemon \
+                 restarted since)"
+                    .to_string()
+            };
+            let record = match source {
+                Source::Local(path) => tokio::task::spawn_blocking(move || {
+                    crate::proxy::raw_io::find_record(path.as_deref(), id, at_ms)
+                })
+                .await
+                .map_err(|err| format!("raw lookup task failed: {err}"))
+                .and_then(|found| found.ok_or_else(not_found)),
+                Source::Remote {
+                    client,
+                    url,
+                    api_key,
+                } => {
+                    let mut request = client.get(&url);
+                    if let Some(k) = &api_key {
+                        request = request.header("x-api-key", k);
+                    }
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .json::<crate::proxy::raw_io::RawIoRecord>()
+                            .await
+                            .map_err(|err| format!("raw-io response parse failed: {err}")),
+                        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                            Err(not_found())
+                        }
+                        Ok(response) => Err(format!("raw-io fetch failed: {}", response.status())),
+                        Err(err) => Err(format!("raw-io fetch failed: {err}")),
+                    }
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                record.map(|record| {
+                    std::sync::Arc::new(ui::raw_content_from_record(general, &record))
+                })
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("raw render task failed: {err}")));
+            let _ = tx.send(RawLoad { key, result }).await;
+        });
     }
 
     /// Toggle the click-opened folded `count` run by any member's stable key
@@ -2615,6 +2877,10 @@ async fn event_loop(
     // `activity.jsonl` delivers here, same pattern as the sessions channel.
     let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<activity::Completed>>(1);
     app.history_tx = Some(hist_tx);
+    // Raw request/response viewer (UI-7): the background raw-io lookup delivers
+    // here — same pattern as the sessions channel (never block this select).
+    let (raw_tx, mut raw_rx) = mpsc::channel::<RawLoad>(2);
+    app.raw_tx = Some(raw_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -2670,7 +2936,17 @@ async fn event_loop(
                 }
                 true
             }
+            // A background raw-record fetch resolved (UI-7) — hand it to the
+            // open modal (stale deliveries are ignored inside).
+            Some(load) = raw_rx.recv() => {
+                app.apply_raw_load(load);
+                true
+            }
         };
+        if let Some(req) = app.take_pending_raw() {
+            app.spawn_raw_fetch(req);
+            redraw = true;
+        }
         if let Some(target) = app.take_pending_switch() {
             app.perform_remote_switch(target).await;
             redraw = true;
@@ -2750,6 +3026,12 @@ async fn event_loop(
                     }
                     None => app.input_modal = None,
                 }
+            }
+            // Clamp the raw viewer's scroll against what this frame rendered
+            // (UI-7). Unlike the input modal, no draw ⇒ no clamp — the modal
+            // owns its content and never closes on entry aging.
+            if let (Some(modal), Some(max)) = (app.raw_modal.as_mut(), main.raw_modal_max_scroll) {
+                modal.scroll = modal.scroll.min(max);
             }
         }
     }
@@ -3917,6 +4199,76 @@ mod tests {
     }
 
     #[test]
+    fn raw_modal_keys_tabs_scroll_and_close(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            title: "raw".into(),
+            tab: RawTab::Request,
+            scroll: 3,
+            spin: 0,
+            state: RawModalState::Loading,
+        });
+        // Tab flips and resets the scroll (the tabs have independent lengths).
+        app.on_key(press(KeyCode::Tab), None);
+        let modal = app.raw_modal.as_ref().unwrap();
+        assert_eq!(modal.tab, RawTab::Response);
+        assert_eq!(modal.scroll, 0);
+        // Scroll keys move; unbound keys are swallowed beneath the modal.
+        app.on_key(press(KeyCode::Down), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().scroll, 1);
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(app.activity_scroll, before, "keys don't leak beneath");
+        assert!(app.raw_modal.is_some());
+        // The wheel scrolls it too (and the click is swallowed).
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 6), None);
+        assert!(app.raw_modal.as_ref().unwrap().scroll > 1);
+        // Esc closes.
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.raw_modal.is_none(), "esc closes the raw viewer");
+    }
+
+    #[test]
+    fn raw_load_applies_only_to_the_matching_loading_modal(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            title: String::new(),
+            tab: RawTab::Request,
+            scroll: 0,
+            spin: 0,
+            state: RawModalState::Loading,
+        });
+        // A stale delivery for a DIFFERENT key is ignored.
+        let other = activity::ActivityKey {
+            at_ms: 9,
+            method: "GET".into(),
+            path: "/x".into(),
+            status: 200,
+        };
+        app.apply_raw_load(RawLoad {
+            key: other,
+            result: Err("nope".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Loading
+        ));
+        // The matching delivery resolves it (a miss becomes Failed).
+        app.apply_raw_load(RawLoad {
+            key: key.clone(),
+            result: Err("miss".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Failed(_)
+        ));
+    }
+
+    #[test]
     fn history_hydration_refused_for_cross_host_attach(/* review M1 */) {
         // Loopback attach (the standard `llmux` → localhost:3456 topology)
         // shares this machine's state file → allowed.
@@ -3995,6 +4347,7 @@ mod tests {
         let count_req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages/count_tokens".into(),
                 account: Some("claude:a@x".into()),
@@ -4099,6 +4452,7 @@ mod tests {
         let req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("claude:a@x".into()),
@@ -4196,6 +4550,7 @@ mod tests {
         let req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("claude:a@x".into()),

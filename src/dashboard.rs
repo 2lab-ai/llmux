@@ -1086,6 +1086,11 @@ pub struct InFlightDoc {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompletedDoc {
     Request {
+        /// Activity id — the raw-io correlation key for the raw viewer
+        /// (paired with `at_ms` to disambiguate across daemon restarts).
+        /// Additive: absent (→ `0` = unknown) in docs from older daemons.
+        #[serde(default)]
+        id: u64,
         at_ms: u64,
         method: String,
         path: String,
@@ -1545,6 +1550,7 @@ pub(crate) fn dashboard_doc(
             .take(ACTIVITY_TAIL)
             .map(|entry| match &entry.body {
                 CompletedBody::Request {
+                    id,
                     method,
                     path,
                     account,
@@ -1559,6 +1565,7 @@ pub(crate) fn dashboard_doc(
                     kind,
                     excerpt,
                 } => CompletedDoc::Request {
+                    id: *id,
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
                     path: path.clone(),

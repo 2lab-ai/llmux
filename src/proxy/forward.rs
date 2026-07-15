@@ -340,6 +340,7 @@ impl ForwardContext {
         account: Option<&AccountId>,
         status: StatusCode,
         response: &[u8],
+        response_headers: Option<&HeaderMap>,
     ) {
         let Some(path) = self.raw_io_path(state) else {
             return;
@@ -355,6 +356,8 @@ impl ForwardContext {
             &self.body,
             response,
             state.config.raw_io.max_body_bytes,
+            Some(redacted_header_pairs(&self.headers)),
+            response_headers.map(redacted_header_pairs),
         );
     }
 
@@ -444,6 +447,35 @@ fn format_headers(headers: &HeaderMap) -> String {
         .map(|(name, value)| format!("  {name}: {}", value.to_str().unwrap_or("<binary>")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Header names whose VALUES are redacted before raw-io capture: they carry
+/// credentials (the client's proxy api key / oauth bearer / cookies). The
+/// NAME stays visible — the raw viewer still shows the header was sent,
+/// CDT-style — but the secret never lands on disk.
+const REDACTED_HEADERS: [&str; 5] = [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "cookie",
+    "set-cookie",
+];
+
+/// Flatten a header map into `(name, value)` pairs in wire order for raw-io
+/// capture, redacting credential values ([`REDACTED_HEADERS`]) and rendering
+/// non-UTF-8 values as a placeholder. Pure; never panics.
+pub(crate) fn redacted_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let v = if REDACTED_HEADERS.contains(&name.as_str()) {
+                "•••redacted".to_string()
+            } else {
+                value.to_str().unwrap_or("<non-utf8>").to_string()
+            };
+            (name.as_str().to_string(), v)
+        })
+        .collect()
 }
 
 fn body_excerpt(body: &[u8]) -> String {
@@ -1823,6 +1855,12 @@ async fn relay(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        let raw_io_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&headers));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
@@ -1848,6 +1886,8 @@ async fn relay(
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
                 );
                 if log_enabled {
                     sections.push(format!(
@@ -1909,7 +1949,7 @@ async fn relay(
         ctx.flush_log(state);
         // Raw-io capture (Feature B): the full non-streaming body, already
         // materialized to relay it — no extra read, no hot-path effect.
-        ctx.capture_raw_io(state, Some(&account), status, &bytes);
+        ctx.capture_raw_io(state, Some(&account), status, &bytes, Some(&headers));
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
@@ -2002,6 +2042,7 @@ async fn relay_translate(
     if !status.is_success() {
         // classify() already diverted 401/429/5xx; what lands here is a 4xx
         // error body — wrapped into an Anthropic-shaped error.
+        let error_headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
         ctx.log(format!(
             "=== RESPONSE BODY ({} bytes) ===\n{}",
@@ -2020,7 +2061,13 @@ async fn relay_translate(
             ctx.started.elapsed().as_millis(),
         );
         // Raw-io capture: request + the upstream error body (already read).
-        ctx.capture_raw_io(state, Some(&account), out_status, &bytes);
+        ctx.capture_raw_io(
+            state,
+            Some(&account),
+            out_status,
+            &bytes,
+            Some(&error_headers),
+        );
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
         return error_response(
@@ -2069,6 +2116,14 @@ async fn relay_translate(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        // The transform relay synthesizes its own SSE response; the UPSTREAM
+        // response headers (request ids, ratelimits) are the informative ones.
+        let raw_io_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(response.headers()));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
@@ -2094,6 +2149,8 @@ async fn relay_translate(
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
                 );
                 // Codex trace: terminal outcome of the streamed request. A
                 // client disconnect mid-stream, an upstream stream error, or a
@@ -2164,6 +2221,9 @@ async fn relay_translate(
         BackendGroup::Grok => state.grok.converter(),
         _ => state.codex.converter(),
     };
+    // Cloned before `bytes_stream()` consumes the response — the aggregate
+    // raw-io capture below wants the upstream response headers.
+    let upstream_headers = response.headers().clone();
     let mut events = sse::EventBuffer::new();
     let mut stream = Box::pin(response.bytes_stream());
     while let Some(item) = stream.next().await {
@@ -2219,6 +2279,7 @@ async fn relay_translate(
                 Some(&account),
                 StatusCode::OK,
                 message_bytes.as_bytes(),
+                Some(&upstream_headers),
             );
             ctx.emit_finished(
                 state,
@@ -2296,6 +2357,30 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn redacted_header_pairs_hide_credentials_keep_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-secret"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let pairs = redacted_header_pairs(&headers);
+        let get = |n: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-type"), Some("application/json"));
+        assert_eq!(get("anthropic-version"), Some("2023-06-01"));
+        // Credential VALUES never reach the record; the names stay visible.
+        assert_eq!(get("x-api-key"), Some("•••redacted"));
+        assert_eq!(get("authorization"), Some("•••redacted"));
+        assert!(pairs
+            .iter()
+            .all(|(_, v)| !v.contains("secret") && !v.contains("tok")));
+    }
     use crate::config::{AccountConfig, Config};
     use crate::proxy::server::AppState;
     use crate::scheduler::AccountPool;
