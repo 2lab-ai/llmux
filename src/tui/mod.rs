@@ -435,6 +435,11 @@ struct App {
     /// window (UI-5 infinite scroll, Z 2026-07-15). Newest-first; merged
     /// strictly-older-than-live at render time. `None` = not loaded yet.
     history_completed: Option<Vec<activity::Completed>>,
+    /// How many of those history entries are MATERIALIZED into the frame's
+    /// view. Grown only on state transitions — scroll events and history
+    /// arrival ([`Self::grow_history_take`]) — so the folding work needed to
+    /// pick the amount never runs on the per-frame render path (review R3-2).
+    history_take: usize,
     /// True while the background history load is in flight.
     history_loading: bool,
     /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
@@ -525,6 +530,7 @@ impl App {
             expanded_activity: None,
             expanded_run: None,
             history_completed: None,
+            history_take: 0,
             history_loading: false,
             history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
@@ -583,7 +589,47 @@ impl App {
     /// scrolled rather than the whole persisted file.
     fn extend_with_history(&self, view: &mut DashboardView) {
         if let Some(history) = &self.history_completed {
-            extend_completed_with_history(&mut view.completed, history, self.activity_scroll);
+            extend_completed_with_history(&mut view.completed, history, self.history_take);
+        }
+    }
+
+    /// Grow the materialized-history window (`history_take`) until the FOLDED
+    /// render-row count reaches `activity_scroll + HISTORY_PAGE` — capped at
+    /// [`HISTORY_GROW_CHUNKS`] chunks per call so one giant folded `count`
+    /// wall cannot make a single event traverse the whole 100k-entry history
+    /// (review R3-2; further scrolling fires further calls, so loading stays
+    /// progressive). Runs ONLY on state transitions — a scroll event or the
+    /// history arrival — never per frame. Folding happens here, on a scratch
+    /// copy; the frame path then just appends the first `history_take`
+    /// strictly-older entries. Called on arrival even at `scroll == 0` so a
+    /// live window that folds to a single row (whose scroll ceiling is 0)
+    /// still gets its first history page and the ceiling can rise
+    /// (review R3-1 deadlock).
+    fn grow_history_take(&mut self, view: &DashboardView) {
+        let Some(history) = &self.history_completed else {
+            return;
+        };
+        let target_rows = self.activity_scroll.saturating_add(HISTORY_PAGE);
+        let mut scratch = view.completed.clone();
+        let mut rows = triage::collapse_completed(&scratch).len();
+        let mut chunks = 0;
+        while rows < target_rows && chunks < HISTORY_GROW_CHUNKS {
+            let oldest = scratch.last().map(|c| c.at);
+            let before = scratch.len();
+            scratch.extend(
+                history
+                    .iter()
+                    .filter(|c| oldest.is_none_or(|o| c.at < o))
+                    .take(HISTORY_CHUNK)
+                    .cloned(),
+            );
+            let appended = scratch.len() - before;
+            if appended == 0 {
+                return; // history exhausted
+            }
+            self.history_take += appended;
+            rows = triage::collapse_completed(&scratch).len();
+            chunks += 1;
         }
     }
 
@@ -1693,6 +1739,9 @@ impl App {
         self.activity_scroll = next.clamp(0, max) as usize;
         if delta > 0 && (self.activity_scroll as i64) >= max.saturating_sub(HISTORY_ARM_MARGIN) {
             self.request_history();
+            if let Some(view) = view {
+                self.grow_history_take(view);
+            }
         }
     }
 
@@ -2346,10 +2395,15 @@ async fn event_loop(
                 true
             }
             // The background history load finished (UI-5 infinite scroll) —
-            // scrolling past the live window now pages these rows in.
+            // materialize the first page immediately so a live window that
+            // folds to a single row (scroll ceiling 0) can start scrolling
+            // (review R3-1), then scrolling pages the rest in.
             Some(history) = hist_rx.recv() => {
                 app.history_completed = Some(history);
                 app.history_loading = false;
+                if let Some(view) = app.view(SystemTime::now()) {
+                    app.grow_history_take(&view);
+                }
                 true
             }
         };
@@ -2466,12 +2520,15 @@ fn apply_event(
 /// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
 /// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
 /// metadata each record carries is folded; no prompt content is retained.
-/// How many FOLDED render rows past the current scroll depth
-/// [`App::extend_with_history`] keeps materialized, how many raw entries it
-/// appends per fold-recheck step, and how close to the loaded end the scroll
-/// must get before [`App::request_history`] arms (UI-5 infinite scroll).
+/// UI-5 infinite-scroll knobs: how many FOLDED render rows past the current
+/// scroll depth [`App::grow_history_take`] targets, how many raw entries it
+/// appends per fold-recheck step, how many such steps ONE state transition
+/// may take (a folded wall then loads progressively across events instead of
+/// traversing the whole history in one), and how close to the loaded end the
+/// scroll must get before [`App::request_history`] arms.
 const HISTORY_PAGE: usize = 300;
 const HISTORY_CHUNK: usize = 512;
+const HISTORY_GROW_CHUNKS: usize = 4;
 const HISTORY_ARM_MARGIN: i64 = 40;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
@@ -2506,43 +2563,29 @@ fn base_url_is_loopback(base_url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Pure merge for [`App::extend_with_history`] (unit-tested): append history
-/// rows behind the live newest-first list — only entries strictly OLDER than
-/// the oldest loaded row (the persisted tail overlaps the live ring; the
-/// timestamp cut dedupes) — until the FOLDED render-row count reaches
-/// `scroll + HISTORY_PAGE`. Scroll position is measured in folded rows
-/// (`triage::collapse_completed`), so the target must be too: comparing the
-/// raw entry count instead stalled hydration forever whenever a large
-/// `count` run folded hundreds of raw entries into one row (review
-/// MUST-FIX 3). Appends in [`HISTORY_CHUNK`] steps, re-folding between
-/// chunks; stops when the target is met or history is exhausted. At the
-/// live tail (`scroll == 0`) nothing is appended.
+/// Pure merge for [`App::extend_with_history`] (unit-tested): append up to
+/// `take` history rows behind the live newest-first list — only entries
+/// strictly OLDER than the oldest loaded row (the persisted tail overlaps
+/// the live ring; the timestamp cut dedupes). A single linear pass, NO
+/// folding — how many rows to materialize (`take`) is decided on state
+/// transitions by [`App::grow_history_take`], keeping the per-frame path a
+/// bounded clone (review R3-2).
 fn extend_completed_with_history(
     completed: &mut Vec<activity::Completed>,
     history: &[activity::Completed],
-    scroll: usize,
+    take: usize,
 ) {
-    if scroll == 0 {
+    if take == 0 {
         return;
     }
-    let target_rows = scroll.saturating_add(HISTORY_PAGE);
-    loop {
-        if triage::collapse_completed(completed).len() >= target_rows {
-            return;
-        }
-        let oldest = completed.last().map(|c| c.at);
-        let before = completed.len();
-        completed.extend(
-            history
-                .iter()
-                .filter(|c| oldest.is_none_or(|o| c.at < o))
-                .take(HISTORY_CHUNK)
-                .cloned(),
-        );
-        if completed.len() == before {
-            return; // history exhausted
-        }
-    }
+    let oldest = completed.last().map(|c| c.at);
+    completed.extend(
+        history
+            .iter()
+            .filter(|c| oldest.is_none_or(|o| c.at < o))
+            .take(take)
+            .cloned(),
+    );
 }
 
 /// Blocking read+replay of the persisted activity log
@@ -3420,21 +3463,21 @@ mod tests {
                 error: false,
             },
         };
-        // Live window: newest-first 100..90; history overlaps (100..90) then
-        // continues older (89..1).
+        // Live window: newest-first 100..91; history overlaps (100..91) then
+        // continues older (90..1).
         let live: Vec<_> = (91..=100).rev().map(note).collect();
         let history: Vec<_> = (1..=100).rev().map(note).collect();
 
-        // At the live tail nothing is appended.
+        // Nothing materialized (`take == 0`) → nothing appended.
         let mut completed = live.clone();
         extend_completed_with_history(&mut completed, &history, 0);
         assert_eq!(completed.len(), live.len());
 
-        // Scrolled: appends only entries STRICTLY older than the live oldest
-        // (the overlap dedupes by timestamp) up to scroll + HISTORY_PAGE.
+        // take = 5 appends exactly the 5 NEWEST strictly-older entries (the
+        // overlap dedupes by timestamp cut).
         let mut completed = live.clone();
         extend_completed_with_history(&mut completed, &history, 5);
-        assert!(completed.len() <= 5 + HISTORY_PAGE);
+        assert_eq!(completed.len(), live.len() + 5);
         assert_eq!(
             completed[live.len()].at,
             SystemTime::UNIX_EPOCH + Duration::from_secs(90),
@@ -3449,12 +3492,13 @@ mod tests {
     }
 
     #[test]
-    fn history_paging_targets_folded_rows_not_raw_entries(/* review MUST-FIX 3 */) {
+    fn folded_wall_deadlock_is_broken_on_history_arrival(/* review R3-1 */) {
         // 350 raw `count` entries sharing one fold key collapse to ONE render
-        // row. Under the old raw-length cap (`completed.len() >= scroll+300`)
-        // that raw bulk blocked hydration forever while the folded ceiling
-        // blocked scrolling — a permanent stall. The folded-row target must
-        // keep appending until render rows (not raw entries) reach the goal.
+        // row, so the scroll ceiling is 0 and `activity_scroll` can never
+        // leave 0 on its own. The arrival-time `grow_history_take` must
+        // materialize the first history page in that exact state — otherwise
+        // loaded history stays permanently unreachable (the R2 regression
+        // test injected an unreachable scroll=5 and proved nothing).
         let count_req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
@@ -3487,13 +3531,25 @@ mod tests {
             "precondition: the live wall folds to one render row"
         );
         let history: Vec<_> = (1..=50).rev().map(note).collect();
-        let mut completed = live.clone();
-        extend_completed_with_history(&mut completed, &history, 5);
-        assert_eq!(
-            completed.len(),
-            live.len() + history.len(),
-            "hydration must page past the folded wall (raw len is not the target)"
+
+        let mut app = remote_app();
+        app.history_completed = Some(history.clone());
+        let mut view = empty_view();
+        view.completed = live.clone();
+        // Arrival-time materialization at scroll == 0 (the deadlock state).
+        assert_eq!(app.activity_scroll, 0);
+        app.grow_history_take(&view);
+        assert!(app.history_take > 0, "first page materialized at scroll 0");
+
+        // The frame path now extends the view and the scroll ceiling rises.
+        extend_completed_with_history(&mut view.completed, &history, app.history_take);
+        assert!(
+            triage::collapse_completed(&view.completed).len() > 1,
+            "history rows are reachable — the folded wall no longer pins the ceiling"
         );
+        // And a wheel-down actually moves now.
+        app.scroll_activity(1, Some(&view));
+        assert_eq!(app.activity_scroll, 1, "scroll escapes 0 after hydration");
     }
 
     #[test]
