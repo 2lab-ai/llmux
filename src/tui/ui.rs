@@ -876,12 +876,18 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
     }
 
     // Period totals for the title: every bucket of the selected granularity,
-    // all four token classes (same reasoning as `model_total`).
+    // all four token classes (same reasoning as `model_total`). Unpriced rows
+    // contribute no cost — the total is qualified so it can't read as "all
+    // traffic priced" when a rate is missing (review R1 MUST-FIX 3).
     let total_cost: f64 = buckets
         .iter()
         .flat_map(|(_, _, g)| g.iter())
         .map(|r| r.cost_usd)
         .sum();
+    let any_unpriced = buckets
+        .iter()
+        .flat_map(|(_, _, g)| g.iter())
+        .any(|r| !r.priced);
     let total_tokens: u64 = buckets
         .iter()
         .flat_map(|(_, _, g)| g.iter())
@@ -889,11 +895,12 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         .fold(0, u64::saturating_add);
     let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
     let title = format!(
-        " usage — {} · {} buckets · Σ {} tok · Σ {} ",
+        " usage — {} · {} buckets · Σ {} tok · Σ {}{} ",
         gran.label(),
         buckets.len(),
         format::human_count(total_tokens),
         format_cost(total_cost),
+        if any_unpriced { " (+unpriced)" } else { "" },
     );
 
     let mut trows: Vec<Row> = Vec::new();
@@ -904,6 +911,7 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         let cache_read: u64 = group.iter().map(|r| r.cache_read).sum();
         let cache_creation: u64 = group.iter().map(|r| r.cache_creation).sum();
         let cost: f64 = group.iter().map(|r| r.cost_usd).sum();
+        let bucket_unpriced = group.iter().any(|r| !r.priced);
         trows.push(
             Row::new(vec![
                 Cell::from(*label),
@@ -913,7 +921,11 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(tokens_out)),
                 Cell::from(format::human_count(cache_read)),
                 Cell::from(format::human_count(cache_creation)),
-                Cell::from(format_cost(cost)),
+                Cell::from(format!(
+                    "{}{}",
+                    format_cost(cost),
+                    if bucket_unpriced { "+?" } else { "" }
+                )),
             ])
             .style(Style::new().add_modifier(Modifier::BOLD)),
         );
@@ -936,7 +948,13 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
                 Cell::from(format::human_count(m.tokens_out)),
                 Cell::from(format::human_count(m.cache_read)),
                 Cell::from(format::human_count(m.cache_creation)),
-                Cell::from(format_cost(m.cost_usd)),
+                // "no rate known" renders as an explicit dash — a fabricated
+                // $0.0000 would read as "free" (review R1 MUST-FIX 3).
+                Cell::from(if m.priced {
+                    format_cost(m.cost_usd)
+                } else {
+                    "—".to_string()
+                }),
             ]));
         }
     }
@@ -4919,6 +4937,7 @@ mod tests {
             cache_read: 40,
             cache_creation: 4,
             cost_usd,
+            priced: true,
         }
     }
 
@@ -4962,16 +4981,33 @@ mod tests {
             ),
             // An hourly row that must NOT appear in the daily table.
             usage_row("hour", 480_000, "10-04 09h", "claude", "opus-x", 7, 7, 0.01),
+            // An UNPRICED row (review R1 MUST-FIX 3): its zero cost must
+            // render as `—`, and both its bucket row and the title carry a
+            // marker so the totals can't read as "all traffic priced".
+            {
+                let mut r = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                r.priced = false;
+                r
+            },
         ];
         let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
         assert!(text.contains("usage — daily"), "title shows granularity");
         assert!(text.contains("2 buckets"), "title counts day buckets only");
         assert!(text.contains("$2.50"), "title sums the day costs");
+        assert!(
+            text.contains("(+unpriced)"),
+            "title qualifies unpriced usage"
+        );
         assert!(text.contains("2024-10-04"), "bucket label rendered");
         assert!(text.contains("2 models"), "bucket summary row rendered");
         assert!(text.contains("claude/opus-x"), "model row rendered");
         assert!(text.contains("codex/gpt-5.5"), "second model row rendered");
         assert!(text.contains("$1.25"), "per-model cost rendered");
+        assert!(
+            text.contains("$0.7500+?"),
+            "bucket with unpriced rows marked"
+        );
+        assert!(text.contains("misc/mystery"), "unpriced model row rendered");
         assert!(!text.contains("10-04 09h"), "hourly rows stay out of daily");
     }
 

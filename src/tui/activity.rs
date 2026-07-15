@@ -863,6 +863,12 @@ pub(crate) struct ActivityLog {
     usage_hourly: UsageBuckets,
     usage_daily: UsageBuckets,
     usage_monthly: UsageBuckets,
+    /// Monotonic high-water marks (newest hour / local day ever folded):
+    /// retention prunes against THESE, never against an individual event's
+    /// timestamp, so an out-of-order replayed event can't resurrect an
+    /// expired bucket or rewind the window (review R1 MUST-FIX 1).
+    usage_hour_hwm: u64,
+    usage_day_hwm: u64,
     /// Fixed UTC offset for usage day/month bucketing in tests. `None` in
     /// production — each event buckets with the offset in force at ITS
     /// timestamp ([`crate::tui::format::local_offset_secs`]), so replayed
@@ -1081,7 +1087,9 @@ impl ActivityLog {
         }
         // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
         // history lands on its original hours/days/months — same reasoning
-        // as the daily chart buckets above.
+        // as the daily chart buckets above. Watermarks merge by max and the
+        // trailing windows re-prune, so historical buckets outside the LIVE
+        // window never survive the merge (review R1 MUST-FIX 1).
         for (src, dst) in [
             (history.usage_hourly, &mut self.usage_hourly),
             (history.usage_daily, &mut self.usage_daily),
@@ -1094,6 +1102,16 @@ impl ActivityLog {
                 }
             }
         }
+        self.usage_hour_hwm = self.usage_hour_hwm.max(history.usage_hour_hwm);
+        self.usage_day_hwm = self.usage_day_hwm.max(history.usage_day_hwm);
+        let hour_cutoff = self
+            .usage_hour_hwm
+            .saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
+        let day_cutoff = self
+            .usage_day_hwm
+            .saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        self.usage_daily.retain(|d, _| *d >= day_cutoff);
         // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
         // replayed history for the same client; history fills the gaps under
         // the same MAX_CLIENTS bound as the live fold.
@@ -1196,14 +1214,25 @@ impl ActivityLog {
             .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
         let key = (group.to_string(), model.to_string());
 
+        // Bucket time and retention time are DIFFERENT quantities (review R1
+        // MUST-FIX 1): the event's timestamp picks the bucket, but pruning
+        // runs against a monotonic high-water mark — an out-of-order OLD
+        // event (startup replay behind live traffic) must neither resurrect
+        // an expired bucket nor rewind the retention window. Same
+        // never-rewinds reasoning as the windowed ring's `roll_to`.
         let hour = epoch_secs / 3_600;
-        self.usage_hourly
-            .entry(hour)
-            .or_default()
-            .entry(key.clone())
-            .or_default()
-            .add(tokens);
-        let hour_cutoff = hour.saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        self.usage_hour_hwm = self.usage_hour_hwm.max(hour);
+        let hour_cutoff = self
+            .usage_hour_hwm
+            .saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        if hour >= hour_cutoff {
+            self.usage_hourly
+                .entry(hour)
+                .or_default()
+                .entry(key.clone())
+                .or_default()
+                .add(tokens);
+        }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
         // Local civil day: shift the clock by the offset, then count whole
@@ -1212,13 +1241,18 @@ impl ActivityLog {
         let local_secs = (epoch_secs as i64).saturating_add(offset);
         let civil_day = local_secs.div_euclid(86_400);
         let day = u64::try_from(civil_day).unwrap_or(0);
-        self.usage_daily
-            .entry(day)
-            .or_default()
-            .entry(key.clone())
-            .or_default()
-            .add(tokens);
-        let day_cutoff = day.saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        self.usage_day_hwm = self.usage_day_hwm.max(day);
+        let day_cutoff = self
+            .usage_day_hwm
+            .saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        if day >= day_cutoff {
+            self.usage_daily
+                .entry(day)
+                .or_default()
+                .entry(key.clone())
+                .or_default()
+                .add(tokens);
+        }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
         let (year, month, _) = crate::tui::format::civil_from_days(civil_day);
@@ -1244,7 +1278,28 @@ impl ActivityLog {
     /// re-sorts by cost). Labels are rendered HERE — the daemon's civil
     /// calendar is the single source of truth for what "a day" means, so
     /// local and attach clients can never disagree.
-    pub(crate) fn usage_stats(&self) -> Vec<crate::dashboard::UsageStatDoc> {
+    ///
+    /// The hourly/daily windows are re-anchored to `now` at READ time (review
+    /// R1 MUST-FIX 1): fold-time pruning follows the event high-water mark
+    /// (bounded memory), but an idle daemon must not advertise stale buckets
+    /// as "trailing 72 h / 180 days" — the serve-side filter is the honest
+    /// window. Months are never filtered.
+    pub(crate) fn usage_stats(&self, now: SystemTime) -> Vec<crate::dashboard::UsageStatDoc> {
+        let now_secs = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hour_floor = (now_secs / 3_600).saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        let now_offset = self
+            .usage_offset_override
+            .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
+        let today = u64::try_from(
+            (now_secs as i64)
+                .saturating_add(now_offset)
+                .div_euclid(86_400),
+        )
+        .unwrap_or(0);
+        let day_floor = today.saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
         fn sorted(
             cells: &HashMap<(String, String), UsageCell>,
         ) -> Vec<(&(String, String), &UsageCell)> {
@@ -1268,11 +1323,18 @@ impl ActivityLog {
                 tokens_out: c.output,
                 cache_read: c.cache_read,
                 cache_creation: c.cache_creation,
+                // Priced at doc-build time (the log holds no pricing config);
+                // conservative `false` here so a row that ever bypasses the
+                // doc build renders `—`, never a fabricated $0.
                 cost_usd: 0.0,
+                priced: false,
             }
         };
         let mut docs = Vec::new();
         for (hour, cells) in self.usage_hourly.iter().rev() {
+            if *hour < hour_floor {
+                break; // BTreeMap rev: everything further back is older.
+            }
             // Hour buckets are UTC hours; label them in the daemon's local
             // wall clock at the bucket start.
             let start = UNIX_EPOCH + Duration::from_secs(hour * 3_600);
@@ -1288,6 +1350,9 @@ impl ActivityLog {
             }
         }
         for (day, cells) in self.usage_daily.iter().rev() {
+            if *day < day_floor {
+                break;
+            }
             let (y, m, d) = crate::tui::format::civil_from_days(*day as i64);
             let label = format!("{y}-{m:02}-{d:02}");
             for (key, cell) in sorted(cells) {
@@ -2907,10 +2972,22 @@ mod tests {
                 "per-account totals for {acct} must match after restore"
             );
         }
+        // Usage calendar buckets (usage-stats): compare the STORES (maps +
+        // watermarks) — the doc accessor takes a read-time `now` these
+        // replay-identity tests have no single value for.
         assert_eq!(
-            a.usage_stats(),
-            b.usage_stats(),
-            "usage calendar buckets must match after restore (usage-stats)"
+            (a.usage_hourly.clone(), a.usage_hour_hwm),
+            (b.usage_hourly.clone(), b.usage_hour_hwm),
+            "hourly usage buckets must match after restore (usage-stats)"
+        );
+        assert_eq!(
+            (a.usage_daily.clone(), a.usage_day_hwm),
+            (b.usage_daily.clone(), b.usage_day_hwm),
+            "daily usage buckets must match after restore (usage-stats)"
+        );
+        assert_eq!(
+            a.usage_monthly, b.usage_monthly,
+            "monthly usage buckets must match after restore (usage-stats)"
         );
     }
 
@@ -2937,9 +3014,15 @@ mod tests {
         }
     }
 
-    /// Rows of one granularity, in document order (newest bucket first).
-    fn usage_rows(log: &ActivityLog, gran: UsageGran) -> Vec<crate::dashboard::UsageStatDoc> {
-        log.usage_stats()
+    /// Rows of one granularity, in document order (newest bucket first),
+    /// read at `now` (the accessor's trailing hourly/daily windows anchor to
+    /// the read time — review R1 MUST-FIX 1).
+    fn usage_rows(
+        log: &ActivityLog,
+        gran: UsageGran,
+        now: SystemTime,
+    ) -> Vec<crate::dashboard::UsageStatDoc> {
+        log.usage_stats(now)
             .into_iter()
             .filter(|r| r.gran == gran.tag())
             .collect()
@@ -2992,7 +3075,8 @@ mod tests {
             at_day_hm(JAN1_2024, 10, 0),
         );
 
-        let hours = usage_rows(&log, UsageGran::Hour);
+        let read_at = at_day_hm(JAN1_2024, 23, 30);
+        let hours = usage_rows(&log, UsageGran::Hour, read_at);
         assert_eq!(hours.len(), 2, "one hour bucket per event");
         // Newest first: the 23:00 UTC bucket leads, labeled in LOCAL wall
         // clock (08h on Jan 2).
@@ -3005,7 +3089,7 @@ mod tests {
         );
         assert_eq!(hours[1].label, "01-01 19h");
 
-        let days = usage_rows(&log, UsageGran::Day);
+        let days = usage_rows(&log, UsageGran::Day, read_at);
         assert_eq!(
             days.len(),
             2,
@@ -3017,7 +3101,7 @@ mod tests {
         assert_eq!(days[1].label, "2024-01-01");
         assert_eq!(days[1].model, "m-noon");
 
-        let months = usage_rows(&log, UsageGran::Month);
+        let months = usage_rows(&log, UsageGran::Month, read_at);
         assert_eq!(months.len(), 2, "one month bucket, two model rows");
         assert!(months.iter().all(|r| r.label == "2024-01"));
         assert!(months.iter().all(|r| r.bucket == 2024 * 12));
@@ -3033,10 +3117,11 @@ mod tests {
             finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/v1/messages"),
             at_day_hm(JAN1_2024 - 1, 23, 0),
         );
-        let months = usage_rows(&log, UsageGran::Month);
+        let read_at = at_day_hm(JAN1_2024 - 1, 23, 0);
+        let months = usage_rows(&log, UsageGran::Month, read_at);
         assert_eq!(months.len(), 1);
         assert_eq!(months[0].label, "2024-01");
-        let days = usage_rows(&log, UsageGran::Day);
+        let days = usage_rows(&log, UsageGran::Day, read_at);
         assert_eq!(days[0].label, "2024-01-01");
     }
 
@@ -3054,7 +3139,7 @@ mod tests {
             finished(2, Some("acct"), Some((5, 5))),
             at_day_hm(JAN1_2024, 1, 5),
         );
-        let hours = usage_rows(&log, UsageGran::Hour);
+        let hours = usage_rows(&log, UsageGran::Hour, at_day_hm(JAN1_2024, 1, 5));
         assert_eq!(hours.len(), 1);
         assert_eq!(hours[0].requests, 1, "tokenless request still counted");
         assert_eq!(hours[0].tokens_in + hours[0].tokens_out, 0);
@@ -3074,17 +3159,80 @@ mod tests {
             finished_full(2, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
             at_day_hm(JAN1_2024 + 200, 0, 0),
         );
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
         assert_eq!(
-            usage_rows(&log, UsageGran::Hour).len(),
+            usage_rows(&log, UsageGran::Hour, read_at).len(),
             1,
             "old hour pruned"
         );
-        assert_eq!(usage_rows(&log, UsageGran::Day).len(), 1, "old day pruned");
         assert_eq!(
-            usage_rows(&log, UsageGran::Month).len(),
+            usage_rows(&log, UsageGran::Day, read_at).len(),
+            1,
+            "old day pruned"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Month, read_at).len(),
             2,
             "months are never pruned"
         );
+    }
+
+    /// Review R1 MUST-FIX 1a: an out-of-order OLD event folded AFTER newer
+    /// traffic (startup replay behind live requests) must not resurrect a
+    /// bucket outside the retention window or rewind it — pruning follows the
+    /// high-water mark, not the event's own timestamp.
+    #[test]
+    fn usage_out_of_order_old_event_cannot_resurrect_expired_buckets() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024 + 200, 0, 0),
+        );
+        // 200 days OLDER than the newest fold: outside both windows.
+        log.apply(
+            finished_full(2, "a", "claude", "m-old", None, 200, 9, 9, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
+        assert_eq!(
+            usage_rows(&log, UsageGran::Hour, read_at).len(),
+            1,
+            "expired hour not resurrected"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Day, read_at).len(),
+            1,
+            "expired day not resurrected"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Month, read_at).len(),
+            2,
+            "months still keep all history"
+        );
+    }
+
+    /// Review R1 MUST-FIX 1b: the served hourly/daily windows anchor to the
+    /// READ time — an idle daemon must not advertise stale buckets as
+    /// "trailing 72 h / 180 days". Months are never filtered.
+    #[test]
+    fn usage_read_window_anchors_to_now_not_last_event() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        // Read 10 days later with NO new traffic: the hour is long gone from
+        // the trailing 72h, the day still sits inside 180d.
+        let read_at = at_day_hm(JAN1_2024 + 10, 0, 0);
+        assert!(usage_rows(&log, UsageGran::Hour, read_at).is_empty());
+        assert_eq!(usage_rows(&log, UsageGran::Day, read_at).len(), 1);
+        assert_eq!(usage_rows(&log, UsageGran::Month, read_at).len(), 1);
+        // Read 200 days later: the day has left the window too.
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
+        assert!(usage_rows(&log, UsageGran::Day, read_at).is_empty());
+        assert_eq!(usage_rows(&log, UsageGran::Month, read_at).len(), 1);
     }
 
     #[test]
