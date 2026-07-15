@@ -15,6 +15,7 @@ use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -1542,16 +1543,18 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     rows.max(1)
 }
 
-/// Rows one newline-free `source` string wraps into at `width` cells. Tokenizes
-/// into words (non-space runs) and single spaces so that EVERY cell — including
-/// leading indentation — is charged, then greedily packs them, hard-splitting
-/// any token too wide for a full row. Empty string counts as 1 row.
+/// Rows one newline-free `source` string wraps into at `width` cells. Iterates
+/// GRAPHEME CLUSTERS (the unit ratatui measures/renders), grouping non-space
+/// clusters into words and treating each space as its own 1-cell token, so that
+/// EVERY cell — including leading indentation — is charged, then greedily packs
+/// them, hard-splitting any token too wide for a full row. Empty string counts
+/// as 1 row.
 fn wrap_rows(source: &str, width: usize) -> usize {
     let mut rows = 1usize;
     let mut col = 0usize;
     let mut word = String::new();
-    for ch in source.chars() {
-        if ch == ' ' {
+    for g in source.graphemes(true) {
+        if g == " " {
             if !word.is_empty() {
                 place_token(&word, width, &mut rows, &mut col);
                 word.clear();
@@ -1560,7 +1563,7 @@ fn wrap_rows(source: &str, width: usize) -> usize {
             // occupy width exactly as `Wrap { trim: false }` renders them.
             place_token(" ", width, &mut rows, &mut col);
         } else {
-            word.push(ch);
+            word.push_str(g);
         }
     }
     if !word.is_empty() {
@@ -1571,9 +1574,10 @@ fn wrap_rows(source: &str, width: usize) -> usize {
 
 /// Place one token (a word or a single space) into the greedy wrap accounting,
 /// advancing `rows`/`col`. A token that overflows the current row moves to a
-/// fresh one; a token wider than a whole row hard-splits CELL-accurately,
-/// char by char, so a 2-cell CJK glyph that cannot straddle the right edge
-/// bumps the row (integer cell-width division would undercount those).
+/// fresh one; a token wider than a whole row hard-splits by GRAPHEME CLUSTER
+/// using str-based cell width — the identical basis ratatui measures with — so
+/// a multi-scalar cluster (a 2-cell CJK glyph, an emoji + VS16) is never split
+/// mid-cluster and never mis-measured by summing scalar widths.
 fn place_token(token: &str, width: usize, rows: &mut usize, col: &mut usize) {
     let w = cell_width(token);
     if w == 0 {
@@ -1592,9 +1596,9 @@ fn place_token(token: &str, width: usize, rows: &mut usize, col: &mut usize) {
         *col = w;
         return;
     }
-    // Token wider than a full row: hard-split, charging each char's cell width.
-    for ch in token.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    // Token wider than a full row: hard-split, charging each cluster's cell width.
+    for g in token.graphemes(true) {
+        let cw = cell_width(g);
         if cw == 0 {
             continue;
         }
@@ -6516,6 +6520,16 @@ mod tests {
         // Odd width where a 2-cell glyph cannot straddle the edge: width 3 holds
         // exactly one 가 per row (2+2 > 3), so 3 가 = 3 rows.
         assert_eq!(wrapped_line_count(&"가".repeat(3), 3), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_measures_multi_scalar_graphemes(/* UI-6 item 3 R2 MUST-FIX */) {
+        // "❤\u{FE0F}" (heart + VS16) is ONE grapheme that ratatui renders 2 cells
+        // wide; summing scalar widths (1 + 0) would undercount it as 1. Measured
+        // per cluster, 5 of them at width 4 = 2 clusters/row → 3 rows.
+        let heart = "\u{2764}\u{FE0F}".repeat(5);
+        assert_eq!(cell_width("\u{2764}\u{FE0F}"), 2, "VS16 cluster is 2 cells");
+        assert_eq!(wrapped_line_count(&heart, 4), 3);
     }
 
     #[test]
