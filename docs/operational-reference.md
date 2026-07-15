@@ -183,6 +183,36 @@ with 200 instead of being forwarded upstream to a guaranteed 404, and a
 the pool, no exhaustion park — so a rate-limited moment paints one line, not
 one per account.
 
+### Raw request/response viewer
+
+An expanded entry's `🔍 request` detail line opens a DevTools-style modal
+over the dashboard with the request's captured payloads (from
+`raw-io.jsonl`; see `raw_io` in [configuration.md](configuration.md)).
+
+- **Tabs follow the wire.** A translated (codex/grok) exchange shows all
+  four legs — `Request` (client → llmux) → `Upstream Req` (the rewritten
+  Responses-API request llmux sent) → `Upstream Resp` (the provider's
+  verbatim reply before conversion) → `Response` (what the client
+  received). A byte-identity Anthropic passthrough shows the classic 2 tabs
+  (client and upstream exchange are the same bytes). Click a tab or walk
+  with `←`/`→`/`Tab`/`h`/`l`.
+- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
+  wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
+  Proportional scrollbars render on the right and bottom edges when the
+  content overflows.
+- **Action buttons** (top-right, click or key): `copy` (`c`) puts the
+  active tab's raw body on the system clipboard; `copy as curl` (`C`)
+  reconstructs a replayable curl for that tab's side of the exchange
+  (redacted credential values stay `•••redacted` — substitute your own);
+  `copy all` (`a`) copies every leg with section markers; `save` (`s`) /
+  `save all` (`S`) write the body / the whole record JSON to `~/Downloads`
+  (timestamped). Clipboard uses `pbcopy`/`wl-copy`/`xclip`/`xsel` when
+  available, falling back to the OSC 52 terminal escape; the outcome
+  flashes on the modal's hint line.
+- `Esc`/`q`/`Enter` closes. Records written by a daemon predating a field
+  render it as "(not captured)"; passthrough records carry no upstream
+  half by design.
+
 ## Scheduling model
 
 Each account tracks two quota windows: 5-hour session and 7-day weekly. Anthropic accounts get passive data from upstream response headers plus active OAuth usage polling; Codex accounts ingest `x-codex-*` headers when present. Selection is pure and deterministic over a snapshot, re-evaluated when the current account becomes ineligible and on a 60-second tick — never per request.
