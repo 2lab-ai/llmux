@@ -15,7 +15,7 @@ Kirigami.ScrollablePage {
     palette.text: IslandTheme.primaryText
     palette.buttonText: IslandTheme.primaryText
     palette.base: IslandTheme.field
-    palette.highlight: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
     palette.highlightedText: IslandTheme.panel
     background: Rectangle { color: IslandTheme.panel }
 
@@ -23,6 +23,7 @@ Kirigami.ScrollablePage {
     // Kept as shell-facing compatibility inputs while canonical state remains authoritative.
     property string surfaceMode: ""
     property bool autostartEnabled: false
+    property bool advancedVisible: false
     signal dispatchRequested(string action, string payloadJson)
 
     readonly property string unavailableText: qsTr("Unavailable")
@@ -38,6 +39,8 @@ Kirigami.ScrollablePage {
     readonly property var capabilities: objectOrEmpty(settings.capabilities)
     readonly property var verificationReceipts: arrayOrEmpty(uiState.verification_receipts)
     readonly property var menuReceiptItems: receiptsForMenu(verificationReceipts)
+    readonly property var visibleMenuReceiptItems: advancedVisible
+        ? menuReceiptItems : failedReceipts(menuReceiptItems)
     readonly property string currentChannel: optionalText(maintenance.channel)
     readonly property string aboutIslandsVersion: optionalText(maintenance.islands_version)
     readonly property string aboutDaemonVersion: optionalText(connection.daemon_version)
@@ -316,6 +319,26 @@ Kirigami.ScrollablePage {
         return result
     }
 
+    function failedReceipts(receipts) {
+        return receipts.filter(function(receiptValue) {
+            return objectOrEmpty(receiptValue).outcome === "failed"
+        })
+    }
+
+    function connectionNeedsAttention() {
+        return uiState.lifecycle === "offline" || uiState.lifecycle === "fatal"
+            || hasValue(connection.error)
+            || (connection.remote === true && connection.authenticated !== true)
+    }
+
+    function connectionAttentionText() {
+        if (hasValue(connection.error))
+            return qsTr("Daemon unavailable: %1").arg(connection.error)
+        if (connection.remote === true && connection.authenticated !== true)
+            return qsTr("Remote daemon authentication is required. Open Advanced to configure the API key.")
+        return qsTr("The llmux daemon is offline. Existing display and startup preferences remain available.")
+    }
+
     function surfaceModeText() {
         var mode = optionalText(capabilities.surface_mode)
         if (mode.length === 0)
@@ -351,7 +374,7 @@ Kirigami.ScrollablePage {
                     font.weight: Font.DemiBold
                 }
                 Label {
-                    text: qsTr("Display, daemon, desktop, events, and maintenance")
+                    text: qsTr("Display, sound, privacy, and startup")
                     color: IslandTheme.secondaryText
                     font.pixelSize: 11
                 }
@@ -365,6 +388,24 @@ Kirigami.ScrollablePage {
                 highlighted: true
                 onClicked: menuPage.dispatchRequested("test_notification", "{}")
             }
+            IslandButton {
+                objectName: "menu-advanced-disclosure"
+                text: qsTr("Advanced")
+                checkable: true
+                checked: menuPage.advancedVisible
+                Accessible.name: qsTr("Show advanced settings")
+                onClicked: menuPage.advancedVisible = checked
+            }
+        }
+
+        IslandInlineMessage {
+            objectName: "menu-connection-attention"
+            Layout.fillWidth: true
+            visible: menuPage.connectionNeedsAttention()
+            type: menuPage.uiState.lifecycle === "fatal"
+                || menuPage.hasValue(menuPage.connection.error)
+                ? Kirigami.MessageType.Error : Kirigami.MessageType.Warning
+            text: menuPage.connectionAttentionText()
         }
 
         IslandInlineMessage {
@@ -491,9 +532,13 @@ Kirigami.ScrollablePage {
                         )
                     }
 
-                    IslandFieldLabel { text: qsTr("Quota") }
+                    IslandFieldLabel {
+                        visible: menuPage.advancedVisible
+                        text: qsTr("Quota")
+                    }
                     IslandSwitch {
                         Layout.fillWidth: true
+                        visible: menuPage.advancedVisible
                         text: qsTr("Show Fable weekly quota")
                         checked: menuPage.settings.show_fable_weekly === true
                         enabled: !menuPage.isOperationBusy("settings")
@@ -510,6 +555,7 @@ Kirigami.ScrollablePage {
             id: connectionCard
             objectName: "connection-settings"
             Layout.fillWidth: true
+            visible: menuPage.advancedVisible
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
@@ -645,7 +691,7 @@ Kirigami.ScrollablePage {
                 spacing: Kirigami.Units.smallSpacing
 
                 IslandSectionLabel {
-                    text: qsTr("KDE desktop integration")
+                    text: qsTr("Startup")
                 }
 
                 IslandSwitch {
@@ -668,7 +714,9 @@ Kirigami.ScrollablePage {
                 }
 
                 GridLayout {
+                    objectName: "platform-diagnostics"
                     Layout.fillWidth: true
+                    visible: menuPage.advancedVisible
                     columns: menuPage.width >= 700 ? 2 : 1
                     columnSpacing: Kirigami.Units.largeSpacing
 
@@ -732,7 +780,9 @@ Kirigami.ScrollablePage {
         }
 
         IslandCard {
+            objectName: "events-settings"
             Layout.fillWidth: true
+            visible: menuPage.advancedVisible
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
@@ -820,6 +870,7 @@ Kirigami.ScrollablePage {
             id: maintenanceCard
             objectName: "maintenance-settings"
             Layout.fillWidth: true
+            visible: menuPage.advancedVisible
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
@@ -905,6 +956,8 @@ Kirigami.ScrollablePage {
         IslandCard {
             objectName: "menu-verification-receipts"
             Layout.fillWidth: true
+            visible: menuPage.advancedVisible
+                || menuPage.visibleMenuReceiptItems.length > 0
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
@@ -915,14 +968,14 @@ Kirigami.ScrollablePage {
 
                 Label {
                     Layout.fillWidth: true
-                    visible: menuPage.menuReceiptItems.length === 0
+                    visible: menuPage.visibleMenuReceiptItems.length === 0
                     text: qsTr("No completed settings, event, maintenance, or autostart operations")
                     color: IslandTheme.secondaryText
                     wrapMode: Text.Wrap
                 }
 
                 Repeater {
-                    model: menuPage.menuReceiptItems
+                    model: menuPage.visibleMenuReceiptItems
 
                     delegate: RowLayout {
                         id: receiptRow
@@ -949,7 +1002,6 @@ Kirigami.ScrollablePage {
                                     .arg(menuPage.hasValue(receiptRow.receipt.target_display)
                                         ? qsTr(" · %1").arg(receiptRow.receipt.target_display) : "")
                                 font.bold: true
-                                font.family: IslandTheme.monoFamily
                                 font.pixelSize: 10
                                 elide: Text.ElideRight
                             }
@@ -958,7 +1010,6 @@ Kirigami.ScrollablePage {
                                 text: menuPage.displayText(receiptRow.receipt.message)
                                 wrapMode: Text.Wrap
                                 color: IslandTheme.secondaryText
-                                font.family: IslandTheme.monoFamily
                                 font.pixelSize: 10
                             }
                             Label {
@@ -980,6 +1031,7 @@ Kirigami.ScrollablePage {
         IslandCard {
             objectName: "about-llmux-islands"
             Layout.fillWidth: true
+            visible: menuPage.advancedVisible
 
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing

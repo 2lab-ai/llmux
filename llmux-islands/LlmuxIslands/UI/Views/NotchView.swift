@@ -22,10 +22,27 @@ struct NotchView: View {
     @StateObject private var activityCoordinator = NotchActivityCoordinator.shared
     @ObservedObject private var usageModel = IslandUsageModel.shared
     @State private var isVisible: Bool = false
-    @State private var isHovering: Bool = false
-    @State private var isBouncing: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let snapshotAdvancedInitiallyPresented: Bool
+    private let snapshotStatisticsPage: StatisticsAdvancedPage
+    private let snapshotNow: Date?
+    private let forceVisible: Bool
 
     @Namespace private var activityNamespace
+
+    init(
+        viewModel: NotchViewModel,
+        snapshotAdvancedInitiallyPresented: Bool = false,
+        snapshotStatisticsPage: StatisticsAdvancedPage = .analytics,
+        snapshotNow: Date? = nil,
+        forceVisible: Bool = false
+    ) {
+        self.viewModel = viewModel
+        self.snapshotAdvancedInitiallyPresented = snapshotAdvancedInitiallyPresented
+        self.snapshotStatisticsPage = snapshotStatisticsPage
+        self.snapshotNow = snapshotNow
+        self.forceVisible = forceVisible
+    }
 
     // llmux-islands has no Claude-session monitor, so the closed-state "activity"
     // pill never lights up. These stay constant so the layout math is identical.
@@ -77,8 +94,9 @@ struct NotchView: View {
         NotchShape(topCornerRadius: topCornerRadius, bottomCornerRadius: bottomCornerRadius)
     }
 
-    private let openAnimation = Animation.spring(response: 0.42, dampingFraction: 0.8, blendDuration: 0)
-    private let closeAnimation = Animation.spring(response: 0.45, dampingFraction: 1.0, blendDuration: 0)
+    private var panelAnimation: Animation? {
+        reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 1, blendDuration: 0)
+    }
 
     // MARK: - Body
 
@@ -100,25 +118,13 @@ struct NotchView: View {
                             .frame(height: 1)
                             .padding(.horizontal, topCornerRadius)
                     }
-                    .shadow(
-                        color: (viewModel.status == .opened || isHovering) ? .black.opacity(0.7) : .clear,
-                        radius: 6
-                    )
                     .frame(
                         maxWidth: viewModel.status == .opened ? notchSize.width : nil,
                         maxHeight: viewModel.status == .opened ? notchSize.height : nil,
                         alignment: .top
                     )
-                    .animation(viewModel.status == .opened ? openAnimation : closeAnimation, value: viewModel.status)
-                    .animation(openAnimation, value: notchSize)
-                    .animation(.smooth, value: activityCoordinator.expandingActivity)
-                    .animation(.spring(response: 0.3, dampingFraction: 0.5), value: isBouncing)
+                    .animation(panelAnimation, value: viewModel.status)
                     .contentShape(Rectangle())
-                    .onHover { hovering in
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.8)) {
-                            isHovering = hovering
-                        }
-                    }
                     .onTapGesture {
                         if viewModel.status != .opened {
                             viewModel.notchOpen(reason: .click)
@@ -126,7 +132,7 @@ struct NotchView: View {
                     }
             }
         }
-        .opacity(isVisible ? 1 : 0)
+        .opacity(forceVisible || isVisible ? 1 : 0)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .preferredColorScheme(.dark)
         .onAppear {
@@ -160,14 +166,6 @@ struct NotchView: View {
             if viewModel.status == .opened {
                 contentView
                     .frame(width: notchSize.width - 24)
-                    .transition(
-                        .asymmetric(
-                            insertion: .scale(scale: 0.8, anchor: .top)
-                                .combined(with: .opacity)
-                                .animation(.smooth(duration: 0.35)),
-                            removal: .opacity.animation(.easeOut(duration: 0.15))
-                        )
-                    )
             }
         }
     }
@@ -201,7 +199,7 @@ struct NotchView: View {
             } else {
                 Rectangle()
                     .fill(.black)
-                    .frame(width: closedNotchSize.width - cornerRadiusInsets.closed.top + (isBouncing ? 16 : 0))
+                    .frame(width: closedNotchSize.width - cornerRadiusInsets.closed.top)
             }
 
             if showClosedActivity, isProcessing {
@@ -219,28 +217,57 @@ struct NotchView: View {
 
     @ViewBuilder
     private var openedHeaderContent: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             if !showClosedActivity {
                 ClaudeCrabIcon(size: 14)
                     .matchedGeometryEffect(id: "crab", in: activityNamespace, isSource: !showClosedActivity)
                     .padding(.leading, 8)
             }
 
-            Spacer()
-
-            Button {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    viewModel.toggleMenu()
+            HStack(spacing: 2) {
+                navigationButton("Usage", symbol: "gauge.with.dots.needle.67percent", route: .usage) {
+                    viewModel.showUsage()
                 }
-            } label: {
-                Image(systemName: viewModel.contentType == .menu ? "xmark" : "line.3.horizontal")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.4))
-                    .frame(width: 22, height: 22)
+                navigationButton("Statistics", symbol: "chart.bar.xaxis", route: .stats) {
+                    viewModel.showStats()
+                }
+                navigationButton("Settings", symbol: "gearshape", route: .menu) {
+                    viewModel.showSettings()
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            Button { viewModel.notchClose() } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Close Llmux Islands")
         }
+    }
+
+    private func navigationButton(
+        _ label: String,
+        symbol: String,
+        route: NotchContentType,
+        action: @escaping () -> Void
+    ) -> some View {
+        let selected = viewModel.contentType == route
+        return Button(action: action) {
+            Label(label, systemImage: symbol)
+                .font(.caption.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.white : Color.white.opacity(0.55))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(selected ? 0.12 : 0))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -248,11 +275,28 @@ struct NotchView: View {
         Group {
             switch viewModel.contentType {
             case .usage:
-                IslandUsageView(model: IslandUsageModel.shared, viewModel: viewModel)
+                IslandUsageView(
+                    model: IslandUsageModel.shared,
+                    viewModel: viewModel,
+                    advancedInitiallyPresented: snapshotAdvancedInitiallyPresented,
+                    snapshotNow: snapshotNow
+                )
             case .stats:
-                IslandStatsView(model: IslandUsageModel.shared, viewModel: viewModel)
+                IslandStatsView(
+                    model: IslandUsageModel.shared,
+                    viewModel: viewModel,
+                    snapshotNow: snapshotNow,
+                    advancedInitiallyPresented: snapshotAdvancedInitiallyPresented,
+                    advancedInitialPage: snapshotStatisticsPage
+                )
             case .menu:
-                NotchMenuView(viewModel: viewModel)
+                NotchMenuView(
+                    viewModel: viewModel,
+                    advancedInitiallyPresented: snapshotAdvancedInitiallyPresented,
+                    snapshotState: snapshotNow.flatMap { _ in
+                        usageModel.canonicalState.map(NotchMenuSnapshotState.init(canonicalState:))
+                    }
+                )
             }
         }
         .frame(width: notchSize.width - 24)

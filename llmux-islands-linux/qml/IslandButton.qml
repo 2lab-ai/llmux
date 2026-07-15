@@ -6,7 +6,7 @@ import org.kde.kirigami as Kirigami
 Button {
     id: control
 
-    property color accentColor: IslandTheme.amber
+    property color accentColor: IslandTheme.primaryText
     property bool destructive: false
 
     implicitHeight: 32
@@ -15,6 +15,7 @@ Button {
     topPadding: 7
     bottomPadding: 7
     hoverEnabled: true
+    opacity: enabled ? 1 : 0.44
     palette.buttonText: IslandTheme.primaryText
     palette.brightText: IslandTheme.primaryText
 
@@ -30,7 +31,7 @@ Button {
             implicitHeight: 14
             color: control.destructive ? IslandTheme.red
                 : control.highlighted || control.checked
-                    ? control.accentColor : IslandTheme.secondaryText
+                    ? IslandTheme.panel : IslandTheme.secondaryText
         }
 
         Label {
@@ -38,7 +39,7 @@ Button {
             text: control.text
             color: control.destructive ? IslandTheme.red
                 : control.highlighted || control.checked
-                    ? control.accentColor : IslandTheme.primaryText
+                    ? IslandTheme.panel : IslandTheme.primaryText
             font.pixelSize: 12
             font.weight: control.highlighted || control.checked
                 ? Font.DemiBold : Font.Medium
@@ -52,13 +53,24 @@ Button {
     background: Rectangle {
         radius: IslandTheme.controlRadius
         color: !control.enabled ? IslandTheme.surface
-            : control.down ? IslandTheme.surfaceRaised
             : control.highlighted || control.checked
-                ? IslandTheme.amberTint
+                ? (control.down ? IslandTheme.secondaryText : IslandTheme.primaryText)
+            : control.down ? IslandTheme.surfaceRaised
                 : control.hovered ? IslandTheme.surfaceHover : IslandTheme.surface
-        border.color: control.highlighted || control.checked
-            ? Qt.rgba(1, 0.7, 0, 0.45) : IslandTheme.border
-        border.width: 1
-        opacity: control.enabled ? 1 : 0.45
+        border.color: control.visualFocus
+            ? (control.highlighted || control.checked ? IslandTheme.panel : IslandTheme.focus)
+            : control.highlighted || control.checked
+                ? IslandTheme.primaryText : IslandTheme.border
+        border.width: control.visualFocus ? 2 : 1
+
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: -3
+            visible: control.visualFocus
+            color: "transparent"
+            border.color: IslandTheme.focus
+            border.width: 2
+            radius: 0
+        }
     }
 }

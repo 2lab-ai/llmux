@@ -18,7 +18,7 @@ struct ClaudeCrabIcon: View {
     // Timer for leg animation
     private let legTimer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
 
-    init(size: CGFloat = 16, color: Color = Color(red: 0.85, green: 0.47, blue: 0.34), animateLegs: Bool = false) {
+    init(size: CGFloat = 16, color: Color = Color.white.opacity(0.78), animateLegs: Bool = false) {
         self.size = size
         self.color = color
         self.animateLegs = animateLegs
@@ -169,4 +169,3 @@ struct ReadyForInputIndicatorIcon: View {
         .frame(width: size, height: size)
     }
 }
-

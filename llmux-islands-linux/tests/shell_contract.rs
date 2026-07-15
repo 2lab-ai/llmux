@@ -28,26 +28,34 @@ fn qml_shell_exposes_every_primary_surface() {
 }
 
 #[test]
-fn qml_visual_system_matches_the_macos_island_language_without_system_chrome() {
+fn qml_visual_system_uses_the_inverted_openai_reference_without_system_chrome() {
     let theme = read("qml/IslandTheme.qml");
     for marker in [
-        r##"panel: "#050505""##,
-        r##"surface: "#111111""##,
-        r##"primaryText: "#e6e6e6""##,
-        r##"secondaryText: "#8a8a8a""##,
+        r##"panel: "#000000""##,
+        r##"surface: "#000000""##,
+        r##"primaryText: "#ffffff""##,
+        "secondaryText: Qt.rgba(1, 1, 1, 0.60)",
+        "tertiaryText: Qt.rgba(1, 1, 1, 0.50)",
+        "disabledText: Qt.rgba(1, 1, 1, 0.44)",
+        r##"focus: "#ffffff""##,
         r##"green: "#66bf73""##,
         r##"amber: "#ffb300""##,
         r##"red: "#ff4d4d""##,
-        r##"blue: "#6699ff""##,
-        r##"magenta: "#cc66cc""##,
-        "cardRadius: 10",
+        "cardRadius: 0",
+        "controlRadius: 0",
         "providerAccent(provider)",
         "quotaAccent(remaining, constraining, warningLevel)",
         r#"monoFamily: "monospace""#,
     ] {
         assert!(
             theme.contains(marker),
-            "missing macOS-derived token {marker}"
+            "missing inverted OpenAI token {marker}"
+        );
+    }
+    for forbidden in ["blue:", "blueTint:", "magenta:", "cyan:"] {
+        assert!(
+            !theme.contains(forbidden),
+            "normal visual tokens must not carry chromatic accent {forbidden}"
         );
     }
 
@@ -151,11 +159,11 @@ fn production_surfaces_use_provider_quota_segment_and_receipt_hierarchy() {
 }
 
 #[test]
-fn offscreen_snapshot_controls_keep_labels_and_account_actions_visible() {
+fn offscreen_snapshot_controls_keep_labels_explicit_and_account_actions_discoverable() {
     let field_label = read("qml/IslandFieldLabel.qml");
     for marker in [
         "color: IslandTheme.secondaryText",
-        "font.family: IslandTheme.monoFamily",
+        "font.weight: Font.Medium",
         "horizontalAlignment: Text.AlignRight",
     ] {
         assert!(
@@ -163,6 +171,10 @@ fn offscreen_snapshot_controls_keep_labels_and_account_actions_visible() {
             "dark form label must contain {marker}"
         );
     }
+    assert!(
+        !field_label.contains("font.family: IslandTheme.monoFamily"),
+        "prose form labels must use the system grotesque"
+    );
 
     let menu = read("qml/Menu.qml");
     assert!(
@@ -182,6 +194,7 @@ fn offscreen_snapshot_controls_keep_labels_and_account_actions_visible() {
         "text: \"⋯\"",
         "display: AbstractButton.TextOnly",
         "Accessible.name: qsTr(\"Account actions\")",
+        "visible: usagePage.advancedVisible",
     ] {
         assert!(
             usage.contains(marker),
@@ -229,6 +242,11 @@ fn controller_contract_is_qml_invokable() {
 #[test]
 fn deterministic_fixture_contains_request_receipts() {
     let fixture = read("fixtures/dashboard.json");
+    let macos_fixture = read("../llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json");
+    assert_eq!(
+        fixture, macos_fixture,
+        "macOS and KDE renderer evidence must consume byte-identical dashboard fixtures"
+    );
     for marker in [
         r#""current_by_group""#,
         r#""accounts""#,
@@ -271,7 +289,7 @@ fn canonical_controller_runtime_is_async_and_timer_bounded() {
     let main = read("qml/Main.qml");
     for marker in [
         "uiState.navigation",
-        "connection.endpoint_display",
+        "uiState.connection",
         "interval: 10000",
         "onDispatchRequested",
         "controller.dispatch(\"app_started\"",
@@ -281,6 +299,10 @@ fn canonical_controller_runtime_is_async_and_timer_bounded() {
             "canonical shell must contain {marker}"
         );
     }
+    assert!(
+        !main.contains("connection.endpoint_display"),
+        "the default shell status must not expose the technical daemon endpoint"
+    );
     assert!(!main.contains("uiState.selected_surface"));
 }
 
@@ -345,13 +367,16 @@ fn layer_shell_has_a_compact_semantic_closed_and_dynamic_open_surface() {
         "preferredContentHeight",
         "sequence: \"Escape\"",
         "onActiveChanged",
-        "Behavior on width",
-        "Behavior on height",
-        "duration: 140",
     ] {
         assert!(
             main.contains(marker),
             "semantic window shell must contain {marker}"
+        );
+    }
+    for forbidden in ["Behavior on width", "Behavior on height", "NumberAnimation"] {
+        assert!(
+            !main.contains(forbidden),
+            "frequent open/close geometry must not animate through {forbidden}"
         );
     }
     assert!(!main.contains("width: 920"));
@@ -433,8 +458,8 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         );
     }
     for marker in [
-        "snapshotSurfaces: [\"usage\", \"statistics\", \"receipts\", \"menu\"]",
-        "captureTarget.grabToImage",
+        "snapshotSurfaces: [\"usage\", \"usage-advanced\", \"statistics\", \"statistics-advanced\", \"receipts\", \"menu\", \"menu-advanced\"]",
+        "snapshotTarget.grabToImage(saveResult, Qt.size(960, height))",
         "result.saveToFile(outputPath)",
         "controller.failHeadless(message)",
         "controller.exitHeadless(0)",
@@ -445,18 +470,51 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         "function retrySnapshot(message)",
         "function snapshotPreferredContentHeight()",
         "Math.ceil(pageHeight) + headerHeight + 32",
+        "function snapshotRoute(name)",
+        "name === \"usage-advanced\"",
+        "name === \"statistics-advanced\" || name === \"receipts\"",
+        "name === \"menu-advanced\"",
         "function snapshotSurfaceCount(name)",
+        "function snapshotSurfaceFlag(name)",
+        "surface === \"usage-advanced\" || surface === \"statistics-advanced\"",
+        "surface === \"usage\" || surface === \"usage-advanced\"",
+        "snapshotSurfaceFlag(\"advancedVisible\")",
         "snapshotSurfaceCount(\"renderedGaugeCount\") < 1",
         "snapshotSurfaceCount(\"renderedHeatmapCellCount\") < 1",
         "snapshotSurfaceCount(\"renderedServingAccountCount\") < 1",
         "snapshotSurfaceCount(\"renderedVerificationReceiptCount\") < 1",
-        "surfaceLoader.item.snapshotReceiptTarget",
+        "id: snapshotTarget",
+        "id: expandedHeader",
+        "id: productionBody",
+        "anchors.top: expandedHeader.bottom",
+        "root.snapshotSurfaces[root.snapshotIndex] === \"usage-advanced\"",
+        "root.snapshotSurfaces[root.snapshotIndex] === \"statistics-advanced\"",
+        "receiptSnapshotMode: controller.snapshotMode",
+        "root.snapshotSurfaces[root.snapshotIndex] === \"receipts\"",
+        "root.snapshotSurfaces[root.snapshotIndex] === \"menu-advanced\"",
     ] {
         assert!(
             qml.contains(marker),
             "snapshot runtime must contain {marker}"
         );
     }
+    assert_eq!(
+        qml.matches("id: expandedHeader").count(),
+        1,
+        "snapshot and production must reuse one real header"
+    );
+    assert!(
+        !qml.contains("header: ToolBar"),
+        "the real production header must live inside the shell capture target"
+    );
+    assert!(
+        !qml.contains("surfaceLoader.item.snapshotReceiptTarget"),
+        "receipt evidence must capture its exact user-facing Statistics route with shell chrome"
+    );
+    assert!(
+        !qml.contains("if (name === \"receipts\")"),
+        "receipt evidence must size the complete Statistics route instead of a detached detail"
+    );
     for marker in [
         "--snapshot-dir",
         "89504e470d0a1a0a",
@@ -478,6 +536,106 @@ fn explicit_snapshot_cli_renders_full_surfaces_and_a_receipt_detail() {
         !docker.contains("cargo run --locked -- --smoke-test"),
         "Arch smoke verification must execute the binary built in the prior layer"
     );
+}
+
+#[test]
+fn t6_advanced_disclosure_is_local_monochrome_and_keeps_common_failures_visible() {
+    let usage = read("qml/Usage.qml");
+    let statistics = read("qml/Statistics.qml");
+    let menu = read("qml/Menu.qml");
+    let main = read("qml/Main.qml");
+
+    for (source, object_name, local_toggle) in [
+        (
+            &usage,
+            "usage-advanced-disclosure",
+            "onClicked: usagePage.advancedVisible = checked",
+        ),
+        (
+            &statistics,
+            "statistics-advanced-disclosure",
+            "onClicked: statisticsPage.advancedVisible = checked",
+        ),
+        (
+            &menu,
+            "menu-advanced-disclosure",
+            "onClicked: menuPage.advancedVisible = checked",
+        ),
+    ] {
+        assert!(source.contains("property bool advancedVisible: false"));
+        assert!(source.contains(&format!("objectName: \"{object_name}\"")));
+        assert!(source.contains("text: qsTr(\"Advanced\")"));
+        assert!(source.contains("checkable: true"));
+        assert!(source.contains(local_toggle));
+
+        let disclosure = source
+            .split(&format!("objectName: \"{object_name}\""))
+            .nth(1)
+            .and_then(|tail| tail.split("            }").next())
+            .expect("advanced disclosure block");
+        assert!(
+            !disclosure.contains("dispatchRequested"),
+            "Advanced toggles presentation only"
+        );
+    }
+
+    for marker in [
+        "id: providerCounterFlow",
+        "visible: usagePage.advancedVisible && providerCounterRepeater.count > 0",
+        "model: usagePage.advancedVisible",
+        "visible: usagePage.visibleUsageReceipts().length > 0",
+        "objectName: \"usage-offline-state\"",
+        "accountCard.account.healthy === false",
+        "accountCard.tokenExpiry.state === \"expired\"",
+        "return verificationReceipts.filter",
+    ] {
+        assert!(
+            usage.contains(marker),
+            "Usage T6 contract must contain {marker}"
+        );
+    }
+
+    for marker in [
+        "objectName: \"statistics-account-overview\"",
+        "visible: statisticsPage.effectiveAdvancedVisible",
+        "property bool receiptSnapshotMode: false",
+        "advancedVisible || receiptSnapshotMode",
+        "visible: statisticsPage.receiptSnapshotMode",
+        "healthSummaryReason",
+    ] {
+        assert!(
+            statistics.contains(marker),
+            "Statistics T6 contract must contain {marker}"
+        );
+    }
+
+    for marker in [
+        "objectName: \"menu-connection-attention\"",
+        "visible: menuPage.connectionNeedsAttention()",
+        "visible: menuPage.advancedVisible",
+        "objectName: \"connection-settings\"",
+        "objectName: \"platform-diagnostics\"",
+        "objectName: \"events-settings\"",
+        "objectName: \"maintenance-settings\"",
+        "objectName: \"about-llmux-islands\"",
+        "failedReceipts(menuReceiptItems)",
+        "Launch Islands at login",
+        "Anonymize account email",
+    ] {
+        assert!(
+            menu.contains(marker),
+            "Settings T6 contract must contain {marker}"
+        );
+    }
+
+    assert!(main.contains("model: [qsTr(\"Usage\"), qsTr(\"Statistics\"), qsTr(\"Settings\")]"));
+    assert!(main.contains("index === 2 ? \"menu\" : \"usage\""));
+
+    for source in [&usage, &statistics, &menu] {
+        assert!(!source.contains("IslandTheme.blue"));
+        assert!(!source.contains("gradient"));
+        assert!(!source.contains("shadow"));
+    }
 }
 
 #[test]

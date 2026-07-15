@@ -10,8 +10,8 @@ ComboBox {
     font.pixelSize: 12
     palette.text: IslandTheme.primaryText
     palette.buttonText: IslandTheme.primaryText
-    palette.highlight: IslandTheme.amberTint
-    palette.highlightedText: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
+    palette.highlightedText: IslandTheme.panel
 
     delegate: IslandItemDelegate {
         required property int index
@@ -22,7 +22,7 @@ ComboBox {
 
     contentItem: Text {
         text: control.displayText
-        color: control.enabled ? IslandTheme.primaryText : IslandTheme.tertiaryText
+        color: control.enabled ? IslandTheme.primaryText : IslandTheme.disabledText
         font: control.font
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
@@ -39,8 +39,8 @@ ComboBox {
     background: Rectangle {
         radius: IslandTheme.controlRadius
         color: control.down ? IslandTheme.surfaceRaised : IslandTheme.field
-        border.color: control.activeFocus ? IslandTheme.amber : IslandTheme.border
-        border.width: 1
+        border.color: control.activeFocus ? IslandTheme.focus : IslandTheme.border
+        border.width: control.activeFocus ? 2 : 1
     }
 
     popup: Popup {
@@ -59,7 +59,7 @@ ComboBox {
 
         background: Rectangle {
             color: IslandTheme.surfaceRaised
-            radius: IslandTheme.controlRadius
+            radius: 0
             border.color: IslandTheme.borderStrong
         }
     }

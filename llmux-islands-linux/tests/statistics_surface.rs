@@ -181,6 +181,37 @@ fn optional_and_additive_values_render_as_unavailable_instead_of_zero() {
 }
 
 #[test]
+fn common_statistics_path_has_summary_and_accounts_with_local_advanced_details() {
+    let qml = read("qml/Statistics.qml");
+
+    for marker in [
+        "property bool advancedVisible: false",
+        "property bool receiptSnapshotMode: false",
+        "advancedVisible || receiptSnapshotMode",
+        "objectName: \"statistics-advanced-disclosure\"",
+        "onClicked: statisticsPage.advancedVisible = checked",
+        "objectName: \"statistics-overview\"",
+        "objectName: \"statistics-account-overview\"",
+        "function healthSummaryReason(row)",
+        "visible: statisticsPage.effectiveAdvancedVisible",
+        "model: [qsTr(\"Models\"), qsTr(\"Clients\"), qsTr(\"Health\"), qsTr(\"Receipts\")]",
+        "visible: statisticsPage.receiptSnapshotMode",
+    ] {
+        assert!(
+            qml.contains(marker),
+            "missing Statistics T6 marker {marker}"
+        );
+    }
+
+    let disclosure = qml
+        .split("objectName: \"statistics-advanced-disclosure\"")
+        .nth(1)
+        .and_then(|tail| tail.split("            }").next())
+        .expect("statistics disclosure block");
+    assert!(!disclosure.contains("dispatchRequested"));
+}
+
+#[test]
 fn test_contract_tracks_the_checked_in_schema_names() {
     let schema = read("../llmux-islands-core/contract/ui-contract.schema.json");
     for field in [

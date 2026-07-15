@@ -24,7 +24,7 @@ Kirigami.ApplicationWindow {
     readonly property int preferredWindowContentHeight: semanticOpen
         ? (controller.snapshotMode ? snapshotPreferredContentHeight()
                                    : expandedPreferredContentHeight()) : 44
-    readonly property var snapshotSurfaces: ["usage", "statistics", "receipts", "menu"]
+    readonly property var snapshotSurfaces: ["usage", "usage-advanced", "statistics", "statistics-advanced", "receipts", "menu", "menu-advanced"]
     property bool surfaceConfigured: false
     property bool noTrayFallback: false
     property bool bootPresentationStarted: false
@@ -145,9 +145,6 @@ Kirigami.ApplicationWindow {
     }
 
     function snapshotPreferredContentHeight() {
-        var name = snapshotIndex >= 0 ? snapshotSurfaces[snapshotIndex] : selectedSurface
-        if (name === "receipts")
-            return 760
         var pageHeight = surfaceLoader.item === null
             || surfaceLoader.item === undefined ? 0
             : Number(surfaceLoader.item.preferredContentHeight)
@@ -245,12 +242,11 @@ Kirigami.ApplicationWindow {
     }
 
     function connectionLabel() {
-        var endpoint = connection.endpoint_display || qsTr("daemon")
         if (uiState.lifecycle === "ready")
-            return endpoint
-        if (connection.error)
-            return qsTr("Offline · %1").arg(connection.error)
-        return qsTr("%1 · %2").arg(endpoint).arg(uiState.lifecycle || qsTr("starting"))
+            return qsTr("Connected")
+        if (uiState.lifecycle === "starting")
+            return qsTr("Connecting")
+        return qsTr("Offline")
     }
 
     function providerDisplayName(provider) {
@@ -342,8 +338,18 @@ Kirigami.ApplicationWindow {
         snapshotCaptureTimer.restart()
     }
 
+    function snapshotRoute(name) {
+        if (name === "usage-advanced")
+            return "usage"
+        if (name === "statistics-advanced" || name === "receipts")
+            return "statistics"
+        if (name === "menu-advanced")
+            return "menu"
+        return name
+    }
+
     function selectSnapshotSurface(name) {
-        selectSurface(name === "receipts" ? "statistics" : name)
+        selectSurface(snapshotRoute(name))
     }
 
     function failSnapshot(message) {
@@ -370,6 +376,11 @@ Kirigami.ApplicationWindow {
         return isFinite(count) ? count : -1
     }
 
+    function snapshotSurfaceFlag(name) {
+        var item = surfaceLoader.item
+        return item !== null && item !== undefined && item[name] === true
+    }
+
     function captureSnapshotSurface() {
         if (!controller.snapshotMode || snapshotCaptureBusy || snapshotIndex < 0)
             return
@@ -381,12 +392,20 @@ Kirigami.ApplicationWindow {
 
         snapshotCaptureBusy = true
         var surface = snapshotSurfaces[snapshotIndex]
-        if (surface === "usage" && snapshotSurfaceCount("renderedGaugeCount") < 1) {
+        if ((surface === "usage-advanced" || surface === "statistics-advanced"
+                || surface === "menu-advanced")
+                && !snapshotSurfaceFlag("advancedVisible")) {
+            snapshotCaptureBusy = false
+            retrySnapshot(qsTr("Advanced snapshot surface did not become ready"))
+            return
+        }
+        if ((surface === "usage" || surface === "usage-advanced")
+                && snapshotSurfaceCount("renderedGaugeCount") < 1) {
             snapshotCaptureBusy = false
             retrySnapshot(qsTr("Usage snapshot rendered no quota gauges"))
             return
         }
-        if (surface === "statistics"
+        if (surface === "statistics-advanced"
                 && (snapshotSurfaceCount("renderedHeatmapCellCount") < 1
                     || snapshotSurfaceCount("renderedServingAccountCount") < 1)) {
             snapshotCaptureBusy = false
@@ -400,8 +419,6 @@ Kirigami.ApplicationWindow {
             return
         }
         var outputPath = controller.snapshotDir + "/" + surface + ".png"
-        var captureTarget = surface === "receipts"
-            ? surfaceLoader.item.snapshotReceiptTarget : snapshotTarget
         var saveResult = function(result) {
             var saved = result !== null && result.saveToFile(outputPath)
             snapshotCaptureBusy = false
@@ -420,10 +437,7 @@ Kirigami.ApplicationWindow {
             selectSnapshotSurface(snapshotSurfaces[snapshotIndex])
             snapshotCaptureTimer.restart()
         }
-        if (surface === "receipts")
-            captureTarget.grabToImage(saveResult)
-        else
-            captureTarget.grabToImage(saveResult, Qt.size(960, height))
+        snapshotTarget.grabToImage(saveResult, Qt.size(960, height))
     }
 
     function automaticPollAllowed() {
@@ -465,25 +479,9 @@ Kirigami.ApplicationWindow {
     palette.text: IslandTheme.primaryText
     palette.button: IslandTheme.surface
     palette.buttonText: IslandTheme.primaryText
-    palette.highlight: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
     palette.highlightedText: IslandTheme.panel
     palette.placeholderText: IslandTheme.tertiaryText
-
-    Behavior on width {
-        enabled: !controller.smokeMode && !controller.snapshotMode
-        NumberAnimation {
-            duration: 140
-            easing.type: Easing.OutCubic
-        }
-    }
-
-    Behavior on height {
-        enabled: !controller.smokeMode && !controller.snapshotMode
-        NumberAnimation {
-            duration: 140
-            easing.type: Easing.OutCubic
-        }
-    }
 
     IslandsController {
         id: controller
@@ -578,145 +576,156 @@ Kirigami.ApplicationWindow {
         }
     }
 
-    header: ToolBar {
-        id: expandedHeader
-        visible: root.semanticOpen
-        height: visible ? implicitHeight : 0
-        implicitHeight: 58
-
-        background: Rectangle {
-            color: IslandTheme.panel
-            border.color: IslandTheme.border
-            border.width: 0
-
-            Rectangle {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                height: 1
-                color: IslandTheme.border
-            }
-        }
-
-        contentItem: RowLayout {
-            spacing: 14
-
-            Label {
-                text: qsTr("llmux Islands")
-                color: IslandTheme.primaryText
-                font.pixelSize: 15
-                font.weight: Font.DemiBold
-                Layout.leftMargin: IslandTheme.pagePadding
-            }
-
-            Item {
-                Layout.fillWidth: true
-            }
-
-            IslandSegmentedControl {
-                Layout.preferredWidth: 330
-                model: [qsTr("Usage"), qsTr("Statistics"), qsTr("Menu")]
-                currentIndex: root.selectedSurface === "statistics" ? 1
-                    : root.selectedSurface === "menu" ? 2 : 0
-                onActivated: function(index) {
-                    root.selectSurface(index === 1 ? "statistics" : index === 2 ? "menu" : "usage")
-                }
-            }
-
-            Rectangle {
-                radius: height / 2
-                implicitWidth: connectionStatus.implicitWidth
-                    + 22
-                implicitHeight: connectionStatus.implicitHeight
-                    + 12
-                color: root.uiState.lifecycle === "ready"
-                    ? IslandTheme.greenTint
-                    : root.uiState.lifecycle === "starting"
-                        ? IslandTheme.amberTint
-                        : IslandTheme.redTint
-                border.color: root.uiState.lifecycle === "ready"
-                    ? IslandTheme.green : root.uiState.lifecycle === "starting"
-                        ? IslandTheme.amber : IslandTheme.red
-                border.width: 1
-                Layout.rightMargin: IslandTheme.pagePadding
-
-                Label {
-                    id: connectionStatus
-                    anchors.centerIn: parent
-                    text: root.connectionLabel()
-                    color: IslandTheme.primaryText
-                    font.family: IslandTheme.monoFamily
-                    font.pixelSize: 10
-                    elide: Text.ElideMiddle
-                }
-            }
-        }
-    }
-
     Item {
         id: snapshotTarget
         anchors.fill: parent
 
-        Loader {
-            id: surfaceLoader
-            anchors.fill: parent
+        ToolBar {
+            id: expandedHeader
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
             visible: root.semanticOpen
-            sourceComponent: root.selectedSurface === "statistics"
-                ? statisticsComponent
-                : root.selectedSurface === "menu" ? menuComponent : usageComponent
-        }
+            height: visible ? implicitHeight : 0
+            implicitHeight: 58
 
-        Rectangle {
-            id: compactIsland
-            objectName: "compact-closed-island"
-            anchors.fill: parent
-            visible: !root.semanticOpen
-            radius: height / 2
-            color: IslandTheme.panel
-            border.color: IslandTheme.borderStrong
-            border.width: 1
+            background: Rectangle {
+                color: IslandTheme.panel
+                border.color: IslandTheme.border
+                border.width: 0
 
-            RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: Kirigami.Units.largeSpacing
-                anchors.rightMargin: Kirigami.Units.largeSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                Kirigami.Icon {
-                    source: "io.twolab.LlmuxIslands"
-                    implicitWidth: Kirigami.Units.iconSizes.small
-                    implicitHeight: implicitWidth
-                }
-
-                Label {
-                    Layout.fillWidth: true
-                    text: root.compactProviderSummary()
-                    color: IslandTheme.primaryText
-                    font.bold: root.totalInFlight > 0
-                    font.family: IslandTheme.monoFamily
-                    font.pixelSize: 11
-                    elide: Text.ElideRight
-                    horizontalAlignment: Text.AlignHCenter
-                }
-
-                Label {
-                    text: root.uiState.lifecycle === "ready" ? "●" : "○"
-                    color: root.uiState.lifecycle === "ready"
-                        ? IslandTheme.green
-                        : IslandTheme.red
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: 1
+                    color: IslandTheme.border
                 }
             }
 
-            MouseArea {
-                id: compactMouseArea
+            contentItem: RowLayout {
+                spacing: 14
+
+                Label {
+                    text: qsTr("llmux Islands")
+                    color: IslandTheme.primaryText
+                    font.pixelSize: 15
+                    font.weight: Font.DemiBold
+                    Layout.leftMargin: IslandTheme.pagePadding
+                }
+
+                Item {
+                    Layout.fillWidth: true
+                }
+
+                IslandSegmentedControl {
+                    Layout.preferredWidth: 300
+                    model: [qsTr("Usage"), qsTr("Statistics"), qsTr("Settings")]
+                    currentIndex: root.selectedSurface === "statistics" ? 1
+                        : root.selectedSurface === "menu" ? 2 : 0
+                    onActivated: function(index) {
+                        root.selectSurface(index === 1 ? "statistics" : index === 2 ? "menu" : "usage")
+                    }
+                }
+
+                Rectangle {
+                    radius: 0
+                    implicitWidth: connectionStatus.implicitWidth
+                        + 22
+                    implicitHeight: connectionStatus.implicitHeight
+                        + 12
+                    color: root.uiState.lifecycle === "ready"
+                        ? IslandTheme.surface
+                        : root.uiState.lifecycle === "starting"
+                            ? IslandTheme.amberTint
+                            : IslandTheme.redTint
+                    border.color: root.uiState.lifecycle === "ready"
+                        ? IslandTheme.borderStrong : root.uiState.lifecycle === "starting"
+                            ? IslandTheme.amber : IslandTheme.red
+                    border.width: 1
+                    Layout.rightMargin: IslandTheme.pagePadding
+
+                    Label {
+                        id: connectionStatus
+                        anchors.centerIn: parent
+                        text: root.connectionLabel()
+                        color: IslandTheme.primaryText
+                        font.pixelSize: 11
+                        font.weight: Font.Medium
+                        elide: Text.ElideMiddle
+                    }
+                }
+            }
+        }
+
+        Item {
+            id: productionBody
+            anchors.top: expandedHeader.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+
+            Loader {
+                id: surfaceLoader
                 anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onEntered: compactHoverOpenTimer.restart()
-                onExited: compactHoverOpenTimer.stop()
-                onClicked: {
-                    compactHoverOpenTimer.stop()
-                    root.requestOpen("click")
+                visible: root.semanticOpen
+                sourceComponent: root.selectedSurface === "statistics"
+                    ? statisticsComponent
+                    : root.selectedSurface === "menu" ? menuComponent : usageComponent
+            }
+
+            Rectangle {
+                id: compactIsland
+                objectName: "compact-closed-island"
+                anchors.fill: parent
+                visible: !root.semanticOpen
+                radius: height / 2
+                color: IslandTheme.panel
+                border.color: IslandTheme.borderStrong
+                border.width: 1
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Kirigami.Units.largeSpacing
+                    anchors.rightMargin: Kirigami.Units.largeSpacing
+                    spacing: Kirigami.Units.smallSpacing
+
+                    Kirigami.Icon {
+                        source: "io.twolab.LlmuxIslands"
+                        implicitWidth: Kirigami.Units.iconSizes.small
+                        implicitHeight: implicitWidth
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: root.compactProviderSummary()
+                        color: IslandTheme.primaryText
+                        font.bold: root.totalInFlight > 0
+                        font.family: IslandTheme.monoFamily
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+
+                    Label {
+                        text: root.uiState.lifecycle === "ready" ? "●" : "○"
+                        color: root.uiState.lifecycle === "ready"
+                            ? IslandTheme.primaryText
+                            : IslandTheme.red
+                    }
+                }
+
+                MouseArea {
+                    id: compactMouseArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: compactHoverOpenTimer.restart()
+                    onExited: compactHoverOpenTimer.stop()
+                    onClicked: {
+                        compactHoverOpenTimer.stop()
+                        root.requestOpen("click")
+                    }
                 }
             }
         }
@@ -735,6 +744,9 @@ Kirigami.ApplicationWindow {
         id: usageComponent
         Usage {
             uiState: root.uiState
+            advancedVisible: controller.snapshotMode
+                && root.snapshotIndex >= 0
+                && root.snapshotSurfaces[root.snapshotIndex] === "usage-advanced"
         }
     }
 
@@ -742,6 +754,12 @@ Kirigami.ApplicationWindow {
         id: statisticsComponent
         Statistics {
             uiState: root.uiState
+            advancedVisible: controller.snapshotMode
+                && root.snapshotIndex >= 0
+                && root.snapshotSurfaces[root.snapshotIndex] === "statistics-advanced"
+            receiptSnapshotMode: controller.snapshotMode
+                && root.snapshotIndex >= 0
+                && root.snapshotSurfaces[root.snapshotIndex] === "receipts"
         }
     }
 
@@ -751,6 +769,9 @@ Kirigami.ApplicationWindow {
             uiState: root.uiState
             surfaceMode: controller.surfaceMode
             autostartEnabled: controller.autostartEnabled
+            advancedVisible: controller.snapshotMode
+                && root.snapshotIndex >= 0
+                && root.snapshotSurfaces[root.snapshotIndex] === "menu-advanced"
         }
     }
 

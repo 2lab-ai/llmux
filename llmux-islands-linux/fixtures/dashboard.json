@@ -168,7 +168,7 @@
       {
         "kind": "note",
         "at_ms": 1700000002000,
-        "text": "upstream failed Authorization: Bearer sk-secret-value",
+        "text": "account alice@example.com failed with HTTP 503",
         "error": true
       }
     ]

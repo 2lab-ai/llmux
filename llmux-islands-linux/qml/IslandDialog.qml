@@ -11,12 +11,12 @@ Dialog {
     palette.button: IslandTheme.surfaceRaised
     palette.buttonText: IslandTheme.primaryText
     palette.base: IslandTheme.field
-    palette.highlight: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
     palette.highlightedText: IslandTheme.panel
 
     background: Rectangle {
         color: IslandTheme.surface
-        radius: 14
+        radius: 0
         border.color: IslandTheme.borderStrong
         border.width: 1
     }

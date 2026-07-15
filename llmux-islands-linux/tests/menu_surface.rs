@@ -278,3 +278,49 @@ fn terminal_menu_operations_have_a_visible_verification_receipt_region() {
         );
     }
 }
+
+#[test]
+fn common_settings_stay_reachable_and_advanced_hides_technical_groups_locally() {
+    let qml = read("qml/Menu.qml");
+
+    for common in [
+        "Screen",
+        "Sound",
+        "Privacy",
+        "Launch Islands at login",
+        "Test notification",
+        "objectName: \"menu-connection-attention\"",
+        "visible: menuPage.connectionNeedsAttention()",
+    ] {
+        assert!(
+            qml.contains(common),
+            "missing common Settings control {common}"
+        );
+    }
+
+    for advanced in [
+        "property bool advancedVisible: false",
+        "objectName: \"menu-advanced-disclosure\"",
+        "onClicked: menuPage.advancedVisible = checked",
+        "objectName: \"connection-settings\"",
+        "objectName: \"platform-diagnostics\"",
+        "objectName: \"events-settings\"",
+        "objectName: \"maintenance-settings\"",
+        "objectName: \"menu-verification-receipts\"",
+        "objectName: \"about-llmux-islands\"",
+        "visible: menuPage.advancedVisible",
+        "failedReceipts(menuReceiptItems)",
+    ] {
+        assert!(
+            qml.contains(advanced),
+            "missing advanced Settings marker {advanced}"
+        );
+    }
+
+    let disclosure = qml
+        .split("objectName: \"menu-advanced-disclosure\"")
+        .nth(1)
+        .and_then(|tail| tail.split("            }").next())
+        .expect("settings disclosure block");
+    assert!(!disclosure.contains("dispatchRequested"));
+}

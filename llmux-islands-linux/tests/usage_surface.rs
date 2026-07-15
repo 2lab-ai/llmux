@@ -251,6 +251,49 @@ fn terminal_usage_operations_have_a_verification_receipt_region() {
 }
 
 #[test]
+fn common_usage_path_keeps_primary_state_while_advanced_is_local_detail_only() {
+    let qml = read("qml/Usage.qml");
+
+    for marker in [
+        "property bool advancedVisible: false",
+        "objectName: \"usage-advanced-disclosure\"",
+        "text: qsTr(\"Advanced\")",
+        "onClicked: usagePage.advancedVisible = checked",
+        "function primaryGauges(account)",
+        "gauge.constraining === true",
+        "visible: !usagePage.advancedVisible",
+        "Number(accountCard.account.in_flight) > 0",
+        "text: qsTr(\"Active\")",
+        "visible: usagePage.advancedVisible",
+        "model: usagePage.advancedVisible",
+        "function visibleUsageReceipts()",
+        "outcome === \"failed\"",
+    ] {
+        assert!(qml.contains(marker), "missing Usage T6 marker {marker}");
+    }
+
+    for critical_marker in [
+        "objectName: \"usage-offline-state\"",
+        "accountCard.account.warning_level === \"critical\"",
+        "accountCard.account.healthy === false",
+        "accountCard.tokenExpiry.state === \"expired\"",
+        "Authentication required: this credential has expired",
+    ] {
+        assert!(
+            qml.contains(critical_marker),
+            "critical state must remain in the common path: {critical_marker}"
+        );
+    }
+
+    let disclosure = qml
+        .split("objectName: \"usage-advanced-disclosure\"")
+        .nth(1)
+        .and_then(|tail| tail.split("            }").next())
+        .expect("usage disclosure block");
+    assert!(!disclosure.contains("dispatchRequested"));
+}
+
+#[test]
 fn test_contract_tracks_the_checked_in_schema_names() {
     let schema = read("../llmux-islands-core/contract/ui-contract.schema.json");
     for field in [

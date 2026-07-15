@@ -13,13 +13,80 @@ import ServiceManagement
 
 // MARK: - NotchMenuView
 
+/// Deterministic projection used only by the offscreen production renderer.
+/// Live Settings continues to read and mutate the native OS adapters below.
+struct NotchMenuSnapshotState {
+    let screenLabel: String
+    let soundLabel: String
+    let emailAnonymous: Bool
+    let showFableWeekly: Bool
+    let launchAtLogin: Bool
+    let accessibilityTrusted: Bool
+    let connectionHost: String
+    let connectionPort: Int
+    let apiKeyConfigured: Bool
+    let releaseChannel: ReleaseChannel
+
+    init(canonicalState state: SharedUiState) {
+        let screenID = state.window.selectedScreenID
+        screenLabel = state.settings.screens.first(where: { $0.selected || $0.id == screenID })?.label
+            ?? Self.fallbackLabel(for: screenID, automaticLabel: "Auto")
+
+        let soundID = state.settings.soundID ?? "default"
+        soundLabel = state.settings.sounds.first(where: { $0.selected == true || $0.id == soundID })?.label
+            ?? Self.fallbackLabel(for: soundID, automaticLabel: "Default")
+
+        emailAnonymous = state.settings.emailAnonymous
+        showFableWeekly = state.settings.showFableWeekly
+        launchAtLogin = state.settings.autostart.enabled ?? false
+        // Accessibility permission is intentionally shell-owned and absent
+        // from UiState. Evidence pins the actionable not-yet-granted state.
+        accessibilityTrusted = false
+
+        let endpoint = URLComponents(string: state.connection.endpointDisplay)
+        connectionHost = endpoint?.host ?? "127.0.0.1"
+        connectionPort = endpoint?.port ?? 3456
+        apiKeyConfigured = state.settings.apiKeyConfigured
+        // The checked-in dashboard fixture is explicitly a preview build.
+        // Keep a deterministic fallback for older UiState payloads that did
+        // not yet project the daemon channel into maintenance state.
+        releaseChannel = state.settings.maintenance.channel
+            .flatMap(ReleaseChannel.init(rawValue:)) ?? .preview
+    }
+
+    private static func fallbackLabel(for id: String, automaticLabel: String) -> String {
+        guard !id.isEmpty, !["auto", "default"].contains(id.lowercased()) else {
+            return automaticLabel
+        }
+        return id.replacingOccurrences(of: "-", with: " ").capitalized
+    }
+}
+
 struct NotchMenuView: View {
     @ObservedObject var viewModel: NotchViewModel
+    @ObservedObject private var usageModel = IslandUsageModel.shared
     @ObservedObject private var screenSelector = ScreenSelector.shared
     @ObservedObject private var soundSelector = SoundSelector.shared
-    @State private var launchAtLogin: Bool = false
+    @State private var launchAtLogin: Bool
+    @State private var accessibilityTrusted: Bool
+    @State private var advancedPresented: Bool
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
     @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
+    private let snapshotState: NotchMenuSnapshotState?
+
+    init(
+        viewModel: NotchViewModel,
+        advancedInitiallyPresented: Bool = false,
+        snapshotState: NotchMenuSnapshotState? = nil
+    ) {
+        self.viewModel = viewModel
+        self.snapshotState = snapshotState
+        _launchAtLogin = State(initialValue: snapshotState?.launchAtLogin ?? false)
+        _accessibilityTrusted = State(
+            initialValue: snapshotState?.accessibilityTrusted ?? AXIsProcessTrusted()
+        )
+        _advancedPresented = State(initialValue: advancedInitiallyPresented)
+    }
 
     static var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
@@ -28,126 +95,104 @@ struct NotchMenuView: View {
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
-        VStack(spacing: 4) {
-            // Navigation
-            MenuRow(icon: "gauge.with.dots.needle.67percent", label: "Usage") {
-                viewModel.showUsage()
-            }
-
-            // Statistics (issue #68 v2): the #62 analytics — overview totals,
-            // models, clients, health — live here, NOT in the default Usage
-            // panel (which stays the v0.2.14 account tile view).
-            MenuRow(icon: "chart.bar.xaxis", label: "Statistics") {
-                viewModel.showStats()
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.08))
-                .padding(.vertical, 4)
-
-            // Appearance settings
-            ScreenPickerRow(screenSelector: screenSelector)
-            SoundPickerRow(soundSelector: soundSelector)
-
-            // Pixelize emails in the Usage area (todo item 3: "email anonymous").
-            // The setting is SERVER-owned when the connected daemon supports it
-            // (llmux 0.2.10+): the toggle POSTs `/llmux/settings` and the row
-            // reflects the daemon's ack (mirrored into the @AppStorage key by
-            // IslandUsageModel, so this row and every mosaic re-render). On an
-            // older daemon the toggle stays local-only, exactly as before.
-            MenuToggleRow(
-                icon: "eye.slash",
-                label: "Email anonymous",
-                isOn: emailAnonymousEnabled
-            ) {
-                Task { await IslandUsageModel.shared.toggleEmailAnonymous() }
-            }
-
-            // Show the temporary Fable weekly (7d) usage row on each tile.
-            // Local-only, default on (the upstream limit is short-lived, so the
-            // row is opt-out rather than opt-in). Toggling flips the @AppStorage
-            // key every UsageProviderColumn observes — no daemon round-trip.
-            MenuToggleRow(
-                icon: "calendar",
-                label: "Show Fable weekly (7d)",
-                isOn: showFableWeekly
-            ) {
-                Task { await IslandUsageModel.shared.setShowFableWeekly(!showFableWeekly) }
-            }
-
-            LlmuxConnectionSection()
-
-            Divider()
-                .background(Color.white.opacity(0.08))
-                .padding(.vertical, 4)
-
-            // llmux CLI maintenance: self-update + release channel switch.
-            LlmuxMaintenanceSection()
-
-            // Operator events (daemon-owned list, /llmux/events).
-            LlmuxEventsSection()
-
-            Divider()
-                .background(Color.white.opacity(0.08))
-                .padding(.vertical, 4)
-
-            // System settings
-            MenuToggleRow(
-                icon: "power",
-                label: "Launch at Login",
-                isOn: launchAtLogin
-            ) {
-                Task {
-                    _ = await IslandUsageModel.shared.setLaunchAtLogin(!launchAtLogin)
-                    launchAtLogin = SMAppService.mainApp.status == .enabled
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Settings")
+                            .font(.headline)
+                        Text("Display, sound, privacy, and startup")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    Spacer()
+                    IslandConnectionLabel(connection: usageModel.connection, accountCount: usageModel.tiles.count)
                 }
-            }
 
-            AccessibilityRow(isEnabled: AXIsProcessTrusted())
-
-            Divider()
-                .background(Color.white.opacity(0.08))
-                .padding(.vertical, 4)
-
-            // About
-            MenuRow(icon: "info.circle", label: "llmux-islands \(Self.appVersion)") {
-                if let url = URL(string: "https://github.com/2lab-ai/llmux/releases") {
-                    NSWorkspace.shared.open(url)
+                if case .offline(let reason) = usageModel.connection {
+                    IslandSafetyBanner(title: "llmux is offline", detail: reason, critical: true)
                 }
-            }
-
-            MenuRow(
-                icon: "star",
-                label: "llmux on GitHub"
-            ) {
-                if let url = URL(string: "https://github.com/2lab-ai/llmux") {
-                    NSWorkspace.shared.open(url)
+                IslandLatestFailureBanner(receipts: usageModel.verificationReceipts)
+                if !accessibilityTrusted {
+                    AccessibilityRow(isEnabled: false)
                 }
-            }
 
-            Divider()
-                .background(Color.white.opacity(0.08))
-                .padding(.vertical, 4)
+                IslandSurface {
+                    VStack(spacing: 0) {
+                        ScreenPickerRow(
+                            screenSelector: screenSelector,
+                            snapshotSelectionLabel: snapshotState?.screenLabel
+                        )
+                        SoundPickerRow(
+                            soundSelector: soundSelector,
+                            snapshotSelectionLabel: snapshotState?.soundLabel
+                        )
+                    }
+                }
 
-            MenuRow(
-                icon: "xmark.circle",
-                label: "Quit",
-                isDestructive: true
-            ) {
-                if let delegate = AppDelegate.shared {
-                    delegate.requestTerminateFromMenu()
-                } else {
-                    NSApplication.shared.terminate(nil)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        if NSApplication.shared.isRunning {
-                            Darwin.exit(0)
+                IslandSurface {
+                    VStack(spacing: 0) {
+                        MenuToggleRow(
+                            icon: "eye.slash",
+                            label: "Email anonymous",
+                            isOn: snapshotState?.emailAnonymous ?? emailAnonymousEnabled
+                        ) {
+                            Task { await usageModel.toggleEmailAnonymous() }
+                        }
+                        MenuToggleRow(icon: "power", label: "Launch at Login", isOn: launchAtLogin) {
+                            Task {
+                                _ = await usageModel.setLaunchAtLogin(!launchAtLogin)
+                                launchAtLogin = SMAppService.mainApp.status == .enabled
+                            }
+                        }
+                    }
+                }
+
+                IslandAdvancedDisclosure(isPresented: $advancedPresented) {
+                    VStack(spacing: 0) {
+                        MenuToggleRow(
+                            icon: "calendar",
+                            label: "Show Fable weekly (7d)",
+                            isOn: snapshotState?.showFableWeekly ?? showFableWeekly
+                        ) {
+                            Task { await usageModel.setShowFableWeekly(!showFableWeekly) }
+                        }
+                        LlmuxConnectionSection(snapshotState: snapshotState)
+                        LlmuxMaintenanceSection(snapshotState: snapshotState)
+                        LlmuxEventsSection()
+                        if accessibilityTrusted {
+                            AccessibilityRow(isEnabled: true)
+                        }
+
+                        MenuRow(icon: "info.circle", label: "llmux-islands \(Self.appVersion)") {
+                            if let url = URL(string: "https://github.com/2lab-ai/llmux/releases") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        MenuRow(icon: "arrow.up.right", label: "llmux source") {
+                            if let url = URL(string: "https://github.com/2lab-ai/llmux") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+                }
+
+                IslandSurface {
+                    MenuRow(icon: "xmark.circle", label: "Quit", isDestructive: true) {
+                        if let delegate = AppDelegate.shared {
+                            delegate.requestTerminateFromMenu()
+                        } else {
+                            NSApplication.shared.terminate(nil)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                if NSApplication.shared.isRunning {
+                                    Darwin.exit(0)
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
         }
         .scrollBounceBehavior(.basedOnSize)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -159,10 +204,15 @@ struct NotchMenuView: View {
                 refreshStates()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshStates()
+        }
     }
 
     private func refreshStates() {
+        guard snapshotState == nil else { return }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        accessibilityTrusted = AXIsProcessTrusted()
         screenSelector.refreshScreens()
     }
 }
@@ -175,13 +225,6 @@ struct AccessibilityRow: View {
     let isEnabled: Bool
 
     @State private var isHovered = false
-    @State private var refreshTrigger = false
-
-    private var currentlyEnabled: Bool {
-        // Re-check on each render when refreshTrigger changes
-        _ = refreshTrigger
-        return isEnabled
-    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -197,13 +240,13 @@ struct AccessibilityRow: View {
             Spacer()
 
             if isEnabled {
-                Circle()
-                    .fill(TerminalColors.green)
-                    .frame(width: 6, height: 6)
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white.opacity(0.6))
 
                 Text("On")
                     .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.4))
+                    .foregroundColor(.white.opacity(0.6))
             } else {
                 Button(action: openAccessibilitySettings) {
                     Text("Enable")
@@ -212,7 +255,7 @@ struct AccessibilityRow: View {
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .background(
-                            RoundedRectangle(cornerRadius: 5)
+                            Rectangle()
                                 .fill(Color.white)
                         )
                 }
@@ -220,15 +263,9 @@ struct AccessibilityRow: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
-        )
+        .frame(minHeight: 44)
+        .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
         .onHover { isHovered = $0 }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            refreshTrigger.toggle()
-        }
     }
 
     private var textColor: Color {
@@ -265,11 +302,8 @@ struct MenuRow: View {
                 Spacer()
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
-            )
+            .frame(minHeight: 44)
+            .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
@@ -305,20 +339,17 @@ struct MenuToggleRow: View {
 
                 Spacer()
 
-                Circle()
-                    .fill(isOn ? TerminalColors.green : Color.white.opacity(0.3))
-                    .frame(width: 6, height: 6)
+                Image(systemName: isOn ? "checkmark" : "minus")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white.opacity(isOn ? 0.8 : 0.5))
 
                 Text(isOn ? "On" : "Off")
                     .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.4))
+                    .foregroundColor(.white.opacity(0.6))
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
-            )
+            .frame(minHeight: 44)
+            .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
@@ -334,18 +365,28 @@ struct MenuToggleRow: View {
 /// Collapsible llmux daemon connection editor, living inside the ☰ menu (the
 /// app has no separate Settings window). Writes `LlmuxSettings` and reconnects.
 private struct LlmuxConnectionSection: View {
-    @State private var host: String = LlmuxSettings.host
-    @State private var port: String = String(LlmuxSettings.port)
+    private let snapshotState: NotchMenuSnapshotState?
+    @State private var host: String
+    @State private var port: String
     @State private var apiKey = ""
-    @State private var storedKeyConfigured = !LlmuxSettings.apiKey.isEmpty
+    @State private var storedKeyConfigured: Bool
     @State private var clearStoredKey = false
     @State private var expanded = false
     @State private var isHovered = false
 
+    init(snapshotState: NotchMenuSnapshotState? = nil) {
+        self.snapshotState = snapshotState
+        _host = State(initialValue: snapshotState?.connectionHost ?? LlmuxSettings.host)
+        _port = State(initialValue: String(snapshotState?.connectionPort ?? LlmuxSettings.port))
+        _storedKeyConfigured = State(
+            initialValue: snapshotState?.apiKeyConfigured ?? !LlmuxSettings.apiKey.isEmpty
+        )
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                expanded.toggle()
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "network")
@@ -358,18 +399,15 @@ private struct LlmuxConnectionSection: View {
                     Spacer()
                     Text("\(host):\(port)")
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(.white.opacity(0.6))
                         .lineLimit(1)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(.white.opacity(0.5))
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.white.opacity(isHovered ? 0.06 : 0))
-                )
+                .frame(minHeight: 44)
+                .background(Color.white.opacity(isHovered ? 0.08 : 0))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -403,9 +441,9 @@ private struct LlmuxConnectionSection: View {
                         Text("Apply & reconnect")
                             .font(.system(size: 11, weight: .semibold))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 7)
-                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
-                            .foregroundColor(.white)
+                            .frame(minHeight: 44)
+                            .background(Color.white)
+                            .foregroundColor(.black)
                     }
                     .buttonStyle(.plain)
                 }
@@ -428,7 +466,7 @@ private struct LlmuxConnectionSection: View {
         .font(.system(size: 11, design: .monospaced))
         .foregroundColor(.white)
         .padding(7)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
+        .background(Color.white.opacity(0.07))
     }
 
     private func apply() {
@@ -471,6 +509,7 @@ private struct LlmuxMaintenanceSection: View {
     /// Injectable so previews/hosts could swap the binary path; production uses
     /// the default `/opt/homebrew/bin/llmux` (with `/usr/bin/env` fallback).
     var runner = CLIRunner()
+    private let snapshotState: NotchMenuSnapshotState?
 
     // Update-now state.
     @State private var updateRunning = false
@@ -489,12 +528,20 @@ private struct LlmuxMaintenanceSection: View {
     @State private var pendingChannel: ReleaseChannel?
     @State private var showConfirm = false
 
+    init(snapshotState: NotchMenuSnapshotState? = nil, runner: CLIRunner = CLIRunner()) {
+        self.snapshotState = snapshotState
+        self.runner = runner
+        _channel = State(initialValue: snapshotState?.releaseChannel)
+        _channelKnown = State(initialValue: snapshotState != nil)
+    }
+
     var body: some View {
         VStack(spacing: 4) {
             updateRow
             channelRow
         }
         .task {
+            guard snapshotState == nil else { return }
             // Read the current channel once when the menu mounts.
             let current = await runner.currentChannel()
             channel = current
@@ -522,12 +569,12 @@ private struct LlmuxMaintenanceSection: View {
                 HStack(spacing: 10) {
                     Image(systemName: "arrow.down.circle")
                         .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(updateRunning ? 0.4 : 0.7))
+                        .foregroundColor(.white.opacity(updateRunning ? 0.44 : 0.7))
                         .frame(width: 16)
 
                     Text("Update now")
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white.opacity(updateRunning ? 0.4 : 0.7))
+                        .foregroundColor(.white.opacity(updateRunning ? 0.44 : 0.7))
 
                     Spacer()
 
@@ -535,12 +582,11 @@ private struct LlmuxMaintenanceSection: View {
                         ProcessingSpinner()
                         Text("Updating…")
                             .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.4))
+                            .foregroundColor(.white.opacity(0.6))
                     }
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color.clear))
+                .frame(minHeight: 44)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -549,7 +595,7 @@ private struct LlmuxMaintenanceSection: View {
             if let summary = updateSummary, !updateRunning {
                 Text(summary)
                     .font(.system(size: 11))
-                    .foregroundColor(updateFailed ? TerminalColors.red : TerminalColors.green)
+                    .foregroundColor(updateFailed ? TerminalColors.red : .white.opacity(0.8))
                     .lineLimit(2)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 4)
@@ -578,23 +624,29 @@ private struct LlmuxMaintenanceSection: View {
                 } else if !channelKnown {
                     Text("…")
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(.white.opacity(0.5))
                 }
             }
 
-            Picker("Release channel", selection: channelBinding) {
+            HStack(spacing: 0) {
                 ForEach(ReleaseChannel.allCases) { option in
-                    Text(option.label).tag(Optional(option))
+                    let selected = channel == option
+                    Button(option.label) {
+                        channelBinding.wrappedValue = option
+                    }
+                    .font(.caption.weight(selected ? .semibold : .regular))
+                    .foregroundColor(selected ? .black : .white.opacity(0.6))
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .background(selected ? Color.white : Color.white.opacity(0.04))
+                    .buttonStyle(.plain)
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .disabled(channelRunning || !channelKnown)
 
             if let summary = channelSummary, !channelRunning {
                 Text(summary)
                     .font(.system(size: 11))
-                    .foregroundColor(channelFailed ? TerminalColors.red : TerminalColors.green)
+                    .foregroundColor(channelFailed ? TerminalColors.red : .white.opacity(0.8))
                     .lineLimit(2)
             }
         }
@@ -690,7 +742,7 @@ private struct LlmuxEventsSection: View {
                     if events.isEmpty && !loading {
                         Text("No events")
                             .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.4))
+                            .foregroundColor(.white.opacity(0.6))
                             .padding(.horizontal, 4)
                     }
 
@@ -705,9 +757,9 @@ private struct LlmuxEventsSection: View {
                             Label("Add event", systemImage: "plus")
                                 .font(.system(size: 11, weight: .semibold))
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 7)
-                                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.12)))
-                                .foregroundColor(.white)
+                                .frame(minHeight: 44)
+                                .background(Color.white)
+                                .foregroundColor(.black)
                         }
                         .buttonStyle(.plain)
                         .disabled(busy)
@@ -716,7 +768,7 @@ private struct LlmuxEventsSection: View {
                     if let summary, !busy {
                         Text(summary)
                             .font(.system(size: 11))
-                            .foregroundColor(failed ? TerminalColors.red : TerminalColors.green)
+                            .foregroundColor(failed ? TerminalColors.red : .white.opacity(0.8))
                             .lineLimit(2)
                             .padding(.horizontal, 4)
                     }
@@ -743,7 +795,7 @@ private struct LlmuxEventsSection: View {
 
     private var header: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            expanded.toggle()
             if expanded {
                 // Instant paint from the last dashboard poll, then refresh.
                 events = IslandUsageModel.shared.dashboard?.events ?? events
@@ -764,18 +816,15 @@ private struct LlmuxEventsSection: View {
                 } else if expanded {
                     Text("\(events.count)")
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(.white.opacity(0.6))
                 }
                 Image(systemName: expanded ? "chevron.up" : "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
+                    .foregroundColor(.white.opacity(0.5))
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.white.opacity(isHovered ? 0.06 : 0))
-            )
+            .frame(minHeight: 44)
+            .background(Color.white.opacity(isHovered ? 0.08 : 0))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -790,9 +839,9 @@ private struct LlmuxEventsSection: View {
             // Tapping the row prefills the edit form.
             Button { openForm(prefilledWith: event) } label: {
                 HStack(spacing: 8) {
-                    Circle()
-                        .fill(active ? TerminalColors.green : Color.white.opacity(0.2))
-                        .frame(width: 6, height: 6)
+                    Image(systemName: active ? "bolt.fill" : "circle")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(active ? .white : .white.opacity(0.5))
                     VStack(alignment: .leading, spacing: 1) {
                         Text(event.content.isEmpty ? event.id : event.content)
                             .font(.system(size: 12, weight: .medium))
@@ -800,7 +849,7 @@ private struct LlmuxEventsSection: View {
                             .lineLimit(1)
                         Text("\(event.id) · \(LlmuxEventTime.displayRange(from: event.from, to: event.to))\(active ? " · active" : "")")
                             .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(active ? TerminalColors.green.opacity(0.9) : .white.opacity(0.4))
+                            .foregroundColor(.white.opacity(active ? 0.8 : 0.6))
                             .lineLimit(1)
                     }
                     Spacer()
@@ -821,8 +870,8 @@ private struct LlmuxEventsSection: View {
             .disabled(busy)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
+        .frame(minHeight: 44)
+        .background(Color.white.opacity(0.04))
     }
 
     // MARK: Form
@@ -839,7 +888,7 @@ private struct LlmuxEventsSection: View {
             if !formValid {
                 Text("id + content required · from/to: RFC3339 with offset or YYYYMMDDHHMM · from < to")
                     .font(.system(size: 10))
-                    .foregroundColor(.white.opacity(0.4))
+                    .foregroundColor(.white.opacity(0.6))
             }
 
             HStack(spacing: 6) {
@@ -847,8 +896,8 @@ private struct LlmuxEventsSection: View {
                     Text("Cancel")
                         .font(.system(size: 11, weight: .semibold))
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
+                        .frame(minHeight: 44)
+                        .background(Color.white.opacity(0.07))
                         .foregroundColor(.white.opacity(0.7))
                 }
                 .buttonStyle(.plain)
@@ -857,16 +906,16 @@ private struct LlmuxEventsSection: View {
                     Text("Save")
                         .font(.system(size: 11, weight: .semibold))
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(formValid ? 0.12 : 0.05)))
-                        .foregroundColor(.white.opacity(formValid ? 1.0 : 0.4))
+                        .frame(minHeight: 44)
+                        .background(formValid ? Color.white : Color.white.opacity(0.05))
+                        .foregroundColor(formValid ? .black : .white.opacity(0.44))
                 }
                 .buttonStyle(.plain)
                 .disabled(!formValid || busy)
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
+        .background(Color.white.opacity(0.04))
     }
 
     /// Mirrors the daemon's 400-validation: non-empty id/content, parseable
@@ -888,7 +937,7 @@ private struct LlmuxEventsSection: View {
             .font(.system(size: 11, design: .monospaced))
             .foregroundColor(.white)
             .padding(7)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
+            .background(Color.white.opacity(0.07))
     }
 
     private func openForm(prefilledWith event: LlmuxEvent?) {
@@ -897,7 +946,7 @@ private struct LlmuxEventsSection: View {
         formTo = event?.to ?? ""
         formContent = event?.content ?? ""
         summary = nil
-        withAnimation(.easeInOut(duration: 0.15)) { showForm = true }
+        showForm = true
     }
 
     // MARK: Actions

@@ -1,34 +1,40 @@
 import SwiftUI
 
-/// The `.stats` content of the floating island (issue #68 v2): the #62
-/// analytics — overview totals, models, clients, health — reached through the
-/// ☰ menu's "Statistics" entry. The default panel stays the v0.2.14 Usage
-/// tile view; this panel renders ONLY when the daemon serves
-/// `/llmux/dashboard` (0.2.15+) and shows a quiet empty state otherwise.
-///
-/// Header + connection badge mirror `IslandUsageView` so both panels read as
-/// the same app; the section switcher is the app's neutral+amber capsule
-/// control (`StatsSegmentedControl`), never the system blue segmented picker.
+/// The common Statistics path contains only summary metrics, account overview,
+/// and safety-relevant health. Models, clients, heat, activity, health detail,
+/// and receipts are local Advanced presentation.
 struct IslandStatsView: View {
     @ObservedObject var model: IslandUsageModel
     @ObservedObject var viewModel: NotchViewModel
 
-    @State private var section: StatsSection = .overview
+    @State private var advancedPresented: Bool
     @State private var now: Date
     private let snapshotNow: Date?
+    private let advancedInitialPage: StatisticsAdvancedPage
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    init(model: IslandUsageModel, viewModel: NotchViewModel, snapshotNow: Date? = nil) {
+    init(
+        model: IslandUsageModel,
+        viewModel: NotchViewModel,
+        snapshotNow: Date? = nil,
+        advancedInitiallyPresented: Bool = false,
+        advancedInitialPage: StatisticsAdvancedPage = .analytics
+    ) {
         self.model = model
         self.viewModel = viewModel
         self.snapshotNow = snapshotNow
+        self.advancedInitialPage = advancedInitialPage
+        _advancedPresented = State(initialValue: advancedInitiallyPresented)
         _now = State(initialValue: snapshotNow ?? Date())
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            StatsSegmentedControl(selection: $section)
+            if case .offline(let reason) = model.connection {
+                IslandSafetyBanner(title: "llmux is offline", detail: reason, critical: true)
+            }
+            IslandLatestFailureBanner(receipts: model.verificationReceipts)
             content
         }
         .onReceive(clock) {
@@ -37,46 +43,66 @@ struct IslandStatsView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Text("Statistics")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(.white)
-            connectionBadge
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Statistics")
+                    .font(.headline)
+                Text("Summary across llmux accounts")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            IslandConnectionLabel(connection: model.connection, accountCount: model.tiles.count)
             Spacer()
-            iconButton("arrow.clockwise") { Task { await model.refresh() } }
+            Button { Task { await model.refresh() } } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(IslandButtonStyle())
         }
         .padding(.horizontal, 2)
-    }
-
-    @ViewBuilder private var connectionBadge: some View {
-        switch model.connection {
-        case .connecting: badge(.white.opacity(0.4), "connecting…")
-        case .online: badge(TerminalColors.green, "\(model.tiles.count)")
-        case .offline: badge(TerminalColors.red, "offline")
-        }
-    }
-
-    private func badge(_ color: Color, _ text: String) -> some View {
-        HStack(spacing: 5) {
-            Circle().fill(color).frame(width: 6, height: 6)
-            Text(text)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.white.opacity(0.5))
-        }
     }
 
     @ViewBuilder private var content: some View {
         if let dashboard = model.dashboard {
             ScrollView(.vertical, showsIndicators: false) {
-                StatsSectionContent(
-                    section: section,
-                    dashboard: dashboard,
-                    tiles: model.tiles,
-                    now: now,
-                    activityReceipts: model.activityReceipts,
-                    verificationReceipts: model.verificationReceipts,
-                    onRemoveAccount: { name in Task { await model.remove(name) } }
-                )
+                VStack(alignment: .leading, spacing: 10) {
+                    let health = DashboardHealth.summary(dashboard.accounts)
+                    if health.isWarning {
+                        UsageHealthBanner(summary: health)
+                    }
+
+                    IslandSurface {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Summary")
+                                .font(.subheadline.weight(.semibold))
+                            UsageSummaryCards(
+                                totals: dashboard.totals,
+                                costCaption: DataQualityLabels(dashboard.dataQuality).cost
+                            )
+                        }
+                    }
+
+                    if !model.tiles.isEmpty {
+                        IslandSurface {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Accounts")
+                                    .font(.subheadline.weight(.semibold))
+                                UsageAccountCompactList(tiles: model.tiles)
+                            }
+                        }
+                    }
+
+                    IslandAdvancedDisclosure(isPresented: $advancedPresented) {
+                        StatisticsAdvancedContent(
+                            dashboard: dashboard,
+                            tiles: model.tiles,
+                            now: now,
+                            activityReceipts: model.activityReceipts,
+                            verificationReceipts: model.verificationReceipts,
+                            initialPage: advancedInitialPage
+                        )
+                    }
+                }
                 .padding(.bottom, 4)
             }
             .scrollBounceBehavior(.basedOnSize)
@@ -89,7 +115,7 @@ struct IslandStatsView: View {
             stateMessage(icon: "chart.bar",
                          title: "No statistics yet",
                          detail: "needs llmux 0.2.15+ (/llmux/dashboard)",
-                         tint: .white.opacity(0.35))
+                         tint: .white.opacity(0.5))
         }
     }
 
@@ -97,20 +123,93 @@ struct IslandStatsView: View {
         VStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: 26)).foregroundColor(tint)
             Text(title).foregroundColor(.white.opacity(0.7))
-            Text(detail).font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.4))
+            Text(detail).font(.caption).foregroundColor(.white.opacity(0.6))
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
 
-    private func iconButton(_ symbol: String, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.white.opacity(0.7))
-                .frame(width: 24, height: 24)
-                .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.06)))
+}
+
+enum StatisticsAdvancedPage: String, CaseIterable {
+    case analytics = "Analytics"
+    case receipts = "Activity & receipts"
+}
+
+/// Production Advanced content, also used by snapshot mode so receipt evidence
+/// proves the same discoverable route that users open in the live panel.
+struct StatisticsAdvancedContent: View {
+    let dashboard: LlmuxDashboard
+    let tiles: [UsageAccountTile]
+    let now: Date
+    let activityReceipts: [SharedActivityReceipt]
+    let verificationReceipts: [SharedVerificationReceipt]
+
+    @State private var page: StatisticsAdvancedPage
+    @State private var section: StatsSection = .overview
+
+    init(
+        dashboard: LlmuxDashboard,
+        tiles: [UsageAccountTile],
+        now: Date,
+        activityReceipts: [SharedActivityReceipt],
+        verificationReceipts: [SharedVerificationReceipt],
+        initialPage: StatisticsAdvancedPage = .analytics
+    ) {
+        self.dashboard = dashboard
+        self.tiles = tiles
+        self.now = now
+        self.activityReceipts = activityReceipts
+        self.verificationReceipts = verificationReceipts
+        _page = State(initialValue: initialPage)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 3) {
+                ForEach(StatisticsAdvancedPage.allCases, id: \.self) { option in
+                    let selected = option == page
+                    Button {
+                        page = option
+                    } label: {
+                        Text(option.rawValue)
+                            .font(.caption.weight(selected ? .semibold : .regular))
+                            .foregroundStyle(selected ? Color.black : Color.white.opacity(0.6))
+                            .frame(maxWidth: .infinity)
+                            .frame(minHeight: 44)
+                            .background(selected ? Color.white : Color.clear)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1)
+            }
+
+            switch page {
+            case .analytics:
+                StatsSegmentedControl(selection: $section)
+                StatsSectionContent(
+                    section: section,
+                    dashboard: dashboard,
+                    tiles: tiles,
+                    now: now,
+                    includePrimaryOverview: false
+                )
+            case .receipts:
+                VStack(alignment: .leading, spacing: 10) {
+                    StatsSectionLabel("Recent activity")
+                    if activityReceipts.isEmpty {
+                        UsageActivityList(activity: dashboard.activity, now: now)
+                    } else {
+                        UsageCanonicalActivityReceiptList(receipts: activityReceipts, now: now)
+                    }
+                    if !verificationReceipts.isEmpty {
+                        StatsSectionLabel("Verification receipts")
+                        UsageVerificationReceiptList(receipts: verificationReceipts, now: now)
+                    }
+                }
+            }
         }
-        .buttonStyle(.plain)
     }
 }

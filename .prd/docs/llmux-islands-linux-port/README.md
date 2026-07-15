@@ -31,9 +31,9 @@ clipboard, notification, sound, and quit commands remain in the thin shell.
   flows, compatibility, and implementation map.
 - [trace.md](trace.md) — seven-section vertical traces, test derivation,
   implementation status, and verification matrix.
-- [visual-receipts/](visual-receipts/) — eight full-surface and receipt-detail
-  PNGs captured from the macOS and KDE production renderers, with source-run
-  provenance and SHA-256 checksums.
+- [visual-receipts/](visual-receipts/) — durable production-renderer PNG
+  evidence with source-run provenance and SHA-256 checksums. The T6
+  default/Advanced set is recorded there only after its authoritative CI run.
 
 ## Scope status
 
@@ -52,8 +52,11 @@ The older `.prd/11-llmux-islands-spec.md` and
 `.prd/12-llmux-islands-architecture.md` describe an earlier Claude/Codex-only
 plan. They remain historical input, not an inventory of the shipped app.
 
-The KDE production renderer owns a shared `IslandTheme` and custom QML control
-set derived from the macOS SwiftUI sources: black panel, translucent dark cards,
-provider/quota accents, amber segmented navigation, and monospaced activity and
-verification receipts. Platform-native integration remains Qt/Kirigami; bright
-system widget chrome is not part of the application surface.
+Both production renderers implement the same OpenAI-reference inversion: black
+canvas, white ink, flat square internal controls, restrained system-sans type,
+and whitespace/hairlines in place of decorative cards. Normal navigation,
+provider identity, and quota are monochrome; semantic color is reserved for
+labelled warning, error, and completion states. Infrequent diagnostics and
+operations are contextual `Advanced` content. Platform-native integration
+remains SwiftUI/AppKit or Qt/Kirigami; bright system widget chrome is not part
+of the application surface.

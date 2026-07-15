@@ -107,7 +107,11 @@ extension SharedAccountTile {
             ),
             errorMessage: healthy ? nil : (blockedReason ?? status),
             issue: nil,
-            paused: paused
+            current: current,
+            paused: paused,
+            healthy: healthy,
+            status: status,
+            inFlight: Int(inFlight)
         )
     }
 }

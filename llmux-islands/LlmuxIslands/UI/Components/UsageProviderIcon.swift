@@ -9,8 +9,10 @@ struct UsageProviderIcon: View {
         Group {
             if let image = UsageProviderIconCache.shared.image(for: provider) {
                 Image(nsImage: image)
+                    .renderingMode(.template)
                     .resizable()
                     .scaledToFit()
+                    .foregroundColor(.white.opacity(0.72))
             } else {
                 Text(String(provider.displayName.prefix(1)))
                     .font(.system(size: size * 0.72, weight: .semibold, design: .rounded))
@@ -66,4 +68,3 @@ private final class UsageProviderIconCache {
         return image
     }
 }
-

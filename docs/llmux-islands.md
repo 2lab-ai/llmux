@@ -15,26 +15,33 @@ The app does not read `~/.config/llmux.json`, does not touch provider credential
 Llmux Islands [mascot] [Claude activity] [Codex activity]
 ```
 
-Activity counters are hidden when the count is zero. When one or more sessions are active, the indicator animates with a rainbow loop; the mascot makes a small jump whose speed scales with activity up to the capped high-activity state.
+Activity counters are hidden when the count is zero. Active providers use the
+same static white-ink hierarchy as the rest of the island; warnings remain
+short text-and-icon signals instead of decorative animation.
 
-## KDE / Linux visual language
+## Cross-platform visual language
 
-The KDE shell keeps the native Qt/Plasma integration boundary, but its open
-surface deliberately uses the same visual grammar as the macOS island instead
-of the desktop's default bright widget chrome:
+The macOS and KDE shells keep their native integration boundaries while sharing
+one restrained presentation contract for the open island:
 
-- a near-black panel with subtly bordered 8–10 px rounded cards;
-- white primary text, muted secondary text, and monospaced telemetry;
-- provider accents for Claude, Codex, Grok, and API-key accounts;
-- green, amber, and red quota/status bars that preserve the shared semantic
-  warning thresholds;
-- amber capsule segmented navigation in Statistics and add-account flows;
-- dark custom buttons, fields, selectors, switches, dialogs, request activity,
-  and verification receipts.
+- a black canvas, white primary ink, and 60%/44% secondary tiers;
+- flat, square internal controls separated by whitespace and hairlines;
+- no gradients, glow, decorative blur, shadow, or normal-state provider color;
+- white-fill/black-text inversion for selection and primary emphasis;
+- color only for rare warning, error, and completion semantics, always paired
+  with text or iconography;
+- system sans typography, with monospace limited to identifiers, timestamps,
+  endpoints, and tabular telemetry.
 
-This is presentation parity, not a second data model. Usage, Statistics, Menu,
-privacy masking, actions, and receipts still come from the shared Rust UI state
-and use the same deterministic snapshot fixture as the macOS renderer.
+Usage, Statistics, and Settings open on a compact common path. Credential
+metadata, secondary quota windows, analytics detail, request receipts, daemon
+configuration, events, maintenance, diagnostics, and build metadata live in a
+labelled, local-only **Advanced** disclosure. Offline, authentication, warning,
+failure, and destructive-confirmation states are never hidden there.
+
+This is presentation parity, not a second data model. Privacy masking, actions,
+and receipts still come from the shared Rust UI state; opening Advanced does
+not dispatch an action, touch the daemon, or persist state.
 
 ## Requirements
 

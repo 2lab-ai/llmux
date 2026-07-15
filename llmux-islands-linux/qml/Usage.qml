@@ -14,12 +14,13 @@ Kirigami.ScrollablePage {
     palette.text: IslandTheme.primaryText
     palette.buttonText: IslandTheme.primaryText
     palette.base: IslandTheme.field
-    palette.highlight: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
     palette.highlightedText: IslandTheme.panel
     background: Rectangle { color: IslandTheme.panel }
 
     property var uiState: ({})
     property var removeCandidate: ({})
+    property bool advancedVisible: false
     property int renderedGaugeRows: 0
     property alias snapshotReceiptTarget: verificationReceiptSection
     readonly property var usage: objectOrEmpty(uiState.usage)
@@ -167,6 +168,21 @@ Kirigami.ScrollablePage {
         })
     }
 
+    function primaryGauges(account) {
+        var gauges = visibleGauges(account)
+        if (gauges.length === 0)
+            return []
+        for (var index = 0; index < gauges.length; index += 1) {
+            if (objectOrEmpty(gauges[index]).constraining === true)
+                return [gauges[index]]
+        }
+        for (var fiveHourIndex = 0; fiveHourIndex < gauges.length; fiveHourIndex += 1) {
+            if (objectOrEmpty(gauges[fiveHourIndex]).kind === "five_hour")
+                return [gauges[fiveHourIndex]]
+        }
+        return [gauges[0]]
+    }
+
     function renderedGaugeCount() {
         return renderedGaugeRows
     }
@@ -242,13 +258,16 @@ Kirigami.ScrollablePage {
             return IslandTheme.redTint
         if (account.warning_level === "warning")
             return IslandTheme.amberTint
-        return IslandTheme.greenTint
+        return IslandTheme.surfaceRaised
     }
 
     function warningMessage(account) {
         account = objectOrEmpty(account)
         if (hasValue(account.blocked_reason))
             return String(account.blocked_reason)
+        var tokenExpiry = objectOrEmpty(account.token_expiry)
+        if (tokenExpiry.state === "expired")
+            return qsTr("Authentication required: this credential has expired")
         if (hasValue(account.status))
             return String(account.status)
         return qsTr("This account needs attention")
@@ -293,6 +312,14 @@ Kirigami.ScrollablePage {
             var receipt = objectOrEmpty(receiptValue)
             return supported[receipt.operation] === true
         }).slice(-6).reverse()
+    }
+
+    function visibleUsageReceipts() {
+        if (advancedVisible)
+            return verificationReceipts
+        return verificationReceipts.filter(function(receiptValue) {
+            return objectOrEmpty(receiptValue).outcome === "failed"
+        })
     }
 
     function receiptOperation(receipt) {
@@ -352,7 +379,7 @@ Kirigami.ScrollablePage {
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: qsTr("Quota, reset, credential health and in-flight state")
+                    text: qsTr("Account status and remaining quota")
                     color: IslandTheme.secondaryText
                     font.pixelSize: 11
                     elide: Text.ElideRight
@@ -374,13 +401,22 @@ Kirigami.ScrollablePage {
                     JSON.stringify({ "source": "manual" })
                 )
             }
+            IslandButton {
+                objectName: "usage-advanced-disclosure"
+                text: qsTr("Advanced")
+                checkable: true
+                checked: usagePage.advancedVisible
+                Accessible.name: qsTr("Show advanced usage details")
+                onClicked: usagePage.advancedVisible = checked
+            }
         }
 
         Flow {
+            id: providerCounterFlow
             Layout.fillWidth: true
             Layout.preferredHeight: childrenRect.height
             spacing: 6
-            visible: providerCounterRepeater.count > 0
+            visible: usagePage.advancedVisible && providerCounterRepeater.count > 0
 
             Repeater {
                 id: providerCounterRepeater
@@ -389,7 +425,7 @@ Kirigami.ScrollablePage {
                 delegate: Rectangle {
                     id: providerCounterChip
                     required property var modelData
-                    radius: height / 2
+                    radius: 0
                     implicitWidth: providerCounterLabel.implicitWidth
                             + 20
                     implicitHeight: providerCounterLabel.implicitHeight
@@ -579,7 +615,7 @@ Kirigami.ScrollablePage {
                 source: "user-identity"
                 implicitWidth: Kirigami.Units.iconSizes.huge
                 implicitHeight: implicitWidth
-                color: IslandTheme.tertiaryText
+                color: IslandTheme.disabledText
             }
             Label {
                 Layout.alignment: Qt.AlignHCenter
@@ -622,7 +658,7 @@ Kirigami.ScrollablePage {
                     opacity: account.paused === true ? 0.72 : 1
                     interactive: true
                     strokeColor: usagePage.accountIsCurrent(accountCard.account)
-                        ? IslandTheme.providerAccent(accountCard.account.provider)
+                        ? IslandTheme.borderStrong
                         : IslandTheme.border
 
                     contentItem: ColumnLayout {
@@ -645,16 +681,15 @@ Kirigami.ScrollablePage {
                                     Layout.fillWidth: true
                                     Label {
                                         text: usagePage.providerLabel(accountCard.account.provider)
-                                        color: IslandTheme.providerAccent(accountCard.account.provider)
+                                        color: IslandTheme.primaryText
                                         font.pixelSize: 14
                                         font.weight: Font.DemiBold
                                     }
                                     Label {
                                         visible: usagePage.accountIsCurrent(accountCard.account)
                                         text: qsTr("Current")
-                                        color: IslandTheme.amber
+                                        color: IslandTheme.secondaryText
                                         font.bold: true
-                                        font.family: IslandTheme.monoFamily
                                         font.pixelSize: 10
                                     }
                                     Item { Layout.fillWidth: true }
@@ -672,6 +707,7 @@ Kirigami.ScrollablePage {
 
                             IslandButton {
                                 id: accountActionsButton
+                                visible: usagePage.advancedVisible
                                 text: "⋯"
                                 display: AbstractButton.TextOnly
                                 Accessible.name: qsTr("Account actions")
@@ -718,7 +754,7 @@ Kirigami.ScrollablePage {
                             spacing: 6
 
                             Rectangle {
-                                radius: height / 2
+                                radius: 0
                                 implicitWidth: accountStatusLabel.implicitWidth
                                         + 16
                                 implicitHeight: accountStatusLabel.implicitHeight
@@ -731,8 +767,7 @@ Kirigami.ScrollablePage {
                                     text: usagePage.optionalText(accountCard.account.status)
                                     textFormat: Text.PlainText
                                     color: accountCard.account.healthy === true
-                                        ? IslandTheme.green : IslandTheme.amber
-                                    font.family: IslandTheme.monoFamily
+                                        ? IslandTheme.primaryText : IslandTheme.amber
                                     font.pixelSize: 10
                                 }
                             }
@@ -745,10 +780,18 @@ Kirigami.ScrollablePage {
                                 text: accountCard.account.healthy === true
                                         ? qsTr("Healthy") : qsTr("Needs attention")
                                 color: accountCard.account.healthy === true
-                                        ? IslandTheme.green
+                                        ? IslandTheme.secondaryText
                                         : IslandTheme.red
                             }
                             Label {
+                                visible: !usagePage.advancedVisible
+                                    && usagePage.hasValue(accountCard.account.in_flight)
+                                    && Number(accountCard.account.in_flight) > 0
+                                text: qsTr("Active")
+                                color: IslandTheme.primaryText
+                            }
+                            Label {
+                                visible: usagePage.advancedVisible
                                 text: usagePage.hasValue(accountCard.account.in_flight)
                                         ? qsTr("%1 in flight").arg(accountCard.account.in_flight)
                                         : qsTr("In flight: %1").arg(usagePage.unavailableText)
@@ -762,7 +805,11 @@ Kirigami.ScrollablePage {
                             visible: accountCard.account.warning_level === "warning"
                                     || accountCard.account.warning_level === "critical"
                                     || usagePage.hasValue(accountCard.account.blocked_reason)
+                                    || accountCard.account.healthy === false
+                                    || accountCard.tokenExpiry.state === "expired"
                             type: accountCard.account.warning_level === "critical"
+                                    || accountCard.account.healthy === false
+                                    || accountCard.tokenExpiry.state === "expired"
                                     ? Kirigami.MessageType.Error
                                     : Kirigami.MessageType.Warning
                             text: usagePage.warningMessage(accountCard.account)
@@ -770,6 +817,7 @@ Kirigami.ScrollablePage {
 
                         RowLayout {
                             Layout.fillWidth: true
+                            visible: usagePage.advancedVisible
 
                             Kirigami.Icon {
                                 source: "appointment-soon"
@@ -798,7 +846,9 @@ Kirigami.ScrollablePage {
                         }
 
                         Repeater {
-                            model: accountCard.gauges
+                            model: usagePage.advancedVisible
+                                ? accountCard.gauges
+                                : usagePage.primaryGauges(accountCard.account)
 
                             delegate: ColumnLayout {
                                 id: gaugeRow
@@ -825,7 +875,6 @@ Kirigami.ScrollablePage {
                                         text: qsTr("Constraining")
                                         color: IslandTheme.red
                                         font.bold: true
-                                        font.family: IslandTheme.monoFamily
                                         font.pixelSize: 9
                                     }
                                     Item { Layout.fillWidth: true }
@@ -876,6 +925,13 @@ Kirigami.ScrollablePage {
                             }
                         }
 
+                        Label {
+                            Layout.fillWidth: true
+                            visible: usagePage.primaryGauges(accountCard.account).length === 0
+                            text: qsTr("Quota data is unavailable")
+                            color: IslandTheme.secondaryText
+                        }
+
                         RowLayout {
                             Layout.fillWidth: true
                             visible: accountCard.busy
@@ -903,7 +959,7 @@ Kirigami.ScrollablePage {
             id: verificationReceiptSection
             objectName: "usage-verification-receipts"
             Layout.fillWidth: true
-            visible: usagePage.verificationReceipts.length > 0
+            visible: usagePage.visibleUsageReceipts().length > 0
             spacing: Kirigami.Units.smallSpacing
 
             IslandSeparator { Layout.fillWidth: true }
@@ -912,7 +968,7 @@ Kirigami.ScrollablePage {
             }
 
             Repeater {
-                model: usagePage.verificationReceipts
+                model: usagePage.visibleUsageReceipts()
 
                 delegate: IslandCard {
                     id: verificationReceiptCard
@@ -926,7 +982,7 @@ Kirigami.ScrollablePage {
                         RowLayout {
                             Layout.fillWidth: true
                             Rectangle {
-                                radius: height / 2
+                                radius: 0
                                 implicitWidth: receiptOutcome.implicitWidth
                                         + Kirigami.Units.largeSpacing
                                 implicitHeight: receiptOutcome.implicitHeight
@@ -945,7 +1001,6 @@ Kirigami.ScrollablePage {
                                 text: usagePage.receiptSummary(verificationReceiptCard.receipt)
                                 textFormat: Text.PlainText
                                 font.bold: true
-                                font.family: IslandTheme.monoFamily
                                 font.pixelSize: 11
                                 elide: Text.ElideRight
                             }
@@ -963,7 +1018,6 @@ Kirigami.ScrollablePage {
                             textFormat: Text.PlainText
                             wrapMode: Text.Wrap
                             color: IslandTheme.secondaryText
-                            font.family: IslandTheme.monoFamily
                             font.pixelSize: 10
                         }
                     }
