@@ -405,6 +405,12 @@ pub(crate) struct RawModal {
     pub key: activity::ActivityKey,
     /// Activity id, used by the save-file names (`llmux-raw-<id>…`).
     pub id: u64,
+    /// Monotonic open-generation (UI-8): bumped every time a modal opens, so a
+    /// stale background delivery (a slow raw fetch or a queued export) for a
+    /// PRIOR open can't land on the modal the user reopened. Keyed on this,
+    /// not just [`ActivityKey`] — the key omits the activity id and a
+    /// close→reopen of the SAME row would otherwise accept the old fetch.
+    pub generation: u64,
     pub title: String,
     /// Index into the Ready content's tab list (2 or 4 tabs, UI-8); clamped
     /// at draw/use time so a stale index can never panic.
@@ -424,15 +430,41 @@ pub(crate) struct RawModal {
 /// the timestamp half of the raw-io lookup), the activity id, and what the
 /// content builder needs from open time (general lines + curl context).
 struct RawFetchReq {
-    key: activity::ActivityKey,
+    generation: u64,
     id: u64,
     general: ui::RawGeneral,
+    /// The lookup key's timestamp half (the record's `at_ms`).
+    at_ms: u64,
 }
 
 /// Result of a background raw fetch, delivered on the raw channel.
 struct RawLoad {
-    key: activity::ActivityKey,
+    generation: u64,
     result: Result<std::sync::Arc<ui::RawContent>, String>,
+}
+
+/// A queued export (copy/save) action (UI-8): run on the blocking pool so a
+/// wedged clipboard tool or a slow Downloads mount can never freeze the TUI
+/// event loop. Carries the modal generation so a late result flashes only on
+/// the modal that requested it.
+struct ClipReq {
+    generation: u64,
+    button: ui::RawButton,
+    id: u64,
+    /// Prebuilt payload for the chosen action (body / curl / all / record).
+    payload: String,
+    /// File-name label for the save actions (tab slug, empty for save-all).
+    label: String,
+    /// Whether this action writes a file (vs. copies to the clipboard).
+    is_save: bool,
+    /// File extension for a save action.
+    ext: &'static str,
+}
+
+/// Outcome of a background export, delivered on the clip channel.
+struct ClipResult {
+    generation: u64,
+    message: String,
 }
 
 /// Attach-mode banner state.
@@ -654,6 +686,13 @@ struct App {
     /// Sender the background raw fetch delivers its [`RawLoad`] on; installed
     /// by the event loop (mirrors `sessions_tx`).
     raw_tx: Option<mpsc::Sender<RawLoad>>,
+    /// Monotonic raw-modal open counter (UI-8); the next modal's generation.
+    raw_generation: u64,
+    /// A queued export action, drained by the event loop onto the blocking
+    /// pool (same pattern as `pending_raw`).
+    pending_clip: Option<ClipReq>,
+    /// Sender the background export delivers its [`ClipResult`] on.
+    clip_tx: Option<mpsc::Sender<ClipResult>>,
 }
 
 impl App {
@@ -703,6 +742,9 @@ impl App {
             raw_modal: None,
             pending_raw: None,
             raw_tx: None,
+            raw_generation: 0,
+            pending_clip: None,
+            clip_tx: None,
             reset_absolute: false,
         }
     }
@@ -1325,6 +1367,10 @@ impl App {
         let activity::CompletedBody::Request { id, .. } = entry.body else {
             return;
         };
+        // A fresh open-generation invalidates any still-in-flight delivery for
+        // the PRIOR modal (raw fetch or queued export).
+        self.raw_generation = self.raw_generation.wrapping_add(1);
+        let generation = self.raw_generation;
         let title = format!(
             " 🔍 raw — {} {} · {} · {} ",
             key.method,
@@ -1346,8 +1392,9 @@ impl App {
                 Backend::Remote(remote) => remote.base_url.clone(),
             };
             self.pending_raw = Some(RawFetchReq {
-                key: key.clone(),
+                generation,
                 id,
+                at_ms: key.at_ms,
                 general: ui::RawGeneral {
                     lines: ui::raw_general_lines(&entry),
                     method: key.method.clone(),
@@ -1360,6 +1407,7 @@ impl App {
         self.raw_modal = Some(RawModal {
             key,
             id,
+            generation,
             title,
             tab: 0,
             scroll: 0,
@@ -1413,14 +1461,19 @@ impl App {
         }
     }
 
-    /// Execute one raw-viewer action button (UI-8) against the ACTIVE tab's
-    /// prebuilt payloads and flash the outcome on the modal's hint line.
-    /// A not-yet-loaded modal flashes instead of acting; failures flash the
-    /// reason — an export must never take the TUI down.
+    /// Queue one raw-viewer action button (UI-8) against the ACTIVE tab's
+    /// prebuilt payloads: the export itself (clipboard subprocess / file
+    /// write) runs on the blocking pool so a wedged clipboard tool or a slow
+    /// Downloads mount can never freeze the TUI event loop (the payload can be
+    /// tens of MiB). A not-yet-loaded modal flashes immediately; the real
+    /// outcome flashes when the background task reports back, gated on the
+    /// modal generation so a stale result never lands on a reopened modal.
     fn raw_modal_action(&mut self, btn: ui::RawButton) {
         let Some(modal) = self.raw_modal.as_mut() else {
             return;
         };
+        let generation = modal.generation;
+        let id = modal.id;
         let RawModalState::Ready(content) = &modal.state else {
             modal.flash = Some((
                 "raw record not loaded yet".to_string(),
@@ -1441,28 +1494,95 @@ impl App {
                 "txt"
             }
         };
-        let label = tab.label.to_lowercase().replace(' ', "-");
-        let result = match btn {
-            ui::RawButton::Copy => clip::copy(&tab.body_text)
-                .map(|dest| format!("copied {} bytes → {dest}", tab.body_text.len())),
-            ui::RawButton::CopyCurl => clip::copy(&tab.curl)
-                .map(|dest| format!("copied curl ({} bytes) → {dest}", tab.curl.len())),
-            ui::RawButton::CopyAll => clip::copy(&content.all_text)
-                .map(|dest| format!("copied all {} bytes → {dest}", content.all_text.len())),
-            ui::RawButton::Save => clip::save(
-                &format!("llmux-raw-{}-{label}", modal.id),
+        // Move the (possibly large) payload string into the queued request —
+        // built once here, consumed by the blocking task. No work on the UI
+        // thread beyond this clone.
+        let (payload, is_save, ext, label) = match btn {
+            ui::RawButton::Copy => (tab.body_text.clone(), false, "", String::new()),
+            ui::RawButton::CopyCurl => (tab.curl.clone(), false, "", String::new()),
+            ui::RawButton::CopyAll => (content.all_text.clone(), false, "", String::new()),
+            ui::RawButton::Save => (
+                tab.body_text.clone(),
+                true,
                 ext(&tab.body_text),
-                &tab.body_text,
-            )
-            .map(|path| format!("saved → {path}")),
-            ui::RawButton::SaveAll => clip::save(
-                &format!("llmux-raw-{}", modal.id),
-                "json",
-                &content.record_json,
-            )
-            .map(|path| format!("saved record → {path}")),
+                tab.label.to_lowercase().replace(' ', "-"),
+            ),
+            ui::RawButton::SaveAll => (content.record_json.clone(), true, "json", String::new()),
         };
-        modal.flash = Some((result.unwrap_or_else(|err| err), std::time::Instant::now()));
+        modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
+        self.pending_clip = Some(ClipReq {
+            generation,
+            button: btn,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        });
+    }
+
+    /// Drain the queued export (event-loop side of [`Self::raw_modal_action`]).
+    fn take_pending_clip(&mut self) -> Option<ClipReq> {
+        self.pending_clip.take()
+    }
+
+    /// Resolve a delivered export outcome onto the open modal's flash line,
+    /// gated on the open-generation so a stale result never lands on a
+    /// reopened modal.
+    fn apply_clip_result(&mut self, result: ClipResult) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            if modal.generation == result.generation {
+                modal.flash = Some((result.message, std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Run one queued export on the blocking pool and deliver the flash
+    /// message on the clip channel. Never touches the UI thread; the payload
+    /// was already built at queue time.
+    fn spawn_clip(&mut self, req: ClipReq) {
+        let Some(tx) = self.clip_tx.clone() else {
+            return;
+        };
+        let ClipReq {
+            generation,
+            button,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        } = req;
+        tokio::task::spawn_blocking(move || {
+            let message = if is_save {
+                let stem = if label.is_empty() {
+                    format!("llmux-raw-{id}")
+                } else {
+                    format!("llmux-raw-{id}-{label}")
+                };
+                match clip::save(&stem, ext, &payload) {
+                    Ok(path) => match button {
+                        ui::RawButton::SaveAll => format!("saved record → {path}"),
+                        _ => format!("saved → {path}"),
+                    },
+                    Err(err) => err,
+                }
+            } else {
+                let n = payload.len();
+                match clip::copy(&payload) {
+                    Ok(dest) => match button {
+                        ui::RawButton::CopyCurl => format!("copied curl ({n} bytes) → {dest}"),
+                        ui::RawButton::CopyAll => format!("copied all {n} bytes → {dest}"),
+                        _ => format!("copied {n} bytes → {dest}"),
+                    },
+                    Err(err) => err,
+                }
+            };
+            let _ = tx.blocking_send(ClipResult {
+                generation,
+                message,
+            });
+        });
     }
 
     /// Drain the queued raw fetch (event-loop side of [`Self::open_raw_modal`]).
@@ -1474,7 +1594,12 @@ impl App {
     /// was closed or re-targeted while the fetch ran (stale delivery).
     fn apply_raw_load(&mut self, load: RawLoad) {
         if let Some(modal) = self.raw_modal.as_mut() {
-            if modal.key == load.key && matches!(modal.state, RawModalState::Loading) {
+            // Gate on the open-generation, not the key: the key omits the
+            // activity id, so a close→reopen of the same row (or two same-ms
+            // requests) could otherwise let a stale fetch's late result — even
+            // a stale 404 — clobber the reopened modal.
+            if modal.generation == load.generation && matches!(modal.state, RawModalState::Loading)
+            {
                 modal.state = match load.result {
                     Ok(content) => RawModalState::Ready(content),
                     Err(msg) => RawModalState::Failed(msg),
@@ -1492,8 +1617,12 @@ impl App {
         let Some(tx) = self.raw_tx.clone() else {
             return;
         };
-        let RawFetchReq { key, id, general } = req;
-        let at_ms = key.at_ms;
+        let RawFetchReq {
+            generation,
+            id,
+            general,
+            at_ms,
+        } = req;
         enum Source {
             Local(Option<std::path::PathBuf>),
             Remote {
@@ -1559,7 +1688,7 @@ impl App {
             })
             .await
             .unwrap_or_else(|err| Err(format!("raw render task failed: {err}")));
-            let _ = tx.send(RawLoad { key, result }).await;
+            let _ = tx.send(RawLoad { generation, result }).await;
         });
     }
 
@@ -3017,6 +3146,11 @@ async fn event_loop(
     // here — same pattern as the sessions channel (never block this select).
     let (raw_tx, mut raw_rx) = mpsc::channel::<RawLoad>(2);
     app.raw_tx = Some(raw_tx);
+    // Raw-viewer exports (UI-8 copy/save): the blocking pool delivers the
+    // outcome flash here so a wedged clipboard tool / slow disk never freezes
+    // this select.
+    let (clip_tx, mut clip_rx) = mpsc::channel::<ClipResult>(4);
+    app.clip_tx = Some(clip_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -3078,9 +3212,19 @@ async fn event_loop(
                 app.apply_raw_load(load);
                 true
             }
+            // A background export (UI-8 copy/save) finished — flash its
+            // outcome on the modal that requested it (gated on generation).
+            Some(result) = clip_rx.recv() => {
+                app.apply_clip_result(result);
+                true
+            }
         };
         if let Some(req) = app.take_pending_raw() {
             app.spawn_raw_fetch(req);
+            redraw = true;
+        }
+        if let Some(req) = app.take_pending_clip() {
+            app.spawn_clip(req);
             redraw = true;
         }
         if let Some(target) = app.take_pending_switch() {
@@ -4372,6 +4516,7 @@ mod tests {
         app.raw_modal = Some(RawModal {
             key: key.clone(),
             id: 7,
+            generation: 1,
             title: "raw".into(),
             tab: 0,
             scroll: 3,
@@ -4412,9 +4557,11 @@ mod tests {
     fn raw_load_applies_only_to_the_matching_loading_modal(/* UI-7 */) {
         let mut app = remote_app();
         let key = seed_one_hit(&mut app);
+        let _ = &key;
         app.raw_modal = Some(RawModal {
             key: key.clone(),
             id: 7,
+            generation: 5,
             title: String::new(),
             tab: 0,
             scroll: 0,
@@ -4423,30 +4570,58 @@ mod tests {
             flash: None,
             state: RawModalState::Loading,
         });
-        // A stale delivery for a DIFFERENT key is ignored.
-        let other = activity::ActivityKey {
-            at_ms: 9,
-            method: "GET".into(),
-            path: "/x".into(),
-            status: 200,
-        };
+        // A stale delivery for a PRIOR generation is ignored — this is the
+        // close→reopen race guard (a late fetch must not clobber the reopen).
         app.apply_raw_load(RawLoad {
-            key: other,
+            generation: 4,
             result: Err("nope".into()),
         });
         assert!(matches!(
             app.raw_modal.as_ref().unwrap().state,
             RawModalState::Loading
         ));
-        // The matching delivery resolves it (a miss becomes Failed).
+        // The matching generation resolves it (a miss becomes Failed).
         app.apply_raw_load(RawLoad {
-            key: key.clone(),
+            generation: 5,
             result: Err("miss".into()),
         });
         assert!(matches!(
             app.raw_modal.as_ref().unwrap().state,
             RawModalState::Failed(_)
         ));
+    }
+
+    #[test]
+    fn clip_result_flashes_only_on_the_requesting_generation(/* UI-8 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 9,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Loading,
+        });
+        // A stale export result (older generation) never flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 8,
+            message: "stale".into(),
+        });
+        assert!(app.raw_modal.as_ref().unwrap().flash.is_none());
+        // The requesting generation's result flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 9,
+            message: "copied 4 bytes → pbcopy".into(),
+        });
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "copied 4 bytes → pbcopy"
+        );
     }
 
     #[test]
