@@ -156,6 +156,100 @@ pub(crate) struct DailyTokens {
     pub cache_creation: u64,
 }
 
+/// Calendar granularities of the Usage tab (usage-stats): hourly, daily,
+/// monthly buckets over the persisted request history. Distinct from
+/// [`StatsWindow`] (trailing 24h/72h windows) — these are CALENDAR buckets
+/// the operator reads like a bill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UsageGran {
+    Hour,
+    #[default]
+    Day,
+    Month,
+}
+
+impl UsageGran {
+    /// The next granularity in the `g` cycle (hour → day → month → hour).
+    pub(crate) fn next(self) -> UsageGran {
+        match self {
+            UsageGran::Hour => UsageGran::Day,
+            UsageGran::Day => UsageGran::Month,
+            UsageGran::Month => UsageGran::Hour,
+        }
+    }
+
+    /// Wire tag carried on [`crate::dashboard::UsageStatDoc::gran`]. Stable —
+    /// the attach client matches on it.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            UsageGran::Hour => "hour",
+            UsageGran::Day => "day",
+            UsageGran::Month => "month",
+        }
+    }
+
+    /// UI label for the Usage tab header.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UsageGran::Hour => "hourly",
+            UsageGran::Day => "daily",
+            UsageGran::Month => "monthly",
+        }
+    }
+}
+
+/// Hourly usage buckets retained for the Usage tab (72h — matches the widest
+/// [`StatsWindow`]). Older hours are answered by the daily/monthly rollups;
+/// arbitrary-past hourly drill-down needs the paged store (issue #107).
+const USAGE_HOURLY_RETAIN_HOURS: u64 = 72;
+/// Daily usage buckets retained for the Usage tab. Wider than the chart's
+/// [`DAILY_RETAIN_DAYS`] so the calendar table reaches back two quarters;
+/// months beyond this are still covered by the unbounded monthly rollup.
+const USAGE_DAILY_RETAIN_DAYS: u64 = 180;
+
+/// One (bucket, group, model) cell of the Usage tab: request count + the four
+/// token counters. Unlike [`DailyTokens`] (chart cells, token events only),
+/// a cell counts EVERY attributed finished request — a failed request with no
+/// usage block still shows up in the requests column, mirroring the
+/// per-model row semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UsageCell {
+    pub requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl UsageCell {
+    /// Fold one finished request into the cell.
+    fn add(&mut self, tokens: Option<TokenCounts>) {
+        self.requests = self.requests.saturating_add(1);
+        if let Some(t) = tokens {
+            self.input = self.input.saturating_add(t.input);
+            self.output = self.output.saturating_add(t.output);
+            self.cache_read = self.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+            self.cache_creation = self
+                .cache_creation
+                .saturating_add(t.cache_creation.unwrap_or(0));
+        }
+    }
+
+    /// Merge another cell (history-behind hydration).
+    fn merge(&mut self, other: &UsageCell) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+    }
+}
+
+/// One usage-bucket map: bucket key → (group, model) → cell. Hour keys are
+/// epoch HOURS (UTC); day keys are LOCAL civil days (epoch days of the
+/// offset-shifted clock); month keys are LOCAL civil `year*12 + month0`.
+type UsageBuckets = std::collections::BTreeMap<u64, HashMap<(String, String), UsageCell>>;
+
 /// Per-account lifetime counters for the table's totals columns and the
 /// global totals pane (ok/error split + in/out token split).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -761,6 +855,19 @@ pub(crate) struct ActivityLog {
     /// (startup replay of the persisted request log fills history), pruned to
     /// [`DAILY_RETAIN_DAYS`].
     daily: std::collections::BTreeMap<u64, HashMap<(String, String), DailyTokens>>,
+    /// Calendar-bucketed usage for the Usage tab (usage-stats): epoch-hour /
+    /// local-civil-day / local-civil-month keys → (group, model) → cell. Fed
+    /// by the same RequestFinished fold (startup replay fills history), pruned
+    /// to [`USAGE_HOURLY_RETAIN_HOURS`] / [`USAGE_DAILY_RETAIN_DAYS`]; the
+    /// monthly rollup is unbounded (12 keys/year).
+    usage_hourly: UsageBuckets,
+    usage_daily: UsageBuckets,
+    usage_monthly: UsageBuckets,
+    /// Fixed UTC offset for usage day/month bucketing in tests. `None` in
+    /// production — each event buckets with the offset in force at ITS
+    /// timestamp ([`crate::tui::format::local_offset_secs`]), so replayed
+    /// history lands on its original local calendar day across DST changes.
+    usage_offset_override: Option<i64>,
     /// Front = newest (the log renders newest-top).
     completed: VecDeque<Completed>,
     totals: HashMap<String, Totals>,
@@ -972,6 +1079,21 @@ impl ActivityLog {
                 cell.cache_creation = cell.cache_creation.saturating_add(t.cache_creation);
             }
         }
+        // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
+        // history lands on its original hours/days/months — same reasoning
+        // as the daily chart buckets above.
+        for (src, dst) in [
+            (history.usage_hourly, &mut self.usage_hourly),
+            (history.usage_daily, &mut self.usage_daily),
+            (history.usage_monthly, &mut self.usage_monthly),
+        ] {
+            for (bucket, cells) in src {
+                let slot = dst.entry(bucket).or_default();
+                for (key, cell) in cells {
+                    slot.entry(key).or_default().merge(&cell);
+                }
+            }
+        }
         // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
         // replayed history for the same client; history fills the gaps under
         // the same MAX_CLIENTS bound as the live fold.
@@ -1050,6 +1172,137 @@ impl ActivityLog {
                     })
             })
             .collect()
+    }
+
+    /// Fold one attributed finished request into the Usage-tab calendar
+    /// buckets (usage-stats). `now` is the event fold time — the startup
+    /// replay passes each record's PERSISTED timestamp, so history lands on
+    /// its real hour/day/month. Day/month keys use the LOCAL civil calendar
+    /// at the offset in force at that instant (tests pin a fixed offset via
+    /// [`Self::set_usage_offset`]).
+    fn record_usage(
+        &mut self,
+        group: &str,
+        model: &str,
+        tokens: Option<TokenCounts>,
+        now: SystemTime,
+    ) {
+        let epoch_secs = match now.duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return,
+        };
+        let offset = self
+            .usage_offset_override
+            .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
+        let key = (group.to_string(), model.to_string());
+
+        let hour = epoch_secs / 3_600;
+        self.usage_hourly
+            .entry(hour)
+            .or_default()
+            .entry(key.clone())
+            .or_default()
+            .add(tokens);
+        let hour_cutoff = hour.saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
+
+        // Local civil day: shift the clock by the offset, then count whole
+        // days. Negative locals (pre-1970 west-of-UTC edge) can't occur for
+        // real traffic; guard with euclid division anyway.
+        let local_secs = (epoch_secs as i64).saturating_add(offset);
+        let civil_day = local_secs.div_euclid(86_400);
+        let day = u64::try_from(civil_day).unwrap_or(0);
+        self.usage_daily
+            .entry(day)
+            .or_default()
+            .entry(key.clone())
+            .or_default()
+            .add(tokens);
+        let day_cutoff = day.saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        self.usage_daily.retain(|d, _| *d >= day_cutoff);
+
+        let (year, month, _) = crate::tui::format::civil_from_days(civil_day);
+        let month_key = u64::try_from(year.saturating_mul(12) + i64::from(month) - 1).unwrap_or(0);
+        self.usage_monthly
+            .entry(month_key)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .add(tokens);
+    }
+
+    /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
+    /// production buckets with the per-event local offset).
+    #[cfg(test)]
+    pub(crate) fn set_usage_offset(&mut self, offset_secs: i64) {
+        self.usage_offset_override = Some(offset_secs);
+    }
+
+    /// Usage-tab rows (usage-stats), flattened for the dashboard document:
+    /// every granularity, newest bucket first, models within a bucket sorted
+    /// by (group, model) so the document is deterministic (the renderer
+    /// re-sorts by cost). Labels are rendered HERE — the daemon's civil
+    /// calendar is the single source of truth for what "a day" means, so
+    /// local and attach clients can never disagree.
+    pub(crate) fn usage_stats(&self) -> Vec<crate::dashboard::UsageStatDoc> {
+        fn sorted(
+            cells: &HashMap<(String, String), UsageCell>,
+        ) -> Vec<(&(String, String), &UsageCell)> {
+            let mut v: Vec<_> = cells.iter().collect();
+            v.sort_by(|a, b| a.0.cmp(b.0));
+            v
+        }
+        let row = |gran: UsageGran,
+                   bucket: u64,
+                   label: String,
+                   (group, model): &(String, String),
+                   c: &UsageCell| {
+            crate::dashboard::UsageStatDoc {
+                gran: gran.tag().to_string(),
+                bucket,
+                label,
+                group: group.clone(),
+                model: model.clone(),
+                requests: c.requests,
+                tokens_in: c.input,
+                tokens_out: c.output,
+                cache_read: c.cache_read,
+                cache_creation: c.cache_creation,
+                cost_usd: 0.0,
+            }
+        };
+        let mut docs = Vec::new();
+        for (hour, cells) in self.usage_hourly.iter().rev() {
+            // Hour buckets are UTC hours; label them in the daemon's local
+            // wall clock at the bucket start.
+            let start = UNIX_EPOCH + Duration::from_secs(hour * 3_600);
+            let offset = self
+                .usage_offset_override
+                .unwrap_or_else(|| crate::tui::format::local_offset_secs(start));
+            let local = (hour * 3_600) as i64 + offset;
+            let (_, month, day) = crate::tui::format::civil_from_days(local.div_euclid(86_400));
+            let hh = local.rem_euclid(86_400) / 3_600;
+            let label = format!("{month:02}-{day:02} {hh:02}h");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Hour, *hour, label.clone(), key, cell));
+            }
+        }
+        for (day, cells) in self.usage_daily.iter().rev() {
+            let (y, m, d) = crate::tui::format::civil_from_days(*day as i64);
+            let label = format!("{y}-{m:02}-{d:02}");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Day, *day, label.clone(), key, cell));
+            }
+        }
+        for (month_key, cells) in self.usage_monthly.iter().rev() {
+            let y = month_key / 12;
+            let m = month_key % 12 + 1;
+            let label = format!("{y}-{m:02}");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Month, *month_key, label.clone(), key, cell));
+            }
+        }
+        docs
     }
 
     /// Per-account totals lookup. The dashboard reads the whole map
@@ -1411,6 +1664,11 @@ impl ActivityLog {
                         let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
                         self.daily.retain(|d, _| *d >= cutoff);
                     }
+                    // Usage-tab calendar fold (usage-stats): unlike the chart
+                    // fold above, EVERY attributed finished request lands in
+                    // its hour/day/month bucket (tokens or not), so the
+                    // requests column matches the per-model row semantics.
+                    self.record_usage(group, model, tokens, now);
                 }
                 self.push_health(now, status);
                 self.push(Completed {
@@ -2649,6 +2907,184 @@ mod tests {
                 "per-account totals for {acct} must match after restore"
             );
         }
+        assert_eq!(
+            a.usage_stats(),
+            b.usage_stats(),
+            "usage calendar buckets must match after restore (usage-stats)"
+        );
+    }
+
+    // ---- usage calendar buckets (usage-stats) ----
+
+    /// A finished, attributed request with NO tokens (pre-completion failure):
+    /// must still count in the usage requests column.
+    fn finished_tokenless(id: u64, group: &str, model: &str) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("acct".into()),
+            status: 500,
+            duration: Duration::from_millis(10),
+            tokens: None,
+            group: Some(group.into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+        }
+    }
+
+    /// Rows of one granularity, in document order (newest bucket first).
+    fn usage_rows(log: &ActivityLog, gran: UsageGran) -> Vec<crate::dashboard::UsageStatDoc> {
+        log.usage_stats()
+            .into_iter()
+            .filter(|r| r.gran == gran.tag())
+            .collect()
+    }
+
+    /// 2024-01-01 is epoch day 19_723 (pinned by `format::civil_from_days`
+    /// tests). All usage tests bucket at a fixed +9h offset (KST — the
+    /// interesting case: local day ≠ UTC day for evening traffic).
+    const JAN1_2024: u64 = 19_723;
+    const KST: i64 = 9 * 3600;
+
+    fn at_day_hm(day: u64, hour: u64, minute: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(day * 86_400 + hour * 3_600 + minute * 60)
+    }
+
+    #[test]
+    fn usage_buckets_hour_day_month_at_local_offset() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(KST);
+        // 23:30 UTC Jan 1 → 08:30 KST Jan 2: local day rolls over.
+        log.apply(
+            finished_full(
+                1,
+                "a",
+                "claude",
+                "m-late",
+                None,
+                200,
+                100,
+                10,
+                Some(7),
+                "/v1/messages",
+            ),
+            at_day_hm(JAN1_2024, 23, 30),
+        );
+        // 10:00 UTC Jan 1 → 19:00 KST Jan 1: same local day.
+        log.apply(
+            finished_full(
+                2,
+                "a",
+                "claude",
+                "m-noon",
+                None,
+                200,
+                200,
+                20,
+                None,
+                "/v1/messages",
+            ),
+            at_day_hm(JAN1_2024, 10, 0),
+        );
+
+        let hours = usage_rows(&log, UsageGran::Hour);
+        assert_eq!(hours.len(), 2, "one hour bucket per event");
+        // Newest first: the 23:00 UTC bucket leads, labeled in LOCAL wall
+        // clock (08h on Jan 2).
+        assert_eq!(hours[0].bucket, JAN1_2024 * 24 + 23);
+        assert_eq!(hours[0].label, "01-02 08h");
+        assert_eq!(hours[0].model, "m-late");
+        assert_eq!(
+            (hours[0].tokens_in, hours[0].tokens_out, hours[0].cache_read),
+            (100, 10, 7)
+        );
+        assert_eq!(hours[1].label, "01-01 19h");
+
+        let days = usage_rows(&log, UsageGran::Day);
+        assert_eq!(
+            days.len(),
+            2,
+            "the evening event lands on the NEXT local day"
+        );
+        assert_eq!(days[0].bucket, JAN1_2024 + 1);
+        assert_eq!(days[0].label, "2024-01-02");
+        assert_eq!(days[0].model, "m-late");
+        assert_eq!(days[1].label, "2024-01-01");
+        assert_eq!(days[1].model, "m-noon");
+
+        let months = usage_rows(&log, UsageGran::Month);
+        assert_eq!(months.len(), 2, "one month bucket, two model rows");
+        assert!(months.iter().all(|r| r.label == "2024-01"));
+        assert!(months.iter().all(|r| r.bucket == 2024 * 12));
+    }
+
+    #[test]
+    fn usage_month_year_rollover_follows_local_calendar() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(KST);
+        // 2023-12-31 23:00 UTC → 2024-01-01 08:00 KST: the LOCAL month is
+        // January even though the UTC month is December.
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/v1/messages"),
+            at_day_hm(JAN1_2024 - 1, 23, 0),
+        );
+        let months = usage_rows(&log, UsageGran::Month);
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].label, "2024-01");
+        let days = usage_rows(&log, UsageGran::Day);
+        assert_eq!(days[0].label, "2024-01-01");
+    }
+
+    #[test]
+    fn usage_counts_tokenless_requests_and_skips_unattributed() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_tokenless(1, "codex", "gpt-5.5"),
+            at_day_hm(JAN1_2024, 1, 0),
+        );
+        // Unattributed (no group/model) request: stays out of usage buckets,
+        // same rule as the per-model rows.
+        log.apply(
+            finished(2, Some("acct"), Some((5, 5))),
+            at_day_hm(JAN1_2024, 1, 5),
+        );
+        let hours = usage_rows(&log, UsageGran::Hour);
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].requests, 1, "tokenless request still counted");
+        assert_eq!(hours[0].tokens_in + hours[0].tokens_out, 0);
+    }
+
+    #[test]
+    fn usage_hourly_and_daily_retention_monthly_unbounded() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        // 200 days later: outside both the 72h hourly and the 180d daily
+        // retention of the FIRST event.
+        log.apply(
+            finished_full(2, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024 + 200, 0, 0),
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Hour).len(),
+            1,
+            "old hour pruned"
+        );
+        assert_eq!(usage_rows(&log, UsageGran::Day).len(), 1, "old day pruned");
+        assert_eq!(
+            usage_rows(&log, UsageGran::Month).len(),
+            2,
+            "months are never pruned"
+        );
     }
 
     #[test]

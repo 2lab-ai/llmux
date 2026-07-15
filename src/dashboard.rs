@@ -244,6 +244,7 @@ impl DashboardHub {
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
             session_labels: state.log.session_labels(),
             daily_usage: state.log.daily_usage(),
+            usage_stats: state.log.usage_stats(),
         }
     }
 }
@@ -276,6 +277,9 @@ pub(crate) struct HubView {
     pub session_labels: HashMap<String, String>,
     /// Tokens-per-day chart rows (UI-3 U14).
     pub daily_usage: Vec<DailyUsageDoc>,
+    /// Usage-tab calendar rows (usage-stats), cost not yet priced (the doc
+    /// build adds it — pricing overrides live in the app state, not the log).
+    pub usage_stats: Vec<UsageStatDoc>,
 }
 
 /// Consume the activity-event and tracing-line channels into the hub. The
@@ -500,6 +504,13 @@ pub struct DashboardDoc {
     /// Tokens-per-day chart rows (UI-3 U14), oldest first. Additive.
     #[serde(default)]
     pub daily_usage: Vec<DailyUsageDoc>,
+    /// Usage-tab calendar rows (usage-stats): every granularity flattened,
+    /// newest bucket first, cost priced server-side (T6 — the attach client
+    /// has no pricing overrides). Additive: absent from an older daemon →
+    /// empty tab with a hint; `skip_serializing_if` keeps it off the wire
+    /// when there is no history yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_stats: Vec<UsageStatDoc>,
     /// Live `email_anonymous` display setting. Account names in THIS document
     /// stay real (SSOT T1); the renderer masks at draw time when this is on,
     /// so an API flip reflects on the next frame/poll without restart — in
@@ -639,6 +650,34 @@ pub struct DailyUsageDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+}
+
+/// One (bucket, group, model) row of the Usage tab (usage-stats).
+///
+/// `gran` is the stable wire tag (`"hour"` / `"day"` / `"month"` —
+/// [`crate::tui::activity::UsageGran::tag`]); `bucket` is the granularity's
+/// sort key (epoch hours / local civil days / `year*12+month0`); `label` is
+/// the server-rendered calendar label (daemon-local civil dates — the daemon
+/// owns what "a day" means, so local and attach clients can never disagree).
+/// `cost_usd` is the API-equivalent estimate priced at doc-build time with
+/// the daemon's pricing overrides (see [`DataQualityDoc::cost`]). Additive:
+/// absent in older docs → no usage rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageStatDoc {
+    pub gran: String,
+    pub bucket: u64,
+    pub label: String,
+    pub group: String,
+    pub model: String,
+    pub requests: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// Live grok provider settings (UI-3 U12), mirroring [`CodexSettingsDoc`]:
@@ -1527,6 +1566,25 @@ pub(crate) fn dashboard_doc(
     // sum of each completed row's per-model cost (Feature D).
     let (model_usage, total_cost_usd) = model_usage_docs(hub, now, &meta.pricing_overrides);
 
+    // Usage-tab calendar rows (usage-stats): price each row server-side (T6)
+    // — the attach client has no pricing overrides to price with.
+    let usage_stats: Vec<UsageStatDoc> = hub
+        .usage_stats
+        .iter()
+        .map(|r| UsageStatDoc {
+            cost_usd: crate::pricing::cost_from_parts(
+                &r.group,
+                &r.model,
+                r.tokens_in,
+                r.tokens_out,
+                Some(r.cache_read),
+                Some(r.cache_creation),
+                &meta.pricing_overrides,
+            ),
+            ..r.clone()
+        })
+        .collect();
+
     // Per-client attribution rows (issue #32): already sorted (requests desc)
     // by the activity log; a direct projection to the wire type.
     let client_usage: Vec<ClientUsageDoc> = hub
@@ -1603,6 +1661,7 @@ pub(crate) fn dashboard_doc(
         codex: meta.codex.clone(),
         grok: meta.grok.clone(),
         daily_usage: hub.daily_usage.clone(),
+        usage_stats,
         email_anonymous: meta.email_anonymous,
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
@@ -2155,6 +2214,54 @@ mod tests {
                 .map(|e| e.requests),
             Some(1)
         );
+    }
+
+    #[test]
+    fn doc_carries_usage_calendar_rows_priced_and_round_trips() {
+        let doc = seeded_doc();
+        // One finished codex/gpt-5.5 request → exactly one row per
+        // granularity (hour, day, month), each carrying the same counters.
+        assert_eq!(doc.usage_stats.len(), 3, "hour + day + month rows");
+        for gran in ["hour", "day", "month"] {
+            let row = doc
+                .usage_stats
+                .iter()
+                .find(|r| r.gran == gran)
+                .unwrap_or_else(|| panic!("missing {gran} row"));
+            assert_eq!(
+                (row.group.as_str(), row.model.as_str()),
+                ("codex", "gpt-5.5")
+            );
+            assert_eq!(row.requests, 1);
+            assert_eq!(row.tokens_in, 700);
+            assert_eq!(row.tokens_out, 300);
+            assert_eq!(row.cache_read, 120);
+            assert_eq!(row.cache_creation, 0);
+            assert!(!row.label.is_empty(), "server-rendered label present");
+            // Priced server-side (T6) at the built-in gpt-5.5 rates: the doc
+            // build and a direct pricing call must agree exactly.
+            let want = crate::pricing::cost_from_parts(
+                "codex",
+                "gpt-5.5",
+                700,
+                300,
+                Some(120),
+                Some(0),
+                &HashMap::new(),
+            );
+            assert!(want > 0.0, "seeded model has a nonzero rate");
+            assert!((row.cost_usd - want).abs() < 1e-12, "doc cost == pricing");
+        }
+        // Round-trip: rows survive serialization (attach mode parses these).
+        let json = serde_json::to_string(&doc).expect("serialize");
+        let back: DashboardDoc = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.usage_stats, doc.usage_stats);
+        // Additive contract: a document from an OLDER daemon (field absent)
+        // parses to an empty list, never an error.
+        let mut value: serde_json::Value = serde_json::to_value(&doc).expect("to_value");
+        value.as_object_mut().expect("object").remove("usage_stats");
+        let old: DashboardDoc = serde_json::from_value(value).expect("parse older doc");
+        assert!(old.usage_stats.is_empty());
     }
 
     #[test]

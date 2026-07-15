@@ -253,6 +253,9 @@ pub(crate) enum Overlay {
     Accounts,
     /// The detailed per-model usage table + drill-down (req13; was `show_models`).
     Stats,
+    /// Calendar usage table (usage-stats): hourly/daily/monthly buckets ×
+    /// model with token breakdown + API-equivalent cost.
+    Usage,
     /// Full-screen log tail (was the `l` log-panel size cycle).
     Logs,
     /// Session timeline (issue #34): persisted raw-io grouped by
@@ -334,6 +337,11 @@ pub(crate) struct Chrome {
     pub menu_account: Option<String>,
     /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
     pub chart_days: u64,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    pub usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
+    /// recent at the top).
+    pub usage_scroll: usize,
 }
 
 /// Attach-mode banner state.
@@ -515,6 +523,12 @@ struct App {
     /// Session toggle (`t`): quota bars show the reset as an absolute UTC
     /// stamp instead of the countdown.
     reset_absolute: bool,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
+    /// the granularity changes so a deep hourly scroll can't strand the
+    /// monthly table past its last row.
+    usage_scroll: usize,
 }
 
 impl App {
@@ -554,6 +568,8 @@ impl App {
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
+            usage_gran: activity::UsageGran::default(),
+            usage_scroll: 0,
             reset_absolute: false,
         }
     }
@@ -686,6 +702,8 @@ impl App {
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
             chart_days: self.chart_days,
+            usage_gran: self.usage_gran,
+            usage_scroll: self.usage_scroll,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -762,6 +780,7 @@ impl App {
             Overlay::None => self.on_key_main(key.code, view),
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
+            Overlay::Usage => self.on_key_usage(key.code),
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
             Overlay::Misc => self.on_key_misc(key.code),
@@ -1104,7 +1123,36 @@ impl App {
             Overlay::None => self.overlay = Overlay::None,
             Overlay::Stats => self.open_stats(view),
             Overlay::Sessions => self.open_sessions(),
+            Overlay::Usage => {
+                self.usage_scroll = 0;
+                self.overlay = Overlay::Usage;
+            }
             other => self.overlay = other,
+        }
+    }
+
+    /// Key handling for the Usage overlay (usage-stats). `g` cycles the
+    /// granularity (hour → day → month), arrows/`j`/`k` scroll by bucket,
+    /// `U`/Esc closes back to MAIN, `q` quits. Scroll clamping happens at
+    /// draw time (the renderer knows how many buckets the view holds).
+    fn on_key_usage(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('U') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('g') => {
+                self.usage_gran = self.usage_gran.next();
+                self.usage_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.usage_scroll = self.usage_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.usage_scroll = self.usage_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => self.usage_scroll = self.usage_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.usage_scroll = self.usage_scroll.saturating_add(10),
+            KeyCode::Home => self.usage_scroll = 0,
+            _ => {}
         }
     }
 
@@ -1190,6 +1238,9 @@ impl App {
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
+            // Calendar usage table (usage-stats): hourly/daily/monthly × model
+            // tokens + API-equivalent cost.
+            KeyCode::Char('U') => self.open_tab(Overlay::Usage, view),
             // Misc (keys/build facts) + Config surfaces (UI-3 U6).
             KeyCode::Char('?') => self.overlay = Overlay::Misc,
             KeyCode::Char('c') => self.overlay = Overlay::Config,
@@ -3646,6 +3697,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
