@@ -4,12 +4,17 @@ import QtQuick.Controls
 CheckBox {
     id: control
 
-    spacing: 8
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: 0
+    rightPadding: 0
+    topPadding: 0
+    bottomPadding: 0
+    spacing: IslandTheme.spaceSm
 
     indicator: Rectangle {
         implicitWidth: 18
         implicitHeight: 18
-        x: control.leftPadding
+        x: 0
         y: parent.height / 2 - height / 2
         radius: 0
         color: control.checked ? IslandTheme.primaryText : IslandTheme.field

@@ -10,16 +10,14 @@ import SwiftUI
 
 struct SoundPickerRow: View {
     @ObservedObject var soundSelector: SoundSelector
-    var snapshotSelectionLabel: String? = nil
     @State private var isHovered = false
     @State private var selectedSound: NotificationSound = AppSettings.notificationSound
 
     private var isExpanded: Bool {
-        snapshotSelectionLabel == nil && soundSelector.isPickerExpanded
+        soundSelector.isPickerExpanded
     }
 
     private func setExpanded(_ value: Bool) {
-        guard snapshotSelectionLabel == nil else { return }
         soundSelector.isPickerExpanded = value
     }
 
@@ -27,7 +25,9 @@ struct SoundPickerRow: View {
         VStack(spacing: 0) {
             // Main row - shows current selection
             Button {
-                setExpanded(!isExpanded)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    setExpanded(!isExpanded)
+                }
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "speaker.wave.2")
@@ -41,18 +41,21 @@ struct SoundPickerRow: View {
 
                     Spacer()
 
-                    Text(snapshotSelectionLabel ?? selectedSound.rawValue)
+                    Text(selectedSound.rawValue)
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.6))
+                        .foregroundColor(.white.opacity(0.4))
                         .lineLimit(1)
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.5))
+                        .foregroundColor(.white.opacity(0.4))
                 }
                 .padding(.horizontal, 12)
-                .frame(minHeight: 44)
-                .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
+                )
             }
             .buttonStyle(.plain)
             .onHover { isHovered = $0 }
@@ -84,7 +87,6 @@ struct SoundPickerRow: View {
             }
         }
         .onAppear {
-            guard snapshotSelectionLabel == nil else { return }
             selectedSound = AppSettings.notificationSound
         }
     }
@@ -106,20 +108,28 @@ private struct SoundOptionRowInline: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: isSelected ? "checkmark" : "circle")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(isSelected ? .black : .white.opacity(0.5))
+                Circle()
+                    .fill(isSelected ? TerminalColors.green : Color.white.opacity(0.2))
+                    .frame(width: 6, height: 6)
 
                 Text(sound.rawValue)
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isSelected ? .black : .white.opacity(isHovered ? 1.0 : 0.7))
+                    .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.7))
 
                 Spacer()
 
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(TerminalColors.green)
+                }
             }
             .padding(.horizontal, 10)
-            .frame(minHeight: 44)
-            .background(isSelected ? Color.white : isHovered ? Color.white.opacity(0.08) : Color.clear)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovered ? Color.white.opacity(0.06) : Color.clear)
+            )
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }

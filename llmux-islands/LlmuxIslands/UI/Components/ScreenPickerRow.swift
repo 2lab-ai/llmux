@@ -9,15 +9,13 @@ import SwiftUI
 
 struct ScreenPickerRow: View {
     @ObservedObject var screenSelector: ScreenSelector
-    var snapshotSelectionLabel: String? = nil
     @State private var isHovered = false
 
     private var isExpanded: Bool {
-        get { snapshotSelectionLabel == nil && screenSelector.isPickerExpanded }
+        get { screenSelector.isPickerExpanded }
     }
 
     private func setExpanded(_ value: Bool) {
-        guard snapshotSelectionLabel == nil else { return }
         screenSelector.isPickerExpanded = value
     }
 
@@ -25,7 +23,9 @@ struct ScreenPickerRow: View {
         VStack(spacing: 0) {
             // Main row - shows current selection
             Button {
-                setExpanded(!isExpanded)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    setExpanded(!isExpanded)
+                }
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "display")
@@ -41,16 +41,19 @@ struct ScreenPickerRow: View {
 
                     Text(currentSelectionLabel)
                         .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.6))
+                        .foregroundColor(.white.opacity(0.4))
                         .lineLimit(1)
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.5))
+                        .foregroundColor(.white.opacity(0.4))
                 }
                 .padding(.horizontal, 12)
-                .frame(minHeight: 44)
-                .background(isHovered ? Color.white.opacity(0.08) : Color.clear)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(isHovered ? Color.white.opacity(0.08) : Color.clear)
+                )
             }
             .buttonStyle(.plain)
             .onHover { isHovered = $0 }
@@ -88,7 +91,6 @@ struct ScreenPickerRow: View {
     }
 
     private var currentSelectionLabel: String {
-        if let snapshotSelectionLabel { return snapshotSelectionLabel }
         switch screenSelector.selectionMode {
         case .automatic:
             return "Auto"
@@ -116,7 +118,11 @@ struct ScreenPickerRow: View {
     }
 
     private func collapseAfterDelay() {
-        setExpanded(false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                setExpanded(false)
+            }
+        }
     }
 }
 
@@ -133,28 +139,36 @@ private struct ScreenOptionRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: isSelected ? "checkmark" : "circle")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundColor(isSelected ? .black : .white.opacity(0.5))
+                Circle()
+                    .fill(isSelected ? TerminalColors.green : Color.white.opacity(0.2))
+                    .frame(width: 6, height: 6)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(label)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(isSelected ? .black : .white.opacity(isHovered ? 1.0 : 0.7))
+                        .foregroundColor(.white.opacity(isHovered ? 1.0 : 0.7))
 
                     if let sublabel = sublabel {
                         Text(sublabel)
                             .font(.system(size: 10))
-                            .foregroundColor(isSelected ? .black.opacity(0.6) : .white.opacity(0.6))
+                            .foregroundColor(.white.opacity(0.4))
                     }
                 }
 
                 Spacer()
 
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(TerminalColors.green)
+                }
             }
             .padding(.horizontal, 10)
-            .frame(minHeight: 44)
-            .background(isSelected ? Color.white : isHovered ? Color.white.opacity(0.08) : Color.clear)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovered ? Color.white.opacity(0.06) : Color.clear)
+            )
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }

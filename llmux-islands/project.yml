@@ -80,9 +80,6 @@ targets:
       # Foundation-only analytics logic (issue #62 S4): formatting, the
       # health-warning rule, data-quality fallbacks, (group, model) keying.
       - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
-      # Presentation-only default/Advanced visibility contract. This file is
-      # Foundation-only and cannot dispatch semantic actions or daemon work.
-      - path: LlmuxIslands/Core/IslandPresentationPolicy.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests

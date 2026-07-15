@@ -79,13 +79,13 @@ Instead:
 | NSEvent global hover/click monitor | Qt `SystemTrayIcon` activation + local pointer handlers | No global interception or accessibility permission |
 | Outside-click close and click repost | focus/active loss and Escape | Never synthesize/repost another application's click |
 | Closed provider counters | tray tooltip/menu/warning icon plus optional compact layer surface | Same provider grouping and total; the portable tray API has no attention-status setter |
-| Usage/Statistics/Settings compact navigation | Checkable Qt Quick Controls ToolButton actions | Same routes and state retention; semantic route `menu` is labelled Settings |
-| SwiftUI compact account rows | Kirigami.AbstractCard delegates in Qt Quick GridLayout | Same current/attention/active state and one primary quota on the default path |
+| Native Usage/Statistics/Menu routes | Checkable Qt Quick segmented actions | Same semantic routes and state retention; Linux route `menu` is labelled Settings without changing macOS navigation |
+| SwiftUI colored quota-tile grid | Equal-width QML card delegates in GridLayout | Same account/current/attention state; Linux defaults to primary quota and reveals secondary detail in Advanced |
 | ContextMenu | Qt Quick Controls Menu | Pause/resume/remove actions and disable rules match |
 | alert/confirmationDialog/sheet | Kirigami.PromptDialog/Dialog | Destructive and channel changes require confirmation |
 | ProgressView | Kirigami.LoadingPlaceholder/BusyIndicator | Busy is operation-scoped, not global |
-| Contextual `Advanced` disclosure | Checkable labelled control plus conditional Qt Quick sections | Presentation-local only; no shared action, effect, persistence, or daemon call |
-| Advanced settings forms | Kirigami.FormLayout | Labels, validation, and keyboard navigation |
+| Linux-only contextual `Advanced` disclosure | Checkable labelled control plus conditional Qt Quick sections | Presentation-local only; macOS keeps its original hierarchy |
+| SwiftUI settings rows | Explicit two-column QML forms | Labels, validation, keyboard navigation, 104px label column, and 16px control gap |
 | ScreenSelector | QGuiApplication::screens/QScreen | Stable screen id and fallback |
 | NSSound | freedesktop notification sound-name | Preview is cancellable and “none” is valid |
 | SMAppService launch at login | XDG autostart or systemd --user | Toggle reflects actual installed state |
@@ -94,7 +94,7 @@ Instead:
 | About/release/source links | Kirigami card/FormLayout with external-link actions | Version/build/channel remain visible |
 | App terminate | QCoreApplication::quit | Stop tasks and unregister integrations |
 
-## Content mapping
+## Semantic content mapping
 
 | Current content | KDE view |
 |---|---|

@@ -9,8 +9,8 @@ Control {
     property int currentIndex: 0
     signal activated(int index)
 
-    implicitHeight: 36
-    padding: 3
+    implicitHeight: IslandTheme.controlHeight
+    padding: IslandTheme.segmentInset
 
     background: Rectangle {
         color: IslandTheme.surface
@@ -20,7 +20,7 @@ Control {
     }
 
     contentItem: RowLayout {
-        spacing: 3
+        spacing: IslandTheme.segmentInset
 
         Repeater {
             model: control.model
@@ -30,7 +30,7 @@ Control {
                 required property int index
                 required property var modelData
                 Layout.fillWidth: true
-                implicitHeight: 28
+                implicitHeight: IslandTheme.segmentItemHeight
                 checkable: true
                 checked: index === control.currentIndex
                 onClicked: control.activated(index)

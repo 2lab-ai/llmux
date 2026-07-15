@@ -24,9 +24,25 @@ QtObject {
     readonly property color amberTint: "#3a2903"
     readonly property color redTint: "#391417"
 
+    readonly property int spaceXs: 4
+    readonly property int spaceSm: 8
+    readonly property int spaceMd: 12
+    readonly property int spaceLg: 16
     readonly property int pagePadding: 24
     readonly property int sectionSpacing: 24
     readonly property int cardPadding: 16
+    readonly property int peerGap: spaceSm
+    readonly property int formColumnGap: spaceLg
+    readonly property int fieldLabelWidth: 104
+    readonly property int controlHeight: 32
+    readonly property int controlPaddingX: spaceMd
+    readonly property int iconTextGap: 6
+    readonly property int segmentInset: 2
+    readonly property int segmentItemHeight: 28
+    readonly property int chipPaddingX: spaceSm
+    readonly property int chipPaddingY: spaceXs
+    readonly property int headerHeight: 56
+    readonly property int navigationWidth: 300
     readonly property int cardRadius: 0
     readonly property int controlRadius: 0
     readonly property string monoFamily: "monospace"

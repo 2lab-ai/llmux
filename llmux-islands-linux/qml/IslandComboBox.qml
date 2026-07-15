@@ -4,9 +4,11 @@ import QtQuick.Controls
 ComboBox {
     id: control
 
-    implicitHeight: 34
-    leftPadding: 10
-    rightPadding: 30
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: IslandTheme.controlPaddingX
+    rightPadding: IslandTheme.controlPaddingX + 18
+    topPadding: 0
+    bottomPadding: 0
     font.pixelSize: 12
     palette.text: IslandTheme.primaryText
     palette.buttonText: IslandTheme.primaryText
@@ -29,7 +31,7 @@ ComboBox {
     }
 
     indicator: Text {
-        x: control.width - width - 10
+        x: control.width - width - IslandTheme.controlPaddingX
         anchors.verticalCenter: parent.verticalCenter
         text: "⌄"
         color: IslandTheme.secondaryText
