@@ -1,10 +1,14 @@
 # llmux-islands — Spec
 
-A native macOS menu/notch app that shows per-account llmux usage at a glance and lets the user
-add/remove subscriptions, driven entirely by llmux's HTTP control API. Companion to the `llmux`
-daemon; lives in this repo at top-level `llmux-islands/`.
+Historical macOS menu/notch plan that led to the first llmux Islands client.
 
-Status: **planned** (design confirmed 2026-06-30). This document records the target contract.
+Status: **historical input, superseded**. The app shipped and later adopted a
+shared Rust semantic core plus an Arch Linux/KDE shell, Grok state, privacy
+projection, and verification receipts. Use the current
+[cross-platform dossier](docs/llmux-islands-linux-port/README.md),
+[user guide](../docs/llmux-islands.md), and maintained
+[architecture](02-architecture.md). The original target contract below is
+preserved rather than rewritten as if those later decisions already existed.
 
 Sibling docs: [`12-llmux-islands-architecture.md`](12-llmux-islands-architecture.md) (how),
 [`10-model-usage-dashboard.md`](10-model-usage-dashboard.md) (the in-TUI usage view this mirrors).

@@ -1,8 +1,9 @@
-//! OpenAI Codex provider (minimum viable, Phase C): serves Anthropic
-//! Messages API requests from a ChatGPT-subscription Codex account by
-//! translating to the Responses API (`POST {base}/responses`, model pinned
-//! to [`CODEX_MODEL`]) and converting the Responses SSE stream back into
-//! Anthropic SSE on the fly.
+//! OpenAI Codex provider: serves Anthropic Messages API requests from a
+//! ChatGPT-subscription Codex account by translating to the Responses API
+//! (`POST {base}/responses`) and converting the Responses SSE stream back into
+//! Anthropic SSE on the fly. Known concrete Codex model IDs pass through;
+//! aliases, decorated/unknown IDs, and model-less requests resolve through the
+//! configured default ([`CODEX_MODEL`] at compile time).
 //!
 //! Translation logic ported from CLIProxyAPI's `codex_claude_request.go` /
 //! `codex_claude_response.go` shapes. The Anthropic passthrough never touches
@@ -27,8 +28,7 @@ pub use super::responses::{
 
 /// Fallback model slug when none is configured. The configurable default now
 /// lives in `config.codex.default_model`; this const is the compile-time
-/// fallback and the value [`CodexShape::default`] uses (so tests and the
-/// `new(base_url)` constructor preserve the original pinned behavior).
+/// fallback and the value [`CodexShape::default`] uses.
 ///
 /// `gpt-5.6-sol` (2026-07-09 launch, flagship tier): probed against the
 /// ChatGPT-account codex backend — bare `gpt-5.6` and `gpt-5.6-codex` are
@@ -41,9 +41,8 @@ pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// Request-shaping knobs for the Responses request, sourced from
 /// `config.codex`. They mirror exactly what the codex CLI sets on the wire:
 /// the model slug, `service_tier: "priority"` when `fast`, and a
-/// `reasoning.effort` value. [`Default`] reproduces the original behavior
-/// (pinned `gpt-5.5`, no fast tier, backend-default effort) so existing tests
-/// and the bare `new` constructor are unaffected.
+/// `reasoning.effort` value. [`Default`] uses `gpt-5.6-sol`, no fast tier, and
+/// backend-default effort.
 #[derive(Debug, Clone)]
 pub struct CodexShape {
     /// Model slug requested upstream.
@@ -56,8 +55,10 @@ pub struct CodexShape {
     pub client_model: Option<String>,
     /// `true` → send `service_tier: "priority"` (codex "fast" mode).
     pub fast: bool,
-    /// `reasoning.effort` value (`none|minimal|low|medium|high|xhigh`), or
-    /// `None` to omit the field and let the backend choose.
+    /// Configured `reasoning.effort` value
+    /// (`none|minimal|low|medium|high|xhigh|max|ultra`), or `None` to preserve
+    /// a client value when present and otherwise let the backend choose. The
+    /// selected model clamps unsupported levels.
     pub effort: Option<String>,
 }
 
@@ -101,8 +102,8 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    /// Construct with the default request shape (pinned `gpt-5.5`). Used by
-    /// tests; production uses [`CodexProvider::with_shape`].
+    /// Construct with the default request shape (`gpt-5.6-sol`). Used by tests;
+    /// production uses [`CodexProvider::with_shape`].
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_shape(base_url, CodexShape::default())
     }
@@ -224,9 +225,10 @@ impl CodexProvider {
 // ---------------------------------------------------------------------------
 
 /// Translate an Anthropic Messages request body into a Responses API body.
-/// Returns `(upstream_body, client_requested_stream)`. The model is ALWAYS
-/// rewritten to [`CODEX_MODEL`]; `max_tokens` and `tool_choice` are ignored
-/// (logged at debug); images and thinking blocks are dropped (warn/debug).
+/// Returns `(upstream_body, client_requested_stream)`. Known concrete models
+/// pass through, current aliases resolve, and other values use the default
+/// [`CODEX_MODEL`] pin. `max_tokens` and `tool_choice` are ignored (logged at
+/// debug); images and thinking blocks are dropped (warn/debug).
 pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool), ProviderError> {
     translate_request_with(body, session_id, &CodexShape::default())
 }

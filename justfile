@@ -14,6 +14,10 @@ test:
 build:
     cargo build --release --locked
 
+# Validate local documentation paths and anchors
+docs-check:
+    node scripts/check-docs.mjs
+
 # Format the tree
 fmt:
     cargo fmt

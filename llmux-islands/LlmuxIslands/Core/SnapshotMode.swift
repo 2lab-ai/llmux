@@ -20,8 +20,9 @@
 //  animation phases. Session counts come from `LLMUX_ISLANDS_DEMO_INFLIGHT`
 //  (DemoMode); relaunch once per counts-state. Output:
 //  `label-c{claude}x{codex}-p{0..3}.png` where p0..p3 = phase 0 / 0.25 / 0.5 /
-//  0.75 of the rainbow hue loop (issue #68 removed the mascot jump — the
-//  phases now vary only the counter hues). Wall-clock mode: setting
+//  0.75 of the rainbow hue loop. Deterministic phase captures keep the mascot
+//  grounded while the live closed label still uses its session-driven jump.
+//  Wall-clock mode: setting
 //  `LLMUX_ISLANDS_SNAPSHOT_T=<seconds>` renders ONE frame at that absolute
 //  time instead of the 4 normalized phases (`rainbowHue(time:)`). Output:
 //  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).

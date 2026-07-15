@@ -1,157 +1,221 @@
 # llmux Islands
 
-`llmux-islands` is the native macOS companion for llmux. It gives the same multi-account usage cockpit a glanceable menu-bar/notch surface while keeping llmux as the only source of truth.
+llmux Islands is the native companion UI for the llmux daemon. It ships as a
+SwiftUI/AppKit notch app on macOS and as a Qt 6/QML/Kirigami shell on Arch
+Linux/KDE. Both clients consume the same Rust semantic state, privacy rules,
+typed actions, and verification receipts while keeping platform-native window,
+tray, sound, and notification behavior.
 
-The app does not read `~/.config/llmux.json`, does not touch provider credentials, and does not run separate usage scripts. It talks to the running llmux daemon over HTTP.
+The daemon remains the source of truth. Islands does not read
+`~/.config/llmux.json`, own provider credentials, or run separate quota
+scripts.
 
-## What it shows
+## At a glance
 
-- Per-account Claude / Codex / API-key usage from the llmux daemon.
-- 5-hour and 7-day quota windows with reset timing.
-- Token/auth health and degraded accounts.
-- A closed floating island label:
+| Capability | macOS | Arch Linux/KDE |
+| --- | --- | --- |
+| Primary surface | notch/floating island | Plasma layer-shell island where available, tray + native window fallback elsewhere |
+| Install | Homebrew cask | repository `PKGBUILD` (`llmux-islands-git`) |
+| Stable/preview package | `llmux-islands`, `llmux-islands-preview` | not yet published to pacman, AUR, xbrew, or GitHub Releases |
+| Shared state/actions | Rust core through C ABI | Rust core through CXX-Qt |
+| Remote policy | loopback HTTP; remote HTTPS + API key; redirects denied | same |
 
-```text
-Llmux Islands [mascot] [Claude activity] [Codex activity]
-```
+## What it shows and controls
 
-Activity counters are hidden when the count is zero. When one or more sessions
-are active, the indicator animates with a rainbow loop; the mascot makes a
-small jump whose speed scales with activity up to the capped high-activity
-state.
+- Claude, Codex, and Grok activity counters in the compact surface.
+- Per-account health, 5-hour/7-day/Fable windows, reset timing, and pauses.
+- Model, token, cost, client, and calendar statistics from the daemon history.
+- Recent request and settings verification receipts without request bodies or
+  secrets.
+- Account add/remove, OAuth orchestration, pause/resume, scheduler and provider
+  settings, events, refresh, and daemon maintenance actions.
+- Email-anonymous and deterministic demo modes for screen sharing.
 
-## Native presentation boundaries
+On the macOS notch, the compact activity indicator hides a provider whose
+in-flight count is zero. Active counts animate, and the mascot's motion scales
+with activity up to a bounded maximum. KDE presents the same provider counts
+and health through its compact text summary and tray surfaces without copying
+that notch-specific animation.
 
-The shells share semantic state and behavior, not a cross-platform widget tree.
+## Before launching
 
-- macOS retains the shipped SwiftUI/AppKit presentation from before the UI
-  renewal: the colored quota mosaic, rounded account tiles, Statistics surface,
-  and native menu hierarchy. Receipt metadata remains available in Statistics.
-- KDE uses a black canvas, white opacity tiers, square controls, and equal-width
-  data grids. Buttons, fields, selectors, switches, and labels follow one 32px
-  control row and the exact 4/8px alignment rhythm documented in the port's
-  `design.md`.
-
-On KDE, credential metadata, secondary quota windows, analytics detail, request
-receipts, daemon configuration, events, maintenance, diagnostics, and build
-metadata live in a labelled, local-only **Advanced** disclosure. Offline,
-authentication, warning, failure, and destructive-confirmation states are
-never hidden there. macOS intentionally keeps its original information
-hierarchy rather than copying this Linux disclosure.
-
-Privacy masking, actions, and receipts come from the shared Rust UI state on
-both platforms. Opening Linux Advanced does not dispatch an action, touch the
-daemon, or persist state.
-
-## Requirements
-
-- macOS with Xcode 15+.
-- XcodeGen: `brew install xcodegen`.
-- A running llmux daemon on `http://127.0.0.1:3456`.
-
-Start the daemon with either:
+Install and configure the `llmux` CLI first, then verify the daemon:
 
 ```bash
-llmux run
+llmux status || llmux restart
 ```
 
-or, if you only want the daemon/TUI:
+For a first installation, follow [Getting started](getting-started.md). Both
+native clients may start a missing local daemon when the selected endpoint is
+loopback and an installed `llmux` binary is available. They never start a
+daemon for a remote endpoint.
 
-```bash
-llmux server
-```
+## macOS
 
-## Install
+### Install
+
+Stable:
 
 ```bash
 brew install 2lab-ai/tap/llmux-islands
 ```
 
-Then launch `LlmuxIslands.app` from Applications, Spotlight, or Finder.
-
-## Build and run from source
+Preview:
 
 ```bash
-cd llmux-islands
-xcodegen generate
-xcodebuild -project LlmuxIslands.xcodeproj -scheme LlmuxIslands -configuration Debug \
-  -derivedDataPath build \
-  CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES build
-open build/Build/Products/Debug/LlmuxIslands.app
+brew install 2lab-ai/tap/llmux-islands-preview
 ```
 
-Click the menu-bar gauge icon to open or hide the island.
+Launch `LlmuxIslands.app` from Applications, Spotlight, or Finder. Click or
+hover over the notch to open the island; click it again or click outside to
+close it. The app intentionally does not create a separate menu-bar status
+item.
 
-## Email anonymous mode
+Source layout and Xcode build commands live in the
+[macOS component README](../llmux-islands/README.md).
 
-Use **Email anonymous** in the Islands menu when recording or screen-sharing real usage.
+## Arch Linux / KDE
 
-When enabled, email addresses in the Usage area are post-processed into a pixelized mosaic so the layout remains faithful but the text is unreadable. Non-email placeholders remain readable.
+There is currently no AUR, pacman repository, xbrew recipe, or Linux GUI
+release asset for Islands. These therefore fail by design today:
 
-This is different from demo mode:
+```text
+xbrew install llmux-islands
+xbrew install llmux-islands-preview
+```
 
-- **Email anonymous mode** preserves your real live usage state and pixelizes emails in the UI.
-- **Demo mode** replaces identities with stable fake addresses and suppresses config writes for public demos.
+Install the repository package instead:
 
-## Demo and recording mode
+```bash
+sudo pacman -S --needed base-devel git
+git clone --depth=1 https://github.com/2lab-ai/llmux.git
+cd llmux/llmux-islands-linux/packaging/arch
+CARGO_BUILD_JOBS=2 MAKEFLAGS=-j2 makepkg -si
+```
 
-For public screenshots or GIFs, launch the app with demo mode:
+This builds and installs package `llmux-islands-git`, which provides
+`llmux-islands` and installs the executable as:
+
+```bash
+llmux-islands-linux
+```
+
+The job limits cap local compile parallelism at two. The package also installs
+the desktop entry, AppStream metadata, icon, and license. It never invokes
+`sudo`, pacman, or an AUR helper from inside the app.
+
+On Plasma Wayland the app uses LayerShellQt for the compact top surface. Other
+Wayland desktops use a regular-window fallback; X11 uses a frameless top-center
+tool window. The tray uses Qt's StatusNotifierItem integration on Plasma.
+
+Configuration is stored at `$XDG_CONFIG_HOME/llmux/islands.json` or
+`~/.config/llmux/islands.json`, with private directory/file permissions. For
+source builds, dependencies, platform mapping, and maintainer verification,
+see the [Linux component README](../llmux-islands-linux/README.md).
+
+## Visual tour
+
+These are real deterministic renders produced by the macOS and clean-Arch CI
+jobs from the same privacy-masked fixture. They are not mockups.
+
+| macOS | KDE |
+| --- | --- |
+| <img src="../.prd/docs/llmux-islands-linux-port/visual-receipts/macos-usage-full.png" alt="macOS Islands usage screen" width="520"> | <img src="../.prd/docs/llmux-islands-linux-port/visual-receipts/kde-usage-full.png" alt="KDE Islands usage screen" width="420"> |
+| Native usage mosaic and account tiles | Monochrome default surface with secondary controls collapsed |
+
+Request and settings outcomes remain inspectable as privacy-safe receipts:
+
+| macOS receipt | KDE receipt |
+| --- | --- |
+| <img src="../.prd/docs/llmux-islands-linux-port/visual-receipts/macos-receipts-detail.png" alt="macOS Islands request receipt" width="520"> | <img src="../.prd/docs/llmux-islands-linux-port/visual-receipts/kde-receipts-detail.png" alt="KDE Islands request and settings receipts" width="420"> |
+
+The complete 11-image gallery, dimensions, SHA-256 hashes, source commit, and
+CI provenance are in the
+[visual-receipts ledger](../.prd/docs/llmux-islands-linux-port/visual-receipts/README.md).
+
+## Presentation boundaries
+
+The platforms share meaning, not a widget tree.
+
+- macOS preserves its native colored quota mosaic, rounded account tiles,
+  statistics hierarchy, and notch interaction.
+- KDE uses a monochrome shell, square aligned controls, equal-width data grids,
+  and a local **Advanced** disclosure for infrequent detail and operations.
+- Offline, authentication, warning, failure, and destructive-confirmation
+  states are never hidden under Advanced.
+- Opening Advanced changes presentation only; it does not dispatch a daemon
+  action or persist state.
+
+The design and cross-platform mapping are documented in the
+[Linux port dossier](../.prd/docs/llmux-islands-linux-port/README.md).
+
+## Privacy
+
+### Email anonymous
+
+Enable **Email anonymous** while showing real live usage on a recording or
+screen share. The daemon/TUI uses stable aliases; Islands projects opaque
+account handles and renders email regions unreadably while retaining layout.
+API documents continue to carry real account names for authorized clients.
+
+### Demo mode
+
+Demo mode replaces live identities with deterministic fake data and suppresses
+config writes. On macOS:
 
 ```bash
 open -na /path/to/LlmuxIslands.app --args --demo
 ```
 
-or set:
+or:
 
 ```bash
-LLMUX_ISLANDS_DEMO=1 open -na /path/to/LlmuxIslands.app
+LLMUX_ISLANDS_DEMO=1 \
+LLMUX_ISLANDS_DEMO_INFLIGHT="claude=3,codex=2,grok=1" \
+open -na /path/to/LlmuxIslands.app
 ```
 
-Demo mode:
-
-- Shows stable fake emails instead of real account names.
-- Holds the island open for recording.
-- Can force activity counters with `LLMUX_ISLANDS_DEMO_INFLIGHT`, for example:
-
-```bash
-LLMUX_ISLANDS_DEMO=1 LLMUX_ISLANDS_DEMO_INFLIGHT="claude=3,codex=2" open -na /path/to/LlmuxIslands.app
-```
-
-From the repository root, the recording helpers are:
-
-```bash
-demo/record-islands.sh
-demo/record-all.sh
-```
-
-The app capture needs a one-time macOS **Screen Recording** grant for the terminal that runs the recorder.
+The Linux snapshot mode is a developer/evidence tool and never contacts a
+live daemon; see the component README rather than using it as normal startup.
 
 ## Remote daemon
 
-Loopback access is unauthenticated by default. For a remote daemon, configure the app with the daemon host/port and the llmux `x-api-key` from your llmux config.
+Loopback HTTP is allowed and does not send a configured remote key. A remote
+Islands endpoint must use HTTPS and an `x-api-key`; redirects are denied. The
+stored control credential remains in native connection settings and is never
+projected back into QML/SwiftUI semantic state.
 
-Do not expose mutating llmux endpoints to an untrusted network without the API key.
+Use a trusted overlay or TLS-terminating endpoint and follow the
+[remote daemon guide](guides/remote-daemon.md). The app never starts or stops a
+daemon on another machine.
 
 ## Troubleshooting
 
-### The island is blank or says llmux is not running
-
-Start or restart the daemon:
+### The app says llmux is unavailable
 
 ```bash
 llmux restart
 llmux status
 ```
 
-### The app build cannot find an Xcode project
+For a remote connection, confirm HTTPS, host/port reachability, and that the
+app key matches the daemon's `proxy.api_key`.
 
-Regenerate it from `project.yml`:
+### `xbrew` cannot install Islands on Arch
+
+That is expected until a Linux package recipe is published. Use the repository
+`PKGBUILD` under [Arch Linux / KDE](#arch-linux-kde).
+
+### The macOS build has no Xcode project
+
+The project is generated and gitignored:
 
 ```bash
 cd llmux-islands
 xcodegen generate
 ```
 
-### Screen recording is black or incomplete
+### Screen capture is black or incomplete
 
-Grant Screen Recording permission to the terminal app that runs `demo/record-islands.sh`, then restart that terminal and record again.
+Grant Screen Recording permission to the terminal that starts the recorder,
+restart that terminal, and capture again.

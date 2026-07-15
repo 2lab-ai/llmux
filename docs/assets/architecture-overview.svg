@@ -1,0 +1,166 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title description">
+  <title id="title">llmux architecture overview</title>
+  <desc id="description">Claude Code sends Anthropic-shaped traffic to one llmux daemon. The daemon accepts, routes, schedules, and adapts requests across Claude, Codex, and Grok account groups while terminal and native clients share its control state.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#101010" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#101010" flood-opacity="0.055"/>
+    </filter>
+    <style>
+      .sans { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      .eyebrow { font-size: 13px; letter-spacing: 1.5px; fill: #6d6d68; }
+      .title { font-size: 48px; font-weight: 650; letter-spacing: -2px; fill: #101010; }
+      .note { font-size: 17px; fill: #4f4f4b; }
+      .card-title { font-size: 30px; font-weight: 650; letter-spacing: -1px; }
+      .section-title { font-size: 17px; font-weight: 650; fill: #101010; }
+      .body { font-size: 14px; fill: #5c5c57; }
+      .small { font-size: 12px; fill: #6d6d68; }
+      .tiny { font-size: 11px; fill: #555550; }
+      .white { fill: #ffffff; }
+      .muted-white { fill: #c8c7c1; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#f4f4f1"/>
+  <rect width="1600" height="1000" fill="url(#grid)"/>
+
+  <text x="58" y="70" class="mono eyebrow">LLMUX / SYSTEM OVERVIEW</text>
+  <text x="58" y="126" class="sans title">One harness. Three provider groups.</text>
+  <text x="1542" y="67" text-anchor="end" class="sans note">Claude Code keeps the workflow. llmux owns routing,</text>
+  <text x="1542" y="92" text-anchor="end" class="sans note">account selection, quota state, and provider translation.</text>
+
+  <!-- Stable harness -->
+  <g filter="url(#shadow)">
+    <rect x="58" y="286" width="270" height="286" rx="18" fill="#20201e"/>
+  </g>
+  <text x="84" y="322" class="mono eyebrow" fill="#aaa9a4">STABLE HARNESS</text>
+  <text x="84" y="366" class="sans card-title white">Claude Code</text>
+  <text x="84" y="411" class="sans body muted-white">One tool environment,</text>
+  <text x="84" y="432" class="sans body muted-white">independent of the serving model.</text>
+  <g class="mono tiny">
+    <rect x="84" y="466" width="52" height="29" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.2"/>
+    <text x="110" y="485" text-anchor="middle" fill="#dddcd6">tools</text>
+    <rect x="143" y="466" width="78" height="29" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.2"/>
+    <text x="182" y="485" text-anchor="middle" fill="#dddcd6">subagents</text>
+    <rect x="228" y="466" width="68" height="29" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.2"/>
+    <text x="262" y="485" text-anchor="middle" fill="#dddcd6">hooks</text>
+    <rect x="84" y="505" width="48" height="29" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.2"/>
+    <text x="108" y="524" text-anchor="middle" fill="#dddcd6">MCP</text>
+    <rect x="139" y="505" width="120" height="29" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.2"/>
+    <text x="199" y="524" text-anchor="middle" fill="#dddcd6">project memory</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="58" y="590" width="270" height="104" rx="18" fill="#ffffff" stroke="#d7d7d1"/>
+  </g>
+  <text x="79" y="620" class="sans body" font-weight="650" fill="#101010">Single integration contract</text>
+  <text x="79" y="648" class="mono tiny">ANTHROPIC_BASE_URL=</text>
+  <text x="79" y="669" class="mono tiny">http://127.0.0.1:3456</text>
+
+  <!-- Directional connectors -->
+  <line x1="328" y1="514" x2="380" y2="514" stroke="#a8a8a2"/>
+  <path d="M 372 507 L 380 514 L 372 521" fill="none" stroke="#6d6d68" stroke-width="1.5"/>
+  <line x1="1180" y1="514" x2="1232" y2="514" stroke="#a8a8a2"/>
+  <path d="M 1224 507 L 1232 514 L 1224 521" fill="none" stroke="#6d6d68" stroke-width="1.5"/>
+
+  <!-- Daemon -->
+  <g filter="url(#shadow)">
+    <rect x="380" y="190" width="800" height="650" rx="19" fill="#ffffff" stroke="#b5b5af" stroke-width="1.5"/>
+  </g>
+  <text x="409" y="226" class="mono eyebrow">LOCAL TRAFFIC CONTROLLER</text>
+  <text x="409" y="266" class="sans card-title" fill="#101010">llmux daemon</text>
+  <rect x="1032" y="218" width="118" height="38" rx="10" fill="#f4f4f1" stroke="#d7d7d1"/>
+  <text x="1091" y="242" text-anchor="middle" class="mono tiny">HTTP :3456</text>
+
+  <!-- Four-stage pipeline -->
+  <rect x="405" y="292" width="750" height="118" rx="14" fill="#fbfbf9" stroke="#d7d7d1"/>
+  <line x1="592.5" y1="292" x2="592.5" y2="410" stroke="#d7d7d1"/>
+  <line x1="780" y1="292" x2="780" y2="410" stroke="#d7d7d1"/>
+  <line x1="967.5" y1="292" x2="967.5" y2="410" stroke="#d7d7d1"/>
+  <g class="sans">
+    <circle cx="432" cy="319" r="12" fill="#101010"/><text x="432" y="323" text-anchor="middle" class="mono tiny white">1</text>
+    <text x="424" y="357" class="section-title">Accept</text><text x="424" y="382" class="small">Anthropic Messages + SSE</text>
+    <circle cx="619" cy="319" r="12" fill="#101010"/><text x="619" y="323" text-anchor="middle" class="mono tiny white">2</text>
+    <text x="611" y="357" class="section-title">Route</text><text x="611" y="382" class="small">model → provider group</text>
+    <circle cx="807" cy="319" r="12" fill="#101010"/><text x="807" y="323" text-anchor="middle" class="mono tiny white">3</text>
+    <text x="799" y="357" class="section-title">Schedule</text><text x="799" y="382" class="small">quota + health + stickiness</text>
+    <circle cx="994" cy="319" r="12" fill="#101010"/><text x="994" y="323" text-anchor="middle" class="mono tiny white">4</text>
+    <text x="986" y="357" class="section-title">Adapt</text><text x="986" y="382" class="small">passthrough / Responses</text>
+  </g>
+
+  <!-- Runtime boxes -->
+  <rect x="405" y="430" width="430" height="244" rx="14" fill="#ffffff" stroke="#d7d7d1"/>
+  <text x="425" y="459" class="mono eyebrow">RUNTIME STATE</text>
+  <text x="425" y="489" class="sans section-title">Group-scoped account selection</text>
+  <g class="sans small">
+    <rect x="425" y="510" width="390" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="438" y="531">Quota windows</text><text x="801" y="531" text-anchor="end" class="mono tiny">5h · 7d · Fable</text>
+    <rect x="425" y="550" width="390" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="438" y="571">Eligibility</text><text x="801" y="571" text-anchor="end" class="mono tiny">auth · pause · cooldown</text>
+    <rect x="425" y="590" width="390" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="438" y="611">Leases</text><text x="801" y="611" text-anchor="end" class="mono tiny">request-pinned</text>
+    <rect x="425" y="630" width="390" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="438" y="651">History</text><text x="801" y="651" text-anchor="end" class="mono tiny">usage · cost · receipts</text>
+  </g>
+
+  <rect x="850" y="430" width="305" height="244" rx="14" fill="#ffffff" stroke="#d7d7d1"/>
+  <text x="870" y="459" class="mono eyebrow">BACKGROUND</text>
+  <text x="870" y="489" class="sans section-title">Daemon maintenance</text>
+  <g class="sans small">
+    <rect x="870" y="510" width="265" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="883" y="531">Usage polling</text><text x="1122" y="531" text-anchor="end" class="mono tiny">bounded</text>
+    <rect x="870" y="550" width="265" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="883" y="571">Token refresh</text><text x="1122" y="571" text-anchor="end" class="mono tiny">pre-expiry</text>
+    <rect x="870" y="590" width="265" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="883" y="611">Cooldown healing</text><text x="1122" y="611" text-anchor="end" class="mono tiny">evidence</text>
+    <rect x="870" y="630" width="265" height="32" rx="9" fill="#f4f4f1"/>
+    <text x="883" y="651">Dashboard fold</text><text x="1122" y="651" text-anchor="end" class="mono tiny">one contract</text>
+  </g>
+
+  <!-- Controls -->
+  <rect x="405" y="696" width="750" height="112" rx="14" fill="#20201e"/>
+  <text x="425" y="728" class="mono eyebrow" fill="#aaa9a4">CONTROL SURFACES</text>
+  <text x="425" y="758" class="sans body muted-white">Observe and dispatch typed operations</text>
+  <g class="sans tiny">
+    <rect x="720" y="720" width="90" height="34" rx="9" fill="none" stroke="#ffffff" stroke-opacity="0.22"/><text x="765" y="741" text-anchor="middle" fill="#d9d8d2">CLI / TUI</text>
+    <rect x="820" y="720" width="128" height="34" rx="9" fill="none" stroke="#ffffff" stroke-opacity="0.22"/><text x="884" y="741" text-anchor="middle" fill="#d9d8d2">macOS Islands</text>
+    <rect x="958" y="720" width="116" height="34" rx="9" fill="none" stroke="#ffffff" stroke-opacity="0.22"/><text x="1016" y="741" text-anchor="middle" fill="#d9d8d2">KDE Islands</text>
+    <rect x="820" y="764" width="128" height="28" rx="8" fill="none" stroke="#ffffff" stroke-opacity="0.22"/><text x="884" y="783" text-anchor="middle" fill="#d9d8d2">remote client</text>
+  </g>
+
+  <!-- Provider cards -->
+  <g filter="url(#shadow)"><rect x="1232" y="222" width="310" height="166" rx="18" fill="#ffffff" stroke="#d7d7d1"/></g>
+  <text x="1253" y="250" class="mono eyebrow">GROUP</text><text x="1253" y="284" class="sans" font-size="23" font-weight="650">Claude</text>
+  <circle cx="1504" cy="264" r="18" fill="#101010"/><text x="1504" y="269" text-anchor="middle" class="mono small white">C</text>
+  <text x="1253" y="316" class="sans small">Subscription OAuth + API keys.</text>
+  <text x="1253" y="335" class="sans small">Anthropic passthrough path.</text>
+  <line x1="1253" y1="352" x2="1521" y2="352" stroke="#e9e9e4"/><text x="1253" y="374" class="mono tiny">fable · opus · sonnet · haiku</text>
+
+  <g filter="url(#shadow)"><rect x="1232" y="414" width="310" height="166" rx="18" fill="#ffffff" stroke="#d7d7d1"/></g>
+  <text x="1253" y="442" class="mono eyebrow">GROUP</text><text x="1253" y="476" class="sans" font-size="23" font-weight="650">Codex</text>
+  <circle cx="1504" cy="456" r="18" fill="#101010"/><text x="1504" y="461" text-anchor="middle" class="mono small white">X</text>
+  <text x="1253" y="508" class="sans small">ChatGPT/Codex OAuth.</text>
+  <text x="1253" y="527" class="sans small">Messages ↔ Responses bridge.</text>
+  <line x1="1253" y1="544" x2="1521" y2="544" stroke="#e9e9e4"/><text x="1253" y="566" class="mono tiny">gpt-* · sol · terra · luna</text>
+
+  <g filter="url(#shadow)"><rect x="1232" y="606" width="310" height="166" rx="18" fill="#ffffff" stroke="#d7d7d1"/></g>
+  <text x="1253" y="634" class="mono eyebrow">GROUP</text><text x="1253" y="668" class="sans" font-size="23" font-weight="650">Grok</text>
+  <circle cx="1504" cy="648" r="18" fill="#101010"/><text x="1504" y="653" text-anchor="middle" class="mono small white">G</text>
+  <text x="1253" y="700" class="sans small">xAI device-code OAuth.</text>
+  <text x="1253" y="719" class="sans small">Provider-specific Responses bridge.</text>
+  <line x1="1253" y1="736" x2="1521" y2="736" stroke="#e9e9e4"/><text x="1253" y="758" class="mono tiny">grok · grok-*</text>
+
+  <!-- Footer -->
+  <line x1="58" y1="884" x2="1542" y2="884" stroke="#bdbdb7"/>
+  <text x="58" y="917" class="sans section-title">Selection boundary</text>
+  <text x="58" y="943" class="sans body">Router chooses a group; scheduler chooses one eligible account inside it.</text>
+  <text x="715" y="917" class="sans section-title">Trust boundary</text>
+  <text x="715" y="943" class="sans body">Loopback trusted; off-loopback needs</text>
+  <text x="715" y="963" class="sans body">a key and encrypted overlay.</text>
+  <text x="1160" y="917" class="sans section-title">Product boundary</text>
+  <text x="1160" y="943" class="sans body">Local, single-human operation —</text>
+  <text x="1160" y="963" class="sans body">not a hosted credential pool.</text>
+</svg>
