@@ -2466,10 +2466,12 @@ fn apply_event(
 /// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
 /// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
 /// metadata each record carries is folded; no prompt content is retained.
-/// How many rows past the current scroll depth [`App::extend_with_history`]
-/// keeps materialized, and how close to the loaded end the scroll must get
-/// before [`App::request_history`] arms (UI-5 infinite scroll).
+/// How many FOLDED render rows past the current scroll depth
+/// [`App::extend_with_history`] keeps materialized, how many raw entries it
+/// appends per fold-recheck step, and how close to the loaded end the scroll
+/// must get before [`App::request_history`] arms (UI-5 infinite scroll).
 const HISTORY_PAGE: usize = 300;
+const HISTORY_CHUNK: usize = 512;
 const HISTORY_ARM_MARGIN: i64 = 40;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
@@ -2506,11 +2508,15 @@ fn base_url_is_loopback(base_url: &str) -> bool {
 
 /// Pure merge for [`App::extend_with_history`] (unit-tested): append history
 /// rows behind the live newest-first list — only entries strictly OLDER than
-/// the oldest live row (the persisted tail overlaps the live ring; the
-/// timestamp cut dedupes), and only up to `scroll + HISTORY_PAGE` total rows,
-/// so the per-frame clone is bounded by how deep the operator actually
-/// scrolled rather than the whole persisted file. At the live tail
-/// (`scroll == 0`) nothing is appended.
+/// the oldest loaded row (the persisted tail overlaps the live ring; the
+/// timestamp cut dedupes) — until the FOLDED render-row count reaches
+/// `scroll + HISTORY_PAGE`. Scroll position is measured in folded rows
+/// (`triage::collapse_completed`), so the target must be too: comparing the
+/// raw entry count instead stalled hydration forever whenever a large
+/// `count` run folded hundreds of raw entries into one row (review
+/// MUST-FIX 3). Appends in [`HISTORY_CHUNK`] steps, re-folding between
+/// chunks; stops when the target is met or history is exhausted. At the
+/// live tail (`scroll == 0`) nothing is appended.
 fn extend_completed_with_history(
     completed: &mut Vec<activity::Completed>,
     history: &[activity::Completed],
@@ -2519,19 +2525,24 @@ fn extend_completed_with_history(
     if scroll == 0 {
         return;
     }
-    let needed = scroll.saturating_add(HISTORY_PAGE);
-    if completed.len() >= needed {
-        return;
+    let target_rows = scroll.saturating_add(HISTORY_PAGE);
+    loop {
+        if triage::collapse_completed(completed).len() >= target_rows {
+            return;
+        }
+        let oldest = completed.last().map(|c| c.at);
+        let before = completed.len();
+        completed.extend(
+            history
+                .iter()
+                .filter(|c| oldest.is_none_or(|o| c.at < o))
+                .take(HISTORY_CHUNK)
+                .cloned(),
+        );
+        if completed.len() == before {
+            return; // history exhausted
+        }
     }
-    let oldest = completed.last().map(|c| c.at);
-    let take = needed - completed.len();
-    completed.extend(
-        history
-            .iter()
-            .filter(|c| oldest.is_none_or(|o| c.at < o))
-            .take(take)
-            .cloned(),
-    );
 }
 
 /// Blocking read+replay of the persisted activity log
@@ -3434,6 +3445,54 @@ mod tests {
         assert!(
             completed.iter().all(|c| seen.insert(c.at)),
             "live+history merge must not duplicate the overlap"
+        );
+    }
+
+    #[test]
+    fn history_paging_targets_folded_rows_not_raw_entries(/* review MUST-FIX 3 */) {
+        // 350 raw `count` entries sharing one fold key collapse to ONE render
+        // row. Under the old raw-length cap (`completed.len() >= scroll+300`)
+        // that raw bulk blocked hydration forever while the folded ceiling
+        // blocked scrolling — a permanent stall. The folded-row target must
+        // keep appending until render rows (not raw entries) reach the goal.
+        let count_req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages/count_tokens".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-fable-5".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("count".into()),
+                excerpt: None,
+            },
+        };
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        let live: Vec<_> = (1_000..1_350).rev().map(count_req).collect();
+        assert_eq!(
+            triage::collapse_completed(&live).len(),
+            1,
+            "precondition: the live wall folds to one render row"
+        );
+        let history: Vec<_> = (1..=50).rev().map(note).collect();
+        let mut completed = live.clone();
+        extend_completed_with_history(&mut completed, &history, 5);
+        assert_eq!(
+            completed.len(),
+            live.len() + history.len(),
+            "hydration must page past the folded wall (raw len is not the target)"
         );
     }
 

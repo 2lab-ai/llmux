@@ -49,14 +49,19 @@ pub fn windows_need_probe(
     now: SystemTime,
     stale_after: Duration,
 ) -> bool {
-    let windows: Vec<&QuotaWindow> = [five_hour, seven_day].into_iter().flatten().collect();
-    if windows.is_empty() {
-        return true;
+    // No heap: this runs per account per forwarded request (trigger filter).
+    let mut any = false;
+    let mut all_stale = true;
+    for w in [five_hour, seven_day].into_iter().flatten() {
+        any = true;
+        if !w.is_stale(now, stale_after) {
+            all_stale = false;
+        }
     }
-    if stale_after.is_zero() {
-        return false;
+    if !any {
+        return true; // windowless — the original probe case
     }
-    windows.iter().all(|w| w.is_stale(now, stale_after))
+    !stale_after.is_zero() && all_stale
 }
 
 /// Failure of a single probe send. Never carries a credential.
