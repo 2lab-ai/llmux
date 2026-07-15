@@ -468,15 +468,19 @@ struct App {
     overlay: Overlay,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
-    /// The newest completed REQUEST's stable identity (Notes carry no key) as
-    /// of the last rendered frame (UI-6 item 4). When new entries prepend while
-    /// scrolled into history, this anchors the viewport: next frame we find how
-    /// many render rows now sit ABOVE this remembered row and bump the offset by
-    /// that count, so the page under the cursor stays put. A ring at capacity
-    /// evicts as it appends (folded-row COUNT stays flat), so a length delta
-    /// would be dead — the key's new position is the only reliable prepend
-    /// count. `None` = no keyed frame observed yet.
+    /// Viewport anchor for UI-6 item 4: the newest completed REQUEST's stable
+    /// identity as of the last rendered frame, plus the render-row index it sat
+    /// at THEN (`last_top_row`). Notes carry no key yet occupy their own render
+    /// row, so the newest keyed request can sit at row ≥1 — the anchor's index
+    /// must therefore be a DELTA (`new_index - last_top_row`), not an absolute,
+    /// or a leading note would bump the offset every idle tick (runaway). When
+    /// new entries prepend while scrolled into history, the anchor's new render
+    /// row minus its seeded row = the prepend count; bumping the offset by that
+    /// keeps the page under the cursor put. Robust at ring capacity (append
+    /// evicts oldest → folded-row COUNT is flat, so a length delta would be
+    /// dead). `None` = no keyed frame observed yet.
     last_top_key: Option<activity::ActivityKey>,
+    last_top_row: usize,
     /// The click-expanded activity entry (Feature B), keyed by stable identity
     /// so it survives new rows prepending. `None` = nothing expanded.
     expanded_activity: Option<activity::ActivityKey>,
@@ -596,6 +600,7 @@ impl App {
             overlay: Overlay::None,
             activity_scroll: 0,
             last_top_key: None,
+            last_top_row: 0,
             expanded_activity: None,
             expanded_run: None,
             history_completed: None,
@@ -666,32 +671,55 @@ impl App {
         }
     }
 
-    /// Keep a scrolled-into-history viewport anchored when new completed
-    /// entries arrive (UI-6 item 4). Rows are newest-first and the scroll window
-    /// counts render rows from the newest, so a freshly prepended entry would
-    /// slide the page the operator is reading down. While `activity_scroll > 0`,
-    /// locate the row that carried last frame's newest-request key in THIS
-    /// frame's folded render rows: its index is exactly how many rows were
-    /// prepended above it, so bumping the offset by that index leaves the same
-    /// rows under the cursor. This holds even at ring capacity, where each
-    /// append evicts the oldest and the folded-row COUNT never changes (a length
-    /// delta would be dead there). Key not found (evicted / edge) → leave the
-    /// offset alone. At `scroll == 0` we keep live-tail (no bump). The anchor is
-    /// re-seeded to the current newest-request key every frame regardless.
-    /// Called once per rendered frame, before `chrome()` snapshots the offset.
+    /// Keep a scrolled-into-history viewport anchored when new completed entries
+    /// arrive (UI-6 item 4). Rows are newest-first and the scroll window counts
+    /// render rows from the newest, so a freshly prepended entry would slide the
+    /// page the operator is reading down. While `activity_scroll > 0`, locate
+    /// the row that carries last frame's anchor key in THIS frame's folded rows:
+    /// its new index MINUS the index it was seeded at (`last_top_row`) is the
+    /// number of rows prepended above it, so bumping the offset by that delta
+    /// leaves the same rows under the cursor. The delta (not the absolute index)
+    /// is essential: a Note occupies its own render row but has no key, so the
+    /// newest keyed request can sit at row ≥1 — an absolute bump would then add
+    /// that offset on every idle redraw tick (runaway). Robust at ring capacity,
+    /// where each append evicts the oldest and the folded-row COUNT never
+    /// changes. Key not found (evicted / edge) → leave the offset alone. At
+    /// `scroll == 0` we keep live-tail (no bump) AND skip the fold — re-seeding
+    /// the anchor needs only the cheap leading scan. Called once per rendered
+    /// frame, before `chrome()` snapshots the offset.
     fn preserve_scroll_on_new_activity(&mut self, view: &DashboardView) {
-        let rows = triage::collapse_completed(&view.completed);
         if self.activity_scroll > 0 {
-            if let Some(anchor) = &self.last_top_key {
-                if let Some(prepended) = Self::render_row_of_key(&view.completed, &rows, anchor) {
-                    let ceiling = rows.len().saturating_sub(1);
-                    self.activity_scroll =
-                        self.activity_scroll.saturating_add(prepended).min(ceiling);
+            if let Some(anchor) = self.last_top_key.clone() {
+                let rows = triage::collapse_completed(&view.completed);
+                if let Some(new_index) = Self::render_row_of_key(&view.completed, &rows, &anchor) {
+                    let prepended = new_index.saturating_sub(self.last_top_row);
+                    if prepended > 0 {
+                        let ceiling = rows.len().saturating_sub(1);
+                        self.activity_scroll =
+                            self.activity_scroll.saturating_add(prepended).min(ceiling);
+                    }
                 }
             }
         }
-        // Re-seed to the newest keyed (request) entry — Notes carry no key.
-        self.last_top_key = view.completed.iter().find_map(|c| c.activity_key());
+        // Re-seed to the newest keyed (request) entry and the render row it now
+        // occupies. That row index is exactly the count of leading Note entries
+        // ahead of the first request (Notes are unfoldable 1:1 rows and any run
+        // fold sits BELOW the first request), so no second fold is needed.
+        match view
+            .completed
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| c.activity_key().map(|k| (k, i)))
+        {
+            Some((key, row)) => {
+                self.last_top_key = Some(key);
+                self.last_top_row = row;
+            }
+            None => {
+                self.last_top_key = None;
+                self.last_top_row = 0;
+            }
+        }
     }
 
     /// The index of the render row containing `key`, or `None` if no row does.
@@ -4148,6 +4176,80 @@ mod tests {
         view.completed.pop();
         app.preserve_scroll_on_new_activity(&view);
         assert_eq!(app.activity_scroll, 0, "live tail is not bumped");
+    }
+
+    /// UI-6 item 4 regression: a Note occupies its own render row but has no
+    /// key, so the newest KEYED request sits at row ≥1. An ABSOLUTE-index bump
+    /// would add that offset on every idle redraw tick (no new arrivals) →
+    /// runaway to the ceiling in ~1-2s. The DELTA anchor must hold the offset
+    /// steady with no arrivals, then bump by exactly the prepended-row count
+    /// when a real request lands above the note.
+    #[test]
+    fn leading_note_does_not_runaway_a_scrolled_viewport() {
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        let req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let top_key =
+            |v: &DashboardView, row: usize| match triage::collapse_completed(&v.completed)[row] {
+                triage::ActivityRow::Single(i) => v.completed[i].activity_key(),
+                triage::ActivityRow::Run { start, .. } => v.completed[start].activity_key(),
+            };
+
+        let mut app = remote_app();
+        let mut view = empty_view();
+        // Newest-first: a Note on top (render row 0, no key), then 9 requests →
+        // 10 render rows. The newest KEYED request is at render row 1.
+        view.completed = std::iter::once(note(100))
+            .chain((1..=9).rev().map(req))
+            .collect();
+        app.activity_scroll = 3;
+
+        // Many idle redraw ticks, NO new arrivals: the offset must NOT drift
+        // (this is exactly what the absolute-index bump got wrong).
+        for _ in 0..5 {
+            app.preserve_scroll_on_new_activity(&view);
+            assert_eq!(
+                app.activity_scroll, 3,
+                "idle ticks with a leading note must not drift the offset"
+            );
+        }
+        let anchored_key = top_key(&view, 3);
+
+        // A real request now lands as the newest entry (the note is pushed down
+        // to render row 1): exactly one new render row prepended → offset += 1.
+        view.completed.insert(0, req(200));
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "note-then-request arrival bumps by exactly the one new render row"
+        );
+        assert_eq!(
+            top_key(&view, app.activity_scroll),
+            anchored_key,
+            "the row under the cursor stayed in place"
+        );
     }
 
     fn stats_view() -> DashboardView {
