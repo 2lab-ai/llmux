@@ -66,4 +66,3 @@ private final class UsageProviderIconCache {
         return image
     }
 }
-

@@ -140,6 +140,9 @@ jobs:
             exit 1
           fi
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

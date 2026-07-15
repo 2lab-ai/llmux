@@ -6,17 +6,22 @@ import XCTest
 /// (a) a full current-daemon document decodes and carries the values through,
 /// (b) an old-daemon-shaped document (every additive field stripped) still
 ///     decodes — missing additive fields must NEVER fail the parse,
-/// (c) broken payloads throw — the exact condition that triggers
-///     `IslandUsageModel`'s fallback to the `/llmux/status` path.
+/// (c) broken payloads throw and remain protocol failures rather than
+///     activating legacy compatibility.
 final class LlmuxDashboardDecodeTests: XCTestCase {
     private func decode(_ json: String) throws -> LlmuxDashboard {
         try JSONDecoder().decode(LlmuxDashboard.self, from: Data(json.utf8))
     }
 
+    private func decodeWire(_ json: String) throws -> LlmuxDashboardWireDocument {
+        try JSONDecoder().decode(LlmuxDashboardWireDocument.self, from: Data(json.utf8))
+    }
+
     // MARK: - (a) full document
 
     func testFullFixtureDecodes() throws {
-        let dash = try decode(DashboardFixtures.full)
+        let wire = try decodeWire(DashboardFixtures.full)
+        let dash = wire.dashboard
 
         XCTAssertEqual(dash.version, "llmux 0.2.14 (preview 2026-07-04-0558-4cc97acd45dc)")
         XCTAssertEqual(dash.port, 3456)
@@ -24,6 +29,7 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertEqual(dash.currentByGroup["claude"], "claude:user1@example.com")
         XCTAssertEqual(dash.currentByGroup["codex"], "codex:user1@example.com")
         XCTAssertEqual(dash.emailAnonymous, false)
+        XCTAssertTrue(wire.hasEmailAnonymousField)
         XCTAssertEqual(dash.showFableWeekly, true)
         // `data_quality` ships in a later slice — absent today, decodes nil.
         XCTAssertNil(dash.dataQuality)
@@ -149,7 +155,8 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
     }
 
     func testOldDaemonDocumentStillDecodes() throws {
-        let dash = try decode(try oldDaemonJSON())
+        let wire = try decodeWire(try oldDaemonJSON())
+        let dash = wire.dashboard
 
         // Missing additive fields degrade to defaults — never a parse error.
         XCTAssertTrue(dash.currentByGroup.isEmpty)
@@ -157,6 +164,7 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertTrue(dash.clientUsage.isEmpty)
         XCTAssertTrue(dash.windowed.isEmpty)
         XCTAssertNil(dash.emailAnonymous)
+        XCTAssertFalse(wire.hasEmailAnonymousField)
         XCTAssertNil(dash.showFableWeekly)
         XCTAssertNil(dash.dataQuality)
         XCTAssertNil(dash.totals.costUsd)
@@ -166,6 +174,48 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         let request = try XCTUnwrap(dash.activity.completed.first(where: \.isRequest))
         XCTAssertNil(request.costUsd)
         XCTAssertEqual(request.status, 200)
+    }
+
+    func testExplicitNullRemainsDistinctFromAnOmittedEmailSetting() throws {
+        var doc = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(DashboardFixtures.full.utf8)) as? [String: Any]
+        )
+        doc["email_anonymous"] = NSNull()
+        let data = try JSONSerialization.data(withJSONObject: doc)
+        let wire = try JSONDecoder().decode(LlmuxDashboardWireDocument.self, from: data)
+
+        XCTAssertNil(wire.dashboard.emailAnonymous)
+        XCTAssertTrue(wire.hasEmailAnonymousField)
+    }
+
+    func testOldDaemonNormalizationInjectsLocalEmailValueWithoutTransferringOwnership() throws {
+        let original = Data(try oldDaemonJSON().utf8)
+        let normalized = try LlmuxDashboardWireNormalizer.normalize(
+            original,
+            localEmailAnonymous: true
+        )
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: normalized.dashboardJSON) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["email_anonymous"] as? Bool, true)
+        XCTAssertFalse(normalized.serverOwnsEmailSetting)
+        XCTAssertNotEqual(normalized.dashboardJSON, original)
+    }
+
+    func testDaemonEmailFieldRemainsByteExactAndServerOwned() throws {
+        let original = Data(DashboardFixtures.full.utf8)
+        let normalized = try LlmuxDashboardWireNormalizer.normalize(
+            original,
+            localEmailAnonymous: true
+        )
+
+        XCTAssertEqual(normalized.dashboardJSON, original)
+        XCTAssertTrue(normalized.serverOwnsEmailSetting)
+        XCTAssertEqual(
+            try decode(String(decoding: normalized.dashboardJSON, as: UTF8.self)).emailAnonymous,
+            false
+        )
     }
 
     func testModelUsageRowWithoutAdditiveFieldsDecodes() throws {
@@ -186,15 +236,15 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertEqual(rows[0].totalTokens, 30)
     }
 
-    // MARK: - (c) broken payloads throw → status fallback
+    // MARK: - (c) broken payloads remain failures
 
     func testGarbageBodyThrows() {
         XCTAssertThrowsError(try decode("upstream exploded: not json"))
     }
 
     func testMissingRequiredKeysThrows() {
-        // /llmux/status-shaped body (no totals/activity/version…): the decode
-        // error is what flips IslandUsageModel onto the status path.
+        // A 2xx status-shaped body is a protocol error. Compatibility is
+        // selected only by an explicit unsupported dashboard HTTP status.
         XCTAssertThrowsError(try decode(#"{"accounts": [], "current": null, "port": 3456}"#))
     }
 
@@ -202,7 +252,7 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertThrowsError(try decode(#"{"version": "x", "port": "not-a-number"}"#))
     }
 
-    // MARK: - status-record bridge (tile parity)
+    // MARK: - status-record DTO parity helper
 
     func testStatusRecordBridgePreservesTileFields() throws {
         let dash = try decode(DashboardFixtures.full)

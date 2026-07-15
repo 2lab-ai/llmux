@@ -72,6 +72,7 @@ enum SnapshotMode {
         case pngEncodeFailed(String)
         case invalidWallClock(String)
         case invalidKind(String)
+        case missingFixture(String)
 
         var description: String {
             switch self {
@@ -83,6 +84,8 @@ enum SnapshotMode {
                 return "LLMUX_ISLANDS_SNAPSHOT_T must be a non-negative number of seconds, got \"\(raw)\""
             case .invalidKind(let raw):
                 return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats, got \"\(raw)\""
+            case .missingFixture(let file):
+                return "snapshot fixture is missing from the app bundle: \(file)"
             }
         }
     }
@@ -202,7 +205,11 @@ enum SnapshotMode {
         let viewModel = makeViewModel()
         viewModel.contentType = .menu
         let url = dir.appendingPathComponent("menu.png")
-        try writeHosted(view: NotchMenuView(viewModel: viewModel), size: viewModel.openedSize, to: url)
+        // The live panel is intentionally scrollable at `openedSize`. Evidence
+        // needs the complete surface, including Accessibility/About/GitHub/Quit,
+        // so give the same ScrollView enough height to lay out every row.
+        let fullMenuSize = CGSize(width: viewModel.openedSize.width, height: 820)
+        try writeHosted(view: NotchMenuView(viewModel: viewModel), size: fullMenuSize, to: url)
         return [url.path]
     }
 
@@ -238,21 +245,20 @@ enum SnapshotMode {
         // model) keying), and zero/absent cache + client cost fields
         // (omitted, never `—`).
         let model = IslandUsageModel.shared
-        model.tiles = fixtureTiles()
-        model.connection = .online
-        let dashboard = try fixtureDashboard()
-        model.dashboard = dashboard
-        model.totals = dashboard.totals
-        model.modelUsage = dashboard.modelUsage
-        model.clientUsage = dashboard.clientUsage
-        model.windowed = dashboard.windowed
-        model.activity = dashboard.activity
-        model.healthWarningCount = DashboardHealth.summary(dashboard.accounts).total
+        let fixture = try fixtureDashboard()
+        try installCanonicalStatsFixture(fixture, into: model)
+        guard let dashboard = model.dashboard else {
+            throw SharedUiCoreError.invalidOutput
+        }
 
         let viewModel = makeViewModel()
         viewModel.contentType = .stats
         let url = dir.appendingPathComponent("stats.png")
-        try writeHosted(view: IslandStatsView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        try writeHosted(
+            view: IslandStatsView(model: model, viewModel: viewModel, snapshotNow: fixture.now),
+            size: viewModel.openedSize,
+            to: url
+        )
         var written = [url.path]
 
         // Each section rendered directly at its content height so every block
@@ -266,7 +272,12 @@ enum SnapshotMode {
         for (section, name, height) in sections {
             let sectionURL = dir.appendingPathComponent(name)
             let view = StatsSectionContent(
-                section: section, dashboard: dashboard, tiles: model.tiles, now: Date()
+                section: section,
+                dashboard: dashboard,
+                tiles: model.tiles,
+                now: fixture.now,
+                activityReceipts: model.activityReceipts,
+                verificationReceipts: model.verificationReceipts
             )
             try writeHosted(
                 view: view
@@ -277,82 +288,111 @@ enum SnapshotMode {
             )
             written.append(sectionURL.path)
         }
+
+        // A readable zoom uses the exact production receipt components. The
+        // full Statistics screenshot above establishes surrounding context;
+        // this artifact makes request metadata and the post-write readback
+        // outcome legible in a PR at normal browser zoom.
+        let receiptsURL = dir.appendingPathComponent("receipts-detail.png")
+        let receipts = VStack(alignment: .leading, spacing: 10) {
+            StatsSectionLabel("recent activity")
+            UsageCanonicalActivityReceiptList(receipts: model.activityReceipts, now: fixture.now)
+            StatsSectionLabel("verification receipts")
+            UsageVerificationReceiptList(receipts: model.verificationReceipts, now: fixture.now)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        try writeHosted(
+            view: receipts,
+            size: CGSize(width: 560, height: 260),
+            to: receiptsURL
+        )
+        written.append(receiptsURL.path)
         return written
     }
 
-    /// Compact dashboard document in the daemon's wire shape (see
-    /// `DashboardFixtures` in the test target for the full captured form).
-    /// Timestamps are computed off `Date()` so "ago" columns render sanely.
-    private static func fixtureDashboard() throws -> LlmuxDashboard {
-        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
-        let json = """
-        {
-          "version": "llmux snapshot-fixture", "port": 3456, "uptime_secs": 935,
-          "current": "claude:demo-1@example.com",
-          "accounts": [
-            {"name": "claude:demo-1@example.com", "type": "oauth", "status": "active",
-             "five_hour": {"utilization": 0.34}, "seven_day": {"utilization": 0.61}, "in_flight": 2,
-             "token_expires_at_ms": \(nowMs + 18_000_000), "last_refresh_ms": \(nowMs - 10_800_000)},
-            {"name": "codex:demo-3@example.com", "type": "codex", "status": "auth_failed",
-             "five_hour": {"utilization": 0.12}, "seven_day": {"utilization": 0.27}, "in_flight": 0}
-          ],
-          "totals": {"requests": 36633, "ok": 35621, "errors": 1012, "tokens_in": 79943758,
-                     "tokens_out": 29670001, "rpm_5m": 16.0, "in_flight": 3, "cost_usd": 8689.71},
-          "model_usage": [
-            {"group": "claude", "model": "claude-opus-4-8", "requests": 30226, "ok": 29720, "errors": 506,
-             "tokens_in": 11366225, "tokens_out": 25550294, "cache_read": 4889342877, "cache_creation": 486121851,
-             "last_used_ms": \(nowMs - 42_000), "in_flight": 2, "cost_usd": 7123.45,
-             "accounts": [{"name": "demo-1@example.com", "requests": 6949, "ok": 6862, "errors": 87,
-                           "tokens_in": 3578850, "tokens_out": 6733525}]},
-            {"group": "codex", "model": "gpt-5.5", "requests": 1354, "ok": 1324, "errors": 30,
-             "tokens_in": 65402313, "tokens_out": 636050, "last_used_ms": \(nowMs - 9_800_000)},
-            {"group": "claude", "model": "gpt-5.5", "requests": 12, "ok": 12, "errors": 0,
-             "tokens_in": 5000, "tokens_out": 900, "last_used_ms": \(nowMs - 86_400_000)}
-          ],
-          "client_usage": [
-            {"client": "{\\"device_id\\":\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\",\\"account_uuid\\":\\"00000000-0000-4000-8000-000000000000\\",\\"session_id\\":\\"468acafe-0000-4000-8000-0000c0ffee00\\"}",
-             "requests": 1825, "ok": 1776, "errors": 49, "tokens_in": 361039,
-             "tokens_out": 1357119, "cost_usd": 0.0, "last_seen_ms": 0},
-            {"client": "unknown", "requests": 11839, "ok": 11216, "errors": 623,
-             "tokens_in": 62996939, "tokens_out": 7053653}
-          ],
-          "windowed": [
-            {"window": "24h", "window_secs": 86400, "cells": [
-              {"group": "claude", "model": "claude-opus-4-8", "account": "demo-1", "requests": 2259, "ok": 2256,
-               "errors": 3, "tokens_in": 352514, "tokens_out": 705761, "tokens": 211044827},
-              {"group": "claude", "model": "claude-fable-5", "account": "demo-2", "requests": 702, "ok": 702,
-               "errors": 0, "tokens_in": 291878, "tokens_out": 567516, "tokens": 145311671},
-              {"group": "codex", "model": "gpt-5.5", "account": "demo-3", "requests": 88, "ok": 86,
-               "errors": 2, "tokens_in": 120000, "tokens_out": 9000, "tokens": 3200000}
-            ]},
-            {"window": "72h", "window_secs": 259200, "cells": [
-              {"group": "claude", "model": "claude-fable-5", "account": "demo-1", "requests": 1488, "ok": 1483,
-               "errors": 5, "tokens_in": 472278, "tokens_out": 1091437, "tokens": 416909032},
-              {"group": "claude", "model": "claude-opus-4-8", "account": "demo-1", "requests": 3348, "ok": 3340,
-               "errors": 8, "tokens_in": 618010, "tokens_out": 1268189, "tokens": 330050079}
-            ]}
-          ],
-          "activity": {
-            "in_flight": [
-              {"id": 201, "method": "POST", "path": "/v1/messages?beta=true",
-               "account": "claude:demo-1@example.com", "started_at_ms": \(nowMs - 4_000),
-               "group": "claude", "model": "claude-opus-4-8"}
-            ],
-            "completed": [
-              {"kind": "request", "at_ms": \(nowMs - 12_000), "method": "POST", "path": "/v1/messages",
-               "account": "claude:demo-1@example.com", "status": 200, "duration_ms": 1463,
-               "tokens": {"input": 106, "output": 7}, "cost_usd": 0.025631,
-               "group": "claude", "model": "claude-opus-4-8"},
-              {"kind": "request", "at_ms": \(nowMs - 95_000), "method": "POST", "path": "/v1/messages",
-               "account": "codex:demo-3@example.com", "status": 502, "duration_ms": 320,
-               "group": "codex", "model": "gpt-5.5"},
-              {"kind": "note", "at_ms": \(nowMs - 300_000),
-               "text": "token refreshed: claude:demo-2@example.com (expires 7h59m)", "error": false}
-            ]
-          }
+    private struct StatsFixture {
+        let now: Date
+        let nowMs: UInt64
+        let dashboardJSON: Data
+    }
+
+    /// Hydrate and mutate the real shared reducer so both receipt families in
+    /// the screenshot come from the same bridge path as the live app.
+    @MainActor
+    private static func installCanonicalStatsFixture(
+        _ fixture: StatsFixture,
+        into model: IslandUsageModel
+    ) throws {
+        let runtime = try SharedUiCoreRuntime(configuration: .init(
+            endpointDisplay: "http://127.0.0.1:3456",
+            remote: false,
+            authenticated: true,
+            apiKeyConfigured: false,
+            selectedScreenID: "snapshot-display",
+            soundID: "default",
+            showFableWeekly: true,
+            presentation: "regular"
+        ))
+        let refresh = try runtime.dispatch([
+            "type": "refresh_requested",
+            "source": "startup",
+        ])
+        guard let initialRequestID = refresh.effects.compactMap(\.dashboardRequestID).first else {
+            throw SharedUiCoreError.invalidOutput
         }
-        """
-        return try JSONDecoder().decode(LlmuxDashboard.self, from: Data(json.utf8))
+        _ = try runtime.applyDashboard(
+            requestID: initialRequestID,
+            dashboardJSON: fixture.dashboardJSON,
+            receivedAtMs: fixture.nowMs
+        )
+
+        let operationID = "snapshot-settings-readback"
+        _ = try runtime.dispatch([
+            "type": "operation_started",
+            "id": operationID,
+            "request": [
+                "kind": "persist_show_fable",
+                "enabled": true,
+            ],
+            "target_display": "Fable weekly quota",
+            "started_at_ms": fixture.nowMs + 100,
+        ])
+        let finished = try runtime.dispatch([
+            "type": "operation_finished",
+            "id": operationID,
+            "outcome": "succeeded",
+            "message": "Preference saved and verified by daemon readback",
+            "finished_at_ms": fixture.nowMs + 150,
+        ])
+        guard let readbackRequestID = finished.effects.compactMap(\.dashboardRequestID).first else {
+            throw SharedUiCoreError.invalidOutput
+        }
+        let readback = try runtime.applyDashboard(
+            requestID: readbackRequestID,
+            dashboardJSON: fixture.dashboardJSON,
+            receivedAtMs: fixture.nowMs + 200
+        )
+        model.installSnapshotFixtureState(readback.state)
+    }
+
+    /// Validated shared dashboard contract fixture with one fixed display
+    /// clock so "ago" columns and PNG pixels are stable across captures.
+    private static func fixtureDashboard() throws -> StatsFixture {
+        // This is the same validated document used by the Rust core/bridge
+        // contract tests. Keeping it as a bundle resource prevents a visually
+        // convenient but schema-invalid Swift-only fixture from drifting.
+        let resource = "snapshot-dashboard"
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "json") else {
+            throw SnapshotError.missingFixture("\(resource).json")
+        }
+        let nowMs: UInt64 = 1_700_000_010_000
+        let now = Date(timeIntervalSince1970: TimeInterval(nowMs) / 1000)
+        return StatsFixture(
+            now: now,
+            nowMs: nowMs,
+            dashboardJSON: try Data(contentsOf: url)
+        )
     }
 
     /// Plausible 16" laptop geometry so `openedSize` matches the app.

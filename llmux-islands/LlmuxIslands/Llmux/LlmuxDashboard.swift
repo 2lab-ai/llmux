@@ -8,8 +8,8 @@ import Foundation
 // `#[serde(default)]`): every field the server added after the endpoint first
 // shipped decodes as Optional or with a default here, so a doc from an OLDER
 // daemon never fails to decode for a missing additive field. A decode failure
-// is reserved for genuinely broken/foreign payloads — that is what triggers
-// `IslandUsageModel`'s fallback to the `/llmux/status` path (gist-02 L33).
+// is reserved for genuinely broken/foreign payloads and does not trigger
+// compatibility; only an explicit unsupported-endpoint HTTP status does.
 //
 // Fields Islands does not consume (pid, upstream, select_params, scheduler,
 // poller, logs, codex, per-account order/scoped_limits/totals/session) are
@@ -76,6 +76,64 @@ struct LlmuxDashboard: Decodable {
         showFableWeekly = try c.decodeIfPresent(Bool.self, forKey: .showFableWeekly)
         dataQuality = try c.decodeIfPresent(LlmuxDashboardDataQuality.self, forKey: .dataQuality)
         events = try c.decodeIfPresent([LlmuxEvent].self, forKey: .events) ?? []
+    }
+}
+
+/// Decodes the value and its wire metadata in one pass. `decodeIfPresent`
+/// intentionally treats a missing key and an explicit JSON null alike, while
+/// ownership depends on whether the daemon actually emitted the additive key.
+struct LlmuxDashboardWireDocument: Decodable {
+    let dashboard: LlmuxDashboard
+    let hasEmailAnonymousField: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case emailAnonymous = "email_anonymous"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        hasEmailAnonymousField = container.contains(.emailAnonymous)
+        dashboard = try LlmuxDashboard(from: decoder)
+    }
+}
+
+/// Canonical bytes and ownership metadata for a dashboard response. Older
+/// daemons omit `email_anonymous`; Rust still needs a concrete value to derive
+/// the UI, but that compatibility value remains owned by local AppSettings.
+struct LlmuxDashboardWireNormalization {
+    let dashboardJSON: Data
+    let serverOwnsEmailSetting: Bool
+}
+
+enum LlmuxDashboardWireNormalizer {
+    static func normalize(
+        _ dashboardJSON: Data,
+        localEmailAnonymous: Bool
+    ) throws -> LlmuxDashboardWireNormalization {
+        let wire = try JSONDecoder().decode(
+            LlmuxDashboardWireDocument.self,
+            from: dashboardJSON
+        )
+        guard !wire.hasEmailAnonymousField else {
+            return LlmuxDashboardWireNormalization(
+                dashboardJSON: dashboardJSON,
+                serverOwnsEmailSetting: true
+            )
+        }
+
+        guard var object = try JSONSerialization.jsonObject(with: dashboardJSON)
+            as? [String: Any]
+        else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: [],
+                debugDescription: "dashboard JSON must be a top-level object"
+            ))
+        }
+        object["email_anonymous"] = localEmailAnonymous
+        return LlmuxDashboardWireNormalization(
+            dashboardJSON: try JSONSerialization.data(withJSONObject: object),
+            serverOwnsEmailSetting: false
+        )
     }
 }
 
@@ -391,9 +449,9 @@ struct LlmuxDashboardDataQuality: Decodable {
 }
 
 extension LlmuxDashboardAccount {
-    /// Bridge to the `/llmux/status` account record so the dashboard path
-    /// feeds the EXACT same tile mapping (`IslandUsageModel.tile(from:)`) as
-    /// the status path — tile parity by construction, not by duplication.
+    /// DTO parity helper retained for decode/analytics tests. The live model
+    /// never uses this bridge: dashboard and normalized status bytes both go
+    /// through Rust, which emits the canonical tile projection.
     /// `group` is `nil` because the dashboard doc omits it; the provider split
     /// then falls back to `type == "codex"`, which matches how the daemon
     /// derives the group from the credential kind (`src/scheduler/mod.rs`).

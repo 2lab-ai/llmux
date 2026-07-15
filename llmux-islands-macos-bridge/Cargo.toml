@@ -1,0 +1,21 @@
+[package]
+name = "llmux-islands-macos-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "llmux_islands_macos_bridge"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+llmux = { path = ".." }
+llmux-islands-core = { path = "../llmux-islands-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"

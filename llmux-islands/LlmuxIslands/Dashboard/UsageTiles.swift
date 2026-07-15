@@ -93,9 +93,16 @@ struct UsageAccountTile: Identifiable {
     let info: CLIUsageInfo?
     let errorMessage: String?
     let issue: UsageIssue?
+    /// Canonical shared-core state is retained for native behavior and future
+    /// projections even though the preserved pre-renewal UI does not add new
+    /// badges for these fields.
+    var current: Bool = false
     /// Operator pause: rendered sepia + context-menu Resume. Defaulted so
     /// non-llmux construction sites stay source-compatible.
     var paused: Bool = false
+    var healthy: Bool = true
+    var status: String = "active"
+    var inFlight: Int = 0
 }
 
 private struct UsageAccountTileRowHeightsPreferenceKey: PreferenceKey {

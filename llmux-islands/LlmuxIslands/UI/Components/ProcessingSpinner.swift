@@ -27,8 +27,10 @@ struct ProcessingSpinner: View {
     }
 }
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview {
     ProcessingSpinner()
         .frame(width: 30, height: 30)
         .background(.black)
 }
+#endif

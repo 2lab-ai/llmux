@@ -1,41 +1,58 @@
 import Foundation
 
 /// Makes the app self-sufficient: right after install, launching LlmuxIslands is
-/// enough — if the local llmux daemon isn't already running, we start it in the
-/// background so the user never has to run `llmux server` by hand.
+/// enough — if the configured loopback HTTP daemon isn't already running, we
+/// start it on that port in the background.
 ///
-/// Only a LOCAL (loopback) daemon is managed. If the user has pointed the app at
-/// a remote llmux via settings, we never spawn a local server.
+/// Only a local, plain-HTTP loopback daemon is managed. Remote and explicit
+/// HTTPS endpoints never cause local process work.
 enum DaemonLauncher {
+    struct LocalEndpoint: Equatable {
+        let baseURL: String
+        let port: Int
+    }
+
     /// Probe the configured daemon; if it's local and unreachable, spawn
-    /// `llmux server --no-tui` detached and wait briefly for it to bind so the
-    /// first status poll succeeds.
-    static func ensureRunning() async {
-        guard hostIsLocal() else { return }
-        if await isReachable() { return }
+    /// `llmux server --port <configured-port> --no-tui` detached and wait
+    /// briefly for that same endpoint to bind so the first status poll succeeds.
+    static func ensureRunning(client: LlmuxClient) async {
+        guard let endpoint = localEndpoint(for: client) else { return }
+        if await isReachable(endpoint) { return }
+        // The probe suspends. If the user changed connection settings while it
+        // was in flight, do not start a daemon for the stale endpoint.
+        guard localEndpoint(for: LlmuxClient.current()) == endpoint else { return }
 
         guard let exe = findBinary() else {
             NSLog("llmux-islands: llmux binary not found — cannot auto-start the daemon. Install llmux (brew install llmux).")
             return
         }
-        spawnDetached(exe: exe)
+        spawnDetached(exe: exe, port: endpoint.port)
 
         // The daemon binds in ~1s (even with zero accounts); poll up to ~6s so
         // the model's first refresh lands on a live server instead of "offline".
         for _ in 0..<20 {
             try? await Task.sleep(nanoseconds: 300_000_000)
-            if await isReachable() { return }
+            if await isReachable(endpoint) { return }
         }
         NSLog("llmux-islands: spawned llmux daemon but it did not answer within ~6s (it may still be starting).")
     }
 
-    private static func hostIsLocal() -> Bool {
-        let host = LlmuxSettings.host
-        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    /// Capture one validated endpoint for probing and spawning. The bundled
+    /// daemon serves plain HTTP, so an explicit HTTPS endpoint is not something
+    /// this adapter can satisfy and must remain untouched.
+    static func localEndpoint(for client: LlmuxClient) -> LocalEndpoint? {
+        guard let endpoint = try? client.validatedEndpoint(),
+              (try? client.isRemoteEndpoint()) == false,
+              let components = URLComponents(string: endpoint),
+              components.scheme?.lowercased() == "http",
+              let port = components.port,
+              (1...65_535).contains(port)
+        else { return nil }
+        return LocalEndpoint(baseURL: endpoint, port: port)
     }
 
-    private static func isReachable() async -> Bool {
-        guard let url = URL(string: LlmuxClient.current().baseURL + "/llmux/status") else { return false }
+    private static func isReachable(_ endpoint: LocalEndpoint) async -> Bool {
+        guard let url = URL(string: endpoint.baseURL + "/llmux/status") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1.5
         guard let (_, resp) = try? await URLSession.shared.data(for: req),
@@ -56,22 +73,26 @@ enum DaemonLauncher {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    /// Spawn `llmux server --no-tui` fully detached via `/bin/sh -c 'nohup … &'`:
-    /// the sh returns immediately and the daemon is reparented to launchd, so it
-    /// survives both this helper and the app quitting. stderr is appended to the
-    /// daemon's own log (same file the CLI uses).
-    private static func spawnDetached(exe: String) {
+    static func launchArguments(port: Int) -> [String] {
+        ["server", "--port", String(port), "--no-tui"]
+    }
+
+    /// Spawn the configured daemon fully detached via `/bin/sh -c 'nohup … &'`.
+    /// Every value entering the command is either a validated integer or shell
+    /// quoted path. stderr is appended to the daemon's own CLI log.
+    private static func spawnDetached(exe: String, port: Int) {
         let stateDir = "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/state/llmux"
         try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
         let log = "\(stateDir)/server.log"
-        let cmd = "nohup \(shq(exe)) server --no-tui >> \(shq(log)) 2>&1 &"
+        let arguments = launchArguments(port: port).map(shq).joined(separator: " ")
+        let cmd = "nohup \(shq(exe)) \(arguments) >> \(shq(log)) 2>&1 &"
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
         proc.arguments = ["-c", cmd]
         do {
             try proc.run()
-            NSLog("llmux-islands: starting llmux daemon (\(exe) server --no-tui)")
+            NSLog("llmux-islands: starting llmux daemon on configured loopback port \(port)")
         } catch {
             NSLog("llmux-islands: failed to start llmux daemon: \(error.localizedDescription)")
         }

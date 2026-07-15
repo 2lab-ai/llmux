@@ -85,6 +85,8 @@ struct StatsSectionContent: View {
     /// rows read the same source as the Usage panel's tile grid.
     let tiles: [UsageAccountTile]
     let now: Date
+    var activityReceipts: [SharedActivityReceipt] = []
+    var verificationReceipts: [SharedVerificationReceipt] = []
     var onRemoveAccount: ((String) -> Void)? = nil
 
     @State private var expandedModelID: String?
@@ -127,7 +129,16 @@ struct StatsSectionContent: View {
             }
         }
         block("recent activity") {
-            UsageActivityList(activity: dashboard.activity, now: now)
+            if activityReceipts.isEmpty {
+                UsageActivityList(activity: dashboard.activity, now: now)
+            } else {
+                UsageCanonicalActivityReceiptList(receipts: activityReceipts, now: now)
+            }
+        }
+        if !verificationReceipts.isEmpty {
+            block("verification receipts") {
+                UsageVerificationReceiptList(receipts: verificationReceipts, now: now)
+            }
         }
     }
 
@@ -200,6 +211,126 @@ struct StatsSectionContent: View {
         VStack(alignment: .leading, spacing: 6) {
             StatsSectionLabel(label)
             content()
+        }
+    }
+}
+
+/// Rust-owned activity receipts. Paths, account labels and notes have already
+/// passed the shared privacy filter before reaching this renderer.
+struct UsageCanonicalActivityReceiptList: View {
+    let receipts: [SharedActivityReceipt]
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(receipts.prefix(11)) { receipt in
+                HStack(spacing: 6) {
+                    Text(DashFormat.ago(ms: receipt.occurredAtMs, now: now))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                        .frame(width: 30, alignment: .trailing)
+                    Text(status(receipt))
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(statusColor(receipt))
+                        .frame(width: 28, alignment: .leading)
+                    Text(receipt.message ?? receipt.model ?? receipt.path ?? receipt.method ?? receipt.kind)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 6)
+                    Text(trailing(receipt))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+    }
+
+    private func status(_ receipt: SharedActivityReceipt) -> String {
+        if receipt.kind == "in_flight" { return "···" }
+        if receipt.kind == "note" { return "note" }
+        return receipt.status.map(String.init) ?? ""
+    }
+
+    private func statusColor(_ receipt: SharedActivityReceipt) -> Color {
+        if receipt.kind == "in_flight" { return TerminalColors.amber }
+        guard let status = receipt.status else {
+            return receipt.error ? TerminalColors.red : .white.opacity(0.45)
+        }
+        return status < 400 ? TerminalColors.green : status < 500 ? TerminalColors.amber : TerminalColors.red
+    }
+
+    private func trailing(_ receipt: SharedActivityReceipt) -> String {
+        if receipt.kind == "in_flight" {
+            return receipt.elapsedMs.map { DashFormat.duration(ms: $0) } ?? "in flight"
+        }
+        return [
+            receipt.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
+            receipt.costUsd.map { DashFormat.cost($0) },
+            receipt.durationMs.map { DashFormat.duration(ms: $0) },
+        ].compactMap { $0 }.joined(separator: "  ")
+    }
+}
+
+/// Bounded operation evidence emitted by the shared reducer after a daemon or
+/// platform mutation finishes. This makes success/failure/no-change visible
+/// without exposing executor-only raw account identifiers.
+struct UsageVerificationReceiptList: View {
+    let receipts: [SharedVerificationReceipt]
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(receipts.prefix(8)) { receipt in
+                HStack(spacing: 6) {
+                    Text(DashFormat.ago(ms: receipt.finishedAtMs, now: now))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                        .frame(width: 30, alignment: .trailing)
+                    Image(systemName: outcomeSymbol(receipt.outcome))
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(outcomeColor(receipt.outcome))
+                        .frame(width: 12)
+                    Text(receipt.operation.replacingOccurrences(of: "_", with: " "))
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.75))
+                    if let target = receipt.targetDisplay {
+                        Text(target)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 4)
+                    Text(receipt.message)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+    }
+
+    private func outcomeSymbol(_ outcome: String) -> String {
+        switch outcome {
+        case "succeeded": "checkmark.circle.fill"
+        case "no_change": "minus.circle.fill"
+        case "cancelled": "xmark.circle"
+        default: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func outcomeColor(_ outcome: String) -> Color {
+        switch outcome {
+        case "succeeded": TerminalColors.green
+        case "no_change", "cancelled": TerminalColors.amber
+        default: TerminalColors.red
         }
     }
 }

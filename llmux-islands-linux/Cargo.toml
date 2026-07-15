@@ -1,0 +1,32 @@
+[package]
+name = "llmux-islands-linux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "KDE/Qt shell for llmux Islands"
+publish = false
+
+[features]
+default = ["gui"]
+gui = [
+    "dep:cxx",
+    "dep:cxx-qt",
+    "dep:cxx-qt-lib",
+    "dep:cxx-qt-build",
+    "dep:tokio",
+]
+
+[dependencies]
+cxx = { version = "1.0", optional = true }
+cxx-qt = { version = "0.9", optional = true }
+cxx-qt-lib = { version = "0.9", features = ["full"], optional = true }
+llmux-islands-core = { path = "../llmux-islands-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "time"], optional = true }
+libc = "0.2"
+zeroize = "1.8"
+
+[build-dependencies]
+cxx-qt-build = { version = "0.9", features = ["link_qt_object_files"], optional = true }

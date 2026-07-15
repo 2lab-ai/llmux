@@ -28,6 +28,12 @@ targets:
     platform: macOS
     sources:
       - path: LlmuxIslands
+    preBuildScripts:
+      - name: Build shared Rust UI core
+        script: /bin/sh "${PROJECT_DIR}/scripts/build-rust-core.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(DERIVED_FILE_DIR)/libllmux_islands_macos_bridge.a"
     settings:
       base:
         PRODUCT_NAME: LlmuxIslands
@@ -36,6 +42,11 @@ targets:
         CODE_SIGN_ENTITLEMENTS: LlmuxIslands/Resources/LlmuxIslands.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_HARDENED_RUNTIME: "NO"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        SWIFT_OBJC_BRIDGING_HEADER: LlmuxIslands/SharedCore/LlmuxIslands-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/../llmux-islands-macos-bridge/include"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(DERIVED_FILE_DIR)"
+        OTHER_LDFLAGS: "$(inherited) -lllmux_islands_macos_bridge -framework Security -framework CoreFoundation"
   # Logic tests for the llmux HTTP DTO contract (issue #62 U27). Deliberately
   # NOT hosted in the app (no TEST_HOST): the DTO sources are compiled directly
   # into the bundle, so `xcodebuild test` never has to launch the menu-bar app
@@ -49,6 +60,7 @@ targets:
       # exception-beacon: pure resolver (signal priority, thresholds,
       # tie-breaks, debounce) — Foundation-only by design.
       - path: LlmuxIslands/Llmux/GlanceSignal.swift
+      - path: LlmuxIslands/Llmux/LegacyStatusDashboardAdapter.swift
       - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
       # Foundation-only `llmux` CLI output parsing (CLIParse / ReleaseChannel /
       # UpdateOutcome). The Process-spawning CLIRunner lives here too but is
@@ -57,6 +69,14 @@ targets:
       # Events DTO + pure time parsing/rendering + echo-list decoding
       # (LlmuxEvent / LlmuxEventTime / LlmuxEventList). No networking in tests.
       - path: LlmuxIslands/Llmux/LlmuxEvents.swift
+      # Security policy for daemon connections (HTTPS remote, strict loopback,
+      # redirect denial) plus its UserDefaults-backed configuration.
+      - path: LlmuxIslands/Llmux/LlmuxClient.swift
+      - path: LlmuxIslands/Llmux/DaemonLauncher.swift
+      - path: LlmuxIslands/Settings/LlmuxSettings.swift
+      # Pure Swift decode mirror of Rust's versioned UiState JSON contract.
+      - path: LlmuxIslands/SharedCore/SharedUiState.swift
+      - path: LlmuxIslands/SharedCore/SharedCoreEffect.swift
       # Foundation-only analytics logic (issue #62 S4): formatting, the
       # health-warning rule, data-quality fallbacks, (group, model) keying.
       - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift

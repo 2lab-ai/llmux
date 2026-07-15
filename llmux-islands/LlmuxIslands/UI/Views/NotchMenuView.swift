@@ -72,7 +72,7 @@ struct NotchMenuView: View {
                 label: "Show Fable weekly (7d)",
                 isOn: showFableWeekly
             ) {
-                showFableWeekly.toggle()
+                Task { await IslandUsageModel.shared.setShowFableWeekly(!showFableWeekly) }
             }
 
             LlmuxConnectionSection()
@@ -97,16 +97,9 @@ struct NotchMenuView: View {
                 label: "Launch at Login",
                 isOn: launchAtLogin
             ) {
-                do {
-                    if launchAtLogin {
-                        try SMAppService.mainApp.unregister()
-                        launchAtLogin = false
-                    } else {
-                        try SMAppService.mainApp.register()
-                        launchAtLogin = true
-                    }
-                } catch {
-                    print("Failed to toggle launch at login: \(error)")
+                Task {
+                    _ = await IslandUsageModel.shared.setLaunchAtLogin(!launchAtLogin)
+                    launchAtLogin = SMAppService.mainApp.status == .enabled
                 }
             }
 
@@ -343,7 +336,9 @@ struct MenuToggleRow: View {
 private struct LlmuxConnectionSection: View {
     @State private var host: String = LlmuxSettings.host
     @State private var port: String = String(LlmuxSettings.port)
-    @State private var apiKey: String = LlmuxSettings.apiKey
+    @State private var apiKey = ""
+    @State private var storedKeyConfigured = !LlmuxSettings.apiKey.isEmpty
+    @State private var clearStoredKey = false
     @State private var expanded = false
     @State private var isHovered = false
 
@@ -386,7 +381,23 @@ private struct LlmuxConnectionSection: View {
                     HStack(spacing: 6) {
                         field(placeholder: "Port", text: $port)
                             .frame(width: 86)
-                        field(placeholder: "API key (optional)", text: $apiKey, secure: true)
+                        field(
+                            placeholder: storedKeyConfigured
+                                ? "API key (blank keeps stored key)"
+                                : "API key (required for remote)",
+                            text: $apiKey,
+                            secure: true
+                        )
+                        .disabled(clearStoredKey)
+                    }
+                    if storedKeyConfigured {
+                        Toggle("Clear the stored API key", isOn: $clearStoredKey)
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.65))
+                            .onChange(of: clearStoredKey) { _, shouldClear in
+                                if shouldClear { apiKey = "" }
+                            }
                     }
                     Button { apply() } label: {
                         Text("Apply & reconnect")
@@ -422,12 +433,29 @@ private struct LlmuxConnectionSection: View {
 
     private func apply() {
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        LlmuxSettings.host = h.isEmpty ? "127.0.0.1" : h
-        LlmuxSettings.port = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 3456
-        LlmuxSettings.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        host = LlmuxSettings.host
-        port = String(LlmuxSettings.port)
-        Task { await IslandUsageModel.shared.refresh() }
+        let candidateHost = h.isEmpty ? "127.0.0.1" : h
+        let candidatePort = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 3456
+        let replacement = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let intent: ConnectionApiKeyIntent = if clearStoredKey {
+            .clear
+        } else if replacement.isEmpty {
+            .keep
+        } else {
+            .replace(replacement)
+        }
+        Task {
+            let applied = await IslandUsageModel.shared.applyConnection(
+                host: candidateHost,
+                port: candidatePort,
+                apiKeyIntent: intent
+            )
+            guard applied else { return }
+            host = LlmuxSettings.host
+            port = String(LlmuxSettings.port)
+            apiKey = ""
+            clearStoredKey = false
+            storedKeyConfigured = !LlmuxSettings.apiKey.isEmpty
+        }
     }
 }
 
@@ -595,7 +623,7 @@ private struct LlmuxMaintenanceSection: View {
         updateRunning = true
         updateSummary = nil
         Task {
-            let outcome = await runner.update()
+            let outcome = await IslandUsageModel.shared.runMaintenanceUpdate(runner: runner)
             updateRunning = false
             updateSummary = outcome.summary
             updateFailed = outcome.isFailure
@@ -607,7 +635,7 @@ private struct LlmuxMaintenanceSection: View {
         channelRunning = true
         channelSummary = nil
         Task {
-            let outcome = await runner.setChannel(target)
+            let outcome = await IslandUsageModel.shared.changeReleaseChannel(to: target, runner: runner)
             channelRunning = false
             if outcome.isFailure {
                 channelFailed = true
@@ -629,7 +657,7 @@ private struct LlmuxMaintenanceSection: View {
 /// replacement for the single event banner). Lists `events[]` from the
 /// dashboard doc (from→to rendered in local time, the currently-active window
 /// marked green), and drives `POST /llmux/events` through the existing
-/// `LlmuxClient` — `{id, from, to, content}` = idempotent upsert,
+/// shared semantic core — `{id, from, to, content}` = idempotent upsert,
 /// `{"remove": id}` = idempotent remove — never the CLI. Same
 /// section/row/inline-result patterns as its neighbors.
 private struct LlmuxEventsSection: View {
@@ -879,11 +907,12 @@ private struct LlmuxEventsSection: View {
         guard !loading else { return }
         loading = true
         Task {
-            do {
-                events = try await LlmuxClient.current().dashboard().events
+            let refreshed = await IslandUsageModel.shared.refreshEvents()
+            if case .online = IslandUsageModel.shared.connection {
+                events = refreshed
                 failed = false
-            } catch {
-                summary = error.localizedDescription
+            } else {
+                summary = "Could not refresh events."
                 failed = true
             }
             loading = false
@@ -902,20 +931,15 @@ private struct LlmuxEventsSection: View {
         busy = true
         summary = nil
         Task {
-            do {
-                if let echoed = try await LlmuxClient.current().upsertEvent(event) {
-                    events = echoed
-                } else if let idx = events.firstIndex(where: { $0.id == event.id }) {
-                    events[idx] = event
-                } else {
-                    events.append(event)
-                }
+            let saved = await IslandUsageModel.shared.upsertEvent(event)
+            if saved {
+                events = IslandUsageModel.shared.dashboard?.events ?? events
                 failed = false
                 summary = "Saved \(event.id)"
                 showForm = false
-            } catch {
+            } else {
                 failed = true
-                summary = error.localizedDescription
+                summary = IslandUsageModel.shared.lastError ?? "Could not save event."
             }
             busy = false
         }
@@ -928,17 +952,14 @@ private struct LlmuxEventsSection: View {
         busy = true
         summary = nil
         Task {
-            do {
-                if let echoed = try await LlmuxClient.current().removeEvent(id: event.id) {
-                    events = echoed
-                } else {
-                    events.removeAll { $0.id == event.id }
-                }
+            let removed = await IslandUsageModel.shared.removeEvent(id: event.id)
+            if removed {
+                events = IslandUsageModel.shared.dashboard?.events ?? events.filter { $0.id != event.id }
                 failed = false
                 summary = "Removed \(event.id)"
-            } catch {
+            } else {
                 failed = true
-                summary = error.localizedDescription
+                summary = IslandUsageModel.shared.lastError ?? "Could not remove event."
             }
             busy = false
         }
