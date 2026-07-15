@@ -1217,7 +1217,11 @@ impl ActivityLog {
         let offset = self
             .usage_offset_override
             .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
-        let key = (group.to_string(), model.to_string());
+        // Same row identity as the per-model table (`record_model`): the
+        // NORMALIZED served model. A raw wire variant (`...[1m]`) must not
+        // split into a parallel usage row the model table merges — and
+        // pricing normalizes anyway, so the cost is identical.
+        let key = (group.to_string(), normalize_model(model));
 
         // Bucket time and retention time are DIFFERENT quantities (review R1
         // MUST-FIX 1): the event's timestamp picks the bucket, but pruning
