@@ -79,6 +79,17 @@ pub struct Config {
     /// config written before this field loads with masking OFF.
     #[serde(default)]
     pub email_anonymous: bool,
+    /// TUI cosmetic animations: the effort-token rainbow marquee (`max`) and
+    /// the headline-model name gradient (`fable-5*`/`gpt-5.6-sol*`). Display-
+    /// only, default ON. Set `false` for a calmer, still-legible board — the
+    /// effort/model tokens keep a distinct STATIC color+bold instead of
+    /// cycling. Working spinners animate regardless (they predate this knob).
+    /// Carried on the dashboard document so BOTH TUI backends honor it, same
+    /// convention as `email_anonymous`/`show_fable_weekly`. Additive
+    /// (`#[serde(default = "default_true")]`): a config written before this
+    /// field loads with effects ON.
+    #[serde(default = "default_true")]
+    pub tui_effects: bool,
     /// Render the model-scoped "Fable" weekly gauge in the dashboard accounts
     /// table (fable-usage U9a). Display-only, default ON. This feature is
     /// TEMPORARY — the upstream Fable weekly limit is expected to disappear
@@ -240,6 +251,7 @@ impl Default for Config {
             pricing: HashMap::new(),
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
+            tui_effects: true,
             show_fable_weekly: true,
             domain_abbrev: default_domain_abbrev(),
             quota_display: QuotaDisplay::default(),
