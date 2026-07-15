@@ -2219,11 +2219,19 @@ async fn relay_translate(
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        // With capture off, a 0 tee limit keeps the relay from copying (and
+        // pinning up to 2×max_body_bytes of) stream bytes that `finish` would
+        // only throw away (hotpath review).
+        let raw_io_tee_limit = if raw_io_path.is_some() {
+            raw_io_max_body
+        } else {
+            0
+        };
         let body = sse::transform_body(
             response,
             converter,
             BODY_LOG_LIMIT,
-            raw_io_max_body,
+            raw_io_tee_limit,
             move |usage,
                   captured,
                   raw_captured,

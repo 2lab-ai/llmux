@@ -37,7 +37,9 @@ pub(crate) fn copy(text: &str) -> Result<String, String> {
     osc52(text)
 }
 
-/// Pipe `text` into `tool args…` via stdin and require exit 0.
+/// Pipe `text` into `tool args…` via stdin and require exit 0. The child is
+/// ALWAYS reaped — a write failure (e.g. BrokenPipe from a tool that exited
+/// early) must not leak a zombie per retry (hotpath review).
 fn pipe_to(tool: &str, args: &[&str], text: &str) -> Result<(), String> {
     let mut child = Command::new(tool)
         .args(args)
@@ -46,12 +48,17 @@ fn pipe_to(tool: &str, args: &[&str], text: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("{tool}: {err}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
+    let write = match child.stdin.as_mut() {
+        Some(stdin) => stdin
             .write_all(text.as_bytes())
-            .map_err(|err| format!("{tool}: {err}"))?;
-    }
-    let status = child.wait().map_err(|err| format!("{tool}: {err}"))?;
+            .map_err(|err| format!("{tool}: {err}")),
+        None => Ok(()),
+    };
+    // Reap unconditionally (wait() closes our stdin handle first, so the
+    // tool sees EOF); only then propagate a write error.
+    let status = child.wait().map_err(|err| format!("{tool}: {err}"));
+    write?;
+    let status = status?;
     if status.success() {
         Ok(())
     } else {
