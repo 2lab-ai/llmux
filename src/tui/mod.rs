@@ -826,6 +826,24 @@ impl App {
                 return true;
             }
         }
+        // Wheel scrolling in the Usage overlay (usage-stats): its primary
+        // interaction IS bucket scrolling, so the wheel must work where the
+        // mouse opened the tab (review CR — the tab was mouse-openable but
+        // keyboard-only to scroll). Routed through the key handler so the
+        // stored-offset clamp applies identically.
+        if self.overlay == Overlay::Usage && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.on_key_usage(KeyCode::Up, view);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.on_key_usage(KeyCode::Down, view);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         // An open context menu (UI-3 U11) owns the mouse: click an item to
         // run it, click anywhere else to dismiss.
         if let Mode::ContextMenu { idx, .. } = self.mode {
@@ -3330,6 +3348,23 @@ mod tests {
         // U closes back to MAIN.
         app.on_key_usage(KeyCode::Char('U'), Some(&view));
         assert_eq!(app.overlay, Overlay::None);
+
+        // Mouse wheel scrolls the Usage overlay (review CR) through the same
+        // clamped path — cycle back to the day granularity first.
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        app.usage_scroll = 0;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown), Some(&view)));
+        assert_eq!(app.usage_scroll, 1, "wheel down scrolls one bucket");
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp), Some(&view)));
+        assert_eq!(app.usage_scroll, 0, "wheel up scrolls back");
     }
 
     /// `open_sessions` must NOT block on the file read: it opens the overlay and

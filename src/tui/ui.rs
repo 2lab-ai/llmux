@@ -852,8 +852,18 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
         .filter(|r| r.gran == gran.tag())
         .collect();
     if rows.is_empty() {
+        // Distinguish "this granularity's trailing window is empty" (idle
+        // daemon >72h → hourly drained, but daily/monthly still have rows)
+        // from "no usage rows at all" (fresh daemon, or an attach to an
+        // older daemon that doesn't serve the field) — review CR: claiming
+        // "no history yet" while the monthly tab is full reads as data loss.
+        let hint = if view.usage_stats.is_empty() {
+            "no usage history yet — send requests through the proxy (older daemons don't serve usage rows)"
+        } else {
+            "no buckets in this granularity's window — `g` switches granularity"
+        };
         let empty = Paragraph::new(Line::from(Span::styled(
-            "no usage history yet — send requests through the proxy (older daemons don't serve usage rows)",
+            hint,
             Style::new().fg(Color::Yellow),
         )))
         .block(
@@ -905,13 +915,30 @@ fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) 
 
     let mut trows: Vec<Row> = Vec::new();
     for (_, label, group) in buckets.iter().skip(scroll) {
-        let requests: u64 = group.iter().map(|r| r.requests).sum();
-        let tokens_in: u64 = group.iter().map(|r| r.tokens_in).sum();
-        let tokens_out: u64 = group.iter().map(|r| r.tokens_out).sum();
-        let cache_read: u64 = group.iter().map(|r| r.cache_read).sum();
-        let cache_creation: u64 = group.iter().map(|r| r.cache_creation).sum();
-        let cost: f64 = group.iter().map(|r| r.cost_usd).sum();
-        let bucket_unpriced = group.iter().any(|r| !r.priced);
+        // The table widget truncates below the fold, so building rows past
+        // the visible area is pure waste — bound the construction to the
+        // screen (review CR: 180 daily buckets × models per frame otherwise).
+        if trows.len() > area.height as usize {
+            break;
+        }
+        // ONE accumulator pass per bucket (review CR): six parallel `.sum()`
+        // sweeps were six lines nothing forced to stay in step with the
+        // columns rendered below them.
+        let (requests, tokens_in, tokens_out, cache_read, cache_creation, cost, bucket_unpriced) =
+            group.iter().fold(
+                (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, false),
+                |(req, ti, to, cr, cc, cost, unpriced), r| {
+                    (
+                        req.saturating_add(r.requests),
+                        ti.saturating_add(r.tokens_in),
+                        to.saturating_add(r.tokens_out),
+                        cr.saturating_add(r.cache_read),
+                        cc.saturating_add(r.cache_creation),
+                        cost + r.cost_usd,
+                        unpriced || !r.priced,
+                    )
+                },
+            );
         trows.push(
             Row::new(vec![
                 Cell::from(*label),
@@ -5018,6 +5045,29 @@ mod tests {
         let view = view_with(vec![]);
         let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
         assert!(text.contains("no usage history yet"));
+    }
+
+    /// When only the SELECTED granularity is empty (idle daemon: hourly
+    /// window drained, daily/monthly still populated) the hint must say so —
+    /// not claim the whole history is missing (review CR).
+    #[test]
+    fn usage_overlay_gran_empty_hints_granularity_switch() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![usage_row(
+            "day",
+            20_000,
+            "2024-10-04",
+            "claude",
+            "opus-x",
+            1_000,
+            200,
+            1.25,
+        )];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_gran = crate::tui::activity::UsageGran::Hour;
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("no buckets in this granularity"));
+        assert!(!text.contains("no usage history yet"));
     }
 
     /// The Stats overlay's windowed heatmap (issue #23) renders the selected
