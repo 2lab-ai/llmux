@@ -50,6 +50,7 @@ llmux breaks the chain by standardizing on one harness and making the account/mo
 - **Remote-first CLI**: `--remote host[:port]` or `remote.host` in config drives one central daemon from many machines (Tailscale/WireGuard). See [Using a remote daemon](#using-a-remote-daemon).
 - **Model catalog API**: `GET /models` and `GET /llmux/models` — curated ids, aliases, efforts, `max_context`, group. See [docs/models.md](docs/models.md).
 - **Detached daemon + live TUI dashboard** for quota windows (incl. Fable weekly / Grok rate-limit gauges), account health, routing, and manual switch.
+- **Calendar usage & cost tab** (2026-07-15): hourly / daily / monthly buckets × model with all four token classes and API-equivalent USD cost, ledger-aligned amounts, replayed from the persisted request history — `U` in the dashboard. See [docs/operational-reference.md](docs/operational-reference.md#usage-tab-calendar-usage--cost).
 - **llmux Islands**, a native macOS menu-bar/notch companion for glanceable usage and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md).
 - **Stable + preview channels** via Homebrew (`llmux` / `llmux-preview`), with `llmux channel` and `llmux update`.
 
