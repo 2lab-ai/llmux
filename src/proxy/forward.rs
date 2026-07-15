@@ -449,26 +449,31 @@ fn format_headers(headers: &HeaderMap) -> String {
         .join("\n")
 }
 
-/// Header names whose VALUES are redacted before raw-io capture: they carry
-/// credentials (the client's proxy api key / oauth bearer / cookies). The
-/// NAME stays visible — the raw viewer still shows the header was sent,
-/// CDT-style — but the secret never lands on disk.
-const REDACTED_HEADERS: [&str; 5] = [
-    "authorization",
-    "proxy-authorization",
-    "x-api-key",
-    "cookie",
-    "set-cookie",
-];
+/// Substrings that mark a header NAME as credential-shaped: its VALUE is
+/// redacted before raw-io capture. The name stays visible — the raw viewer
+/// still shows the header was sent, CDT-style — but the secret never lands
+/// on disk.
+const REDACTED_NAME_MARKS: [&str; 5] = ["auth", "key", "token", "secret", "cookie"];
+
+/// Whether a header's value must be redacted from raw-io capture, by name
+/// (lowercase per `HeaderName`). A substring heuristic instead of a fixed
+/// name list (trinity review R2): the known llmux inbound surface is
+/// `authorization` / `x-api-key` / cookies, but a future backend introducing
+/// e.g. `x-goog-api-key` or `x-amz-security-token` must fail SAFE (redacted)
+/// rather than silently persist to the append-only log until someone
+/// remembers to extend a list.
+fn header_is_sensitive(name: &str) -> bool {
+    REDACTED_NAME_MARKS.iter().any(|mark| name.contains(mark))
+}
 
 /// Flatten a header map into `(name, value)` pairs in wire order for raw-io
-/// capture, redacting credential values ([`REDACTED_HEADERS`]) and rendering
-/// non-UTF-8 values as a placeholder. Pure; never panics.
+/// capture, redacting credential values ([`header_is_sensitive`]) and
+/// rendering non-UTF-8 values as a placeholder. Pure; never panics.
 pub(crate) fn redacted_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(name, value)| {
-            let v = if REDACTED_HEADERS.contains(&name.as_str()) {
+            let v = if header_is_sensitive(name.as_str()) {
                 "•••redacted".to_string()
             } else {
                 value.to_str().unwrap_or("<non-utf8>").to_string()
@@ -2377,6 +2382,28 @@ mod tests {
         // Credential VALUES never reach the record; the names stay visible.
         assert_eq!(get("x-api-key"), Some("•••redacted"));
         assert_eq!(get("authorization"), Some("•••redacted"));
+        // The name heuristic fails SAFE on credential headers llmux does not
+        // (yet) receive — no silent persistence when a new backend shows up.
+        let mut extra = HeaderMap::new();
+        extra.insert("x-goog-api-key", HeaderValue::from_static("g-secret"));
+        extra.insert("x-amz-security-token", HeaderValue::from_static("a-tok"));
+        extra.insert("x-auth-token", HeaderValue::from_static("t"));
+        extra.insert("request-id", HeaderValue::from_static("req_1"));
+        let extra_pairs = redacted_header_pairs(&extra);
+        let get2 = |n: &str| {
+            extra_pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get2("x-goog-api-key"), Some("•••redacted"));
+        assert_eq!(get2("x-amz-security-token"), Some("•••redacted"));
+        assert_eq!(get2("x-auth-token"), Some("•••redacted"));
+        assert_eq!(
+            get2("request-id"),
+            Some("req_1"),
+            "benign names stay visible"
+        );
         assert!(pairs
             .iter()
             .all(|(_, v)| !v.contains("secret") && !v.contains("tok")));

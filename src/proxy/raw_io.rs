@@ -384,11 +384,18 @@ const FIND_TS_WINDOW_MS: u64 = 300_000;
 /// the log BACKWARDS from the end (clicks land on recent entries; the file can
 /// be tens of GB, so a forward scan would read all of it for every lookup).
 ///
-/// Records are appended in capture-time order, so the scan early-exits once it
-/// walks past `at_ms - FIND_TS_WINDOW_MS` — nothing earlier can qualify. The
-/// id alone is NOT unique across daemon restarts (per-process counter); the
-/// timestamp window disambiguates. Corrupt/foreign lines are skipped. Strictly
-/// best-effort and read-only: any IO error yields `None`, never a panic.
+/// Among the in-window id matches the one with the CLOSEST capture timestamp
+/// to `at_ms` wins — never the first (= newest) match. The id alone is NOT
+/// unique across daemon restarts (per-process counter), and two runs less
+/// than the window apart can BOTH have an in-window record for the same id;
+/// capture and completion are stamped at the same terminal moment on the same
+/// host, so the true record sits within fold-lag milliseconds of `at_ms` and
+/// min-distance selection is effectively exact (trinity review R2, gpt-5.6
+/// MUST-FIX 1). Records are appended in capture-time order, so the scan
+/// early-exits once it walks past `at_ms - FIND_TS_WINDOW_MS` (or, with a
+/// candidate in hand, past the point where anything older must lose). Corrupt/
+/// foreign lines are skipped. Strictly best-effort and read-only: any IO
+/// error yields `None` (or the best candidate so far), never a panic.
 pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Option<RawIoRecord> {
     let path = path?;
     let file = std::fs::File::open(path).ok()?;
@@ -398,6 +405,13 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
     let needle = format!("\"id\":{id},");
     let floor = at_ms.saturating_sub(FIND_TS_WINDOW_MS);
     let ceil = at_ms.saturating_add(FIND_TS_WINDOW_MS);
+    let mut best: Option<(u64, RawIoRecord)> = None; // (distance to at_ms, record)
+    let keep_best = |candidate: RawIoRecord, best: &mut Option<(u64, RawIoRecord)>| {
+        let dist = candidate.ts_ms.abs_diff(at_ms);
+        if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+            *best = Some((dist, candidate));
+        }
+    };
 
     const CHUNK: u64 = 256 * 1024;
     let mut reader = file;
@@ -434,12 +448,22 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
             if record.id != id || record.v != RECORD_VERSION {
                 continue;
             }
-            if record.ts_ms >= floor && record.ts_ms <= ceil {
-                return Some(record);
+            let ts = record.ts_ms;
+            if ts >= floor && ts <= ceil {
+                keep_best(record, &mut best);
+                // Scanning backwards, timestamps only get older: once we are
+                // AT/BELOW at_ms with a candidate this close, nothing older
+                // can sit closer — done.
+                if let Some((dist, _)) = &best {
+                    if ts <= at_ms && at_ms.abs_diff(ts) >= *dist {
+                        return best.map(|(_, r)| r);
+                    }
+                }
+                continue;
             }
-            if record.ts_ms < floor {
+            if ts < floor {
                 // Append order: everything further back is older still.
-                return None;
+                return best.map(|(_, r)| r);
             }
         }
         // Time-based early exit even when no id matched in this chunk: parse
@@ -452,12 +476,12 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
             .and_then(|t| serde_json::from_str::<RawIoRecord>(t.trim()).ok())
         {
             if oldest.ts_ms < floor {
-                return None;
+                return best.map(|(_, r)| r);
             }
         }
         carry = head.to_vec();
     }
-    None
+    best.map(|(_, r)| r)
 }
 
 /// Prune the raw-io log to a retention window, best-effort.
@@ -953,6 +977,28 @@ mod tests {
             new.request_headers.as_deref(),
             Some(&[("content-type".to_string(), "application/json".to_string())][..])
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_record_prefers_the_closest_ts_within_one_window(/* trinity R2 */) {
+        // Two daemon runs 2 minutes apart reuse id=1 — BOTH records sit inside
+        // each other's ±5 min window, so the window alone cannot disambiguate.
+        // The lookup must return the record CLOSEST to the entry's completion
+        // time, not the first (= newest) match the backwards scan meets.
+        let path = tmp_path("find-closest");
+        let t_old = 100 * MS_PER_DAY; // "12:00" — pre-restart run
+        let t_new = t_old + 120_000; // "12:02" — post-restart run, same id
+        append(Some(&path), &rec(1, t_old));
+        append(Some(&path), &rec(1, t_new));
+
+        let old = find_record(Some(&path), 1, t_old + 500).expect("old entry resolves");
+        assert_eq!(old.ts_ms, t_old, "12:00 activity gets the 12:00 raw record");
+        let new = find_record(Some(&path), 1, t_new + 500).expect("new entry resolves");
+        assert_eq!(new.ts_ms, t_new, "12:02 activity gets the 12:02 raw record");
+        // Equidistant-ish query still lands on the strictly closer one.
+        let mid = find_record(Some(&path), 1, t_old + 50_000).expect("mid query");
+        assert_eq!(mid.ts_ms, t_old, "50s vs 70s away — closer record wins");
         let _ = std::fs::remove_file(&path);
     }
 
