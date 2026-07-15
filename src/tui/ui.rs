@@ -215,6 +215,7 @@ pub(crate) fn draw(
         Overlay::None => {}
         Overlay::Accounts => draw_accounts_overlay(frame, view, &ctx, chrome),
         Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
+        Overlay::Usage => draw_usage_overlay(frame, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, view),
         Overlay::Sessions => draw_sessions_overlay(frame, &ctx, chrome),
         Overlay::Misc => draw_misc_overlay(frame, view),
@@ -831,6 +832,187 @@ fn heatmap_panel_height(
     // activity" / first row), then never starve the model view above it.
     let want = 3 + cells.max(1) as u16;
     want.min(total.saturating_sub(8))
+}
+
+/// Usage overlay (`U`, usage-stats): the calendar usage table — hourly /
+/// daily / monthly buckets (`g` cycles) × model, with the four token classes
+/// and the API-equivalent cost. Rows arrive on the document pre-bucketed,
+/// pre-labeled, and pre-priced (the daemon's civil calendar and pricing
+/// overrides are the single source of truth — see `UsageStatDoc`); this
+/// renderer only filters by the selected granularity, groups consecutive
+/// rows by bucket, and draws a bold per-bucket total row above the per-model
+/// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
+fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) {
+    let area = overlay_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let gran = chrome.usage_gran;
+    let rows: Vec<&crate::dashboard::UsageStatDoc> = view
+        .usage_stats
+        .iter()
+        .filter(|r| r.gran == gran.tag())
+        .collect();
+    if rows.is_empty() {
+        // Distinguish "this granularity's trailing window is empty" (idle
+        // daemon >72h → hourly drained, but daily/monthly still have rows)
+        // from "no usage rows at all" (fresh daemon, or an attach to an
+        // older daemon that doesn't serve the field) — review CR: claiming
+        // "no history yet" while the monthly tab is full reads as data loss.
+        let hint = if view.usage_stats.is_empty() {
+            "no usage history yet — send requests through the proxy (older daemons don't serve usage rows)"
+        } else {
+            "no buckets in this granularity's window — `g` switches granularity"
+        };
+        let empty = Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(
+            Block::new()
+                .borders(Borders::TOP)
+                .title(format!(" usage — {} ", gran.label())),
+        );
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    // Group consecutive rows by bucket — the document orders each granularity
+    // newest bucket first, models within a bucket adjacent.
+    let mut buckets: Vec<(u64, &str, Vec<&crate::dashboard::UsageStatDoc>)> = Vec::new();
+    for r in rows {
+        match buckets.last_mut() {
+            Some((bucket, _, group)) if *bucket == r.bucket => group.push(r),
+            _ => buckets.push((r.bucket, r.label.as_str(), vec![r])),
+        }
+    }
+
+    // Period totals for the title: every bucket of the selected granularity,
+    // all four token classes (same reasoning as `model_total`). Unpriced rows
+    // contribute no cost — the total is qualified so it can't read as "all
+    // traffic priced" when a rate is missing (review R1 MUST-FIX 3).
+    let total_cost: f64 = buckets
+        .iter()
+        .flat_map(|(_, _, g)| g.iter())
+        .map(|r| r.cost_usd)
+        .sum();
+    let any_unpriced = buckets
+        .iter()
+        .flat_map(|(_, _, g)| g.iter())
+        .any(|r| !r.priced);
+    let total_tokens: u64 = buckets
+        .iter()
+        .flat_map(|(_, _, g)| g.iter())
+        .map(usage_row_tokens)
+        .fold(0, u64::saturating_add);
+    let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
+    let title = format!(
+        " usage — {} · {} buckets · Σ {} tok · Σ {}{} ",
+        gran.label(),
+        buckets.len(),
+        format::human_count(total_tokens),
+        format_cost(total_cost),
+        if any_unpriced { " (+unpriced)" } else { "" },
+    );
+
+    let mut trows: Vec<Row> = Vec::new();
+    for (_, label, group) in buckets.iter().skip(scroll) {
+        // The table widget truncates below the fold, so building rows past
+        // the visible area is pure waste — bound the construction to the
+        // screen (review CR: 180 daily buckets × models per frame otherwise).
+        if trows.len() > area.height as usize {
+            break;
+        }
+        // ONE accumulator pass per bucket (review CR): six parallel `.sum()`
+        // sweeps were six lines nothing forced to stay in step with the
+        // columns rendered below them.
+        let (requests, tokens_in, tokens_out, cache_read, cache_creation, cost, bucket_unpriced) =
+            group.iter().fold(
+                (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, false),
+                |(req, ti, to, cr, cc, cost, unpriced), r| {
+                    (
+                        req.saturating_add(r.requests),
+                        ti.saturating_add(r.tokens_in),
+                        to.saturating_add(r.tokens_out),
+                        cr.saturating_add(r.cache_read),
+                        cc.saturating_add(r.cache_creation),
+                        cost + r.cost_usd,
+                        unpriced || !r.priced,
+                    )
+                },
+            );
+        trows.push(
+            Row::new(vec![
+                Cell::from(*label),
+                Cell::from(Span::styled(format!("{} models", group.len()), dim())),
+                Cell::from(format::human_count(requests)),
+                Cell::from(format::human_count(tokens_in)),
+                Cell::from(format::human_count(tokens_out)),
+                Cell::from(format::human_count(cache_read)),
+                Cell::from(format::human_count(cache_creation)),
+                Cell::from(format!(
+                    "{}{}",
+                    format_cost(cost),
+                    if bucket_unpriced { "+?" } else { "" }
+                )),
+            ])
+            .style(Style::new().add_modifier(Modifier::BOLD)),
+        );
+        let mut models = group.clone();
+        models.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| usage_row_tokens(b).cmp(&usage_row_tokens(a)))
+        });
+        for m in models {
+            trows.push(Row::new(vec![
+                Cell::from(""),
+                Cell::from(Span::styled(
+                    format!("{}/{}", m.group, m.model),
+                    group_color(Some(&m.group)),
+                )),
+                Cell::from(format::human_count(m.requests)),
+                Cell::from(format::human_count(m.tokens_in)),
+                Cell::from(format::human_count(m.tokens_out)),
+                Cell::from(format::human_count(m.cache_read)),
+                Cell::from(format::human_count(m.cache_creation)),
+                // "no rate known" renders as an explicit dash — a fabricated
+                // $0.0000 would read as "free" (review R1 MUST-FIX 3).
+                Cell::from(if m.priced {
+                    format_cost(m.cost_usd)
+                } else {
+                    "—".to_string()
+                }),
+            ]));
+        }
+    }
+
+    let header = vec![
+        "bucket", "model", "req", "input", "output", "cache r", "cache w", "cost",
+    ];
+    let constraints = vec![
+        Constraint::Length(12),
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(10),
+    ];
+    let table = Table::new(trows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
+}
+
+/// Total tokens of one usage row: all four classes, same reasoning as
+/// [`model_total`] — `tokens_in` alone would hide cache-heavy traffic that
+/// the `cost` column still prices.
+fn usage_row_tokens(r: &&crate::dashboard::UsageStatDoc) -> u64 {
+    r.tokens_in
+        .saturating_add(r.tokens_out)
+        .saturating_add(r.cache_read)
+        .saturating_add(r.cache_creation)
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
@@ -2595,6 +2777,7 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("dashboard", Overlay::None),
     ("accounts", Overlay::Accounts),
     ("stats", Overlay::Stats),
+    ("usage", Overlay::Usage),
     ("logs", Overlay::Logs),
     ("sessions", Overlay::Sessions),
     ("misc", Overlay::Misc),
@@ -4238,6 +4421,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 key("q"),
                 Span::raw(" quit"),
             ]),
+            // Usage overlay (usage-stats): granularity cycle + scroll + back.
+            Overlay::Usage => Line::from(vec![
+                Span::raw(" usage — "),
+                key("g"),
+                Span::raw(" hour/day/month  "),
+                key("↑/k ↓/j"),
+                Span::raw(" bucket  "),
+                key("U/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
             // Logs overlay: full-screen tail; l/Esc back.
             Overlay::Logs => Line::from(vec![
                 Span::raw(" logs — "),
@@ -4396,6 +4591,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -4604,6 +4800,8 @@ mod tests {
             menu_anchor: None,
             menu_account: None,
             chart_days: 14,
+            usage_gran: Default::default(),
+            usage_scroll: 0,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -4740,6 +4938,136 @@ mod tests {
             text.contains("gpt-5.5"),
             "MAIN model data still visible underneath the overlay"
         );
+    }
+
+    /// One usage row for the Usage-overlay render tests (usage-stats).
+    #[allow(clippy::too_many_arguments)]
+    fn usage_row(
+        gran: &str,
+        bucket: u64,
+        label: &str,
+        group: &str,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd: f64,
+    ) -> crate::dashboard::UsageStatDoc {
+        crate::dashboard::UsageStatDoc {
+            gran: gran.into(),
+            bucket,
+            label: label.into(),
+            group: group.into(),
+            model: model.into(),
+            requests: 3,
+            tokens_in,
+            tokens_out,
+            cache_read: 40,
+            cache_creation: 4,
+            cost_usd,
+            priced: true,
+        }
+    }
+
+    /// The Usage overlay (usage-stats) renders the selected granularity's
+    /// buckets: a bold per-bucket total row (label + "N models" + summed
+    /// counters + summed cost) above per-model rows, and the period totals in
+    /// the title. Rows of OTHER granularities never leak into the table.
+    #[test]
+    fn usage_overlay_renders_buckets_models_and_costs() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                1_000,
+                200,
+                1.25,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "codex",
+                "gpt-5.5",
+                500,
+                100,
+                0.50,
+            ),
+            usage_row(
+                "day",
+                19_999,
+                "2024-10-03",
+                "claude",
+                "opus-x",
+                900,
+                90,
+                0.75,
+            ),
+            // An hourly row that must NOT appear in the daily table.
+            usage_row("hour", 480_000, "10-04 09h", "claude", "opus-x", 7, 7, 0.01),
+            // An UNPRICED row (review R1 MUST-FIX 3): its zero cost must
+            // render as `—`, and both its bucket row and the title carry a
+            // marker so the totals can't read as "all traffic priced".
+            {
+                let mut r = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                r.priced = false;
+                r
+            },
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(text.contains("usage — daily"), "title shows granularity");
+        assert!(text.contains("2 buckets"), "title counts day buckets only");
+        assert!(text.contains("$2.50"), "title sums the day costs");
+        assert!(
+            text.contains("(+unpriced)"),
+            "title qualifies unpriced usage"
+        );
+        assert!(text.contains("2024-10-04"), "bucket label rendered");
+        assert!(text.contains("2 models"), "bucket summary row rendered");
+        assert!(text.contains("claude/opus-x"), "model row rendered");
+        assert!(text.contains("codex/gpt-5.5"), "second model row rendered");
+        assert!(text.contains("$1.25"), "per-model cost rendered");
+        assert!(
+            text.contains("$0.7500+?"),
+            "bucket with unpriced rows marked"
+        );
+        assert!(text.contains("misc/mystery"), "unpriced model row rendered");
+        assert!(!text.contains("10-04 09h"), "hourly rows stay out of daily");
+    }
+
+    /// With no usage rows for the selected granularity the overlay shows the
+    /// empty hint (also the shape an OLDER daemon's document renders as).
+    #[test]
+    fn usage_overlay_empty_shows_hint() {
+        let view = view_with(vec![]);
+        let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(text.contains("no usage history yet"));
+    }
+
+    /// When only the SELECTED granularity is empty (idle daemon: hourly
+    /// window drained, daily/monthly still populated) the hint must say so —
+    /// not claim the whole history is missing (review CR).
+    #[test]
+    fn usage_overlay_gran_empty_hints_granularity_switch() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![usage_row(
+            "day",
+            20_000,
+            "2024-10-04",
+            "claude",
+            "opus-x",
+            1_000,
+            200,
+            1.25,
+        )];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_gran = crate::tui::activity::UsageGran::Hour;
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("no buckets in this granularity"));
+        assert!(!text.contains("no usage history yet"));
     }
 
     /// The Stats overlay's windowed heatmap (issue #23) renders the selected
