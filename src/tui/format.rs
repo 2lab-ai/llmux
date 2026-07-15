@@ -252,6 +252,15 @@ pub(crate) fn month_day_hm(at: SystemTime, offset_secs: i64) -> String {
     format!("{}/{} {}", month, day, clock_hm(at, offset_secs))
 }
 
+/// Local civil day (whole days since the epoch of the offset-shifted clock)
+/// for an instant. THE one definition of "which local day is this" shared by
+/// the usage fold and its read-time window (review CR — two hand-copied
+/// versions of this shift could silently disagree). Negative locals
+/// (pre-1970 west-of-UTC edge) clamp to day 0 — real traffic can't be there.
+pub(crate) fn local_civil_day(epoch_secs: i64, offset_secs: i64) -> u64 {
+    u64::try_from(epoch_secs.saturating_add(offset_secs).div_euclid(86_400)).unwrap_or(0)
+}
+
 /// Days-since-epoch → (year, month, day), Howard Hinnant's civil algorithm.
 pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;

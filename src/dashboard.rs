@@ -1573,16 +1573,15 @@ pub(crate) fn dashboard_doc(
     let (model_usage, total_cost_usd) = model_usage_docs(hub, now, &meta.pricing_overrides);
 
     // Usage-tab calendar rows (usage-stats): price each row server-side (T6)
-    // — the attach client has no pricing overrides to price with. `priced`
-    // distinguishes a real $0 from "no rate known" so a rate-less row can't
-    // masquerade as free (review R1 MUST-FIX 3).
+    // — the attach client has no pricing overrides to price with. ONE
+    // `priced_cost` lookup yields both the cost and the `priced` flag, so a
+    // rate-less row can never masquerade as free (review R1 MUST-FIX 3) and
+    // the two fields cannot diverge.
     let usage_stats: Vec<UsageStatDoc> = hub
         .usage_stats
         .iter()
-        .map(|r| UsageStatDoc {
-            priced: crate::pricing::price_for(&r.group, &r.model, &meta.pricing_overrides)
-                .is_some(),
-            cost_usd: crate::pricing::cost_from_parts(
+        .map(|r| {
+            let cost = crate::pricing::priced_cost(
                 &r.group,
                 &r.model,
                 r.tokens_in,
@@ -1590,8 +1589,12 @@ pub(crate) fn dashboard_doc(
                 Some(r.cache_read),
                 Some(r.cache_creation),
                 &meta.pricing_overrides,
-            ),
-            ..r.clone()
+            );
+            UsageStatDoc {
+                priced: cost.is_some(),
+                cost_usd: cost.unwrap_or(0.0),
+                ..r.clone()
+            }
         })
         .collect();
 

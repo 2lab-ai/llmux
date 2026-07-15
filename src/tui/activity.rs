@@ -250,6 +250,15 @@ impl UsageCell {
 /// offset-shifted clock); month keys are LOCAL civil `year*12 + month0`.
 type UsageBuckets = std::collections::BTreeMap<u64, HashMap<(String, String), UsageCell>>;
 
+/// First bucket key inside a trailing window of `retain` buckets ending at
+/// `anchor` INCLUSIVE: `anchor - (retain - 1)`. The `- 1` is the load-bearing
+/// inclusive-window semantic — every fold/merge/read site shares this one
+/// definition so retention and serving can never disagree at the boundary
+/// bucket (review CR).
+fn window_floor(anchor: u64, retain: u64) -> u64 {
+    anchor.saturating_sub(retain - 1)
+}
+
 /// Per-account lifetime counters for the table's totals columns and the
 /// global totals pane (ok/error split + in/out token split).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1104,13 +1113,9 @@ impl ActivityLog {
         }
         self.usage_hour_hwm = self.usage_hour_hwm.max(history.usage_hour_hwm);
         self.usage_day_hwm = self.usage_day_hwm.max(history.usage_day_hwm);
-        let hour_cutoff = self
-            .usage_hour_hwm
-            .saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        let hour_cutoff = window_floor(self.usage_hour_hwm, USAGE_HOURLY_RETAIN_HOURS);
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
-        let day_cutoff = self
-            .usage_day_hwm
-            .saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        let day_cutoff = window_floor(self.usage_day_hwm, USAGE_DAILY_RETAIN_DAYS);
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
         // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
         // replayed history for the same client; history fills the gaps under
@@ -1220,11 +1225,21 @@ impl ActivityLog {
         // event (startup replay behind live traffic) must neither resurrect
         // an expired bucket nor rewind the retention window. Same
         // never-rewinds reasoning as the windowed ring's `roll_to`.
+        //
+        // The hwm advance is CLAMPED to the wall clock (review CR): the hwm
+        // never rewinds, so a single future-dated event (host clock skew, a
+        // corrupt persisted timestamp) would otherwise drag the cutoff years
+        // ahead and silently drop ALL real traffic from the hourly/daily
+        // stores until the wall clock caught up. A future event still folds
+        // into its own bucket — the read side hides buckets past `now`
+        // ([`Self::usage_stats`]) — it just can't move the retention window.
+        let wall_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
         let hour = epoch_secs / 3_600;
-        self.usage_hour_hwm = self.usage_hour_hwm.max(hour);
-        let hour_cutoff = self
-            .usage_hour_hwm
-            .saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        self.usage_hour_hwm = self.usage_hour_hwm.max(hour.min(wall_secs / 3_600 + 1));
+        let hour_cutoff = window_floor(self.usage_hour_hwm, USAGE_HOURLY_RETAIN_HOURS);
         if hour >= hour_cutoff {
             self.usage_hourly
                 .entry(hour)
@@ -1235,16 +1250,11 @@ impl ActivityLog {
         }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
-        // Local civil day: shift the clock by the offset, then count whole
-        // days. Negative locals (pre-1970 west-of-UTC edge) can't occur for
-        // real traffic; guard with euclid division anyway.
-        let local_secs = (epoch_secs as i64).saturating_add(offset);
-        let civil_day = local_secs.div_euclid(86_400);
-        let day = u64::try_from(civil_day).unwrap_or(0);
-        self.usage_day_hwm = self.usage_day_hwm.max(day);
-        let day_cutoff = self
-            .usage_day_hwm
-            .saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        let day = crate::tui::format::local_civil_day(epoch_secs as i64, offset);
+        let wall_day =
+            crate::tui::format::local_civil_day(wall_secs.min(i64::MAX as u64) as i64, offset);
+        self.usage_day_hwm = self.usage_day_hwm.max(day.min(wall_day + 1));
+        let day_cutoff = window_floor(self.usage_day_hwm, USAGE_DAILY_RETAIN_DAYS);
         if day >= day_cutoff {
             self.usage_daily
                 .entry(day)
@@ -1255,7 +1265,7 @@ impl ActivityLog {
         }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
-        let (year, month, _) = crate::tui::format::civil_from_days(civil_day);
+        let (year, month, _) = crate::tui::format::civil_from_days(day as i64);
         let month_key = u64::try_from(year.saturating_mul(12) + i64::from(month) - 1).unwrap_or(0);
         self.usage_monthly
             .entry(month_key)
@@ -1283,23 +1293,23 @@ impl ActivityLog {
     /// R1 MUST-FIX 1): fold-time pruning follows the event high-water mark
     /// (bounded memory), but an idle daemon must not advertise stale buckets
     /// as "trailing 72 h / 180 days" — the serve-side filter is the honest
-    /// window. Months are never filtered.
+    /// window. Buckets PAST `now` (a future-dated persisted record) are
+    /// hidden on every granularity too — never rendered as top rows.
     pub(crate) fn usage_stats(&self, now: SystemTime) -> Vec<crate::dashboard::UsageStatDoc> {
         let now_secs = now
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let hour_floor = (now_secs / 3_600).saturating_sub(USAGE_HOURLY_RETAIN_HOURS - 1);
+        let now_hour = now_secs / 3_600;
+        let hour_floor = window_floor(now_hour, USAGE_HOURLY_RETAIN_HOURS);
         let now_offset = self
             .usage_offset_override
             .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
-        let today = u64::try_from(
-            (now_secs as i64)
-                .saturating_add(now_offset)
-                .div_euclid(86_400),
-        )
-        .unwrap_or(0);
-        let day_floor = today.saturating_sub(USAGE_DAILY_RETAIN_DAYS - 1);
+        let today = crate::tui::format::local_civil_day(now_secs as i64, now_offset);
+        let day_floor = window_floor(today, USAGE_DAILY_RETAIN_DAYS);
+        let (this_year, this_month, _) = crate::tui::format::civil_from_days(today as i64);
+        let month_ceil =
+            u64::try_from(this_year.saturating_mul(12) + i64::from(this_month) - 1).unwrap_or(0);
         fn sorted(
             cells: &HashMap<(String, String), UsageCell>,
         ) -> Vec<(&(String, String), &UsageCell)> {
@@ -1332,6 +1342,9 @@ impl ActivityLog {
         };
         let mut docs = Vec::new();
         for (hour, cells) in self.usage_hourly.iter().rev() {
+            if *hour > now_hour {
+                continue; // future-dated garbage: hidden, ages out
+            }
             if *hour < hour_floor {
                 break; // BTreeMap rev: everything further back is older.
             }
@@ -1350,6 +1363,9 @@ impl ActivityLog {
             }
         }
         for (day, cells) in self.usage_daily.iter().rev() {
+            if *day > today {
+                continue; // future-dated garbage: hidden, ages out
+            }
             if *day < day_floor {
                 break;
             }
@@ -1360,6 +1376,9 @@ impl ActivityLog {
             }
         }
         for (month_key, cells) in self.usage_monthly.iter().rev() {
+            if *month_key > month_ceil {
+                continue; // future-dated garbage: hidden (months never prune)
+            }
             let y = month_key / 12;
             let m = month_key % 12 + 1;
             let label = format!("{y}-{m:02}");
@@ -3233,6 +3252,48 @@ mod tests {
         let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
         assert!(usage_rows(&log, UsageGran::Day, read_at).is_empty());
         assert_eq!(usage_rows(&log, UsageGran::Month, read_at).len(), 1);
+    }
+
+    /// Review CR (trinity R1 gpt-5.6 MUST-FIX): a single FUTURE-dated event
+    /// (clock skew, corrupt persisted line) must not drag the retention
+    /// window forward and drop real traffic — the hwm advance clamps to the
+    /// wall clock — and the future bucket itself must stay hidden at read
+    /// time (upper bound on every granularity).
+    #[test]
+    fn usage_future_event_cannot_poison_retention_or_render() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        let real_now = SystemTime::now();
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            real_now,
+        );
+        // 1000 days in the future — without the wall clamp this advances the
+        // hwm and prunes every real bucket.
+        log.apply(
+            finished_full(2, "a", "claude", "m-future", None, 200, 9, 9, None, "/p"),
+            real_now + Duration::from_secs(1000 * 86_400),
+        );
+        log.apply(
+            finished_full(3, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            real_now,
+        );
+        let hours = usage_rows(&log, UsageGran::Hour, real_now);
+        assert_eq!(hours.len(), 1, "real bucket survives the future event");
+        assert_eq!(hours[0].model, "m");
+        assert_eq!(hours[0].requests, 2, "both real folds landed");
+        assert!(
+            usage_rows(&log, UsageGran::Day, real_now)
+                .iter()
+                .all(|r| r.model == "m"),
+            "future day bucket hidden at read time"
+        );
+        assert!(
+            usage_rows(&log, UsageGran::Month, real_now)
+                .iter()
+                .all(|r| r.model == "m"),
+            "future month bucket hidden at read time (months never prune)"
+        );
     }
 
     #[test]
