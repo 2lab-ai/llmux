@@ -62,6 +62,10 @@ pub(crate) struct DashboardView {
     pub grok: crate::dashboard::GrokSettingsDoc,
     /// Tokens-per-day chart rows (UI-3 U14), straight from the document.
     pub daily_usage: Vec<crate::dashboard::DailyUsageDoc>,
+    /// Usage-tab calendar rows (usage-stats), straight from the document —
+    /// labels and cost are server-rendered, the client only filters by
+    /// granularity and draws.
+    pub usage_stats: Vec<crate::dashboard::UsageStatDoc>,
     /// Live `email_anonymous` display setting (SSOT E4): when on, every
     /// draw-time surface that shows an account email renders it through
     /// [`crate::demo::alias_always`] / [`crate::demo::mask_email_text`]
@@ -349,6 +353,7 @@ impl DashboardView {
             session_labels: doc.session_labels.clone(),
             grok: doc.grok.clone(),
             daily_usage: doc.daily_usage.clone(),
+            usage_stats: doc.usage_stats.clone(),
             version: doc.version.clone(),
             pid: doc.pid,
             uptime: Duration::from_secs(doc.uptime_secs),
