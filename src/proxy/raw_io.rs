@@ -139,6 +139,42 @@ pub struct RawIoRecord {
     /// same redaction + additive semantics as `request_headers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<Vec<(String, String)>>,
+    /// The upstream (proxy→API) half of a TRANSLATED exchange (codex/grok):
+    /// the rewritten Responses-API request the proxy actually sent and the
+    /// verbatim upstream reply it transformed for the client. `None` on the
+    /// byte-identity claude passthrough — client and upstream payloads are the
+    /// same bytes, so the raw viewer renders 2 payloads instead of 4.
+    /// Additive: records written before this field load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamRaw>,
+}
+
+/// The proxy→API side of one translated exchange (see
+/// [`RawIoRecord::upstream`]). Bodies arrive PRE-BOUNDED by the caller (the
+/// forward path applies the same `max_body_bytes` cap + truncation marker as
+/// the client-side bodies); headers arrive pre-redacted
+/// (`forward::redacted_header_pairs`) so upstream bearer tokens never land on
+/// disk. Every field is optional — an upstream error path may know the request
+/// half but have no transformed response, and vice versa.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamRaw {
+    /// Full upstream URL (`endpoint` + provider path), the `copy as curl`
+    /// target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Rewritten request body the proxy sent upstream (bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    /// Upstream request headers (wire order, credential values redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Vec<(String, String)>>,
+    /// Verbatim upstream response body BEFORE transformation (bounded; the
+    /// Responses-API SSE/JSON the converter consumed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    /// Upstream response headers (redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Vec<(String, String)>>,
 }
 
 /// Captured header pairs (wire order, values already redacted by the caller);
@@ -165,6 +201,7 @@ impl RawIoRecord {
         max_body_bytes: usize,
         request_headers: HeaderPairs,
         response_headers: HeaderPairs,
+        upstream: Option<UpstreamRaw>,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -178,14 +215,17 @@ impl RawIoRecord {
             response_body: bounded_body(response_body, max_body_bytes),
             request_headers,
             response_headers,
+            upstream,
         }
     }
 }
 
 /// Clip a body to `max_body_bytes` on a UTF-8 char boundary, appending a
 /// `…[truncated N bytes]` marker when it overflows. A body within the cap is
-/// returned whole (lossy UTF-8). Pure; never panics.
-fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
+/// returned whole (lossy UTF-8). Pure; never panics. `pub(crate)` so the
+/// forward path can pre-bound [`UpstreamRaw`] bodies with the SAME cap +
+/// marker as the client-side bodies.
+pub(crate) fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
     let s = String::from_utf8_lossy(body);
     if s.len() <= max_body_bytes {
         return s.into_owned();
@@ -205,8 +245,9 @@ fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
 /// marker with the exact dropped count — which `bounded_body` alone cannot
 /// compute, because the relay only handed us the bounded prefix, not the whole
 /// body. When nothing was dropped the prefix is returned whole (lossy UTF-8).
-/// Pure; never panics.
-fn bounded_body_streamed(kept: &[u8], total: usize) -> String {
+/// Pure; never panics. `pub(crate)` for the forward path's upstream tee (same
+/// bounded-prefix + total shape as the client-side stream tee).
+pub(crate) fn bounded_body_streamed(kept: &[u8], total: usize) -> String {
     let s = String::from_utf8_lossy(kept).into_owned();
     let dropped = total.saturating_sub(kept.len());
     if dropped == 0 {
@@ -272,6 +313,7 @@ pub fn capture(
     max_body_bytes: usize,
     request_headers: HeaderPairs,
     response_headers: HeaderPairs,
+    upstream: Option<UpstreamRaw>,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
@@ -288,6 +330,7 @@ pub fn capture(
         max_body_bytes,
         request_headers,
         response_headers,
+        upstream,
     );
     append(path, &record);
 }
@@ -315,6 +358,7 @@ impl RawIoRecord {
         max_body_bytes: usize,
         request_headers: HeaderPairs,
         response_headers: HeaderPairs,
+        upstream: Option<UpstreamRaw>,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -328,6 +372,7 @@ impl RawIoRecord {
             response_body: bounded_body_streamed(response_kept, response_total),
             request_headers,
             response_headers,
+            upstream,
         }
     }
 }
@@ -351,6 +396,7 @@ pub fn capture_streamed(
     max_body_bytes: usize,
     request_headers: HeaderPairs,
     response_headers: HeaderPairs,
+    upstream: Option<UpstreamRaw>,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
@@ -368,6 +414,7 @@ pub fn capture_streamed(
         max_body_bytes,
         request_headers,
         response_headers,
+        upstream,
     );
     append(path, &record);
 }
@@ -680,6 +727,7 @@ mod tests {
             RESPONSE_CAP_BYTES,
             Some(vec![("content-type".into(), "application/json".into())]),
             Some(vec![("request-id".into(), "req_1".into())]),
+            None,
         )
     }
 
@@ -710,6 +758,33 @@ mod tests {
     }
 
     #[test]
+    fn upstream_half_round_trips_and_stays_off_passthrough_records(/* UI-8 */) {
+        let path = tmp_path("upstream");
+        // A translated exchange carries the rewritten upstream half…
+        let mut record = rec(9, 1_700_000_000_000);
+        record.upstream = Some(UpstreamRaw {
+            url: Some("https://api.example.com/responses".into()),
+            request_body: Some(r#"{"input":[]}"#.into()),
+            request_headers: Some(vec![("authorization".into(), "•••redacted".into())]),
+            response_body: Some("event: response.completed\n\n".into()),
+            response_headers: Some(vec![("x-request-id".into(), "req_9".into())]),
+        });
+        append(Some(&path), &record);
+        let line = std::fs::read_to_string(&path).expect("written");
+        let parsed: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
+        assert_eq!(parsed, record, "upstream half survives the round-trip");
+        // …while a passthrough record (upstream: None) serializes WITHOUT the
+        // key at all (additive schema), and a pre-UI-8 line parses to None.
+        let _ = std::fs::remove_file(&path);
+        append(Some(&path), &rec(1, 1));
+        let line = std::fs::read_to_string(&path).expect("written");
+        assert!(!line.contains("\"upstream\""), "absent, not null: {line}");
+        let old: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
+        assert_eq!(old.upstream, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn body_over_the_cap_is_truncated_with_a_marker() {
         let big = "a".repeat(RESPONSE_CAP_BYTES + 500);
         let record = RawIoRecord::new(
@@ -722,6 +797,7 @@ mod tests {
             big.as_bytes(),
             b"resp",
             RESPONSE_CAP_BYTES,
+            None,
             None,
             None,
         );
@@ -753,6 +829,7 @@ mod tests {
             RESPONSE_CAP_BYTES,
             None,
             None,
+            None,
         );
         assert_eq!(record.request_body.len(), RESPONSE_CAP_BYTES);
         assert!(!record.request_body.contains("truncated"));
@@ -773,6 +850,7 @@ mod tests {
             body.as_bytes(),
             b"",
             RESPONSE_CAP_BYTES,
+            None,
             None,
             None,
         );
@@ -806,6 +884,7 @@ mod tests {
             32,
             None,
             None,
+            None,
         );
         assert!(
             record.request_body.contains("…[truncated 68 bytes]"),
@@ -818,7 +897,9 @@ mod tests {
             record.response_body
         );
         // And a body under the override is kept whole.
-        let small = RawIoRecord::new(1, 0, None, None, None, None, b"hi", b"hi", 32, None, None);
+        let small = RawIoRecord::new(
+            1, 0, None, None, None, None, b"hi", b"hi", 32, None, None, None,
+        );
         assert_eq!(small.request_body, "hi");
         assert_eq!(small.response_body, "hi");
     }
@@ -838,6 +919,7 @@ mod tests {
             kept,
             kept.len(),
             RESPONSE_CAP_BYTES,
+            None,
             None,
             None,
         );
@@ -863,6 +945,7 @@ mod tests {
             kept,
             total,
             10, // cap (matches what the relay retained)
+            None,
             None,
             None,
         );
