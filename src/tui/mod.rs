@@ -94,6 +94,22 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
     )
 }
 
+/// Distinct buckets of one granularity on the view (usage-stats): the Usage
+/// overlay's scroll bound. Rows arrive grouped by bucket (newest first), so
+/// counting key CHANGES equals counting distinct buckets — the same grouping
+/// the renderer applies.
+fn usage_bucket_count(view: &DashboardView, gran: activity::UsageGran) -> usize {
+    let mut count = 0;
+    let mut last: Option<u64> = None;
+    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
+        if last != Some(r.bucket) {
+            count += 1;
+            last = Some(r.bucket);
+        }
+    }
+    count
+}
+
 /// Can this client open a browser for an OAuth flow? The login dance (browser
 /// plus localhost callback) runs in the CLIENT, so this gates the `n` new-login
 /// key; when it returns false the picker is replaced by the `llmux login`
@@ -253,6 +269,9 @@ pub(crate) enum Overlay {
     Accounts,
     /// The detailed per-model usage table + drill-down (req13; was `show_models`).
     Stats,
+    /// Calendar usage table (usage-stats): hourly/daily/monthly buckets ×
+    /// model with token breakdown + API-equivalent cost.
+    Usage,
     /// Full-screen log tail (was the `l` log-panel size cycle).
     Logs,
     /// Session timeline (issue #34): persisted raw-io grouped by
@@ -334,6 +353,11 @@ pub(crate) struct Chrome {
     pub menu_account: Option<String>,
     /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
     pub chart_days: u64,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    pub usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
+    /// recent at the top).
+    pub usage_scroll: usize,
 }
 
 /// Attach-mode banner state.
@@ -515,6 +539,12 @@ struct App {
     /// Session toggle (`t`): quota bars show the reset as an absolute UTC
     /// stamp instead of the countdown.
     reset_absolute: bool,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
+    /// the granularity changes so a deep hourly scroll can't strand the
+    /// monthly table past its last row.
+    usage_scroll: usize,
 }
 
 impl App {
@@ -554,6 +584,8 @@ impl App {
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
+            usage_gran: activity::UsageGran::default(),
+            usage_scroll: 0,
             reset_absolute: false,
         }
     }
@@ -686,6 +718,8 @@ impl App {
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
             chart_days: self.chart_days,
+            usage_gran: self.usage_gran,
+            usage_scroll: self.usage_scroll,
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -762,6 +796,7 @@ impl App {
             Overlay::None => self.on_key_main(key.code, view),
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
+            Overlay::Usage => self.on_key_usage(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
             Overlay::Misc => self.on_key_misc(key.code),
@@ -789,6 +824,24 @@ impl App {
             if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
                 self.open_tab(tab, view);
                 return true;
+            }
+        }
+        // Wheel scrolling in the Usage overlay (usage-stats): its primary
+        // interaction IS bucket scrolling, so the wheel must work where the
+        // mouse opened the tab (review CR — the tab was mouse-openable but
+        // keyboard-only to scroll). Routed through the key handler so the
+        // stored-offset clamp applies identically.
+        if self.overlay == Overlay::Usage && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.on_key_usage(KeyCode::Up, view);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.on_key_usage(KeyCode::Down, view);
+                    return true;
+                }
+                _ => {}
             }
         }
         // An open context menu (UI-3 U11) owns the mouse: click an item to
@@ -1104,7 +1157,46 @@ impl App {
             Overlay::None => self.overlay = Overlay::None,
             Overlay::Stats => self.open_stats(view),
             Overlay::Sessions => self.open_sessions(),
+            Overlay::Usage => {
+                self.usage_scroll = 0;
+                self.overlay = Overlay::Usage;
+            }
             other => self.overlay = other,
+        }
+    }
+
+    /// Key handling for the Usage overlay (usage-stats). `g` cycles the
+    /// granularity (hour → day → month), arrows/`j`/`k` scroll by bucket,
+    /// `U`/Esc closes back to MAIN, `q` quits. The STORED offset is clamped
+    /// against the selected granularity's bucket count on every press —
+    /// clamping only a draw-time copy would let presses at the bottom
+    /// accumulate invisible overscroll debt (review R1 MUST-FIX 2).
+    fn on_key_usage(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let max_scroll = view
+            .map(|v| usage_bucket_count(v, self.usage_gran).saturating_sub(1))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('U') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('g') => {
+                self.usage_gran = self.usage_gran.next();
+                self.usage_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.usage_scroll = self.usage_scroll.saturating_sub(1).min(max_scroll);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.usage_scroll = self.usage_scroll.saturating_add(1).min(max_scroll);
+            }
+            KeyCode::PageUp => {
+                self.usage_scroll = self.usage_scroll.saturating_sub(10).min(max_scroll);
+            }
+            KeyCode::PageDown => {
+                self.usage_scroll = self.usage_scroll.saturating_add(10).min(max_scroll);
+            }
+            KeyCode::Home => self.usage_scroll = 0,
+            KeyCode::End => self.usage_scroll = max_scroll,
+            _ => {}
         }
     }
 
@@ -1190,6 +1282,9 @@ impl App {
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
+            // Calendar usage table (usage-stats): hourly/daily/monthly × model
+            // tokens + API-equivalent cost.
+            KeyCode::Char('U') => self.open_tab(Overlay::Usage, view),
             // Misc (keys/build facts) + Config surfaces (UI-3 U6).
             KeyCode::Char('?') => self.overlay = Overlay::Misc,
             KeyCode::Char('c') => self.overlay = Overlay::Config,
@@ -3212,6 +3307,66 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
     }
 
+    /// Usage-overlay scroll clamps the STORED offset at the last bucket
+    /// (review R1 MUST-FIX 2): pressing `j` at the bottom must not bank
+    /// invisible overscroll debt that later `k` presses have to pay off.
+    #[test]
+    fn usage_scroll_clamps_stored_offset_no_overscroll_debt() {
+        let row = |bucket: u64| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket,
+            label: format!("day-{bucket}"),
+            group: "claude".into(),
+            model: "m".into(),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.1,
+            priced: true,
+        };
+        let mut view = empty_view();
+        view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets
+        let mut app = remote_app();
+        app.overlay = Overlay::Usage;
+
+        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (2).
+        for _ in 0..5 {
+            app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        }
+        assert_eq!(app.usage_scroll, 2, "stored offset clamped at last bucket");
+        // ONE up moves immediately — no invisible debt to pay first.
+        app.on_key_usage(KeyCode::Char('k'), Some(&view));
+        assert_eq!(app.usage_scroll, 1);
+        // Granularity cycle resets the scroll; the next granularity (month)
+        // has no rows in this view, so the offset stays pinned at 0.
+        app.on_key_usage(KeyCode::Char('g'), Some(&view));
+        assert_eq!(app.usage_scroll, 0);
+        app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        assert_eq!(app.usage_scroll, 0, "empty granularity can't scroll");
+        // U closes back to MAIN.
+        app.on_key_usage(KeyCode::Char('U'), Some(&view));
+        assert_eq!(app.overlay, Overlay::None);
+
+        // Mouse wheel scrolls the Usage overlay (review CR) through the same
+        // clamped path — cycle back to the day granularity first.
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        app.usage_scroll = 0;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown), Some(&view)));
+        assert_eq!(app.usage_scroll, 1, "wheel down scrolls one bucket");
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp), Some(&view)));
+        assert_eq!(app.usage_scroll, 0, "wheel up scrolls back");
+    }
+
     /// `open_sessions` must NOT block on the file read: it opens the overlay and
     /// flips into the loading state immediately, leaving `sessions` untouched.
     /// With no `sessions_tx` (the event loop never runs under test) the load is
@@ -3646,6 +3801,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,

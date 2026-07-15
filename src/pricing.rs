@@ -213,14 +213,40 @@ pub fn cost_from_parts(
     cache_creation: Option<u64>,
     overrides: &HashMap<String, ModelPrice>,
 ) -> f64 {
-    let Some(price) = price_for(group, model, overrides) else {
-        return 0.0;
-    };
+    priced_cost(
+        group,
+        model,
+        tokens_in,
+        tokens_out,
+        cache_read,
+        cache_creation,
+        overrides,
+    )
+    .unwrap_or(0.0)
+}
+
+/// [`cost_from_parts`] without the `0.0` sentinel: `None` means "no rate
+/// known for this `(group, model)`", so a caller can never mistake a missing
+/// rate for a free request (usage-stats review — the `priced` flag and the
+/// cost must come from ONE lookup, not two calls that merely agree today).
+#[allow(clippy::too_many_arguments)]
+pub fn priced_cost(
+    group: &str,
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    overrides: &HashMap<String, ModelPrice>,
+) -> Option<f64> {
+    let price = price_for(group, model, overrides)?;
     let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
-    per_m(tokens_in, price.input)
-        + per_m(tokens_out, price.output)
-        + per_m(cache_read.unwrap_or(0), price.cache_read)
-        + per_m(cache_creation.unwrap_or(0), price.cache_creation)
+    Some(
+        per_m(tokens_in, price.input)
+            + per_m(tokens_out, price.output)
+            + per_m(cache_read.unwrap_or(0), price.cache_read)
+            + per_m(cache_creation.unwrap_or(0), price.cache_creation),
+    )
 }
 
 #[cfg(test)]
