@@ -1852,7 +1852,11 @@ fn curl_command(
     body: &str,
 ) -> String {
     let sh = |t: &str| t.replace('\'', "'\\''");
-    let mut out = format!("curl -X {} '{}'", method, sh(url));
+    // Quote the method too: `http::Method` accepts RFC 7230 `tchar`
+    // extension tokens (backtick, `$`, `|`, `&`, `'`…), and the client's raw
+    // method rides into here — an unquoted `-X `id`` would run a command
+    // substitution when the operator pastes the "copy as curl" output.
+    let mut out = format!("curl -X '{}' '{}'", sh(method), sh(url));
     for (name, value) in headers.unwrap_or_default() {
         if matches!(
             name.as_str(),
@@ -7385,7 +7389,14 @@ mod tests {
             ]),
             r#"{"model":"m","note":"it's quoted"}"#,
         );
-        assert!(curl.starts_with("curl -X POST 'http://localhost:3456/v1/messages'"));
+        assert!(curl.starts_with("curl -X 'POST' 'http://localhost:3456/v1/messages'"));
+        // A method carrying shell metacharacters (valid RFC 7230 tchar tokens)
+        // is quoted, not interpolated raw — no command substitution on paste.
+        let evil = curl_command("`id`", "http://x/y", None, "");
+        assert!(
+            evil.starts_with("curl -X '`id`' 'http://x/y'"),
+            "method shell-quoted: {evil}"
+        );
         assert!(curl.contains("-H 'content-type: application/json'"));
         assert!(
             curl.contains("-H 'x-api-key: •••redacted'"),
@@ -7434,7 +7445,7 @@ mod tests {
         );
         assert!(two.tabs[0]
             .curl
-            .contains("curl -X POST 'http://localhost:3456/v1/messages'"));
+            .contains("curl -X 'POST' 'http://localhost:3456/v1/messages'"));
         assert_eq!(two.tabs[0].body_text, r#"{"model":"claude"}"#);
 
         // Upstream half present → 4 tabs in wire order, the upstream pair
@@ -7455,7 +7466,7 @@ mod tests {
         assert_eq!(four.tabs[1].body_text, r#"{"input":[]}"#);
         assert!(four.tabs[1]
             .curl
-            .contains("curl -X POST 'https://api.example.com/responses'"));
+            .contains("curl -X 'POST' 'https://api.example.com/responses'"));
         assert!(four.tabs[2].body_text.contains("response.completed"));
         assert!(
             four.tabs[2].curl.contains("api.example.com"),

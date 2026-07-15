@@ -2133,9 +2133,11 @@ async fn relay_translate(
             0,
             ctx.started.elapsed().as_millis(),
         );
-        // Raw-io capture: request + the upstream error body (already read).
-        // The upstream half carries the REWRITTEN request + the same error
-        // reply (it is the upstream's verbatim response).
+        // Raw-io 4-payload capture: the CLIENT leg is the Anthropic-shaped
+        // error the client actually receives (built once below and returned),
+        // NOT the provider's verbatim bytes — those are the exchange llmux
+        // never forwards. The upstream half carries the rewritten request +
+        // the provider's real error reply.
         let max_body = state.config.raw_io.max_body_bytes;
         let upstream_raw = upstream_meta.map(|m| {
             m.into_raw(
@@ -2144,21 +2146,34 @@ async fn relay_translate(
                 Some(redacted_header_pairs(&error_headers)),
             )
         });
+        let client_message = format!("{served} upstream: {}", body_excerpt(&bytes));
+        let client_json = serde_json::json!({
+            "type": "error",
+            "error": { "type": error_type, "message": client_message },
+        })
+        .to_string();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         ctx.capture_raw_io(
             state,
             Some(&account),
             out_status,
-            &bytes,
-            Some(&error_headers),
+            client_json.as_bytes(),
+            Some(&client_headers),
             upstream_raw,
         );
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
-        return error_response(
-            out_status,
-            error_type,
-            &format!("{served} upstream: {}", body_excerpt(&bytes)),
+        let mut client_error = Response::new(axum::body::Body::from(client_json));
+        *client_error.status_mut() = out_status;
+        client_error.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
         );
+        return client_error;
     }
 
     if client_stream {

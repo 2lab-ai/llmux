@@ -1815,6 +1815,99 @@ async fn raw_io_translated_exchange_captures_the_upstream_half() {
     );
 }
 
+/// A translated (codex) 4xx: the raw record's CLIENT `Response` leg must hold
+/// the Anthropic-shaped error llmux SYNTHESIZED for the client — not the
+/// provider's verbatim body, which belongs only in the upstream half (UI-8
+/// fidelity fix: the 4-leg trace must not duplicate the provider error into
+/// the client leg).
+#[tokio::test]
+async fn raw_io_translated_4xx_client_leg_is_the_synthesized_error() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 400,
+        body: r#"{"error":{"type":"invalid_request","message":"provider-side detail 0xDEADBEEF"}}"#
+            .to_string(),
+    });
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 400, "client sees the wrapped 4xx");
+    let client_body = String::from_utf8(response.bytes().await.unwrap().to_vec()).unwrap();
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None).await.json().await.unwrap();
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().unwrap();
+            at_ms = entry["at_ms"].as_u64().unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0);
+
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let r = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .send()
+            .await
+            .unwrap();
+        if r.status().is_success() {
+            raw = r.json().await.unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Client leg == what the client received (the synthesized wrapper),
+    // NOT the provider's raw body.
+    assert_eq!(
+        raw["response_body"].as_str().unwrap(),
+        client_body,
+        "client Response leg mirrors the delivered wrapper: {raw}"
+    );
+    // The client leg is the WRAPPED Anthropic error llmux synthesized
+    // (`type: error` + `invalid_request_error`), not the provider's bare
+    // shape. llmux does surface the provider detail inside the wrapper's
+    // message — that's what the client genuinely received.
+    let client_leg: serde_json::Value =
+        serde_json::from_str(raw["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        client_leg["type"], "error",
+        "synthesized Anthropic error shape"
+    );
+    assert_eq!(client_leg["error"]["type"], "invalid_request_error");
+    // The upstream leg is the provider's BARE body (its own error shape),
+    // distinct from the client wrapper — the 4 legs are not duplicates.
+    let up = &raw["upstream"];
+    let up_body: serde_json::Value =
+        serde_json::from_str(up["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        up_body["error"]["type"], "invalid_request",
+        "upstream leg keeps the provider's own error shape: {up}"
+    );
+    assert!(
+        up["response_body"].as_str().unwrap().contains("0xDEADBEEF"),
+        "provider detail present in the upstream leg: {up}"
+    );
+    assert_ne!(
+        raw["response_body"].as_str().unwrap(),
+        up["response_body"].as_str().unwrap(),
+        "client and upstream legs are distinct payloads, not a duplicate"
+    );
+}
+
 /// The dashboard endpoint serves a status superset: accounts in selection
 /// order, the meta fields (version/pid/port/uptime/upstream/config_path),
 /// the activity tail (a driven request shows up as completed), the scheduler
