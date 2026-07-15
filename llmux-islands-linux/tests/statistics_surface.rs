@@ -209,6 +209,11 @@ fn common_statistics_path_has_summary_and_accounts_with_local_advanced_details()
         .and_then(|tail| tail.split("            }").next())
         .expect("statistics disclosure block");
     assert!(!disclosure.contains("dispatchRequested"));
+    assert!(disclosure.contains("checked: statisticsPage.effectiveAdvancedVisible"));
+    assert!(
+        !disclosure.contains("enabled: !statisticsPage.receiptSnapshotMode"),
+        "receipt evidence must render the selected Advanced disclosure at normal contrast"
+    );
 }
 
 #[test]

@@ -414,7 +414,6 @@ Kirigami.ScrollablePage {
                 text: qsTr("Advanced")
                 checkable: true
                 checked: statisticsPage.effectiveAdvancedVisible
-                enabled: !statisticsPage.receiptSnapshotMode
                 Accessible.name: qsTr("Show advanced statistics details")
                 onClicked: statisticsPage.advancedVisible = checked
             }
