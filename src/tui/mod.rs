@@ -688,13 +688,18 @@ struct App {
     raw_tx: Option<mpsc::Sender<RawLoad>>,
     /// Monotonic raw-modal open counter (UI-8); the next modal's generation.
     raw_generation: u64,
-    /// A queued export action, drained by the event loop onto the blocking
-    /// pool (same pattern as `pending_raw`).
-    /// Queued exports (UI-8 copy/save). A `VecDeque`, not a single slot: two
-    /// export actions in one input burst (ready events drain before the
-    /// event loop spawns them) must both run — a single `Option` silently
-    /// dropped the earlier one, a regression from the old synchronous path.
+    /// Queued exports (UI-8 copy/save), dispatched SINGLE-FLIGHT and in order.
+    /// A `VecDeque`, not a single slot: two export actions in one input burst
+    /// (ready events drain before the event loop spawns them) must both run —
+    /// a single `Option` silently dropped the earlier one. But the loop spawns
+    /// only ONE at a time (`clip_inflight`), so clipboard writes execute in
+    /// press order (last-writer is the last press, not a race) and a slow/
+    /// wedged exporter applies backpressure instead of piling unbounded work
+    /// onto the blocking pool. Capped at [`CLIP_QUEUE_MAX`].
     pending_clip: std::collections::VecDeque<ClipReq>,
+    /// True while one export runs on the blocking pool; cleared when its
+    /// [`ClipResult`] arrives. Gates the next dispatch (single-flight).
+    clip_inflight: bool,
     /// Sender the background export delivers its [`ClipResult`] on.
     clip_tx: Option<mpsc::Sender<ClipResult>>,
 }
@@ -748,6 +753,7 @@ impl App {
             raw_tx: None,
             raw_generation: 0,
             pending_clip: std::collections::VecDeque::new(),
+            clip_inflight: false,
             clip_tx: None,
             reset_absolute: false,
         }
@@ -1533,6 +1539,15 @@ impl App {
             ),
             ui::RawButton::SaveAll => (content.record_json.clone(), true, "json", String::new()),
         };
+        if self.pending_clip.len() >= CLIP_QUEUE_MAX {
+            // Bounded: a wedged/slow exporter with a spamming user must not
+            // grow the queue without limit. Reject the newest with feedback.
+            modal.flash = Some((
+                "export busy — try again in a moment".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
         modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
         self.pending_clip.push_back(ClipReq {
             generation,
@@ -1546,8 +1561,21 @@ impl App {
     }
 
     /// Drain the queued export (event-loop side of [`Self::raw_modal_action`]).
-    fn take_pending_clip(&mut self) -> Option<ClipReq> {
-        self.pending_clip.pop_front()
+    /// Single-flight: hand the event loop the next export ONLY when none is
+    /// running, marking the slot busy. Cleared by [`Self::clip_finished`] when
+    /// the result arrives, so exports run one at a time, in FIFO press order.
+    fn next_clip_if_idle(&mut self) -> Option<ClipReq> {
+        if self.clip_inflight {
+            return None;
+        }
+        let req = self.pending_clip.pop_front()?;
+        self.clip_inflight = true;
+        Some(req)
+    }
+
+    /// Mark the in-flight export done (its result arrived), freeing the next.
+    fn clip_finished(&mut self) {
+        self.clip_inflight = false;
     }
 
     /// Resolve a delivered export outcome onto the open modal's flash line,
@@ -3236,9 +3264,12 @@ async fn event_loop(
                 app.apply_raw_load(load);
                 true
             }
-            // A background export (UI-8 copy/save) finished — flash its
-            // outcome on the modal that requested it (gated on generation).
+            // A background export (UI-8 copy/save) finished — free the
+            // single-flight slot so the next queued export can dispatch, then
+            // flash the outcome on the modal that requested it (the flash is
+            // gated on generation; freeing the slot is unconditional).
             Some(result) = clip_rx.recv() => {
+                app.clip_finished();
                 app.apply_clip_result(result);
                 true
             }
@@ -3247,7 +3278,7 @@ async fn event_loop(
             app.spawn_raw_fetch(req);
             redraw = true;
         }
-        while let Some(req) = app.take_pending_clip() {
+        if let Some(req) = app.next_clip_if_idle() {
             app.spawn_clip(req);
             redraw = true;
         }
@@ -3407,6 +3438,12 @@ const MODAL_PAGE: u16 = 10;
 
 /// Horizontal pan step for the raw viewer (UI-8), in display cells.
 const RAW_PAN: u16 = 8;
+
+/// Cap on queued (not-yet-dispatched) exports (UI-8). Single-flight dispatch
+/// already bounds concurrent work to one; this bounds the BACKLOG so a user
+/// spamming the button against a slow/wedged exporter can't grow the deque
+/// without limit. Human-paced presses never approach it.
+const CLIP_QUEUE_MAX: usize = 8;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
 /// session, purely a memory backstop against a huge persisted file.
@@ -4727,16 +4764,71 @@ mod tests {
             2,
             "both queued — the second must not overwrite the first"
         );
-        // Draining pops them in order (FIFO).
+        // Single-flight FIFO: the first dispatch pops Copy and marks the slot
+        // busy; a second dispatch attempt while busy yields nothing (no
+        // concurrent clipboard write / no last-writer race).
         assert!(matches!(
-            app.take_pending_clip().map(|r| r.button),
+            app.next_clip_if_idle().map(|r| r.button),
             Some(ui::RawButton::Copy)
         ));
+        assert!(app.clip_inflight, "slot busy after dispatch");
+        assert!(
+            app.next_clip_if_idle().is_none(),
+            "single-flight: no second dispatch while one is in flight"
+        );
+        // Its result frees the slot → the next (Save) dispatches, in order.
+        app.clip_finished();
         assert!(matches!(
-            app.take_pending_clip().map(|r| r.button),
+            app.next_clip_if_idle().map(|r| r.button),
             Some(ui::RawButton::Save)
         ));
-        assert!(app.take_pending_clip().is_none());
+        app.clip_finished();
+        assert!(app.next_clip_if_idle().is_none());
+    }
+
+    #[test]
+    fn export_queue_is_bounded_and_rejects_overflow_with_feedback(/* MUST-FIX */) {
+        // A spamming user against a wedged exporter must not grow the queue
+        // without limit: past the cap the newest is rejected with feedback
+        // (already-queued actions are preserved, growth is bounded).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        for _ in 0..(CLIP_QUEUE_MAX + 5) {
+            app.raw_modal_action(ui::RawButton::Copy);
+        }
+        assert_eq!(
+            app.pending_clip.len(),
+            CLIP_QUEUE_MAX,
+            "queue capped, never grows past CLIP_QUEUE_MAX"
+        );
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "export busy — try again in a moment",
+            "overflow rejected with feedback, not silently dropped"
+        );
     }
 
     #[test]
