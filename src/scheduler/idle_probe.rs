@@ -32,8 +32,37 @@ use std::time::{Duration, SystemTime};
 use http::HeaderMap;
 
 use super::headers as rl_headers;
+use super::window::QuotaWindow;
 use super::{AccountId, AccountPool};
 use crate::config::{AccountCredential, IdleProbeConfig};
+
+/// True when an account's window data no longer represents live usage: it has
+/// no window at all, or EVERY window it does have is older than `stale_after`
+/// (Z 2026-07-15 — cold subscriptions must keep refreshing, not freeze at
+/// their last reading). `stale_after == 0` disables the staleness re-probe,
+/// reverting to the original windowless-only gate. Shared by the orchestrator
+/// gate ([`IdleProber::probe_if_idle`]) and the proxy's trigger filter
+/// (`AppState::trigger_idle_probes`) so the two can never disagree.
+pub fn windows_need_probe(
+    five_hour: Option<&QuotaWindow>,
+    seven_day: Option<&QuotaWindow>,
+    now: SystemTime,
+    stale_after: Duration,
+) -> bool {
+    // No heap: this runs per account per forwarded request (trigger filter).
+    let mut any = false;
+    let mut all_stale = true;
+    for w in [five_hour, seven_day].into_iter().flatten() {
+        any = true;
+        if !w.is_stale(now, stale_after) {
+            all_stale = false;
+        }
+    }
+    if !any {
+        return true; // windowless — the original probe case
+    }
+    !stale_after.is_zero() && all_stale
+}
 
 /// Failure of a single probe send. Never carries a credential.
 #[derive(Debug, thiserror::Error)]
@@ -120,22 +149,33 @@ impl<P: Prober> IdleProber<P> {
         true
     }
 
-    /// True if the account currently has NO window at all (neither 5h nor
-    /// 7d) AND is not operator-paused — the only case a probe is for. An
-    /// account with any window is already covered by headers/poll, and a
-    /// paused account was explicitly benched by the operator (spending quota
-    /// on it would contradict the pause), so both are left alone.
-    fn probe_eligible(&self, account: &AccountId) -> bool {
+    /// True if the account's window data needs a probe at `now` — no window
+    /// at all, or every window stale past `stale_after_secs`
+    /// ([`windows_need_probe`]) — AND it is not operator-paused. An account
+    /// with a fresh window is already covered by headers/poll, and a paused
+    /// account was explicitly benched by the operator (spending quota on it
+    /// would contradict the pause), so both are left alone.
+    fn probe_eligible(&self, account: &AccountId, now: SystemTime) -> bool {
+        let stale_after = Duration::from_secs(self.config.stale_after_secs);
         self.pool
             .snapshot()
             .accounts
             .iter()
             .find(|a| &a.id == account)
-            .is_some_and(|a| !a.paused && a.five_hour.is_none() && a.seven_day.is_none())
+            .is_some_and(|a| {
+                !a.paused
+                    && windows_need_probe(
+                        a.five_hour.as_ref(),
+                        a.seven_day.as_ref(),
+                        now,
+                        stale_after,
+                    )
+            })
     }
 
     /// On-demand entry point: probe `account` once iff probing is enabled, the
-    /// account has no window and is not paused, and its cooldown has elapsed.
+    /// account needs window data (none, or all stale) and is not paused, and
+    /// its cooldown has elapsed.
     /// Returns whether a probe was actually sent. On a successful send the parsed
     /// `anthropic-ratelimit-*` headers are recorded into the pool via
     /// [`AccountPool::record_headers`] (the `WindowSource::Headers` path).
@@ -143,7 +183,7 @@ impl<P: Prober> IdleProber<P> {
     /// The pure gating (`try_acquire`) completes and the lock is released
     /// BEFORE the `.await` on the send — no std lock is held across await.
     pub async fn probe_if_idle(&self, account: &AccountId, now: SystemTime) -> bool {
-        if !self.config.enabled || !self.probe_eligible(account) {
+        if !self.config.enabled || !self.probe_eligible(account, now) {
             return false;
         }
         let Some(credential) = self.pool.credential(account) else {
@@ -221,6 +261,7 @@ mod tests {
             // The orchestrator never reads `sweep_secs` (the timer lives in the
             // proxy server); the gate tests only exercise enabled + cooldown.
             sweep_secs: 0,
+            stale_after_secs: 900,
         }
     }
 
@@ -430,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_with_a_window_is_not_probed() {
+    async fn account_with_a_fresh_window_is_not_probed() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         // Pre-populate a window via the usage path so the account is not idle.
         pool.record_usage(
@@ -450,9 +491,80 @@ mod tests {
 
         assert!(
             !orch.probe_if_idle(&id("a"), now()).await,
-            "account already has a window: not probed"
+            "account has a fresh window: not probed"
         );
         assert_eq!(prober.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_window_account_is_reprobed_after_stale_after() {
+        // Z 2026-07-15: a cold subscription's gauge must keep refreshing. A
+        // window recorded at NOW becomes probe-eligible again once it ages
+        // past `stale_after_secs` (900 in `cfg`), cooldown permitting.
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_usage(
+            &id("a"),
+            &crate::scheduler::usage::UsageSnapshot {
+                five_hour: Some(rl_headers::WindowReading {
+                    utilization: 0.1,
+                    resets_at: at(NOW_SECS + 100_000),
+                }),
+                seven_day: None,
+                scoped: Vec::new(),
+            },
+            now(),
+        );
+        let prober = CountingProber::new(0.42);
+        let orch = IdleProber::new(pool.clone(), &prober, cfg(true, 900));
+
+        assert!(
+            !orch.probe_if_idle(&id("a"), at(NOW_SECS + 899)).await,
+            "within stale_after: window is fresh, no probe"
+        );
+        assert!(
+            orch.probe_if_idle(&id("a"), at(NOW_SECS + 901)).await,
+            "past stale_after: stale window re-probed"
+        );
+        assert_eq!(prober.call_count(), 1);
+    }
+
+    #[test]
+    fn windows_need_probe_gate() {
+        let stale_after = Duration::from_secs(900);
+        let w = |fetched: u64| QuotaWindow {
+            utilization: 0.5,
+            resets_at: at(NOW_SECS + 100_000),
+            fetched_at: at(fetched),
+            source: crate::scheduler::window::WindowSource::Headers,
+        };
+        // Windowless: always needs a probe.
+        assert!(windows_need_probe(None, None, now(), stale_after));
+        // One fresh window: no probe.
+        let fresh = w(NOW_SECS);
+        assert!(!windows_need_probe(Some(&fresh), None, now(), stale_after));
+        // All windows stale: probe.
+        let stale = w(NOW_SECS - 1000);
+        assert!(windows_need_probe(
+            Some(&stale),
+            Some(&stale),
+            now(),
+            stale_after
+        ));
+        // Mixed (one fresh, one stale): the fresh one still represents live
+        // data — no probe.
+        assert!(!windows_need_probe(
+            Some(&fresh),
+            Some(&stale),
+            now(),
+            stale_after
+        ));
+        // stale_after = 0 disables the staleness re-probe entirely.
+        assert!(!windows_need_probe(
+            Some(&stale),
+            None,
+            now(),
+            Duration::ZERO
+        ));
     }
 
     #[tokio::test]

@@ -324,21 +324,32 @@ impl AppState {
     }
 
     /// On-demand idle-account probe trigger (issue #21). For every account in
-    /// `group` (or all accounts on the legacy `None` path) that currently has
-    /// NO 5h/7d window, spawn a single gated `max_tokens = 1` probe so the
-    /// next ranking/display has real data. Each spawn is fully gated inside
-    /// `IdleProber::probe_if_idle` (kill-switch + per-account cooldown +
-    /// has-no-window re-check), so this is safe to call on every forwarded
-    /// request: a no-op when probing is disabled, and at most one send per
-    /// account per cooldown otherwise. Spawned, never awaited — the probe must
-    /// not add latency to the request that triggered it.
+    /// `group` (or all accounts on the legacy `None` path) whose window data
+    /// needs a probe — none at all, or every window stale past
+    /// `stale_after_secs` (Z 2026-07-15 cold-refresh) — spawn a single gated
+    /// `max_tokens = 1` probe so the next ranking/display has real data. Each
+    /// spawn is fully gated inside `IdleProber::probe_if_idle` (kill-switch +
+    /// per-account cooldown + needs-window re-check), so this is safe to call
+    /// on every forwarded request: a no-op when probing is disabled, and at
+    /// most one send per account per cooldown otherwise. Spawned, never
+    /// awaited — the probe must not add latency to the request that triggered
+    /// it.
     pub fn trigger_idle_probes(&self, group: Option<crate::routing::BackendGroup>) {
         if !self.config.proxy.idle_probe.enabled {
             return;
         }
+        let now = SystemTime::now();
+        let stale_after =
+            std::time::Duration::from_secs(self.config.proxy.idle_probe.stale_after_secs);
         let snapshot = self.pool.snapshot();
         for account in snapshot.accounts.iter().filter(|a| {
-            group.is_none_or(|g| a.group == g) && a.five_hour.is_none() && a.seven_day.is_none()
+            group.is_none_or(|g| a.group == g)
+                && crate::scheduler::idle_probe::windows_need_probe(
+                    a.five_hour.as_ref(),
+                    a.seven_day.as_ref(),
+                    now,
+                    stale_after,
+                )
         }) {
             let prober = self.idle_prober.clone();
             let id = account.id.clone();
@@ -956,12 +967,29 @@ pub fn router(state: AppState) -> Router {
         .route("/models", get(models_endpoint))
         .route("/llmux/models", get(models_endpoint))
         .route("/v1/oauth/token", post(oauth_token_relay))
+        // Root reachability ping, answered LOCALLY (Z 2026-07-15, startup-set
+        // bug): Claude Code fires `HEAD /` against its base URL as a
+        // connectivity check on session start. The fallback used to forward
+        // it upstream with a leased credential, which burned a scheduler pick
+        // just to render a `[claude] 404` activity row per new session. A
+        // proxy answers reachability itself. GET/HEAD ONLY (axum serves HEAD
+        // from the GET handler, body elided) — other methods on `/` get an
+        // honest 405 rather than a fake 200 (review MUST-FIX 2).
+        .route("/", get(root_ping))
         .fallback(forward_any)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             client_auth,
         ))
         .with_state(state)
+}
+
+/// `HEAD|GET /` → 200 "llmux", answered locally (never forwarded, never
+/// leased an account, never an activity row). Claude Code probes its base URL
+/// with `HEAD /` on every session start; upstream Anthropic 404s that path,
+/// so forwarding it only produced a misleading `[claude] 404` per session.
+async fn root_ping() -> &'static str {
+    "llmux"
 }
 
 /// Pure client-auth decision (FR1): when a proxy api key is configured,

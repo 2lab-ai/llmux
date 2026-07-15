@@ -305,7 +305,11 @@ type FoldKey<'a> = (
     Option<&'a str>,
 );
 
-/// `None` = never foldable (notes, non-2xx, anything without a full key).
+/// `None` = never foldable. Only `count` probes group (Z 2026-07-15 "그루핑
+/// count빼고 하지마"): count_tokens is the one traffic class Claude Code fires
+/// in walls; every other kind — user turns, security passes, upstream errors —
+/// renders 1:1 so nothing meaningful hides inside a fold. Notes, non-2xx and
+/// keyless entries stay unfoldable as before.
 fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
     match &entry.body {
         CompletedBody::Request {
@@ -315,8 +319,9 @@ fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
             status,
             group,
             model,
+            kind,
             ..
-        } if (200..300).contains(status) => Some((
+        } if (200..300).contains(status) && kind.as_deref() == Some("count") => Some((
             method.as_str(),
             path.as_str(),
             account.as_deref(),
@@ -647,7 +652,7 @@ mod tests {
 
     // ---- activity folding ----
 
-    fn request(status: u16, path: &str, at_secs: u64) -> Completed {
+    fn request_kind(status: u16, path: &str, at_secs: u64, kind: Option<&str>) -> Completed {
         Completed {
             at: UNIX_EPOCH + Duration::from_secs(at_secs),
             body: CompletedBody::Request {
@@ -662,10 +667,15 @@ mod tests {
                 effort: None,
                 fast: false,
                 user_id: None,
-                kind: None,
+                kind: kind.map(str::to_string),
                 excerpt: None,
             },
         }
+    }
+
+    /// A foldable `count` probe — the only kind that groups (Z 2026-07-15).
+    fn request(status: u16, path: &str, at_secs: u64) -> Completed {
+        request_kind(status, path, at_secs, Some("count"))
     }
 
     fn note(at_secs: u64) -> Completed {
@@ -689,6 +699,28 @@ mod tests {
             collapse_completed(&entries),
             vec![ActivityRow::Run { start: 0, len: 3 }]
         );
+    }
+
+    #[test]
+    fn only_count_kind_folds(/* Z 2026-07-15 "그루핑 count빼고 하지마" */) {
+        // Identical consecutive 2xx entries that are NOT count probes (user
+        // turns, security passes, untagged rows) render 1:1 — never folded.
+        for kind in [Some("user"), Some("security"), None] {
+            let entries = vec![
+                request_kind(200, "/v1/messages", 30, kind),
+                request_kind(200, "/v1/messages", 20, kind),
+                request_kind(200, "/v1/messages", 10, kind),
+            ];
+            assert_eq!(
+                collapse_completed(&entries),
+                vec![
+                    ActivityRow::Single(0),
+                    ActivityRow::Single(1),
+                    ActivityRow::Single(2),
+                ],
+                "kind {kind:?} must not fold"
+            );
+        }
     }
 
     #[test]

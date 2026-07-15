@@ -35,6 +35,10 @@ pub fn classify(path: &str, body: &[u8]) -> Classified {
     let value: Option<serde_json::Value> = serde_json::from_slice(body).ok();
     let system = value.as_ref().map(system_text).unwrap_or_default();
     let last_user = value.as_ref().and_then(last_user_text).unwrap_or_default();
+    let max_tokens = value
+        .as_ref()
+        .and_then(|v| v.get("max_tokens"))
+        .and_then(|t| t.as_u64());
     let excerpt = clean_excerpt(&last_user);
 
     // `count_tokens` first: Claude Code fires these constantly as context
@@ -42,15 +46,17 @@ pub fn classify(path: &str, body: &[u8]) -> Classified {
     let kind = if path.contains("count_tokens") {
         "count"
     } else {
-        kind_from_signatures(&system, &last_user)
+        kind_from_signatures(&system, &last_user, max_tokens)
     };
     Classified { kind, excerpt }
 }
 
 /// The family fingerprints (docs/system-prompts/families.md), most specific
 /// first. `system` = concatenated system text; `last_user` = the newest
-/// user-role text block.
-fn kind_from_signatures(system: &str, last_user: &str) -> &'static str {
+/// user-role text block; `max_tokens` = the body's output cap (control
+/// probes pin it to 1 — review MUST-FIX 1: the text alone must not reroute
+/// a legitimate prompt that happens to say "quota").
+fn kind_from_signatures(system: &str, last_user: &str, max_tokens: Option<u64>) -> &'static str {
     // Control families identified by the system contract.
     if system.contains("security monitor for autonomous AI coding agents") {
         return "security";
@@ -75,6 +81,21 @@ fn kind_from_signatures(system: &str, last_user: &str) -> &'static str {
     }
     if last_user.starts_with("Based on the conversation transcript above") {
         return "audit";
+    }
+    // Claude Code's per-session rate-limit status probe: a bare "quota" user
+    // turn AND `max_tokens: 1` (both pinned from the raw-io capture,
+    // 2026-07-15). Not an llmux probe (ours sends "." outside the forward
+    // path). The kind changes routing (single-attempt, no park), so BOTH
+    // signature halves are required — a real prompt that merely says
+    // "quota" keeps full failover.
+    if last_user.trim() == "quota" && max_tokens == Some(1) {
+        return "quota";
+    }
+    // Claude Code's return-recap control turn, fired when a session resumes
+    // ("The user stepped away and is coming back.") — harness scaffolding,
+    // not typed input.
+    if last_user.trim_start().starts_with("The user stepped away") {
+        return "recap";
     }
     // Execution families: subagent / SDK-host / main CLI — all carry a real
     // input turn, so they read as flavored `user` kinds.
@@ -235,6 +256,35 @@ mod tests {
                     "[SUGGESTION MODE: Suggest what the user might naturally type next]",
                 ),
                 "suggest",
+            ),
+            (
+                // Claude Code's per-session rate-limit probe (raw-io
+                // 2026-07-15): bare "quota" turn + max_tokens 1.
+                serde_json::json!({
+                    "model": "claude-fable-5",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "quota"}],
+                })
+                .to_string()
+                .into_bytes(),
+                "quota",
+            ),
+            (
+                // A REAL prompt that merely says "quota" (no max_tokens: 1
+                // signature) must stay a plain user turn — the quota kind
+                // changes routing (review MUST-FIX 1).
+                body(
+                    "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "quota",
+                ),
+                "user",
+            ),
+            (
+                body(
+                    "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "The user stepped away and is coming back.",
+                ),
+                "recap",
             ),
         ];
         for (b, want) in cases {
