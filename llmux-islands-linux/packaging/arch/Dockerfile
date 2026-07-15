@@ -96,6 +96,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 WORKDIR /src
 RUN git init \
     && git add Cargo.toml Cargo.lock LICENSE src llmux-islands-core llmux-islands-linux \
+       llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json \
     && git -c user.name='llmux CI' -c user.email='ci@invalid.example' \
        commit -m 'package fixture'
 RUN useradd --uid 1000 --user-group --create-home builder \
