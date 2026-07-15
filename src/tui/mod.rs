@@ -27,6 +27,7 @@
 
 pub(crate) mod activity;
 mod anim;
+mod clip;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
 // `llmux status` output and the dashboard agree on the display.
@@ -384,13 +385,6 @@ pub(crate) struct InputModal {
     pub scroll: u16,
 }
 
-/// Which tab of the raw request/response viewer (UI-7) is active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RawTab {
-    Request,
-    Response,
-}
-
 /// Content state of the raw viewer: the fetch is asynchronous (a backwards
 /// scan of a possibly-huge `raw-io.jsonl`, or an HTTP round-trip in attach
 /// mode), so the modal opens Loading and resolves to Ready/Failed.
@@ -409,21 +403,30 @@ pub(crate) enum RawModalState {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RawModal {
     pub key: activity::ActivityKey,
+    /// Activity id, used by the save-file names (`llmux-raw-<id>…`).
+    pub id: u64,
     pub title: String,
-    pub tab: RawTab,
+    /// Index into the Ready content's tab list (2 or 4 tabs, UI-8); clamped
+    /// at draw/use time so a stale index can never panic.
+    pub tab: usize,
     pub scroll: u16,
+    /// Horizontal pan in display cells (UI-8; clamped like `scroll`).
+    pub hscroll: u16,
     /// Animation frame for the Loading spinner (advances with the shared tick).
     pub spin: usize,
+    /// Action feedback ("copied … → pbcopy" / "saved → …"), shown in place of
+    /// the key legend until it expires (drawn ~3 s).
+    pub flash: Option<(String, std::time::Instant)>,
     pub state: RawModalState,
 }
 
 /// A queued raw-record fetch: the clicked entry's stable key (its `at_ms` is
-/// the timestamp half of the raw-io lookup), the activity id, and the general
-/// metadata lines prebuilt from the entry at open time.
+/// the timestamp half of the raw-io lookup), the activity id, and what the
+/// content builder needs from open time (general lines + curl context).
 struct RawFetchReq {
     key: activity::ActivityKey,
     id: u64,
-    general: Vec<ratatui::text::Line<'static>>,
+    general: ui::RawGeneral,
 }
 
 /// Result of a background raw fetch, delivered on the raw channel.
@@ -560,6 +563,10 @@ struct App {
     /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
     /// one rect per tab label. Same record/read cycle as `activity_chrome`.
     tab_chrome: Vec<ui::TabHit>,
+    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
+    /// payload-tab rects + top-right action buttons. Same record/read cycle
+    /// as `activity_chrome`; empty while the modal is closed.
+    raw_chrome: ui::RawModalChrome,
     /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
     /// top-border row of a pane, dragging it resizes the pane ABOVE it.
     separator_chrome: Vec<ui::SeparatorHit>,
@@ -669,6 +676,7 @@ impl App {
             history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
+            raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
@@ -1022,12 +1030,57 @@ impl App {
             }
             return true;
         }
-        // The raw viewer (UI-7) owns the mouse the same way when open.
-        if let Some(modal) = self.raw_modal.as_mut() {
+        // The raw viewer (UI-7) owns the mouse the same way when open; UI-8
+        // adds clickable payload tabs + the top-right action buttons and a
+        // horizontal wheel pan.
+        if self.raw_modal.is_some() {
+            let hit = |r: &ratatui::layout::Rect| {
+                mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
             match mouse.kind {
-                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(3),
-                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(3),
-                _ => {}
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let button = self
+                        .raw_chrome
+                        .buttons
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(b, _)| b);
+                    let tab = self
+                        .raw_chrome
+                        .tabs
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(i, _)| i);
+                    if let Some(btn) = button {
+                        self.raw_modal_action(btn);
+                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
+                        modal.tab = idx;
+                        modal.scroll = 0;
+                        modal.hscroll = 0;
+                    }
+                }
+                kind => {
+                    if let Some(modal) = self.raw_modal.as_mut() {
+                        match kind {
+                            MouseEventKind::ScrollUp => {
+                                modal.scroll = modal.scroll.saturating_sub(3)
+                            }
+                            MouseEventKind::ScrollDown => {
+                                modal.scroll = modal.scroll.saturating_add(3)
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN)
+                            }
+                            MouseEventKind::ScrollRight => {
+                                modal.hscroll = modal.hscroll.saturating_add(RAW_PAN)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             return true;
         }
@@ -1285,48 +1338,131 @@ impl App {
                     .to_string(),
             )
         } else {
+            // The curl builder needs the client base URL — the record stores
+            // only bodies/headers. Local mode targets this process's own
+            // listen port; attach mode the daemon it is attached to.
+            let base_url = match &self.backend {
+                Backend::Local(state) => format!("http://localhost:{}", state.config.proxy.port),
+                Backend::Remote(remote) => remote.base_url.clone(),
+            };
             self.pending_raw = Some(RawFetchReq {
                 key: key.clone(),
                 id,
-                general: ui::raw_general_lines(&entry),
+                general: ui::RawGeneral {
+                    lines: ui::raw_general_lines(&entry),
+                    method: key.method.clone(),
+                    path: key.path.clone(),
+                    base_url,
+                },
             });
             RawModalState::Loading
         };
         self.raw_modal = Some(RawModal {
             key,
+            id,
             title,
-            tab: RawTab::Request,
+            tab: 0,
             scroll: 0,
+            hscroll: 0,
             spin: 0,
+            flash: None,
             state,
         });
     }
 
-    /// Key handling while the raw viewer is open (UI-7): Esc/q/Enter close,
-    /// ←/→/Tab/h/l switch tabs (scroll resets — the tabs have independent
-    /// lengths), arrows/PgUp/PgDn/Home/End scroll. Everything else is
-    /// swallowed so nothing leaks beneath the modal.
+    /// Key handling while the raw viewer is open (UI-7/UI-8): Esc/q/Enter
+    /// close, ←/→/Tab/h/l walk the payload tabs (both offsets reset — tabs
+    /// have independent sizes), arrows/PgUp/PgDn/Home/End scroll, H/L pan
+    /// horizontally, and c/C/a/s/S fire the copy/curl/copy-all/save/save-all
+    /// actions (same as the top-right buttons). Everything else is swallowed
+    /// so nothing leaks beneath the modal.
     fn on_key_raw_modal(&mut self, code: KeyCode) {
         let Some(modal) = self.raw_modal.as_mut() else {
             return;
         };
+        let tab_count = match &modal.state {
+            RawModalState::Ready(content) => content.tabs.len().max(1),
+            _ => 1,
+        };
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.raw_modal = None,
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
-                modal.tab = match modal.tab {
-                    RawTab::Request => RawTab::Response,
-                    RawTab::Response => RawTab::Request,
-                };
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                modal.tab = (modal.tab + 1) % tab_count;
                 modal.scroll = 0;
+                modal.hscroll = 0;
             }
+            KeyCode::Left | KeyCode::Char('h') => {
+                modal.tab = (modal.tab + tab_count - 1) % tab_count;
+                modal.scroll = 0;
+                modal.hscroll = 0;
+            }
+            KeyCode::Char('H') => modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN),
+            KeyCode::Char('L') => modal.hscroll = modal.hscroll.saturating_add(RAW_PAN),
             KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
             KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
             KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
             KeyCode::Home => modal.scroll = 0,
             KeyCode::End => modal.scroll = u16::MAX,
+            KeyCode::Char('c') => self.raw_modal_action(ui::RawButton::Copy),
+            KeyCode::Char('C') => self.raw_modal_action(ui::RawButton::CopyCurl),
+            KeyCode::Char('a') => self.raw_modal_action(ui::RawButton::CopyAll),
+            KeyCode::Char('s') => self.raw_modal_action(ui::RawButton::Save),
+            KeyCode::Char('S') => self.raw_modal_action(ui::RawButton::SaveAll),
             _ => {}
         }
+    }
+
+    /// Execute one raw-viewer action button (UI-8) against the ACTIVE tab's
+    /// prebuilt payloads and flash the outcome on the modal's hint line.
+    /// A not-yet-loaded modal flashes instead of acting; failures flash the
+    /// reason — an export must never take the TUI down.
+    fn raw_modal_action(&mut self, btn: ui::RawButton) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        let RawModalState::Ready(content) = &modal.state else {
+            modal.flash = Some((
+                "raw record not loaded yet".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        };
+        let Some(tab) = content
+            .tabs
+            .get(modal.tab.min(content.tabs.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let ext = |text: &str| {
+            if text.trim_start().starts_with(['{', '[']) {
+                "json"
+            } else {
+                "txt"
+            }
+        };
+        let label = tab.label.to_lowercase().replace(' ', "-");
+        let result = match btn {
+            ui::RawButton::Copy => clip::copy(&tab.body_text)
+                .map(|dest| format!("copied {} bytes → {dest}", tab.body_text.len())),
+            ui::RawButton::CopyCurl => clip::copy(&tab.curl)
+                .map(|dest| format!("copied curl ({} bytes) → {dest}", tab.curl.len())),
+            ui::RawButton::CopyAll => clip::copy(&content.all_text)
+                .map(|dest| format!("copied all {} bytes → {dest}", content.all_text.len())),
+            ui::RawButton::Save => clip::save(
+                &format!("llmux-raw-{}-{label}", modal.id),
+                ext(&tab.body_text),
+                &tab.body_text,
+            )
+            .map(|path| format!("saved → {path}")),
+            ui::RawButton::SaveAll => clip::save(
+                &format!("llmux-raw-{}", modal.id),
+                "json",
+                &content.record_json,
+            )
+            .map(|path| format!("saved record → {path}")),
+        };
+        modal.flash = Some((result.unwrap_or_else(|err| err), std::time::Instant::now()));
     }
 
     /// Drain the queued raw fetch (event-loop side of [`Self::open_raw_modal`]).
@@ -3009,6 +3145,7 @@ async fn event_loop(
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
+            app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
@@ -3027,11 +3164,12 @@ async fn event_loop(
                     None => app.input_modal = None,
                 }
             }
-            // Clamp the raw viewer's scroll against what this frame rendered
-            // (UI-7). Unlike the input modal, no draw ⇒ no clamp — the modal
-            // owns its content and never closes on entry aging.
-            if let (Some(modal), Some(max)) = (app.raw_modal.as_mut(), main.raw_modal_max_scroll) {
-                modal.scroll = modal.scroll.min(max);
+            // Clamp the raw viewer's scroll offsets against what this frame
+            // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
+            // clamp — the modal owns its content and never closes on aging.
+            if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
+                modal.scroll = modal.scroll.min(raw.max_scroll.0);
+                modal.hscroll = modal.hscroll.min(raw.max_scroll.1);
             }
         }
     }
@@ -3098,6 +3236,9 @@ const HISTORY_ARM_MARGIN: i64 = 40;
 
 /// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
 const MODAL_PAGE: u16 = 10;
+
+/// Horizontal pan step for the raw viewer (UI-8), in display cells.
+const RAW_PAN: u16 = 8;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
 /// session, purely a memory backstop against a huge persisted file.
@@ -4202,19 +4343,56 @@ mod tests {
     fn raw_modal_keys_tabs_scroll_and_close(/* UI-7 */) {
         let mut app = remote_app();
         let key = seed_one_hit(&mut app);
+        // Ready content: a plain (no-upstream) record renders the classic
+        // 2 tabs; the upstream pair appears only on translated exchanges.
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            None,
+            None,
+            None,
+            Some(200),
+            b"{}",
+            b"{}",
+            1024,
+            None,
+            None,
+            None,
+        );
+        let content = ui::raw_content_from_record(
+            ui::RawGeneral {
+                lines: Vec::new(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                base_url: "http://localhost:3456".into(),
+            },
+            &record,
+        );
+        assert_eq!(content.tabs.len(), 2, "no upstream half → 2 payload tabs");
         app.raw_modal = Some(RawModal {
             key: key.clone(),
+            id: 7,
             title: "raw".into(),
-            tab: RawTab::Request,
+            tab: 0,
             scroll: 3,
+            hscroll: 5,
             spin: 0,
-            state: RawModalState::Loading,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
         });
-        // Tab flips and resets the scroll (the tabs have independent lengths).
+        // Tab advances and resets BOTH offsets (tabs have independent sizes).
         app.on_key(press(KeyCode::Tab), None);
         let modal = app.raw_modal.as_ref().unwrap();
-        assert_eq!(modal.tab, RawTab::Response);
+        assert_eq!(modal.tab, 1);
         assert_eq!(modal.scroll, 0);
+        assert_eq!(modal.hscroll, 0);
+        // ← wraps back around the 2-tab ring; H/L pan horizontally.
+        app.on_key(press(KeyCode::Left), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().tab, 0);
+        app.on_key(press(KeyCode::Char('L')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, RAW_PAN);
+        app.on_key(press(KeyCode::Char('H')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, 0);
         // Scroll keys move; unbound keys are swallowed beneath the modal.
         app.on_key(press(KeyCode::Down), None);
         assert_eq!(app.raw_modal.as_ref().unwrap().scroll, 1);
@@ -4236,10 +4414,13 @@ mod tests {
         let key = seed_one_hit(&mut app);
         app.raw_modal = Some(RawModal {
             key: key.clone(),
+            id: 7,
             title: String::new(),
-            tab: RawTab::Request,
+            tab: 0,
             scroll: 0,
+            hscroll: 0,
             spin: 0,
+            flash: None,
             state: RawModalState::Loading,
         });
         // A stale delivery for a DIFFERENT key is ignored.
@@ -4695,6 +4876,7 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             tui_effects: true,
+            gradient: ui::GradientCfg::default(),
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),

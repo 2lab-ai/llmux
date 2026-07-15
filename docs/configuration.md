@@ -144,6 +144,23 @@ This differs from demo mode: demo mode uses stable fake identities and suppresse
 
 `tui_effects` (default `true`) gates the dashboard's cosmetic animations: the `max` effort token's rainbow marquee and the headline-model name gradient (`fable-5*`, `gpt-5.6-sol*`). Set it to `false` for a calmer board — those tokens keep a distinct static color and bold instead of cycling. Working spinners animate regardless of this setting. Like `email_anonymous`, the flag is carried on the dashboard document so both the local TUI and `llmux attach` honor it.
 
+`tui_gradient` tunes those gradients (all fields optional; shown with defaults):
+
+```json
+"tui_gradient": {
+  "speed": 1.0,
+  "claude": "#ff79c6",
+  "codex": "#56dcdc",
+  "max_effort": null
+}
+```
+
+- `speed` multiplies how fast both gradients drift (`2.0` = twice as fast, `0.5` = half; non-positive or non-finite values fall back to `1.0`).
+- `claude` / `codex` are the `#rrggbb` base colors the headline-model gradient breathes around, per backend group (unparseable values fall back to the defaults).
+- `max_effort`, when set to a `#rrggbb` color, replaces the `max` effort token's rainbow with a solid gradient on that color; `null`/absent keeps the rainbow.
+
+Like `tui_effects`, the resolved settings ride the dashboard document, so `llmux attach` renders them identically. Read at daemon startup.
+
 ## Account types
 
 | Type | Added by | Meaning |
