@@ -72,6 +72,12 @@ pub(crate) struct InFlight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletedBody {
     Request {
+        /// The request's activity id — the correlation key into the raw-io
+        /// log (`raw-io.jsonl`) for the raw request/response viewer. A
+        /// per-process counter (1-based; resets on daemon restart), so raw
+        /// lookups pair it with the completion timestamp. `0` = unknown
+        /// (an attach doc from a pre-UI-7 daemon).
+        id: u64,
         method: String,
         path: String,
         account: Option<String>,
@@ -1771,6 +1777,7 @@ impl ActivityLog {
                 self.push(Completed {
                     at: now,
                     body: CompletedBody::Request {
+                        id,
                         method,
                         path,
                         account,

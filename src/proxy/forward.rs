@@ -332,14 +332,18 @@ impl ForwardContext {
     /// buffered terminal points (codex aggregate, codex error, the JSON relay
     /// path). The streaming relays capture inside their `finish` closures with
     /// the teed bytes instead, because `ctx` is moved into the closure there.
-    /// `response` is the body delivered to the client (or the error body). A
-    /// `None` path makes this a complete no-op.
+    /// `response` is the body delivered to the client (or the error body).
+    /// `upstream` is the proxy→API half of a TRANSLATED exchange (`None` on
+    /// the byte-identity passthrough — the 2-payload case). A `None` path
+    /// makes this a complete no-op.
     fn capture_raw_io(
         &self,
         state: &AppState,
         account: Option<&AccountId>,
         status: StatusCode,
         response: &[u8],
+        response_headers: Option<&HeaderMap>,
+        upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
     ) {
         let Some(path) = self.raw_io_path(state) else {
             return;
@@ -355,6 +359,9 @@ impl ForwardContext {
             &self.body,
             response,
             state.config.raw_io.max_body_bytes,
+            Some(redacted_header_pairs(&self.headers)),
+            response_headers.map(redacted_header_pairs),
+            upstream,
         );
     }
 
@@ -444,6 +451,75 @@ fn format_headers(headers: &HeaderMap) -> String {
         .map(|(name, value)| format!("  {name}: {}", value.to_str().unwrap_or("<binary>")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Substrings that mark a header NAME as credential-shaped: its VALUE is
+/// redacted before raw-io capture. The name stays visible — the raw viewer
+/// still shows the header was sent, CDT-style — but the secret never lands
+/// on disk.
+const REDACTED_NAME_MARKS: [&str; 5] = ["auth", "key", "token", "secret", "cookie"];
+
+/// Whether a header's value must be redacted from raw-io capture, by name
+/// (lowercase per `HeaderName`). A substring heuristic instead of a fixed
+/// name list (trinity review R2): the known llmux inbound surface is
+/// `authorization` / `x-api-key` / cookies, but a future backend introducing
+/// e.g. `x-goog-api-key` or `x-amz-security-token` must fail SAFE (redacted)
+/// rather than silently persist to the append-only log until someone
+/// remembers to extend a list.
+fn header_is_sensitive(name: &str) -> bool {
+    REDACTED_NAME_MARKS.iter().any(|mark| name.contains(mark))
+}
+
+/// Flatten a header map into `(name, value)` pairs in wire order for raw-io
+/// capture, redacting credential values ([`header_is_sensitive`]) and
+/// rendering non-UTF-8 values as a placeholder. Pure; never panics.
+pub(crate) fn redacted_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let v = if header_is_sensitive(name.as_str()) {
+                "•••redacted".to_string()
+            } else {
+                value.to_str().unwrap_or("<non-utf8>").to_string()
+            };
+            (name.as_str().to_string(), v)
+        })
+        .collect()
+}
+
+/// The proxy→API request half, captured at dispatch for raw-io's 4-payload
+/// viewer (UI-8). Built ONLY on the translate path (codex/grok — the proxy
+/// rewrites the payload there) and only while capture is enabled; the claude
+/// passthrough forwards the client's bytes verbatim, so it stays `None` and
+/// the raw viewer renders 2 payloads. Headers arrive pre-redacted; the `Bytes`
+/// body clone is refcounted (cheap).
+struct UpstreamMeta {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+}
+
+impl UpstreamMeta {
+    /// Join this request half with the upstream RESPONSE half observed at the
+    /// terminal capture point. `response_body` must already be bounded
+    /// (`raw_io::bounded_body` / `bounded_body_streamed`).
+    fn into_raw(
+        self,
+        max_body_bytes: usize,
+        response_body: Option<String>,
+        response_headers: Option<Vec<(String, String)>>,
+    ) -> crate::proxy::raw_io::UpstreamRaw {
+        crate::proxy::raw_io::UpstreamRaw {
+            url: Some(self.url),
+            request_body: Some(crate::proxy::raw_io::bounded_body(
+                &self.body,
+                max_body_bytes,
+            )),
+            request_headers: Some(self.headers),
+            response_body,
+            response_headers,
+        }
+    }
 }
 
 fn body_excerpt(body: &[u8]) -> String {
@@ -1005,6 +1081,21 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
             }
         };
+        // Raw-io 4-payload capture (UI-8): on the translate path the proxy
+        // REWRITES the payload, so the upstream request differs from the
+        // client's — keep the rewritten half for the raw viewer. The
+        // passthrough forwards the client's bytes verbatim → `None` (the
+        // 2-payload case). Built only when capture is on (`Bytes` clone is
+        // refcounted — cheap either way).
+        let upstream_meta = if is_translate && ctx.raw_io_path(state).is_some() {
+            Some(UpstreamMeta {
+                url: format!("{}{}", endpoint.trim_end_matches('/'), upstream_req.path),
+                headers: redacted_header_pairs(&upstream_req.headers),
+                body: upstream_req.body.clone(),
+            })
+        } else {
+            None
+        };
         if ctx.log_enabled {
             ctx.log(format!(
                 "=== REQUEST (account: {account}, switches: {switches}) ===\n{} {}{}\n{}",
@@ -1071,8 +1162,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             UpstreamSignal::Relay => {
                 return match translate_stream {
                     Some(client_stream) => {
-                        relay_translate(state, ctx, lease, account, response, client_stream, served)
-                            .await
+                        relay_translate(
+                            state,
+                            ctx,
+                            lease,
+                            account,
+                            response,
+                            client_stream,
+                            served,
+                            upstream_meta,
+                        )
+                        .await
                     }
                     None => relay(state, ctx, lease, account, response).await,
                 };
@@ -1823,6 +1923,12 @@ async fn relay(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        let raw_io_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&headers));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
@@ -1848,6 +1954,9 @@ async fn relay(
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
+                    None, // byte-identity passthrough — client IS the upstream exchange
                 );
                 if log_enabled {
                     sections.push(format!(
@@ -1909,7 +2018,9 @@ async fn relay(
         ctx.flush_log(state);
         // Raw-io capture (Feature B): the full non-streaming body, already
         // materialized to relay it — no extra read, no hot-path effect.
-        ctx.capture_raw_io(state, Some(&account), status, &bytes);
+        // Byte-identity passthrough: client and upstream exchange are the same
+        // bytes → no separate upstream half (2-payload case).
+        ctx.capture_raw_io(state, Some(&account), status, &bytes, Some(&headers), None);
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
@@ -1963,6 +2074,7 @@ fn translate_count_tokens_response(
 /// with a clean Anthropic `error` event from the converter. Non-2xx bodies
 /// are wrapped into Anthropic error shapes — upstream bytes are NEVER relayed
 /// verbatim (the client speaks the Anthropic wire format only).
+#[allow(clippy::too_many_arguments)]
 async fn relay_translate(
     state: &AppState,
     ctx: &mut ForwardContext,
@@ -1971,6 +2083,7 @@ async fn relay_translate(
     response: reqwest::Response,
     client_stream: bool,
     served: BackendGroup,
+    upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
     let status = response.status();
     // Request trace (best-effort): input breakdown captured now from the
@@ -2002,6 +2115,7 @@ async fn relay_translate(
     if !status.is_success() {
         // classify() already diverted 401/429/5xx; what lands here is a 4xx
         // error body — wrapped into an Anthropic-shaped error.
+        let error_headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
         ctx.log(format!(
             "=== RESPONSE BODY ({} bytes) ===\n{}",
@@ -2019,15 +2133,47 @@ async fn relay_translate(
             0,
             ctx.started.elapsed().as_millis(),
         );
-        // Raw-io capture: request + the upstream error body (already read).
-        ctx.capture_raw_io(state, Some(&account), out_status, &bytes);
+        // Raw-io 4-payload capture: the CLIENT leg is the Anthropic-shaped
+        // error the client actually receives (built once below and returned),
+        // NOT the provider's verbatim bytes — those are the exchange llmux
+        // never forwards. The upstream half carries the rewritten request +
+        // the provider's real error reply.
+        let max_body = state.config.raw_io.max_body_bytes;
+        let upstream_raw = upstream_meta.map(|m| {
+            m.into_raw(
+                max_body,
+                Some(crate::proxy::raw_io::bounded_body(&bytes, max_body)),
+                Some(redacted_header_pairs(&error_headers)),
+            )
+        });
+        let client_message = format!("{served} upstream: {}", body_excerpt(&bytes));
+        let client_json = serde_json::json!({
+            "type": "error",
+            "error": { "type": error_type, "message": client_message },
+        })
+        .to_string();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        ctx.capture_raw_io(
+            state,
+            Some(&account),
+            out_status,
+            client_json.as_bytes(),
+            Some(&client_headers),
+            upstream_raw,
+        );
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
-        return error_response(
-            out_status,
-            error_type,
-            &format!("{served} upstream: {}", body_excerpt(&bytes)),
+        let mut client_error = Response::new(axum::body::Body::from(client_json));
+        *client_error.status_mut() = out_status;
+        client_error.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
         );
+        return client_error;
     }
 
     if client_stream {
@@ -2069,20 +2215,62 @@ async fn relay_translate(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        // 4-payload split (UI-8): the transform relay synthesizes its own SSE
+        // response, so the CLIENT response headers are the synthesized ones
+        // (mirroring what `out` sets below); the upstream's real headers
+        // (request ids, ratelimits) ride in the record's `upstream` half.
+        let raw_io_res_headers = raw_io_path.as_ref().map(|_| {
+            vec![
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("cache-control".to_string(), "no-cache".to_string()),
+            ]
+        });
+        let raw_io_upstream_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(response.headers()));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        // With capture off, a 0 tee limit keeps the relay from copying (and
+        // pinning up to 2×max_body_bytes of) stream bytes that `finish` would
+        // only throw away (hotpath review).
+        let raw_io_tee_limit = if raw_io_path.is_some() {
+            raw_io_max_body
+        } else {
+            0
+        };
         let body = sse::transform_body(
             response,
             converter,
             BODY_LOG_LIMIT,
-            raw_io_max_body,
-            move |usage, captured, raw_captured, error, converter, client_gone| {
+            raw_io_tee_limit,
+            move |usage,
+                  captured,
+                  raw_captured,
+                  upstream_captured,
+                  error,
+                  converter,
+                  client_gone| {
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
                 // `raw_captured` carries the bounded prefix + the total emitted
                 // length, so an over-cap body is marker-truncated accurately.
+                // The upstream half joins the rewritten request with the
+                // verbatim pre-transform reply tee (same bounded shape).
+                let upstream_raw = upstream_meta.map(|m| {
+                    m.into_raw(
+                        raw_io_max_body,
+                        Some(crate::proxy::raw_io::bounded_body_streamed(
+                            upstream_captured.bytes(),
+                            upstream_captured.total(),
+                        )),
+                        raw_io_upstream_res_headers,
+                    )
+                });
                 crate::proxy::raw_io::capture_streamed(
                     raw_io_path.as_deref(),
                     activity_id,
@@ -2094,6 +2282,9 @@ async fn relay_translate(
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
+                    upstream_raw,
                 );
                 // Codex trace: terminal outcome of the streamed request. A
                 // client disconnect mid-stream, an upstream stream error, or a
@@ -2164,11 +2355,24 @@ async fn relay_translate(
         BackendGroup::Grok => state.grok.converter(),
         _ => state.codex.converter(),
     };
+    // Cloned before `bytes_stream()` consumes the response — the aggregate
+    // raw-io capture below wants the upstream response headers.
+    let upstream_headers = response.headers().clone();
+    // Upstream tee (UI-8, 4-payload): the verbatim pre-transform reply, bounded
+    // like every other raw-io body. Only observed when capture is on.
+    let raw_io_max_body = state.config.raw_io.max_body_bytes;
+    let mut upstream_tee = ctx
+        .raw_io_path(state)
+        .is_some()
+        .then(|| sse::RawCapture::new(raw_io_max_body));
     let mut events = sse::EventBuffer::new();
     let mut stream = Box::pin(response.bytes_stream());
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => {
+                if let Some(tee) = upstream_tee.as_mut() {
+                    tee.push(&chunk);
+                }
                 for event in events.push(&chunk) {
                     let _ = converter.on_event(&event);
                 }
@@ -2212,13 +2416,31 @@ async fn relay_translate(
                 trace_duration_ms,
             );
             // Raw-io capture: request + the aggregated Messages JSON the client
-            // receives.
+            // receives. Client response headers are the synthesized ones
+            // (mirroring `out` below); the upstream's real headers + verbatim
+            // pre-transform reply ride in the record's `upstream` half (UI-8).
             let message_bytes = message.to_string();
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let upstream_raw = upstream_meta.map(|m| {
+                m.into_raw(
+                    raw_io_max_body,
+                    upstream_tee.take().map(|tee| {
+                        crate::proxy::raw_io::bounded_body_streamed(tee.bytes(), tee.total())
+                    }),
+                    Some(redacted_header_pairs(&upstream_headers)),
+                )
+            });
             ctx.capture_raw_io(
                 state,
                 Some(&account),
                 StatusCode::OK,
                 message_bytes.as_bytes(),
+                Some(&client_headers),
+                upstream_raw,
             );
             ctx.emit_finished(
                 state,
@@ -2296,6 +2518,52 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn redacted_header_pairs_hide_credentials_keep_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-secret"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let pairs = redacted_header_pairs(&headers);
+        let get = |n: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-type"), Some("application/json"));
+        assert_eq!(get("anthropic-version"), Some("2023-06-01"));
+        // Credential VALUES never reach the record; the names stay visible.
+        assert_eq!(get("x-api-key"), Some("•••redacted"));
+        assert_eq!(get("authorization"), Some("•••redacted"));
+        // The name heuristic fails SAFE on credential headers llmux does not
+        // (yet) receive — no silent persistence when a new backend shows up.
+        let mut extra = HeaderMap::new();
+        extra.insert("x-goog-api-key", HeaderValue::from_static("g-secret"));
+        extra.insert("x-amz-security-token", HeaderValue::from_static("a-tok"));
+        extra.insert("x-auth-token", HeaderValue::from_static("t"));
+        extra.insert("request-id", HeaderValue::from_static("req_1"));
+        let extra_pairs = redacted_header_pairs(&extra);
+        let get2 = |n: &str| {
+            extra_pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get2("x-goog-api-key"), Some("•••redacted"));
+        assert_eq!(get2("x-amz-security-token"), Some("•••redacted"));
+        assert_eq!(get2("x-auth-token"), Some("•••redacted"));
+        assert_eq!(
+            get2("request-id"),
+            Some("req_1"),
+            "benign names stay visible"
+        );
+        assert!(pairs
+            .iter()
+            .all(|(_, v)| !v.contains("secret") && !v.contains("tok")));
+    }
     use crate::config::{AccountConfig, Config};
     use crate::proxy::server::AppState;
     use crate::scheduler::AccountPool;

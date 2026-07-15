@@ -567,6 +567,7 @@ mod tests {
             codex: Default::default(),
             email_anonymous: false,
             tui_effects: true,
+            gradient: crate::tui::ui::GradientCfg::default(),
             show_fable_weekly: false,
             domain_abbrev: BTreeMap::new(),
             quota_display: Default::default(),
@@ -658,6 +659,7 @@ mod tests {
         Completed {
             at: UNIX_EPOCH + Duration::from_secs(at_secs),
             body: CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: path.into(),
                 account: Some("a@x".into()),

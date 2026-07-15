@@ -90,6 +90,13 @@ pub struct Config {
     /// field loads with effects ON.
     #[serde(default = "default_true")]
     pub tui_effects: bool,
+    /// TUI gradient animation tuning (UI-8): drift speed + per-group base
+    /// colors for the headline-model gradient, and an optional solid override
+    /// for the `max` effort token. Display-only, carried on the dashboard
+    /// document like `tui_effects` so both TUI backends honor it. Additive
+    /// (`#[serde(default)]`): older configs load the defaults.
+    #[serde(default)]
+    pub tui_gradient: TuiGradient,
     /// Render the model-scoped "Fable" weekly gauge in the dashboard accounts
     /// table (fable-usage U9a). Display-only, default ON. This feature is
     /// TEMPORARY — the upstream Fable weekly limit is expected to disappear
@@ -252,6 +259,7 @@ impl Default for Config {
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
             tui_effects: true,
+            tui_gradient: TuiGradient::default(),
             show_fable_weekly: true,
             domain_abbrev: default_domain_abbrev(),
             quota_display: QuotaDisplay::default(),
@@ -310,6 +318,60 @@ impl Default for RawIoConfig {
             max_body_bytes: default_raw_io_max_body_bytes(),
         }
     }
+}
+
+/// TUI gradient animation tuning (UI-8): how fast the headline-model /
+/// max-effort gradients drift and which base colors the solid (per-group)
+/// gradient breathes. Display-only — carried on the dashboard document (like
+/// `tui_effects`) so the local AND attach TUIs honor it; read at boot from
+/// the config file.
+///
+/// ```json
+/// "tui_gradient": { "speed": 2.0, "claude": "#ff79c6", "codex": "#56dcdc" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuiGradient {
+    /// Speed multiplier for the temporal drift of BOTH gradient modes.
+    /// `1.0` (default) is the baseline drift; `2.0` doubles it, `0.5` halves
+    /// it. Non-finite or non-positive values fall back to `1.0` at render
+    /// time (the TUI never freezes on a bad config).
+    #[serde(default = "default_gradient_speed")]
+    pub speed: f32,
+    /// Base color (hex `#rrggbb`) the claude headline-model gradient breathes
+    /// around. Unparseable values fall back to the built-in default.
+    #[serde(default = "default_gradient_claude")]
+    pub claude: String,
+    /// Base color (hex `#rrggbb`) for the codex headline-model gradient.
+    #[serde(default = "default_gradient_codex")]
+    pub codex: String,
+    /// Optional hex base for the `max` effort token: when set, the rainbow is
+    /// replaced by a solid gradient on this color; `None` (default) keeps the
+    /// 3-phase sine rainbow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_effort: Option<String>,
+}
+
+impl Default for TuiGradient {
+    fn default() -> Self {
+        Self {
+            speed: default_gradient_speed(),
+            claude: default_gradient_claude(),
+            codex: default_gradient_codex(),
+            max_effort: None,
+        }
+    }
+}
+
+fn default_gradient_speed() -> f32 {
+    1.0
+}
+
+fn default_gradient_claude() -> String {
+    "#ff79c6".to_string()
+}
+
+fn default_gradient_codex() -> String {
+    "#56dcdc".to_string()
 }
 
 /// Model→backend-group routing config. When `enabled` is false (the

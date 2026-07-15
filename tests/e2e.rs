@@ -1599,6 +1599,315 @@ async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Respons
     request.send().await.expect("dashboard reachable")
 }
 
+/// A driven request is captured to raw-io (bodies + headers with credential
+/// values redacted) and `GET /llmux/raw-io?id=&at_ms=` serves it back — the
+/// raw request/response viewer's data path (TUI UI-7), proven end to end:
+/// forward capture → jsonl → backwards lookup → endpoint.
+#[tokio::test]
+async fn raw_io_endpoint_serves_the_captured_exchange() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok_with(
+        r#"{"id":"msg_raw","type":"message","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        (0.20, 3_600),
+        (0.20, 12 * 3_600),
+    ));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"model":"claude-opus-4-8"}"#).await;
+    assert_eq!(response.status(), 200);
+
+    // Read the completed entry's (id, at_ms) — the raw-io correlation pair the
+    // TUI clicks with — off the dashboard document.
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"]
+                .as_u64()
+                .expect("completed entries carry the id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "the completed doc entry carries a live activity id");
+
+    // The endpoint returns the captured exchange for that (id, at_ms) pair.
+    let raw: serde_json::Value = client
+        .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable")
+        .error_for_status()
+        .expect("raw-io 200")
+        .json()
+        .await
+        .expect("raw-io json");
+    assert_eq!(raw["id"].as_u64(), Some(id));
+    assert!(
+        raw["request_body"]
+            .as_str()
+            .expect("request body")
+            .contains("claude-opus-4-8"),
+        "verbatim request body served: {raw}"
+    );
+    assert!(
+        raw["response_body"]
+            .as_str()
+            .expect("response body")
+            .contains("msg_raw"),
+        "response body as delivered to the client: {raw}"
+    );
+    // Request headers captured in wire order; the client credential value is
+    // REDACTED while its name stays visible.
+    let req_headers = raw["request_headers"].as_array().expect("request headers");
+    let header = |n: &str| {
+        req_headers
+            .iter()
+            .find(|p| p[0] == n)
+            .map(|p| p[1].as_str().unwrap().to_string())
+    };
+    assert_eq!(header("content-type").as_deref(), Some("application/json"));
+    assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+    assert_eq!(header("x-api-key").as_deref(), Some("•••redacted"));
+    assert!(
+        raw["response_headers"].as_array().is_some(),
+        "response headers captured: {raw}"
+    );
+    // The claude passthrough is byte-identity — no separate upstream half
+    // (the raw viewer's 2-payload case, UI-8).
+    assert!(
+        raw["upstream"].is_null(),
+        "passthrough records carry no upstream half: {raw}"
+    );
+
+    // An unknown id (or an id from another daemon run's window) is a 404.
+    let miss = client
+        .get(proxy.url(&format!("/llmux/raw-io?id=777777&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable");
+    assert_eq!(miss.status(), 404);
+}
+
+/// A TRANSLATED (codex) exchange captures all four payload legs (UI-8): the
+/// client request, the REWRITTEN Responses-API request llmux sent upstream,
+/// the verbatim upstream reply BEFORE transformation, and the Anthropic-SSE
+/// response delivered to the client — with upstream credentials redacted.
+#[tokio::test]
+async fn raw_io_translated_exchange_captures_the_upstream_half() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 64));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    // Drain the client stream so the relay finishes and flushes the record.
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    assert!(body.contains("message_start"), "anthropic SSE out:\n{body}");
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().expect("id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "completed entry landed on the dashboard");
+
+    // The record may flush a beat after the activity event — poll briefly.
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let response = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .send()
+            .await
+            .expect("raw-io reachable");
+        if response.status().is_success() {
+            raw = response.json().await.expect("raw-io json");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let upstream = &raw["upstream"];
+    assert!(
+        upstream.is_object(),
+        "translated exchange carries the upstream half: {raw}"
+    );
+    assert!(
+        upstream["url"]
+            .as_str()
+            .expect("upstream url")
+            .contains("/responses"),
+        "rewritten target URL: {upstream}"
+    );
+    assert!(
+        upstream["request_body"]
+            .as_str()
+            .expect("upstream request body")
+            .contains("\"input\""),
+        "the REWRITTEN Responses-API body, not the client's: {upstream}"
+    );
+    assert!(
+        upstream["response_body"]
+            .as_str()
+            .expect("upstream response body")
+            .contains("response.completed"),
+        "verbatim pre-transform upstream reply: {upstream}"
+    );
+    let up_req_headers = upstream["request_headers"]
+        .as_array()
+        .expect("upstream request headers");
+    let auth = up_req_headers
+        .iter()
+        .find(|p| p[0] == "authorization")
+        .map(|p| p[1].as_str().unwrap().to_string());
+    assert_eq!(
+        auth.as_deref(),
+        Some("•••redacted"),
+        "upstream bearer never lands on disk: {upstream}"
+    );
+    // Client legs keep their own shapes: verbatim inbound body, synthesized
+    // outbound headers (the transform relay writes its own SSE response).
+    assert!(raw["request_body"]
+        .as_str()
+        .expect("client request body")
+        .contains("claude-sonnet-4-5"));
+    assert!(raw["response_body"]
+        .as_str()
+        .expect("client response body")
+        .contains("message_start"));
+    let res_headers = raw["response_headers"]
+        .as_array()
+        .expect("client response headers");
+    assert!(
+        res_headers
+            .iter()
+            .any(|p| p[0] == "content-type" && p[1] == "text/event-stream"),
+        "client response headers are the synthesized SSE ones: {raw}"
+    );
+}
+
+/// A translated (codex) 4xx: the raw record's CLIENT `Response` leg must hold
+/// the Anthropic-shaped error llmux SYNTHESIZED for the client — not the
+/// provider's verbatim body, which belongs only in the upstream half (UI-8
+/// fidelity fix: the 4-leg trace must not duplicate the provider error into
+/// the client leg).
+#[tokio::test]
+async fn raw_io_translated_4xx_client_leg_is_the_synthesized_error() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 400,
+        body: r#"{"error":{"type":"invalid_request","message":"provider-side detail 0xDEADBEEF"}}"#
+            .to_string(),
+    });
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 400, "client sees the wrapped 4xx");
+    let client_body = String::from_utf8(response.bytes().await.unwrap().to_vec()).unwrap();
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None).await.json().await.unwrap();
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().unwrap();
+            at_ms = entry["at_ms"].as_u64().unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0);
+
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let r = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .send()
+            .await
+            .unwrap();
+        if r.status().is_success() {
+            raw = r.json().await.unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Client leg == what the client received (the synthesized wrapper),
+    // NOT the provider's raw body.
+    assert_eq!(
+        raw["response_body"].as_str().unwrap(),
+        client_body,
+        "client Response leg mirrors the delivered wrapper: {raw}"
+    );
+    // The client leg is the WRAPPED Anthropic error llmux synthesized
+    // (`type: error` + `invalid_request_error`), not the provider's bare
+    // shape. llmux does surface the provider detail inside the wrapper's
+    // message — that's what the client genuinely received.
+    let client_leg: serde_json::Value =
+        serde_json::from_str(raw["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        client_leg["type"], "error",
+        "synthesized Anthropic error shape"
+    );
+    assert_eq!(client_leg["error"]["type"], "invalid_request_error");
+    // The upstream leg is the provider's BARE body (its own error shape),
+    // distinct from the client wrapper — the 4 legs are not duplicates.
+    let up = &raw["upstream"];
+    let up_body: serde_json::Value =
+        serde_json::from_str(up["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        up_body["error"]["type"], "invalid_request",
+        "upstream leg keeps the provider's own error shape: {up}"
+    );
+    assert!(
+        up["response_body"].as_str().unwrap().contains("0xDEADBEEF"),
+        "provider detail present in the upstream leg: {up}"
+    );
+    assert_ne!(
+        raw["response_body"].as_str().unwrap(),
+        up["response_body"].as_str().unwrap(),
+        "client and upstream legs are distinct payloads, not a duplicate"
+    );
+}
+
 /// The dashboard endpoint serves a status superset: accounts in selection
 /// order, the meta fields (version/pid/port/uptime/upstream/config_path),
 /// the activity tail (a driven request shows up as completed), the scheduler

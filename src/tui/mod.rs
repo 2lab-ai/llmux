@@ -27,6 +27,7 @@
 
 pub(crate) mod activity;
 mod anim;
+mod clip;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
 // `llmux status` output and the dashboard agree on the display.
@@ -368,6 +369,10 @@ pub(crate) struct Chrome {
     /// the stored key every frame, so it works identically in local and attach
     /// mode and closes gracefully when the entry ages out of the ring.
     pub input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7), or `None` when
+    /// closed. Content-owning (cheap to clone — the body lines sit behind an
+    /// `Arc`), drawn last like the input modal.
+    pub raw_modal: Option<RawModal>,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -378,6 +383,88 @@ pub(crate) struct Chrome {
 pub(crate) struct InputModal {
     pub key: activity::ActivityKey,
     pub scroll: u16,
+}
+
+/// Content state of the raw viewer: the fetch is asynchronous (a backwards
+/// scan of a possibly-huge `raw-io.jsonl`, or an HTTP round-trip in attach
+/// mode), so the modal opens Loading and resolves to Ready/Failed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RawModalState {
+    Loading,
+    Failed(String),
+    /// Prebuilt per-tab lines behind an `Arc` — `Chrome` is cloned every
+    /// frame, and a Ready body can be megabytes of styled lines.
+    Ready(std::sync::Arc<ui::RawContent>),
+}
+
+/// The click-opened raw request/response viewer (UI-7). Unlike [`InputModal`]
+/// it owns its content (fetched once) — it never goes stale and survives the
+/// entry aging out of the activity ring.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawModal {
+    pub key: activity::ActivityKey,
+    /// Activity id, used by the save-file names (`llmux-raw-<id>…`).
+    pub id: u64,
+    /// Monotonic open-generation (UI-8): bumped every time a modal opens, so a
+    /// stale background delivery (a slow raw fetch or a queued export) for a
+    /// PRIOR open can't land on the modal the user reopened. Keyed on this,
+    /// not just [`ActivityKey`] — the key omits the activity id and a
+    /// close→reopen of the SAME row would otherwise accept the old fetch.
+    pub generation: u64,
+    pub title: String,
+    /// Index into the Ready content's tab list (2 or 4 tabs, UI-8); clamped
+    /// at draw/use time so a stale index can never panic.
+    pub tab: usize,
+    pub scroll: u16,
+    /// Horizontal pan in display cells (UI-8; clamped like `scroll`).
+    pub hscroll: u16,
+    /// Animation frame for the Loading spinner (advances with the shared tick).
+    pub spin: usize,
+    /// Action feedback ("copied … → pbcopy" / "saved → …"), shown in place of
+    /// the key legend until it expires (drawn ~3 s).
+    pub flash: Option<(String, std::time::Instant)>,
+    pub state: RawModalState,
+}
+
+/// A queued raw-record fetch: the clicked entry's stable key (its `at_ms` is
+/// the timestamp half of the raw-io lookup), the activity id, and what the
+/// content builder needs from open time (general lines + curl context).
+struct RawFetchReq {
+    generation: u64,
+    id: u64,
+    general: ui::RawGeneral,
+    /// The lookup key's timestamp half (the record's `at_ms`).
+    at_ms: u64,
+}
+
+/// Result of a background raw fetch, delivered on the raw channel.
+struct RawLoad {
+    generation: u64,
+    result: Result<std::sync::Arc<ui::RawContent>, String>,
+}
+
+/// A queued export (copy/save) action (UI-8): run on the blocking pool so a
+/// wedged clipboard tool or a slow Downloads mount can never freeze the TUI
+/// event loop. Carries the modal generation so a late result flashes only on
+/// the modal that requested it.
+struct ClipReq {
+    generation: u64,
+    button: ui::RawButton,
+    id: u64,
+    /// Prebuilt payload for the chosen action (body / curl / all / record).
+    payload: String,
+    /// File-name label for the save actions (tab slug, empty for save-all).
+    label: String,
+    /// Whether this action writes a file (vs. copies to the clipboard).
+    is_save: bool,
+    /// File extension for a save action.
+    ext: &'static str,
+}
+
+/// Outcome of a background export, delivered on the clip channel.
+struct ClipResult {
+    generation: u64,
+    message: String,
 }
 
 /// Attach-mode banner state.
@@ -508,6 +595,10 @@ struct App {
     /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
     /// one rect per tab label. Same record/read cycle as `activity_chrome`.
     tab_chrome: Vec<ui::TabHit>,
+    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
+    /// payload-tab rects + top-right action buttons. Same record/read cycle
+    /// as `activity_chrome`; empty while the modal is closed.
+    raw_chrome: ui::RawModalChrome,
     /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
     /// top-border row of a pane, dragging it resizes the pane ABOVE it.
     separator_chrome: Vec<ui::SeparatorHit>,
@@ -587,6 +678,30 @@ struct App {
     /// scroll offset is clamped after each draw against the wrapped line count
     /// the render pass reports (`MainChrome::input_modal_max_scroll`).
     input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7); `None` when closed.
+    raw_modal: Option<RawModal>,
+    /// A queued raw-record fetch, drained by the event loop into a background
+    /// task (same pattern as the other `pending_*` remote ops).
+    pending_raw: Option<RawFetchReq>,
+    /// Sender the background raw fetch delivers its [`RawLoad`] on; installed
+    /// by the event loop (mirrors `sessions_tx`).
+    raw_tx: Option<mpsc::Sender<RawLoad>>,
+    /// Monotonic raw-modal open counter (UI-8); the next modal's generation.
+    raw_generation: u64,
+    /// Queued exports (UI-8 copy/save), dispatched SINGLE-FLIGHT and in order.
+    /// A `VecDeque`, not a single slot: two export actions in one input burst
+    /// (ready events drain before the event loop spawns them) must both run —
+    /// a single `Option` silently dropped the earlier one. But the loop spawns
+    /// only ONE at a time (`clip_inflight`), so clipboard writes execute in
+    /// press order (last-writer is the last press, not a race) and a slow/
+    /// wedged exporter applies backpressure instead of piling unbounded work
+    /// onto the blocking pool. Capped at [`CLIP_QUEUE_MAX`].
+    pending_clip: std::collections::VecDeque<ClipReq>,
+    /// True while one export runs on the blocking pool; cleared when its
+    /// [`ClipResult`] arrives. Gates the next dispatch (single-flight).
+    clip_inflight: bool,
+    /// Sender the background export delivers its [`ClipResult`] on.
+    clip_tx: Option<mpsc::Sender<ClipResult>>,
 }
 
 impl App {
@@ -609,6 +724,7 @@ impl App {
             history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
+            raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
@@ -632,6 +748,13 @@ impl App {
             usage_gran: activity::UsageGran::default(),
             usage_scroll: 0,
             input_modal: None,
+            raw_modal: None,
+            pending_raw: None,
+            raw_tx: None,
+            raw_generation: 0,
+            pending_clip: std::collections::VecDeque::new(),
+            clip_inflight: false,
+            clip_tx: None,
             reset_absolute: false,
         }
     }
@@ -834,6 +957,12 @@ impl App {
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
             input_modal: self.input_modal.clone(),
+            // The Loading spinner rides the shared frame counter (set here so
+            // the stored modal itself never needs a per-tick mutation).
+            raw_modal: self.raw_modal.clone().map(|mut m| {
+                m.spin = self.frame;
+                m
+            }),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -897,6 +1026,11 @@ impl App {
             self.on_key_input_modal(key.code);
             return;
         }
+        // The raw viewer (UI-7) swallows keys the same way when open.
+        if self.raw_modal.is_some() {
+            self.on_key_raw_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -945,6 +1079,60 @@ impl App {
                 MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(1),
                 MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(1),
                 _ => {}
+            }
+            return true;
+        }
+        // The raw viewer (UI-7) owns the mouse the same way when open; UI-8
+        // adds clickable payload tabs + the top-right action buttons and a
+        // horizontal wheel pan.
+        if self.raw_modal.is_some() {
+            let hit = |r: &ratatui::layout::Rect| {
+                mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let button = self
+                        .raw_chrome
+                        .buttons
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(b, _)| b);
+                    let tab = self
+                        .raw_chrome
+                        .tabs
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(i, _)| i);
+                    if let Some(btn) = button {
+                        self.raw_modal_action(btn);
+                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
+                        modal.tab = idx;
+                        modal.scroll = 0;
+                        modal.hscroll = 0;
+                    }
+                }
+                kind => {
+                    if let Some(modal) = self.raw_modal.as_mut() {
+                        match kind {
+                            MouseEventKind::ScrollUp => {
+                                modal.scroll = modal.scroll.saturating_sub(3)
+                            }
+                            MouseEventKind::ScrollDown => {
+                                modal.scroll = modal.scroll.saturating_add(3)
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN)
+                            }
+                            MouseEventKind::ScrollRight => {
+                                modal.hscroll = modal.hscroll.saturating_add(RAW_PAN)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             return true;
         }
@@ -1069,6 +1257,12 @@ impl App {
                         self.open_input_modal(key);
                         true
                     }
+                    // Clicking the `🔍 request` detail line opens the raw
+                    // request/response viewer (UI-7).
+                    Some(ui::ActivityClick::OpenRaw(key, id)) => {
+                        self.open_raw_modal(key, id, view);
+                        true
+                    }
                     Some(ui::ActivityClick::Entry(key)) => {
                         self.toggle_expand(key);
                         true
@@ -1163,6 +1357,391 @@ impl App {
             KeyCode::End => modal.scroll = u16::MAX,
             _ => {}
         }
+    }
+
+    /// Open the raw request/response viewer (UI-7) on the clicked entry: build
+    /// the title + general metadata from the entry NOW (it may age out of the
+    /// ring while we fetch), queue the background raw-io lookup, and show the
+    /// modal in its Loading state. An entry from a pre-UI-7 daemon (`id == 0`)
+    /// fails immediately — there is no raw correlation key to look up.
+    fn open_raw_modal(
+        &mut self,
+        key: activity::ActivityKey,
+        id: u64,
+        view: Option<&DashboardView>,
+    ) {
+        // Select by the activity id, NOT just the key: the key omits the id,
+        // so two requests completing in the same millisecond with the same
+        // method/path/status would otherwise both resolve to the first match
+        // and the viewer could show/export the wrong request's record. The id
+        // is unique within a live view snapshot (per-process counter).
+        let entry = view.and_then(|v| {
+            v.completed
+                .iter()
+                .find(|c| {
+                    matches!(&c.body, activity::CompletedBody::Request { id: eid, .. } if *eid == id)
+                        && c.activity_key().as_ref() == Some(&key)
+                })
+                .cloned()
+        });
+        let Some(entry) = entry else {
+            return; // row vanished between draw and click — nothing to open
+        };
+        let activity::CompletedBody::Request { id, .. } = entry.body else {
+            return;
+        };
+        // A fresh open-generation invalidates any still-in-flight delivery for
+        // the PRIOR modal (raw fetch or queued export).
+        self.raw_generation = self.raw_generation.wrapping_add(1);
+        let generation = self.raw_generation;
+        let title = format!(
+            " 🔍 raw — {} {} · {} · {} ",
+            key.method,
+            key.path,
+            key.status,
+            format::clock_hms_utc(entry.at),
+        );
+        let state = if id == 0 {
+            RawModalState::Failed(
+                "no raw link: this entry was recorded by a daemon predating the raw viewer"
+                    .to_string(),
+            )
+        } else {
+            // The curl builder needs the client base URL — the record stores
+            // only bodies/headers. Local mode targets this process's own
+            // listen port; attach mode the daemon it is attached to.
+            let base_url = match &self.backend {
+                Backend::Local(state) => {
+                    // The ACTUAL listener port, not `config.proxy.port` — a
+                    // `port = 0` config binds an OS-assigned port stored here,
+                    // so the curl target must read `bound_port` or it would
+                    // say `localhost:0`.
+                    let port = state.bound_port.load(std::sync::atomic::Ordering::Relaxed);
+                    format!("http://localhost:{port}")
+                }
+                Backend::Remote(remote) => remote.base_url.clone(),
+            };
+            self.pending_raw = Some(RawFetchReq {
+                generation,
+                id,
+                at_ms: key.at_ms,
+                general: ui::RawGeneral {
+                    lines: ui::raw_general_lines(&entry),
+                    method: key.method.clone(),
+                    path: key.path.clone(),
+                    base_url,
+                },
+            });
+            RawModalState::Loading
+        };
+        self.raw_modal = Some(RawModal {
+            key,
+            id,
+            generation,
+            title,
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state,
+        });
+    }
+
+    /// Key handling while the raw viewer is open (UI-7/UI-8): Esc/q/Enter
+    /// close, ←/→/Tab/h/l walk the payload tabs (both offsets reset — tabs
+    /// have independent sizes), arrows/PgUp/PgDn/Home/End scroll, H/L pan
+    /// horizontally, and c/C/a/s/S fire the copy/curl/copy-all/save/save-all
+    /// actions (same as the top-right buttons). Everything else is swallowed
+    /// so nothing leaks beneath the modal.
+    fn on_key_raw_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        let tab_count = match &modal.state {
+            RawModalState::Ready(content) => content.tabs.len().max(1),
+            _ => 1,
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.raw_modal = None,
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                modal.tab = (modal.tab + 1) % tab_count;
+                modal.scroll = 0;
+                modal.hscroll = 0;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                modal.tab = (modal.tab + tab_count - 1) % tab_count;
+                modal.scroll = 0;
+                modal.hscroll = 0;
+            }
+            KeyCode::Char('H') => modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN),
+            KeyCode::Char('L') => modal.hscroll = modal.hscroll.saturating_add(RAW_PAN),
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            KeyCode::Char('c') => self.raw_modal_action(ui::RawButton::Copy),
+            KeyCode::Char('C') => self.raw_modal_action(ui::RawButton::CopyCurl),
+            KeyCode::Char('a') => self.raw_modal_action(ui::RawButton::CopyAll),
+            KeyCode::Char('s') => self.raw_modal_action(ui::RawButton::Save),
+            KeyCode::Char('S') => self.raw_modal_action(ui::RawButton::SaveAll),
+            _ => {}
+        }
+    }
+
+    /// Queue one raw-viewer action button (UI-8) against the ACTIVE tab's
+    /// prebuilt payloads: the export itself (clipboard subprocess / file
+    /// write) runs on the blocking pool so a wedged clipboard tool or a slow
+    /// Downloads mount can never freeze the TUI event loop (the payload can be
+    /// tens of MiB). A not-yet-loaded modal flashes immediately; the real
+    /// outcome flashes when the background task reports back, gated on the
+    /// modal generation so a stale result never lands on a reopened modal.
+    fn raw_modal_action(&mut self, btn: ui::RawButton) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        let generation = modal.generation;
+        let id = modal.id;
+        let RawModalState::Ready(content) = &modal.state else {
+            modal.flash = Some((
+                "raw record not loaded yet".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        };
+        let Some(tab) = content
+            .tabs
+            .get(modal.tab.min(content.tabs.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let ext = |text: &str| {
+            if text.trim_start().starts_with(['{', '[']) {
+                "json"
+            } else {
+                "txt"
+            }
+        };
+        // Move the (possibly large) payload string into the queued request —
+        // built once here, consumed by the blocking task. No work on the UI
+        // thread beyond this clone.
+        let (payload, is_save, ext, label) = match btn {
+            ui::RawButton::Copy => (tab.body_text.clone(), false, "", String::new()),
+            ui::RawButton::CopyCurl => (tab.curl.clone(), false, "", String::new()),
+            ui::RawButton::CopyAll => (content.all_text.clone(), false, "", String::new()),
+            ui::RawButton::Save => (
+                tab.body_text.clone(),
+                true,
+                ext(&tab.body_text),
+                tab.label.to_lowercase().replace(' ', "-"),
+            ),
+            ui::RawButton::SaveAll => (content.record_json.clone(), true, "json", String::new()),
+        };
+        if self.pending_clip.len() >= CLIP_QUEUE_MAX {
+            // Bounded: a wedged/slow exporter with a spamming user must not
+            // grow the queue without limit. Reject the newest with feedback.
+            modal.flash = Some((
+                "export busy — try again in a moment".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
+        self.pending_clip.push_back(ClipReq {
+            generation,
+            button: btn,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        });
+    }
+
+    /// Drain the queued export (event-loop side of [`Self::raw_modal_action`]).
+    /// Single-flight: hand the event loop the next export ONLY when none is
+    /// running, marking the slot busy. Cleared by [`Self::clip_finished`] when
+    /// the result arrives, so exports run one at a time, in FIFO press order.
+    fn next_clip_if_idle(&mut self) -> Option<ClipReq> {
+        if self.clip_inflight {
+            return None;
+        }
+        let req = self.pending_clip.pop_front()?;
+        self.clip_inflight = true;
+        Some(req)
+    }
+
+    /// Mark the in-flight export done (its result arrived), freeing the next.
+    fn clip_finished(&mut self) {
+        self.clip_inflight = false;
+    }
+
+    /// Resolve a delivered export outcome onto the open modal's flash line,
+    /// gated on the open-generation so a stale result never lands on a
+    /// reopened modal.
+    fn apply_clip_result(&mut self, result: ClipResult) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            if modal.generation == result.generation {
+                modal.flash = Some((result.message, std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Run one queued export on the blocking pool and deliver the flash
+    /// message on the clip channel. Never touches the UI thread; the payload
+    /// was already built at queue time.
+    fn spawn_clip(&mut self, req: ClipReq) {
+        let Some(tx) = self.clip_tx.clone() else {
+            return;
+        };
+        let ClipReq {
+            generation,
+            button,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        } = req;
+        tokio::task::spawn_blocking(move || {
+            let message = if is_save {
+                let stem = if label.is_empty() {
+                    format!("llmux-raw-{id}")
+                } else {
+                    format!("llmux-raw-{id}-{label}")
+                };
+                match clip::save(&stem, ext, &payload) {
+                    Ok(path) => match button {
+                        ui::RawButton::SaveAll => format!("saved record → {path}"),
+                        _ => format!("saved → {path}"),
+                    },
+                    Err(err) => err,
+                }
+            } else {
+                let n = payload.len();
+                match clip::copy(&payload) {
+                    Ok(dest) => match button {
+                        ui::RawButton::CopyCurl => format!("copied curl ({n} bytes) → {dest}"),
+                        ui::RawButton::CopyAll => format!("copied all {n} bytes → {dest}"),
+                        _ => format!("copied {n} bytes → {dest}"),
+                    },
+                    Err(err) => err,
+                }
+            };
+            let _ = tx.blocking_send(ClipResult {
+                generation,
+                message,
+            });
+        });
+    }
+
+    /// Drain the queued raw fetch (event-loop side of [`Self::open_raw_modal`]).
+    fn take_pending_raw(&mut self) -> Option<RawFetchReq> {
+        self.pending_raw.take()
+    }
+
+    /// Resolve a delivered raw load into the open modal. Ignored when the modal
+    /// was closed or re-targeted while the fetch ran (stale delivery).
+    fn apply_raw_load(&mut self, load: RawLoad) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            // Gate on the open-generation, not the key: the key omits the
+            // activity id, so a close→reopen of the same row (or two same-ms
+            // requests) could otherwise let a stale fetch's late result — even
+            // a stale 404 — clobber the reopened modal.
+            if modal.generation == load.generation && matches!(modal.state, RawModalState::Loading)
+            {
+                modal.state = match load.result {
+                    Ok(content) => RawModalState::Ready(content),
+                    Err(msg) => RawModalState::Failed(msg),
+                };
+            }
+        }
+    }
+
+    /// Spawn the background raw-record fetch for `req` and deliver the result
+    /// on the raw channel (never blocks the event loop — the local path is a
+    /// backwards file scan on the blocking pool, the attach path an HTTP GET to
+    /// `GET /llmux/raw-io`). Content lines are built in the task too: a Ready
+    /// body can be megabytes.
+    fn spawn_raw_fetch(&mut self, req: RawFetchReq) {
+        let Some(tx) = self.raw_tx.clone() else {
+            return;
+        };
+        let RawFetchReq {
+            generation,
+            id,
+            general,
+            at_ms,
+        } = req;
+        enum Source {
+            Local(Option<std::path::PathBuf>),
+            Remote {
+                client: reqwest::Client,
+                url: String,
+                api_key: Option<String>,
+            },
+        }
+        let source = match &self.backend {
+            Backend::Local(state) => Source::Local(
+                state
+                    .config
+                    .raw_io
+                    .enabled
+                    .then(|| state.raw_io_path.clone())
+                    .flatten(),
+            ),
+            Backend::Remote(remote) => Source::Remote {
+                client: remote.client.clone(),
+                url: format!("{}/llmux/raw-io?id={id}&at_ms={at_ms}", remote.base_url),
+                api_key: remote.api_key.clone(),
+            },
+        };
+        tokio::spawn(async move {
+            let not_found = || {
+                "no raw-io record for this request (capture disabled, pruned, or the daemon \
+                 restarted since)"
+                    .to_string()
+            };
+            let record = match source {
+                Source::Local(path) => tokio::task::spawn_blocking(move || {
+                    crate::proxy::raw_io::find_record(path.as_deref(), id, at_ms)
+                })
+                .await
+                .map_err(|err| format!("raw lookup task failed: {err}"))
+                .and_then(|found| found.ok_or_else(not_found)),
+                Source::Remote {
+                    client,
+                    url,
+                    api_key,
+                } => {
+                    let mut request = client.get(&url);
+                    if let Some(k) = &api_key {
+                        request = request.header("x-api-key", k);
+                    }
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .json::<crate::proxy::raw_io::RawIoRecord>()
+                            .await
+                            .map_err(|err| format!("raw-io response parse failed: {err}")),
+                        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                            Err(not_found())
+                        }
+                        Ok(response) => Err(format!("raw-io fetch failed: {}", response.status())),
+                        Err(err) => Err(format!("raw-io fetch failed: {err}")),
+                    }
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                record.map(|record| {
+                    std::sync::Arc::new(ui::raw_content_from_record(general, &record))
+                })
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("raw render task failed: {err}")));
+            let _ = tx.send(RawLoad { generation, result }).await;
+        });
     }
 
     /// Toggle the click-opened folded `count` run by any member's stable key
@@ -2615,6 +3194,15 @@ async fn event_loop(
     // `activity.jsonl` delivers here, same pattern as the sessions channel.
     let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<activity::Completed>>(1);
     app.history_tx = Some(hist_tx);
+    // Raw request/response viewer (UI-7): the background raw-io lookup delivers
+    // here — same pattern as the sessions channel (never block this select).
+    let (raw_tx, mut raw_rx) = mpsc::channel::<RawLoad>(2);
+    app.raw_tx = Some(raw_tx);
+    // Raw-viewer exports (UI-8 copy/save): the blocking pool delivers the
+    // outcome flash here so a wedged clipboard tool / slow disk never freezes
+    // this select.
+    let (clip_tx, mut clip_rx) = mpsc::channel::<ClipResult>(4);
+    app.clip_tx = Some(clip_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -2670,7 +3258,30 @@ async fn event_loop(
                 }
                 true
             }
+            // A background raw-record fetch resolved (UI-7) — hand it to the
+            // open modal (stale deliveries are ignored inside).
+            Some(load) = raw_rx.recv() => {
+                app.apply_raw_load(load);
+                true
+            }
+            // A background export (UI-8 copy/save) finished — free the
+            // single-flight slot so the next queued export can dispatch, then
+            // flash the outcome on the modal that requested it (the flash is
+            // gated on generation; freeing the slot is unconditional).
+            Some(result) = clip_rx.recv() => {
+                app.clip_finished();
+                app.apply_clip_result(result);
+                true
+            }
         };
+        if let Some(req) = app.take_pending_raw() {
+            app.spawn_raw_fetch(req);
+            redraw = true;
+        }
+        if let Some(req) = app.next_clip_if_idle() {
+            app.spawn_clip(req);
+            redraw = true;
+        }
         if let Some(target) = app.take_pending_switch() {
             app.perform_remote_switch(target).await;
             redraw = true;
@@ -2733,6 +3344,7 @@ async fn event_loop(
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
+            app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
@@ -2750,6 +3362,13 @@ async fn event_loop(
                     }
                     None => app.input_modal = None,
                 }
+            }
+            // Clamp the raw viewer's scroll offsets against what this frame
+            // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
+            // clamp — the modal owns its content and never closes on aging.
+            if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
+                modal.scroll = modal.scroll.min(raw.max_scroll.0);
+                modal.hscroll = modal.hscroll.min(raw.max_scroll.1);
             }
         }
     }
@@ -2816,6 +3435,15 @@ const HISTORY_ARM_MARGIN: i64 = 40;
 
 /// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
 const MODAL_PAGE: u16 = 10;
+
+/// Horizontal pan step for the raw viewer (UI-8), in display cells.
+const RAW_PAN: u16 = 8;
+
+/// Cap on queued (not-yet-dispatched) exports (UI-8). Single-flight dispatch
+/// already bounds concurrent work to one; this bounds the BACKLOG so a user
+/// spamming the button against a slow/wedged exporter can't grow the deque
+/// without limit. Human-paced presses never approach it.
+const CLIP_QUEUE_MAX: usize = 8;
 
 /// Ceiling on hydrated history entries — far beyond any real scrolling
 /// session, purely a memory backstop against a huge persisted file.
@@ -3917,6 +4545,293 @@ mod tests {
     }
 
     #[test]
+    fn raw_modal_keys_tabs_scroll_and_close(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        // Ready content: a plain (no-upstream) record renders the classic
+        // 2 tabs; the upstream pair appears only on translated exchanges.
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            None,
+            None,
+            None,
+            Some(200),
+            b"{}",
+            b"{}",
+            1024,
+            None,
+            None,
+            None,
+        );
+        let content = ui::raw_content_from_record(
+            ui::RawGeneral {
+                lines: Vec::new(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                base_url: "http://localhost:3456".into(),
+            },
+            &record,
+        );
+        assert_eq!(content.tabs.len(), 2, "no upstream half → 2 payload tabs");
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            id: 7,
+            generation: 1,
+            title: "raw".into(),
+            tab: 0,
+            scroll: 3,
+            hscroll: 5,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        // Tab advances and resets BOTH offsets (tabs have independent sizes).
+        app.on_key(press(KeyCode::Tab), None);
+        let modal = app.raw_modal.as_ref().unwrap();
+        assert_eq!(modal.tab, 1);
+        assert_eq!(modal.scroll, 0);
+        assert_eq!(modal.hscroll, 0);
+        // ← wraps back around the 2-tab ring; H/L pan horizontally.
+        app.on_key(press(KeyCode::Left), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().tab, 0);
+        app.on_key(press(KeyCode::Char('L')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, RAW_PAN);
+        app.on_key(press(KeyCode::Char('H')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, 0);
+        // Scroll keys move; unbound keys are swallowed beneath the modal.
+        app.on_key(press(KeyCode::Down), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().scroll, 1);
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(app.activity_scroll, before, "keys don't leak beneath");
+        assert!(app.raw_modal.is_some());
+        // The wheel scrolls it too (and the click is swallowed).
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 6), None);
+        assert!(app.raw_modal.as_ref().unwrap().scroll > 1);
+        // Esc closes.
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.raw_modal.is_none(), "esc closes the raw viewer");
+    }
+
+    #[test]
+    fn raw_load_applies_only_to_the_matching_loading_modal(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let _ = &key;
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            id: 7,
+            generation: 5,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Loading,
+        });
+        // A stale delivery for a PRIOR generation is ignored — this is the
+        // close→reopen race guard (a late fetch must not clobber the reopen).
+        app.apply_raw_load(RawLoad {
+            generation: 4,
+            result: Err("nope".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Loading
+        ));
+        // The matching generation resolves it (a miss becomes Failed).
+        app.apply_raw_load(RawLoad {
+            generation: 5,
+            result: Err("miss".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn clip_result_flashes_only_on_the_requesting_generation(/* UI-8 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 9,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Loading,
+        });
+        // A stale export result (older generation) never flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 8,
+            message: "stale".into(),
+        });
+        assert!(app.raw_modal.as_ref().unwrap().flash.is_none());
+        // The requesting generation's result flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 9,
+            message: "copied 4 bytes → pbcopy".into(),
+        });
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "copied 4 bytes → pbcopy"
+        );
+    }
+
+    #[test]
+    fn open_raw_modal_selects_by_id_under_same_ms_key_collision(/* MUST-FIX */) {
+        // Two requests completing in the SAME millisecond with identical
+        // method/path/status share an ActivityKey (which omits the id). The
+        // opener must fetch the CLICKED row's record, not the first match.
+        let req = |id: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_millis(42),
+            body: activity::CompletedBody::Request {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let first = req(7);
+        let second = req(8);
+        let key = first.activity_key().unwrap();
+        assert_eq!(key, second.activity_key().unwrap(), "keys collide");
+        let mut view = empty_view();
+        view.completed = vec![first, second];
+
+        // Click resolved to the SECOND row's id → the modal must open on id 8,
+        // not the first-match id 7.
+        let mut app = remote_app();
+        app.open_raw_modal(key, 8, Some(&view));
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().id,
+            8,
+            "opener pinned the clicked row via id, not the first key match"
+        );
+    }
+
+    #[test]
+    fn burst_of_exports_all_queue_none_dropped(/* MUST-FIX */) {
+        // Two export actions before the event loop drains the queue must both
+        // run — the async path used to be a single slot and silently dropped
+        // the first (a regression from synchronous execution).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        app.raw_modal_action(ui::RawButton::Copy);
+        app.raw_modal_action(ui::RawButton::Save);
+        assert_eq!(
+            app.pending_clip.len(),
+            2,
+            "both queued — the second must not overwrite the first"
+        );
+        // Single-flight FIFO: the first dispatch pops Copy and marks the slot
+        // busy; a second dispatch attempt while busy yields nothing (no
+        // concurrent clipboard write / no last-writer race).
+        assert!(matches!(
+            app.next_clip_if_idle().map(|r| r.button),
+            Some(ui::RawButton::Copy)
+        ));
+        assert!(app.clip_inflight, "slot busy after dispatch");
+        assert!(
+            app.next_clip_if_idle().is_none(),
+            "single-flight: no second dispatch while one is in flight"
+        );
+        // Its result frees the slot → the next (Save) dispatches, in order.
+        app.clip_finished();
+        assert!(matches!(
+            app.next_clip_if_idle().map(|r| r.button),
+            Some(ui::RawButton::Save)
+        ));
+        app.clip_finished();
+        assert!(app.next_clip_if_idle().is_none());
+    }
+
+    #[test]
+    fn export_queue_is_bounded_and_rejects_overflow_with_feedback(/* MUST-FIX */) {
+        // A spamming user against a wedged exporter must not grow the queue
+        // without limit: past the cap the newest is rejected with feedback
+        // (already-queued actions are preserved, growth is bounded).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        for _ in 0..(CLIP_QUEUE_MAX + 5) {
+            app.raw_modal_action(ui::RawButton::Copy);
+        }
+        assert_eq!(
+            app.pending_clip.len(),
+            CLIP_QUEUE_MAX,
+            "queue capped, never grows past CLIP_QUEUE_MAX"
+        );
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "export busy — try again in a moment",
+            "overflow rejected with feedback, not silently dropped"
+        );
+    }
+
+    #[test]
     fn history_hydration_refused_for_cross_host_attach(/* review M1 */) {
         // Loopback attach (the standard `llmux` → localhost:3456 topology)
         // shares this machine's state file → allowed.
@@ -3995,6 +4910,7 @@ mod tests {
         let count_req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages/count_tokens".into(),
                 account: Some("claude:a@x".into()),
@@ -4099,6 +5015,7 @@ mod tests {
         let req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("claude:a@x".into()),
@@ -4196,6 +5113,7 @@ mod tests {
         let req = |secs: u64| activity::Completed {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             body: activity::CompletedBody::Request {
+                id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("claude:a@x".into()),
@@ -4340,6 +5258,7 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             tui_effects: true,
+            gradient: ui::GradientCfg::default(),
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
