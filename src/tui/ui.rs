@@ -1521,11 +1521,18 @@ fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     }
 }
 
-/// Number of terminal rows `text` occupies when wrapped at `width` cells the
-/// way ratatui's `Wrap { trim: false }` does: greedy word wrap, hard-splitting
-/// any word wider than the line, honoring explicit newlines. Used only to bound
-/// the input modal's scroll (UI-6 item 3), so an off-by-one against ratatui's
-/// exact splitter costs at most one line of reachable scroll.
+/// Number of terminal rows `text` occupies when wrapped at `width` cells to
+/// match ratatui's `Wrap { trim: false }`: greedy word wrap, whitespace is
+/// rendered (leading/interior spaces occupy cells, never dropped from the width
+/// tally), over-wide words hard-split, explicit newlines honored. Used to bound
+/// the input modal's scroll (UI-6 item 3).
+///
+/// INVARIANT: this NEVER underestimates the row count. Ratatui trims trailing
+/// whitespace on wrapped rows, which we may charge — so we can overshoot by a
+/// row or two, but never undershoot. That direction matters: an underestimate
+/// would shrink `max_scroll`, letting the post-draw clamp cut off the tail of a
+/// long/indented prompt (operator can't reach "전체 input"); an overestimate at
+/// most leaves a blank overscroll row while the tail stays reachable.
 fn wrapped_line_count(text: &str, width: u16) -> usize {
     let width = (width as usize).max(1);
     let mut rows = 0usize;
@@ -1535,35 +1542,68 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     rows.max(1)
 }
 
-/// Rows one newline-free `source` string wraps into at `width` cells. Greedy
-/// word wrap with hard-split of over-wide words; empty string counts as 1 row.
+/// Rows one newline-free `source` string wraps into at `width` cells. Tokenizes
+/// into words (non-space runs) and single spaces so that EVERY cell — including
+/// leading indentation — is charged, then greedily packs them, hard-splitting
+/// any token too wide for a full row. Empty string counts as 1 row.
 fn wrap_rows(source: &str, width: usize) -> usize {
     let mut rows = 1usize;
     let mut col = 0usize;
-    let mut first = true;
-    for word in source.split(' ') {
-        let sep = usize::from(!first);
-        first = false;
-        let w = cell_width(word);
-        if col != 0 && col + sep + w <= width {
-            col += sep + w;
-            continue;
-        }
-        // Word starts a fresh row (either the very first token, or it did not
-        // fit on the current row).
-        if col != 0 {
-            rows += 1;
-        }
-        if w <= width {
-            col = w;
+    let mut word = String::new();
+    for ch in source.chars() {
+        if ch == ' ' {
+            if !word.is_empty() {
+                place_token(&word, width, &mut rows, &mut col);
+                word.clear();
+            }
+            // Each space is its own 1-cell token — leading/interior spaces
+            // occupy width exactly as `Wrap { trim: false }` renders them.
+            place_token(" ", width, &mut rows, &mut col);
         } else {
-            // Word wider than the line: it spills across extra full rows.
-            let spill = (w - 1) / width;
-            rows += spill;
-            col = w - spill * width;
+            word.push(ch);
         }
     }
+    if !word.is_empty() {
+        place_token(&word, width, &mut rows, &mut col);
+    }
     rows
+}
+
+/// Place one token (a word or a single space) into the greedy wrap accounting,
+/// advancing `rows`/`col`. A token that overflows the current row moves to a
+/// fresh one; a token wider than a whole row hard-splits CELL-accurately,
+/// char by char, so a 2-cell CJK glyph that cannot straddle the right edge
+/// bumps the row (integer cell-width division would undercount those).
+fn place_token(token: &str, width: usize, rows: &mut usize, col: &mut usize) {
+    let w = cell_width(token);
+    if w == 0 {
+        return;
+    }
+    if *col + w <= width {
+        *col += w;
+        return;
+    }
+    // Does not fit on the current row: break to a fresh one first.
+    if *col > 0 {
+        *rows += 1;
+        *col = 0;
+    }
+    if w <= width {
+        *col = w;
+        return;
+    }
+    // Token wider than a full row: hard-split, charging each char's cell width.
+    for ch in token.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cw == 0 {
+            continue;
+        }
+        if *col + cw > width {
+            *rows += 1;
+            *col = 0;
+        }
+        *col += cw;
+    }
 }
 
 /// Draw the click-opened input-text modal (UI-6 item 3): a centered, bordered,
@@ -6454,6 +6494,66 @@ mod tests {
         assert_eq!(wrapped_line_count("line1\nline2", 40), 2);
         // A word wider than the line hard-splits across rows.
         assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_charges_leading_whitespace(/* UI-6 item 3 MUST-FIX */) {
+        // Leading indentation occupies cells: "    " fills the 4-cell row, so the
+        // "x" wraps to a second row (ratatui `Wrap { trim: false }` renders the
+        // spaces). The old estimator dropped leading spaces and returned 1.
+        assert_eq!(wrapped_line_count("    x", 4), 2);
+        // A multi-line indented block = per-line manual cell math:
+        //   "    x"  → "    " (row) + "x" (row)        = 2 rows
+        //   "  yy"   → "  yy" is 4 cells, fits one row  = 1 row
+        assert_eq!(wrapped_line_count("    x\n  yy", 4), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_accounts_wide_chars(/* UI-6 item 3 MUST-FIX */) {
+        // 가 = 2 cells; at width 4 only two fit per row, so 5 of them need 3
+        // rows. Integer cell-width division would have said 2 (undercount).
+        assert_eq!(wrapped_line_count(&"가".repeat(5), 4), 3);
+        // Odd width where a 2-cell glyph cannot straddle the edge: width 3 holds
+        // exactly one 가 per row (2+2 > 3), so 3 가 = 3 rows.
+        assert_eq!(wrapped_line_count(&"가".repeat(3), 3), 3);
+    }
+
+    #[test]
+    fn input_modal_tail_reachable_at_max_scroll(/* UI-6 item 3 MUST-FIX */) {
+        // Operator contract "전체 input을 볼 수 있도록": scrolling to the reported
+        // max must bring the LAST line of an indented, multi-line prompt on
+        // screen. A too-small max (leading-space undercount) would strand it.
+        let mut lines: Vec<String> = (0..40).map(|i| format!("    indented line {i}")).collect();
+        lines.push("    TAILMARKER_LAST".to_string());
+        let excerpt = lines.join("\n");
+        let entry = completed_with_excerpt(Some("user"), &excerpt);
+        let key = key_of(&entry);
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+
+        // First render: read back the reported max scroll for this modal size.
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.input_modal = Some(InputModal {
+            key: key.clone(),
+            scroll: 0,
+        });
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let max = hits
+            .expect("layout")
+            .input_modal_max_scroll
+            .expect("modal drawn");
+
+        // Scroll to the reported max and re-render: the tail line is on screen.
+        chrome.input_modal = Some(InputModal { key, scroll: max });
+        let text = render(&view, &chrome, 60, 24);
+        assert!(
+            text.contains("TAILMARKER_LAST"),
+            "the last prompt line must be reachable at max scroll (max={max})"
+        );
     }
 
     #[test]
