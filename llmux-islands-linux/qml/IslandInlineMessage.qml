@@ -11,7 +11,7 @@ Control {
     readonly property bool isError: type === Kirigami.MessageType.Error
     readonly property bool isWarning: type === Kirigami.MessageType.Warning
     readonly property color accentColor: isError ? IslandTheme.red
-        : isWarning ? IslandTheme.amber : IslandTheme.blue
+        : isWarning ? IslandTheme.amber : IslandTheme.borderStrong
 
     padding: 10
 
@@ -23,9 +23,9 @@ Control {
     }
 
     background: Rectangle {
-        radius: IslandTheme.controlRadius
+        radius: 0
         color: control.isError ? IslandTheme.redTint
-            : control.isWarning ? IslandTheme.amberTint : IslandTheme.blueTint
+            : control.isWarning ? IslandTheme.amberTint : IslandTheme.surface
         border.color: control.accentColor
         border.width: 1
     }

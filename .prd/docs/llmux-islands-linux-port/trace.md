@@ -245,6 +245,65 @@ privacy-safe target, outcome, sanitized message, and timestamps. Package-owner
 and channel guidance may appear only in the sanitized message; auth headers and
 credential-bearing download URLs are excluded.
 
+## T6 — Minimal default path and contextual Advanced disclosure
+
+### 0. Client Surface
+
+Usage opens with connection/attention state, privacy-safe account identity,
+primary quota, add account, and refresh. Statistics opens with summary metrics
+and account overview. Settings opens with navigation plus screen, sound,
+privacy, and launch-at-login preferences. Each platform provides a labelled
+Advanced disclosure in the context it affects; snapshot receipt mode opens the
+relevant Statistics disclosure so receipt evidence remains inspectable.
+
+### 1. API Entry
+
+None. Opening or closing Advanced is shell-local presentation state and never
+calls an llmux endpoint.
+
+### 2. Input
+
+The only new input is a user activation of a keyboard-accessible disclosure.
+It carries no account id, credential, endpoint, or persisted value.
+
+### 3. Layer Flow
+
+`UiState.usage/statistics/settings` → platform view summary. The same canonical
+state → platform Advanced content when `shell.advanced_visible` is true.
+`Advanced activation` → shell-local boolean → visibility only; it does not map
+to `Action`, `Effect`, HTTP, persistence, or a receipt.
+
+### 4. Side Effects
+
+None. Existing mutations keep their T3–T5 effects only when their explicit
+control is activated. Disclosure does not refresh, write settings, or start an
+operation.
+
+### 5. Error Paths
+
+Offline, fatal, authentication-required, warning, critical, destructive
+confirmation, and operation failure states stay visible while Advanced is
+closed. Missing additive diagnostic data renders as unavailable only after the
+relevant disclosure opens and never becomes a misleading zero.
+
+### 6. Output
+
+An inverted OpenAI-reference surface with one-level progressive disclosure:
+black canvas, white ink, opacity-tier hierarchy, flat square internal surfaces,
+system grotesque/sans typography, and whitespace instead of decorative cards.
+Provider decoration and normal-state quota/navigation/focus accents are
+monochrome; rare semantic warning, error, and success color is paired with text
+or iconography. Both shells expose equivalent default and Advanced groups.
+
+### 7. Observability
+
+Default and Advanced/receipt production-renderer screenshots exist for macOS
+and KDE. Both consume the same canonical privacy-safe `UiState` fixture and
+fixed clock. Each exact seven-file set includes the production shell chrome,
+selected navigation, and connection state. Contract tests assert the disclosure
+label, default-hidden technical groups, preserved critical-state visibility,
+and the absence of a semantic dispatch when disclosure is toggled.
+
 ## Contract tests derived before implementation
 
 | Trace | Happy path | Sad path | Side-effect | Transformation contract |
@@ -254,6 +313,7 @@ credential-bearing download URLs are excluded.
 | T3 | add/pause/remove result then refresh | no key, no confirmation, stale id, HTTP fail | busy + receipt + refresh | real id/secret executor arrows |
 | T4 | server/local settings and event/autostart | invalid interval/write/network fail | atomic persistence/idempotency | action fields to daemon/file |
 | T5 | pacman instruction or absolute Linuxbrew delegation | unknown owner/system path/checksum mismatch | no pacman mutation; protected atomic primitive | request→owner→plan→receipt |
+| T6 | common path remains complete; Advanced reveals canonical detail | hidden critical/offline state is rejected | disclosure causes no daemon/persistence effect | UiState→summary/detail visibility only |
 
 RED is an iteration-stage observation, not a deliberately broken branch commit.
 Tests are not weakened to obtain GREEN, and every saved commit must pass the
@@ -272,7 +332,8 @@ repository build gate.
 | macOS SwiftUI/AppKit shell | Shared-core runtime integrated | Strict schema decoder, C ABI ownership wrapper, canonical projections, executor effects, hardened endpoint policy, and Xcode build integration; macOS CI is the authoritative full build because this development host has Command Line Tools but not Xcode |
 | Tray/layer-shell/notifications | Verified at adapter/build boundary with platform fallbacks | Qt `SystemTrayIcon` with Plasma StatusNotifierItem backend and native message activation, LayerShellQt Wayland, positioned X11, regular fallback, freedesktop sound |
 | Arch maintenance/package | Verified fail-closed | Pacman instruction-only, absolute Linuxbrew delegation, protected checksum primitive, and an unprivileged `makepkg` release build followed by package installation and installed-binary smoke in the clean Arch image |
-| Runtime parity | Automated gates verified | Linux tests plus clean Arch CXX-Qt compile, metadata validation, QML lint, warning-free offscreen smoke, and three distinct 960x760 UI snapshots uploaded with a SHA-256 manifest; manual Plasma Wayland/X11 acceptance remains a release checklist |
+| Minimal/Advanced presentation hierarchy | Implemented; visual CI receipt pending | T6 contracts cover the cross-platform default path, contextual disclosures, semantic-color restraint, critical-state exception, local-only toggle behavior, and seven deterministic states per renderer |
+| Runtime parity | Local T6 gates and macOS renderer verified; clean-platform re-verification pending | Linux no-default format, warning-free clippy, and 92 tests pass with `-j 2`; the full Swift app source typechecks against macOS 14 and a linked AppKit snapshot process emits the exact seven distinct full-shell PNGs. GitHub Actions remains authoritative for Xcode/XCTest, Qt/QML, Arch packaging, smoke, and final renderer captures |
 
 Verification receipt (2026-07-14): the shared core passes 46 contract, fixture,
 reducer, and HTTP tests; the macOS bridge passes eleven ABI tests plus its native
@@ -280,11 +341,27 @@ C smoke executable; the Linux crate passes 85 tests both locally and in a fresh
 Arch container. The existing workspace baseline remains green with 766 unit
 tests and 38 E2E tests (one ignored by design).
 
-The clean Arch image produces real Usage, Statistics, and Menu captures at
-960x760. CI exports all three PNGs plus `SHA256SUMS` as the
-`llmux-islands-kde-snapshots` artifact, so the evidence and its run-specific
-hashes remain reproducible instead of relying on stale values copied into this
-document.
+T6 local verification receipt (2026-07-15): `cargo fmt --check`, warning-free
+no-default `cargo clippy`, and all 92 Linux shell tests pass with `-j 2`;
+`xcodegen generate` and a complete macOS 14 `swiftc -typecheck` pass, apart from
+one pre-existing actor-isolation warning in `ScreenObserver`. A directly linked
+AppKit snapshot process also emitted the exact seven-file macOS contract from
+the canonical fixed fixture; all files were distinct and visually inspected for
+shell chrome, default/Advanced hierarchy, monochrome provider treatment, and
+uncropped content. The shared-core, macOS, and KDE dashboard fixture files are
+byte-identical and guarded transitively by the macOS bridge and Linux shell
+contracts. Re-rendering with conflicting host connection, API-key presence,
+sound, and Fable defaults produced byte-identical copies of all seven macOS
+PNGs. Snapshot mode also skips the live CLI channel query, so the receipt set
+does not inherit host preferences or local CLI state. This host has Command
+Line Tools rather than full Xcode, so it does not claim Xcode build or XCTest
+evidence.
+
+The clean Arch gate is configured to produce seven real captures: Usage and
+Usage Advanced, Statistics and Statistics Advanced, receipt detail, Settings,
+and Settings Advanced. The macOS gate requires the equivalent seven PNGs. Each
+artifact carries `SHA256SUMS`; the final run-specific hashes and inspected PNGs
+belong in `visual-receipts/` rather than being predicted in this trace.
 
 ## Required file map
 

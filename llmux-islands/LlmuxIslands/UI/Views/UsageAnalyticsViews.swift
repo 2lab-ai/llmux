@@ -19,11 +19,10 @@ import SwiftUI
 // Detail views are in-panel expansions, not sheets: sheets are unreliable in
 // the borderless island (see the AddAccountInline note in IslandUsageView).
 
-// MARK: - Section switcher (neutral + amber, never system blue)
+// MARK: - Section switcher
 
-/// Capsule segmented control in the app's own scheme: monospaced small-caps
-/// labels, amber tint on the selected segment. Replaces the system
-/// `.segmented` picker whose bright blue selection pill was a tone violation.
+/// Flat monochrome local switcher. Frequent navigation is immediate and does
+/// not dispatch a shared semantic action.
 struct StatsSegmentedControl: View {
     @Binding var selection: StatsSection
 
@@ -33,43 +32,37 @@ struct StatsSegmentedControl: View {
                 segment(section)
             }
         }
-        .padding(3)
-        .background(Capsule(style: .continuous).fill(Color.white.opacity(0.05)))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1)
+        }
     }
 
     private func segment(_ section: StatsSection) -> some View {
         let selected = selection == section
         return Button {
-            withAnimation(.easeInOut(duration: 0.15)) { selection = section }
+            selection = section
         } label: {
-            Text(section.title.uppercased())
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                .tracking(0.6)
-                .foregroundColor(selected ? TerminalColors.amber : .white.opacity(0.5))
+            Text(section.title)
+                .font(.caption.weight(selected ? .semibold : .regular))
+                .foregroundColor(selected ? .black : .white.opacity(0.6))
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 5)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(selected ? TerminalColors.amber.opacity(0.16) : Color.clear)
-                )
-                .contentShape(Capsule(style: .continuous))
+                .frame(minHeight: 44)
+                .background(selected ? Color.white : Color.clear)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 }
 
-/// Small-caps monospaced section header — same grammar as the summary-card
-/// titles, used above every block so the whole panel shares one hierarchy.
 struct StatsSectionLabel: View {
     let text: String
 
     init(_ text: String) { self.text = text }
 
     var body: some View {
-        Text(text.uppercased())
-            .font(.system(size: 9, weight: .semibold, design: .monospaced))
-            .tracking(0.8)
-            .foregroundColor(.white.opacity(0.4))
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundColor(.white.opacity(0.6))
     }
 }
 
@@ -88,6 +81,7 @@ struct StatsSectionContent: View {
     var activityReceipts: [SharedActivityReceipt] = []
     var verificationReceipts: [SharedVerificationReceipt] = []
     var onRemoveAccount: ((String) -> Void)? = nil
+    var includePrimaryOverview = true
 
     @State private var expandedModelID: String?
     @State private var expandedAccount: String?
@@ -109,26 +103,28 @@ struct StatsSectionContent: View {
     // MARK: Overview — totals, accounts, top models, heat, activity
 
     @ViewBuilder private var overview: some View {
-        if health.isWarning {
-            UsageHealthBanner(summary: health)   // U11 — same rule as the closed pill
-        }
-        UsageSummaryCards(totals: dashboard.totals, costCaption: labels.cost)
-        if !tiles.isEmpty {
-            block("accounts") {
-                UsageAccountCompactList(tiles: tiles, onRemove: onRemoveAccount)
+        if includePrimaryOverview {
+            if health.isWarning {
+                UsageHealthBanner(summary: health)   // U11 — same rule as the closed pill
+            }
+            UsageSummaryCards(totals: dashboard.totals, costCaption: labels.cost)
+            if !tiles.isEmpty {
+                block("Accounts") {
+                    UsageAccountCompactList(tiles: tiles, onRemove: onRemoveAccount)
+                }
             }
         }
         if !dashboard.modelUsage.isEmpty {
-            block("top models") {
+            block("Top models") {
                 modelList(rows: LlmuxDashboardModelUsage.top(dashboard.modelUsage), caption: labels.modelUsage)
             }
         }
         if !dashboard.windowed.isEmpty {
-            block("token heat") {
+            block("Token heat") {
                 UsageHeatStrip(windowed: dashboard.windowed, caption: labels.windowed)
             }
         }
-        block("recent activity") {
+        block("Recent activity") {
             if activityReceipts.isEmpty {
                 UsageActivityList(activity: dashboard.activity, now: now)
             } else {
@@ -136,7 +132,7 @@ struct StatsSectionContent: View {
             }
         }
         if !verificationReceipts.isEmpty {
-            block("verification receipts") {
+            block("Verification receipts") {
                 UsageVerificationReceiptList(receipts: verificationReceipts, now: now)
             }
         }
@@ -160,9 +156,7 @@ struct StatsSectionContent: View {
                     cacheCaption: labels.cache,
                     now: now
                 ) {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        expandedModelID = expandedModelID == row.id ? nil : row.id
-                    }
+                    expandedModelID = expandedModelID == row.id ? nil : row.id
                 }
             }
             if rows.isEmpty {
@@ -192,15 +186,17 @@ struct StatsSectionContent: View {
     @ViewBuilder private var healthSection: some View {
         block("account health") {
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(dashboard.accounts, id: \.name) { account in
+                ForEach(Array(dashboard.accounts.enumerated()), id: \.element.name) { index, account in
                     UsageAccountHealthRow(
                         account: account,
                         isExpanded: expandedAccount == account.name,
-                        now: now
+                        now: now,
+                        privacyAlias: IslandPresentationPolicy.privateAccountLabel(
+                            providerName: providerName(for: account),
+                            ordinal: index + 1
+                        )
                     ) {
-                        withAnimation(.easeInOut(duration: 0.15)) {
-                            expandedAccount = expandedAccount == account.name ? nil : account.name
-                        }
+                        expandedAccount = expandedAccount == account.name ? nil : account.name
                     }
                 }
             }
@@ -211,6 +207,14 @@ struct StatsSectionContent: View {
         VStack(alignment: .leading, spacing: 6) {
             StatsSectionLabel(label)
             content()
+        }
+    }
+
+    private func providerName(for account: LlmuxDashboardAccount) -> String {
+        switch account.type.lowercased() {
+        case "codex": "Codex"
+        case "grok": "Grok"
+        default: "Claude"
         }
     }
 }
@@ -227,7 +231,7 @@ struct UsageCanonicalActivityReceiptList: View {
                 HStack(spacing: 6) {
                     Text(DashFormat.ago(ms: receipt.occurredAtMs, now: now))
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.35))
+                        .foregroundColor(.white.opacity(0.5))
                         .frame(width: 30, alignment: .trailing)
                     Text(status(receipt))
                         .font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -241,13 +245,13 @@ struct UsageCanonicalActivityReceiptList: View {
                     Spacer(minLength: 6)
                     Text(trailing(receipt))
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.45))
+                        .foregroundColor(.white.opacity(0.6))
                         .lineLimit(1)
                 }
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 
     private func status(_ receipt: SharedActivityReceipt) -> String {
@@ -259,7 +263,7 @@ struct UsageCanonicalActivityReceiptList: View {
     private func statusColor(_ receipt: SharedActivityReceipt) -> Color {
         if receipt.kind == "in_flight" { return TerminalColors.amber }
         guard let status = receipt.status else {
-            return receipt.error ? TerminalColors.red : .white.opacity(0.45)
+            return receipt.error ? TerminalColors.red : .white.opacity(0.6)
         }
         return status < 400 ? TerminalColors.green : status < 500 ? TerminalColors.amber : TerminalColors.red
     }
@@ -289,7 +293,7 @@ struct UsageVerificationReceiptList: View {
                 HStack(spacing: 6) {
                     Text(DashFormat.ago(ms: receipt.finishedAtMs, now: now))
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.35))
+                        .foregroundColor(.white.opacity(0.5))
                         .frame(width: 30, alignment: .trailing)
                     Image(systemName: outcomeSymbol(receipt.outcome))
                         .font(.system(size: 9, weight: .semibold))
@@ -308,13 +312,13 @@ struct UsageVerificationReceiptList: View {
                     Spacer(minLength: 4)
                     Text(receipt.message)
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.45))
+                        .foregroundColor(.white.opacity(0.6))
                         .lineLimit(1)
                 }
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 
     private func outcomeSymbol(_ outcome: String) -> String {
@@ -358,10 +362,9 @@ struct UsageSummaryCards: View {
 
     private func card(_ title: String, _ value: String, _ caption: String?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title.uppercased())
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .tracking(0.6)
-                .foregroundColor(.white.opacity(0.4))
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.white.opacity(0.6))
             Text(value)
                 .font(.system(size: 15, weight: .semibold, design: .monospaced))
                 .foregroundColor(.white.opacity(0.9))
@@ -370,14 +373,14 @@ struct UsageSummaryCards: View {
             if let caption {
                 Text(caption)
                     .font(.system(size: 8))
-                    .foregroundColor(.white.opacity(0.35))
+                    .foregroundColor(.white.opacity(0.5))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 }
 
@@ -399,8 +402,10 @@ struct UsageHealthBanner: View {
             Spacer()
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(TerminalColors.amber.opacity(0.15)))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(TerminalColors.amber.opacity(0.4), lineWidth: 1))
+        .background(Color.white.opacity(0.04))
+        .overlay(alignment: .leading) {
+            Rectangle().fill(TerminalColors.amber).frame(width: 2)
+        }
     }
 }
 
@@ -421,7 +426,7 @@ struct UsageModelRow: View {
             if isExpanded { detail }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(isExpanded ? 0.08 : 0.05)))
+        .background(Color.white.opacity(isExpanded ? 0.08 : 0.04))
     }
 
     private var header: some View {
@@ -441,7 +446,7 @@ struct UsageModelRow: View {
             }
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(.white.opacity(0.35))
+                .foregroundColor(.white.opacity(0.5))
         }
     }
 
@@ -516,7 +521,7 @@ struct UsageClientRow: View {
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 }
 
@@ -537,11 +542,11 @@ struct UsageHeatStrip: View {
                 HStack(spacing: 6) {
                     Text(slice.window)
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.45))
+                        .foregroundColor(.white.opacity(0.6))
                         .frame(width: 28, alignment: .leading)
                     HStack(spacing: 2) {
                         ForEach(cells) { cell in
-                            RoundedRectangle(cornerRadius: 2)
+                            Rectangle()
                                 .fill(color(for: cell, peak: peak))
                                 .frame(width: 10, height: 10)
                                 .help("\(cell.group)/\(cell.model) — \(cell.account): \(DashFormat.count(cell.tokens)) tok, \(DashFormat.count(cell.requests)) req")
@@ -553,15 +558,13 @@ struct UsageHeatStrip: View {
             AnalyticsCaption(text: caption)
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 
-    /// Group hue = the app's provider palette (claude amber / codex blue, same
-    /// as `GroupBadge` and the v0.2.14 tiles) scaled by intensity — no rainbow.
+    /// One neutral quantitative scale; provider/group identity remains text.
     private func color(for cell: LlmuxDashboardWindowedCell, peak: UInt64) -> Color {
-        let base = cell.group == "codex" ? TerminalColors.blue : TerminalColors.amber
         let intensity = peak > 0 ? Double(cell.tokens) / Double(peak) : 0
-        return base.opacity(0.2 + 0.8 * intensity)
+        return Color.white.opacity(0.14 + 0.72 * intensity)
     }
 }
 
@@ -592,7 +595,7 @@ struct UsageActivityList: View {
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+        .background(Color.white.opacity(0.04))
     }
 
     @ViewBuilder private func completedRow(_ entry: LlmuxDashboardCompleted) -> some View {
@@ -603,7 +606,7 @@ struct UsageActivityList: View {
                 timeText(DashFormat.ago(ms: entry.atMs, now: now))
                 Text(entry.text ?? "note")
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(entry.error == true ? TerminalColors.amber : .white.opacity(0.45))
+                    .foregroundColor(entry.error == true ? TerminalColors.amber : .white.opacity(0.6))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
@@ -637,7 +640,7 @@ struct UsageActivityList: View {
             Spacer(minLength: 6)
             Text(trailing)
                 .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.45))
+                .foregroundColor(.white.opacity(0.6))
                 .lineLimit(1)
         }
     }
@@ -645,7 +648,7 @@ struct UsageActivityList: View {
     private func timeText(_ value: String) -> some View {
         Text(value)
             .font(.system(size: 9, design: .monospaced))
-            .foregroundColor(.white.opacity(0.35))
+            .foregroundColor(.white.opacity(0.5))
             .frame(width: 30, alignment: .trailing)
     }
 
@@ -665,6 +668,7 @@ struct UsageAccountHealthRow: View {
     let account: LlmuxDashboardAccount
     let isExpanded: Bool
     let now: Date
+    let privacyAlias: String
     let onTap: () -> Void
 
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
@@ -686,17 +690,19 @@ struct UsageAccountHealthRow: View {
             if isExpanded { detail }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(isExpanded ? 0.08 : 0.05)))
+        .background(Color.white.opacity(isExpanded ? 0.08 : 0.04))
     }
 
     private var header: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(isAuthFailed ? TerminalColors.red : isOverQuota ? TerminalColors.amber : TerminalColors.green)
-                .frame(width: 6, height: 6)
+            Image(systemName: isAuthFailed ? "exclamationmark.octagon.fill" : isOverQuota ? "exclamationmark.triangle.fill" : "circle.fill")
+                .font(.system(size: isAuthFailed || isOverQuota ? 9 : 6))
+                .foregroundColor(isAuthFailed ? TerminalColors.red : isOverQuota ? TerminalColors.amber : .white.opacity(0.72))
+                .accessibilityLabel(isAuthFailed ? "Authentication failed" : isOverQuota ? "Quota warning" : "Healthy")
             EmailPixelized(
                 isActive: emailAnonymousEnabled && account.name.contains("@"),
-                cacheKey: account.name
+                cacheKey: account.name,
+                accessibilityLabel: privacyAlias
             ) {
                 Text(account.name)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -714,7 +720,7 @@ struct UsageAccountHealthRow: View {
             }
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(.white.opacity(0.35))
+                .foregroundColor(.white.opacity(0.5))
         }
     }
 
@@ -763,14 +769,14 @@ struct GroupBadge: View {
     let group: String
 
     var body: some View {
-        Text(group.uppercased())
-            .font(.system(size: 8, weight: .bold, design: .monospaced))
-            .foregroundColor(group == "codex" ? TerminalColors.blue : TerminalColors.amber)
+        Text(group.capitalized)
+            .font(.caption2.weight(.semibold))
+            .foregroundColor(.white.opacity(0.6))
             .padding(.horizontal, 5)
             .padding(.vertical, 2)
             .background(
-                Capsule(style: .continuous)
-                    .fill((group == "codex" ? TerminalColors.blue : TerminalColors.amber).opacity(0.15))
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
             )
     }
 }
@@ -806,7 +812,7 @@ struct StatText: View {
         HStack(spacing: 4) {
             Text(label)
                 .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.35))
+                .foregroundColor(.white.opacity(0.5))
             Text(value)
                 .font(.system(size: 9, weight: .semibold, design: .monospaced))
                 .foregroundColor(.white.opacity(0.7))
@@ -821,7 +827,7 @@ struct AnalyticsCaption: View {
     var body: some View {
         Text(text)
             .font(.system(size: 8))
-            .foregroundColor(.white.opacity(0.35))
+            .foregroundColor(.white.opacity(0.5))
             .lineLimit(1)
     }
 }

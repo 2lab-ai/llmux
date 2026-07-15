@@ -76,6 +76,7 @@ class NotchViewModel: ObservableObject {
     let geometry: NotchGeometry
     let spacing: CGFloat = 12
     let hasPhysicalNotch: Bool
+    private let openedSizeOverride: CGSize?
 
     var deviceNotchRect: CGRect { geometry.deviceNotchRect }
     var screenRect: CGRect { geometry.screenRect }
@@ -83,49 +84,41 @@ class NotchViewModel: ObservableObject {
 
     /// Dynamic opened size based on content type
     var openedSize: CGSize {
+        if let openedSizeOverride {
+            return openedSizeOverride
+        }
         switch contentType {
         case .usage:
             return CGSize(
-                width: min(screenRect.width * 0.5, 600),
+                width: min(screenRect.width * 0.5, 560),
                 height: usageOpenedHeight
             )
         case .stats:
-            // Statistics (issue #68 v2): the sections scroll, so the panel
-            // takes a fixed height tuned to the overview card stack instead
-            // of growing with the account count like the usage tile grid.
             return CGSize(
-                width: min(screenRect.width * 0.5, 600),
-                height: max(420, min(640, screenRect.height - 72))
+                width: min(screenRect.width * 0.5, 560),
+                height: max(440, min(480, screenRect.height - 72))
             )
         case .menu:
-            // Menu has many fixed-height rows; 420 can push bottom actions outside
-            // the interactive panel hit area. Keep a larger base height.
-            let baseMenuHeight: CGFloat = 520
+            let baseMenuHeight: CGFloat = 460
             let expandedHeight = screenSelector.expandedPickerHeight + soundSelector.expandedPickerHeight
             let maxMenuHeight = max(420, min(windowHeight - 24, screenRect.height - 72))
             return CGSize(
-                width: min(screenRect.width * 0.4, 480),
+                width: min(screenRect.width * 0.4, 500),
                 height: min(baseMenuHeight + expandedHeight, maxMenuHeight)
             )
         }
     }
 
-    /// Height of the usage panel, sized to the number of account tiles.
-    /// The grid is two columns, so rows = ceil(count / 2); 1–2 accounts fit a
-    /// single row (no tall empty void), 3–4 take two rows, 5+ keep growing and
-    /// then scroll once they hit the screen limit — instead of a fixed 640 that
-    /// left most of the panel black. `perRow`/`chrome` are tuned to the rendered
-    /// tile height (token footer removed, usage rows enlarged).
+    /// Height of the default compact account list. Advanced details remain in
+    /// the same bounded scroll surface and do not alter semantic window state.
     private var usageOpenedHeight: CGFloat {
         let count = IslandUsageModel.shared.tiles.count
-        let chrome: CGFloat = 96          // notch header + "Usage" toolbar + paddings
-        let perRow: CGFloat = 186         // one grid row of enlarged tiles (measured ≈180)
-        let rowSpacing: CGFloat = 10
-        let rows = max(1, Int(ceil(Double(max(count, 1)) / 2.0)))
-        let desired = chrome + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
-        let minHeight: CGFloat = 240
+        let chrome: CGFloat = 154
+        let perAccount: CGFloat = 48
+        let desired = chrome + CGFloat(min(max(count, 1), 7)) * perAccount
+        let minHeight: CGFloat = 340
         let maxHeight = max(minHeight, screenRect.height - 72)
-        return min(max(desired, minHeight), maxHeight)
+        return min(max(desired, minHeight), min(580, maxHeight))
     }
 
     // MARK: - Animation
@@ -146,13 +139,20 @@ class NotchViewModel: ObservableObject {
 
     // MARK: - Initialization
 
-    init(deviceNotchRect: CGRect, screenRect: CGRect, windowHeight: CGFloat, hasPhysicalNotch: Bool) {
+    init(
+        deviceNotchRect: CGRect,
+        screenRect: CGRect,
+        windowHeight: CGFloat,
+        hasPhysicalNotch: Bool,
+        openedSizeOverride: CGSize? = nil
+    ) {
         self.geometry = NotchGeometry(
             deviceNotchRect: deviceNotchRect,
             screenRect: screenRect,
             windowHeight: windowHeight
         )
         self.hasPhysicalNotch = hasPhysicalNotch
+        self.openedSizeOverride = openedSizeOverride
         setupEventHandlers()
         observeSelectors()
     }
@@ -344,6 +344,16 @@ class NotchViewModel: ObservableObject {
     func showStats() {
         lastNonMenuContentType = .stats
         contentType = .stats
+        reportNavigation()
+    }
+
+    /// Open Settings directly from the compact top navigation. The semantic
+    /// core retains its established `menu` route name; only the shell label is
+    /// renewed.
+    func showSettings() {
+        guard contentType != .menu else { return }
+        lastNonMenuContentType = contentType
+        contentType = .menu
         reportNavigation()
     }
 

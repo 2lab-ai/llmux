@@ -14,7 +14,7 @@ Control {
 
     background: Rectangle {
         color: IslandTheme.surface
-        radius: height / 2
+        radius: 0
         border.color: IslandTheme.border
         border.width: 1
     }
@@ -36,19 +36,31 @@ Control {
                 onClicked: control.activated(index)
 
                 contentItem: Text {
-                    text: String(segment.modelData).toUpperCase()
-                    color: segment.checked ? IslandTheme.amber : IslandTheme.secondaryText
-                    font.family: IslandTheme.monoFamily
-                    font.pixelSize: 10
+                    text: String(segment.modelData)
+                    color: segment.checked ? IslandTheme.panel : IslandTheme.secondaryText
+                    font.pixelSize: 11
                     font.weight: Font.DemiBold
-                    font.letterSpacing: 0.8
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
 
                 background: Rectangle {
-                    radius: height / 2
-                    color: segment.checked ? IslandTheme.amberTint : "transparent"
+                    radius: 0
+                    color: segment.checked ? IslandTheme.primaryText : "transparent"
+                    border.color: segment.visualFocus
+                        ? (segment.checked ? IslandTheme.panel : IslandTheme.focus)
+                        : segment.checked ? IslandTheme.primaryText : "transparent"
+                    border.width: segment.visualFocus ? 2 : 1
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: -3
+                        visible: segment.visualFocus
+                        color: "transparent"
+                        border.color: IslandTheme.focus
+                        border.width: 2
+                        radius: 0
+                    }
                 }
             }
         }

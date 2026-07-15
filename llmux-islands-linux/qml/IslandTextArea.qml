@@ -9,7 +9,7 @@ TextArea {
     topPadding: 9
     bottomPadding: 9
     color: IslandTheme.primaryText
-    selectionColor: IslandTheme.amber
+    selectionColor: IslandTheme.primaryText
     selectedTextColor: IslandTheme.panel
     placeholderTextColor: IslandTheme.tertiaryText
     font.pixelSize: 12
@@ -17,7 +17,7 @@ TextArea {
     background: Rectangle {
         radius: IslandTheme.controlRadius
         color: IslandTheme.field
-        border.color: control.activeFocus ? IslandTheme.amber : IslandTheme.border
-        border.width: 1
+        border.color: control.activeFocus ? IslandTheme.focus : IslandTheme.border
+        border.width: control.activeFocus ? 2 : 1
     }
 }

@@ -9,6 +9,8 @@ Kirigami.ScrollablePage {
     id: statisticsPage
 
     property var uiState: ({})
+    property bool advancedVisible: false
+    property bool receiptSnapshotMode: false
     property int selectedSection: 0
     property int renderedHeatmapCells: 0
     property int renderedServingAccounts: 0
@@ -22,6 +24,7 @@ Kirigami.ScrollablePage {
     readonly property var activityReceipts: arrayOrEmpty(statistics.activity_receipts)
     readonly property var verificationReceipts: arrayOrEmpty(uiState.verification_receipts)
     readonly property var dataQuality: objectOrEmpty(statistics.data_quality)
+    readonly property bool effectiveAdvancedVisible: advancedVisible || receiptSnapshotMode
     readonly property string unavailableText: qsTr("Unavailable")
     readonly property real preferredContentHeight: statisticsContent.implicitHeight
 
@@ -32,7 +35,7 @@ Kirigami.ScrollablePage {
     palette.text: IslandTheme.primaryText
     palette.buttonText: IslandTheme.primaryText
     palette.base: IslandTheme.field
-    palette.highlight: IslandTheme.amber
+    palette.highlight: IslandTheme.primaryText
     palette.highlightedText: IslandTheme.panel
     background: Rectangle { color: IslandTheme.panel }
 
@@ -294,6 +297,21 @@ Kirigami.ScrollablePage {
         return optionalTime(firstAvailable(row, ["last_refresh_ms", "refreshed_at_ms"]))
     }
 
+    function healthSummaryReason(row) {
+        var account = objectOrEmpty(row)
+        var blocked = firstAvailable(account, ["blocked_reason", "blocked"])
+        if (hasValue(blocked))
+            return String(blocked)
+        if (account.healthy === false) {
+            if (hasValue(account.status))
+                return String(account.status)
+            return qsTr("Account health or authentication needs attention")
+        }
+        if (account.paused === true)
+            return qsTr("Paused by user")
+        return ""
+    }
+
     function receiptStatusText(receipt) {
         if (receipt.kind === "in_flight")
             return qsTr("In flight")
@@ -304,12 +322,12 @@ Kirigami.ScrollablePage {
 
     function receiptStatusColor(receipt) {
         if (receipt.kind === "in_flight")
-            return IslandTheme.amberTint
+            return IslandTheme.surfaceRaised
         if (receipt.error || (hasValue(receipt.status) && Number(receipt.status) >= 400))
             return IslandTheme.redTint
         if (receipt.kind === "note")
             return IslandTheme.surfaceRaised
-        return IslandTheme.greenTint
+        return IslandTheme.surfaceRaised
     }
 
     function receiptHeadline(receipt) {
@@ -373,37 +391,47 @@ Kirigami.ScrollablePage {
             }
 
             Rectangle {
-                radius: height / 2
+                radius: 0
                 implicitWidth: statisticsConnectionLabel.implicitWidth + 18
                 implicitHeight: statisticsConnectionLabel.implicitHeight + 10
-                color: IslandTheme.greenTint
-                border.color: IslandTheme.green
+                color: IslandTheme.surface
+                border.color: IslandTheme.border
                 border.width: 1
 
                 Label {
                     id: statisticsConnectionLabel
                     anchors.centerIn: parent
                     text: qsTr("%1 accounts").arg(statisticsPage.accountCountText())
-                    color: IslandTheme.green
-                    font.family: IslandTheme.monoFamily
-                    font.pixelSize: 10
+                    color: IslandTheme.secondaryText
+                    font.pixelSize: 11
                 }
             }
 
             Item { Layout.fillWidth: true }
+
+            IslandButton {
+                objectName: "statistics-advanced-disclosure"
+                text: qsTr("Advanced")
+                checkable: true
+                checked: statisticsPage.effectiveAdvancedVisible
+                enabled: !statisticsPage.receiptSnapshotMode
+                Accessible.name: qsTr("Show advanced statistics details")
+                onClicked: statisticsPage.advancedVisible = checked
+            }
         }
 
         IslandSegmentedControl {
             Layout.fillWidth: true
-            model: [qsTr("Overview"), qsTr("Models"), qsTr("Clients"), qsTr("Health")]
-            currentIndex: statisticsPage.selectedSection
+            visible: statisticsPage.effectiveAdvancedVisible
+            model: [qsTr("Models"), qsTr("Clients"), qsTr("Health"), qsTr("Receipts")]
+            currentIndex: statisticsPage.receiptSnapshotMode
+                ? 3 : statisticsPage.selectedSection
             onActivated: function(index) { statisticsPage.selectedSection = index }
         }
 
         IslandInlineMessage {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
-                && statisticsPage.attentionAccountCount() > 0
+            visible: statisticsPage.attentionAccountCount() > 0
             type: Kirigami.MessageType.Warning
             text: qsTr("%1 account needs attention")
                 .arg(statisticsPage.attentionAccountCount())
@@ -412,7 +440,6 @@ Kirigami.ScrollablePage {
         ColumnLayout {
             objectName: "statistics-overview"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
@@ -422,6 +449,7 @@ Kirigami.ScrollablePage {
                 }
                 Item { Layout.fillWidth: true }
                 Label {
+                    visible: statisticsPage.effectiveAdvancedVisible
                     text: qsTr("Model data: %1 · Cost: %2")
                             .arg(statisticsPage.qualityValue("model_usage"))
                             .arg(statisticsPage.qualityValue("cost"))
@@ -434,15 +462,21 @@ Kirigami.ScrollablePage {
 
             GridLayout {
                 Layout.fillWidth: true
-                columns: statisticsPage.width >= 760 ? 5 : 2
+                columns: statisticsPage.width >= 760
+                    ? (statisticsPage.effectiveAdvancedVisible ? 5 : 4) : 2
                 columnSpacing: Kirigami.Units.smallSpacing
                 rowSpacing: Kirigami.Units.smallSpacing
 
                 Repeater {
-                    model: [
+                    model: statisticsPage.effectiveAdvancedVisible ? [
                         { "label": qsTr("Requests"), "value": statisticsPage.optionalNumber(statisticsPage.overview.requests) },
                         { "label": qsTr("Tokens"), "value": statisticsPage.overviewTokensText() },
                         { "label": qsTr("API-equivalent cost"), "value": statisticsPage.optionalCurrency(statisticsPage.overview.cost_usd) },
+                        { "label": qsTr("Error rate"), "value": statisticsPage.errorRateText() },
+                        { "label": qsTr("Accounts"), "value": statisticsPage.accountCountText() }
+                    ] : [
+                        { "label": qsTr("Requests"), "value": statisticsPage.optionalNumber(statisticsPage.overview.requests) },
+                        { "label": qsTr("Tokens"), "value": statisticsPage.overviewTokensText() },
                         { "label": qsTr("Error rate"), "value": statisticsPage.errorRateText() },
                         { "label": qsTr("Accounts"), "value": statisticsPage.accountCountText() }
                     ]
@@ -471,6 +505,9 @@ Kirigami.ScrollablePage {
 
             IslandSectionLabel {
                 Layout.fillWidth: true
+                visible: statisticsPage.effectiveAdvancedVisible
+                    && !statisticsPage.receiptSnapshotMode
+                    && statisticsPage.selectedSection === 0
                 text: qsTr("Top models")
             }
 
@@ -478,6 +515,9 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
                 Layout.preferredHeight: childrenRect.height
                 spacing: Kirigami.Units.smallSpacing
+                visible: statisticsPage.effectiveAdvancedVisible
+                    && !statisticsPage.receiptSnapshotMode
+                    && statisticsPage.selectedSection === 0
 
                 Repeater {
                     model: statisticsPage.models.slice(0, 3)
@@ -485,9 +525,9 @@ Kirigami.ScrollablePage {
                     delegate: Rectangle {
                         id: topModelChip
                         required property var modelData
-                        radius: height / 2
-                        color: IslandTheme.amberTint
-                        border.color: IslandTheme.amber
+                        radius: 0
+                        color: IslandTheme.surfaceRaised
+                        border.color: IslandTheme.border
                         border.width: 1
                         implicitWidth: topModelLabel.implicitWidth + Kirigami.Units.largeSpacing
                         implicitHeight: topModelLabel.implicitHeight + Kirigami.Units.smallSpacing * 2
@@ -499,7 +539,7 @@ Kirigami.ScrollablePage {
                                     + statisticsPage.optionalNumber(topModelChip.modelData.requests)
                             maximumLineCount: 1
                             elide: Text.ElideRight
-                            color: IslandTheme.amber
+                            color: IslandTheme.primaryText
                             font.family: IslandTheme.monoFamily
                             font.pixelSize: 10
                             font.weight: Font.DemiBold
@@ -515,15 +555,91 @@ Kirigami.ScrollablePage {
             }
         }
 
+        ColumnLayout {
+            objectName: "statistics-account-overview"
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.smallSpacing
+
+            IslandSectionLabel {
+                text: qsTr("Account overview")
+            }
+
+            Repeater {
+                model: statisticsPage.health
+
+                delegate: IslandCard {
+                    id: accountOverviewCard
+                    required property var modelData
+                    readonly property var account: statisticsPage.objectOrEmpty(modelData)
+                    readonly property string attentionReason: statisticsPage.healthSummaryReason(account)
+                    Layout.fillWidth: true
+
+                    contentItem: ColumnLayout {
+                        spacing: 6
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Rectangle {
+                                implicitWidth: 7
+                                implicitHeight: 7
+                                radius: width / 2
+                                color: accountOverviewCard.account.healthy === false
+                                    ? IslandTheme.red
+                                    : accountOverviewCard.account.paused === true
+                                        ? IslandTheme.amber : IslandTheme.secondaryText
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: statisticsPage.optionalText(
+                                    statisticsPage.firstAvailable(accountOverviewCard.account,
+                                                                  ["display_name", "name"])
+                                )
+                                font.weight: Font.DemiBold
+                                elide: Text.ElideMiddle
+                            }
+                            Label {
+                                text: statisticsPage.optionalText(accountOverviewCard.account.status)
+                                color: accountOverviewCard.account.healthy === false
+                                    ? IslandTheme.red : IslandTheme.secondaryText
+                            }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            visible: accountOverviewCard.attentionReason.length > 0
+                            text: accountOverviewCard.attentionReason
+                            textFormat: Text.PlainText
+                            color: accountOverviewCard.account.healthy === false
+                                ? IslandTheme.red : IslandTheme.amber
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+            }
+
+            Label {
+                visible: statisticsPage.health.length === 0
+                Layout.fillWidth: true
+                text: qsTr("Account overview is %1")
+                    .arg(statisticsPage.unavailableText.toLowerCase())
+                color: IslandTheme.secondaryText
+                horizontalAlignment: Text.AlignHCenter
+            }
+        }
+
         IslandSeparator {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 0
         }
 
         ColumnLayout {
             objectName: "statistics-heatmaps"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
@@ -575,10 +691,10 @@ Kirigami.ScrollablePage {
                                     id: heatCell
                                     required property var modelData
                                     Layout.fillWidth: true
-                                    radius: Kirigami.Units.smallSpacing
-                                    color: Qt.rgba(IslandTheme.amber.r,
-                                                   IslandTheme.amber.g,
-                                                   IslandTheme.amber.b,
+                                    radius: 0
+                                    color: Qt.rgba(IslandTheme.primaryText.r,
+                                                   IslandTheme.primaryText.g,
+                                                   IslandTheme.primaryText.b,
                                                    statisticsPage.heatCellIntensity(modelData))
                                     implicitHeight: heatCellLayout.implicitHeight + Kirigami.Units.smallSpacing * 2
 
@@ -638,13 +754,17 @@ Kirigami.ScrollablePage {
 
         IslandSeparator {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 1
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 0
         }
 
         ColumnLayout {
             objectName: "statistics-models"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 1
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 0
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
@@ -695,7 +815,7 @@ Kirigami.ScrollablePage {
                                         .arg(statisticsPage.optionalNumber(modelCard.modelData.in_flight))
                                 color: statisticsPage.hasValue(modelCard.modelData.in_flight)
                                         && Number(modelCard.modelData.in_flight) > 0
-                                        ? IslandTheme.amber : IslandTheme.secondaryText
+                                        ? IslandTheme.primaryText : IslandTheme.secondaryText
                             }
                         }
 
@@ -704,7 +824,7 @@ Kirigami.ScrollablePage {
                             columns: statisticsPage.width >= 760 ? 4 : 2
                             columnSpacing: Kirigami.Units.largeSpacing
                             Label { text: qsTr("Requests %1").arg(statisticsPage.optionalNumber(modelCard.modelData.requests)) }
-                            Label { text: qsTr("OK %1").arg(statisticsPage.optionalNumber(modelCard.modelData.ok)); color: IslandTheme.green }
+                            Label { text: qsTr("OK %1").arg(statisticsPage.optionalNumber(modelCard.modelData.ok)); color: IslandTheme.primaryText }
                             Label { text: qsTr("Errors %1").arg(statisticsPage.optionalNumber(modelCard.modelData.errors)); color: IslandTheme.red }
                             Label { text: qsTr("Cost %1").arg(statisticsPage.optionalCurrency(modelCard.modelData.cost_usd)) }
                             Label { text: qsTr("Input %1").arg(statisticsPage.optionalNumber(modelCard.modelData.tokens_in)) }
@@ -765,13 +885,17 @@ Kirigami.ScrollablePage {
 
         IslandSeparator {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 2
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 1
         }
 
         ColumnLayout {
             objectName: "statistics-clients"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 2
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 1
             spacing: Kirigami.Units.smallSpacing
 
             IslandSectionLabel {
@@ -827,15 +951,17 @@ Kirigami.ScrollablePage {
 
         IslandSeparator {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
-                || statisticsPage.selectedSection === 3
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 2
         }
 
         ColumnLayout {
             objectName: "statistics-health"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
-                || statisticsPage.selectedSection === 3
+            visible: statisticsPage.effectiveAdvancedVisible
+                && !statisticsPage.receiptSnapshotMode
+                && statisticsPage.selectedSection === 2
             spacing: Kirigami.Units.smallSpacing
 
             IslandSectionLabel {
@@ -858,9 +984,10 @@ Kirigami.ScrollablePage {
                                 implicitWidth: Kirigami.Units.smallSpacing
                                 implicitHeight: healthName.implicitHeight
                                 radius: width / 2
-                                color: healthCard.modelData.healthy && !healthCard.modelData.paused
-                                        ? IslandTheme.green
-                                        : IslandTheme.red
+                                color: healthCard.modelData.paused === true
+                                    ? IslandTheme.amber
+                                    : healthCard.modelData.healthy
+                                        ? IslandTheme.secondaryText : IslandTheme.red
                             }
                             Label {
                                 id: healthName
@@ -907,14 +1034,18 @@ Kirigami.ScrollablePage {
 
         IslandSeparator {
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
+            visible: statisticsPage.receiptSnapshotMode
+                || (statisticsPage.effectiveAdvancedVisible
+                    && statisticsPage.selectedSection === 3)
         }
 
         ColumnLayout {
             id: receiptEvidenceSection
             objectName: "statistics-activity-receipts"
             Layout.fillWidth: true
-            visible: statisticsPage.selectedSection === 0
+            visible: statisticsPage.receiptSnapshotMode
+                || (statisticsPage.effectiveAdvancedVisible
+                    && statisticsPage.selectedSection === 3)
             spacing: Kirigami.Units.smallSpacing
 
             RowLayout {
@@ -952,7 +1083,7 @@ Kirigami.ScrollablePage {
                         RowLayout {
                             Layout.fillWidth: true
                             Rectangle {
-                                radius: height / 2
+                                radius: 0
                                 implicitWidth: receiptStatus.implicitWidth + Kirigami.Units.largeSpacing
                                 implicitHeight: receiptStatus.implicitHeight + Kirigami.Units.smallSpacing
                                 color: statisticsPage.receiptStatusColor(receiptCard.receipt)
@@ -1021,7 +1152,7 @@ Kirigami.ScrollablePage {
                             Label {
                                 text: receiptCard.receipt.fast ? qsTr("Fast") : qsTr("Standard")
                                 color: receiptCard.receipt.fast
-                                        ? IslandTheme.amber : IslandTheme.secondaryText
+                                        ? IslandTheme.primaryText : IslandTheme.secondaryText
                                 font.family: IslandTheme.monoFamily
                                 font.pixelSize: 9
                             }
@@ -1059,7 +1190,6 @@ Kirigami.ScrollablePage {
                             color: receiptCard.receipt.error
                                     ? IslandTheme.red : IslandTheme.primaryText
                             wrapMode: Text.Wrap
-                            font.family: IslandTheme.monoFamily
                             font.pixelSize: 10
                         }
                     }
@@ -1117,7 +1247,6 @@ Kirigami.ScrollablePage {
                                     verificationCard.receipt.outcome
                                 )
                                 font.bold: true
-                                font.family: IslandTheme.monoFamily
                                 font.pixelSize: 10
                                 elide: Text.ElideRight
                             }
@@ -1130,7 +1259,6 @@ Kirigami.ScrollablePage {
                                 )
                                 color: IslandTheme.secondaryText
                                 wrapMode: Text.Wrap
-                                font.family: IslandTheme.monoFamily
                                 font.pixelSize: 10
                             }
                         }

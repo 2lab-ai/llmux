@@ -546,7 +546,11 @@ final class IslandUsageModel: ObservableObject {
             info: tile.info,
             errorMessage: tile.errorMessage,
             issue: tile.issue,
-            paused: tile.paused
+            current: tile.current,
+            paused: tile.paused,
+            healthy: tile.healthy,
+            status: tile.status,
+            inFlight: tile.inFlight
         )
     }
 

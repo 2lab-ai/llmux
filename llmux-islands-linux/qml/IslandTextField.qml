@@ -8,7 +8,7 @@ TextField {
     leftPadding: 10
     rightPadding: 10
     color: IslandTheme.primaryText
-    selectionColor: IslandTheme.amber
+    selectionColor: IslandTheme.primaryText
     selectedTextColor: IslandTheme.panel
     placeholderTextColor: IslandTheme.tertiaryText
     font.pixelSize: 12
@@ -17,7 +17,7 @@ TextField {
     background: Rectangle {
         radius: IslandTheme.controlRadius
         color: IslandTheme.field
-        border.color: control.activeFocus ? IslandTheme.amber : IslandTheme.border
-        border.width: 1
+        border.color: control.activeFocus ? IslandTheme.focus : IslandTheme.border
+        border.width: control.activeFocus ? 2 : 1
     }
 }

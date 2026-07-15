@@ -79,12 +79,13 @@ Instead:
 | NSEvent global hover/click monitor | Qt `SystemTrayIcon` activation + local pointer handlers | No global interception or accessibility permission |
 | Outside-click close and click repost | focus/active loss and Escape | Never synthesize/repost another application's click |
 | Closed provider counters | tray tooltip/menu/warning icon plus optional compact layer surface | Same provider grouping and total; the portable tray API has no attention-status setter |
-| Usage/stats/menu segmented navigation | Checkable Qt Quick Controls ToolButton actions | Same routes and state retention |
-| SwiftUI LazyVGrid tiles | Kirigami.AbstractCard delegates in Qt Quick GridLayout | Responsive one/two-column layout |
+| Usage/Statistics/Settings compact navigation | Checkable Qt Quick Controls ToolButton actions | Same routes and state retention; semantic route `menu` is labelled Settings |
+| SwiftUI compact account rows | Kirigami.AbstractCard delegates in Qt Quick GridLayout | Same current/attention/active state and one primary quota on the default path |
 | ContextMenu | Qt Quick Controls Menu | Pause/resume/remove actions and disable rules match |
 | alert/confirmationDialog/sheet | Kirigami.PromptDialog/Dialog | Destructive and channel changes require confirmation |
 | ProgressView | Kirigami.LoadingPlaceholder/BusyIndicator | Busy is operation-scoped, not global |
-| Settings forms | Kirigami.FormLayout | Labels, validation, and keyboard navigation |
+| Contextual `Advanced` disclosure | Checkable labelled control plus conditional Qt Quick sections | Presentation-local only; no shared action, effect, persistence, or daemon call |
+| Advanced settings forms | Kirigami.FormLayout | Labels, validation, and keyboard navigation |
 | ScreenSelector | QGuiApplication::screens/QScreen | Stable screen id and fallback |
 | NSSound | freedesktop notification sound-name | Preview is cancellable and “none” is valid |
 | SMAppService launch at login | XDG autostart or systemd --user | Toggle reflects actual installed state |
@@ -98,15 +99,16 @@ Instead:
 | Current content | KDE view |
 |---|---|
 | Usage header/status/add/refresh | Kirigami toolbar actions and InlineMessage |
-| Account usage tiles | Kirigami.AbstractCard delegates |
+| Default account usage | Compact Kirigami card delegates with current/attention/active state and primary quota |
+| Advanced account details | Secondary quota, token/credential metadata, raw status, and account mutation controls |
 | OAuth/API key chooser | Kirigami dialog with provider cards and password field |
 | Device verification code | Selectable Label, copy and open actions |
-| Statistics overview cards | Kirigami.AbstractCard delegates in a responsive GridLayout |
-| Model/client/health detail | Kirigami.AbstractCard sections with nested Repeater rows |
-| 24h/72h heat map | Qt Quick Grid with accessible textual fallback |
-| Recent activity/request receipts | Sectioned headings with repeated card/row delegates for in-flight, completed, note, and verification receipts |
+| Statistics default | Summary metrics plus compact account overview and actionable health |
+| Statistics Advanced | Model/client/health detail and 24h/72h heat map in contextual sections |
+| Recent activity/request receipts | Advanced section with repeated card/row delegates for in-flight, completed, note, and verification receipts; failures remain visible at their originating surface |
+| Settings default | Screen, sound, privacy, launch-at-login, and actionable connection state |
+| Settings Advanced | Connection editor, platform diagnostics, events, maintenance, receipts, and build/source metadata |
 | Events editor | Modal Qt Quick Controls Dialog with inline date-time validation |
-| Connection and maintenance | Kirigami.AbstractCard/FormLayout sections |
 
 ## Code-sharing boundary
 

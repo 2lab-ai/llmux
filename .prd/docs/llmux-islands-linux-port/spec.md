@@ -202,6 +202,53 @@ key is present. Debug output uses redacted implementations. Open URL, copy,
 notification, sound preview, native window configuration, and quit are
 shell-owned commands rather than falsely portable core effects.
 
+## Presentation hierarchy and progressive disclosure
+
+Both native shells render the same two-level information hierarchy without
+adding state to the shared semantic contract:
+
+1. The default path shows current connection/attention state, account identity,
+   primary quota or usage, compact navigation, and the action needed most often
+   on that surface.
+2. A clearly labelled, keyboard-accessible `Advanced` disclosure reveals
+   diagnostic and infrequent controls in the context they affect. This includes
+   credential/token metadata, in-flight internals, model/client/health detail,
+   heatmaps, request and verification receipts, daemon endpoint credentials,
+   platform capability diagnostics, events, release/channel maintenance, and
+   build/source metadata.
+3. Warning, critical, offline, fatal, authentication-required, and destructive
+   confirmation states remain visible at the default level. Progressive
+   disclosure must never conceal the reason a primary action is unavailable.
+4. Screen, sound, privacy, launch-at-login, add account, refresh, and navigation
+   remain directly reachable. Contextual account mutation actions may live in
+   the account's Advanced disclosure, with removal still requiring confirmation.
+5. Disclosure state is presentation-local, ephemeral, and excluded from
+   `UiState`, persistence, actions, effects, receipts, and daemon traffic.
+6. Renderer evidence uses one canonical privacy-safe `UiState` fixture and
+   fixed clock on both platforms. Each artifact set contains exactly seven
+   distinct PNGs—Usage/default+Advanced, Statistics/default+Advanced, receipt
+   detail, and Settings/default+Advanced—and includes the real shell brand,
+   navigation, selected route, and connection state.
+
+The named `openai` UI/UX reference is the visual north star. Because Islands is
+an inverted menu-bar/notch surface, it uses the reference's full-inversion mode:
+pure or near-black canvas, white ink, and 100%/60%/44% opacity tiers. Emphasis
+comes from white-fill/black-text inversion rather than a chromatic accent.
+Internal cards, controls, and disclosures are flat and square (`0px` radius)
+where platform primitives permit; they have no shadow, gradient, glow, or
+decorative material blur. The outer island/window silhouette may retain its
+platform-required rounding.
+
+Provider identity is text or iconography rather than decorative color. Color is
+reserved for rare semantic warning, error, success, and indispensable
+quantitative distinction, always paired with text or iconography; normal quota
+bars, focus, and navigation are monochrome. Platform system grotesque/sans
+typography stands in for OpenAI Sans, with monospaced text limited to identifiers,
+timestamps, endpoints, and tabular numeric telemetry. Layout follows a 4/8-point
+spacing rhythm with generous whitespace. Frequent navigation and keyboard
+actions do not animate; any occasional disclosure feedback is short,
+interruptible, and reduced-motion safe.
+
 ## Required flows
 
 ### Startup and polling

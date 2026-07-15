@@ -10,25 +10,29 @@ import SwiftUI
 
 struct ProcessingSpinner: View {
     @State private var phase: Int = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let symbols = ["·", "✢", "✳", "∗", "✻", "✽"]
-    private let color = Color(red: 0.85, green: 0.47, blue: 0.34) // Claude orange
 
     private let timer = Timer.publish(every: 0.15, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        Text(symbols[phase % symbols.count])
+        Text(reduceMotion ? "…" : symbols[phase % symbols.count])
             .font(.system(size: 12, weight: .bold))
-            .foregroundColor(color)
+            .foregroundColor(.white.opacity(0.6))
             .frame(width: 12, alignment: .center)
             .onReceive(timer) { _ in
-                phase = (phase + 1) % symbols.count
+                if !reduceMotion {
+                    phase = (phase + 1) % symbols.count
+                }
             }
     }
 }
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview {
     ProcessingSpinner()
         .frame(width: 30, height: 30)
         .background(.black)
 }
+#endif

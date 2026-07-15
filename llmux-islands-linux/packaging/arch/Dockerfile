@@ -62,7 +62,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     && test "$snapshot_status" -eq 0 \
     && if printf '%s\n' "$snapshot_log" | grep -Fq 'QML warning:'; then exit 1; fi \
     && hashes='' \
-    && for surface in usage statistics menu; do \
+    && for surface in usage usage-advanced statistics statistics-advanced menu menu-advanced; do \
          file="/tmp/llmux-islands-snapshots/$surface.png"; \
          test -s "$file"; \
          size="$(wc -c < "$file")"; \
@@ -81,8 +81,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     && test "$(od -An -tx1 -N8 "$receipt" | tr -d ' \n')" = "89504e470d0a1a0a" \
     && receipt_hash="$(sha256sum "$receipt" | cut -d ' ' -f 1)" \
     && case " $hashes " in *" $receipt_hash "*) exit 1;; esac \
+    && test "$(find /tmp/llmux-islands-snapshots -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 7 \
     && cd /tmp/llmux-islands-snapshots \
-    && sha256sum usage.png statistics.png receipts.png menu.png > SHA256SUMS
+    && sha256sum \
+         usage.png usage-advanced.png \
+         statistics.png statistics-advanced.png \
+         receipts.png menu.png menu-advanced.png \
+         > SHA256SUMS
 
 # Exercise the real PKGBUILD against this exact checkout. makepkg refuses to
 # run as root, so commit the minimal Docker context and build as an unprivileged

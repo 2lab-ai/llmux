@@ -151,14 +151,16 @@ jobs:
           app="$RUNNER_TEMP/LlmuxIslandsDerivedData/Build/Products/Debug/LlmuxIslands.app/Contents/MacOS/LlmuxIslands"
           test -x "$app"
           "$app" -emailAnonymousEnabled YES
-          for surface in menu.png usage-anon-on.png stats.png receipts-detail.png; do
+          for surface in menu.png menu-advanced.png usage-anon-on.png usage-advanced.png stats.png stats-advanced.png receipts-detail.png; do
             file="$LLMUX_ISLANDS_SNAPSHOT_DIR/$surface"
             test -s "$file"
             test "$(stat -f%z "$file")" -gt 20000
             test "$(od -An -tx1 -N8 "$file" | tr -d ' \n')" = "89504e470d0a1a0a"
           done
+          test "$(find "$LLMUX_ISLANDS_SNAPSHOT_DIR" -maxdepth 1 -type f -name '*.png' | wc -l | tr -d ' ')" -eq 7
           cd "$LLMUX_ISLANDS_SNAPSHOT_DIR"
           shasum -a 256 *.png > SHA256SUMS
+          test "$(cut -d ' ' -f 1 SHA256SUMS | sort -u | wc -l | tr -d ' ')" -eq 7
 
       - name: Upload deterministic macOS surface evidence
         uses: actions/upload-artifact@v4
