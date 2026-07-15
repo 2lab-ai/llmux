@@ -1,5 +1,13 @@
 # Findings — dashboard overhaul + codex settings + routing (2026-06-13)
 
+> **Status — dated shipped findings.** Routing, priority-mode, and usage-scale
+> evidence below records the 2026-06-13 implementation. The model/context
+> section predates the current `gpt-5.6-sol` default and is superseded by
+> [Models](../docs/models.md) and the
+> [context-window FAQ](../docs/faq.md#what-does-1m-do-on-a-codex-model-name).
+> Treat its `gpt-5.5` values and workaround as historical, not current setup
+> instructions.
+
 Evidence-anchored notes from the dashboard/codex/routing work. Where a claim
 rests on a live capture or external source, it is cited.
 

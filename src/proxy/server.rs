@@ -718,14 +718,16 @@ pub async fn serve(
         }
     });
 
-    // Background: keep ALL cold accounts warm (issue #45, generalized). A cold
-    // account with NO client traffic is never probed by the request path. The
-    // oauth-only usage poller covers cold *oauth* accounts, but cold Codex AND
-    // cold api-key accounts have no other window source, so their 5h/7d windows
-    // stay empty forever (and show no usage in `status`/dashboard/llmux-islands).
+    // Background: refresh eligible cold non-Grok accounts (issue #45,
+    // generalized). A cold account with NO client traffic is never probed by
+    // the request path. The oauth-only usage poller covers cold *oauth*
+    // accounts, but eligible cold Codex and api-key accounts have no other
+    // window source, so their 5h/7d windows stay empty forever (and show no
+    // usage in `status`/dashboard/llmux-islands). Operator-paused accounts are
+    // excluded by the probe gate.
     // When the idle probe is enabled AND a positive sweep cadence is configured,
-    // fire the probe trigger for EVERY backend group on a timer (`None` = all
-    // groups). `trigger_idle_probes` is fully self-gated (kill-switch +
+    // consider every backend group on a timer (`None` = no group pre-filter).
+    // `trigger_idle_probes` is fully self-gated (kill-switch +
     // has-no-window + per-account cooldown inside `probe_if_idle`), so an oauth
     // account the poller already warmed is skipped (it has a window), and the
     // per-account cooldown — not this cadence — bounds cost: at most one probe

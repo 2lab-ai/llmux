@@ -1,6 +1,5 @@
-//! CLI surface (FR5) — mirrors teamclaude's commands. Arg structs here are
-//! COMPLETE (they are the user-facing contract); handlers live in their own
-//! files and are `todo!()` until the port lands.
+//! CLI surface and user-facing argument contract. Command handlers live in
+//! their matching modules.
 
 pub mod accounts;
 pub mod api;

@@ -1,5 +1,11 @@
 # llmux-islands — Architecture
 
+Status: **historical macOS input, superseded**. This describes the original
+native-client cut. The shipped cross-platform boundary is documented in the
+[Linux port dossier](docs/llmux-islands-linux-port/README.md) and maintained
+[`02-architecture.md`](02-architecture.md). Paths and line references below
+remain as dated design evidence.
+
 Two parts: (A) a small **new HTTP surface in the Rust daemon** that exposes GUI-initiated OAuth
 login (the only net-new server work — display/add-apikey/remove/switch already exist), and (B) a
 **new native macOS app** (`llmux-islands/`) that lifts agent-island's presentation layer and

@@ -1,5 +1,6 @@
-//! Load/save of `~/.config/llmux.json` — atomic writes, 0600 perms, and
-//! read-merge-write so server and CLI can edit concurrently.
+//! Load/save of `~/.config/llmux.json` — atomic replacement, 0600 permissions,
+//! and reload-before-mutation updates. Atomic replacement prevents torn files;
+//! it does not serialize overlapping cross-process writers.
 
 pub mod migrate;
 pub mod schema;
@@ -268,17 +269,15 @@ fn write_tmp_and_rename(tmp: &Path, path: &Path, data: &[u8]) -> Result<(), Conf
     Ok(())
 }
 
-/// Read-merge-write update: re-reads the file, applies `mutate` to the
-/// freshest on-disk state, and saves atomically.
-/// This is the ONLY safe way to write when the server may also be writing
-/// (e.g. persisting refreshed tokens) — never `save(load()?)` around edits.
+/// Reload-before-mutation update: reads the file immediately before applying
+/// `mutate`, then saves by atomic replacement. Prefer this over editing a
+/// long-lived snapshot because it narrows the stale-state window and prevents
+/// partial files.
 ///
-/// Concurrency contract: callers express intent as *merges* on the fresh
-/// state — `Config::upsert_account` (keyed by `account_uuid`/`name`) and
-/// `Config::update_oauth_tokens` (keyed by account identity) — never as a
-/// blind overwrite of a stale in-memory snapshot. Two writers each doing
-/// `update(|c| c.upsert_account(...))` therefore both land: each rewrite
-/// starts from the other's persisted accounts.
+/// This is not a cross-process transaction: there is no writer lock or
+/// compare-and-swap between the read and rename. Overlapping callers can both
+/// read the same version and the later rename can overwrite the earlier
+/// mutation. Callers should therefore avoid simultaneous config writes.
 pub fn update<F>(mutate: F) -> Result<Config, ConfigError>
 where
     F: FnOnce(&mut Config),
@@ -297,7 +296,7 @@ where
     Ok(config)
 }
 
-/// Generate a proxy api key: `ta-` + 32 random bytes, base64url (no pad).
+/// Generate a proxy API key: `lm-` + 32 random bytes, base64url (no pad).
 pub fn generate_api_key() -> String {
     use base64::Engine as _;
     format!(
@@ -930,7 +929,7 @@ mod tests {
         // Issue #45: the probe is ALWAYS-ON out of the box — a cold account
         // (no 5h/7d window) gets a 1-token probe without any operator opt-in.
         // Both the Rust default and a config file missing the block entirely
-        // must load enabled with an hourly sweep.
+        // must load enabled with the current 15-minute sweep/cooldown.
         let defaults = IdleProbeConfig::default();
         assert!(defaults.enabled, "probing on by default");
         assert_eq!(defaults.per_account_cooldown_secs, 900);

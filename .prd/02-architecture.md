@@ -1,236 +1,368 @@
 # llmux — Architecture
 
-Rust, edition 2021. Single binary, tokio multi-thread runtime. Module layout follows herdr's
-state/runtime separation: scheduler decisions are pure functions over snapshots, runtime state is
-folded into dashboard documents, and provider-specific format conversion is isolated from the
-Anthropic passthrough fast path.
+Status: **maintained, shipped**. Rust 2021, one daemon/CLI binary plus a shared
+Rust native-UI core and platform-native macOS/KDE shells. This record describes
+the source tree and runtime at the 2026-07-15 documentation audit.
 
-## Crate layout
+The product-level contract is [01-spec.md](01-spec.md). The reader-oriented
+overview and rendered diagram are in [docs/architecture.md](../docs/architecture.md).
+
+## Design spine
+
+- Claude Code speaks Anthropic Messages to one endpoint.
+- Routing classifies the requested model into Claude, Codex, or Grok.
+- One `AccountPool` owns all accounts, with group-scoped selection state and a
+  separate Fable-scoped Claude slot.
+- Pure selection functions consume snapshots; runtime code revalidates and
+  leases the chosen account.
+- Provider-specific conversion is isolated from the Anthropic passthrough path.
+- One dashboard fold produces stable documents for local TUI, attach, and
+  native clients.
+- Native shells share semantic Rust state/actions/effects, not UI widgets.
+
+## Repository layout
 
 ```text
 src/
-  main.rs              # entry, tokio runtime, command dispatch
-  cli/                 # clap commands + command impls
-    mod.rs             # server/dashboard/run/stop dispatch, daemon attach decision
-    daemon.rs          # probe/spawn/wait/stop helpers (herdr-style client/server)
-    login.rs import.rs run.rs status.rs accounts.rs api.rs env.rs
-  config/              # ~/.config/llmux.json load/save, atomic read-merge-write
-    mod.rs schema.rs migrate.rs
-  auth/
-    oauth.rs           # Claude PKCE flow, token exchange, refresh (coalesced)
-    codex.rs           # Codex auth.json import + OpenAI token refresh
-    profile.rs         # /api/oauth/profile client (email, uuid, tier)
-    credentials.rs     # ~/.claude/.credentials.json import
-  scheduler/
-    mod.rs             # AccountPool: owns state, applies events, leases
-    select.rs          # PURE: eligibility + ranking + selection_order + blocking_reason
-    window.rs          # QuotaWindow {utilization, resets_at, fetched_at, source}
-    headers.rs         # Anthropic unified + Codex x-codex-* header parsing
-    usage.rs           # /api/oauth/usage poller (Claude OAuth only, backoff ladder)
-  proxy/
-    server.rs          # axum listener, /llmux/* control endpoints, background tasks
-    forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
-    sse.rs             # passthrough + transform relay; SseTransform trait
-    logging.rs         # optional request logs, credential masking
+  main.rs, lib.rs            process entry and crate exports
+  cli/                       commands, local/remote endpoint resolution,
+                             daemon lifecycle, brew channel/update
+  config/                    v1 schema, migration, private atomic persistence
+  auth/                      Claude PKCE, Codex OAuth/import, Grok device code,
+                             profile and credential imports
+  routing.rs                 model → BackendGroup classifier
+  scheduler/                 account state, windows, header/usage evidence,
+                             idle-probe policy, pure selection
   provider/
-    mod.rs             # Provider trait + UnifiedRequest/Response types
-    anthropic.rs       # passthrough impl (identity hooks, zero-copy fast path)
-    codex.rs           # Anthropic Messages <-> OpenAI Responses translation + SSE converter
-    stubs.rs           # gemini/local compile-checked drafts
-  dashboard.rs         # DashboardHub + DashboardDoc (/llmux/dashboard contract)
-  tui/
-    mod.rs             # local + remote dashboard loops, attach client
-    view.rs            # DashboardView: single render input from live state or DashboardDoc
-    ui.rs              # ratatui renderer, no fork between local/attach
-    activity.rs logs.rs format.rs event.rs
-  build_info.rs        # channel + build id from env (herdr pattern)
-tests/
-  e2e.rs               # mock upstream + proxy acceptance scenarios
-  mock_upstream.rs     # Anthropic/Codex simulators (headers, 429, SSE)
+    anthropic.rs             Anthropic passthrough + client annotation cleanup
+    responses.rs             shared Messages ↔ Responses conversion/SSE core
+    codex.rs                 Codex model/effort/auth adapter
+    grok.rs                  Grok model/effort/auth adapter
+    stubs.rs                 non-shipping design stubs
+  proxy/
+    server.rs                listener, auth layer, routes, background tasks
+    forward.rs               classify, lease, refresh, dispatch, retry, record
+    sse.rs                   streaming relay and transform boundary
+    idle_probe.rs            bounded cold-account request construction
+    raw_io.rs                best-effort payload capture and pruning
+    codex_trace.rs           shared tagged Responses trace writer
+    classify.rs              activity/request-family classification
+    logging.rs               credential-masked debug logs
+    login.rs                 daemon-side interactive-login coordination
+  dashboard.rs               DashboardHub and stable status/dashboard DTOs
+  catalog.rs                 curated model document + dynamic Grok pin row
+  pricing.rs                 built-in/override API-equivalent costs
+  session.rs                 session projection
+  event.rs                   operator banner parsing/selection
+  demo.rs                    stable privacy-safe aliases
+  tui/                       event loop, views, overlays, activity/history UI
+  build_info.rs, logging.rs  build identity and process logging
+
+llmux-islands-core/          versioned semantic UI state, daemon client,
+                             reducer, privacy, derived state, receipts
+llmux-islands-macos-bridge/  C ABI owner for Swift
+llmux-islands/               SwiftUI/AppKit macOS shell
+llmux-islands-linux/         CXX-Qt + QML/Kirigami KDE shell and Arch package
+tests/                       daemon/provider end-to-end acceptance
 ```
 
 ## Runtime topology
 
 ```text
-Claude Code
-  │ ANTHROPIC_BASE_URL=http://localhost:3456
-  ▼
-llmux daemon (axum)
-  ├─ AccountPool (scheduler state, windows, leases)
-  ├─ Provider dispatch
-  │   ├─ AnthropicPassthrough → https://api.anthropic.com
-  │   └─ CodexProvider       → https://chatgpt.com/backend-api/codex/responses
-  ├─ Background tasks
-  │   ├─ usage poller (Claude OAuth accounts)
-  │   ├─ token refresh pass (< refresh_ahead_secs remaining)
-  │   ├─ scheduler re-evaluation tick
-  │   └─ DashboardHub fold (activity/log/poller/switch state)
-  └─ Control API
-      ├─ GET  /llmux/status
-      ├─ GET  /llmux/dashboard
-      ├─ POST /llmux/switch
-      └─ POST /llmux/shutdown
+Claude Code / SDK client
+          │ Anthropic Messages HTTP + SSE
+          ▼
+┌──────────────────────────── llmux daemon ────────────────────────────┐
+│ client-auth layer: loopback exempt; off-loopback x-api-key required │
+│                                                                     │
+│ request classify ─► model router ─► scheduler snapshot/lease        │
+│                                      │                              │
+│                     ┌────────────────┼────────────────┐             │
+│                     ▼                ▼                ▼             │
+│              Anthropic path    Codex adapter     Grok adapter       │
+│                     │          Responses bridge  Responses bridge   │
+│                     └────────────────┼────────────────┘             │
+│                                      ▼                              │
+│                     upstream response / transformed SSE             │
+│                                      │                              │
+│        headers + usage + outcome ─► pool + dashboard + history      │
+│                                                                     │
+│ background: usage poll · refresh · idle probe · reset/cooldown heal │
+│ control: /llmux/* · /models · login orchestration · shutdown        │
+└─────────────────────────────────────────────────────────────────────┘
+          ▲ dashboard/status/actions
+          │
+ CLI/TUI · remote attach · macOS Islands · KDE Islands
 ```
 
-`llmux run` is a client command: it probes `/llmux/status`, spawns a detached daemon with
-`server --no-tui` if none is running, waits until ready, then launches `claude` with
-`ANTHROPIC_BASE_URL`. `llmux dashboard` is an attach client: it polls `/llmux/dashboard`
-and renders the same ratatui layout without binding the proxy port.
+The listener binds `0.0.0.0:<port>`. `127.0.0.1:3456` is the normal client
+address, not an exclusive bind. A shared router layer applies client auth to
+explicit control/catalog routes and the fallback proxy data path.
 
-## Concurrency model
+## Process roles
 
-- `AccountPool` is behind `Arc<RwLock<PoolState>>`; mutations go through event methods
-  (`record_headers`, `record_429`, `record_usage`, `switch_to`) that re-validate preconditions
-  before applying.
-- In-flight requests hold an `AccountLease` (Drop-based guard incrementing/decrementing a
-  per-account counter). Switching away never cancels leased requests; the lease pins the
-  credential clone for the request lifetime.
-- Claude OAuth refresh uses `RefreshCoalescer`: concurrent refresh callers for the same account
-  await the same outcome.
-- Codex refresh uses the OpenAI refresh-token grant; it is not coalesced in v0.1 because it is
-  rare and idempotent enough for the single-user daemon.
-- Config writes are read-merge-write and atomic. Refresh updates include `last_refresh_ms` so the
-  UI can prove the daemon is actually maintaining credentials.
-- DashboardHub is the single fold target for activity/log/poller/switch events. Both local TUI and
-  remote attach render from `DashboardView`, so layout logic is not duplicated.
+The same `llmux` executable has server and client roles:
 
-## Scheduler data flow
+- `server` owns the listener and background work. On a TTY it also renders the
+  in-process TUI.
+- `run` probes a target, starts a detached local server when appropriate, and
+  launches Claude Code.
+- `dashboard` polls `/llmux/dashboard` and renders the same view model without
+  binding.
+- `status`, `accounts`, and `env` are short-lived clients.
+- Remote mode resolves a central endpoint. Read/attach commands target it;
+  lifecycle/account mutation refuses; channel/update and the direct-upstream
+  debug `api` command remain local to the client machine.
 
-```text
-Anthropic response headers ──┐
-Codex x-codex-* headers ─────┼──> headers.rs ─────┐
-/api/oauth/usage poll ───────┘                     ├──> PoolState.windows
-429 + retry-after ─────────────────> forward.rs ───┘          │
-                                                               ▼
-                         select.rs::pick(snapshot, now) — pure, deterministic
-                         1 gates: health, cooldown, thresholds, staleness
-                         2 stickiness + perishability override (SWITCH_MARGIN)
-                         3 rank: max score (servable×urgency) → min 5h → min 7d reset → id
-                                                               │
-                         switch_to(expected_current, target)  # CAS-ish, lease guard
-```
+Detached server stderr goes to `$XDG_STATE_HOME/llmux/server.log`. Readiness is
+proven by the HTTP status endpoint, not only by process existence.
 
-Two evidence sources feed the same Claude windows; freshest `fetched_at` wins per window. Headers
-are authoritative during traffic; the poller covers idle Claude OAuth accounts. If usage data is
-stale, a Claude account is ineligible unless all accounts are stale (headers-only fallback). Codex
-has no usage poller, so staleness does not gate it; quota thresholds still gate Codex when
-`x-codex-*` header evidence exists.
+## Client authentication
 
-## Provider dispatch and request flow
+`client_auth` runs after routing so it protects every route, including the
+fallback data path.
 
-1. Buffer incoming request body and create an activity item.
-2. Acquire an `AccountLease`. When `routing.enabled` (see `routing.rs`), the request's
-   `model` first selects a backend **group** (claude vs codex; the model field — previously
-   only carried through `UnifiedRequest` as a future routing key — now drives selection), the
-   scheduler is filtered to that group, and the lease is sticky per group. The leased
-   credential then determines the provider:
-   - `oauth` / `apikey` → `AnthropicPassthrough`.
-   - `codex` → `CodexProvider`.
+- Loopback IPv4/IPv6 peers are trusted and may omit the key.
+- A non-loopback peer must present the configured `proxy.api_key` as
+  `x-api-key`.
+- Missing peer metadata is not treated as loopback.
+- The gate is constant-time enough for the local ownership role but is not a
+  multi-tenant authentication system.
+- The transport is HTTP. Encryption belongs to Tailscale/WireGuard/TLS outside
+  llmux.
 
-   Routing is **on by default**, so the `model` normally selects the group. With routing disabled
-   no group filter is applied: a single legacy current slot is used and codex becomes the
-   cross-group overflow pool — the older behavior.
-3. Refresh credential if near expiry; on one 401, force refresh and retry once.
-4. Build provider request:
-   - Anthropic: identity body, inject Bearer or x-api-key.
-   - Codex: translate Anthropic Messages to OpenAI Responses JSON, inject Codex OAuth headers.
-5. Send upstream, classify response, and retry/switch according to taxonomy.
-6. Relay response:
-   - Anthropic: byte-identity SSE/body relay; usage observed from emitted Anthropic SSE.
-   - Codex: Responses SSE transform relay; converter emits Anthropic SSE and usage accounting sees
-     the emitted events.
-7. Finish activity, record totals, update DashboardHub.
+## Request flow
 
-## Error taxonomy (forward.rs)
+1. The server admits and buffers the request body up to
+   `proxy.max_request_bytes`, because a retry may need to replay it.
+2. Activity classification and model extraction happen once at forward entry.
+3. `routing::Classifier` maps the model to `BackendGroup`.
+4. Scheduler code creates a group/scoped snapshot, evaluates eligibility and
+   ranking, and chooses an account.
+5. Runtime code acquires an `AccountLease`, increments in-flight state, and
+   clones the credential. The lease pins the account through completion or
+   disconnect.
+6. Near-expiry refresh occurs before dispatch. One eligible 401 path may force
+   a refresh and retry.
+7. Auth/header rewrite and provider conversion produce the upstream request.
+8. The upstream response is classified for retry, cooldown, or direct relay.
+9. SSE is relayed with backpressure. Codex/Grok use the shared Responses
+   converter; Claude remains Anthropic-shaped except auth/header replacement
+   and `[1m]` model annotation normalization.
+10. Header windows, emitted usage, activity outcome, token/cost data, trace/raw
+    capture, and dashboard state are recorded best-effort around the response.
+11. Dropping the lease decrements in-flight state. A concurrent current-account
+    change never moves the request.
 
-| Upstream signal | Action |
-|---|---|
-| 429 + retry-after | Park that account. If short, wait and retry same account; if long, switch and retry request. |
-| 401 on refreshable account | Force one refresh, retry; second 401 marks auth_failed and switches. |
-| 5xx / connect reset / timeout | Transient: return 502/close so client retries. |
-| Persistent provider error | Mark account error or return provider-shaped error, depending on retryability. |
-| Codex non-2xx | Wrap body as Anthropic error event/body; never relay raw Codex JSON to Claude Code. |
-| Codex 2xx stream without content-type | Treat as SSE by contract. The live backend omits `content-type`; malformed streams terminate with Anthropic `error`. |
+## Routing
 
-## Config schema (v1)
+`BackendGroup` has a stable order `Claude < Codex < Grok`. Builtin classifier
+families are intentionally disjoint; evaluation precedence is Codex, Claude,
+then Grok.
 
-```jsonc
-{
-  "version": 1,
-  "proxy": { "port": 3456, "api_key": "ta-..." },
-  "upstream": "https://api.anthropic.com",
-  "codex": {
-    "upstream": "https://chatgpt.com/backend-api/codex",
-    "token_url": "https://auth.openai.com/oauth/token",
-    "default_model": "gpt-5.5",
-    "fast": false
-  },
-  "scheduler": {
-    "five_hour_max": 0.90,
-    "seven_day_max": 0.99,
-    "usage_poll_secs": 300,
-    "usage_max_age_secs": 600,
-    "refresh_ahead_secs": 25200
-  },
-  "routing": {            // model→backend-group routing; all keys default-able
-    "enabled": true,     // default; false = Codex-as-overflow (no group filter)
-    "claude_models": [],  // empty = builtin rules; non-empty replaces them
-    "codex_models": [],
-    "default_group": "claude",   // unmatched / model-less request lands here
-    "on_empty_group": "error"    // "error" = 404 not_found_error; "fallback" = other group
-  },
-  "accounts": [
-    { "name": "a@x.com", "type": "oauth", "account_uuid": "...",
-      "access_token": "...", "refresh_token": "...",
-      "expires_at_ms": 0, "last_refresh_ms": 0 },
-    { "name": "api-1", "type": "apikey", "api_key": "..." },
-    { "name": "chatgpt@example.com", "type": "codex", "account_id": "...",
-      "access_token": "...", "refresh_token": "...",
-      "expires_at_ms": 0, "last_refresh_ms": 0 }
-  ]
-}
-```
+Each group's empty config list retains its builtins. A non-empty list replaces
+that group's builtins and parses tokens as prefix, `~substring`, or `=exact`.
+Unmatched/model-less traffic uses `default_group`.
 
-`migrate.rs` reads teamclaude's `~/.config/teamclaude.json`; `credentials.rs` reads
-`~/.claude/.credentials.json`; `auth/codex.rs` reads Codex CLI `~/.codex/auth.json`.
+When `on_empty_group = "fallback"`, only a group with at least one configured
+account qualifies; the scan order is Claude → Codex → Grok. Parked or limited
+accounts still count as configured, so fallback never silently changes provider
+semantics merely because a group is temporarily exhausted.
 
-## Codex translation details
+## Scheduler state and selection
 
-The Codex endpoint is OpenAI Responses-shaped but rejects `role:"system"` input items. The
-translator therefore:
-- folds top-level Anthropic `system` and any message-level system messages into `instructions`;
-- maps legal input roles to `assistant`, `developer`, or `user` (never `system`);
-- maps Anthropic text blocks to `input_text`/`output_text`;
-- maps `tool_use` to `function_call` and `tool_result` to `function_call_output`;
-- drops request-side images/thinking in v0.1 with warnings;
-- sends `codex.default_model` (default `gpt-5.5`), optional `service_tier`/`reasoning.effort`,
-  `stream: true`, `store: false`, and a stable `prompt_cache_key`.
+`AccountPool` is backed by synchronized `PoolState`. It owns accounts, window
+evidence, cooldowns, in-flight counts, operator pauses/limits, and current
+selection:
 
-The response converter is a state machine over Responses SSE events:
-- `response.created` → Anthropic `message_start`;
-- text deltas → `content_block_start` + `content_block_delta` + `content_block_stop`;
-- reasoning summary deltas → thinking blocks;
-- function call items/argument deltas → `tool_use` + `input_json_delta`;
-- `response.completed` → `message_delta` + `message_stop`;
-- `response.failed`/malformed stream → Anthropic `error`.
+- one current slot per backend group for ordinary traffic;
+- one Fable-scoped Claude current slot;
+- legacy scalar projection retained only for backward-compatible documents.
 
-## Control-plane auth
+`scheduler/select.rs` contains deterministic eligibility, rank, and next-in-line
+functions. Runtime state mutations revalidate assumptions rather than applying
+an obsolete snapshot blindly.
 
-Control endpoints share the status endpoint's gate: loopback clients are exempt; non-loopback
-clients need the generated proxy API key. This preserves local UX while avoiding unauthenticated
-remote control if the user binds beyond localhost.
+### Evidence sources
 
-## Key dependencies
+- Claude: OAuth usage polling plus Anthropic unified response headers.
+- Codex: `x-codex-*` traffic headers plus bounded idle probes when enabled.
+- Anthropic API-key: response headers plus eligible idle probes.
+- Grok: reset-less `x-ratelimit-*` observations with a provider-specific
+  fallback horizon; no fabricated OAuth usage endpoint and no idle probing.
 
-tokio, axum (server) + reqwest (upstream/streaming), serde/serde_json, clap, ratatui + crossterm,
-tracing + tracing-subscriber, sha2/base64 (PKCE/JWT payload decode), thiserror, ulid, uuid, libc.
+Freshest compatible evidence wins. Passed reset times read as empty. A 429
+records an explicit `retry-after` park when present; without one, the runtime
+uses a short heuristic, a Fable-scoped cooldown, or the Grok free-tier
+estimate as appropriate. Fresh capacity evidence can heal heuristic parks.
 
-## Porting pitfalls now codified
+### Modes
 
-- SSE events fragment across chunks; both passthrough observer and Codex transform buffer correctly.
-- Anthropic reset vs Codex reset timestamps differ; parse per source.
-- Do not require `content-type: text/event-stream` for Codex 2xx; live backend omits it.
-- Never emit `role:"system"` in Codex input.
-- Mask credentials in logs; request logging is opt-in and capped.
-- TTY detection: bind/probe happens before TUI init so bind errors never corrupt the terminal.
-- Config writes must preserve concurrently refreshed tokens.
+- `default`: ranks by `servable_now × urgency`, remains sticky, and proactively
+  moves only when another account exceeds the current score by 25%.
+- `round-robin`: remains until hard-ineligible, then advances in stable roster
+  order with no score-based proactive move.
+
+Fable eligibility adds the scoped weekly gate without poisoning non-Fable
+traffic on the same account.
+
+## Provider boundary
+
+### Anthropic
+
+The fast path preserves Anthropic wire semantics. It strips client auth,
+injects OAuth/API-key auth, removes the client-only `[1m]` suffix when present,
+and otherwise avoids Responses conversion.
+
+### Shared Responses core
+
+`provider/responses.rs` owns the common Anthropic Messages ↔ Responses
+translation and streaming event converter. Provider adapters supply endpoint,
+identity headers, model resolution, effort rules, service tier, and tracing
+labels.
+
+### Codex
+
+Known concrete IDs pass through. Variant aliases and bare `gpt-5.6` resolve to
+the current generation; other strings use the configured pin
+`gpt-5.6-sol`. Configured effort overrides the client and is clamped per model.
+`fast` maps to `service_tier: "priority"`.
+
+### Grok
+
+Concrete `grok-*` IDs pass through; bare `grok` uses the live pin
+`grok-4.5`. The adapter uses xAI OAuth/device identity and rate-limit rules,
+has no priority tier, and shares the tagged trace file with Codex.
+
+## Background work
+
+Tasks start beside the ready listener and remain bounded:
+
+- Claude OAuth usage poll with provider/backoff handling;
+- access-token refresh before `refresh_ahead_secs`;
+- scheduler reset/cooldown re-evaluation;
+- on-demand and periodic cold-account probing, sharing one cooldown gate;
+- raw-I/O startup pruning;
+- activity-history startup hydration and ongoing append;
+- dashboard publication and login orchestration/state.
+
+Cold probing is not a second scheduler. Its response headers feed the existing
+window evidence path.
+
+## Dashboard and persistence
+
+`DashboardHub` folds request, scheduler, settings, login, and history events
+into stable documents. Local TUI and attach render `DashboardView`, preventing
+separate layout semantics for in-process and HTTP clients. Islands consumes the
+same daemon dashboard and normalizes it through the shared UI core.
+
+Durable stores:
+
+| Store | Behavior |
+| --- | --- |
+| `~/.config/llmux.json` | private atomic config and credentials |
+| `server.log` | daemon stderr/log stream |
+| `activity.jsonl` | append-only request metadata; hydrated and paged locally |
+| `raw-io.jsonl` | optional payload capture; startup retention pruning |
+| `codex-trace.jsonl` | tagged Codex and Grok Responses traces |
+
+Raw capture and traces are best-effort and may contain sensitive content. Their
+write failure must not change the bytes delivered to the client.
+
+## Concurrency invariants
+
+- Request leases pin account/credential clones and maintain exact in-flight
+  counters through `Drop`.
+- Selection uses snapshots; state-changing application rechecks live
+  preconditions.
+- Claude OAuth refresh calls for one account coalesce; other OAuth adapters
+  follow their provider refresh path without leaking tokens into UI state.
+- Config mutation reloads before applying intent and atomically replaces the
+  file. No cross-process lock/CAS serializes writers, so overlapping mutations
+  can still lose an update.
+- Activity/dashboard publication never blocks the network stream on durable
+  evidence IO.
+- Login orchestration permits only the concurrency supported by fixed callback
+  resources and publishes explicit progress/cancel state.
+
+## Native-client boundary
+
+`llmux-islands-core` owns:
+
+- typed daemon client operations and DTO normalization;
+- versioned privacy-safe `UiState`;
+- reducer, typed actions/effects, derived state, and receipts;
+- account-handle anonymization and secret-exclusion invariants.
+
+The macOS bridge owns the audited C ABI. Swift executes native effects and
+renders the established notch/usage/statistics/menu hierarchy. Linux connects
+the same Rust state machine through CXX-Qt and renders QML/Kirigami; platform
+modules implement tray, window, screen, autostart, notification, sound, and
+maintenance behavior.
+
+Remote native clients accept loopback HTTP but require remote HTTPS plus key
+and deny redirects. This is intentionally stricter than the CLI overlay path.
+
+## Configuration boundary
+
+`config/schema.rs` is the on-disk contract. Major groups are:
+
+- `proxy`, including body/timeout/idle-probe safety;
+- `scheduler` and per-account pause/limits;
+- `routing` for three provider groups;
+- `codex` and `grok` request shaping;
+- `remote` client resolution;
+- pricing, raw-I/O, events, and display/privacy flags;
+- tagged account credentials.
+
+Additive fields use serde defaults. Breaking tagged-enum additions require an
+explicit downgrade note. User-facing defaults are centralized in
+[docs/configuration.md](../docs/configuration.md).
+
+## Failure semantics
+
+| Signal | Result |
+| --- | --- |
+| Request body over cap | 413 before upstream dispatch |
+| Off-loopback key missing/wrong | client-auth rejection on any route |
+| 429 with retry information | park leased account; retry/switch according to scope |
+| Refreshable 401 | one forced refresh path; repeated failure degrades auth and selection |
+| Connect/5xx/idle timeout | provider-shaped transient failure; request-safe retry rules only |
+| Matched group with no configured account | 404 by default; optional fixed-order fallback |
+| All eligible accounts exhausted | 429 with nearest meaningful retry horizon |
+| Malformed Responses stream | Anthropic-shaped error/termination, never raw vendor JSON |
+| Native remote HTTP/redirect | rejected before credential-bearing follow-up |
+
+## Build and verification topology
+
+- Root `ci.yml`: Rust format, lint, tests, and platform jobs.
+- `release.yml`: tagged stable four-architecture CLI build plus macOS Islands
+  zip and checksums.
+- `preview.yml`: the same CLI matrix and macOS app under timestamped prerelease
+  identity, then tap dispatch.
+- `linux-islands.yml`: shared core gates, clean-Arch package/install/snapshot
+  evidence, macOS bridge ABI smoke, Xcode tests, and native screenshot evidence.
+
+Linux Islands is not a release asset. The clean-Arch Docker build is CI
+evidence; the user installation surface is the repository PKGBUILD.
+
+## Porting pitfalls codified
+
+- Do not describe the normal address `127.0.0.1` as an exclusive bind.
+- Client auth protects the fallback proxy path as well as control routes.
+- Router choice and provider upstream-model resolution are separate.
+- `[1m]` is a client annotation, not an upstream context guarantee.
+- Fable has a scoped selection slot/gate; it is not merely another Claude alias.
+- Grok rate-limit evidence is not a Claude 5h/7d poller.
+- Activity history is append-only; only raw-I/O has retention pruning.
+- Codex and Grok share the trace filename with provider tags.
+- macOS/KDE share semantics, not visual parity.
+- Docker parity builds are CI/maintainer tools, not the Linux install path.
+
+## Related records
+
+- [Product specification](01-spec.md)
+- [Decision archive](README.md)
+- [Scheduler perishability](09-scheduler-perishability.md)
+- [Grok spec and trace](../docs/grok/)
+- [Cross-platform Islands dossier](docs/llmux-islands-linux-port/README.md)

@@ -1,8 +1,11 @@
 # PRD — model usage dashboard (2026-06-14)
 
-Status: **designed → implementing**. The Problem/Solution/User-Stories sections below state the
-target behavior; the **Finalized Design** and **Implementation Plan** sections at the end pin the
-concrete data model, document fields, keybinding, and layout that the implementation follows.
+Status: **shipped; historical design record**. The model/account usage DTOs,
+local/attach TUI surfaces, and native-client projections described here were
+implemented. Problem/Solution/User-Stories and the original implementation
+plan are preserved to show the acceptance lineage; current operation is in
+[`docs/operational-reference.md`](../docs/operational-reference.md) and the
+maintained system boundary is in [`02-architecture.md`](02-architecture.md).
 
 ## Problem Statement
 

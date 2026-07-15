@@ -138,8 +138,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
 /// 1. `overrides` keyed by the **normalized** model (case preserved as written
 ///    in config, but matched case-insensitively against the normalized model).
 /// 2. The built-in default table (exact then prefix), case-insensitive.
-/// 3. Group fallback: `group == "claude"` → opus-tier rates; `group ==
-///    "codex"` → gpt-5.5 rates; any other group → `None` (all-zero cost).
+/// 3. Group fallback: `group == "claude"` → opus-tier rates, `group ==
+///    "codex"` → gpt-5.5 rates, `group == "grok"` → grok-4.5 rates; any
+///    other group → `None` (all-zero cost).
 ///
 /// `overrides` keys are normalized + lowercased on read, so a config can use
 /// either the display slug (`claude-opus-4-8[1m]`) or the bare slug.

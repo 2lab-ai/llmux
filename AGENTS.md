@@ -23,9 +23,12 @@ Documentation ownership after feature work: **[`rules/documents.md`](rules/docum
 ## Conventions
 
 - Conventional commits, lowercase, no emojis, no AI co-author lines.
-- `just check` (fmt + clippy -D warnings + tests) must pass before every commit.
-- Config writes are read-merge-write (`config::update`) — never load/edit/save around a
-  running server.
+- `CARGO_BUILD_JOBS=2 just check` (fmt + clippy -D warnings + tests) must pass
+  before every commit; keep local Cargo parallelism bounded unless the user
+  explicitly requests a different limit.
+- Config writes go through `config::update`, which reloads immediately before mutation and
+  atomically replaces the file — never load/edit/save around a running server. This prevents
+  torn files, not cross-process write races; avoid overlapping writers.
 - **User-visible changes update their owning doc in the same PR** — see
   [`rules/documents.md`](rules/documents.md). Feature incomplete if docs-impact is skipped
   without an explicit N/A reason.
@@ -62,3 +65,7 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
   `git push "https://x-access-token:$(gh auth token)@github.com/2lab-ai/llmux" <ref>`.
 - The `/api/oauth/usage` endpoint returns **percentages (0–100)**, not fractions — each
   evidence source has a fixed scale (see `src/scheduler/usage.rs`).
+- **Linux Islands Docker is a CI/maintainer parity path, not normal local
+  installation.** Use the repository PKGBUILD for Arch users. Do not launch
+  the clean-Arch Docker build locally unless the user explicitly asks to
+  reproduce that CI job; it can consume every available core.

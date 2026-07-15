@@ -2,12 +2,10 @@
 //! claude-code-router's hourglass — Anthropic-shaped wire format in, a
 //! unified intermediate at the waist, provider-native format out, and back.
 //!
-//! Shipping: [`anthropic::AnthropicPassthrough`] (all hooks identity,
-//! zero-copy fast path) and [`codex::CodexProvider`] (Messages↔Responses
-//! translation with a live SSE transform — it bypasses the whole-body trait
-//! hooks, which cannot express streaming transforms; see
-//! `proxy::sse::SseTransform`). Compile-checked design stubs remain in
-//! [`stubs`].
+//! Shipping: [`anthropic::AnthropicPassthrough`] (passthrough with auth and
+//! client-model annotation normalization), [`codex::CodexProvider`], and the
+//! Grok adapter. Codex and Grok share the Responses translation/SSE core in
+//! [`responses`]. Compile-checked non-shipping designs remain in [`stubs`].
 
 pub mod anthropic;
 pub mod codex;
@@ -19,8 +17,8 @@ use crate::config::AccountCredential;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// The provider is a v0.1 design stub — wired into the type system but
-    /// intentionally not functional (spec §Non-goals).
+    /// A non-shipping provider design is wired into the type system but is
+    /// intentionally not functional.
     #[error("provider {provider} is a design stub, not implemented in v0.1")]
     NotImplemented { provider: &'static str },
     #[error("credential injection failed: {0}")]
@@ -65,33 +63,33 @@ pub struct ProviderResponse {
     pub body: bytes::Bytes,
 }
 
-/// Unified intermediate request (the hourglass waist). DRAFT: it wraps the
-/// Anthropic wire shape so the passthrough fast path stays zero-copy; real
-/// cross-provider fields are added when the first non-Anthropic backend
-/// becomes more than a stub.
+/// Unified intermediate request (the hourglass waist). It keeps the Anthropic
+/// wire shape intact for the passthrough path while exposing the model and
+/// streaming fields used by routing and Responses-family adapters.
 #[derive(Debug, Clone)]
 pub struct UnifiedRequest {
-    /// Model id extracted from the body, when present (future routing key).
+    /// Model id extracted from the body, when present (the routing key).
     pub model: Option<String>,
     /// Whether the client requested SSE streaming.
     pub stream: bool,
     pub wire: AnthropicRequest,
 }
 
-/// Unified intermediate response. Same draft caveat as [`UnifiedRequest`].
+/// Unified intermediate response around the Anthropic-shaped client contract.
 #[derive(Debug, Clone)]
 pub struct UnifiedResponse {
     pub wire: AnthropicResponse,
 }
 
 /// The transformer trait (FR4). Conversion hooks are fallible — identity
-/// (infallible) for the Anthropic passthrough, `Err(NotImplemented)` for the
-/// v0.1 design stubs; that is how stubs stay compile-checked without
+/// (infallible) for the Anthropic passthrough, `Err(NotImplemented)` for
+/// non-shipping design stubs; that is how stubs stay compile-checked without
 /// panicking. Dyn-compatibility of `auth` is deferred to the implementation
 /// stage (the proxy may hold an enum instead of `dyn Provider`).
 #[allow(async_fn_in_trait)]
 pub trait Provider: Send + Sync {
-    /// Stable provider name (`anthropic`, `openai-codex`, `gemini`, `local`).
+    /// Stable provider name (`anthropic`, `openai-codex`, `xai-grok`, or a
+    /// non-shipping design stub).
     fn name(&self) -> &'static str;
 
     /// Upstream base URL requests for this provider are sent to.

@@ -1,31 +1,12 @@
-# TODO
+# Archived task note
 
-## llmux-islands floating island label
+The former compact-label animation and email-anonymous items were completed
+and shipped. Their original intent, acceptance matrix, implementation rounds,
+and release evidence are preserved in:
 
-1. `llmux-islands`의 플로팅 아일랜드가 현재는 그냥 검은 박스로 보인다. 맥북에서 확장 화면 등에 출력할 때 그 영역에 정보를 쓸 수 있으므로, 이름/상태를 예쁘게 출력한다.
+- [Islands task SSOT](.prd/islands-todo/ssot.md)
+- [Islands convergence log](.prd/islands-todo/loop.md)
 
-   표시 형식:
-
-   ```text
-   Llmux Islands [클로드문어] [클로드아이콘]{세션숫자} [코덱스아이콘]{코덱스_세션숫자}
-   ```
-
-   - `클로드문어`는 현재 앱의 최상단 좌측에 표시 중인 이름을 사용한다.
-   - 실행 중인 모델 activity 세션 숫자가 `0`이면 해당 아이콘/숫자는 출력하지 않는다.
-   - 세션 숫자가 `1` 이상이면 레인보우 색상으로 색상을 루프 돌린다.
-
-2. `클로드문어`가 살짝 점프하도록 루프 애니메이션을 넣는다.
-
-   - 세션 숫자가 `1`일 때는 정상 속도.
-   - 세션 숫자가 `2` 이상이면 점점 빨라진다.
-   - 세션 숫자가 `10`이면 아주 빠르게 점프한다.
-   - 속도 스케일은 `10`까지만 적용한다.
-
-## llmux-islands email anonymous mode
-
-3. `llmux-islands` 설정에 `email anonymous` on/off 옵션을 추가한다.
-
-   - `on`이면 `llmux-islands Usage` 화면/영역에서 이메일을 후처리로 모자이크 처리한다.
-   - 이메일 텍스트를 알아볼 수 없을 정도로 `pixelize` 필터를 적용한다.
-   - 기준값은 대략 `4x4` 픽셀라이즈 정도로 시작한다.
-   - `off`이면 기존처럼 이메일을 그대로 표시한다.
+This file is not an active backlog. Track new work in GitHub issues and add a
+decision/convergence record to the [decision archive](.prd/README.md) when the
+change needs durable design evidence.

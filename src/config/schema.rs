@@ -46,8 +46,9 @@ pub struct Config {
     pub grok: GrokConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
-    /// Model→backend-group routing (default: disabled — exactly today's
-    /// overflow behavior). See [`RoutingConfig`].
+    /// Model→backend-group routing (enabled by default for Claude, Codex, and
+    /// Grok; disabling restores legacy cross-group overflow). See
+    /// [`RoutingConfig`].
     #[serde(default)]
     pub routing: RoutingConfig,
     /// API-equivalent pricing overrides (Feature D). Keyed by the *normalized*
@@ -120,8 +121,9 @@ pub struct Config {
     pub quota_display: QuotaDisplay,
     /// Account names the scheduler must NOT auto-select (operator pause).
     /// A paused account is ineligible for automatic selection AND manual
-    /// switch (resume it first); its live windows keep polling so the gauges
-    /// stay truthful. Kept as a top-level set (not a per-account field) so
+    /// switch (resume it first). Claude OAuth polling can still refresh Claude
+    /// windows, while paused Codex/API-key accounts are excluded from idle
+    /// probes and can age. Kept as a top-level set (not a per-account field) so
     /// the on-disk account entries stay pure credentials. Additive
     /// (`#[serde(default)]`): older configs load with nothing paused.
     #[serde(default)]
@@ -312,17 +314,14 @@ impl Default for RawIoConfig {
     }
 }
 
-/// Model→backend-group routing config. When `enabled` is false (the
-/// default), routing is OFF and the scheduler behaves exactly as before:
-/// no group filter anywhere, codex accounts stay the cross-group overflow
-/// pool. When `enabled` is true, an inbound request's `model` selects a
-/// backend group (claude vs codex) and the scheduler picks within that
-/// group, sticky per group.
+/// Model→backend-group routing config. Routing is enabled by default: an
+/// inbound request's `model` selects Claude, Codex, or Grok and the scheduler
+/// picks within that group, sticky per group. When disabled, no group filter
+/// is applied and Codex accounts retain the legacy cross-group overflow role.
 ///
-/// Empty `claude_models` / `codex_models` keep the builtin rules for that
-/// group (see [`crate::routing::Classifier`]); a non-empty list replaces the
-/// builtins for that group. All fields are additive (`#[serde(default)]`),
-/// so a config written before routing existed loads with `enabled = false`.
+/// Empty per-group model lists keep the builtin rules (see
+/// [`crate::routing::Classifier`]); a non-empty list replaces that group's
+/// builtins. The `enabled` serde default is `true`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingConfig {
     /// Master switch. When `true` (now the default), an inbound request's
@@ -407,9 +406,10 @@ pub struct CodexConfig {
     #[serde(default)]
     pub fast: bool,
     /// Reasoning effort for the Responses request: one of
-    /// `none|minimal|low|medium|high|xhigh` (the codex CLI's `ReasoningEffort`
-    /// wire values). `None` → omit `reasoning.effort` and let the backend use
-    /// the model's default. Display + request only.
+    /// `none|minimal|low|medium|high|xhigh|max|ultra`. The selected model
+    /// clamps unsupported levels. `None` → preserve a client effort when one
+    /// is present, otherwise let the backend use its default. Display +
+    /// request only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Append a JSON-line trace of every codex request/response to
@@ -482,7 +482,7 @@ pub struct ProxyConfig {
     /// Listen port. Default 3456.
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Proxy-level API key (`ta-...`), auto-generated on first run.
+    /// Proxy-level API key (`lm-...`), auto-generated on first run.
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -512,10 +512,8 @@ pub struct ProxyConfig {
     /// written before this field load with the 64 MiB default.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
-    /// On-demand idle-account usage probe (issue #21). Additive
-    /// (`#[serde(default)]`), so a config written before this section existed
-    /// loads with the conservative defaults — and, critically, with probing
-    /// DISABLED (`enabled = false`).
+    /// On-demand and periodic idle-account usage probe. Additive
+    /// (`#[serde(default)]`), with bounded probing enabled by default.
     #[serde(default)]
     pub idle_probe: IdleProbeConfig,
 }
@@ -544,7 +542,7 @@ impl Default for ProxyConfig {
 /// - **On demand** (#21): the forward path probes idle accounts so the next
 ///   ranking/display has real data.
 /// - **Timer sweep** (#45): when `sweep_secs > 0`, a background task fires the
-///   same probe for EVERY cold account (any provider) on a timer, so their
+///   same probe for every eligible cold account (never Grok) on a timer, so their
 ///   windows stay populated with ZERO client traffic. The usage poller already
 ///   covers cold oauth accounts, so in practice the sweep is what keeps cold
 ///   Codex and api-key accounts (which have no poller) visible; an oauth account
@@ -553,7 +551,7 @@ impl Default for ProxyConfig {
 /// Both modes share a global kill-switch (`enabled = false` disables ALL
 /// probing) and a per-account cooldown so a single account is probed at most
 /// once per `per_account_cooldown_secs`. Defaults are ALWAYS-ON (issue #45):
-/// probing enabled with an hourly sweep, so cold accounts populate their
+/// probing enabled with a 15-minute sweep/cooldown, so cold accounts populate their
 /// windows out of the box; the kill-switch remains for operators who want
 /// zero probe traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,20 +560,21 @@ pub struct IdleProbeConfig {
     /// mandate) allows a single gated probe per idle account; `false` disables
     /// all idle probing (on-demand AND the timer sweep). Cost when on is
     /// bounded by the per-account cooldown: at most one `max_tokens = 1`
-    /// request per cold account per hour, and only while it has no window.
+    /// request per eligible cold account per 15 minutes at defaults.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Minimum wall-clock gap between two probes of the SAME account, seconds.
     /// Once an account is probed, a second probe is suppressed until this
     /// elapses — so a hot ranking/display path that keeps asking about an idle
-    /// account never bursts a probe per request. Default 3600 (1 hour).
+    /// account never bursts a probe per request. Default 900 (15 minutes).
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
-    /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
-    /// (issue #45), seconds. Default 900 (15 min — one tick per default
-    /// cooldown). `0` disables the sweep entirely; the probe then stays purely
-    /// on-demand. When `> 0` and `enabled = true`, a background task probes
-    /// every cold account every `sweep_secs` seconds, reusing the same
+    /// Timer-sweep cadence for refreshing eligible cold non-Grok accounts
+    /// (issue #45), seconds. Operator-paused accounts are excluded. Default
+    /// 900 (15 min — one tick per default cooldown). `0` disables the sweep
+    /// entirely; the probe then stays purely on-demand. When `> 0` and
+    /// `enabled = true`, a background task considers every eligible cold
+    /// account every `sweep_secs` seconds, reusing the same
     /// kill-switch + per-account cooldown (so the cooldown — not this cadence
     /// — bounds cost: at most one probe per account per
     /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
@@ -689,8 +688,8 @@ pub struct AccountConfig {
     pub credential: AccountCredential,
 }
 
-/// Credential payload, tagged by `"type": "oauth" | "apikey" | "codex"`
-/// in JSON.
+/// Credential payload, tagged by
+/// `"type": "oauth" | "apikey" | "codex" | "grok"` in JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AccountCredential {

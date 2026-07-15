@@ -1,8 +1,14 @@
 # Scheduler redesign — research + decision (2026-06-14)
 
+> **Status — superseded research.** This document preserves the inputs and the
+> first 3× urgency proposal. The shipped 4× urgency curve and 25% stickiness
+> margin are defined in
+> [09 — Scheduler perishability](09-scheduler-perishability.md); operator-facing
+> behavior lives in [Scheduling accounts](../docs/guides/scheduling.md).
+
 Consulted three independent strategists (OR/optimization, pragmatic systems, steelman of the
 owner's "5-slice" idea). This records where they converged, the one design decision, and the
-policy we ship. Baseline being replaced: `.prd/06-scheduler-current.md`.
+policy proposed here. Baseline being replaced: `.prd/06-scheduler-current.md`.
 
 ## The owner's insight (restated)
 

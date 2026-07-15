@@ -134,9 +134,10 @@ async fn list_live(endpoint: &Endpoint) -> Result<(), CliError> {
     }
 }
 
-/// Remove one account by name via read-merge-write (`config::update`) so a
-/// concurrently running server's writes are not clobbered. Asks for
-/// confirmation unless `--yes` (non-TTY stdin requires `--yes`).
+/// Remove one account by name through `config::update`, which reloads before
+/// mutation and atomically replaces the file. This narrows the stale-snapshot
+/// window but does not serialize overlapping writers. Asks for confirmation
+/// unless `--yes` (non-TTY stdin requires `--yes`).
 pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
     use std::io::IsTerminal as _;
 
