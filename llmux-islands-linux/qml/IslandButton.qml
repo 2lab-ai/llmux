@@ -9,18 +9,19 @@ Button {
     property color accentColor: IslandTheme.primaryText
     property bool destructive: false
 
-    implicitHeight: 32
-    leftPadding: display === AbstractButton.IconOnly ? 8 : 12
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: display === AbstractButton.IconOnly
+        ? IslandTheme.spaceSm : IslandTheme.controlPaddingX
     rightPadding: leftPadding
-    topPadding: 7
-    bottomPadding: 7
+    topPadding: 0
+    bottomPadding: 0
     hoverEnabled: true
     opacity: enabled ? 1 : 0.44
     palette.buttonText: IslandTheme.primaryText
     palette.brightText: IslandTheme.primaryText
 
     contentItem: RowLayout {
-        spacing: 6
+        spacing: IslandTheme.iconTextGap
 
         Kirigami.Icon {
             visible: control.display !== AbstractButton.TextOnly
@@ -29,6 +30,7 @@ Button {
                 ? control.icon.source : control.icon.name
             implicitWidth: 14
             implicitHeight: 14
+            Layout.alignment: Qt.AlignVCenter
             color: !control.enabled ? IslandTheme.disabledText
                 : control.destructive ? IslandTheme.red
                 : control.highlighted || control.checked
@@ -49,6 +51,7 @@ Button {
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
             Layout.fillWidth: true
+            Layout.alignment: Qt.AlignVCenter
         }
     }
 

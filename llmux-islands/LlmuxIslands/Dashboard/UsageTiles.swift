@@ -93,9 +93,12 @@ struct UsageAccountTile: Identifiable {
     let info: CLIUsageInfo?
     let errorMessage: String?
     let issue: UsageIssue?
-    /// Canonical presentation state. Defaults keep standalone previews and
-    /// older fixture construction source-compatible.
+    /// Canonical shared-core state is retained for native behavior and future
+    /// projections even though the preserved pre-renewal UI does not add new
+    /// badges for these fields.
     var current: Bool = false
+    /// Operator pause: rendered sepia + context-menu Resume. Defaulted so
+    /// non-llmux construction sites stay source-compatible.
     var paused: Bool = false
     var healthy: Bool = true
     var status: String = "active"
@@ -882,21 +885,17 @@ private extension String {
 // MARK: - Compact account rows (issue #68 — Statistics overview)
 
 /// Per-account rows at TUI-accounts-table density: 1–2 lines per account.
-/// This is the shared common-path account summary for Usage and Statistics.
+/// Used ONLY by the Statistics panel's Overview section (issue #68 v2) as the
+/// account summary between the totals cards and the top models; the default
+/// Usage panel keeps the v0.2.14 `UsageAccountTileGrid`.
 struct UsageAccountCompactList: View {
     let tiles: [UsageAccountTile]
     var onRemove: ((String) -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 4) {
-            ForEach(Array(tiles.enumerated()), id: \.element.id) { index, tile in
-                UsageAccountCompactRow(
-                    tile: tile,
-                    privacyAlias: IslandPresentationPolicy.privateAccountLabel(
-                        providerName: tile.provider.displayName,
-                        ordinal: index + 1
-                    )
-                )
+            ForEach(tiles) { tile in
+                UsageAccountCompactRow(tile: tile)
                     .contextMenu {
                         if let onRemove {
                             Button("Remove \(tile.label)", role: .destructive) {
@@ -918,7 +917,6 @@ struct UsageAccountCompactList: View {
 /// `DashboardHealth`).
 struct UsageAccountCompactRow: View {
     let tile: UsageAccountTile
-    let privacyAlias: String
 
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
     @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
@@ -933,7 +931,7 @@ struct UsageAccountCompactRow: View {
 
     private var isBroken: Bool { tile.info?.error == true || tile.info?.available == false }
 
-    private var allGauges: [Gauge] {
+    private var gauges: [Gauge] {
         guard let info = tile.info, info.available, !info.error else { return [] }
         var result: [Gauge] = []
         if let five = info.fiveHourPercent {
@@ -949,19 +947,6 @@ struct UsageAccountCompactRow: View {
         return result
     }
 
-    /// The common path shows one decision-making quota only. A warning or
-    /// constraining window wins; otherwise the familiar 5-hour window wins.
-    /// Exact secondary windows remain available in the local Advanced panel.
-    private var gauges: [Gauge] {
-        if let warning = allGauges.first(where: \.warning) {
-            return [warning]
-        }
-        if let fiveHour = allGauges.first(where: { $0.id == "5h" }) {
-            return [fiveHour]
-        }
-        return Array(allGauges.prefix(1))
-    }
-
     private func gauge(_ id: String, usedPercent: Double, warningOverride: Bool? = nil) -> Gauge {
         let fraction = max(0, min(1, usedPercent / 100))
         return Gauge(
@@ -972,50 +957,31 @@ struct UsageAccountCompactRow: View {
     }
 
     private var dotColor: Color {
-        if !tile.healthy || isBroken { return TerminalColors.red }
+        if isBroken { return TerminalColors.red }
         if gauges.contains(where: \.warning) { return TerminalColors.amber }
-        return Color.white.opacity(0.72)
+        return TerminalColors.green
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                Image(systemName: stateSymbol)
-                    .font(.system(size: stateSymbol == "circle.fill" ? 6 : 9, weight: .semibold))
-                    .foregroundColor(dotColor)
-                    .accessibilityLabel(stateAccessibilityLabel)
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 6, height: 6)
                 UsageProviderIcon(provider: tile.provider, size: 11)
                 EmailPixelized(
                     isActive: emailAnonymousEnabled && displayName.contains("@"),
-                    cacheKey: displayName,
-                    accessibilityLabel: privacyAlias
+                    cacheKey: displayName
                 ) {
                     Text(displayName)
-                        .font(.caption.weight(.semibold))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundColor(.white.opacity(0.85))
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
                 Spacer(minLength: 8)
-                if tile.current {
-                    stateLabel("Current", inverted: true)
-                }
-                if tile.paused {
-                    stateLabel("Paused", symbol: "pause.fill")
-                } else if !tile.healthy || isBroken {
-                    stateLabel("Needs attention", symbol: "exclamationmark.triangle.fill", warning: true)
-                }
-                if tile.inFlight > 0 {
-                    stateLabel("Active \(tile.inFlight)", symbol: "waveform")
-                }
-            }
-            if !gauges.isEmpty {
-                HStack(spacing: 10) {
-                    Spacer(minLength: 25)
-                    ForEach(gauges) { gauge in
-                        gaugeView(gauge)
-                    }
-                    Spacer(minLength: 0)
+                ForEach(gauges) { gauge in
+                    gaugeView(gauge)
                 }
             }
             // Second line only when there is something to say — never a
@@ -1036,58 +1002,20 @@ struct UsageAccountCompactRow: View {
             }
         }
         .padding(.horizontal, 8)
-        .frame(minHeight: 44)
-        .background(Color.white.opacity(0.04))
-    }
-
-    private var stateSymbol: String {
-        if !tile.healthy || isBroken { return "exclamationmark.octagon.fill" }
-        if tile.paused { return "pause.circle.fill" }
-        return "circle.fill"
-    }
-
-    private var stateAccessibilityLabel: String {
-        if !tile.healthy || isBroken { return "Needs attention" }
-        if tile.paused { return "Paused" }
-        return "Healthy"
-    }
-
-    private func stateLabel(
-        _ text: String,
-        symbol: String? = nil,
-        inverted: Bool = false,
-        warning: Bool = false
-    ) -> some View {
-        HStack(spacing: 3) {
-            if let symbol {
-                Image(systemName: symbol)
-                    .font(.system(size: 8, weight: .semibold))
-            }
-            Text(text)
-                .font(.caption2.weight(.semibold))
-        }
-        .foregroundColor(inverted ? .black : warning ? TerminalColors.amber : .white.opacity(0.6))
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
-        .background(inverted ? Color.white : Color.white.opacity(0.06))
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
     }
 
     private func gaugeView(_ gauge: Gauge) -> some View {
         HStack(spacing: 4) {
-            if gauge.warning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(TerminalColors.amber)
-                    .accessibilityLabel("Quota warning")
-            }
             Text(gauge.id)
                 .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.6))
-            Rectangle()
+                .foregroundColor(.white.opacity(0.4))
+            Capsule(style: .continuous)
                 .fill(Color.white.opacity(0.1))
                 .frame(width: 44, height: 3)
                 .overlay(alignment: .leading) {
-                    Rectangle()
+                    Capsule(style: .continuous)
                         .fill(gauge.warning ? TerminalColors.red : Color.white.opacity(0.55))
                         .frame(width: 44 * gauge.usedFraction)
                 }
@@ -1114,7 +1042,7 @@ private struct MiniSegmentBar: View {
 
             HStack(spacing: spacing) {
                 ForEach(0..<segmentCount, id: \.self) { index in
-                    Rectangle()
+                    RoundedRectangle(cornerRadius: 2)
                         .fill(index < filledSegments ? fillColor : emptyColor)
                         .frame(width: segmentWidth)
                 }

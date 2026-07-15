@@ -28,8 +28,8 @@ struct EmailPixelized<Content: View>: View {
     /// Snapshot invalidation key: pass the rendered string so a changed email
     /// re-renders the mosaic.
     let cacheKey: String
-    /// Privacy-safe name retained in the accessibility tree while glyphs are
-    /// visually mosaiced. Callers with lists should provide a stable ordinal.
+    /// Privacy-safe fallback retained in the accessibility tree while the
+    /// visible email glyphs are mosaiced.
     let accessibilityLabel: String
     @ViewBuilder let content: () -> Content
 

@@ -365,7 +365,7 @@ Kirigami.ScrollablePage {
 
         RowLayout {
             Layout.fillWidth: true
-            spacing: 8
+            spacing: IslandTheme.spaceSm
 
             ColumnLayout {
                 Layout.fillWidth: true
@@ -415,7 +415,7 @@ Kirigami.ScrollablePage {
             id: providerCounterFlow
             Layout.fillWidth: true
             Layout.preferredHeight: childrenRect.height
-            spacing: 6
+            spacing: IslandTheme.iconTextGap
             visible: usagePage.advancedVisible && providerCounterRepeater.count > 0
 
             Repeater {
@@ -427,9 +427,9 @@ Kirigami.ScrollablePage {
                     required property var modelData
                     radius: 0
                     implicitWidth: providerCounterLabel.implicitWidth
-                            + 20
+                            + IslandTheme.chipPaddingX * 2
                     implicitHeight: providerCounterLabel.implicitHeight
-                            + 10
+                            + IslandTheme.chipPaddingY * 2
                     color: IslandTheme.surface
                     border.color: IslandTheme.border
                     border.width: 1
@@ -480,7 +480,7 @@ Kirigami.ScrollablePage {
                     && usagePage.login.phase !== "idle"
 
             contentItem: ColumnLayout {
-                spacing: 8
+                spacing: IslandTheme.spaceSm
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -558,6 +558,8 @@ Kirigami.ScrollablePage {
                     }
 
                     RowLayout {
+                        objectName: "usage-verification-actions"
+                        spacing: IslandTheme.spaceSm
                         Layout.fillWidth: true
 
                         IslandButton {
@@ -583,6 +585,7 @@ Kirigami.ScrollablePage {
                 }
 
                 RowLayout {
+                    spacing: IslandTheme.spaceSm
                     Layout.fillWidth: true
                     visible: usagePage.loginActive
 
@@ -640,8 +643,9 @@ Kirigami.ScrollablePage {
         GridLayout {
             Layout.fillWidth: true
             columns: usagePage.width >= 760 ? 2 : 1
-            columnSpacing: Kirigami.Units.largeSpacing
-            rowSpacing: Kirigami.Units.largeSpacing
+            uniformCellWidths: true
+            columnSpacing: IslandTheme.peerGap
+            rowSpacing: IslandTheme.peerGap
 
             Repeater {
                 model: usagePage.accounts
@@ -662,9 +666,10 @@ Kirigami.ScrollablePage {
                         : IslandTheme.border
 
                     contentItem: ColumnLayout {
-                        spacing: 9
+                        spacing: IslandTheme.spaceSm
 
                         RowLayout {
+                            spacing: IslandTheme.spaceSm
                             Layout.fillWidth: true
 
                             Kirigami.Icon {
@@ -751,14 +756,14 @@ Kirigami.ScrollablePage {
                         Flow {
                             Layout.fillWidth: true
                             Layout.preferredHeight: childrenRect.height
-                            spacing: 6
+                            spacing: IslandTheme.spaceSm
 
                             Rectangle {
                                 radius: 0
                                 implicitWidth: accountStatusLabel.implicitWidth
-                                        + 16
+                                        + IslandTheme.chipPaddingX * 2
                                 implicitHeight: accountStatusLabel.implicitHeight
-                                        + 8
+                                        + IslandTheme.chipPaddingY * 2
                                 color: usagePage.statusBackground(accountCard.account)
 
                                 Label {
@@ -1164,6 +1169,8 @@ Kirigami.ScrollablePage {
             }
 
             RowLayout {
+                objectName: "usage-add-dialog-actions"
+                spacing: IslandTheme.spaceSm
                 Layout.fillWidth: true
 
                 Item { Layout.fillWidth: true }

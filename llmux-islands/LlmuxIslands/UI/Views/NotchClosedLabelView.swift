@@ -7,9 +7,10 @@
 //      Llmux Islands [mascot] [claude]{n} [codex]{m}
 //
 //  - `[mascot]` is the existing pixel-art ClaudeCrabIcon (the app's top-left
-//    element), held still so frequent activity never becomes decoration.
+//    element), looping a small vertical jump whose speed scales with the Claude
+//    session count: 1 = normal, faster from 2, very fast at 10, clamped past 10.
 //  - A provider group `[icon]{count}` is hidden entirely while its count is 0;
-//    at ≥1 it uses the same neutral white-ink hierarchy as the rest of Islands.
+//    at ≥1 it cycles through rainbow hues in a continuous loop.
 //
 //  Layout/colors live in `NotchClosedLabelContent`, a pure function of counts
 //  and animation phases — the live view drives it from a TimelineView clock;
@@ -51,17 +52,22 @@ struct NotchClosedLabelView: View {
     static let codexHueSeed: Double = 0.35
     static let grokHueSeed: Double = 0.7
 
+    private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 || grokCount > 0 }
+
     var body: some View {
-        NotchClosedLabelContent(
-            claudeCount: claudeCount,
-            codexCount: codexCount,
-            grokCount: grokCount,
-            jumpOffset: 0,
-            claudeHue: 0,
-            codexHue: 0,
-            grokHue: 0,
-            signal: signal
-        )
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !(isAnimating && active))) { timeline in
+            let time = timeline.date.timeIntervalSinceReferenceDate
+            NotchClosedLabelContent(
+                claudeCount: claudeCount,
+                codexCount: codexCount,
+                grokCount: grokCount,
+                jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
+                claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
+                codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed),
+                grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed),
+                signal: signal
+            )
+        }
     }
 
     // MARK: - Rainbow
@@ -128,7 +134,7 @@ struct NotchClosedLabelContent: View {
             // Prefix text. If space ever gets tight, shrink/truncate this
             // (never the counts) — see minimumScaleFactor + tail truncation.
             Text("Llmux Islands")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundColor(.white.opacity(0.85))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -139,9 +145,10 @@ struct NotchClosedLabelContent: View {
                 // session groups, dim the mascot, and SAY offline.
                 ClaudeCrabIcon(size: 14, animateLegs: false)
                     .opacity(0.35)
-                chip("offline", color: Color.white.opacity(0.6))
+                chip("offline", color: Color.white.opacity(0.45))
             } else {
-                ClaudeCrabIcon(size: 14, animateLegs: false)
+                ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
+                    .offset(y: jumpOffset)
 
                 if claudeCount > 0 {
                     providerGroup(.claude, count: claudeCount, hue: claudeHue)
@@ -166,7 +173,7 @@ struct NotchClosedLabelContent: View {
         case .auth, .limit: return Color(red: 1.0, green: 0.42, blue: 0.36)
         case .lowQuota: return Color(red: 1.0, green: 0.72, blue: 0.28)
         case .degraded: return Color(red: 0.95, green: 0.62, blue: 0.45)
-        case .offline, .none: return Color.white.opacity(0.6)
+        case .offline, .none: return Color.white.opacity(0.45)
         }
     }
 
@@ -178,7 +185,7 @@ struct NotchClosedLabelContent: View {
                 .fill(Color.white.opacity(0.25))
                 .frame(width: 1, height: 10)
             Text(text)
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: 11, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(color)
                 .lineLimit(1)
@@ -189,10 +196,11 @@ struct NotchClosedLabelContent: View {
     private func providerGroup(_ provider: UsageProvider, count: Int, hue: Double) -> some View {
         HStack(spacing: 3) {
             UsageProviderIcon(provider: provider, size: 12)
+                .hueRotation(.degrees(hue * 360))
             Text("\(count)")
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: 11, weight: .bold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(Color.white.opacity(0.85))
+                .foregroundStyle(Color(hue: hue, saturation: 0.85, brightness: 1.0))
         }
     }
 }

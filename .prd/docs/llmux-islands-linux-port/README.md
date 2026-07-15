@@ -27,6 +27,8 @@ clipboard, notification, sound, and quit commands remain in the thin shell.
   inventory, including recent request activity (the receipt surface).
 - [platform-mapping.md](platform-mapping.md) — exhaustive macOS-to-KDE mapping,
   official research, alternatives, and architecture decision.
+- [design.md](design.md) — macOS pre-renewal preservation boundary and exact
+  Linux/KDE alignment tokens, geometry rules, and visual acceptance criteria.
 - [spec.md](spec.md) — shared semantic state/action/effect contract, invariants,
   flows, compatibility, and implementation map.
 - [trace.md](trace.md) — seven-section vertical traces, test derivation,
@@ -52,11 +54,9 @@ The older `.prd/11-llmux-islands-spec.md` and
 `.prd/12-llmux-islands-architecture.md` describe an earlier Claude/Codex-only
 plan. They remain historical input, not an inventory of the shipped app.
 
-Both production renderers implement the same OpenAI-reference inversion: black
-canvas, white ink, flat square internal controls, restrained system-sans type,
-and whitespace/hairlines in place of decorative cards. Normal navigation,
-provider identity, and quota are monochrome; semantic color is reserved for
-labelled warning, error, and completion states. Infrequent diagnostics and
-operations are contextual `Advanced` content. Platform-native integration
-remains SwiftUI/AppKit or Qt/Kirigami; bright system widget chrome is not part
-of the application surface.
+The presentation boundary is intentionally asymmetric. macOS preserves the
+pre-renewal SwiftUI/AppKit island UI at `57df760`; KDE keeps the current
+OpenAI-reference inversion and uses the exact alignment tokens in `design.md`.
+Both shells still consume the same Rust semantic state, privacy rules, actions,
+and receipts. Linux `Advanced` disclosure is presentation-local and does not
+imply a matching macOS redesign.

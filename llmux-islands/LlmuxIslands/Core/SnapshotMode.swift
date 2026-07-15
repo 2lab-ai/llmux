@@ -26,11 +26,14 @@
 //  time instead of the 4 normalized phases (`rainbowHue(time:)`). Output:
 //  `t{t*100 as %03d}-c{claude}.png` (e.g. t=0.3, claude=3 → `t030-c3.png`).
 //
-//  Menu + usage + stats family — each common-path surface plus an explicitly
-//  expanded Advanced counterpart, and a production receipt-detail route.
-//  Fixture accounts use demo-safe identities. Force the anonymous state
-//  per-process WITHOUT touching the shared defaults domain by launching with
-//  `-emailAnonymousEnabled YES` / `NO` (volatile argument domain).
+//  Menu + usage + stats family — the ☰ menu (`menu.png`), the DEFAULT Usage
+//  panel (the restored v0.2.14 tile grid, issue #68 v2) with fixture accounts
+//  carrying demo fake emails (`usage-anon-on.png` / `usage-anon-off.png`,
+//  named after the effective email-anonymous state), and the Statistics panel
+//  (`stats.png` full panel + `stats-{overview,models,clients,health}.png`
+//  per section). Force the anon state per-process WITHOUT touching the shared
+//  defaults domain by launching with `-emailAnonymousEnabled YES` / `NO`
+//  (volatile argument domain); run the binary twice to get both usage states.
 //
 
 import AppKit
@@ -70,7 +73,6 @@ enum SnapshotMode {
         case invalidWallClock(String)
         case invalidKind(String)
         case missingFixture(String)
-        case unexpectedSurfaceSet
 
         var description: String {
             switch self {
@@ -84,8 +86,6 @@ enum SnapshotMode {
                 return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats, got \"\(raw)\""
             case .missingFixture(let file):
                 return "snapshot fixture is missing from the app bundle: \(file)"
-            case .unexpectedSurfaceSet:
-                return "opened-panel snapshot output did not match the exact seven-surface contract"
             }
         }
     }
@@ -118,7 +118,7 @@ enum SnapshotMode {
 
         let kinds = try requestedKinds()
         if kinds.contains(where: { $0 != .label }) {
-            normalizeSnapshotLaunchArguments()
+            normalizeEmailAnonymousLaunchArgument()
         }
 
         var written: [String] = []
@@ -128,15 +128,6 @@ enum SnapshotMode {
             case .menu: written += try renderMenu(into: dir)
             case .usage: written += try renderUsage(into: dir)
             case .stats: written += try renderStats(into: dir)
-            }
-        }
-        if kinds == [.menu, .usage, .stats] {
-            let actual = Set(written.map { URL(fileURLWithPath: $0).lastPathComponent })
-            let expected = Set(IslandPresentationPolicy.snapshotSurfaceFiles(
-                emailAnonymous: AppSettings.emailAnonymousEnabled
-            ))
-            guard actual == expected, written.count == expected.count else {
-                throw SnapshotError.unexpectedSurfaceSet
             }
         }
         return written
@@ -208,75 +199,44 @@ enum SnapshotMode {
 
     // MARK: - Menu + usage family (opened panels)
 
-    /// Settings in both its common-path default and explicit Advanced state.
+    /// The ☰ menu as composed in the app (includes the "Email anonymous" row).
     @MainActor
     private static func renderMenu(into dir: URL) throws -> [String] {
-        let model = IslandUsageModel.shared
-        let fixture = try fixtureDashboard()
-        try installCanonicalStatsFixture(fixture, into: model)
-
-        let viewModel = makeOpenedViewModel(contentType: .menu)
+        let viewModel = makeViewModel()
+        viewModel.contentType = .menu
         let url = dir.appendingPathComponent("menu.png")
-        try writeHosted(
-            view: NotchView(viewModel: viewModel, snapshotNow: fixture.now, forceVisible: true),
-            size: viewModel.openedSize,
-            to: url
-        )
-
-        let advancedViewModel = makeOpenedViewModel(
-            contentType: .menu,
-            openedSizeOverride: CGSize(width: 500, height: 820)
-        )
-        let advancedURL = dir.appendingPathComponent("menu-advanced.png")
-        try writeHosted(
-            view: NotchView(
-                viewModel: advancedViewModel,
-                snapshotAdvancedInitiallyPresented: true,
-                snapshotNow: fixture.now,
-                forceVisible: true
-            ),
-            size: advancedViewModel.openedSize,
-            to: advancedURL
-        )
-        return [url.path, advancedURL.path]
+        // The live panel is intentionally scrollable at `openedSize`. Evidence
+        // needs the complete surface, including Accessibility/About/GitHub/Quit,
+        // so give the same ScrollView enough height to lay out every row.
+        let fullMenuSize = CGSize(width: viewModel.openedSize.width, height: 820)
+        try writeHosted(view: NotchMenuView(viewModel: viewModel), size: fullMenuSize, to: url)
+        return [url.path]
     }
 
-    /// Usage in both its common-path default and explicit Advanced state,
-    /// named after the effective email-anonymous state.
+    /// The DEFAULT Usage panel — the restored v0.2.14 account tile grid
+    /// (issue #68 v2: no tabs, no analytics), named after the effective
+    /// email-anonymous state.
     @MainActor
     private static func renderUsage(into dir: URL) throws -> [String] {
+        // Deterministic fixture accounts with demo fake emails — no daemon
+        // dependency, and the production daemon is never queried. Dashboard
+        // stays nil: the default panel never renders analytics anymore.
         let model = IslandUsageModel.shared
-        let fixture = try fixtureDashboard()
-        try installCanonicalStatsFixture(fixture, into: model)
+        model.tiles = fixtureTiles()
+        model.connection = .online
+        model.dashboard = nil
 
-        let viewModel = makeOpenedViewModel(contentType: .usage)
+        let viewModel = makeViewModel()
+        viewModel.contentType = .usage
         let anonOn = AppSettings.emailAnonymousEnabled
         let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
-        try writeHosted(
-            view: NotchView(viewModel: viewModel, snapshotNow: fixture.now, forceVisible: true),
-            size: viewModel.openedSize,
-            to: url
-        )
-
-        let advancedViewModel = makeOpenedViewModel(
-            contentType: .usage,
-            openedSizeOverride: CGSize(width: 560, height: 620)
-        )
-        let advancedURL = dir.appendingPathComponent("usage-advanced.png")
-        try writeHosted(
-            view: NotchView(
-                viewModel: advancedViewModel,
-                snapshotAdvancedInitiallyPresented: true,
-                snapshotNow: fixture.now,
-                forceVisible: true
-            ),
-            size: advancedViewModel.openedSize,
-            to: advancedURL
-        )
-        return [url.path, advancedURL.path]
+        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
+        return [url.path]
     }
 
-    /// Statistics in common, Advanced analytics, and Advanced receipts states.
+    /// The Statistics panel (issue #68 v2): the full panel as opened from the
+    /// ☰ menu (`stats.png`, Overview selected) plus each section rendered
+    /// standalone (`stats-{overview,models,clients,health}.png`).
     @MainActor
     private static func renderStats(into dir: URL) throws -> [String] {
         // Deterministic dashboard document (issue #62 S4): fallback
@@ -287,52 +247,64 @@ enum SnapshotMode {
         let model = IslandUsageModel.shared
         let fixture = try fixtureDashboard()
         try installCanonicalStatsFixture(fixture, into: model)
-        guard model.dashboard != nil else {
+        guard let dashboard = model.dashboard else {
             throw SharedUiCoreError.invalidOutput
         }
 
-        let viewModel = makeOpenedViewModel(contentType: .stats)
+        let viewModel = makeViewModel()
+        viewModel.contentType = .stats
         let url = dir.appendingPathComponent("stats.png")
         try writeHosted(
-            view: NotchView(viewModel: viewModel, snapshotNow: fixture.now, forceVisible: true),
+            view: IslandStatsView(model: model, viewModel: viewModel, snapshotNow: fixture.now),
             size: viewModel.openedSize,
             to: url
         )
         var written = [url.path]
 
-        let advancedViewModel = makeOpenedViewModel(
-            contentType: .stats,
-            openedSizeOverride: CGSize(width: 560, height: 860)
-        )
-        let advancedURL = dir.appendingPathComponent("stats-advanced.png")
-        try writeHosted(
-            view: NotchView(
-                viewModel: advancedViewModel,
-                snapshotAdvancedInitiallyPresented: true,
-                snapshotNow: fixture.now,
-                forceVisible: true
-            ),
-            size: advancedViewModel.openedSize,
-            to: advancedURL
-        )
-        written.append(advancedURL.path)
+        // Each section rendered directly at its content height so every block
+        // (cards, accounts, models, heat, activity, health) is fully visible.
+        let sections: [(StatsSection, String, CGFloat)] = [
+            (.overview, "stats-overview.png", 760),
+            (.models, "stats-models.png", 420),
+            (.clients, "stats-clients.png", 420),
+            (.health, "stats-health.png", 420),
+        ]
+        for (section, name, height) in sections {
+            let sectionURL = dir.appendingPathComponent(name)
+            let view = StatsSectionContent(
+                section: section,
+                dashboard: dashboard,
+                tiles: model.tiles,
+                now: fixture.now,
+                activityReceipts: model.activityReceipts,
+                verificationReceipts: model.verificationReceipts
+            )
+            try writeHosted(
+                view: view
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading),
+                size: CGSize(width: 560, height: height),
+                to: sectionURL
+            )
+            written.append(sectionURL.path)
+        }
 
-        // The exact production Statistics route opens Advanced and selects its
-        // Activity & receipts page, with the same outer shell chrome as a user.
+        // A readable zoom uses the exact production receipt components. The
+        // full Statistics screenshot above establishes surrounding context;
+        // this artifact makes request metadata and the post-write readback
+        // outcome legible in a PR at normal browser zoom.
         let receiptsURL = dir.appendingPathComponent("receipts-detail.png")
-        let receiptViewModel = makeOpenedViewModel(
-            contentType: .stats,
-            openedSizeOverride: CGSize(width: 560, height: 700)
-        )
+        let receipts = VStack(alignment: .leading, spacing: 10) {
+            StatsSectionLabel("recent activity")
+            UsageCanonicalActivityReceiptList(receipts: model.activityReceipts, now: fixture.now)
+            StatsSectionLabel("verification receipts")
+            UsageVerificationReceiptList(receipts: model.verificationReceipts, now: fixture.now)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         try writeHosted(
-            view: NotchView(
-                viewModel: receiptViewModel,
-                snapshotAdvancedInitiallyPresented: true,
-                snapshotStatisticsPage: .receipts,
-                snapshotNow: fixture.now,
-                forceVisible: true
-            ),
-            size: receiptViewModel.openedSize,
+            view: receipts,
+            size: CGSize(width: 560, height: 260),
             to: receiptsURL
         )
         written.append(receiptsURL.path)
@@ -425,31 +397,25 @@ enum SnapshotMode {
 
     /// Plausible 16" laptop geometry so `openedSize` matches the app.
     @MainActor
-    private static func makeOpenedViewModel(
-        contentType: NotchContentType,
-        openedSizeOverride: CGSize? = nil
-    ) -> NotchViewModel {
-        let viewModel = NotchViewModel(
+    private static func makeViewModel() -> NotchViewModel {
+        NotchViewModel(
             deviceNotchRect: CGRect(x: 764, y: 1085, width: 200, height: 32),
             screenRect: CGRect(x: 0, y: 0, width: 1728, height: 1117),
             windowHeight: 800,
-            hasPhysicalNotch: true,
-            openedSizeOverride: openedSizeOverride
+            hasPhysicalNotch: true
         )
-        viewModel.contentType = contentType
-        viewModel.status = .opened
-        return viewModel
     }
 
-    /// Snapshot evidence uses only volatile, per-process preferences. Coerce
-    /// the requested privacy flag to a real Bool for `@AppStorage`, and pin the
-    /// canonical fixture's Fable visibility so host defaults cannot change any
-    /// Usage/Statistics pixels. Persisted user defaults are never touched.
-    private static func normalizeSnapshotLaunchArguments() {
-        let emailAnonymous = AppSettings.emailAnonymousEnabled
+    /// `-emailAnonymousEnabled YES/NO` lands in the volatile argument domain
+    /// as a String; `bool(forKey:)` coerces it (so AppSettings reads it fine)
+    /// but SwiftUI's @AppStorage does a strict Bool cast and would silently
+    /// fall back to its default. Re-write the coerced value into the same
+    /// volatile domain as a typed Bool so the views see it too. Volatile =
+    /// per-process; the user's persisted defaults are never touched.
+    private static func normalizeEmailAnonymousLaunchArgument() {
+        let value = AppSettings.emailAnonymousEnabled
         var argumentDomain = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        argumentDomain[AppSettings.emailAnonymousEnabledKey] = emailAnonymous
-        argumentDomain[AppSettings.showFableWeeklyKey] = true
+        argumentDomain[AppSettings.emailAnonymousEnabledKey] = value
         UserDefaults.standard.setVolatileDomain(argumentDomain, forName: UserDefaults.argumentDomain)
     }
 
@@ -499,6 +465,54 @@ enum SnapshotMode {
         try data.write(to: url)
     }
 
+    /// Four representative accounts using the demo fake emails
+    /// (`DemoMode.fakeEmail`), mirroring what `LLMUX_ISLANDS_DEMO=1` shows.
+    private static func fixtureTiles() -> [UsageAccountTile] {
+        let now = Date()
+
+        func info(name: String, fiveHour: Double, sevenDay: Double) -> CLIUsageInfo {
+            CLIUsageInfo(
+                name: name,
+                available: true,
+                error: false,
+                fiveHourPercent: fiveHour,
+                sevenDayPercent: sevenDay,
+                fiveHourReset: now.addingTimeInterval(2 * 3600 + 17 * 60),
+                sevenDayReset: now.addingTimeInterval(3 * 24 * 3600 + 5 * 3600),
+                model: nil,
+                plan: nil,
+                buckets: nil
+            )
+        }
+
+        func tile(index: Int, provider: UsageProvider, tier: String?, fiveHour: Double, sevenDay: Double) -> UsageAccountTile {
+            let email = DemoMode.fakeEmail(index: index)
+            return UsageAccountTile(
+                id: email,
+                provider: provider,
+                accountId: email,
+                label: email,
+                email: email,
+                tier: tier,
+                claudeIsTeam: nil,
+                tokenRefresh: TokenRefreshInfo(
+                    expiresAt: now.addingTimeInterval(5 * 3600),
+                    lifetimeSeconds: 8 * 3600
+                ),
+                info: info(name: email, fiveHour: fiveHour, sevenDay: sevenDay),
+                errorMessage: nil,
+                issue: nil
+            )
+        }
+
+        return [
+            tile(index: 0, provider: .claude, tier: "max20", fiveHour: 34, sevenDay: 61),
+            tile(index: 1, provider: .claude, tier: "max5", fiveHour: 78, sevenDay: 42),
+            tile(index: 2, provider: .codex, tier: nil, fiveHour: 12, sevenDay: 27),
+            // 7d ≥ 90% — exercises the compact rows' warning color (#68).
+            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 96),
+        ]
+    }
 }
 
 /// The closed island as snapshot mode renders it: `NotchClosedLabelContent`

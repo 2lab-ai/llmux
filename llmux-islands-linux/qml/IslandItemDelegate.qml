@@ -4,9 +4,11 @@ import QtQuick.Controls
 ItemDelegate {
     id: control
 
-    implicitHeight: 32
-    leftPadding: 10
-    rightPadding: 10
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: IslandTheme.controlPaddingX
+    rightPadding: IslandTheme.controlPaddingX
+    topPadding: 0
+    bottomPadding: 0
     hoverEnabled: true
 
     contentItem: Label {

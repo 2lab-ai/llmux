@@ -126,6 +126,149 @@ fn qml_visual_system_uses_the_inverted_openai_reference_without_system_chrome() 
 }
 
 #[test]
+fn linux_alignment_contract_binds_shared_geometry_tokens() {
+    let theme = read("qml/IslandTheme.qml");
+    for marker in [
+        "spaceXs: 4",
+        "spaceSm: 8",
+        "spaceMd: 12",
+        "spaceLg: 16",
+        "pagePadding: 24",
+        "sectionSpacing: 24",
+        "cardPadding: 16",
+        "fieldLabelWidth: 104",
+        "controlHeight: 32",
+        "controlPaddingX: spaceMd",
+        "iconTextGap: 6",
+        "segmentInset: 2",
+        "segmentItemHeight: 28",
+        "headerHeight: 56",
+        "navigationWidth: 300",
+    ] {
+        assert!(
+            theme.contains(marker),
+            "missing Linux alignment token {marker}"
+        );
+    }
+
+    for (file, markers) in [
+        (
+            "qml/IslandButton.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "IslandTheme.controlPaddingX",
+                "spacing: IslandTheme.iconTextGap",
+                "verticalAlignment: Text.AlignVCenter",
+            ][..],
+        ),
+        (
+            "qml/IslandTextField.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "leftPadding: IslandTheme.controlPaddingX",
+                "verticalAlignment: TextInput.AlignVCenter",
+            ][..],
+        ),
+        (
+            "qml/IslandComboBox.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "leftPadding: IslandTheme.controlPaddingX",
+                "verticalAlignment: Text.AlignVCenter",
+            ][..],
+        ),
+        (
+            "qml/IslandSegmentedControl.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "padding: IslandTheme.segmentInset",
+                "implicitHeight: IslandTheme.segmentItemHeight",
+            ][..],
+        ),
+        (
+            "qml/IslandSwitch.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "leftPadding: 0",
+                "verticalAlignment: Text.AlignVCenter",
+            ][..],
+        ),
+        (
+            "qml/IslandCheckBox.qml",
+            &[
+                "implicitHeight: IslandTheme.controlHeight",
+                "leftPadding: 0",
+                "verticalAlignment: Text.AlignVCenter",
+            ][..],
+        ),
+        (
+            "qml/IslandFieldLabel.qml",
+            &[
+                "Layout.preferredWidth: IslandTheme.fieldLabelWidth",
+                "Layout.preferredHeight: IslandTheme.controlHeight",
+                "horizontalAlignment: Text.AlignRight",
+            ][..],
+        ),
+    ] {
+        let source = read(file);
+        for marker in markers {
+            assert!(source.contains(marker), "{file} must bind {marker}");
+        }
+    }
+
+    let main = read("qml/Main.qml");
+    for marker in [
+        "implicitHeight: IslandTheme.headerHeight",
+        "padding: 0",
+        "spacing: IslandTheme.spaceMd",
+        "Layout.preferredWidth: IslandTheme.navigationWidth",
+        "Layout.rightMargin: IslandTheme.pagePadding",
+    ] {
+        assert!(
+            main.contains(marker),
+            "header alignment must contain {marker}"
+        );
+    }
+
+    let usage = read("qml/Usage.qml");
+    let statistics = read("qml/Statistics.qml");
+    let menu = read("qml/Menu.qml");
+    assert!(usage.contains("uniformCellWidths: true"));
+    assert!(usage.contains("columnSpacing: IslandTheme.peerGap"));
+    assert!(statistics.matches("uniformCellWidths: true").count() >= 4);
+    assert!(statistics.contains("columnSpacing: IslandTheme.peerGap"));
+    assert!(menu.contains("columnSpacing: IslandTheme.formColumnGap"));
+    assert!(menu.contains("rowSpacing: IslandTheme.spaceSm"));
+
+    for (source, object_names) in [
+        (
+            &usage,
+            &["usage-verification-actions", "usage-add-dialog-actions"][..],
+        ),
+        (
+            &menu,
+            &[
+                "event-card-actions",
+                "about-actions",
+                "event-dialog-actions",
+            ][..],
+        ),
+    ] {
+        for object_name in object_names {
+            let anchor = format!("objectName: \"{object_name}\"");
+            let start = source
+                .find(&anchor)
+                .unwrap_or_else(|| panic!("missing action row {object_name}"));
+            let contract = &source[start..source.len().min(start + 160)];
+            assert!(
+                contract.contains("spacing: IslandTheme.spaceSm"),
+                "action row {object_name} must use the shared 8px spacing token"
+            );
+        }
+    }
+}
+
+#[test]
 fn production_surfaces_use_provider_quota_segment_and_receipt_hierarchy() {
     let usage = read("qml/Usage.qml");
     for marker in [

@@ -587,7 +587,8 @@ Kirigami.ApplicationWindow {
             anchors.right: parent.right
             visible: root.semanticOpen
             height: visible ? implicitHeight : 0
-            implicitHeight: 58
+            implicitHeight: IslandTheme.headerHeight
+            padding: 0
 
             background: Rectangle {
                 color: IslandTheme.panel
@@ -604,7 +605,7 @@ Kirigami.ApplicationWindow {
             }
 
             contentItem: RowLayout {
-                spacing: 14
+                spacing: IslandTheme.spaceMd
 
                 Label {
                     text: qsTr("llmux Islands")
@@ -619,7 +620,8 @@ Kirigami.ApplicationWindow {
                 }
 
                 IslandSegmentedControl {
-                    Layout.preferredWidth: 300
+                    Layout.preferredWidth: IslandTheme.navigationWidth
+                    Layout.preferredHeight: IslandTheme.controlHeight
                     model: [qsTr("Usage"), qsTr("Statistics"), qsTr("Settings")]
                     currentIndex: root.selectedSurface === "statistics" ? 1
                         : root.selectedSurface === "menu" ? 2 : 0
@@ -631,9 +633,8 @@ Kirigami.ApplicationWindow {
                 Rectangle {
                     radius: 0
                     implicitWidth: connectionStatus.implicitWidth
-                        + 22
-                    implicitHeight: connectionStatus.implicitHeight
-                        + 12
+                        + IslandTheme.controlPaddingX * 2
+                    implicitHeight: IslandTheme.controlHeight
                     color: root.uiState.lifecycle === "ready"
                         ? IslandTheme.surface
                         : root.uiState.lifecycle === "starting"

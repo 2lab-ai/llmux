@@ -4,8 +4,8 @@ import QtQuick.Controls
 TextArea {
     id: control
 
-    leftPadding: 10
-    rightPadding: 10
+    leftPadding: IslandTheme.controlPaddingX
+    rightPadding: IslandTheme.controlPaddingX
     topPadding: 9
     bottomPadding: 9
     color: IslandTheme.primaryText

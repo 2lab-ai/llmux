@@ -382,6 +382,7 @@ Kirigami.ScrollablePage {
 
         RowLayout {
             Layout.fillWidth: true
+            spacing: IslandTheme.spaceSm
 
             Label {
                 text: qsTr("Statistics")
@@ -392,8 +393,10 @@ Kirigami.ScrollablePage {
 
             Rectangle {
                 radius: 0
-                implicitWidth: statisticsConnectionLabel.implicitWidth + 18
-                implicitHeight: statisticsConnectionLabel.implicitHeight + 10
+                implicitWidth: statisticsConnectionLabel.implicitWidth
+                    + IslandTheme.chipPaddingX * 2
+                implicitHeight: statisticsConnectionLabel.implicitHeight
+                    + IslandTheme.chipPaddingY * 2
                 color: IslandTheme.surface
                 border.color: IslandTheme.border
                 border.width: 1
@@ -463,8 +466,9 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
                 columns: statisticsPage.width >= 760
                     ? (statisticsPage.effectiveAdvancedVisible ? 5 : 4) : 2
-                columnSpacing: Kirigami.Units.smallSpacing
-                rowSpacing: Kirigami.Units.smallSpacing
+                uniformCellWidths: true
+                columnSpacing: IslandTheme.peerGap
+                rowSpacing: IslandTheme.peerGap
 
                 Repeater {
                     model: statisticsPage.effectiveAdvancedVisible ? [
@@ -486,7 +490,7 @@ Kirigami.ScrollablePage {
                         Layout.fillWidth: true
 
                         contentItem: ColumnLayout {
-                            spacing: 4
+                            spacing: IslandTheme.spaceXs
                             IslandSectionLabel {
                                 text: overviewCard.modelData.label
                             }
@@ -513,7 +517,7 @@ Kirigami.ScrollablePage {
             Flow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: childrenRect.height
-                spacing: Kirigami.Units.smallSpacing
+                spacing: IslandTheme.spaceSm
                 visible: statisticsPage.effectiveAdvancedVisible
                     && !statisticsPage.receiptSnapshotMode
                     && statisticsPage.selectedSection === 0
@@ -528,8 +532,10 @@ Kirigami.ScrollablePage {
                         color: IslandTheme.surfaceRaised
                         border.color: IslandTheme.border
                         border.width: 1
-                        implicitWidth: topModelLabel.implicitWidth + Kirigami.Units.largeSpacing
-                        implicitHeight: topModelLabel.implicitHeight + Kirigami.Units.smallSpacing * 2
+                        implicitWidth: topModelLabel.implicitWidth
+                            + IslandTheme.chipPaddingX * 2
+                        implicitHeight: topModelLabel.implicitHeight
+                            + IslandTheme.chipPaddingY * 2
 
                         Label {
                             id: topModelLabel
@@ -574,7 +580,7 @@ Kirigami.ScrollablePage {
                     Layout.fillWidth: true
 
                     contentItem: ColumnLayout {
-                        spacing: 6
+                        spacing: IslandTheme.spaceSm
 
                         RowLayout {
                             Layout.fillWidth: true
@@ -656,8 +662,9 @@ Kirigami.ScrollablePage {
             GridLayout {
                 Layout.fillWidth: true
                 columns: statisticsPage.width >= 760 ? 2 : 1
-                columnSpacing: Kirigami.Units.smallSpacing
-                rowSpacing: Kirigami.Units.smallSpacing
+                uniformCellWidths: true
+                columnSpacing: IslandTheme.peerGap
+                rowSpacing: IslandTheme.peerGap
 
                 Repeater {
                     model: ["24h", "72h"]
@@ -821,7 +828,8 @@ Kirigami.ScrollablePage {
                         GridLayout {
                             Layout.fillWidth: true
                             columns: statisticsPage.width >= 760 ? 4 : 2
-                            columnSpacing: Kirigami.Units.largeSpacing
+                            uniformCellWidths: true
+                            columnSpacing: IslandTheme.spaceLg
                             Label { text: qsTr("Requests %1").arg(statisticsPage.optionalNumber(modelCard.modelData.requests)) }
                             Label { text: qsTr("OK %1").arg(statisticsPage.optionalNumber(modelCard.modelData.ok)); color: IslandTheme.primaryText }
                             Label { text: qsTr("Errors %1").arg(statisticsPage.optionalNumber(modelCard.modelData.errors)); color: IslandTheme.red }
@@ -1011,7 +1019,8 @@ Kirigami.ScrollablePage {
                         GridLayout {
                             Layout.fillWidth: true
                             columns: statisticsPage.width >= 760 ? 3 : 1
-                            columnSpacing: Kirigami.Units.largeSpacing
+                            uniformCellWidths: true
+                            columnSpacing: IslandTheme.spaceLg
                             Label { text: qsTr("Credential: %1").arg(statisticsPage.healthCredential(healthCard.modelData)) }
                             Label { text: qsTr("Cooldown / block: %1").arg(statisticsPage.healthCooldown(healthCard.modelData)) }
                             Label { text: qsTr("In flight: %1").arg(statisticsPage.optionalNumber(healthCard.modelData.in_flight)) }
@@ -1078,13 +1087,15 @@ Kirigami.ScrollablePage {
                     Layout.fillWidth: true
 
                     contentItem: ColumnLayout {
-                        spacing: 6
+                        spacing: IslandTheme.spaceSm
                         RowLayout {
                             Layout.fillWidth: true
                             Rectangle {
                                 radius: 0
-                                implicitWidth: receiptStatus.implicitWidth + Kirigami.Units.largeSpacing
-                                implicitHeight: receiptStatus.implicitHeight + Kirigami.Units.smallSpacing
+                                implicitWidth: receiptStatus.implicitWidth
+                                    + IslandTheme.chipPaddingX * 2
+                                implicitHeight: receiptStatus.implicitHeight
+                                    + IslandTheme.chipPaddingY * 2
                                 color: statisticsPage.receiptStatusColor(receiptCard.receipt)
 
                                 Label {

@@ -364,6 +364,7 @@ Kirigami.ScrollablePage {
 
         RowLayout {
             Layout.fillWidth: true
+            spacing: IslandTheme.spaceSm
 
             ColumnLayout {
                 spacing: 0
@@ -432,8 +433,8 @@ Kirigami.ScrollablePage {
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
-                    columnSpacing: 16
-                    rowSpacing: 10
+                    columnSpacing: IslandTheme.formColumnGap
+                    rowSpacing: IslandTheme.spaceSm
 
                     IslandFieldLabel { text: qsTr("Screen") }
 
@@ -470,6 +471,7 @@ Kirigami.ScrollablePage {
                     IslandFieldLabel { text: qsTr("Sound") }
                     RowLayout {
                         Layout.fillWidth: true
+                        spacing: IslandTheme.spaceSm
 
                         IslandComboBox {
                             id: soundSelector
@@ -561,6 +563,7 @@ Kirigami.ScrollablePage {
                 spacing: Kirigami.Units.smallSpacing
 
                 RowLayout {
+                    spacing: IslandTheme.spaceSm
                     Layout.fillWidth: true
                     IslandSectionLabel {
                         text: qsTr("Daemon connection")
@@ -576,8 +579,8 @@ Kirigami.ScrollablePage {
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
-                    columnSpacing: 16
-                    rowSpacing: 10
+                    columnSpacing: IslandTheme.formColumnGap
+                    rowSpacing: IslandTheme.spaceSm
 
                     IslandFieldLabel { text: qsTr("Scheme") }
 
@@ -662,6 +665,7 @@ Kirigami.ScrollablePage {
                 }
 
                 RowLayout {
+                    spacing: IslandTheme.spaceSm
                     Layout.fillWidth: true
                     Label {
                         text: menuPage.connection.remote === true
@@ -718,7 +722,9 @@ Kirigami.ScrollablePage {
                     Layout.fillWidth: true
                     visible: menuPage.advancedVisible
                     columns: menuPage.width >= 700 ? 2 : 1
-                    columnSpacing: Kirigami.Units.largeSpacing
+                    uniformCellWidths: true
+                    columnSpacing: IslandTheme.peerGap
+                    rowSpacing: IslandTheme.peerGap
 
                     ColumnLayout {
                         Layout.fillWidth: true
@@ -818,7 +824,8 @@ Kirigami.ScrollablePage {
                         Layout.fillWidth: true
 
                         contentItem: RowLayout {
-                            spacing: Kirigami.Units.largeSpacing
+                            objectName: "event-card-actions"
+                            spacing: IslandTheme.spaceSm
 
                             ColumnLayout {
                                 Layout.fillWidth: true
@@ -882,8 +889,8 @@ Kirigami.ScrollablePage {
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
-                    columnSpacing: 16
-                    rowSpacing: 8
+                    columnSpacing: IslandTheme.formColumnGap
+                    rowSpacing: IslandTheme.spaceSm
 
                     IslandFieldLabel { text: qsTr("Installed version") }
                     Label {
@@ -935,6 +942,7 @@ Kirigami.ScrollablePage {
                 }
 
                 RowLayout {
+                    spacing: IslandTheme.spaceSm
                     Layout.fillWidth: true
                     Label {
                         Layout.fillWidth: true
@@ -1043,8 +1051,8 @@ Kirigami.ScrollablePage {
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
-                    columnSpacing: 16
-                    rowSpacing: 8
+                    columnSpacing: IslandTheme.formColumnGap
+                    rowSpacing: IslandTheme.spaceSm
 
                     IslandFieldLabel { text: qsTr("Islands version") }
                     Label {
@@ -1075,6 +1083,8 @@ Kirigami.ScrollablePage {
                 }
 
                 RowLayout {
+                    objectName: "about-actions"
+                    spacing: IslandTheme.spaceSm
                     Layout.fillWidth: true
                     IslandButton {
                         text: qsTr("Open source")
@@ -1208,6 +1218,8 @@ Kirigami.ScrollablePage {
                 text: eventEditor.validationMessage
             }
             RowLayout {
+                objectName: "event-dialog-actions"
+                spacing: IslandTheme.spaceSm
                 Layout.fillWidth: true
                 Item { Layout.fillWidth: true }
                 IslandButton {

@@ -4,9 +4,12 @@ import QtQuick.Controls
 TextField {
     id: control
 
-    implicitHeight: 34
-    leftPadding: 10
-    rightPadding: 10
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: IslandTheme.controlPaddingX
+    rightPadding: IslandTheme.controlPaddingX
+    topPadding: 0
+    bottomPadding: 0
+    verticalAlignment: TextInput.AlignVCenter
     color: IslandTheme.primaryText
     selectionColor: IslandTheme.primaryText
     selectedTextColor: IslandTheme.panel

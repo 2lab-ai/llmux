@@ -202,52 +202,54 @@ key is present. Debug output uses redacted implementations. Open URL, copy,
 notification, sound preview, native window configuration, and quit are
 shell-owned commands rather than falsely portable core effects.
 
-## Presentation hierarchy and progressive disclosure
+## Native presentation contracts
 
-Both native shells render the same two-level information hierarchy without
-adding state to the shared semantic contract:
+The shared semantic contract deliberately stops before widget presentation.
+Each shell keeps its native information hierarchy while consuming the same
+`UiState`, actions, privacy projection, and receipts.
+
+### macOS preservation
+
+The SwiftUI/AppKit shell preserves the presentation from
+`57df760cb57ba811d2a29bcddeb149eb7c4a04ad`, immediately before the native
+surface renewal. Its colored quota mosaic, rounded account tiles, Statistics
+sections, native menu rows, notch geometry, animations, and original sizes are
+restored as one boundary. It does not adopt the Linux `Advanced` disclosure.
+The preserved tree already consumes the shared Rust state and renders request
+and verification receipts, so restoration does not remove semantic behavior.
+
+### Linux/KDE hierarchy and alignment
+
+The KDE shell keeps its current two-level hierarchy:
 
 1. The default path shows current connection/attention state, account identity,
-   primary quota or usage, compact navigation, and the action needed most often
-   on that surface.
-2. A clearly labelled, keyboard-accessible `Advanced` disclosure reveals
-   diagnostic and infrequent controls in the context they affect. This includes
-   credential/token metadata, in-flight internals, model/client/health detail,
-   heatmaps, request and verification receipts, daemon endpoint credentials,
-   platform capability diagnostics, events, release/channel maintenance, and
-   build/source metadata.
-3. Warning, critical, offline, fatal, authentication-required, and destructive
-   confirmation states remain visible at the default level. Progressive
-   disclosure must never conceal the reason a primary action is unavailable.
-4. Screen, sound, privacy, launch-at-login, add account, refresh, and navigation
-   remain directly reachable. Contextual account mutation actions may live in
-   the account's Advanced disclosure, with removal still requiring confirmation.
-5. Disclosure state is presentation-local, ephemeral, and excluded from
+   primary quota or usage, compact navigation, and the most frequent actions.
+2. A labelled, keyboard-accessible `Advanced` disclosure reveals credential and
+   token metadata, secondary quota, analytics detail, request and verification
+   receipts, daemon configuration, events, maintenance, diagnostics, and build
+   metadata in context.
+3. Warning, critical, offline, fatal, authentication-required, destructive
+   confirmation, and operation failure states remain visible while Advanced is
+   closed.
+4. Disclosure state is presentation-local, ephemeral, and excluded from
    `UiState`, persistence, actions, effects, receipts, and daemon traffic.
-6. Renderer evidence uses one canonical privacy-safe `UiState` fixture and
-   fixed clock on both platforms. Each artifact set contains exactly seven
-   distinct PNGs—Usage/default+Advanced, Statistics/default+Advanced, receipt
-   detail, and Settings/default+Advanced—and includes the real shell brand,
-   navigation, selected route, and connection state.
 
-The named `openai` UI/UX reference is the visual north star. Because Islands is
-an inverted menu-bar/notch surface, it uses the reference's full-inversion mode:
-pure or near-black canvas, white ink, and 100%/60%/44% opacity tiers. Emphasis
-comes from white-fill/black-text inversion rather than a chromatic accent.
-Internal cards, controls, and disclosures are flat and square (`0px` radius)
-where platform primitives permit; they have no shadow, gradient, glow, or
-decorative material blur. The outer island/window silhouette may retain its
-platform-required rounding.
+The named `openai` UI/UX reference applies to Linux only: black canvas, white
+ink and opacity tiers, square flat controls, no decorative color, shadow,
+gradient, glow, or blur. Exact layout tokens and 960px acceptance coordinates
+are defined in `design.md`. Buttons, fields, combos, switches, checkboxes, and
+segmented controls share a 32px row; page/header gutters are 24px; peer actions
+and equal-width data cards use an 8px gap; form labels use a 104px column plus a
+16px control gap.
 
-Provider identity is text or iconography rather than decorative color. Color is
-reserved for rare semantic warning, error, success, and indispensable
-quantitative distinction, always paired with text or iconography; normal quota
-bars, focus, and navigation are monochrome. Platform system grotesque/sans
-typography stands in for OpenAI Sans, with monospaced text limited to identifiers,
-timestamps, endpoints, and tabular numeric telemetry. Layout follows a 4/8-point
-spacing rhythm with generous whitespace. Frequent navigation and keyboard
-actions do not animate; any occasional disclosure feedback is short,
-interruptible, and reduced-motion safe.
+### Renderer evidence
+
+Both renderers use the canonical privacy-safe fixture and fixed clock, but the
+artifact contracts reflect their native presentations. macOS requires three
+full-surface proofs—Usage, Statistics, and Menu—plus a readable receipt-detail
+crop, and may emit supporting section crops. KDE requires six full-shell
+proofs—Usage and Advanced, Statistics and Advanced, Settings and Advanced—plus
+a receipt-detail crop.
 
 ## Required flows
 

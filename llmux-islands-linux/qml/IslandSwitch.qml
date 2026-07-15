@@ -4,13 +4,18 @@ import QtQuick.Controls
 Switch {
     id: control
 
-    spacing: 9
+    implicitHeight: IslandTheme.controlHeight
+    leftPadding: 0
+    rightPadding: 0
+    topPadding: 0
+    bottomPadding: 0
+    spacing: IslandTheme.spaceSm
     palette.windowText: IslandTheme.primaryText
 
     indicator: Rectangle {
         implicitWidth: 34
         implicitHeight: 18
-        x: control.leftPadding
+        x: 0
         y: parent.height / 2 - height / 2
         radius: height / 2
         color: control.checked ? IslandTheme.primaryText : IslandTheme.field
