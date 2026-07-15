@@ -567,6 +567,7 @@ mod tests {
             codex: Default::default(),
             email_anonymous: false,
             tui_effects: true,
+            gradient: crate::tui::ui::GradientCfg::default(),
             show_fable_weekly: false,
             domain_abbrev: BTreeMap::new(),
             quota_display: Default::default(),

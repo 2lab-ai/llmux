@@ -12,7 +12,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table, Wrap,
 };
 use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
@@ -30,7 +31,7 @@ use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState, RawTab};
+use super::{anim, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -238,9 +239,9 @@ pub(crate) fn draw(
     // footer — same layering contract as the input modal (the two are never
     // open at once: each swallows the clicks that could open the other).
     if let Some(modal) = &chrome.raw_modal {
-        let max_scroll = draw_raw_modal(frame, modal);
+        let raw_chrome = draw_raw_modal(frame, modal);
         if let Some(hits) = hits.as_mut() {
-            hits.raw_modal_max_scroll = Some(max_scroll);
+            hits.raw_modal = Some(raw_chrome);
         }
     }
 
@@ -411,7 +412,7 @@ fn draw_main(
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
-        raw_modal_max_scroll: None,
+        raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -1790,16 +1791,99 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
 // body, JSON pretty-printed with syntax highlighting.
 // ---------------------------------------------------------------------------
 
-/// Prebuilt, immutable content of the raw viewer — one `Vec<Line>` per tab,
-/// built ONCE off the UI thread when the raw-io record arrives (a body can be
-/// 8 MiB; per-frame construction would stutter the render loop). The modal
-/// holds it behind an `Arc` so the per-frame `Chrome` clone stays cheap.
+/// Prebuilt, immutable content of the raw viewer — one tab per captured
+/// payload leg, built ONCE off the UI thread when the raw-io record arrives
+/// (a body can be 8 MiB; per-frame construction would stutter the render
+/// loop). The modal holds it behind an `Arc` so the per-frame `Chrome` clone
+/// stays cheap.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RawContent {
-    /// Request tab: general section + request headers + request body.
-    pub request: Vec<Line<'static>>,
-    /// Response tab: status + response headers + response body.
-    pub response: Vec<Line<'static>>,
+    /// Payload tabs in wire order (UI-8): client→llmux request, llmux→api
+    /// request, api→llmux response, llmux→client response. The upstream pair
+    /// exists only on TRANSLATED exchanges (codex/grok) — the claude
+    /// passthrough is byte-identity, so those records show the classic 2 tabs.
+    pub tabs: Vec<RawTabContent>,
+    /// Whole-record pretty JSON — the `save all` payload.
+    pub record_json: String,
+    /// Every tab's labeled plain body concatenated — the `copy all` payload.
+    pub all_text: String,
+}
+
+/// One payload tab: prebuilt styled lines plus the plain-text payloads the
+/// copy/save actions hand out (prebuilt too — a button press must not walk
+/// megabytes of styled spans on the UI thread).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawTabContent {
+    pub label: &'static str,
+    pub lines: Vec<Line<'static>>,
+    /// Widest line in display cells — the horizontal scroll bound.
+    pub width: u16,
+    /// The raw body verbatim — the `copy` / `save` payload.
+    pub body_text: String,
+    /// `copy as curl` for this tab's SIDE of the exchange: client tabs carry
+    /// the client request against llmux, upstream tabs the rewritten request
+    /// against the provider (a response is reproduced by replaying its
+    /// request).
+    pub curl: String,
+}
+
+/// What the opener knows at click time, threaded into the off-thread content
+/// build: the general metadata lines plus what the curl builder needs — the
+/// raw-io record stores neither the client method/path nor the local base
+/// URL.
+#[derive(Debug, Clone)]
+pub(crate) struct RawGeneral {
+    pub lines: Vec<Line<'static>>,
+    pub method: String,
+    pub path: String,
+    /// `http://localhost:<port>` (local) or the attach base URL (remote).
+    pub base_url: String,
+}
+
+/// Reconstruct a copy-pasteable `curl` for one side of the exchange. Redacted
+/// header values stay verbatim (`•••redacted` — the user substitutes real
+/// credentials); headers curl manages itself (content-length, host,
+/// accept-encoding) are dropped so the command replays cleanly. Single quotes
+/// are shell-escaped.
+fn curl_command(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: &str,
+) -> String {
+    let sh = |t: &str| t.replace('\'', "'\\''");
+    let mut out = format!("curl -X {} '{}'", method, sh(url));
+    for (name, value) in headers.unwrap_or_default() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "host" | "accept-encoding" | "connection"
+        ) {
+            continue;
+        }
+        out.push_str(&format!(" \\\n  -H '{}: {}'", sh(name), sh(value)));
+    }
+    if !body.is_empty() {
+        out.push_str(&format!(" \\\n  --data-raw '{}'", sh(body)));
+    }
+    out
+}
+
+/// Assemble one [`RawTabContent`], measuring the widest line for the
+/// horizontal scroll bound.
+fn raw_tab(
+    label: &'static str,
+    lines: Vec<Line<'static>>,
+    body_text: String,
+    curl: String,
+) -> RawTabContent {
+    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    RawTabContent {
+        label,
+        lines,
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        body_text,
+        curl,
+    }
 }
 
 /// Hard wrap applied to raw body lines at build time (cells are clipped by the
@@ -2053,25 +2137,84 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
     lines
 }
 
-/// Build the full per-tab content from a fetched raw-io record + the general
-/// lines the opener captured from the entry. Runs OFF the UI thread.
+/// Build the full per-tab content from a fetched raw-io record + what the
+/// opener captured from the entry ([`RawGeneral`]). Runs OFF the UI thread.
+/// Tab order is the wire order (UI-8): client request → upstream request →
+/// upstream response → client response; the upstream pair appears only when
+/// the record carries an `upstream` half (translated exchanges).
 pub(crate) fn raw_content_from_record(
-    general: Vec<Line<'static>>,
+    general: RawGeneral,
     record: &crate::proxy::raw_io::RawIoRecord,
 ) -> RawContent {
-    let mut request = general;
-    request.push(Line::default());
-    request.push(raw_section("request headers"));
-    request.extend(raw_header_lines(record.request_headers.as_deref()));
-    request.push(Line::default());
-    request.push(raw_section(&format!(
+    let client_url = format!("{}{}", general.base_url.trim_end_matches('/'), general.path);
+    let client_curl = curl_command(
+        &general.method,
+        &client_url,
+        record.request_headers.as_deref(),
+        &record.request_body,
+    );
+
+    let mut tabs: Vec<RawTabContent> = Vec::new();
+
+    // Tab 1: the request Claude Code sent llmux.
+    let mut lines = general.lines;
+    lines.push(Line::default());
+    lines.push(raw_section("request headers"));
+    lines.extend(raw_header_lines(record.request_headers.as_deref()));
+    lines.push(Line::default());
+    lines.push(raw_section(&format!(
         "request body · {} bytes",
         record.request_body.len()
     )));
-    request.extend(raw_body_lines(&record.request_body));
+    lines.extend(raw_body_lines(&record.request_body));
+    tabs.push(raw_tab(
+        "Request",
+        lines,
+        record.request_body.clone(),
+        client_curl.clone(),
+    ));
 
-    let mut response = vec![raw_section("response")];
-    response.push(Line::from(vec![
+    // Tabs 2+3: the rewritten exchange with the provider (translate path).
+    if let Some(up) = record.upstream.as_ref() {
+        let upstream_curl = curl_command(
+            &general.method,
+            up.url.as_deref().unwrap_or("<upstream url not captured>"),
+            up.request_headers.as_deref(),
+            up.request_body.as_deref().unwrap_or(""),
+        );
+        if up.url.is_some() || up.request_body.is_some() || up.request_headers.is_some() {
+            let mut lines = vec![raw_section("upstream request — llmux → api")];
+            if let Some(url) = up.url.as_deref() {
+                lines.push(raw_header_line("url", url));
+            }
+            lines.push(Line::default());
+            lines.push(raw_section("request headers"));
+            lines.extend(raw_header_lines(up.request_headers.as_deref()));
+            lines.push(Line::default());
+            let body = up.request_body.clone().unwrap_or_default();
+            lines.push(raw_section(&format!("request body · {} bytes", body.len())));
+            lines.extend(raw_body_lines(&body));
+            tabs.push(raw_tab("Upstream Req", lines, body, upstream_curl.clone()));
+        }
+        if up.response_body.is_some() || up.response_headers.is_some() {
+            let mut lines = vec![raw_section("upstream response — api → llmux")];
+            lines.push(Line::default());
+            lines.push(raw_section("response headers"));
+            lines.extend(raw_header_lines(up.response_headers.as_deref()));
+            lines.push(Line::default());
+            let body = up.response_body.clone().unwrap_or_default();
+            lines.push(raw_section(&format!(
+                "response body · {} bytes",
+                body.len()
+            )));
+            lines.extend(raw_body_lines(&body));
+            tabs.push(raw_tab("Upstream Resp", lines, body, upstream_curl));
+        }
+    }
+
+    // Last tab: the response llmux delivered to Claude Code.
+    let mut lines = vec![raw_section("response")];
+    lines.push(Line::from(vec![
         Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
         Span::raw(
             record
@@ -2080,26 +2223,58 @@ pub(crate) fn raw_content_from_record(
                 .unwrap_or_else(|| "?".into()),
         ),
     ]));
-    response.push(Line::default());
-    response.push(raw_section("response headers"));
-    response.extend(raw_header_lines(record.response_headers.as_deref()));
-    response.push(Line::default());
-    response.push(raw_section(&format!(
+    lines.push(Line::default());
+    lines.push(raw_section("response headers"));
+    lines.extend(raw_header_lines(record.response_headers.as_deref()));
+    lines.push(Line::default());
+    lines.push(raw_section(&format!(
         "response body · {} bytes",
         record.response_body.len()
     )));
-    response.extend(raw_body_lines(&record.response_body));
+    lines.extend(raw_body_lines(&record.response_body));
+    tabs.push(raw_tab(
+        "Response",
+        lines,
+        record.response_body.clone(),
+        client_curl,
+    ));
 
-    RawContent { request, response }
+    let all_text = tabs
+        .iter()
+        .map(|t| format!("── {} ──\n{}\n\n", t.label, t.body_text))
+        .collect::<String>();
+    let record_json = serde_json::to_string_pretty(record).unwrap_or_else(|_| "{}".to_string());
+    RawContent {
+        tabs,
+        record_json,
+        all_text,
+    }
 }
 
-/// Draw the raw request/response viewer (UI-7): a near-full-screen modal with
-/// a Request/Response tab bar, the prebuilt content scrolled by whole lines.
-/// Returns the max scroll for the ACTIVE tab so the runtime can clamp.
-fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> u16 {
+/// Draw the raw request/response viewer (UI-7/UI-8): a near-full-screen modal
+/// with a payload tab bar (2 or 4 tabs), top-right action buttons, the
+/// prebuilt content scrolled by whole lines both ways, and proportional
+/// scrollbars on the right + bottom edges. Returns the frame's
+/// [`RawModalChrome`] (scroll clamps + click rects) so the runtime can clamp
+/// offsets and route clicks.
+fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     let area = centered_rect(frame.area(), 94, 92);
     frame.render_widget(Clear, area);
 
+    // The bottom hint doubles as the action-feedback line: a fresh flash
+    // ("copied 4132 bytes → pbcopy", "saved → ~/Downloads/…") replaces the key
+    // legend until it expires.
+    let hint = match &modal.flash {
+        Some((msg, at)) if at.elapsed() < std::time::Duration::from_secs(3) => Line::from(
+            Span::styled(format!(" {msg} "), Style::new().fg(Color::Yellow)),
+        )
+        .centered(),
+        _ => Line::from(Span::styled(
+            " ←→/tab switch · ↑↓ scroll · H/L pan · c copy · C curl · a copy all · s save · S save all · esc ",
+            dim(),
+        ))
+        .centered(),
+    };
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(dim())
@@ -2107,47 +2282,68 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> u16 {
             modal.title.clone(),
             Style::new().add_modifier(Modifier::BOLD),
         ))
-        .title_bottom(
-            Line::from(Span::styled(
-                " ←→/tab switch · ↑↓ scroll · pgup/pgdn · esc close ",
-                dim(),
-            ))
-            .centered(),
-        );
+        .title_bottom(hint);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let mut chrome = RawModalChrome::default();
     if inner.height < 2 || inner.width == 0 {
-        return 0;
+        return chrome;
     }
 
-    // Tab bar (row 0) + a blank spacer, then the content viewport.
-    let tab = |label: &str, active: bool| {
-        if active {
-            Span::styled(
-                format!(" {label} "),
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!(" {label} "), dim())
+    // Action buttons over the top border, right-aligned (UI-8): rendered as an
+    // exact-rect Paragraph so the recorded hit rects are authoritative.
+    const BUTTONS: [RawButton; 5] = [
+        RawButton::Copy,
+        RawButton::CopyCurl,
+        RawButton::CopyAll,
+        RawButton::Save,
+        RawButton::SaveAll,
+    ];
+    let btn_w = |b: RawButton| b.label().len() as u16 + 2; // " label "
+    let total: u16 = BUTTONS.iter().map(|b| btn_w(*b)).sum::<u16>() + (BUTTONS.len() as u16 - 1);
+    let border_row_w = area.width.saturating_sub(2);
+    if total <= border_row_w {
+        let mut x = area.x + 1 + border_row_w - total;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let row_area = Rect {
+            x,
+            y: area.y,
+            width: total,
+            height: 1,
+        };
+        for (i, btn) in BUTTONS.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("│", dim()));
+                x += 1;
+            }
+            let w = btn_w(*btn);
+            chrome.buttons.push((
+                *btn,
+                Rect {
+                    x,
+                    y: area.y,
+                    width: w,
+                    height: 1,
+                },
+            ));
+            spans.push(Span::styled(
+                format!(" {} ", btn.label()),
+                Style::new().fg(Color::Cyan),
+            ));
+            x += w;
         }
-    };
-    let tabs = Line::from(vec![
-        Span::raw(" "),
-        tab("Request", modal.tab == RawTab::Request),
-        Span::raw(" "),
-        tab("Response", modal.tab == RawTab::Response),
-    ]);
-    frame.render_widget(Paragraph::new(tabs), Rect { height: 1, ..inner });
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+    }
 
+    // Content viewport: tab bar (row 0) + spacer, right column + bottom row
+    // reserved for the scrollbars.
     let viewport = Rect {
+        x: inner.x,
         y: inner.y + 2,
-        height: inner.height.saturating_sub(2),
-        ..inner
+        width: inner.width.saturating_sub(1),
+        height: inner.height.saturating_sub(3),
     };
-    let lines: &[Line<'static>] = match &modal.state {
+    let content = match &modal.state {
         RawModalState::Loading => {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -2156,7 +2352,7 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> u16 {
                 ))),
                 viewport,
             );
-            return 0;
+            return chrome;
         }
         RawModalState::Failed(msg) => {
             frame.render_widget(
@@ -2167,25 +2363,99 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> u16 {
                 .wrap(Wrap { trim: false }),
                 viewport,
             );
-            return 0;
+            return chrome;
         }
-        RawModalState::Ready(content) => match modal.tab {
-            RawTab::Request => &content.request,
-            RawTab::Response => &content.response,
-        },
+        RawModalState::Ready(content) => content,
     };
-    let max_scroll = u16::try_from(lines.len())
+
+    // Tab bar: one hit rect per label, active tab inverted.
+    let active = modal.tab.min(content.tabs.len().saturating_sub(1));
+    let mut tab_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut x = inner.x + 1;
+    for (i, t) in content.tabs.iter().enumerate() {
+        let w = t.label.len() as u16 + 2;
+        chrome.tabs.push((
+            i,
+            Rect {
+                x,
+                y: inner.y,
+                width: w,
+                height: 1,
+            },
+        ));
+        tab_spans.push(if i == active {
+            Span::styled(
+                format!(" {} ", t.label),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {} ", t.label), dim())
+        });
+        tab_spans.push(Span::raw(" "));
+        x += w + 1;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)),
+        Rect { height: 1, ..inner },
+    );
+
+    if viewport.height == 0 || viewport.width == 0 {
+        return chrome;
+    }
+    let tab = &content.tabs[active];
+    let lines = &tab.lines;
+    let max_v = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_sub(viewport.height);
-    let scroll = usize::from(modal.scroll.min(max_scroll));
+    let max_h = tab.width.saturating_sub(viewport.width);
+    chrome.max_scroll = (max_v, max_h);
+    let scroll = usize::from(modal.scroll.min(max_v));
+    let hscroll = modal.hscroll.min(max_h);
     let visible: Vec<Line<'static>> = lines
         .iter()
         .skip(scroll)
         .take(usize::from(viewport.height))
         .cloned()
         .collect();
-    frame.render_widget(Paragraph::new(visible), viewport);
-    max_scroll
+    frame.render_widget(Paragraph::new(visible).scroll((0, hscroll)), viewport);
+
+    // Proportional scrollbars (UI-8): right edge = vertical, bottom =
+    // horizontal. Rendered only when the content overflows that axis.
+    if max_v > 0 {
+        let mut state =
+            ScrollbarState::new(usize::from(max_v)).position(usize::from(modal.scroll.min(max_v)));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(dim())
+                .thumb_style(Style::new().fg(Color::Cyan)),
+            Rect {
+                x: inner.right().saturating_sub(1),
+                y: viewport.y,
+                width: 1,
+                height: viewport.height,
+            },
+            &mut state,
+        );
+    }
+    if max_h > 0 {
+        let mut state = ScrollbarState::new(usize::from(max_h)).position(usize::from(hscroll));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .style(dim())
+                .thumb_style(Style::new().fg(Color::Cyan)),
+            Rect {
+                x: viewport.x,
+                y: inner.bottom().saturating_sub(1),
+                width: viewport.width,
+                height: 1,
+            },
+            &mut state,
+        );
+    }
+    chrome
 }
 
 /// Attach-mode pre-first-document screen: identity + a "connecting…" /
@@ -3591,10 +3861,47 @@ pub(crate) struct MainChrome {
     /// visible inner height) so the runtime can clamp its stored offset; `None`
     /// means no modal was open OR its entry aged out of the ring (→ close it).
     pub input_modal_max_scroll: Option<u16>,
-    /// Same clamp feedback for the raw request/response viewer (UI-7). Unlike
+    /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
+    /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
     /// the raw modal owns its content and never closes on entry aging.
-    pub raw_modal_max_scroll: Option<u16>,
+    pub raw_modal: Option<RawModalChrome>,
+}
+
+/// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
+/// offsets and to route clicks — the tab bar and the top-right action buttons
+/// are mouse targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RawModalChrome {
+    /// Largest valid (vertical, horizontal) scroll for the ACTIVE tab.
+    pub max_scroll: (u16, u16),
+    /// One rect per rendered tab label, with the tab index it selects.
+    pub tabs: Vec<(usize, Rect)>,
+    /// One rect per rendered action button.
+    pub buttons: Vec<(RawButton, Rect)>,
+}
+
+/// The raw viewer's top-right action buttons (UI-8):
+/// `copy | copy as curl | copy all | save | save all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawButton {
+    Copy,
+    CopyCurl,
+    CopyAll,
+    Save,
+    SaveAll,
+}
+
+impl RawButton {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RawButton::Copy => "copy",
+            RawButton::CopyCurl => "copy as curl",
+            RawButton::CopyAll => "copy all",
+            RawButton::Save => "save",
+            RawButton::SaveAll => "save all",
+        }
+    }
 }
 
 /// What kind of row a hit rect belongs to, deciding what a click does
@@ -3846,6 +4153,7 @@ fn draw_activity(
                     request.effort.as_deref(),
                     anim_frame,
                     view.tui_effects,
+                    view.gradient,
                 ),
                 metrics.meta_w,
             ));
@@ -3894,6 +4202,7 @@ fn draw_activity(
                     &metrics,
                     anim_frame,
                     view.tui_effects,
+                    view.gradient,
                 ));
                 let mut height = 1u16;
                 if expanded {
@@ -3938,6 +4247,7 @@ fn draw_activity(
                     &metrics,
                     anim_frame,
                     view.tui_effects,
+                    view.gradient,
                 ));
                 if let Some(key) = key {
                     hits.push(ActivityHit {
@@ -3965,6 +4275,7 @@ fn draw_activity(
                             &metrics,
                             anim_frame,
                             view.tui_effects,
+                            view.gradient,
                         ));
                         let mut member_height = 1u16;
                         if member_expanded {
@@ -4038,6 +4349,7 @@ fn pad_cells_left(text: &str, width: usize) -> String {
 /// `▸ HH:MM:SS count 33× [meta] email → (all 2xx)` — the START time only
 /// (Z 2026-07-15), the run size riding the type column. The marker toggles
 /// the fold; the body expands it.
+#[allow(clippy::too_many_arguments)]
 fn folded_run_line(
     run: &[Completed],
     expanded: bool,
@@ -4046,6 +4358,7 @@ fn folded_run_line(
     m: &RowMetrics,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> Line<'static> {
     let marker = if expanded { '▾' } else { '▸' };
     let oldest = &run[run.len() - 1];
@@ -4086,6 +4399,7 @@ fn folded_run_line(
             effort.as_deref(),
             frame,
             effects_on,
+            g,
         ),
         m.meta_w,
     ));
@@ -4108,6 +4422,7 @@ fn completed_line(
     m: &RowMetrics,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> Line<'static> {
     match &entry.body {
         CompletedBody::Request {
@@ -4187,6 +4502,7 @@ fn completed_line(
                     effort.as_deref(),
                     frame,
                     effects_on,
+                    g,
                 ),
                 m.meta_w,
             ));
@@ -4534,28 +4850,30 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
 ///
 /// `phase = FREQ * char_index + DRIFT * frame` gives the spatial spread across
 /// characters plus temporal drift; luma is floored at `MIN_LUMA` for
-/// legibility. FREQ/luma mirror herdr's constants; DRIFT is herdr's `normal`
-/// speed (0.09) — llmux's 120 ms render tick is slower than herdr's, so
-/// herdr's default `calm` (0.04) would barely move here.
+/// legibility. FREQ/luma mirror herdr's constants. DRIFT is the speed-1.0
+/// baseline: at llmux's 120 ms render tick (~8 fps) it completes a luma cycle
+/// in ~2.2 s — herdr's `normal` (0.09/frame at its faster tick) translated to
+/// a tick this slow read as barely moving (UI-8 user report), hence the
+/// larger baseline. Config `tui_gradient.speed` multiplies it.
 const GRADIENT_MIN_LUMA: f32 = 0.45;
 const GRADIENT_MAX_LUMA: f32 = 1.00;
 const GRADIENT_FREQ: f32 = 0.30;
-const GRADIENT_DRIFT: f32 = 0.09;
+const GRADIENT_DRIFT: f32 = 0.35;
 
 /// The shared gradient phase for `(frame, char_idx)`. The frame is bounded
 /// before it meets f32: past ~2^24 an f32 can no longer step by 1, so
 /// `DRIFT * frame` would freeze on a long-lived daemon/attach TUI. The modulo
 /// wrap (~33 h at 120 ms/tick) is a single-frame phase jump — invisible next
 /// to a frozen animation.
-fn gradient_phase(frame: usize, char_idx: usize) -> f32 {
-    GRADIENT_FREQ * char_idx as f32 + GRADIENT_DRIFT * ((frame % 1_000_000) as f32)
+fn gradient_phase(frame: usize, char_idx: usize, speed: f32) -> f32 {
+    GRADIENT_FREQ * char_idx as f32 + GRADIENT_DRIFT * speed * ((frame % 1_000_000) as f32)
 }
 
 /// Rainbow mode: deterministic truecolor for `(frame, char_idx)` — R/G/B are
 /// the same sine offset by 0° / 120° / 240°, so the hue rotates while every
 /// channel stays inside the legible luma band.
-fn gradient_rainbow(frame: usize, char_idx: usize) -> Color {
-    let phase = gradient_phase(frame, char_idx);
+fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
+    let phase = gradient_phase(frame, char_idx, speed);
     let chan = |offset: f32| -> u8 {
         let raw = (phase + offset).sin() * 0.5 + 0.5; // 0.0..=1.0
         let lit = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
@@ -4570,8 +4888,8 @@ fn gradient_rainbow(frame: usize, char_idx: usize) -> Color {
 
 /// Solid (단색) mode: scale a fixed base color by the sine luma factor — the
 /// hue is the group's, only its brightness breathes along the text.
-fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize) -> Color {
-    let raw = gradient_phase(frame, char_idx).sin() * 0.5 + 0.5; // 0.0..=1.0
+fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize, speed: f32) -> Color {
+    let raw = gradient_phase(frame, char_idx, speed).sin() * 0.5 + 0.5; // 0.0..=1.0
     let factor = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
     let scale = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
     Color::Rgb(scale(base.0), scale(base.1), scale(base.2))
@@ -4582,17 +4900,67 @@ fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize) -> Color {
 const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
 const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
 
+/// Render-ready gradient tuning (UI-8), resolved ONCE per document from
+/// config `tui_gradient` at view-build time: hex colors parsed (unparseable →
+/// built-in base), speed sanitized (non-finite/non-positive → 1.0). `Copy` —
+/// handed by value into the span builders every frame, so `ui.rs` never
+/// re-validates strings on the render path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientCfg {
+    pub speed: f32,
+    pub claude: (u8, u8, u8),
+    pub codex: (u8, u8, u8),
+    /// `Some(base)` replaces the max-effort rainbow with a solid gradient on
+    /// that color; `None` keeps the rainbow.
+    pub max_effort: Option<(u8, u8, u8)>,
+}
+
+impl GradientCfg {
+    pub fn from_config(cfg: &crate::config::TuiGradient) -> Self {
+        let speed = if cfg.speed.is_finite() && cfg.speed > 0.0 {
+            cfg.speed
+        } else {
+            1.0
+        };
+        Self {
+            speed,
+            claude: parse_hex_color(&cfg.claude).unwrap_or(CLAUDE_GRADIENT_BASE),
+            codex: parse_hex_color(&cfg.codex).unwrap_or(CODEX_GRADIENT_BASE),
+            max_effort: cfg.max_effort.as_deref().and_then(parse_hex_color),
+        }
+    }
+}
+
+impl Default for GradientCfg {
+    fn default() -> Self {
+        Self::from_config(&crate::config::TuiGradient::default())
+    }
+}
+
+/// Parse `#rrggbb` (case-insensitive, `#` required) into an RGB triple.
+/// Anything else — short forms, missing `#`, bad hex — is `None`, and the
+/// caller falls back to the built-in base rather than guessing.
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
 /// The solid-gradient base color for a model whose abbreviated slug marks it a
 /// HEADLINE model (`fable-5*` / `gpt-5.6-sol*`), or `None` for ordinary models
 /// (which keep their flat group color). Detection runs on the [`abbrev_model`]
 /// slug so it matches whether the caller renders the raw id (models strip) or
-/// the already-abbreviated badge slug (activity badge).
-fn model_gradient_base(group: Option<&str>, model: &str) -> Option<(u8, u8, u8)> {
+/// the already-abbreviated badge slug (activity badge). The base comes from
+/// the resolved config ([`GradientCfg`]), defaulting to the built-in anchors.
+fn model_gradient_base(group: Option<&str>, model: &str, g: GradientCfg) -> Option<(u8, u8, u8)> {
     let slug = abbrev_model(group, model);
     if slug.starts_with("fable-5") || slug.starts_with("gpt-5.6-sol") {
         Some(match group {
-            Some("codex") => CODEX_GRADIENT_BASE,
-            _ => CLAUDE_GRADIENT_BASE,
+            Some("codex") => g.codex,
+            _ => g.claude,
         })
     } else {
         None
@@ -4609,8 +4977,9 @@ fn model_name_spans(
     text: &str,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> Vec<Span<'static>> {
-    match model_gradient_base(group, text) {
+    match model_gradient_base(group, text, g) {
         Some(base) if effects_on => text
             .chars()
             .enumerate()
@@ -4618,7 +4987,7 @@ fn model_name_spans(
                 Span::styled(
                     c.to_string(),
                     Style::new()
-                        .fg(gradient_solid(base, frame, i))
+                        .fg(gradient_solid(base, frame, i, g.speed))
                         .add_modifier(Modifier::BOLD),
                 )
             })
@@ -4641,6 +5010,7 @@ fn effort_spans(
     effort: &str,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> Vec<Span<'static>> {
     match effort {
         "xhigh" => vec![Span::styled(
@@ -4649,15 +5019,19 @@ fn effort_spans(
                 .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD),
         )],
+        // Config `tui_gradient.max_effort` swaps the rainbow for a solid
+        // gradient on the chosen color (UI-8); default keeps the rainbow.
         "max" if effects_on => effort
             .chars()
             .enumerate()
             .map(|(i, c)| {
+                let color = match g.max_effort {
+                    Some(base) => gradient_solid(base, frame, i, g.speed),
+                    None => gradient_rainbow(frame, i, g.speed),
+                };
                 Span::styled(
                     c.to_string(),
-                    Style::new()
-                        .fg(gradient_rainbow(frame, i))
-                        .add_modifier(Modifier::BOLD),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
                 )
             })
             .collect(),
@@ -4737,6 +5111,7 @@ fn activity_meta_spans(
     effort: Option<&str>,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> Vec<Span<'static>> {
     // Same filtering as activity_meta_body so the parts match exactly.
     let effort = effort.map(str::trim).filter(|e| !e.is_empty() && *e != "-");
@@ -4745,10 +5120,10 @@ fn activity_meta_spans(
     // single space; each may itself be several per-char spans.
     let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
     if let Some(m) = model_slug {
-        parts.push(model_name_spans(group, m, frame, effects_on));
+        parts.push(model_name_spans(group, m, frame, effects_on, g));
     }
     if let Some(e) = effort {
-        parts.push(effort_spans(group, e, frame, effects_on));
+        parts.push(effort_spans(group, e, frame, effects_on, g));
     }
     if parts.is_empty() {
         return Vec::new();
@@ -4931,17 +5306,19 @@ fn model_name_cells(
     active: bool,
     frame: usize,
     effects_on: bool,
+    g: GradientCfg,
 ) -> (Cell<'static>, Cell<'static>) {
     let group = Cell::from(Span::styled(
         m.group.to_uppercase(),
         group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
     ));
-    let name_cell = if model_gradient_base(Some(m.group.as_str()), &m.model).is_some() {
+    let name_cell = if model_gradient_base(Some(m.group.as_str()), &m.model, g).is_some() {
         Cell::from(Line::from(model_name_spans(
             Some(m.group.as_str()),
             &m.model,
             frame,
             effects_on,
+            g,
         )))
     } else {
         let name_style = if active {
@@ -4985,7 +5362,8 @@ fn draw_models_strip(
 
     let rows = rows_data.into_iter().map(|m| {
         let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-        let (group_cell, name_cell) = model_name_cells(m, active, frame_n, view.tui_effects);
+        let (group_cell, name_cell) =
+            model_name_cells(m, active, frame_n, view.tui_effects, view.gradient);
         let share = model_total(m) as f64 / max_total as f64;
         let mut cells = vec![
             Cell::from(model_active_marker(m, now, frame_n)),
@@ -5113,7 +5491,8 @@ fn draw_models_table(
         .map(|(i, m)| {
             let idx = start + i;
             let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-            let (group_cell, name_cell) = model_name_cells(m, active, ctx.frame, view.tui_effects);
+            let (group_cell, name_cell) =
+                model_name_cells(m, active, ctx.frame, view.tui_effects, view.gradient);
             let ok_err = Line::from(vec![
                 Span::styled(format::human_count(m.ok), Style::new().fg(Color::Green)),
                 Span::raw("/"),
@@ -5730,6 +6109,7 @@ mod tests {
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
             tui_effects: true,
+            gradient: GradientCfg::default(),
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::default(),
@@ -6800,8 +7180,22 @@ mod tests {
         // gradient, so a color change can only come from the `max` marquee.
         // Effects ON: `max` is one span per char and the palette slides with
         // the frame, so consecutive frames differ.
-        let f0 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 0, true);
-        let f1 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 1, true);
+        let f0 = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("max"),
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        let f1 = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("max"),
+            1,
+            true,
+            GradientCfg::default(),
+        );
         assert_ne!(fg(&f0), fg(&f1), "max marquee must cycle across frames");
         // The assembled TEXT stays byte-identical to the width-measuring SSOT.
         assert_eq!(
@@ -6809,8 +7203,22 @@ mod tests {
             activity_meta_body(Some("codex"), Some("gpt-5.5"), Some("max"))
         );
         // Effects OFF: static — every frame renders the same distinct color.
-        let off0 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 0, false);
-        let off9 = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("max"), 9, false);
+        let off0 = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("max"),
+            0,
+            false,
+            GradientCfg::default(),
+        );
+        let off9 = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("max"),
+            9,
+            false,
+            GradientCfg::default(),
+        );
         assert_eq!(fg(&off0), fg(&off9), "effects off ⇒ static color");
         assert!(
             off0.iter().any(|s| s.style.fg == Some(Color::LightMagenta)),
@@ -6818,8 +7226,22 @@ mod tests {
         );
         // xhigh is a static distinct color regardless of the frame (a plain
         // non-headline model isolates the effort token from the name gradient).
-        let xh_on = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("xhigh"), 0, true);
-        let xh_off = activity_meta_spans(Some("codex"), Some("gpt-5.5"), Some("xhigh"), 5, true);
+        let xh_on = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("xhigh"),
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        let xh_off = activity_meta_spans(
+            Some("codex"),
+            Some("gpt-5.5"),
+            Some("xhigh"),
+            5,
+            true,
+            GradientCfg::default(),
+        );
         assert_eq!(fg(&xh_on), fg(&xh_off), "xhigh never animates");
         assert!(xh_on.iter().any(|s| s.style.fg == Some(Color::LightRed)));
     }
@@ -6829,13 +7251,13 @@ mod tests {
         let fg = |spans: &[Span]| spans.iter().map(|s| s.style.fg).collect::<Vec<_>>();
         // A headline model splits into per-char spans, all from the claude
         // (magenta) family, and the palette slides with the frame.
-        let on0 = model_name_spans(Some("claude"), "fable-5", 0, true);
-        let on1 = model_name_spans(Some("claude"), "fable-5", 8, true);
+        let on0 = model_name_spans(Some("claude"), "fable-5", 0, true, GradientCfg::default());
+        let on1 = model_name_spans(Some("claude"), "fable-5", 8, true, GradientCfg::default());
         assert!(on0.len() > 1, "gradient splits the name per char");
         assert!(
             on0.iter()
                 .enumerate()
-                .all(|(i, s)| s.style.fg == Some(gradient_solid(CLAUDE_GRADIENT_BASE, 0, i))),
+                .all(|(i, s)| s.style.fg == Some(gradient_solid(CLAUDE_GRADIENT_BASE, 0, i, 1.0))),
             "fable-5 uses the solid claude/magenta gradient (herdr 단색 mode)"
         );
         assert_ne!(fg(&on0), fg(&on1), "gradient drifts with the frame");
@@ -6848,19 +7270,204 @@ mod tests {
             assert!(r >= b && b >= g, "magenta hue preserved, got ({r},{g},{b})");
         }
         // Codex headline models use the cyan family base.
-        let codex = model_name_spans(Some("codex"), "gpt-5.6-sol", 0, true);
+        let codex = model_name_spans(
+            Some("codex"),
+            "gpt-5.6-sol",
+            0,
+            true,
+            GradientCfg::default(),
+        );
         assert!(codex
             .iter()
             .enumerate()
-            .all(|(i, s)| s.style.fg == Some(gradient_solid(CODEX_GRADIENT_BASE, 0, i))));
+            .all(|(i, s)| s.style.fg == Some(gradient_solid(CODEX_GRADIENT_BASE, 0, i, 1.0))));
         // Effects OFF: a single static bold group-colored span.
-        let off = model_name_spans(Some("claude"), "fable-5", 0, false);
+        let off = model_name_spans(Some("claude"), "fable-5", 0, false, GradientCfg::default());
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].style.fg, Some(Color::Magenta));
         assert!(off[0].style.add_modifier.contains(Modifier::BOLD));
         // Ordinary models stay a single plain group span (no gradient) even on.
-        let plain = model_name_spans(Some("claude"), "opus-4-8", 0, true);
+        let plain = model_name_spans(Some("claude"), "opus-4-8", 0, true, GradientCfg::default());
         assert_eq!(plain.len(), 1);
+    }
+
+    #[test]
+    fn gradient_cfg_parses_hex_and_sanitizes_speed(/* UI-8 */) {
+        // Well-formed config: colors parse, speed passes through.
+        let cfg = GradientCfg::from_config(&crate::config::TuiGradient {
+            speed: 2.5,
+            claude: "#102030".into(),
+            codex: "#a0B0c0".into(),
+            max_effort: Some("#ffffff".into()),
+        });
+        assert_eq!(cfg.speed, 2.5);
+        assert_eq!(cfg.claude, (0x10, 0x20, 0x30));
+        assert_eq!(cfg.codex, (0xa0, 0xb0, 0xc0), "hex is case-insensitive");
+        assert_eq!(cfg.max_effort, Some((255, 255, 255)));
+        // Garbage falls back instead of guessing: colors to the built-in
+        // anchors, speed to 1.0 — a bad config must never freeze or panic.
+        for bad_speed in [0.0, -3.0, f32::NAN, f32::INFINITY] {
+            let cfg = GradientCfg::from_config(&crate::config::TuiGradient {
+                speed: bad_speed,
+                claude: "not-a-color".into(),
+                codex: "#12345".into(),
+                max_effort: Some("".into()),
+            });
+            assert_eq!(cfg.speed, 1.0, "speed {bad_speed} sanitized");
+            assert_eq!(cfg.claude, CLAUDE_GRADIENT_BASE);
+            assert_eq!(cfg.codex, CODEX_GRADIENT_BASE);
+            assert_eq!(cfg.max_effort, None);
+        }
+        // Defaults: speed 1.0, the built-in anchors, rainbow kept.
+        let def = GradientCfg::default();
+        assert_eq!(
+            (def.speed, def.claude, def.codex, def.max_effort),
+            (1.0, CLAUDE_GRADIENT_BASE, CODEX_GRADIENT_BASE, None)
+        );
+    }
+
+    #[test]
+    fn gradient_speed_scales_the_temporal_drift(/* UI-8 */) {
+        // Same frame, double speed ⇒ double the temporal phase advance.
+        let base = gradient_phase(10, 0, 1.0) - gradient_phase(0, 0, 1.0);
+        let fast = gradient_phase(10, 0, 2.0) - gradient_phase(0, 0, 2.0);
+        assert!((fast - 2.0 * base).abs() < 1e-4);
+        // And the configured base colors drive the solid gradient directly:
+        // at any phase the scaled channels keep the base's ordering.
+        let custom = GradientCfg::from_config(&crate::config::TuiGradient {
+            speed: 1.0,
+            claude: "#804020".into(),
+            codex: "#56dcdc".into(),
+            max_effort: None,
+        });
+        let spans = model_name_spans(Some("claude"), "fable-5", 3, true, custom);
+        for s in &spans {
+            let Some(Color::Rgb(r, g, b)) = s.style.fg else {
+                panic!("truecolor expected");
+            };
+            assert!(r >= g && g >= b, "configured hue preserved ({r},{g},{b})");
+        }
+    }
+
+    #[test]
+    fn max_effort_override_swaps_rainbow_for_solid(/* UI-8 */) {
+        let solid = GradientCfg {
+            max_effort: Some((200, 100, 50)),
+            ..GradientCfg::default()
+        };
+        let spans = effort_spans(Some("codex"), "max", 0, true, solid);
+        for (i, s) in spans.iter().enumerate() {
+            assert_eq!(
+                s.style.fg,
+                Some(gradient_solid((200, 100, 50), 0, i, 1.0)),
+                "max token breathes the configured color instead of the rainbow"
+            );
+        }
+        // Default keeps the rainbow (distinct from any solid scaling).
+        let rainbow = effort_spans(Some("codex"), "max", 0, true, GradientCfg::default());
+        assert_eq!(
+            rainbow[0].style.fg,
+            Some(gradient_rainbow(0, 0, 1.0)),
+            "no override → 3-phase sine rainbow"
+        );
+    }
+
+    #[test]
+    fn curl_command_replays_the_exchange_shell_safely(/* UI-8 */) {
+        let curl = curl_command(
+            "POST",
+            "http://localhost:3456/v1/messages",
+            Some(&[
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "•••redacted".to_string()),
+                ("content-length".to_string(), "42".to_string()),
+                ("host".to_string(), "localhost:3456".to_string()),
+            ]),
+            r#"{"model":"m","note":"it's quoted"}"#,
+        );
+        assert!(curl.starts_with("curl -X POST 'http://localhost:3456/v1/messages'"));
+        assert!(curl.contains("-H 'content-type: application/json'"));
+        assert!(
+            curl.contains("-H 'x-api-key: •••redacted'"),
+            "redacted value kept verbatim for the user to substitute"
+        );
+        assert!(
+            !curl.contains("-H 'content-length") && !curl.contains("-H 'host"),
+            "curl-managed headers dropped so the command replays cleanly: {curl}"
+        );
+        assert!(
+            curl.contains(concat!(
+                r#"--data-raw '{"model":"m","note":"it'"#,
+                r#"\''s quoted"}'"#
+            )),
+            "single quotes shell-escaped: {curl}"
+        );
+    }
+
+    #[test]
+    fn raw_content_builds_four_tabs_for_translated_exchanges(/* UI-8 */) {
+        let general = || RawGeneral {
+            lines: vec![Line::from("general")],
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            base_url: "http://localhost:3456".into(),
+        };
+        let mut record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            Some("codex".into()),
+            None,
+            None,
+            Some(200),
+            br#"{"model":"claude"}"#,
+            b"event: message_start\n\n",
+            1 << 20,
+            Some(vec![("content-type".into(), "application/json".into())]),
+            None,
+            None,
+        );
+        // No upstream half → the classic 2 tabs, both carrying the client curl.
+        let two = raw_content_from_record(general(), &record);
+        assert_eq!(
+            two.tabs.iter().map(|t| t.label).collect::<Vec<_>>(),
+            vec!["Request", "Response"]
+        );
+        assert!(two.tabs[0]
+            .curl
+            .contains("curl -X POST 'http://localhost:3456/v1/messages'"));
+        assert_eq!(two.tabs[0].body_text, r#"{"model":"claude"}"#);
+
+        // Upstream half present → 4 tabs in wire order, the upstream pair
+        // carrying the REWRITTEN request's curl against the provider.
+        record.upstream = Some(crate::proxy::raw_io::UpstreamRaw {
+            url: Some("https://api.example.com/responses".into()),
+            request_body: Some(r#"{"input":[]}"#.into()),
+            request_headers: Some(vec![("authorization".into(), "•••redacted".into())]),
+            response_body: Some("event: response.completed\n\n".into()),
+            response_headers: Some(vec![("x-request-id".into(), "req_9".into())]),
+        });
+        let four = raw_content_from_record(general(), &record);
+        assert_eq!(
+            four.tabs.iter().map(|t| t.label).collect::<Vec<_>>(),
+            vec!["Request", "Upstream Req", "Upstream Resp", "Response"],
+            "wire order: client req → upstream req → upstream resp → client resp"
+        );
+        assert_eq!(four.tabs[1].body_text, r#"{"input":[]}"#);
+        assert!(four.tabs[1]
+            .curl
+            .contains("curl -X POST 'https://api.example.com/responses'"));
+        assert!(four.tabs[2].body_text.contains("response.completed"));
+        assert!(
+            four.tabs[2].curl.contains("api.example.com"),
+            "a response tab replays its side's request"
+        );
+        // The bulk payloads are prebuilt for the buttons.
+        assert!(four.all_text.contains("── Upstream Req ──"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&four.record_json).expect("save-all payload is valid JSON");
+        assert_eq!(parsed["id"].as_u64(), Some(7));
+        // Every tab measured its widest line for the horizontal scroll bound.
+        assert!(four.tabs.iter().all(|t| t.width > 0));
     }
 
     #[test]
@@ -7139,11 +7746,21 @@ mod tests {
         let abbrev = BTreeMap::new();
         let cost_span = |entry: &Completed| {
             let m = RowMetrics::measure(200, &[], &[entry]);
-            completed_line(entry, false, false, &labels, &abbrev, &m, 0, true)
-                .spans
-                .into_iter()
-                .find(|s| s.content.contains('$'))
-                .expect("a cost span with a $ amount")
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans
+            .into_iter()
+            .find(|s| s.content.contains('$'))
+            .expect("a cost span with a $ amount")
         };
 
         // 1M output tokens on gpt-5.5 = $30.00 ≥ $1 → Yellow + BOLD.

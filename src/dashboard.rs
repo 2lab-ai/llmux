@@ -537,6 +537,11 @@ pub struct DashboardDoc {
     /// the client defaults effects ON.
     #[serde(default = "default_true")]
     pub tui_effects: bool,
+    /// Config `tui_gradient` (UI-8): gradient drift speed + base colors,
+    /// carried like `tui_effects` so both TUI backends honor it. Additive:
+    /// absent in docs from an older daemon → the built-in defaults.
+    #[serde(default)]
+    pub tui_gradient: crate::config::TuiGradient,
     /// Whether the TUI should render the model-scoped "Fable" weekly gauge in
     /// the accounts table (fable-usage U9a — config `show_fable_weekly`,
     /// default ON). The scoped data itself is ALWAYS emitted (`fable_weekly` /
@@ -1179,6 +1184,8 @@ pub struct DocMeta {
     /// Config `tui_effects`: whether the TUI plays cosmetic animations. See
     /// [`DashboardDoc::tui_effects`].
     pub tui_effects: bool,
+    /// Config `tui_gradient` (UI-8). See [`DashboardDoc::tui_gradient`].
+    pub tui_gradient: crate::config::TuiGradient,
     /// Config `show_fable_weekly` (fable-usage U9a): whether the TUI renders
     /// the Fable weekly gauge. See [`DashboardDoc::show_fable_weekly`].
     pub show_fable_weekly: bool,
@@ -1712,6 +1719,7 @@ pub(crate) fn dashboard_doc(
         usage_stats,
         email_anonymous: meta.email_anonymous,
         tui_effects: meta.tui_effects,
+        tui_gradient: meta.tui_gradient.clone(),
         show_fable_weekly: meta.show_fable_weekly,
         domain_abbrev: meta.domain_abbrev.clone(),
         quota_display: meta.quota_display,
@@ -1768,6 +1776,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // Config-file display gate, same convention as show_fable_weekly: no
         // runtime toggle / endpoint, so read the loaded config snapshot.
         tui_effects: state.config.tui_effects,
+        tui_gradient: state.config.tui_gradient.clone(),
         // Config-file gate (fable-usage U9a). No runtime toggle / endpoint by
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
@@ -1829,6 +1838,7 @@ mod tests {
             pricing_overrides: HashMap::new(),
             email_anonymous: false,
             tui_effects: true,
+            tui_gradient: crate::config::TuiGradient::default(),
             show_fable_weekly: true,
             domain_abbrev: crate::config::default_domain_abbrev(),
             quota_display: crate::config::QuotaDisplay::Used,

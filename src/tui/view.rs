@@ -79,6 +79,11 @@ pub(crate) struct DashboardView {
     /// off those tokens keep a distinct STATIC color+bold; working spinners
     /// animate regardless (they predate this knob). Render-only gate.
     pub tui_effects: bool,
+    /// Gradient drift speed + base colors (config `tui_gradient`, UI-8),
+    /// pre-resolved at view-build time into render-ready values: unparseable
+    /// hex falls back to the built-in bases, non-finite/non-positive speed to
+    /// 1.0 — so `ui.rs` never re-validates per frame.
+    pub gradient: crate::tui::ui::GradientCfg,
     /// Whether the accounts table renders the model-scoped "Fable" weekly gauge
     /// (fable-usage U9a — config `show_fable_weekly`, default ON). Carried on
     /// the view so the one shared renderer honors it in both TUI backends;
@@ -400,6 +405,7 @@ impl DashboardView {
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,
             tui_effects: doc.tui_effects,
+            gradient: crate::tui::ui::GradientCfg::from_config(&doc.tui_gradient),
             show_fable_weekly: doc.show_fable_weekly,
             domain_abbrev: doc.domain_abbrev.clone(),
             quota_display: doc.quota_display,
