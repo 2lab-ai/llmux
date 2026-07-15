@@ -972,8 +972,10 @@ pub fn router(state: AppState) -> Router {
         // connectivity check on session start. The fallback used to forward
         // it upstream with a leased credential, which burned a scheduler pick
         // just to render a `[claude] 404` activity row per new session. A
-        // proxy answers reachability itself.
-        .route("/", axum::routing::any(root_ping))
+        // proxy answers reachability itself. GET/HEAD ONLY (axum serves HEAD
+        // from the GET handler, body elided) — other methods on `/` get an
+        // honest 405 rather than a fake 200 (review MUST-FIX 2).
+        .route("/", get(root_ping))
         .fallback(forward_any)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

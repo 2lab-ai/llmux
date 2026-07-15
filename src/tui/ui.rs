@@ -2863,6 +2863,12 @@ fn draw_activity(
     let rows = triage::collapse_completed(&view.completed);
     let total = rows.len();
     let scroll = chrome.activity_scroll.min(total.saturating_sub(1));
+    // Rows that can actually paint cells this frame (review MUST-FIX 4): a
+    // COLLAPSED run contributes only its newest member — every member shares
+    // the fold key (group/model/effort), so one carries the badge width, and
+    // the hidden members' dur/tok values never render. An EXPANDED run
+    // contributes at most a screenful of members. Without this bound a folded
+    // count wall re-measured (and re-priced) its whole raw length per frame.
     let visible: Vec<&Completed> = rows
         .iter()
         .skip(scroll)
@@ -2870,7 +2876,13 @@ fn draw_activity(
         .flat_map(|row| match row {
             ActivityRow::Single(idx) => vec![&view.completed[*idx]],
             ActivityRow::Run { start, len } => {
-                view.completed[*start..*start + *len].iter().collect()
+                let run = &view.completed[*start..*start + *len];
+                let (expanded, _) = triage::run_toggle_key(run, chrome.expanded_run.as_ref());
+                if expanded {
+                    run.iter().take(capacity.saturating_add(8)).collect()
+                } else {
+                    vec![&run[0]]
+                }
             }
         })
         .collect();
