@@ -22,6 +22,9 @@ Rough: sizes below are **characters** (~4 chars ≈ 1 token English, not exact).
 | CLI `/compact` summarize-transcript instruction | CLI compact | control (**uncaptured**) |
 | `goal completion auditor` | Completion auditor | control |
 | `You ARE the external reviewer, running on GPT-5.6` | Dual-persona reviewer | control |
+| bare `"quota"` user turn + `max_tokens: 1` | CLI quota probe | control ping |
+| bare `"Hi"` user turn + `max_tokens: 1`, minimal system | CLI warmup ping | control ping |
+| `The user stepped away and is coming back.` | CLI return recap | control ping |
 
 Operator spine: [README.md](./README.md). Evidence: [topology.md](./topology.md).
 
@@ -204,6 +207,27 @@ Must emit **gpt56-zhuge** then **gpt56-elon**, then merged MUST-FIX /
 Nice-to-have / Missing evidence. Hard tool budget is part of the contract.
 
 ---
+
+## Control pings (tiny harness probes)
+
+Captured on live `raw-io.jsonl` **2026-07-15**. These are not prompt
+families — they are one-line control requests Claude Code fires around the
+session lifecycle. All carry the client's `metadata.user_id`
+(device_id + session_id), which is how they were attributed.
+
+| Ping | Wire shape | When | llmux handling |
+| --- | --- | --- | --- |
+| **quota probe** | `messages: [{role: user, content: "quota"}]`, `max_tokens: 1`, no real system | every session start + periodic retries; reads the `anthropic-ratelimit-*` response headers | classified kind `quota` (BOTH halves required); routed with exactly ONE upstream attempt, no failover sweep, no exhaustion park |
+| **warmup ping** | `content: [{text: "Hi", cache_control: ephemeral}]`, `max_tokens: 1`, system = billing header + one-liner | model change / warmup | plain classification; note grok ignores `max_tokens: 1` and answers at length (token waste is upstream behavior, not llmux) |
+| **return recap** | user text starts `The user stepped away and is coming back.` | session resume | classified kind `recap` |
+
+Related non-body probe: Claude Code also sends `HEAD /` against its base URL
+as a reachability check; llmux answers it locally (200, GET/HEAD only) and
+never forwards it upstream.
+
+llmux's OWN idle probe (issue #21) is different from all of the above: it
+sends `content: "."` with `max_tokens: 1` outside the forward path and never
+appears in the activity feed.
 
 ## What not to do
 

@@ -19,7 +19,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `remove <name> [--yes]` | Remove an account by name. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`.
+In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ## Install and launch details
 
@@ -137,6 +137,47 @@ Codex request-shaping is also settable live from the dashboard's Codex group: `d
 Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), or `codex` (ChatGPT/Codex subscription token). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
 
 `email_anonymous` (default `false`) masks account emails on every display surface. The TUI render layer uses the same stable fake-email mapping as demo mode, and llmux Islands pixelizes emails in its Usage panel. The value is served in `GET /llmux/status` and can be flipped live via `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ toggle.
+
+## Activity feed
+
+The dashboard's activity panel shows one row per completed request
+(2026-07-15 layout):
+
+```text
+▸ HH:MM:SS  kind  [model effort]  email…(10) → 200 3.1s 269tok $0.0079 «session» "input text to the screen edge"
+```
+
+- **kind** — what the request was, classified once at forward entry from the
+  buffered body: `user`, `count` (count_tokens), `security`, `compact`,
+  `summary`, `title`, `suggest`, `audit`, `subagent`, `sdk`, plus two
+  harness control pings — `quota` (Claude Code's per-session rate-limit
+  probe: a bare `"quota"` turn with `max_tokens: 1`) and `recap` ("The user
+  stepped away…"). See
+  [system-prompts/families.md](system-prompts/families.md) for the wire
+  fingerprints.
+- **badge** — `[model effort]`, group conveyed by color; the vendor prefix
+  is stripped (`claude-opus-4-8[1m]` → `opus-4-8[1m]`). Columns are padded
+  to the widest visible value per frame, and the input excerpt takes the
+  remaining terminal width.
+- **Clicking a row** expands its detail lines (full method+path, client id,
+  account, token/cost breakdown). Clicking again collapses.
+- **Grouping** — only consecutive `count` probes fold, into
+  `▸ HH:MM:SS count N× …` (start time). The leading `▸` marker toggles the
+  fold; clicking the header body only ever expands; clicking a member row
+  inside an open fold expands that member's own detail instead of closing
+  the group.
+- **Infinite scroll** — wheel/arrow scrolling past the in-memory window
+  hydrates the persisted `activity.jsonl` in the background and pages older
+  rows in on demand. Works for the in-process TUI and loopback attach; a
+  cross-host attach deliberately refuses local-file history (the file
+  belongs to a different daemon) until a remote paging endpoint exists.
+
+Two request-handling behaviors keep the feed honest at session start:
+`HEAD|GET /` (Claude Code's base-URL reachability check) is answered locally
+with 200 instead of being forwarded upstream to a guaranteed 404, and a
+`quota` probe gets exactly one upstream attempt — no failover sweep across
+the pool, no exhaustion park — so a rate-limited moment paints one line, not
+one per account.
 
 ## Scheduling model
 

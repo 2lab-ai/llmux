@@ -64,6 +64,29 @@ Each account tracks 5-hour and 7-day quota windows. The scheduler chooses among 
 
 See [the scheduler perishability design](../.prd/09-scheduler-perishability.md) for the derivation and edge cases.
 
+## Idle probe (cold-account refresh)
+
+The OAuth usage poller covers Claude subscription accounts only. Codex and
+API-key accounts get their 5h/7d gauges from a gated `max_tokens = 1` probe
+through their own credential (`proxy.idle_probe`), delivered on demand (real
+traffic to the group) and by a background timer sweep. Since 2026-07-15 the
+probe also re-fires when an account's freshest window observation goes
+**stale**, so cold subscriptions keep live gauges instead of freezing at
+their first reading.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `proxy.idle_probe.enabled` | `true` | Master kill-switch for ALL probing (on-demand + sweep). |
+| `proxy.idle_probe.per_account_cooldown_secs` | `900` | Min gap between two probes of the same account. |
+| `proxy.idle_probe.sweep_secs` | `900` | Background sweep cadence; `0` disables the sweep (on-demand only). |
+| `proxy.idle_probe.stale_after_secs` | `900` | Window observations older than this make the account probe-eligible again; `0` reverts to windowless-only probing. |
+
+Steady-state cost: at most four 1-token probes per cold account per hour.
+Grok accounts are never probed (no quota surface). Operator-paused accounts
+are never probed. Configs still carrying an untouched pre-2026-07-15 default
+block (`3600/3600` or the old disabled triple) are migrated to these
+defaults on load; any other explicit combination is kept verbatim.
+
 ## Model routing
 
 With `routing.enabled = true`, the inbound `model` string selects a backend group:
