@@ -690,7 +690,11 @@ struct App {
     raw_generation: u64,
     /// A queued export action, drained by the event loop onto the blocking
     /// pool (same pattern as `pending_raw`).
-    pending_clip: Option<ClipReq>,
+    /// Queued exports (UI-8 copy/save). A `VecDeque`, not a single slot: two
+    /// export actions in one input burst (ready events drain before the
+    /// event loop spawns them) must both run — a single `Option` silently
+    /// dropped the earlier one, a regression from the old synchronous path.
+    pending_clip: std::collections::VecDeque<ClipReq>,
     /// Sender the background export delivers its [`ClipResult`] on.
     clip_tx: Option<mpsc::Sender<ClipResult>>,
 }
@@ -743,7 +747,7 @@ impl App {
             pending_raw: None,
             raw_tx: None,
             raw_generation: 0,
-            pending_clip: None,
+            pending_clip: std::collections::VecDeque::new(),
             clip_tx: None,
             reset_absolute: false,
         }
@@ -1249,8 +1253,8 @@ impl App {
                     }
                     // Clicking the `🔍 request` detail line opens the raw
                     // request/response viewer (UI-7).
-                    Some(ui::ActivityClick::OpenRaw(key)) => {
-                        self.open_raw_modal(key, view);
+                    Some(ui::ActivityClick::OpenRaw(key, id)) => {
+                        self.open_raw_modal(key, id, view);
                         true
                     }
                     Some(ui::ActivityClick::Entry(key)) => {
@@ -1354,11 +1358,24 @@ impl App {
     /// ring while we fetch), queue the background raw-io lookup, and show the
     /// modal in its Loading state. An entry from a pre-UI-7 daemon (`id == 0`)
     /// fails immediately — there is no raw correlation key to look up.
-    fn open_raw_modal(&mut self, key: activity::ActivityKey, view: Option<&DashboardView>) {
+    fn open_raw_modal(
+        &mut self,
+        key: activity::ActivityKey,
+        id: u64,
+        view: Option<&DashboardView>,
+    ) {
+        // Select by the activity id, NOT just the key: the key omits the id,
+        // so two requests completing in the same millisecond with the same
+        // method/path/status would otherwise both resolve to the first match
+        // and the viewer could show/export the wrong request's record. The id
+        // is unique within a live view snapshot (per-process counter).
         let entry = view.and_then(|v| {
             v.completed
                 .iter()
-                .find(|c| c.activity_key().as_ref() == Some(&key))
+                .find(|c| {
+                    matches!(&c.body, activity::CompletedBody::Request { id: eid, .. } if *eid == id)
+                        && c.activity_key().as_ref() == Some(&key)
+                })
                 .cloned()
         });
         let Some(entry) = entry else {
@@ -1517,7 +1534,7 @@ impl App {
             ui::RawButton::SaveAll => (content.record_json.clone(), true, "json", String::new()),
         };
         modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
-        self.pending_clip = Some(ClipReq {
+        self.pending_clip.push_back(ClipReq {
             generation,
             button: btn,
             id,
@@ -1530,7 +1547,7 @@ impl App {
 
     /// Drain the queued export (event-loop side of [`Self::raw_modal_action`]).
     fn take_pending_clip(&mut self) -> Option<ClipReq> {
-        self.pending_clip.take()
+        self.pending_clip.pop_front()
     }
 
     /// Resolve a delivered export outcome onto the open modal's flash line,
@@ -3230,7 +3247,7 @@ async fn event_loop(
             app.spawn_raw_fetch(req);
             redraw = true;
         }
-        if let Some(req) = app.take_pending_clip() {
+        while let Some(req) = app.take_pending_clip() {
             app.spawn_clip(req);
             redraw = true;
         }
@@ -4629,6 +4646,97 @@ mod tests {
             app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
             "copied 4 bytes → pbcopy"
         );
+    }
+
+    #[test]
+    fn open_raw_modal_selects_by_id_under_same_ms_key_collision(/* MUST-FIX */) {
+        // Two requests completing in the SAME millisecond with identical
+        // method/path/status share an ActivityKey (which omits the id). The
+        // opener must fetch the CLICKED row's record, not the first match.
+        let req = |id: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_millis(42),
+            body: activity::CompletedBody::Request {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let first = req(7);
+        let second = req(8);
+        let key = first.activity_key().unwrap();
+        assert_eq!(key, second.activity_key().unwrap(), "keys collide");
+        let mut view = empty_view();
+        view.completed = vec![first, second];
+
+        // Click resolved to the SECOND row's id → the modal must open on id 8,
+        // not the first-match id 7.
+        let mut app = remote_app();
+        app.open_raw_modal(key, 8, Some(&view));
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().id,
+            8,
+            "opener pinned the clicked row via id, not the first key match"
+        );
+    }
+
+    #[test]
+    fn burst_of_exports_all_queue_none_dropped(/* MUST-FIX */) {
+        // Two export actions before the event loop drains the queue must both
+        // run — the async path used to be a single slot and silently dropped
+        // the first (a regression from synchronous execution).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        app.raw_modal_action(ui::RawButton::Copy);
+        app.raw_modal_action(ui::RawButton::Save);
+        assert_eq!(
+            app.pending_clip.len(),
+            2,
+            "both queued — the second must not overwrite the first"
+        );
+        // Draining pops them in order (FIFO).
+        assert!(matches!(
+            app.take_pending_clip().map(|r| r.button),
+            Some(ui::RawButton::Copy)
+        ));
+        assert!(matches!(
+            app.take_pending_clip().map(|r| r.button),
+            Some(ui::RawButton::Save)
+        ));
+        assert!(app.take_pending_clip().is_none());
     }
 
     #[test]
