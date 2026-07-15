@@ -244,7 +244,7 @@ impl DashboardHub {
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
             session_labels: state.log.session_labels(),
             daily_usage: state.log.daily_usage(),
-            usage_stats: state.log.usage_stats(),
+            usage_stats: state.log.usage_stats(now),
         }
     }
 }
@@ -678,6 +678,12 @@ pub struct UsageStatDoc {
     pub cache_creation: u64,
     #[serde(default)]
     pub cost_usd: f64,
+    /// Whether a price was found for this row's `(group, model)` (config
+    /// override, built-in table, or group fallback). `false` means the `0.0`
+    /// in `cost_usd` is "no rate known", NOT "free" — the renderer shows `—`
+    /// instead of a fabricated `$0` (review R1 MUST-FIX 3).
+    #[serde(default = "default_true")]
+    pub priced: bool,
 }
 
 /// Live grok provider settings (UI-3 U12), mirroring [`CodexSettingsDoc`]:
@@ -1567,11 +1573,15 @@ pub(crate) fn dashboard_doc(
     let (model_usage, total_cost_usd) = model_usage_docs(hub, now, &meta.pricing_overrides);
 
     // Usage-tab calendar rows (usage-stats): price each row server-side (T6)
-    // — the attach client has no pricing overrides to price with.
+    // — the attach client has no pricing overrides to price with. `priced`
+    // distinguishes a real $0 from "no rate known" so a rate-less row can't
+    // masquerade as free (review R1 MUST-FIX 3).
     let usage_stats: Vec<UsageStatDoc> = hub
         .usage_stats
         .iter()
         .map(|r| UsageStatDoc {
+            priced: crate::pricing::price_for(&r.group, &r.model, &meta.pricing_overrides)
+                .is_some(),
             cost_usd: crate::pricing::cost_from_parts(
                 &r.group,
                 &r.model,
@@ -2251,6 +2261,7 @@ mod tests {
             );
             assert!(want > 0.0, "seeded model has a nonzero rate");
             assert!((row.cost_usd - want).abs() < 1e-12, "doc cost == pricing");
+            assert!(row.priced, "known (group, model) is marked priced");
         }
         // Round-trip: rows survive serialization (attach mode parses these).
         let json = serde_json::to_string(&doc).expect("serialize");
