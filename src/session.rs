@@ -300,6 +300,7 @@ mod tests {
                 ("x-api-key".into(), "•••redacted".into()),
             ]),
             response_headers: Some(vec![("request-id".into(), format!("req_{id}"))]),
+            upstream: None,
         }
     }
 

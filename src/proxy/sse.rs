@@ -159,19 +159,21 @@ pub trait SseTransform: Send {
 /// [`passthrough_body`]). Backpressure/disconnect semantics are identical to
 /// the passthrough pump.
 ///
-/// `finish` receives the transform's usage, TWO independent observe-only
-/// buffers of the EMITTED Anthropic-SSE bytes, the upstream error if one
-/// aborted the stream, the finished transform, and whether the client
-/// disconnected:
+/// `finish` receives the transform's usage, THREE independent observe-only
+/// buffers, the upstream error if one aborted the stream, the finished
+/// transform, and whether the client disconnected:
 /// - `captured` — the first `capture_limit` emitted bytes (short debug log
 ///   excerpt).
 /// - `raw_captured` — the first `raw_capture_limit` emitted bytes (raw-io
 ///   full-payload tee).
+/// - `upstream_captured` — the first `raw_capture_limit` UPSTREAM bytes,
+///   verbatim as they arrived BEFORE transformation (the raw viewer's
+///   api→proxy payload; 4-payload UI-8).
 ///
-/// Both are filled from the same emitted output, capped independently. Each
-/// emitted chunk is `tx.send`'d to the client FIRST; the copies are a side
-/// effect. Callers move the account lease into `finish` (never switch
-/// mid-stream).
+/// The first two are filled from the same emitted output, capped
+/// independently; the third observes the inbound chunks. Each emitted chunk is
+/// `tx.send`'d to the client FIRST; the copies are a side effect. Callers move
+/// the account lease into `finish` (never switch mid-stream).
 pub fn transform_body<T, F>(
     upstream: reqwest::Response,
     mut transform: T,
@@ -184,19 +186,23 @@ where
     // `finish` also receives the finished transform (for converter-level detail
     // like the codex trace's raw usage / event count) and whether the relay
     // ended because the CLIENT disconnected (vs. upstream completing).
-    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>, &T, bool) + Send + 'static,
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, RawCapture, Option<String>, &T, bool)
+        + Send
+        + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut events = EventBuffer::new();
         let mut captured: Vec<u8> = Vec::new();
         let mut raw_captured = RawCapture::new(raw_capture_limit);
+        let mut upstream_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
         let mut stream = Box::pin(upstream.bytes_stream());
         let mut client_gone = false;
         'pump: while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
+                    upstream_captured.push(&chunk);
                     for event in events.push(&chunk) {
                         let out = transform.on_event(&event);
                         if out.is_empty() {
@@ -243,6 +249,7 @@ where
             transform.usage(),
             captured,
             raw_captured,
+            upstream_captured,
             error,
             &transform,
             client_gone,
