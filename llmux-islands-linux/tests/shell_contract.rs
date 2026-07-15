@@ -243,9 +243,17 @@ fn controller_contract_is_qml_invokable() {
 fn deterministic_fixture_contains_request_receipts() {
     let fixture = read("fixtures/dashboard.json");
     let macos_fixture = read("../llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json");
+    let dockerfile = read("packaging/arch/Dockerfile");
     assert_eq!(
         fixture, macos_fixture,
         "macOS and KDE renderer evidence must consume byte-identical dashboard fixtures"
+    );
+    assert_eq!(
+        dockerfile
+            .matches("llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json")
+            .count(),
+        3,
+        "the Arch COPY source/destination and makepkg Git fixture must all carry the macOS parity fixture"
     );
     for marker in [
         r#""current_by_group""#,
