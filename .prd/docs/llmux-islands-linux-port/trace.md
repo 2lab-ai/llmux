@@ -333,7 +333,7 @@ repository build gate.
 | Tray/layer-shell/notifications | Verified at adapter/build boundary with platform fallbacks | Qt `SystemTrayIcon` with Plasma StatusNotifierItem backend and native message activation, LayerShellQt Wayland, positioned X11, regular fallback, freedesktop sound |
 | Arch maintenance/package | Verified fail-closed | Pacman instruction-only, absolute Linuxbrew delegation, protected checksum primitive, and an unprivileged `makepkg` release build followed by package installation and installed-binary smoke in the clean Arch image |
 | Minimal/Advanced presentation hierarchy | Implemented; visual CI receipt pending | T6 contracts cover the cross-platform default path, contextual disclosures, semantic-color restraint, critical-state exception, local-only toggle behavior, and seven deterministic states per renderer |
-| Runtime parity | Local T6 gates and macOS renderer verified; clean-platform re-verification pending | Linux no-default format, warning-free clippy, and 92 tests pass with `-j 2`; the full Swift app source typechecks against macOS 14 and a linked AppKit snapshot process emits the exact seven distinct full-shell PNGs. GitHub Actions remains authoritative for Xcode/XCTest, Qt/QML, Arch packaging, smoke, and final renderer captures |
+| Runtime parity | Local T6 gates and macOS renderer verified; clean-platform re-verification pending | Linux no-default format, warning-free clippy, and 93 tests pass with `-j 2`; the full Swift app source typechecks against macOS 14 and a linked AppKit snapshot process emits the exact seven distinct full-shell PNGs. GitHub Actions remains authoritative for Xcode/XCTest, Qt/QML, Arch packaging, smoke, and final renderer captures |
 
 Verification receipt (2026-07-14): the shared core passes 46 contract, fixture,
 reducer, and HTTP tests; the macOS bridge passes eleven ABI tests plus its native
@@ -342,7 +342,7 @@ Arch container. The existing workspace baseline remains green with 766 unit
 tests and 38 E2E tests (one ignored by design).
 
 T6 local verification receipt (2026-07-15): `cargo fmt --check`, warning-free
-no-default `cargo clippy`, and all 92 Linux shell tests pass with `-j 2`;
+no-default `cargo clippy`, and all 93 Linux shell tests pass with `-j 2`;
 `xcodegen generate` and a complete macOS 14 `swiftc -typecheck` pass, apart from
 one pre-existing actor-isolation warning in `ScreenObserver`. A directly linked
 AppKit snapshot process also emitted the exact seven-file macOS contract from
