@@ -28,6 +28,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY LICENSE ./LICENSE
 COPY src ./src
 COPY llmux-islands-core ./llmux-islands-core
+COPY llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json ./llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json
 COPY llmux-islands-linux ./llmux-islands-linux
 
 WORKDIR /src/llmux-islands-linux
