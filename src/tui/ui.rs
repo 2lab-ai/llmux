@@ -4060,53 +4060,79 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Full rainbow the `max` effort token cycles through (TUI UI-6 item 6): the
-/// per-char fg is `palette[(char_idx + frame) % len]`, so the band appears to
-/// slide one cell per animation tick — a deliberately loud marker for the top
-/// effort. Gated on `tui_effects`; off → a static [`Color::LightMagenta`] bold.
-const EFFORT_MAX_RAINBOW: [Color; 6] = [
-    Color::Red,
-    Color::Yellow,
-    Color::Green,
-    Color::Cyan,
-    Color::Blue,
-    Color::Magenta,
-];
+/// Smooth animated gradients (TUI UI-7): a port of herdr-mx's host-banner
+/// "lolcat" effect (`herdr src/ui/sidebar.rs`), replacing the old discrete
+/// ANSI marquee palettes — those slid hard color bands one cell per tick and
+/// read as flicker, not a gradient. Two modes, exactly like herdr:
+///
+/// - **rainbow** — per-char truecolor from a 3-phase sine sweep (R/G/B offset
+///   by 120°), hue rotating with the frame. Used for the `max` effort token
+///   (the deliberately loud top-effort marker, UI-6 item 6).
+/// - **solid (단색)** — a fixed per-group base color whose LUMA breathes with
+///   the same sine phase, hue never changing. Used for headline-model names
+///   (`fable-5*` magenta family, `gpt-5.6-sol*` cyan family, UI-6 item 7).
+///
+/// `phase = FREQ * char_index + DRIFT * frame` gives the spatial spread across
+/// characters plus temporal drift; luma is floored at `MIN_LUMA` for
+/// legibility. FREQ/luma mirror herdr's constants; DRIFT is herdr's `normal`
+/// speed (0.09) — llmux's 120 ms render tick is slower than herdr's, so
+/// herdr's default `calm` (0.04) would barely move here.
+const GRADIENT_MIN_LUMA: f32 = 0.45;
+const GRADIENT_MAX_LUMA: f32 = 1.00;
+const GRADIENT_FREQ: f32 = 0.30;
+const GRADIENT_DRIFT: f32 = 0.09;
 
-/// Headline-model name gradients (TUI UI-6 item 7): a marquee within each
-/// group's OWN color family (distinct from item 6's full rainbow), keyed on
-/// group. Claude/magenta family for `fable-5*`, codex/cyan family for
-/// `gpt-5.6-sol*`. Gated on `tui_effects`; off → a static bold group color.
-const CLAUDE_GRADIENT: [Color; 4] = [
-    Color::Magenta,
-    Color::LightMagenta,
-    Color::White,
-    Color::LightMagenta,
-];
-const CODEX_GRADIENT: [Color; 4] = [
-    Color::Cyan,
-    Color::LightCyan,
-    Color::White,
-    Color::LightCyan,
-];
-
-/// Per-character marquee color: index `palette` by char position plus the
-/// shared animation `frame`, so the palette appears to slide one cell per tick.
-fn marquee_color(palette: &[Color], char_idx: usize, frame: usize) -> Color {
-    palette[(char_idx + frame) % palette.len()]
+/// The shared gradient phase for `(frame, char_idx)`. The frame is bounded
+/// before it meets f32: past ~2^24 an f32 can no longer step by 1, so
+/// `DRIFT * frame` would freeze on a long-lived daemon/attach TUI. The modulo
+/// wrap (~33 h at 120 ms/tick) is a single-frame phase jump — invisible next
+/// to a frozen animation.
+fn gradient_phase(frame: usize, char_idx: usize) -> f32 {
+    GRADIENT_FREQ * char_idx as f32 + GRADIENT_DRIFT * ((frame % 1_000_000) as f32)
 }
 
-/// The animated group-family gradient palette for a model whose abbreviated
-/// slug marks it a HEADLINE model (`fable-5*` / `gpt-5.6-sol*`), or `None` for
-/// ordinary models (which keep their flat group color). Detection runs on the
-/// [`abbrev_model`] slug so it matches whether the caller renders the raw id
-/// (models strip) or the already-abbreviated badge slug (activity badge).
-fn model_gradient_palette(group: Option<&str>, model: &str) -> Option<&'static [Color]> {
+/// Rainbow mode: deterministic truecolor for `(frame, char_idx)` — R/G/B are
+/// the same sine offset by 0° / 120° / 240°, so the hue rotates while every
+/// channel stays inside the legible luma band.
+fn gradient_rainbow(frame: usize, char_idx: usize) -> Color {
+    let phase = gradient_phase(frame, char_idx);
+    let chan = |offset: f32| -> u8 {
+        let raw = (phase + offset).sin() * 0.5 + 0.5; // 0.0..=1.0
+        let lit = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
+        (lit * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(
+        chan(0.0),
+        chan(std::f32::consts::TAU / 3.0),
+        chan(2.0 * std::f32::consts::TAU / 3.0),
+    )
+}
+
+/// Solid (단색) mode: scale a fixed base color by the sine luma factor — the
+/// hue is the group's, only its brightness breathes along the text.
+fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize) -> Color {
+    let raw = gradient_phase(frame, char_idx).sin() * 0.5 + 0.5; // 0.0..=1.0
+    let factor = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
+    let scale = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(scale(base.0), scale(base.1), scale(base.2))
+}
+
+/// Solid-gradient base colors per headline family: truecolor anchors of the
+/// groups' ANSI families (claude = magenta, codex = cyan).
+const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
+const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
+
+/// The solid-gradient base color for a model whose abbreviated slug marks it a
+/// HEADLINE model (`fable-5*` / `gpt-5.6-sol*`), or `None` for ordinary models
+/// (which keep their flat group color). Detection runs on the [`abbrev_model`]
+/// slug so it matches whether the caller renders the raw id (models strip) or
+/// the already-abbreviated badge slug (activity badge).
+fn model_gradient_base(group: Option<&str>, model: &str) -> Option<(u8, u8, u8)> {
     let slug = abbrev_model(group, model);
     if slug.starts_with("fable-5") || slug.starts_with("gpt-5.6-sol") {
         Some(match group {
-            Some("codex") => &CODEX_GRADIENT,
-            _ => &CLAUDE_GRADIENT,
+            Some("codex") => CODEX_GRADIENT_BASE,
+            _ => CLAUDE_GRADIENT_BASE,
         })
     } else {
         None
@@ -4124,15 +4150,15 @@ fn model_name_spans(
     frame: usize,
     effects_on: bool,
 ) -> Vec<Span<'static>> {
-    match model_gradient_palette(group, text) {
-        Some(pal) if effects_on => text
+    match model_gradient_base(group, text) {
+        Some(base) if effects_on => text
             .chars()
             .enumerate()
             .map(|(i, c)| {
                 Span::styled(
                     c.to_string(),
                     Style::new()
-                        .fg(marquee_color(pal, i, frame))
+                        .fg(gradient_solid(base, frame, i))
                         .add_modifier(Modifier::BOLD),
                 )
             })
@@ -4170,7 +4196,7 @@ fn effort_spans(
                 Span::styled(
                     c.to_string(),
                     Style::new()
-                        .fg(marquee_color(&EFFORT_MAX_RAINBOW, i, frame))
+                        .fg(gradient_rainbow(frame, i))
                         .add_modifier(Modifier::BOLD),
                 )
             })
@@ -4450,7 +4476,7 @@ fn model_name_cells(
         m.group.to_uppercase(),
         group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
     ));
-    let name_cell = if model_gradient_palette(Some(m.group.as_str()), &m.model).is_some() {
+    let name_cell = if model_gradient_base(Some(m.group.as_str()), &m.model).is_some() {
         Cell::from(Line::from(model_name_spans(
             Some(m.group.as_str()),
             &m.model,
@@ -6343,19 +6369,29 @@ mod tests {
         // A headline model splits into per-char spans, all from the claude
         // (magenta) family, and the palette slides with the frame.
         let on0 = model_name_spans(Some("claude"), "fable-5", 0, true);
-        let on1 = model_name_spans(Some("claude"), "fable-5", 1, true);
+        let on1 = model_name_spans(Some("claude"), "fable-5", 8, true);
         assert!(on0.len() > 1, "gradient splits the name per char");
         assert!(
             on0.iter()
-                .all(|s| CLAUDE_GRADIENT.contains(&s.style.fg.unwrap())),
-            "fable-5 uses the claude/magenta family"
+                .enumerate()
+                .all(|(i, s)| s.style.fg == Some(gradient_solid(CLAUDE_GRADIENT_BASE, 0, i))),
+            "fable-5 uses the solid claude/magenta gradient (herdr 단색 mode)"
         );
-        assert_ne!(fg(&on0), fg(&on1), "gradient marquee shifts with the frame");
-        // Codex headline models use the cyan family.
+        assert_ne!(fg(&on0), fg(&on1), "gradient drifts with the frame");
+        // Solid mode NEVER changes hue — every span keeps the base color's
+        // channel ordering (r > b > g for the magenta base), only luma moves.
+        for s in on0.iter().chain(on1.iter()) {
+            let Some(Color::Rgb(r, g, b)) = s.style.fg else {
+                panic!("solid gradient renders truecolor, got {:?}", s.style.fg);
+            };
+            assert!(r >= b && b >= g, "magenta hue preserved, got ({r},{g},{b})");
+        }
+        // Codex headline models use the cyan family base.
         let codex = model_name_spans(Some("codex"), "gpt-5.6-sol", 0, true);
         assert!(codex
             .iter()
-            .all(|s| CODEX_GRADIENT.contains(&s.style.fg.unwrap())));
+            .enumerate()
+            .all(|(i, s)| s.style.fg == Some(gradient_solid(CODEX_GRADIENT_BASE, 0, i))));
         // Effects OFF: a single static bold group-colored span.
         let off = model_name_spans(Some("claude"), "fable-5", 0, false);
         assert_eq!(off.len(), 1);
