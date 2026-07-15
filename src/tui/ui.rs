@@ -1048,18 +1048,39 @@ fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell
             Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         ),
     };
-    let sign_style = frac_style;
+    // The `$` sign sits at the QUIETEST tier — never louder than the
+    // fraction (on Detail rows the fraction is already at the floor, so
+    // they share it).
+    let sign_style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    // No rate known — or an INVALID amount (negative / non-finite, reachable
+    // through a pathological config `pricing` override) — renders as the
+    // explicit dash: invalid data must never dress up as a credible $0
+    // (review R1 MUST-FIX, same honesty contract as `priced: false`). The
+    // dash lands where the ones digit would be, keeping the ledger column.
+    let cost = cost.filter(|c| c.is_finite() && *c >= 0.0);
     let Some(cost) = cost else {
-        // The dash lands where the ones digit would be, keeping the empty
-        // cell aligned with the ledger column.
         return Cell::from(Line::from(vec![
             Span::raw(" ".repeat(1 + USAGE_COST_INT_WIDTH - 1)),
             Span::styled("—", frac_style),
         ]));
     };
-    // Integer arithmetic on the rounded sub-units so a carry can't produce
-    // an 11-character fraction (0.99999 must render $1.00, not $0.10000).
-    let cost = cost.max(0.0);
+    let (int_part, frac) = usage_cost_parts(cost);
+    Cell::from(Line::from(vec![
+        Span::raw(" ".repeat(USAGE_COST_INT_WIDTH.saturating_sub(int_part.len()))),
+        Span::styled("$", sign_style),
+        Span::styled(int_part, int_style),
+        Span::styled(format!("{frac}{marker}"), frac_style),
+    ]))
+}
+
+/// Split a non-negative cost into its grouped integer part and its fraction
+/// string. Integer arithmetic on the rounded sub-units so a carry can't
+/// produce an 11-character fraction (0.99999 must render `("1", ".00")`,
+/// not `("0", ".10000")`); sub-dollar amounts keep 4 fraction digits,
+/// dollar-plus amounts 2. Grouped integers past [`USAGE_COST_INT_WIDTH`]
+/// keep rendering, merely unaligned — alignment is guaranteed up to
+/// $999,999 per bucket.
+fn usage_cost_parts(cost: f64) -> (String, String) {
     let (dollars, frac) = if cost < 0.995 {
         let tenths_of_mill = (cost * 10_000.0).round() as u64;
         (
@@ -1070,13 +1091,7 @@ fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell
         let cents = (cost * 100.0).round() as u64;
         (cents / 100, format!(".{:02}", cents % 100))
     };
-    let int_part = group_thousands(dollars);
-    Cell::from(Line::from(vec![
-        Span::raw(" ".repeat(USAGE_COST_INT_WIDTH.saturating_sub(int_part.len()))),
-        Span::styled("$", sign_style),
-        Span::styled(int_part, int_style),
-        Span::styled(format!("{frac}{marker}"), frac_style),
-    ]))
+    (group_thousands(dollars), frac)
 }
 
 /// `1234567` → `"1,234,567"` — plain thousands grouping for ledger integer
@@ -5149,6 +5164,46 @@ mod tests {
         assert_eq!(dot_col("$1.25"), small, "detail amounts align");
         assert_eq!(dot_col("$1,234.50"), small, "comma amount aligns");
         assert_eq!(dot_col("$0.7500+?"), small, "marker doesn't shift the dot");
+    }
+
+    /// Ledger number splitting (usage-cost polish): carry-safe rounding,
+    /// the sub-dollar 4-digit fraction, and thousands grouping.
+    #[test]
+    fn usage_cost_parts_carry_grouping_and_subdollar_precision() {
+        assert_eq!(usage_cost_parts(0.99999), ("1".into(), ".00".into()));
+        assert_eq!(usage_cost_parts(0.0076), ("0".into(), ".0076".into()));
+        assert_eq!(usage_cost_parts(0.0), ("0".into(), ".0000".into()));
+        assert_eq!(usage_cost_parts(1.25), ("1".into(), ".25".into()));
+        assert_eq!(usage_cost_parts(1_234.499), ("1,234".into(), ".50".into()));
+        assert_eq!(
+            usage_cost_parts(1_234_567.891),
+            ("1,234,567".into(), ".89".into())
+        );
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+    }
+
+    /// An invalid amount (negative rate via a pathological config `pricing`
+    /// override, or non-finite) must render the honesty dash, never a
+    /// credible-looking $0 (review R1 MUST-FIX).
+    #[test]
+    fn usage_overlay_invalid_cost_renders_dash_not_zero() {
+        let mut view = view_with(vec![]);
+        let mut r = usage_row("day", 20_000, "2024-10-04", "claude", "neg-x", 10, 5, -0.42);
+        r.priced = true;
+        view.usage_stats = vec![r];
+        let text = render(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(text.contains("claude/neg-x"), "row rendered");
+        assert!(
+            !text.contains("$0.0000") && !text.contains("$0.00"),
+            "negative cost must not dress up as free"
+        );
+        let model_line = text
+            .lines()
+            .find(|l| l.contains("claude/neg-x"))
+            .expect("model line");
+        assert!(model_line.contains('—'), "invalid cost renders the dash");
     }
 
     /// With no usage rows for the selected granularity the overlay shows the
