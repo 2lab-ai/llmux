@@ -716,6 +716,39 @@ pub struct ConfigFactsDoc {
     pub codex_upstream: String,
     #[serde(default)]
     pub proxy_max_request_bytes: u64,
+    /// On-disk sizes of the persistence files (bytes), refreshed at most
+    /// every 30s (never per frame — the misc tab reads these). `None` = file
+    /// absent or stat failed.
+    #[serde(default)]
+    pub raw_io_bytes: Option<u64>,
+    #[serde(default)]
+    pub activity_log_bytes: Option<u64>,
+}
+
+/// 30s-TTL cache for the persistence-file sizes shown on the misc tab — a
+/// stat per render frame would be wasteful; staleness up to the TTL is fine
+/// for a glance fact.
+fn persist_file_sizes(
+    raw_io: Option<&std::path::Path>,
+    activity: Option<&std::path::Path>,
+) -> (Option<u64>, Option<u64>) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    type SizesAt = (Instant, Option<u64>, Option<u64>);
+    static CACHE: Mutex<Option<SizesAt>> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, raw, act)) = *cache {
+        if at.elapsed() < std::time::Duration::from_secs(30) {
+            return (raw, act);
+        }
+    }
+    let stat =
+        |p: Option<&std::path::Path>| p.and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    let fresh = (stat(raw_io), stat(activity));
+    *cache = Some((Instant::now(), fresh.0, fresh.1));
+    fresh
 }
 
 /// One (day, group, model, fast) row of the observed-performance stats
@@ -1866,6 +1899,16 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             gradient_speed: state.config.tui_gradient.speed,
             codex_upstream: state.config.codex.upstream.clone(),
             proxy_max_request_bytes: state.config.proxy.max_request_bytes as u64,
+            raw_io_bytes: persist_file_sizes(
+                state.raw_io_path.as_deref(),
+                state.activity_log_path.as_deref(),
+            )
+            .0,
+            activity_log_bytes: persist_file_sizes(
+                state.raw_io_path.as_deref(),
+                state.activity_log_path.as_deref(),
+            )
+            .1,
         },
         config_path: state.config_path.as_ref().map(|p| p.display().to_string()),
         refresh_ahead_secs: state.config.scheduler.refresh_ahead_secs,
