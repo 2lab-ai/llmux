@@ -3321,7 +3321,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let raw_path = dir.join("raw-io.jsonl");
         state.raw_io_path = Some(raw_path.clone());
+        // The capture gate reads the LIVE holder (config-editor v1), seeded
+        // from config at boot — flip the holder like a runtime toggle would.
         state.config.raw_io.enabled = false;
+        state
+            .settings_live
+            .raw_io_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let response = forward(&state, client_request("{}")).await;
         assert_eq!(response.status(), StatusCode::OK);

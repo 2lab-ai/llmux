@@ -544,6 +544,7 @@ mod tests {
             grok: Default::default(),
             daily_usage: Vec::new(),
             daily_perf: Vec::new(),
+            config_facts: Default::default(),
             usage_stats: Vec::new(),
             version: "llmux test".into(),
             pid: 1,
