@@ -1388,10 +1388,6 @@ fn ms_to_systemtime(ms: u64) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
-/// The rect a summoned overlay covers: the whole screen except the bottom two
-/// rows reserved for the footer keybar, so MAIN's footer slot is never double
-/// drawn and the keybar stays visible under the overlay.
-
 // ---------------------------------------------------------------------------
 // Perf overlay (perf telemetry v1): observed performance per provider/model.
 // ---------------------------------------------------------------------------
@@ -1503,7 +1499,7 @@ fn perf_series(view: &DashboardView, days: u64, now: SystemTime) -> Vec<PerfAgg>
         a.ttfb_ms_sum += r.ttfb_ms_sum;
     }
     let mut rows: Vec<PerfAgg> = agg.into_values().collect();
-    rows.sort_by(|a, b| b.output_tokens.cmp(&a.output_tokens));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.output_tokens));
     rows
 }
 
@@ -1732,11 +1728,10 @@ fn draw_perf_health(
             match cells.get(&(day, *group)) {
                 Some(a) => {
                     day_n += a.requests;
-                    let ttfb = (a.ttfb_n > 0)
-                        .then(|| {
-                            format::elapsed_secs(Duration::from_millis(a.ttfb_ms_sum / a.ttfb_n))
-                        })
-                        .unwrap_or_else(|| "—".into());
+                    let ttfb = match a.ttfb_ms_sum.checked_div(a.ttfb_n) {
+                        Some(avg) => format::elapsed_secs(Duration::from_millis(avg)),
+                        None => "—".into(),
+                    };
                     let err = a.err_pct();
                     let err_style = if err >= 10.0 {
                         Style::new().fg(Color::Red)
@@ -1789,9 +1784,10 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
     let end = (start + capacity).min(total);
     let rows = series[start..end].iter().enumerate().map(|(i, a)| {
         let idx = start + i;
-        let ttfb = (a.ttfb_n > 0)
-            .then(|| format::elapsed_secs(Duration::from_millis(a.ttfb_ms_sum / a.ttfb_n)))
-            .unwrap_or_else(|| "—".into());
+        let ttfb = match a.ttfb_ms_sum.checked_div(a.ttfb_n) {
+            Some(avg) => format::elapsed_secs(Duration::from_millis(avg)),
+            None => "—".into(),
+        };
         let coverage = format!("{}/{}", a.measured_n, a.tps_n);
         let row = Row::new(vec![
             Cell::from(perf_series_label(&a.group, &a.model, a.fast)),
