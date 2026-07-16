@@ -1982,10 +1982,12 @@ async fn relay(
             move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
                 // Provider failure = transport break OR a protocol-level SSE
                 // `error` event (arrives under a clean HTTP 200).
-                // A client disconnect is NOT a provider failure — only
-                // count upstream terminations.
-                let upstream_error =
-                    !timing.client_gone && (error.is_some() || timing.saw_error_event);
+                let upstream_error = provider_failure(
+                    timing.client_gone,
+                    error.is_some(),
+                    false,
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -2315,13 +2317,12 @@ async fn relay_translate(
                 // level protocol failure (codex/grok `response.failed` — the
                 // converter preserves its message), or an SSE `error` event
                 // is a provider failure even under a client-200.
-                // A client disconnect must not read as a provider failure —
-                // an interrupted converter reports error_message() for the
-                // truncation WE caused. Gate every signal on !client_gone.
-                let upstream_error = !client_gone
-                    && (error.is_some()
-                        || converter.error_message().is_some()
-                        || timing.saw_error_event);
+                let upstream_error = provider_failure(
+                    client_gone,
+                    error.is_some(),
+                    converter.error_message().is_some(),
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
@@ -2546,6 +2547,21 @@ async fn relay_translate(
     ctx.flush_log(state);
     drop(lease);
     result
+}
+
+/// Whether a finished relay counts as a PROVIDER failure for perf accounting
+/// (the `aborted` flag): any upstream termination — transport break,
+/// converter-level protocol failure, or an SSE `error` event — but NEVER a
+/// client disconnect: when the client walked away, every downstream signal
+/// (including a converter truncation error) describes OUR cancellation, not
+/// the provider. Pure so the exact production decision is unit-testable.
+fn provider_failure(
+    client_gone: bool,
+    transport_error: bool,
+    converter_error: bool,
+    saw_error_event: bool,
+) -> bool {
+    !client_gone && (transport_error || converter_error || saw_error_event)
 }
 
 /// Millis from `start` to `at`, saturating (the pump's landmarks are always
@@ -4358,27 +4374,43 @@ mod tests {
 
     #[tokio::test]
     async fn transform_pump_client_disconnect_never_claims_gen_or_failure() {
-        // The CLIENT walks away mid-stream: client_gone is reported, and the
-        // timing refuses to claim a gen span for OUR truncation — the
-        // aborted expression gates every failure signal on !client_gone.
-        let big_text = "x".repeat(200_000);
-        let body = format!(
-            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r1\"}}}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{big_text}\"}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n\n"
+        // The CLIENT walks away mid-stream — deterministically: the mpsc
+        // channel holds 16 events, the stream carries 30+ output deltas, and
+        // the receiver is dropped without reading, so the pump MUST block on
+        // a full channel and then fail its send. No conditional asserts.
+        let mut body = String::from(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
         );
-        let (timing, client_gone, _, _) = run_transform(body, true).await;
-        if client_gone {
-            assert!(timing.client_gone);
-            assert_eq!(
-                timing.gen_ms(),
-                None,
-                "client truncation never becomes a measured span"
-            );
+        for i in 0..30 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk {i}\"}}\n\n"
+            ));
         }
-        // (If the tiny stream was fully buffered before the drop, the pump
-        // legitimately finished — the disconnect branch is then untestable in
-        // this run; client_gone=false with a real span is honest.)
+        body.push_str(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        );
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, true).await;
+        assert!(client_gone, "dropped receiver must surface as client_gone");
+        assert!(timing.client_gone);
+        assert_eq!(
+            timing.gen_ms(),
+            None,
+            "client truncation never becomes a measured span"
+        );
+        // The exact production decision: whatever the converter thinks of
+        // the truncation WE caused, a client disconnect is never a provider
+        // failure (RequestFinished.aborted = false).
+        assert!(
+            !provider_failure(
+                client_gone,
+                transport_error,
+                converter_error.is_some(),
+                timing.saw_error_event,
+            ),
+            "client disconnect must not count as a provider failure"
+        );
     }
-
     #[tokio::test]
     async fn sse_passthrough_records_ttfb_and_first_output_delta() {
         // Perf telemetry v1 (trinity contract C1/C8, passthrough path): the
