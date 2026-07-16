@@ -159,6 +159,10 @@ pub struct StreamTiming {
     /// An SSE `error` event was observed on the stream — a protocol-level
     /// provider failure that arrives under a transport-clean HTTP 200.
     pub saw_error_event: bool,
+    /// The CLIENT disconnected mid-relay. Not a provider failure — and the
+    /// stream was truncated on OUR side, so no post-delta span may be
+    /// claimed from it (see [`Self::gen_ms`]).
+    pub client_gone: bool,
 }
 
 impl StreamTiming {
@@ -188,8 +192,13 @@ impl StreamTiming {
     }
 
     /// The stream-side post-delta span in millis (first delta → stream end),
-    /// when both landmarks were observed.
+    /// when both landmarks were observed. `None` after a client disconnect —
+    /// the relay stopped pulling, so the span would measure OUR truncation,
+    /// not the provider's generation.
     pub fn gen_ms(&self) -> Option<u64> {
+        if self.client_gone {
+            return None;
+        }
         let (fc, end) = (self.first_content?, self.stream_end?);
         Some(u64::try_from(end.saturating_duration_since(fc).as_millis()).unwrap_or(u64::MAX))
     }
@@ -351,6 +360,7 @@ where
                         timing.on_payload(&out);
                         if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                             client_gone = true;
+                            timing.client_gone = true;
                             break 'pump;
                         }
                         capture(&mut captured, &out, capture_limit);
@@ -370,6 +380,7 @@ where
                 timing.on_payload(&out);
                 if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                     client_gone = true;
+                    timing.client_gone = true;
                 } else {
                     capture(&mut captured, &out, capture_limit);
                     raw_captured.push(&out);
@@ -528,6 +539,7 @@ where
                     // the receiver and we stop polling upstream. Send FIRST,
                     // then observe — the copies never delay the client.
                     if tx.send(Ok(chunk.clone())).await.is_err() {
+                        timing.client_gone = true;
                         break;
                     }
                     capture(&mut captured, &chunk, capture_limit);

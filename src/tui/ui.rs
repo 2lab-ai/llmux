@@ -1745,11 +1745,14 @@ fn draw_perf_chart(
                     y_max = y_max.max(y);
                     let low = *n < 5;
                     if low != current_low && !current.is_empty() {
-                        // Repeat the boundary point so the line stays
-                        // connected across the style change.
                         let last = *current.last().expect("non-empty");
                         segments.push((idx, current_low, std::mem::take(&mut current)));
-                        current.push(last);
+                        // Connect across the flip only INTO the dim segment
+                        // — a low-confidence point must never be repainted
+                        // at full brightness (review MUST-FIX: dim = n<5).
+                        if low {
+                            current.push(last);
+                        }
                     }
                     current_low = low;
                     current.push((x as f64, y));
@@ -6645,6 +6648,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 Span::raw(" perf — "),
                 key("d"),
                 Span::raw(" span  "),
+                key("←/h →/l"),
+                Span::raw(" day  "),
                 key("↑/k ↓/j"),
                 Span::raw(" series  "),
                 key("p/Esc"),

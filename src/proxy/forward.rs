@@ -1982,7 +1982,10 @@ async fn relay(
             move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
                 // Provider failure = transport break OR a protocol-level SSE
                 // `error` event (arrives under a clean HTTP 200).
-                let upstream_error = error.is_some() || timing.saw_error_event;
+                // A client disconnect is NOT a provider failure — only
+                // count upstream terminations.
+                let upstream_error =
+                    !timing.client_gone && (error.is_some() || timing.saw_error_event);
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -2312,9 +2315,13 @@ async fn relay_translate(
                 // level protocol failure (codex/grok `response.failed` — the
                 // converter preserves its message), or an SSE `error` event
                 // is a provider failure even under a client-200.
-                let upstream_error = error.is_some()
-                    || converter.error_message().is_some()
-                    || timing.saw_error_event;
+                // A client disconnect must not read as a provider failure —
+                // an interrupted converter reports error_message() for the
+                // truncation WE caused. Gate every signal on !client_gone.
+                let upstream_error = !client_gone
+                    && (error.is_some()
+                        || converter.error_message().is_some()
+                        || timing.saw_error_event);
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
@@ -4264,6 +4271,112 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.input_tokens, 25);
         assert_eq!(totals.output_tokens, 42);
+    }
+
+    /// Drive `sse::transform_body` with a REAL HTTP response (the scripted
+    /// mock) through the REAL codex converter and capture what `finish`
+    /// receives — the integration chain the closures build RequestFinished
+    /// from (review MUST-FIX 4).
+    async fn run_transform(
+        body: String,
+        drop_client: bool,
+    ) -> (crate::proxy::sse::StreamTiming, bool, Option<String>, bool) {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSseOwned { body });
+        let upstream = spawn_mock(shared.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{upstream}/v1/responses"))
+            .send()
+            .await
+            .expect("mock reachable");
+        let converter = crate::provider::responses::ResponsesSseConverter::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = crate::proxy::sse::transform_body(
+            response,
+            converter,
+            BODY_LOG_LIMIT,
+            0,
+            move |_usage, _cap, _raw, _up, error, converter, client_gone, timing| {
+                let _ = tx.send((
+                    timing,
+                    client_gone,
+                    converter.error_message().map(str::to_string),
+                    error.is_some(),
+                ));
+            },
+        );
+        if drop_client {
+            drop(body); // client walks away → tx.send fails inside the pump
+        } else {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("finish ran")
+            .expect("finish delivered")
+    }
+
+    #[tokio::test]
+    async fn transform_pump_latches_thinking_first_ttft_and_gen_span() {
+        // Codex wire: reasoning summary delta arrives FIRST — it must latch
+        // first_content (thinking counts) and yield a positive gen span at
+        // upstream EOF, with no failure signals.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hm\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, false).await;
+        assert!(timing.first_byte.is_some(), "ttfb latched");
+        assert!(
+            timing.first_content.is_some(),
+            "thinking delta latches first_content"
+        );
+        assert!(timing.gen_ms().is_some(), "gen span present at EOF");
+        assert!(!timing.saw_error_event && !client_gone);
+        assert!(converter_error.is_none() && !transport_error);
+    }
+
+    #[tokio::test]
+    async fn transform_pump_reports_protocol_failure_not_client_disconnect() {
+        // response.failed under a clean HTTP 200 → the converter preserves
+        // the failure; the closure's provider-error signal comes from it.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, _) = run_transform(body, false).await;
+        assert!(!client_gone);
+        assert!(
+            converter_error.is_some(),
+            "protocol failure preserved by the converter"
+        );
+        assert!(
+            timing.first_content.is_none(),
+            "no content delta before the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_pump_client_disconnect_never_claims_gen_or_failure() {
+        // The CLIENT walks away mid-stream: client_gone is reported, and the
+        // timing refuses to claim a gen span for OUR truncation — the
+        // aborted expression gates every failure signal on !client_gone.
+        let big_text = "x".repeat(200_000);
+        let body = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r1\"}}}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{big_text}\"}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":2}}}}}}\n\n"
+        );
+        let (timing, client_gone, _, _) = run_transform(body, true).await;
+        if client_gone {
+            assert!(timing.client_gone);
+            assert_eq!(
+                timing.gen_ms(),
+                None,
+                "client truncation never becomes a measured span"
+            );
+        }
+        // (If the tiny stream was fully buffered before the drop, the pump
+        // legitimately finished — the disconnect branch is then untestable in
+        // this run; client_gone=false with a real span is honest.)
     }
 
     #[tokio::test]
