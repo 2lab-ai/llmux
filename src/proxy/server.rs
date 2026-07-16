@@ -83,6 +83,55 @@ impl UsageTotals {
     }
 }
 
+/// Live (no-restart) values of the runtime-tunable settings, following the
+/// `email_anonymous`/`round_robin` holder convention: seeded from config at
+/// boot, flipped by `POST /llmux/settings` (persist-then-apply), read by
+/// their consumers each use — `AppState.config` is a per-clone snapshot, so
+/// shared mutable state must ride an `Arc`. Ceilings are stored as f64 bits
+/// in `AtomicU64`.
+#[derive(Debug)]
+pub struct SettingsLive {
+    pub tui_effects: AtomicBool,
+    pub show_fable_weekly: AtomicBool,
+    /// `true` = quota gauges fill with REMAINING (config `quota_display`).
+    pub quota_remaining: AtomicBool,
+    /// Model→group routing gate (config `routing.enabled`) — read by the
+    /// forward path per request.
+    pub routing_enabled: AtomicBool,
+    /// Raw-io capture gate (config `raw_io.enabled`) — read per request.
+    pub raw_io_enabled: AtomicBool,
+    pub five_hour_max: AtomicU64,
+    pub seven_day_max: AtomicU64,
+    pub fable_weekly_max: AtomicU64,
+    pub usage_max_age_secs: AtomicU64,
+}
+
+impl SettingsLive {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            tui_effects: AtomicBool::new(config.tui_effects),
+            show_fable_weekly: AtomicBool::new(config.show_fable_weekly),
+            quota_remaining: AtomicBool::new(
+                config.quota_display == crate::config::QuotaDisplay::Remaining,
+            ),
+            routing_enabled: AtomicBool::new(config.routing.enabled),
+            raw_io_enabled: AtomicBool::new(config.raw_io.enabled),
+            five_hour_max: AtomicU64::new(config.scheduler.five_hour_max.to_bits()),
+            seven_day_max: AtomicU64::new(config.scheduler.seven_day_max.to_bits()),
+            fable_weekly_max: AtomicU64::new(config.scheduler.fable_weekly_max.to_bits()),
+            usage_max_age_secs: AtomicU64::new(config.scheduler.usage_max_age_secs),
+        }
+    }
+
+    pub fn quota_display(&self) -> crate::config::QuotaDisplay {
+        if self.quota_remaining.load(Ordering::Relaxed) {
+            crate::config::QuotaDisplay::Remaining
+        } else {
+            crate::config::QuotaDisplay::Used
+        }
+    }
+}
+
 /// Shared per-request state. Cloning is cheap (`Arc` inside the pool,
 /// `reqwest::Client` is internally reference-counted).
 #[derive(Clone)]
@@ -170,6 +219,8 @@ pub struct AppState {
     /// `AppState.config` is a per-clone snapshot; shared mutable state must
     /// ride an `Arc`.
     pub email_anonymous: Arc<AtomicBool>,
+    /// Live runtime-tunable settings (see [`SettingsLive`]).
+    pub settings_live: Arc<SettingsLive>,
     /// Live scheduler mode (config `scheduler.mode`), same atomic convention
     /// as `email_anonymous`: `false` = default, `true` = round-robin. A TUI
     /// `S` / `POST /llmux/scheduler-mode` flip reflects in the very next
@@ -279,6 +330,7 @@ impl AppState {
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
+            settings_live: Arc::new(SettingsLive::from_config(&config)),
             round_robin: Arc::new(AtomicBool::new(
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
@@ -297,12 +349,17 @@ impl AppState {
 
     pub fn select_params(&self) -> SelectParams {
         let mut params = SelectParams::from(&self.config.scheduler);
-        // The live atomic wins over the boot-time config snapshot.
+        // The live atomics win over the boot-time config snapshot.
         params.mode = if self.round_robin.load(Ordering::Relaxed) {
             crate::config::SchedulerMode::RoundRobin
         } else {
             crate::config::SchedulerMode::Default
         };
+        let live = &self.settings_live;
+        params.five_hour_max = f64::from_bits(live.five_hour_max.load(Ordering::Relaxed));
+        params.seven_day_max = f64::from_bits(live.seven_day_max.load(Ordering::Relaxed));
+        params.fable_weekly_max = f64::from_bits(live.fable_weekly_max.load(Ordering::Relaxed));
+        params.usage_max_age = Duration::from_secs(live.usage_max_age_secs.load(Ordering::Relaxed));
         params
     }
 
@@ -1499,11 +1556,282 @@ async fn models_endpoint(State(state): State<AppState>) -> Response {
 /// Every field is optional; an omitted field keeps its current value (same
 /// contract as `POST /llmux/codex`), so the endpoint stays additive as more
 /// settings join it.
-#[derive(serde::Deserialize)]
-struct SettingsRequest {
+/// `POST /llmux/settings` body: every field optional — only the fields
+/// present are validated + applied. Live fields flip a [`SettingsLive`]
+/// holder after the persist; restart-only fields persist read-merge-write
+/// and are reported back under `restart_required`. Config-editor v1
+/// (trinity contract C6).
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct SettingsRequest {
     /// Mask account emails on display surfaces (TUI render layer; islands
     /// mirrors it into its pixelization). See `Config::email_anonymous`.
-    email_anonymous: Option<bool>,
+    pub email_anonymous: Option<bool>,
+    pub tui_effects: Option<bool>,
+    pub show_fable_weekly: Option<bool>,
+    /// `"used"` | `"remaining"`.
+    pub quota_display: Option<String>,
+    pub routing_enabled: Option<bool>,
+    pub raw_io_enabled: Option<bool>,
+    /// Scheduler ceilings, fractions in `[0.0, 1.0]`.
+    pub five_hour_max: Option<f64>,
+    pub seven_day_max: Option<f64>,
+    pub fable_weekly_max: Option<f64>,
+    /// Scheduler usage evidence max age, seconds in `[5, 3600]`.
+    pub usage_max_age_secs: Option<u64>,
+    // ---- persisted-only (effective on next daemon start) ----
+    pub raw_io_retention_days: Option<u64>,
+    pub raw_io_max_body_bytes: Option<u64>,
+    /// `"claude"` | `"codex"` | `"grok"`.
+    pub routing_default_group: Option<String>,
+    /// `"error"` | `"fallback"`.
+    pub routing_on_empty_group: Option<String>,
+    pub tui_gradient_speed: Option<f32>,
+    pub upstream: Option<String>,
+    pub codex_upstream: Option<String>,
+    pub proxy_port: Option<u16>,
+    pub proxy_max_request_bytes: Option<u64>,
+}
+
+/// One validated settings change, applied to config (read-merge-write) and,
+/// for live fields, to the [`SettingsLive`] holders. Returns the applied
+/// field names split into live vs restart-required — the TUI status line and
+/// config-tab labels are driven by this split, so a "wrote but won't apply
+/// until restart" change can never masquerade as live (trinity contract C6:
+/// no silent lies).
+pub fn apply_settings(
+    state: &AppState,
+    req: &SettingsRequest,
+) -> Result<(Vec<&'static str>, Vec<&'static str>), String> {
+    use std::sync::atomic::Ordering;
+    // ---- validate everything BEFORE writing anything (atomic apply). ----
+    let quota = match req.quota_display.as_deref() {
+        None => None,
+        Some("used") => Some(crate::config::QuotaDisplay::Used),
+        Some("remaining") => Some(crate::config::QuotaDisplay::Remaining),
+        Some(other) => return Err(format!("quota_display: unknown value {other:?}")),
+    };
+    for (name, v) in [
+        ("five_hour_max", req.five_hour_max),
+        ("seven_day_max", req.seven_day_max),
+        ("fable_weekly_max", req.fable_weekly_max),
+    ] {
+        if let Some(v) = v {
+            if !(0.0..=1.0).contains(&v) || v.is_nan() {
+                return Err(format!("{name}: must be a fraction in [0.0, 1.0]"));
+            }
+        }
+    }
+    if let Some(age) = req.usage_max_age_secs {
+        if !(5..=3600).contains(&age) {
+            return Err("usage_max_age_secs: must be in [5, 3600]".into());
+        }
+    }
+    if let Some(days) = req.raw_io_retention_days {
+        if days > 3650 {
+            return Err("raw_io_retention_days: must be <= 3650".into());
+        }
+    }
+    if let Some(bytes) = req.raw_io_max_body_bytes {
+        if !(1024..=1_073_741_824).contains(&bytes) {
+            return Err("raw_io_max_body_bytes: must be in [1 KiB, 1 GiB]".into());
+        }
+    }
+    if let Some(group) = req.routing_default_group.as_deref() {
+        if !["claude", "codex", "grok"].contains(&group) {
+            return Err(format!("routing_default_group: unknown group {group:?}"));
+        }
+    }
+    if let Some(mode) = req.routing_on_empty_group.as_deref() {
+        if !["error", "fallback"].contains(&mode) {
+            return Err(format!("routing_on_empty_group: unknown mode {mode:?}"));
+        }
+    }
+    if let Some(speed) = req.tui_gradient_speed {
+        if !(0.01..=10.0).contains(&speed) || speed.is_nan() {
+            return Err("tui_gradient_speed: must be in [0.01, 10.0]".into());
+        }
+    }
+    for (name, url) in [
+        ("upstream", req.upstream.as_deref()),
+        ("codex_upstream", req.codex_upstream.as_deref()),
+    ] {
+        if let Some(url) = url {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!("{name}: must be an http(s) URL"));
+            }
+        }
+    }
+    if let Some(port) = req.proxy_port {
+        if port == 0 {
+            return Err("proxy_port: must be non-zero".into());
+        }
+    }
+    if let Some(bytes) = req.proxy_max_request_bytes {
+        if !(65_536..=1_073_741_824).contains(&bytes) {
+            return Err("proxy_max_request_bytes: must be in [64 KiB, 1 GiB]".into());
+        }
+    }
+
+    // ---- persist all requested fields in ONE read-merge-write. ----
+    if let Some(path) = &state.config_path {
+        let req_clone = SettingsRequest {
+            email_anonymous: req.email_anonymous,
+            tui_effects: req.tui_effects,
+            show_fable_weekly: req.show_fable_weekly,
+            quota_display: req.quota_display.clone(),
+            routing_enabled: req.routing_enabled,
+            raw_io_enabled: req.raw_io_enabled,
+            five_hour_max: req.five_hour_max,
+            seven_day_max: req.seven_day_max,
+            fable_weekly_max: req.fable_weekly_max,
+            usage_max_age_secs: req.usage_max_age_secs,
+            raw_io_retention_days: req.raw_io_retention_days,
+            raw_io_max_body_bytes: req.raw_io_max_body_bytes,
+            routing_default_group: req.routing_default_group.clone(),
+            routing_on_empty_group: req.routing_on_empty_group.clone(),
+            tui_gradient_speed: req.tui_gradient_speed,
+            upstream: req.upstream.clone(),
+            codex_upstream: req.codex_upstream.clone(),
+            proxy_port: req.proxy_port,
+            proxy_max_request_bytes: req.proxy_max_request_bytes,
+        };
+        let quota_for_write = quota;
+        crate::config::update_path(path, move |c| {
+            let r = &req_clone;
+            if let Some(v) = r.email_anonymous {
+                c.email_anonymous = v;
+            }
+            if let Some(v) = r.tui_effects {
+                c.tui_effects = v;
+            }
+            if let Some(v) = r.show_fable_weekly {
+                c.show_fable_weekly = v;
+            }
+            if let Some(q) = quota_for_write {
+                c.quota_display = q;
+            }
+            if let Some(v) = r.routing_enabled {
+                c.routing.enabled = v;
+            }
+            if let Some(v) = r.raw_io_enabled {
+                c.raw_io.enabled = v;
+            }
+            if let Some(v) = r.five_hour_max {
+                c.scheduler.five_hour_max = v;
+            }
+            if let Some(v) = r.seven_day_max {
+                c.scheduler.seven_day_max = v;
+            }
+            if let Some(v) = r.fable_weekly_max {
+                c.scheduler.fable_weekly_max = v;
+            }
+            if let Some(v) = r.usage_max_age_secs {
+                c.scheduler.usage_max_age_secs = v;
+            }
+            if let Some(v) = r.raw_io_retention_days {
+                c.raw_io.retention_days = v;
+            }
+            if let Some(v) = r.raw_io_max_body_bytes {
+                c.raw_io.max_body_bytes = usize::try_from(v).unwrap_or(usize::MAX);
+            }
+            if let Some(v) = &r.routing_default_group {
+                c.routing.default_group = v.clone();
+            }
+            if let Some(v) = &r.routing_on_empty_group {
+                c.routing.on_empty_group = v.clone();
+            }
+            if let Some(v) = r.tui_gradient_speed {
+                c.tui_gradient.speed = v;
+            }
+            if let Some(v) = &r.upstream {
+                c.upstream = v.clone();
+            }
+            if let Some(v) = &r.codex_upstream {
+                c.codex.upstream = v.clone();
+            }
+            if let Some(v) = r.proxy_port {
+                c.proxy.port = v;
+            }
+            if let Some(v) = r.proxy_max_request_bytes {
+                c.proxy.max_request_bytes = usize::try_from(v).unwrap_or(usize::MAX);
+            }
+        })
+        .map_err(|err| format!("config write failed: {err}"))?;
+    }
+
+    // ---- flip live holders (only after the persist succeeded). ----
+    let live = &state.settings_live;
+    let mut applied: Vec<&'static str> = Vec::new();
+    let mut restart: Vec<&'static str> = Vec::new();
+    if let Some(v) = req.email_anonymous {
+        state.email_anonymous.store(v, Ordering::Relaxed);
+        applied.push("email_anonymous");
+    }
+    if let Some(v) = req.tui_effects {
+        live.tui_effects.store(v, Ordering::Relaxed);
+        applied.push("tui_effects");
+    }
+    if let Some(v) = req.show_fable_weekly {
+        live.show_fable_weekly.store(v, Ordering::Relaxed);
+        applied.push("show_fable_weekly");
+    }
+    if let Some(q) = quota {
+        live.quota_remaining.store(
+            q == crate::config::QuotaDisplay::Remaining,
+            Ordering::Relaxed,
+        );
+        applied.push("quota_display");
+    }
+    if let Some(v) = req.routing_enabled {
+        live.routing_enabled.store(v, Ordering::Relaxed);
+        applied.push("routing_enabled");
+    }
+    if let Some(v) = req.raw_io_enabled {
+        live.raw_io_enabled.store(v, Ordering::Relaxed);
+        applied.push("raw_io_enabled");
+    }
+    if let Some(v) = req.five_hour_max {
+        live.five_hour_max.store(v.to_bits(), Ordering::Relaxed);
+        applied.push("five_hour_max");
+    }
+    if let Some(v) = req.seven_day_max {
+        live.seven_day_max.store(v.to_bits(), Ordering::Relaxed);
+        applied.push("seven_day_max");
+    }
+    if let Some(v) = req.fable_weekly_max {
+        live.fable_weekly_max.store(v.to_bits(), Ordering::Relaxed);
+        applied.push("fable_weekly_max");
+    }
+    if let Some(v) = req.usage_max_age_secs {
+        live.usage_max_age_secs.store(v, Ordering::Relaxed);
+        applied.push("usage_max_age_secs");
+    }
+    // Persisted-only fields: the running daemon keeps its boot value.
+    for (name, present) in [
+        ("raw_io_retention_days", req.raw_io_retention_days.is_some()),
+        ("raw_io_max_body_bytes", req.raw_io_max_body_bytes.is_some()),
+        ("routing_default_group", req.routing_default_group.is_some()),
+        (
+            "routing_on_empty_group",
+            req.routing_on_empty_group.is_some(),
+        ),
+        ("tui_gradient_speed", req.tui_gradient_speed.is_some()),
+        ("upstream", req.upstream.is_some()),
+        ("codex_upstream", req.codex_upstream.is_some()),
+        ("proxy_port", req.proxy_port.is_some()),
+        (
+            "proxy_max_request_bytes",
+            req.proxy_max_request_bytes.is_some(),
+        ),
+    ] {
+        if present {
+            restart.push(name);
+        }
+    }
+    if !applied.is_empty() || !restart.is_empty() {
+        tracing::info!(?applied, restart_required = ?restart, "settings updated");
+    }
+    Ok((applied, restart))
 }
 
 /// `POST /llmux/settings` `{"email_anonymous":true|false}` — flip the
@@ -1519,23 +1847,26 @@ async fn settings_endpoint(
     State(state): State<AppState>,
     body: axum::extract::Json<SettingsRequest>,
 ) -> Response {
-    if let Some(enabled) = body.email_anonymous {
-        if let Some(path) = &state.config_path {
-            if let Err(err) = crate::config::update_path(path, |c| c.email_anonymous = enabled) {
-                return relay_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("config write failed: {err}"),
-                );
-            }
+    let (applied, restart_required) = match apply_settings(&state, &body) {
+        Ok(result) => result,
+        Err(err) => {
+            // Validation errors are the caller's fault (400); a persist
+            // failure is ours (500).
+            let status = if err.starts_with("config write failed") {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return relay_error(status, &err);
         }
-        state.email_anonymous.store(enabled, Ordering::Relaxed);
-        tracing::info!(email_anonymous = enabled, "settings updated");
-    }
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({
             "ok": true,
+            "applied": applied,
+            "restart_required": restart_required,
             "email_anonymous": state.email_anonymous.load(Ordering::Relaxed),
         })
         .to_string(),
@@ -3338,6 +3669,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_settings_validates_flips_live_and_reports_restart() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+
+        // Invalid values are rejected BEFORE any write (atomic apply).
+        for bad in [
+            SettingsRequest {
+                five_hour_max: Some(1.5),
+                ..Default::default()
+            },
+            SettingsRequest {
+                quota_display: Some("sideways".into()),
+                ..Default::default()
+            },
+            SettingsRequest {
+                usage_max_age_secs: Some(4),
+                ..Default::default()
+            },
+            SettingsRequest {
+                routing_default_group: Some("frontier".into()),
+                ..Default::default()
+            },
+            SettingsRequest {
+                upstream: Some("ftp://nope".into()),
+                ..Default::default()
+            },
+        ] {
+            apply_settings(&state, &bad).expect_err("invalid value rejected");
+        }
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(
+            on_disk.scheduler.five_hour_max,
+            crate::config::SchedulerConfig::default().five_hour_max,
+            "rejected request wrote nothing (default intact)"
+        );
+
+        // A mixed live + restart-required request applies both classes.
+        let req = SettingsRequest {
+            tui_effects: Some(false),
+            routing_enabled: Some(true),
+            five_hour_max: Some(0.5),
+            raw_io_retention_days: Some(7),
+            ..Default::default()
+        };
+        let (applied, restart) = apply_settings(&state, &req).expect("valid");
+        assert_eq!(
+            applied,
+            vec!["tui_effects", "routing_enabled", "five_hour_max"]
+        );
+        assert_eq!(restart, vec!["raw_io_retention_days"]);
+        // Live holders flipped (no restart)...
+        assert!(!state.settings_live.tui_effects.load(Ordering::Relaxed));
+        assert!(state.settings_live.routing_enabled.load(Ordering::Relaxed));
+        assert_eq!(
+            state.select_params().five_hour_max,
+            0.5,
+            "scheduler reads the live ceiling immediately"
+        );
+        // ...and everything persisted read-merge-write.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert!(!on_disk.tui_effects);
+        assert!(on_disk.routing.enabled);
+        assert_eq!(on_disk.scheduler.five_hour_max, 0.5);
+        assert_eq!(on_disk.raw_io.retention_days, 7);
+        assert_eq!(on_disk.accounts.len(), 1, "accounts survive the merge");
+    }
+
+    #[tokio::test]
     async fn settings_endpoint_flips_live_state_and_persists() {
         let dir = TempDir::new();
         let path = dir.path().join("llmux.json");
@@ -3348,6 +3748,7 @@ mod tests {
             State(state.clone()),
             axum::extract::Json(SettingsRequest {
                 email_anonymous: Some(true),
+                ..Default::default()
             }),
         )
         .await;
@@ -3369,6 +3770,7 @@ mod tests {
             State(state.clone()),
             axum::extract::Json(SettingsRequest {
                 email_anonymous: Some(false),
+                ..Default::default()
             }),
         )
         .await;
@@ -3416,9 +3818,7 @@ mod tests {
 
         let response = settings_endpoint(
             State(state.clone()),
-            axum::extract::Json(SettingsRequest {
-                email_anonymous: None,
-            }),
+            axum::extract::Json(SettingsRequest::default()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
