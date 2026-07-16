@@ -397,6 +397,57 @@ pub fn pick_scoped(
         .filter(|a| gate_scoped(a, params, now, headers_only, heuristic_degraded, scope).is_none())
         .collect();
 
+    // The Fable lane schedules like the main lane, but on the FABLE weekly
+    // window (issues #121/#8-report): candidates are ranked by
+    // [`fable_score`] (Fable headroom × Fable reset urgency — the exact
+    // `account_score` shape with the 7d window swapped for the Fable
+    // bucket), so a soon-resetting full Fable bucket is burned before a
+    // far-reset one (use-it-or-lose-it). Stickiness anchors on the fable
+    // slot, SEEDED from the account-wide current when the slot is empty —
+    // so with no clearly-better candidate (SWITCH_MARGIN, same damping as
+    // the main lane) fable traffic stays on the account the operator sees
+    // as current, a COLD Fable bucket included, instead of splitting
+    // prompt-cache locality across subscriptions. Round-robin keeps its
+    // absolute-stickiness contract: an eligible anchor is never abandoned.
+    if scope == RequestScope::Fable && !heuristic_degraded {
+        let anchor_id = group_current(snapshot, group, RequestScope::Fable)
+            .or_else(|| group_current(snapshot, group, RequestScope::NonFable));
+        let anchor = anchor_id.and_then(|id| eligible.iter().copied().find(|a| &a.id == id));
+        let best = eligible
+            .iter()
+            .copied()
+            .min_by(|a, b| fable_ranked(a, b, params, group, now));
+        let chosen = match (anchor, best) {
+            (Some(anchor), Some(best)) => {
+                let clearly_better = params.mode != crate::config::SchedulerMode::RoundRobin
+                    && best.id != anchor.id
+                    && fable_score(best, params, now)
+                        > fable_score(anchor, params, now) * (1.0 + SWITCH_MARGIN);
+                if clearly_better {
+                    best
+                } else {
+                    anchor
+                }
+            }
+            (None, Some(best)) => best,
+            (_, None) => {
+                return Decision::Exhausted {
+                    retry_after: soonest_reset(snapshot, now),
+                }
+            }
+        };
+        // `Stay` only when the FABLE slot itself already points at the
+        // choice — a seeded/fallback anchor must materialize as a Switch so
+        // the commit writes `fable_current` and the lease fast-path works.
+        return if group_current(snapshot, group, RequestScope::Fable) == Some(&chosen.id) {
+            Decision::Stay
+        } else {
+            Decision::Switch {
+                to: chosen.id.clone(),
+            }
+        };
+    }
+
     // In heuristic-degraded mode every candidate is heuristic-parked: rank by
     // soonest `cooldown_until` so the next request lands on the soonest-freed
     // account. Otherwise use the mode's comparator: round-robin picks the next
@@ -591,6 +642,82 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
         None => 1.0,
     };
     servable_now * urgency
+}
+
+/// [`account_score`] for the FABLE lane (issue #121 follow-up): the same
+/// servable × urgency shape with the Fable weekly bucket taking the 7d
+/// window's roles. `servable_now = min(5h, 7d, Fable headroom)` — a Fable
+/// request burns all three budgets, so the binding one wins.
+///
+/// `urgency` is HYPERBOLIC (`week / time-left`, clamped), not the main
+/// lane's linear ramp: the linear ramp under-discriminates near the reset
+/// (38h-left vs 3h-left differ by ×1.19 — inside `SWITCH_MARGIN`, so the
+/// live defect this fixes — a FULL bucket resetting in 3h ignored in favor
+/// of a 93% bucket resetting in 1d14h — would survive a linear ramp). The
+/// hyperbola is the required burn RATE: remaining budget over the time
+/// left to burn it (3h-left ≈ 56×, 38h ≈ 4.4×, 6d ≈ 1.2×), so imminent
+/// resets win decisively while far resets leave stickiness in charge. A
+/// COLD bucket (never observed) has no known perishability and scores 1.0×
+/// — held by anchoring, never hunted.
+pub fn fable_score(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> f64 {
+    let five = account
+        .five_hour
+        .map_or(0.0, |w| w.effective_utilization(now));
+    let seven = account
+        .seven_day
+        .map_or(0.0, |w| w.effective_utilization(now));
+    let fable_window = account.fable_weekly().map(|s| s.window);
+    let fable = fable_window.map_or(0.0, |w| w.effective_utilization(now));
+    let (five_max, seven_max, fable_max) = effective_limits(account, params);
+    let r5 = (five_max - five).max(0.0);
+    let r7 = (seven_max - seven).max(0.0);
+    let rf = (fable_max - fable).max(0.0);
+    let servable_now = r5.min(r7).min(rf);
+    let urgency = match live_reset(&fable_window, now) {
+        Some(reset) => {
+            let secs_left = reset
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f64()
+                .max(1.0);
+            (SEVEN_DAY_PERIOD.as_secs_f64() / secs_left).clamp(1.0, FABLE_URGENCY_CAP)
+        }
+        None => 1.0,
+    };
+    servable_now * urgency
+}
+
+/// Ceiling for the hyperbolic Fable urgency: a reset ≤ ~100 minutes out is
+/// already maximally urgent — an unbounded hyperbola near zero would just
+/// amplify float noise between two both-imminent buckets.
+const FABLE_URGENCY_CAP: f64 = 100.0;
+
+/// [`rank`] for the FABLE lane: higher [`fable_score`] first, then soonest
+/// live Fable reset (known before unknown), then lower 5h utilization, then
+/// stable id. The codex tier rule is irrelevant here (fable models route to
+/// the claude group).
+fn fable_ranked(
+    a: &AccountSnapshot,
+    b: &AccountSnapshot,
+    params: &SelectParams,
+    _group: Option<BackendGroup>,
+    now: SystemTime,
+) -> Ordering {
+    let fable_reset = |x: &AccountSnapshot| live_reset(&x.fable_weekly().map(|s| s.window), now);
+    fable_score(b, params, now)
+        .total_cmp(&fable_score(a, params, now))
+        .then_with(|| match (fable_reset(a), fable_reset(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| {
+            let five =
+                |x: &AccountSnapshot| x.five_hour.map_or(0.0, |w| w.effective_utilization(now));
+            five(a).total_cmp(&five(b))
+        })
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// Ranking comparator: provider tier first (codex accounts are the overflow
@@ -2497,6 +2624,81 @@ mod tests {
             pick_scoped(&snap, &params(), None, now(), RequestScope::NonFable),
             Decision::Switch { to: id("a") },
             "non-Fable capacity is untouched"
+        );
+    }
+
+    fn fable_bucket(id_: &str, utilization: f64, resets_in_secs: u64) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(utilization, resets_in_secs),
+            severity: LimitSeverity::Normal,
+            is_active: false,
+        }];
+        a
+    }
+
+    /// Live defect 2026-07-16: two subscriptions — the fable lane camped a
+    /// 93%-remaining bucket resetting in 1d14h while a FULL bucket resetting
+    /// in 3h went unburned and expired. Use-it-or-lose-it must win: the
+    /// hyperbolic urgency (needed burn rate) makes the imminent reset
+    /// decisive over stickiness.
+    #[test]
+    fn fable_lane_burns_the_soon_resetting_full_bucket_first() {
+        let far = fable_bucket("far", 0.07, 38 * HOUR);
+        let soon = fable_bucket("soon", 0.0, 3 * HOUR);
+        // `far` is the account current AND the sticky fable current.
+        let mut snap = pool(vec![far, soon], Some("far"));
+        snap.fable_current.insert(BackendGroup::Claude, id("far"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("soon") },
+            "a full bucket resetting in 3h outranks a camped 93% bucket at 1d14h"
+        );
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::NonFable),
+            Decision::Stay,
+            "the main lane is untouched by fable perishability"
+        );
+    }
+
+    /// Issue #121: with no clearly-better bucket, the fable lane anchors on
+    /// the account-wide current — a COLD fable bucket included — and the
+    /// seeded anchor materializes as a Switch so `fable_current` commits.
+    #[test]
+    fn fable_lane_seeds_its_slot_from_the_account_current_when_cold() {
+        // Both accounts fable-cold: no perishability evidence anywhere.
+        let a = account("a");
+        let b = account("b");
+        let snap = pool(vec![a, b], Some("b"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("b") },
+            "empty fable slot seeds from the account current, not the ranker's pick"
+        );
+        // Once the slot points at the anchor, the lane stays.
+        let mut snap = pool(vec![account("a"), account("b")], Some("b"));
+        snap.fable_current.insert(BackendGroup::Claude, id("b"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Stay
+        );
+    }
+
+    /// Paused is absolute for the fable lane too (issue #121): a paused
+    /// anchor is never followed — the lane picks among the remaining
+    /// eligible accounts.
+    #[test]
+    fn fable_lane_never_follows_a_paused_anchor() {
+        let mut a = account("a");
+        a.paused = true;
+        let b = account("b");
+        let mut snap = pool(vec![a, b], Some("a"));
+        snap.fable_current.insert(BackendGroup::Claude, id("a"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("b") },
+            "a paused fable sticky current is abandoned at the next evaluation"
         );
     }
 

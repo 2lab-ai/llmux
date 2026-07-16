@@ -1017,17 +1017,22 @@ impl AccountPool {
         let heuristic_degraded = select::heuristic_degraded_mode(&snapshot, params, group, now);
         let unusable = match snapshot.accounts.iter().find(|a| a.id == current) {
             // Reuse the pure gate so the lease agrees with what the selector
-            // chose. Auth failure and a RetryAfter cooldown always refuse; a
-            // Heuristic cooldown refuses UNLESS the group is in degraded mode.
-            // 5h/7d/staleness gates are evaluation-tick concerns, not a reason
-            // to refuse a request already routed to the sticky current — so
-            // ignore those reasons here, matching the prior behavior (which
-            // refused only on health + active cooldown). A Fable request ALSO
-            // refuses on its scope-specific gates (Fable cooldown / Fable
-            // preemptive exclusion), so it never leases a Fable-dead current.
+            // chose. Auth failure, operator pause and a RetryAfter cooldown
+            // always refuse; a Heuristic cooldown refuses UNLESS the group is
+            // in degraded mode. 5h/7d/staleness gates are evaluation-tick
+            // concerns, not a reason to refuse a request already routed to
+            // the sticky current — so ignore those reasons here. A Fable
+            // request ALSO refuses on its scope-specific gates (Fable
+            // cooldown / Fable preemptive exclusion), so it never leases a
+            // Fable-dead current. Paused is in the refuse set because pause
+            // is the operator's ABSOLUTE bench (issue #121): the fable slot
+            // used to keep leasing a paused sticky current indefinitely —
+            // the NonFable slot healed on the next evaluation tick, but
+            // nothing re-evaluated `fable_current`.
             Some(acct) => matches!(
                 select::gate_scoped(acct, params, now, headers_only, heuristic_degraded, scope),
                 Some(select::IneligibleReason::AuthUnhealthy)
+                    | Some(select::IneligibleReason::Paused)
                     | Some(select::IneligibleReason::CoolingDown)
                     | Some(select::IneligibleReason::FableCoolingDown)
                     | Some(select::IneligibleReason::FableWeeklyExhausted)
@@ -1381,6 +1386,48 @@ mod tests {
             assert!(acct.cooldown_until.is_none());
             assert_eq!(acct.in_flight, 0);
         }
+    }
+
+    /// Issue #121 (live defect 2026-07-16): a PAUSED fable sticky current
+    /// kept serving new fable leases indefinitely — `Paused` was missing
+    /// from the lease refuse set, and nothing re-evaluated `fable_current`.
+    /// The full heal cycle: pause refuses the lease, the fable evaluation
+    /// moves the slot, the next lease lands on the healthy account.
+    #[test]
+    fn paused_fable_current_is_refused_and_heals_on_the_fable_tick() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        assert_eq!(
+            pool.evaluate_scoped(None, &params(), now(), select::RequestScope::Fable),
+            Decision::Switch { to: id("a") },
+            "fable slot seeds from the account current"
+        );
+        assert_eq!(
+            pool.lease_for_scoped(None, &params(), select::RequestScope::Fable)
+                .expect("healthy current leases")
+                .id,
+            id("a")
+        );
+
+        pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
+        assert!(
+            pool.lease_for_scoped(None, &params(), select::RequestScope::Fable)
+                .is_err(),
+            "a paused fable current must refuse new leases"
+        );
+        // The fable-scope evaluation (now run by the periodic tick, issue
+        // #121) moves the slot off the paused account…
+        assert_eq!(
+            pool.evaluate_scoped(None, &params(), now(), select::RequestScope::Fable),
+            Decision::Switch { to: id("b") }
+        );
+        // …and leases flow again.
+        assert_eq!(
+            pool.lease_for_scoped(None, &params(), select::RequestScope::Fable)
+                .expect("healed")
+                .id,
+            id("b")
+        );
     }
 
     /// Issue #115: the operator reset returns every account to the cold shape
