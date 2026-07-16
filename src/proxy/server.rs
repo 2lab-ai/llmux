@@ -371,9 +371,11 @@ impl AppState {
     ) -> Result<crate::config::SchedulerMode, crate::config::ConfigError> {
         // Persist FIRST (config-editor contract): a failed write must leave
         // the live scheduler untouched — never let disk and runtime diverge.
-        if let Some(path) = &self.config_path {
-            crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
-        }
+        // No config path = nothing to persist → refuse rather than diverge.
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::PersistenceUnavailable);
+        };
+        crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
         self.round_robin.store(
             mode == crate::config::SchedulerMode::RoundRobin,
             Ordering::Relaxed,
@@ -1446,16 +1448,22 @@ async fn codex_config_endpoint(
             Some(e.to_ascii_lowercase())
         };
     }
-    // Apply live (takes effect on the next request) ...
-    state.codex.set_shape(shape.clone());
-    // ... and persist so it survives a daemon restart (best-effort).
+    // Persist FIRST (config-editor contract): a failed write leaves the
+    // live shape untouched and surfaces the error — live-then-persist would
+    // let disk and runtime diverge behind a 200.
     if let Some(path) = &state.config_path {
-        let _ = crate::config::update_path(path, |c| {
+        if let Err(err) = crate::config::update_path(path, |c| {
             c.codex.default_model = shape.model.clone();
             c.codex.fast = shape.fast;
             c.codex.reasoning_effort = shape.effort.clone();
-        });
+        }) {
+            return relay_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("config write failed: {err}"),
+            );
+        }
     }
+    state.codex.set_shape(shape.clone());
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -1506,19 +1514,24 @@ async fn grok_config_endpoint(
             );
         }
     }
-    // Apply live (takes effect on the next request) ...
-    state.grok.set_shape(shape.clone());
-    // ... and persist so it survives a daemon restart. The outcome is
-    // reported, not swallowed (C10).
+    // Persist FIRST (config-editor contract): a failed write leaves the
+    // live shape untouched and surfaces the error.
     let persisted = match &state.config_path {
-        Some(path) => crate::config::update_path(path, |c| {
-            c.grok.default_model = shape.model.clone();
-            c.grok.reasoning_effort = shape.effort.clone();
-        })
-        .map_err(|err| tracing::warn!(error = %err, "grok config persist failed"))
-        .is_ok(),
+        Some(path) => {
+            if let Err(err) = crate::config::update_path(path, |c| {
+                c.grok.default_model = shape.model.clone();
+                c.grok.reasoning_effort = shape.effort.clone();
+            }) {
+                return relay_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("config write failed: {err}"),
+                );
+            }
+            true
+        }
         None => false,
     };
+    state.grok.set_shape(shape.clone());
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],

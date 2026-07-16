@@ -35,6 +35,8 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     #[error("could not determine config directory")]
     NoConfigDir,
+    #[error("no config path — persistence unavailable")]
+    PersistenceUnavailable,
     #[error("invalid import data: {0}")]
     Invalid(String),
 }
@@ -297,7 +299,7 @@ where
     Ok(config)
 }
 
-/// Generate a proxy api key: `ta-` + 32 random bytes, base64url (no pad).
+/// Generate a proxy api key: `lm-` + 32 random bytes, base64url (no pad).
 pub fn generate_api_key() -> String {
     use base64::Engine as _;
     format!(
