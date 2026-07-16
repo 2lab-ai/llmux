@@ -1258,6 +1258,11 @@ impl ActivityLog {
             }
         }
         self.perf_day_hwm = self.perf_day_hwm.max(history.perf_day_hwm);
+        // Re-prune after the merge with the same clamped anchor.
+        if self.perf_day_hwm > 0 {
+            let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
+            self.perf_daily.retain(|d, _| *d >= cutoff);
+        }
         // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
         // history lands on its original hours/days/months — same reasoning
         // as the daily chart buckets above. Watermarks merge by max and the
@@ -1978,10 +1983,16 @@ impl ActivityLog {
                         .entry((group.clone(), normalize_model(model), fast))
                         .or_default()
                         .add(status, aborted, tokens, duration_ms, ttfb_ms, gen_ms);
-                    // Retention prunes against a monotonic high-water mark —
-                    // a replayed out-of-order (or future-dated) event must
-                    // never rewind the window (same rule as the usage hwm).
-                    self.perf_day_hwm = self.perf_day_hwm.max(day);
+                    // Retention prunes against a monotonic high-water mark,
+                    // CLAMPED to the wall clock (+1 day of skew tolerance) —
+                    // an out-of-order replay can't rewind the window, and one
+                    // future-dated line can't prune real history (same rule
+                    // as the usage hwm).
+                    let wall_day = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    self.perf_day_hwm = self.perf_day_hwm.max(day.min(wall_day + 1));
                     let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
                     self.perf_daily.retain(|d, _| *d >= cutoff);
                 }
@@ -3689,6 +3700,81 @@ mod tests {
             (unknown.requests, unknown.tps_n, unknown.measured_n),
             (1, 1, 0)
         );
+    }
+
+    #[test]
+    fn perf_retention_survives_future_dated_lines_and_day_boundaries() {
+        // Review MUST-FIX: one future-dated line must not prune real history
+        // (hwm clamps to wall+1), and days age out at exactly 90 days.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let ev = |id: u64| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(1_000),
+            tokens: Some(TokenCounts {
+                input: 1,
+                output: 10,
+                cache_read: None,
+                cache_creation: None,
+            }),
+            group: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+        };
+        let now = SystemTime::now();
+        let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);
+        // Real history: today and 88 days back (inside the window even
+        // under the +1-day skew tolerance the hwm clamp allows).
+        log.apply(ev(1), day(88));
+        log.apply(ev(2), now);
+        assert_eq!(log.daily_perf().len(), 2);
+        // A future-dated line (clock skew / corrupt replay) 1000 days ahead:
+        // the clamped hwm keeps BOTH real days alive.
+        log.apply(ev(3), now + Duration::from_secs(1_000 * 86_400));
+        assert!(
+            log.daily_perf().len() >= 3,
+            "future line lands but prunes nothing real"
+        );
+        // A line just past the retention window prunes at the boundary.
+        log.apply(ev(4), day(DAILY_RETAIN_DAYS + 1));
+        let today_epoch = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        assert!(
+            log.daily_perf()
+                .iter()
+                .all(|r| r.day + DAILY_RETAIN_DAYS > today_epoch),
+            "expired day pruned at the boundary"
+        );
+    }
+
+    #[test]
+    fn modern_persisted_line_round_trips_gen_and_aborted() {
+        // Non-default gen_ms/aborted survive persist → parse → replay.
+        let line = r#"{"v":1,"ts_ms":1000,"id":9,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null,"fast":true,"ttfb_ms":120,"ttft_ms":800,"gen_ms":600,"aborted":true}"#;
+        let record: PersistedRequest = serde_json::from_str(line).expect("parses");
+        assert_eq!(record.gen_ms, Some(600));
+        assert!(record.aborted);
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let (event, ts) = record.into_event();
+        log.apply(event, ts);
+        let rows = log.daily_perf();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].errors, 1, "aborted counts as a provider error");
+        assert_eq!(rows[0].measured_n, 1);
+        assert_eq!(rows[0].post_ttft_ms, 600, "gen span is the denominator");
     }
 
     #[test]

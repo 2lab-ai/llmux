@@ -152,6 +152,13 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
 pub struct StreamTiming {
     pub first_byte: Option<std::time::Instant>,
     pub first_content: Option<std::time::Instant>,
+    /// The instant the pump observed the upstream stream END (EOF or error)
+    /// — captured INSIDE the pump, before any finish-side raw-io/trace/log
+    /// work, so the post-delta span never absorbs post-processing time.
+    pub stream_end: Option<std::time::Instant>,
+    /// An SSE `error` event was observed on the stream — a protocol-level
+    /// provider failure that arrives under a transport-clean HTTP 200.
+    pub saw_error_event: bool,
 }
 
 impl StreamTiming {
@@ -163,12 +170,56 @@ impl StreamTiming {
     }
 
     /// Observe an SSE payload headed to the client; latches `first_content`
-    /// on the first content delta.
+    /// on the first content delta and flags protocol-level `error` events.
     pub fn on_payload(&mut self, payload: &[u8]) {
         if self.first_content.is_none() && contains_content_delta(payload) {
             self.first_content = Some(std::time::Instant::now());
         }
+        if !self.saw_error_event && contains_error_event(payload) {
+            self.saw_error_event = true;
+        }
     }
+
+    /// Record that the upstream stream ended NOW (first call wins).
+    pub fn on_stream_end(&mut self) {
+        if self.stream_end.is_none() {
+            self.stream_end = Some(std::time::Instant::now());
+        }
+    }
+
+    /// The stream-side post-delta span in millis (first delta → stream end),
+    /// when both landmarks were observed.
+    pub fn gen_ms(&self) -> Option<u64> {
+        let (fc, end) = (self.first_content?, self.stream_end?);
+        Some(u64::try_from(end.saturating_duration_since(fc).as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+/// Whether `payload` carries an SSE `error` event (event name line or JSON
+/// `data.type == "error"`) — the protocol-level failure marker.
+pub fn contains_error_event(payload: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    for chunk in text.split("\n\n") {
+        for line in chunk.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                if name.trim() == "error" {
+                    return true;
+                }
+            } else if let Some(d) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(d.trim()) {
+                    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether `payload` carries a NON-EMPTY Anthropic `content_block_delta`
@@ -312,6 +363,7 @@ where
                 }
             }
         }
+        timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
             let out = transform.on_event(&rest);
             if !out.is_empty() && !client_gone {
@@ -488,6 +540,7 @@ where
                 }
             }
         }
+        timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
             timing.on_payload(rest.as_bytes());
             if let Some(observed) = extract_usage(&rest) {

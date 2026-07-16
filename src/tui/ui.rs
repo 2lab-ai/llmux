@@ -1549,10 +1549,47 @@ fn perf_series(view: &DashboardView, days: u64, now: SystemTime) -> Vec<PerfAgg>
     rows
 }
 
-/// Number of series rows the Perf overlay shows for the span — the key
-/// handler clamps its cursor with this.
-pub(crate) fn perf_series_count(view: &DashboardView, days: u64) -> usize {
-    perf_series(view, days, SystemTime::now()).len()
+/// Number of series rows the Perf overlay shows for the span (or the
+/// drilled-down day) — the key handler clamps its cursor with this.
+pub(crate) fn perf_series_count(view: &DashboardView, days: u64, day_off: Option<u64>) -> usize {
+    let now = SystemTime::now();
+    match day_off {
+        None => perf_series(view, days, now).len(),
+        Some(off) => perf_series_for_day(view, off, now).len(),
+    }
+}
+
+/// The per-(model, fast) series of ONE day, `off` days back from today —
+/// the contract C5 daily drill-down (`Σoutput/Σms` within that day).
+fn perf_series_for_day(view: &DashboardView, off: u64, now: SystemTime) -> Vec<PerfAgg> {
+    let (_, today) = perf_window(now, 1);
+    let day = today.saturating_sub(off);
+    let mut rows: Vec<PerfAgg> = Vec::new();
+    let mut agg: std::collections::BTreeMap<(String, String, Option<bool>), PerfAgg> =
+        Default::default();
+    for r in view.daily_perf.iter().filter(|r| r.day == day) {
+        let a = agg
+            .entry((r.group.clone(), r.model.clone(), r.fast))
+            .or_insert_with(|| PerfAgg {
+                group: r.group.clone(),
+                model: r.model.clone(),
+                fast: r.fast,
+                ..Default::default()
+            });
+        a.requests += r.requests;
+        a.errors += r.errors;
+        a.tps_n += r.tps_n;
+        a.output_tokens += r.output_tokens;
+        a.e2e_ms += r.e2e_ms;
+        a.measured_n += r.measured_n;
+        a.measured_output += r.measured_output;
+        a.post_ttft_ms += r.post_ttft_ms;
+        a.ttfb_n += r.ttfb_n;
+        a.ttfb_ms_sum += r.ttfb_ms_sum;
+    }
+    rows.extend(agg.into_values());
+    rows.sort_by_key(|a| std::cmp::Reverse(a.output_tokens));
+    rows
 }
 
 /// Colors for the perf chart series (rank order, distinct on dark terminals).
@@ -1582,7 +1619,10 @@ fn draw_perf_overlay(
         frame.render_widget(empty, area);
         return;
     }
-    let series = perf_series(view, days, ctx.now);
+    let series = match chrome.perf_day_off {
+        None => perf_series(view, days, ctx.now),
+        Some(off) => perf_series_for_day(view, off, ctx.now),
+    };
     // "Collecting since" = the first day that actually observed v1 TIMING
     // (ttfb or a measured span) — legacy replayed rows contribute e2e sums
     // but must not backdate the collection start (review MUST-FIX).
@@ -1614,7 +1654,17 @@ fn draw_perf_overlay(
     } else {
         draw_perf_health(frame, health_area, view, ctx, days, Some(&title));
     }
-    draw_perf_table(frame, table_area, &series, chrome.perf_cursor);
+    let scope = match chrome.perf_day_off {
+        None => format!("last {days}d"),
+        Some(off) => {
+            let (_, today) = perf_window(ctx.now, 1);
+            format!(
+                "day {} · h/l walks days",
+                day_label(today.saturating_sub(off))
+            )
+        }
+    };
+    draw_perf_table(frame, table_area, &series, chrome.perf_cursor, &scope);
 }
 
 /// `MM-DD`-style label for an epoch day (UTC), reusing the month/day half of
@@ -1663,7 +1713,7 @@ fn draw_perf_chart(
     // samples is a GAP, never a fabricated 0 (contract C5): each series is
     // split into contiguous sampled segments and each segment becomes its
     // own same-colored dataset, so the line breaks over quiet days.
-    let mut sums: Vec<Vec<Option<(u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
+    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
     for r in view.daily_perf.iter().filter(&in_span) {
         if let Some(idx) = ranked
             .iter()
@@ -1671,41 +1721,62 @@ fn draw_perf_chart(
         {
             let x = (r.day - start) as usize;
             if r.tps_n > 0 {
-                let slot = sums[idx][x].get_or_insert((0, 0));
+                let slot = sums[idx][x].get_or_insert((0, 0, 0));
                 slot.0 += r.output_tokens;
                 slot.1 += r.e2e_ms;
+                slot.2 += r.tps_n;
             }
         }
     }
+    // Segments split on BOTH gaps and confidence flips: low-sample (n<5)
+    // stretches render dim so a thin day can't read as a confident trend
+    // point; quiet days stay gaps (never a fabricated 0).
     let mut y_max = 1f64;
-    let mut segments: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+    // (series rank, low-confidence?, points)
+    type Segment = (usize, bool, Vec<(f64, f64)>);
+    let mut segments: Vec<Segment> = Vec::new();
     for (idx, day_sums) in sums.iter().enumerate() {
         let mut current: Vec<(f64, f64)> = Vec::new();
+        let mut current_low = false;
         for (x, slot) in day_sums.iter().enumerate() {
             match slot {
-                Some((out, ms)) if *ms > 0 => {
+                Some((out, ms, n)) if *ms > 0 => {
                     let y = *out as f64 * 1000.0 / *ms as f64;
                     y_max = y_max.max(y);
+                    let low = *n < 5;
+                    if low != current_low && !current.is_empty() {
+                        // Repeat the boundary point so the line stays
+                        // connected across the style change.
+                        let last = *current.last().expect("non-empty");
+                        segments.push((idx, current_low, std::mem::take(&mut current)));
+                        current.push(last);
+                    }
+                    current_low = low;
                     current.push((x as f64, y));
                 }
                 _ => {
                     if !current.is_empty() {
-                        segments.push((idx, std::mem::take(&mut current)));
+                        segments.push((idx, current_low, std::mem::take(&mut current)));
                     }
                 }
             }
         }
         if !current.is_empty() {
-            segments.push((idx, current));
+            segments.push((idx, current_low, current));
         }
     }
     let datasets: Vec<Dataset> = segments
         .iter()
-        .map(|(idx, data)| {
+        .map(|(idx, low, data)| {
+            let style = if *low {
+                dim()
+            } else {
+                Style::new().fg(PERF_CHART_COLORS[*idx])
+            };
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::new().fg(PERF_CHART_COLORS[*idx]))
+                .style(style)
                 .data(data)
         })
         .collect();
@@ -1741,7 +1812,7 @@ fn draw_perf_chart(
         spans.push(Span::raw(perf_series_label(group, model, *fast)));
     }
     spans.push(Span::styled(
-        "   (e2e t/s — estimated post-delta rates in the table below)",
+        "   (e2e t/s · dim = n<5 — estimated post-delta rates in the table below)",
         dim(),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
@@ -1847,7 +1918,7 @@ fn draw_perf_health(
 /// output tokens, e2e + estimated post-delta t/s, avg TTFB, and measured
 /// coverage (`measured/tps` samples). The estimated column is derived from
 /// measured samples only — approximate/legacy samples never mix in.
-fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: usize) {
+fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: usize, scope: &str) {
     let total = series.len();
     let cursor = cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1);
@@ -1911,7 +1982,7 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(format!(
-            " series — {} of {total} · est = post-first-delta (measured only) ",
+            " series ({scope}) — {} of {total} · est = post-first-delta (measured only) ",
             cursor.saturating_add(1).min(total.max(1))
         )));
     frame.render_widget(table, area);
@@ -7018,6 +7089,7 @@ mod tests {
             chart_days: 14,
             perf_days: 14,
             perf_cursor: 0,
+            perf_day_off: None,
             usage_gran: Default::default(),
             usage_scroll: 0,
             input_modal: None,

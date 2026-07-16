@@ -422,10 +422,10 @@ impl ForwardContext {
             ttft_ms: self
                 .dispatched
                 .and_then(|d| timing.first_content.map(|at| ms_since(d, at))),
-            gen_ms: timing
-                .first_content
-                .map(|fc| ms_since(fc, std::time::Instant::now())),
-            aborted: false,
+            // Fixed inside the pump at upstream EOF (StreamTiming::gen_ms) —
+            // JSON assembly / raw-io capture never inflates the span.
+            gen_ms: timing.gen_ms(),
+            aborted: timing.saw_error_event,
             user_id: self.user_id.clone(),
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
@@ -1980,7 +1980,9 @@ async fn relay(
             raw_io_max_body,
             std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
             move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
-                let upstream_error = error.is_some();
+                // Provider failure = transport break OR a protocol-level SSE
+                // `error` event (arrives under a clean HTTP 200).
+                let upstream_error = error.is_some() || timing.saw_error_event;
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -2030,9 +2032,9 @@ async fn relay(
                         fast: Some(fast),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
                         ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
-                        gen_ms: timing
-                            .first_content
-                            .map(|fc| ms_since(fc, std::time::Instant::now())),
+                        // Fixed INSIDE the pump at upstream EOF — finish-side
+                        // raw-io/log work never inflates the span.
+                        gen_ms: timing.gen_ms(),
                         aborted: upstream_error,
                         user_id,
                         kind,
@@ -2306,9 +2308,13 @@ async fn relay_translate(
                   converter,
                   client_gone,
                   timing: sse::StreamTiming| {
-                // Provider-health truth: a mid-stream upstream break is a
-                // failure even though the client already holds a 200 header.
-                let upstream_error = error.is_some();
+                // Provider-health truth: a transport break, a converter-
+                // level protocol failure (codex/grok `response.failed` — the
+                // converter preserves its message), or an SSE `error` event
+                // is a provider failure even under a client-200.
+                let upstream_error = error.is_some()
+                    || converter.error_message().is_some()
+                    || timing.saw_error_event;
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
@@ -2386,9 +2392,7 @@ async fn relay_translate(
                         fast: Some(fast),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
                         ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
-                        gen_ms: timing
-                            .first_content
-                            .map(|fc| ms_since(fc, std::time::Instant::now())),
+                        gen_ms: timing.gen_ms(),
                         aborted: upstream_error,
                         user_id,
                         kind,
@@ -2457,6 +2461,7 @@ async fn relay_translate(
             }
         }
     }
+    timing.on_stream_end();
     if let Some(rest) = events.take_remainder() {
         let out = converter.on_event(&rest);
         timing.on_payload(&out);

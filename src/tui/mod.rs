@@ -407,6 +407,9 @@ pub(crate) struct Chrome {
     pub perf_days: u64,
     /// Cursor row in the Perf overlay's series table.
     pub perf_cursor: usize,
+    /// Selected day for the series table, as an offset back from today
+    /// (`None` = whole-span aggregate; `h`/`l` or ←/→ move it).
+    pub perf_day_off: Option<u64>,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     pub usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
@@ -656,9 +659,10 @@ struct App {
     pane_heights: PaneHeights,
     /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
     chart_days: u64,
-    /// Perf overlay span (`d` cycles) + series-table cursor.
+    /// Perf overlay span (`d` cycles) + series-table cursor + day select.
     perf_days: u64,
     perf_cursor: usize,
+    perf_day_off: Option<u64>,
     /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
@@ -786,6 +790,7 @@ impl App {
             chart_days: 14,
             perf_days: 14,
             perf_cursor: 0,
+            perf_day_off: None,
             account_row_chrome: Vec::new(),
             menu_chrome: None,
             menu_anchor: None,
@@ -1016,6 +1021,7 @@ impl App {
             chart_days: self.chart_days,
             perf_days: self.perf_days,
             perf_cursor: self.perf_cursor,
+            perf_day_off: self.perf_day_off,
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
             input_modal: self.input_modal.clone(),
@@ -1969,7 +1975,7 @@ impl App {
     /// closes, `q` quits.
     fn on_key_perf(&mut self, code: KeyCode, view: Option<&DashboardView>) {
         let rows = view
-            .map(|v| ui::perf_series_count(v, self.perf_days))
+            .map(|v| ui::perf_series_count(v, self.perf_days, self.perf_day_off))
             .unwrap_or(0);
         match code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -1982,6 +1988,25 @@ impl App {
                     .map(|i| (i + 1) % spans.len())
                     .unwrap_or(0);
                 self.perf_days = spans[next];
+                self.perf_cursor = 0;
+                self.perf_day_off = None;
+            }
+            // Day drill-down (contract C5: per-day model×fast detail):
+            // ←/h walks back a day, →/l walks forward; walking past today
+            // returns to the whole-span aggregate.
+            KeyCode::Left | KeyCode::Char('h') => {
+                let max_off = self.perf_days.saturating_sub(1);
+                self.perf_day_off = Some(match self.perf_day_off {
+                    None => 0,
+                    Some(off) => (off + 1).min(max_off),
+                });
+                self.perf_cursor = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.perf_day_off = match self.perf_day_off {
+                    None | Some(0) => None,
+                    Some(off) => Some(off - 1),
+                };
                 self.perf_cursor = 0;
             }
             KeyCode::Up | KeyCode::Char('k') => {
