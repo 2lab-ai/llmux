@@ -46,7 +46,8 @@ Remote daemon:
       llmux --remote llmux-host run     # point claude at the remote proxy
       llmux status                       # probe the remote (with remote.host set)
 
-  In remote mode run/server/dashboard/status/env/accounts target the remote;
+  In remote mode run/server/dashboard/status/env/accounts/reset-usage target
+  the remote;
   stop/restart/remove/login/import are refused (run them on the daemon's host);
   channel/update stay local (they manage this machine's binary).
 
@@ -103,6 +104,10 @@ pub enum Command {
     Status(StatusArgs),
     /// List configured accounts.
     Accounts(AccountsArgs),
+    /// Force every account's usage windows and cooldowns back to cold on the
+    /// target daemon (POST /llmux/reset-usage) — for when the provider reset
+    /// quota server-side and the local gauges overstate usage.
+    ResetUsage(ResetUsageArgs),
     /// Remove an account by name.
     Remove(RemoveArgs),
     /// Debug: perform a GET against the upstream API on the current account.
@@ -145,6 +150,9 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {}
+
+#[derive(Debug, Args)]
+pub struct ResetUsageArgs {}
 
 #[derive(Debug, Args)]
 pub struct RestartArgs {}
@@ -273,6 +281,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::list(args, remote).await,
+        Command::ResetUsage(args) => daemon::reset_usage(args, remote).await,
         Command::Remove(args) => accounts::remove(args).await,
         Command::Api(args) => api::run(args).await,
         Command::Channel(args) => channel::run(args).await,
@@ -776,6 +785,11 @@ mod tests {
             None
         );
         assert_eq!(remote_refused_command(&Command::Env(EnvArgs {})), None);
+        assert_eq!(
+            remote_refused_command(&Command::ResetUsage(ResetUsageArgs {})),
+            None,
+            "reset-usage targets the daemon, so remote mode must allow it"
+        );
         assert_eq!(
             remote_refused_command(&Command::Channel(ChannelArgs { channel: None })),
             None

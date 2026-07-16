@@ -508,6 +508,28 @@ impl PoolState {
         }
     }
 
+    /// Force every account's usage state back to COLD (issue #115): providers
+    /// occasionally reset quota server-side, leaving these in-memory windows
+    /// and cooldowns overstating utilization until they age out. Clears the
+    /// account windows, the model-scoped limits and every cooldown — and ONLY
+    /// usage: health, pause state, per-account ceilings, credentials and
+    /// in-flight leases are operator/liveness state and stay untouched.
+    /// Gauges repopulate from the next usage poll / response headers (the
+    /// idle-probe cold sweep keeps cold accounts refreshing). Returns the
+    /// number of accounts reset.
+    pub fn reset_usage(&mut self) -> usize {
+        for account in &mut self.accounts {
+            account.five_hour = None;
+            account.seven_day = None;
+            account.scoped_limits.clear();
+            account.scoped_cooldowns.clear();
+            account.cooldown_until = None;
+            account.cooldown_source = None;
+            account.cooldown_set_at = None;
+        }
+        self.accounts.len()
+    }
+
     /// Record an upstream 429. With `retry_after` the account parks exactly
     /// that long (`CooldownSource::RetryAfter`); without it a default
     /// heuristic cooldown applies.
@@ -1135,6 +1157,12 @@ impl AccountPool {
         self.write().record_usage(account, usage, now);
     }
 
+    /// See [`PoolState::reset_usage`] — the `POST /llmux/reset-usage`
+    /// operator command (issue #115).
+    pub fn reset_usage(&self) -> usize {
+        self.write().reset_usage()
+    }
+
     pub fn record_429(&self, account: &AccountId, retry_after: Option<Duration>, now: SystemTime) {
         self.write().record_429(account, retry_after, now);
     }
@@ -1353,6 +1381,49 @@ mod tests {
             assert!(acct.cooldown_until.is_none());
             assert_eq!(acct.in_flight, 0);
         }
+    }
+
+    /// Issue #115: the operator reset returns every account to the cold shape
+    /// above — windows/scoped limits/cooldowns gone — while operator state
+    /// (pause, per-account ceilings) survives.
+    #[test]
+    fn reset_usage_clears_windows_and_cooldowns_but_keeps_operator_state() {
+        let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
+        state.record_usage(
+            &id("a"),
+            &usage(
+                Some(reading(0.87, NOW_SECS + 3600)),
+                Some(reading(0.42, NOW_SECS + 86_400)),
+            ),
+            now(),
+        );
+        state.record_429(&id("b"), None, now());
+        state.accounts[1].paused = true;
+        assert!(state.accounts[0].five_hour.is_some(), "seed took");
+        assert!(state.accounts[1].cooldown_until.is_some(), "seed took");
+
+        assert_eq!(state.reset_usage(), 2, "reports the accounts reset");
+        for acct in &state.accounts {
+            assert!(acct.five_hour.is_none(), "{}: 5h window cold", acct.id.0);
+            assert!(acct.seven_day.is_none(), "{}: 7d window cold", acct.id.0);
+            assert!(
+                acct.scoped_limits.is_empty(),
+                "{}: scoped limits",
+                acct.id.0
+            );
+            assert!(
+                acct.scoped_cooldowns.is_empty(),
+                "{}: scoped cooldowns",
+                acct.id.0
+            );
+            assert!(acct.cooldown_until.is_none(), "{}: cooldown", acct.id.0);
+            assert!(acct.cooldown_source.is_none(), "{}: source", acct.id.0);
+            assert!(acct.cooldown_set_at.is_none(), "{}: set_at", acct.id.0);
+        }
+        assert!(
+            state.accounts[1].paused,
+            "pause is operator state, not usage — must survive the reset"
+        );
     }
 
     #[test]
