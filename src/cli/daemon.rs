@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::{proxy_base_url, CliError, StopArgs};
+use super::{proxy_base_url, CliError, ResetUsageArgs, StopArgs};
 use crate::config::Config;
 
 /// Probe timeout: long enough for a loaded localhost server, short enough
@@ -426,6 +426,72 @@ async fn shutdown_and_wait(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// `llmux reset-usage` — `POST /llmux/reset-usage` on the target daemon
+/// (local, or the remote in remote mode): force every account's usage
+/// windows, scoped limits and cooldowns back to cold after a provider-side
+/// quota reset (issue #115). Gauges repopulate from the next usage poll /
+/// response headers. A missing server is an error — there is no live usage
+/// to reset without a daemon.
+pub async fn reset_usage(_args: ResetUsageArgs, remote: Option<String>) -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let endpoint = super::resolve_endpoint(remote.as_deref(), &config)?;
+    match probe_server(&endpoint.base_url, endpoint.api_key.as_deref()).await? {
+        ServerProbe::NotRunning => {
+            return Err(CliError::Message(format!(
+                "server not running on {}:{} — no live usage to reset",
+                endpoint.host, endpoint.port
+            )));
+        }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "llmux on {}:{} rejected the api key (401) — check `remote.api_key` \
+                 (remote) or `proxy.api_key` (local) in the config",
+                endpoint.host, endpoint.port
+            )));
+        }
+        ServerProbe::Foreign { detail } => {
+            return Err(CliError::Message(format!(
+                "port {} answers but is not llmux: {detail}",
+                endpoint.port
+            )));
+        }
+        ServerProbe::Running { .. } => {}
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
+    let url = format!("{}/llmux/reset-usage", endpoint.base_url);
+    let mut request = client.post(&url);
+    if let Some(api_key) = endpoint.api_key.as_deref() {
+        request = request.header("x-api-key", api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| CliError::Message(format!("reset-usage request failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(CliError::Message(format!(
+            "server returned {} for {url}",
+            response.status()
+        )));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| CliError::Message(format!("reset-usage response parse failed: {err}")))?;
+    let accounts = body
+        .get("accounts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!(
+        "usage reset to cold for {accounts} account(s) on {}:{} — gauges repopulate on the next poll",
+        endpoint.host, endpoint.port
+    );
+    Ok(())
 }
 
 /// `llmux stop` — cooperatively shut down the running server and wait for
