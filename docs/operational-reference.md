@@ -19,11 +19,32 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `remove <name> [--yes]` | Remove an account by name. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Usage tab (calendar usage + cost)
 
 The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title carries the period totals. Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
+
+### Perf tab (observed performance)
+
+The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
+
+- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series, y = end-to-end output tokens/sec (`Σoutput / Σduration` per day).
+- **Provider health matrix** — one row per day, one column per provider: request count, error %, average TTFB (time to first upstream body byte), and e2e t/s. A day with no traffic renders `—`, never a fabricated `0`.
+- **Series table** — per `(provider, model, fast)` over the span (`j`/`k` scroll): requests, error %, output tokens, `e2e t/s`, `est t/s`, average TTFB, and measured coverage (`measured/throughput` samples).
+
+Metric semantics (v1, deliberately conservative):
+
+- `e2e t/s` = output tokens / total request duration — always available, includes queueing and time-to-first-token.
+- TTFB and the first-delta offset are measured from the **served attempt's upstream dispatch** (the moment the winning upstream request was sent) — request-body buffering, scheduling, token refreshes, and 429 parks never contaminate them.
+- `est t/s` = output tokens / the **stream-side span from the first streamed output delta to the end of the upstream stream** (fixed inside the relay pump at upstream EOF — file IO and post-processing never inflate it) (the first `content_block_delta`, thinking deltas included; empty deltas never count). Labeled *estimated* because hidden reasoning (e.g. Codex reasoning that streams only as summaries) may precede the first delta — this is **not** a model decode-speed claim. Derived only from requests whose UPSTREAM stream produced a first delta (a client asking for `stream=false` still counts — llmux streams from the provider either way); legacy history and upstream JSON/non-SSE responses never mix into it.
+- Codex **fast mode** splits every series: `⚡` = fast on, no marker = off, `?` = history recorded before the field existed (unknown — kept separate, never counted as off).
+- Confidence is judged per statistic: `e2e` dims under its own throughput-sample count, `est` under its measured-sample count (fewer than 5 → dim; still shown — low traffic is itself a signal); aggregates whose summed span can't support a stable ratio show `—`. Quiet days are chart GAPS and `—` health rows, never a fabricated `0`. A mid-stream upstream abort — transport break, converter-level `response.failed`, or an SSE `error` event — counts as an error even though the client already held a 200. In the perf tab, `h`/`l` (←/→) drill the series table into a single day (the user-facing per-day provider/model stats); `Esc`-ward `l` past today returns to the span aggregate.
+- Data is rebuilt from the persisted request log on restart and retained 90 days; the tab title carries `timing since <date>` — the first day that actually observed v1 timing, not the oldest replayed legacy row.
+
+The activity feed gains the same per-request view: a `t/s` column (e2e) on every completed row, and the click-expanded detail shows `e2e` / `est … post-delta` / `ttfb` / `first output` when recorded. Attach clients receive the same rows on `GET /llmux/dashboard` (`daily_perf`).
+
+In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
 
 ## Install and launch details
 

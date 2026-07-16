@@ -135,6 +135,150 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
     }
 }
 
+/// Wall-clock landmarks of one relayed stream, captured inside the pump and
+/// handed to `finish` for activity timing (perf telemetry v1):
+/// - `first_byte` — the instant the FIRST successful upstream body chunk
+///   arrived (TTFB).
+/// - `first_content` — the instant the FIRST `content_block_delta` event was
+///   observed on the downstream-normalized output ("first streamed output
+///   delta"; text_delta / thinking_delta / input_json_delta alike —
+///   deliberately NOT text-only, so thinking time stays inside the
+///   post-delta window and the numerator/denominator agree).
+///
+/// `None` means the stream ended before that landmark. Instants (not
+/// durations) so `finish` can compute offsets against the request's own
+/// start.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamTiming {
+    pub first_byte: Option<std::time::Instant>,
+    pub first_content: Option<std::time::Instant>,
+    /// The instant the pump observed the upstream stream END (EOF or error)
+    /// — captured INSIDE the pump, before any finish-side raw-io/trace/log
+    /// work, so the post-delta span never absorbs post-processing time.
+    pub stream_end: Option<std::time::Instant>,
+    /// An SSE `error` event was observed on the stream — a protocol-level
+    /// provider failure that arrives under a transport-clean HTTP 200.
+    pub saw_error_event: bool,
+    /// The CLIENT disconnected mid-relay. Not a provider failure — and the
+    /// stream was truncated on OUR side, so no post-delta span may be
+    /// claimed from it (see [`Self::gen_ms`]).
+    pub client_gone: bool,
+}
+
+impl StreamTiming {
+    /// Record a successful body-chunk arrival (first call wins).
+    pub fn on_chunk(&mut self) {
+        if self.first_byte.is_none() {
+            self.first_byte = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Observe an SSE payload headed to the client; latches `first_content`
+    /// on the first content delta and flags protocol-level `error` events.
+    pub fn on_payload(&mut self, payload: &[u8]) {
+        if self.first_content.is_none() && contains_content_delta(payload) {
+            self.first_content = Some(std::time::Instant::now());
+        }
+        if !self.saw_error_event && contains_error_event(payload) {
+            self.saw_error_event = true;
+        }
+    }
+
+    /// Record that the upstream stream ended NOW (first call wins).
+    pub fn on_stream_end(&mut self) {
+        if self.stream_end.is_none() {
+            self.stream_end = Some(std::time::Instant::now());
+        }
+    }
+
+    /// The stream-side post-delta span in millis (first delta → stream end),
+    /// when both landmarks were observed. `None` after a client disconnect —
+    /// the relay stopped pulling, so the span would measure OUR truncation,
+    /// not the provider's generation.
+    pub fn gen_ms(&self) -> Option<u64> {
+        if self.client_gone {
+            return None;
+        }
+        let (fc, end) = (self.first_content?, self.stream_end?);
+        Some(u64::try_from(end.saturating_duration_since(fc).as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+/// Whether `payload` carries an SSE `error` event (event name line or JSON
+/// `data.type == "error"`) — the protocol-level failure marker.
+pub fn contains_error_event(payload: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    for chunk in text.split("\n\n") {
+        for line in chunk.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                if name.trim() == "error" {
+                    return true;
+                }
+            } else if let Some(d) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(d.trim()) {
+                    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether `payload` carries a NON-EMPTY Anthropic `content_block_delta`
+/// event — the "first streamed output delta" latch for [`StreamTiming`].
+/// Structured check (not a substring scan): each complete SSE event is
+/// identified by its `event:` name line or its JSON `data.type`, and only a
+/// delta whose `text` / `thinking` / `partial_json` value is non-empty
+/// counts — framing, empty deltas, and lifecycle events that merely CONTAIN
+/// the token (e.g. a tool named after it) can never latch. Called only until
+/// the first latch, so the per-event JSON parse is bounded.
+pub fn contains_content_delta(payload: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    for chunk in text.split("\n\n") {
+        let mut named_delta = false;
+        let mut data: Option<&str> = None;
+        for line in chunk.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                named_delta = name.trim() == "content_block_delta";
+            } else if let Some(d) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                data = Some(d.trim());
+            }
+        }
+        let Some(data) = data else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let typed_delta =
+            value.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta");
+        if !(named_delta || typed_delta) {
+            continue;
+        }
+        let non_empty = value.get("delta").is_some_and(|d| {
+            ["text", "thinking", "partial_json"].iter().any(|k| {
+                d.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+            })
+        });
+        if non_empty {
+            return true;
+        }
+    }
+    false
+}
+
 /// Stateful per-request SSE transformer: upstream events in, downstream SSE
 /// bytes out. The codex provider's Responses→Anthropic converter implements
 /// this; the Anthropic passthrough never goes through it (byte-identity path
@@ -186,7 +330,7 @@ where
     // `finish` also receives the finished transform (for converter-level detail
     // like the codex trace's raw usage / event count) and whether the relay
     // ended because the CLIENT disconnected (vs. upstream completing).
-    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, RawCapture, Option<String>, &T, bool)
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, RawCapture, Option<String>, &T, bool, StreamTiming)
         + Send
         + 'static,
 {
@@ -197,11 +341,13 @@ where
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut upstream_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
+        let mut timing = StreamTiming::default();
         let mut stream = Box::pin(upstream.bytes_stream());
         let mut client_gone = false;
         'pump: while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
+                    timing.on_chunk();
                     upstream_captured.push(&chunk);
                     for event in events.push(&chunk) {
                         let out = transform.on_event(&event);
@@ -209,8 +355,12 @@ where
                             continue;
                         }
                         // Send FIRST, then observe both buffers.
+                        // Observe timing BEFORE the client send: the latch
+                        // must not absorb client backpressure.
+                        timing.on_payload(&out);
                         if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                             client_gone = true;
+                            timing.client_gone = true;
                             break 'pump;
                         }
                         capture(&mut captured, &out, capture_limit);
@@ -223,11 +373,14 @@ where
                 }
             }
         }
+        timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
             let out = transform.on_event(&rest);
             if !out.is_empty() && !client_gone {
+                timing.on_payload(&out);
                 if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                     client_gone = true;
+                    timing.client_gone = true;
                 } else {
                     capture(&mut captured, &out, capture_limit);
                     raw_captured.push(&out);
@@ -253,6 +406,7 @@ where
             error,
             &transform,
             client_gone,
+            timing,
         );
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -344,7 +498,7 @@ pub fn passthrough_body<F>(
     finish: F,
 ) -> axum::body::Body
 where
-    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>) + Send + 'static,
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>, StreamTiming) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
@@ -353,6 +507,7 @@ where
         let mut captured: Vec<u8> = Vec::new();
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
+        let mut timing = StreamTiming::default();
         let mut stream = Box::pin(upstream.bytes_stream());
         loop {
             let item = match tokio::time::timeout(idle_timeout, stream.next()).await {
@@ -373,7 +528,9 @@ where
             };
             match item {
                 Ok(chunk) => {
+                    timing.on_chunk();
                     for event in events.push(&chunk) {
+                        timing.on_payload(event.as_bytes());
                         if let Some(observed) = extract_usage(&event) {
                             usage.add(observed);
                         }
@@ -382,6 +539,7 @@ where
                     // the receiver and we stop polling upstream. Send FIRST,
                     // then observe — the copies never delay the client.
                     if tx.send(Ok(chunk.clone())).await.is_err() {
+                        timing.client_gone = true;
                         break;
                     }
                     capture(&mut captured, &chunk, capture_limit);
@@ -394,12 +552,14 @@ where
                 }
             }
         }
+        timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
+            timing.on_payload(rest.as_bytes());
             if let Some(observed) = extract_usage(&rest) {
                 usage.add(observed);
             }
         }
-        finish(usage, captured, raw_captured, error);
+        finish(usage, captured, raw_captured, error, timing);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }

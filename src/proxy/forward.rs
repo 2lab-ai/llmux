@@ -234,6 +234,14 @@ struct ForwardContext {
     /// Correlates RequestStarted → Routed → Finished in the activity feed.
     activity_id: u64,
     started: std::time::Instant,
+    /// The instant the SERVED upstream attempt was dispatched (set right
+    /// before each `send_upstream`; retries overwrite it, so the value the
+    /// relay sees belongs to the attempt that actually produced the
+    /// response). TTFB/TTFT are measured from THIS baseline — measuring from
+    /// `started` would fold body buffering, scheduling, token refreshes, and
+    /// 429 parks into a provider metric (review MUST-FIX 7). `None` only on
+    /// pre-dispatch failures, where no timing is emitted anyway.
+    dispatched: Option<std::time::Instant>,
     /// The model named in the request body (for the routing log line).
     model: Option<String>,
     /// The keyless per-client metering identity (`metadata.user_id`) parsed
@@ -356,6 +364,7 @@ impl ForwardContext {
             model,
             account.map(|a| a.0.clone()),
             Some(status.as_u16()),
+            Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             &self.body,
             response,
             state.config.raw_io.max_body_bytes,
@@ -365,13 +374,29 @@ impl ForwardContext {
         );
     }
 
-    /// Emit the terminal activity event for this request.
+    /// Emit the terminal activity event for this request (no stream timing —
+    /// error paths and non-streaming relays, where TTFB/first-delta were never
+    /// observed).
     fn emit_finished(
         &self,
         state: &AppState,
         account: Option<&AccountId>,
         status: StatusCode,
         tokens: Option<TokenCounts>,
+    ) {
+        self.emit_finished_timed(state, account, status, tokens, sse::StreamTiming::default());
+    }
+
+    /// Emit the terminal activity event with the stream-timing landmarks the
+    /// relay pump observed (perf telemetry v1): TTFB + first streamed output
+    /// delta, both as millis offsets from this request's start.
+    fn emit_finished_timed(
+        &self,
+        state: &AppState,
+        account: Option<&AccountId>,
+        status: StatusCode,
+        tokens: Option<TokenCounts>,
+        timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
             group,
@@ -390,7 +415,17 @@ impl ForwardContext {
             group,
             model,
             effort,
-            fast,
+            fast: Some(fast),
+            ttfb_ms: self
+                .dispatched
+                .and_then(|d| timing.first_byte.map(|at| ms_since(d, at))),
+            ttft_ms: self
+                .dispatched
+                .and_then(|d| timing.first_content.map(|at| ms_since(d, at))),
+            // Fixed inside the pump at upstream EOF (StreamTiming::gen_ms) —
+            // JSON assembly / raw-io capture never inflates the span.
+            gen_ms: timing.gen_ms(),
+            aborted: timing.saw_error_event,
             user_id: self.user_id.clone(),
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
@@ -697,7 +732,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 group: None,
                 model: None,
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 // Body never read → no metering identity; metered as unknown.
                 user_id: None,
                 kind: None,
@@ -744,6 +783,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         sections: Vec::new(),
         activity_id,
         started,
+        dispatched: None,
         model,
         user_id,
         kind: Some(classified.kind.to_string()),
@@ -1105,6 +1145,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
+        ctx.dispatched = Some(std::time::Instant::now());
         let send_result = send_upstream(state, &endpoint, &upstream_req).await;
 
         let response = match send_result {
@@ -1901,6 +1942,7 @@ async fn relay(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
             group,
             model,
@@ -1937,7 +1979,15 @@ async fn relay(
             BODY_LOG_LIMIT,
             raw_io_max_body,
             std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
-            move |usage, captured, raw_captured, error| {
+            move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
+                // Provider failure = transport break OR a protocol-level SSE
+                // `error` event (arrives under a clean HTTP 200).
+                let upstream_error = provider_failure(
+                    timing.client_gone,
+                    error.is_some(),
+                    false,
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -1950,6 +2000,7 @@ async fn relay(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(status.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
@@ -1983,7 +2034,13 @@ async fn relay(
                         group,
                         model,
                         effort,
-                        fast,
+                        fast: Some(fast),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        // Fixed INSIDE the pump at upstream EOF — finish-side
+                        // raw-io/log work never inflates the span.
+                        gen_ms: timing.gen_ms(),
+                        aborted: upstream_error,
                         user_id,
                         kind,
                         excerpt,
@@ -2194,6 +2251,7 @@ async fn relay_translate(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
             group,
             model,
@@ -2253,7 +2311,18 @@ async fn relay_translate(
                   upstream_captured,
                   error,
                   converter,
-                  client_gone| {
+                  client_gone,
+                  timing: sse::StreamTiming| {
+                // Provider-health truth: a transport break, a converter-
+                // level protocol failure (codex/grok `response.failed` — the
+                // converter preserves its message), or an SSE `error` event
+                // is a provider failure even under a client-200.
+                let upstream_error = provider_failure(
+                    client_gone,
+                    error.is_some(),
+                    converter.error_message().is_some(),
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
@@ -2278,6 +2347,7 @@ async fn relay_translate(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(StatusCode::OK.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
@@ -2327,7 +2397,11 @@ async fn relay_translate(
                         group,
                         model,
                         effort,
-                        fast,
+                        fast: Some(fast),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        gen_ms: timing.gen_ms(),
+                        aborted: upstream_error,
                         user_id,
                         kind,
                         excerpt,
@@ -2366,15 +2440,18 @@ async fn relay_translate(
         .is_some()
         .then(|| sse::RawCapture::new(raw_io_max_body));
     let mut events = sse::EventBuffer::new();
+    let mut timing = sse::StreamTiming::default();
     let mut stream = Box::pin(response.bytes_stream());
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => {
+                timing.on_chunk();
                 if let Some(tee) = upstream_tee.as_mut() {
                     tee.push(&chunk);
                 }
                 for event in events.push(&chunk) {
-                    let _ = converter.on_event(&event);
+                    let out = converter.on_event(&event);
+                    timing.on_payload(&out);
                 }
             }
             Err(err) => {
@@ -2392,8 +2469,10 @@ async fn relay_translate(
             }
         }
     }
+    timing.on_stream_end();
     if let Some(rest) = events.take_remainder() {
-        let _ = converter.on_event(&rest);
+        let out = converter.on_event(&rest);
+        timing.on_payload(&out);
     }
     let _ = converter.on_end();
     let usage = converter.usage();
@@ -2442,11 +2521,12 @@ async fn relay_translate(
                 Some(&client_headers),
                 upstream_raw,
             );
-            ctx.emit_finished(
+            ctx.emit_finished_timed(
                 state,
                 Some(&account),
                 StatusCode::OK,
                 Some(token_counts(usage)),
+                timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
             out.headers_mut().insert(
@@ -2467,6 +2547,28 @@ async fn relay_translate(
     ctx.flush_log(state);
     drop(lease);
     result
+}
+
+/// Whether a finished relay counts as a PROVIDER failure for perf accounting
+/// (the `aborted` flag): any upstream termination — transport break,
+/// converter-level protocol failure, or an SSE `error` event — but NEVER a
+/// client disconnect: when the client walked away, every downstream signal
+/// (including a converter truncation error) describes OUR cancellation, not
+/// the provider. Pure so the exact production decision is unit-testable.
+fn provider_failure(
+    client_gone: bool,
+    transport_error: bool,
+    converter_error: bool,
+    saw_error_event: bool,
+) -> bool {
+    !client_gone && (transport_error || converter_error || saw_error_event)
+}
+
+/// Millis from `start` to `at`, saturating (the pump's landmarks are always
+/// at-or-after the request start; clamp instead of panicking if clocks say
+/// otherwise).
+fn ms_since(start: std::time::Instant, at: std::time::Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Usage from a non-streaming JSON response body (`{"usage": {...}}`),
@@ -2595,6 +2697,7 @@ mod tests {
             sections: Vec::new(),
             activity_id: 0,
             started: std::time::Instant::now(),
+            dispatched: Some(std::time::Instant::now()),
             model: Some(model.to_string()),
             user_id: None,
             kind: None,
@@ -4184,6 +4287,217 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.input_tokens, 25);
         assert_eq!(totals.output_tokens, 42);
+    }
+
+    /// Drive `sse::transform_body` with a REAL HTTP response (the scripted
+    /// mock) through the REAL codex converter and capture what `finish`
+    /// receives — the integration chain the closures build RequestFinished
+    /// from (review MUST-FIX 4).
+    async fn run_transform(
+        body: String,
+        drop_client: bool,
+    ) -> (crate::proxy::sse::StreamTiming, bool, Option<String>, bool) {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSseOwned { body });
+        let upstream = spawn_mock(shared.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{upstream}/v1/responses"))
+            .send()
+            .await
+            .expect("mock reachable");
+        let converter = crate::provider::responses::ResponsesSseConverter::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = crate::proxy::sse::transform_body(
+            response,
+            converter,
+            BODY_LOG_LIMIT,
+            0,
+            move |_usage, _cap, _raw, _up, error, converter, client_gone, timing| {
+                let _ = tx.send((
+                    timing,
+                    client_gone,
+                    converter.error_message().map(str::to_string),
+                    error.is_some(),
+                ));
+            },
+        );
+        if drop_client {
+            drop(body); // client walks away → tx.send fails inside the pump
+        } else {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("finish ran")
+            .expect("finish delivered")
+    }
+
+    #[tokio::test]
+    async fn transform_pump_latches_thinking_first_ttft_and_gen_span() {
+        // Codex wire: reasoning summary delta arrives FIRST — it must latch
+        // first_content (thinking counts) and yield a positive gen span at
+        // upstream EOF, with no failure signals.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hm\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, false).await;
+        assert!(timing.first_byte.is_some(), "ttfb latched");
+        assert!(
+            timing.first_content.is_some(),
+            "thinking delta latches first_content"
+        );
+        assert!(timing.gen_ms().is_some(), "gen span present at EOF");
+        assert!(!timing.saw_error_event && !client_gone);
+        assert!(converter_error.is_none() && !transport_error);
+    }
+
+    #[tokio::test]
+    async fn transform_pump_reports_protocol_failure_not_client_disconnect() {
+        // response.failed under a clean HTTP 200 → the converter preserves
+        // the failure; the closure's provider-error signal comes from it.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, _) = run_transform(body, false).await;
+        assert!(!client_gone);
+        assert!(
+            converter_error.is_some(),
+            "protocol failure preserved by the converter"
+        );
+        assert!(
+            timing.first_content.is_none(),
+            "no content delta before the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_pump_client_disconnect_never_claims_gen_or_failure() {
+        // The CLIENT walks away mid-stream — deterministically: the mpsc
+        // channel holds 16 events, the stream carries 30+ output deltas, and
+        // the receiver is dropped without reading, so the pump MUST block on
+        // a full channel and then fail its send. No conditional asserts.
+        let mut body = String::from(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
+        );
+        for i in 0..30 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk {i}\"}}\n\n"
+            ));
+        }
+        body.push_str(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        );
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, true).await;
+        assert!(client_gone, "dropped receiver must surface as client_gone");
+        assert!(timing.client_gone);
+        assert_eq!(
+            timing.gen_ms(),
+            None,
+            "client truncation never becomes a measured span"
+        );
+        // The exact production decision: whatever the converter thinks of
+        // the truncation WE caused, a client disconnect is never a provider
+        // failure (RequestFinished.aborted = false).
+        assert!(
+            !provider_failure(
+                client_gone,
+                transport_error,
+                converter_error.is_some(),
+                timing.saw_error_event,
+            ),
+            "client disconnect must not count as a provider failure"
+        );
+    }
+    #[tokio::test]
+    async fn sse_passthrough_records_ttfb_and_first_output_delta() {
+        // Perf telemetry v1 (trinity contract C1/C8, passthrough path): the
+        // finished event carries TTFB (first body chunk) and TTFT (first
+        // content_block_delta — thinking deltas count) as millis offsets.
+        const SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSse { body: SSE_BODY });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response_body(response).await;
+
+        // Drain events until the finish (the closure fires after last chunk).
+        let finished = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await.expect("events channel open") {
+                    ActivityEvent::RequestFinished {
+                        fast,
+                        ttfb_ms,
+                        ttft_ms,
+                        tokens,
+                        ..
+                    } => break (fast, ttfb_ms, ttft_ms, tokens),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("finished event");
+        let (fast, ttfb_ms, ttft_ms, tokens) = finished;
+        assert_eq!(fast, Some(false), "claude passthrough: fast recorded off");
+        assert!(ttfb_ms.is_some(), "TTFB captured on first body chunk");
+        assert!(
+            ttft_ms.is_some(),
+            "TTFT captured on first content_block_delta (thinking counts)"
+        );
+        assert!(
+            ttft_ms.unwrap() >= ttfb_ms.unwrap(),
+            "first output delta cannot precede first byte"
+        );
+        assert_eq!(tokens.expect("usage").output, 42);
+    }
+
+    #[tokio::test]
+    async fn sse_passthrough_without_content_delta_leaves_ttft_none() {
+        // A stream that never emits a content delta (usage frames only) must
+        // stay honest: ttfb recorded, ttft absent — the request stays in the
+        // approximate (e2e-only) series, never fabricated into measured.
+        const SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSse { body: SSE_BODY });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response_body(response).await;
+
+        let (ttfb_ms, ttft_ms) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await.expect("events channel open") {
+                    ActivityEvent::RequestFinished {
+                        ttfb_ms, ttft_ms, ..
+                    } => break (ttfb_ms, ttft_ms),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("finished event");
+        assert!(ttfb_ms.is_some(), "TTFB still captured");
+        assert_eq!(ttft_ms, None, "no content delta → no first-output claim");
     }
 
     #[tokio::test]
