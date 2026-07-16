@@ -51,8 +51,54 @@ llmux breaks the chain by standardizing on one harness and making the account/mo
 - **Model catalog API**: `GET /models` and `GET /llmux/models` — curated ids, aliases, efforts, `max_context`, group. See [docs/models.md](docs/models.md).
 - **Detached daemon + live TUI dashboard** for quota windows (incl. Fable weekly / Grok rate-limit gauges), account health, routing, and manual switch.
 - **Calendar usage & cost tab** (2026-07-15): hourly / daily / monthly buckets × model with all four token classes and API-equivalent USD cost, ledger-aligned amounts, replayed from the persisted request history — `U` in the dashboard. See [docs/operational-reference.md](docs/operational-reference.md#usage-tab-calendar-usage--cost).
+- **DevTools-style raw request viewer** (2026-07-15): the activity feed's `🔍 request` line opens every captured leg of an exchange — client request, rewritten upstream request, verbatim upstream response, delivered response — with scrolling, `copy` / `copy as curl` / `save` actions. See [The accidental AI debugger](#the-accidental-ai-debugger) and [docs/operational-reference.md](docs/operational-reference.md#raw-requestresponse-viewer).
 - **llmux Islands**, a native macOS menu-bar/notch companion plus an Arch Linux/KDE Qt/Kirigami port for glanceable usage, request receipts, and screen-share-safe email masking. See [docs/llmux-islands.md](docs/llmux-islands.md), [the Linux build guide](llmux-islands-linux/README.md), and [the cross-platform design/evidence dossier](.prd/docs/llmux-islands-linux-port/README.md).
 - **Stable + preview channels** via Homebrew (`llmux` / `llmux-preview`), with `llmux channel` and `llmux update`.
+
+## The accidental AI debugger
+
+llmux was built as a router. But once every request your agent makes flows through
+`localhost:3456`, and llmux keeps the raw bytes of both halves of every exchange,
+you get something you didn't install it for: **DevTools for your agent's wire
+traffic**.
+
+![llmux raw viewer demo — from the live activity feed into the raw request/response viewer: request body, then the Response tab with the SSE stream and rate-limit headers](screenshots/llmux-raw-viewer-demo.gif)
+
+[Original raw-viewer recording (mp4)](screenshots/llmux-raw-viewer-demo.mp4)
+
+- **Live per-request receipts.** The activity feed prints one row per completed
+  request: what it was (`user` turn, `subagent`, `security` pass, `compact`,
+  `count`, …), model + effort, serving account, status, latency, tokens,
+  API-equivalent cost, and a session-tagged input preview. "Which subagent just
+  burned 236k tokens on that turn" has a one-glance answer.
+- **A DevTools-style raw viewer.** Open any request (`🔍 request` on an expanded
+  row) into a modal over the dashboard. A translated codex/grok exchange shows all
+  four legs of the wire — `Request` (what Claude Code sent) → `Upstream Req` (what
+  llmux rewrote it into) → `Upstream Resp` (the provider's verbatim reply) →
+  `Response` (what your client received). Headers, SSE events, rate-limit state,
+  request bodies: scroll, pan, and read the actual bytes.
+- **Copy as curl.** Any leg exports as a replayable `curl` (credential values stay
+  `•••redacted`), raw bodies copy to the clipboard, and `save all` writes the whole
+  record JSON to `~/Downloads`. A provider bug report with the exact failing frame
+  attached is one keypress.
+- **Wire truth, archived.** The same capture path feeds `raw-io.jsonl` and the
+  [real captured system prompts](docs/system-prompts/) — what Claude Code actually
+  injects per model, not what the docs say it injects.
+- **Screen-share-safe.** `email_anonymous` masks every account email behind a fixed
+  pool of famous-CS-name fakes across the TUI and Islands, and credential headers
+  are redacted fail-safe at capture time. The recordings on this page were taken
+  live with masking on (remaining identifiers pixelated in post).
+
+![llmux usage & cost tab and raw request headers — calendar cost buckets per model, a poller-failure banner, and the request general/headers view](screenshots/llmux-usage-raw-demo.gif)
+
+[Original usage-tab recording (mp4)](screenshots/llmux-usage-raw-demo.mp4)
+
+The kinds of questions this answers in seconds, because the evidence is already on
+screen: why is this request 428 KB; did `context_management` edits actually apply
+upstream; what did the provider really return before the adapter converted it;
+which account is about to hit its 5-hour window, and why did the scheduler switch.
+Debugging an agent stack without seeing the wire is guesswork — this makes the wire
+a first-class surface.
 
 ## Install
 
