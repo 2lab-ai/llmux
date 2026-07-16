@@ -527,6 +527,9 @@ pub struct DashboardDoc {
     /// `skip_serializing_if` keeps it off the wire with no history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_perf: Vec<DailyPerfDoc>,
+    /// Config-editor facts (additive: defaults on older daemons).
+    #[serde(default)]
+    pub config_facts: ConfigFactsDoc,
     /// Usage-tab calendar rows (usage-stats): every granularity flattened,
     /// newest bucket first, cost priced server-side (T6 — the attach client
     /// has no pricing overrides). Additive: absent from an older daemon →
@@ -686,6 +689,33 @@ pub struct DailyUsageDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+}
+
+/// Config facts the TUI config editor renders that ride no other doc field
+/// (config-editor v1, additive). Live-holder-backed values report the
+/// EFFECTIVE state; restart-only values report the boot snapshot — after an
+/// edit the daemon keeps running on the old value, and the editor labels the
+/// row "restart required" instead of pretending it applied.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigFactsDoc {
+    #[serde(default)]
+    pub routing_enabled: bool,
+    #[serde(default)]
+    pub routing_default_group: String,
+    #[serde(default)]
+    pub routing_on_empty_group: String,
+    #[serde(default)]
+    pub raw_io_enabled: bool,
+    #[serde(default)]
+    pub raw_io_retention_days: u64,
+    #[serde(default)]
+    pub raw_io_max_body_bytes: u64,
+    #[serde(default)]
+    pub gradient_speed: f32,
+    #[serde(default)]
+    pub codex_upstream: String,
+    #[serde(default)]
+    pub proxy_max_request_bytes: u64,
 }
 
 /// One (day, group, model, fast) row of the observed-performance stats
@@ -1267,6 +1297,8 @@ pub struct DocMeta {
     /// [`crate::proxy::server::AppState::event_banners`] holder. See
     /// [`DashboardDoc::events`].
     pub events: Vec<crate::config::EventBanner>,
+    /// Config-editor facts (see [`ConfigFactsDoc`]).
+    pub config_facts: ConfigFactsDoc,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1743,6 +1775,7 @@ pub(crate) fn dashboard_doc(
             .map(|(group, id)| (group.as_str().to_string(), id.0.clone()))
             .collect(),
         upstream: meta.upstream.clone(),
+        config_facts: meta.config_facts.clone(),
         config_path: meta.config_path.clone(),
         select_params: SelectParamsDoc::from(params),
         refresh_ahead_secs: meta.refresh_ahead_secs,
@@ -1817,6 +1850,23 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(std::sync::atomic::Ordering::Relaxed),
         upstream: state.config.upstream.clone(),
+        config_facts: ConfigFactsDoc {
+            routing_enabled: state
+                .settings_live
+                .routing_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            routing_default_group: state.config.routing.default_group.clone(),
+            routing_on_empty_group: state.config.routing.on_empty_group.clone(),
+            raw_io_enabled: state
+                .settings_live
+                .raw_io_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            raw_io_retention_days: state.config.raw_io.retention_days,
+            raw_io_max_body_bytes: state.config.raw_io.max_body_bytes as u64,
+            gradient_speed: state.config.tui_gradient.speed,
+            codex_upstream: state.config.codex.upstream.clone(),
+            proxy_max_request_bytes: state.config.proxy.max_request_bytes as u64,
+        },
         config_path: state.config_path.as_ref().map(|p| p.display().to_string()),
         refresh_ahead_secs: state.config.scheduler.refresh_ahead_secs,
         evaluate_tick_secs: EVALUATE_TICK.as_secs(),
@@ -1958,6 +2008,7 @@ mod tests {
             uptime_secs: 130,
             port: 3456,
             upstream: "https://api.anthropic.com".into(),
+            config_facts: Default::default(),
             config_path: Some("/tmp/llmux.json".into()),
             refresh_ahead_secs: 7 * 3600,
             evaluate_tick_secs: 60,

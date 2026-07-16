@@ -251,6 +251,16 @@ pub(crate) enum Mode {
         idx: usize,
         item: usize,
     },
+    /// Typing a new value for a config-editor row (config-editor v1). The
+    /// buffer lives in [`App::config_input`] (Mode stays `Copy`).
+    ConfigEdit {
+        action: ui::ConfigAction,
+    },
+    /// y/n gate before a blast-radius config change (config-editor v1). The
+    /// human-readable description lives in [`App::config_input`].
+    ConfigConfirm {
+        action: ui::ConfigAction,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -378,6 +388,9 @@ pub(crate) struct Chrome {
     pub session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles).
     pub session_sort: SessionSort,
+    /// Config-editor cursor row + the edit/confirm prompt text.
+    pub config_cursor: usize,
+    pub config_input: String,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -565,6 +578,8 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
+    /// Config-editor settings change awaiting POST (attach mode).
+    pending_settings: Option<crate::proxy::server::SettingsRequest>,
     /// Pause/resume queued by the switcher's `p` key, performed by the event
     /// loop via `POST /llmux/pause-account`.
     pending_pause: Option<(String, bool)>,
@@ -648,6 +663,8 @@ struct App {
     tab_chrome: Vec<ui::TabHit>,
     /// Sessions table hit layout from the last frame (mouse row select).
     sessions_chrome: Option<ui::SessionsChrome>,
+    /// Config-editor value-cell hits from the last frame.
+    config_chrome: Vec<ui::ConfigHit>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
     /// payload-tab rects + top-right action buttons. Same record/read cycle
     /// as `activity_chrome`; empty while the modal is closed.
@@ -709,6 +726,12 @@ struct App {
     session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
     session_sort: SessionSort,
+    /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
+    config_cursor: usize,
+    config_input: String,
+    /// Pending confirmed settings request awaiting y/n (built at edit time so
+    /// confirm applies EXACTLY what was validated).
+    config_pending: Option<crate::proxy::server::SettingsRequest>,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -784,6 +807,7 @@ impl App {
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
             sessions_chrome: None,
+            config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
@@ -806,6 +830,9 @@ impl App {
             sessions_tx: None,
             session_cursor: 0,
             session_sort: SessionSort::default(),
+            config_cursor: 0,
+            config_input: String::new(),
+            config_pending: None,
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
@@ -1012,6 +1039,8 @@ impl App {
             sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
             session_sort: self.session_sort,
+            config_cursor: self.config_cursor,
+            config_input: self.config_input.clone(),
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
@@ -1111,6 +1140,10 @@ impl App {
             Mode::ContextMenu { idx, item } => {
                 return self.on_key_context_menu(key.code, idx, item, view)
             }
+            Mode::ConfigEdit { action } => return self.on_key_config_edit(key.code, action, view),
+            Mode::ConfigConfirm { action } => {
+                return self.on_key_config_confirm(key.code, action, view)
+            }
             Mode::Normal => {}
         }
         // Otherwise (Mode::Normal): the active overlay, if any, gets the key;
@@ -1124,7 +1157,7 @@ impl App {
             Overlay::Sessions => self.on_key_sessions(key.code),
             Overlay::Misc => self.on_key_misc(key.code),
             Overlay::Perf => self.on_key_perf(key.code, view),
-            Overlay::Config => self.on_key_config(key.code),
+            Overlay::Config => self.on_key_config(key.code, view),
         }
     }
 
@@ -1229,6 +1262,43 @@ impl App {
                 MouseEventKind::ScrollDown => {
                     self.on_key_usage(KeyCode::Down, view);
                     return true;
+                }
+                _ => {}
+            }
+        }
+        // Config editor (config-editor v1): click a value cell to activate
+        // that row (same path as Enter); wheel moves the cursor.
+        if self.overlay == Overlay::Config && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.config_cursor = self.config_cursor.saturating_sub(1);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    let rows = view
+                        .map(|v| {
+                            let chrome = self.chrome();
+                            ui::config_row_count(v, &chrome)
+                        })
+                        .unwrap_or(0);
+                    self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(hit) = self
+                        .config_chrome
+                        .iter()
+                        .find(|h| {
+                            mouse.row == h.area.y
+                                && mouse.column >= h.area.x
+                                && mouse.column < h.area.right()
+                        })
+                        .copied()
+                    {
+                        self.config_cursor = hit.row;
+                        self.activate_config_action(hit.action, view);
+                        return true;
+                    }
                 }
                 _ => {}
             }
@@ -2028,13 +2098,286 @@ impl App {
         }
     }
 
-    /// Key handling for the Config overlay (`c`, UI-3 U6). `c`/`Esc` closes.
-    fn on_key_config(&mut self, code: KeyCode) {
+    /// Key handling for the Config overlay (`c`, config-editor v1): arrows
+    /// move the cursor, Enter activates the row (toggle / cycle / edit
+    /// prompt), `c`/`Esc` closes.
+    fn on_key_config(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let rows = view.map(|v| {
+            let chrome = self.chrome();
+            ui::config_row_count(v, &chrome)
+        });
+        let rows = rows.unwrap_or(0);
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.config_cursor = self.config_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let action = view.and_then(|v| {
+                    let chrome = self.chrome();
+                    ui::config_row_action(v, &chrome, self.config_cursor)
+                });
+                if let Some(action) = action {
+                    self.activate_config_action(action, view);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Activate one config row: toggles/cycles act (through the confirm gate
+    /// when the action is blast-radius); value rows open the edit prompt
+    /// prefilled with the current value.
+    fn activate_config_action(&mut self, action: ui::ConfigAction, view: Option<&DashboardView>) {
+        use ui::ConfigAction as A;
+        // Existing live paths keep their own flows (no settings round-trip).
+        match action {
+            A::CodexModel => return self.cycle_codex_model(view),
+            A::CodexEffort => return self.cycle_codex_effort(view),
+            A::CodexFast => return self.toggle_codex_fast(view),
+            A::GrokEffort => return self.cycle_grok_effort(view),
+            A::ResetDisplay => return self.toggle_reset_display(),
+            _ => {}
+        }
+        if action.input_hint().is_some() {
+            // Prefill with the current value where that is cheap to read.
+            self.config_input = view
+                .map(|v| {
+                    let f = &v.config_facts;
+                    let p = &v.select_params;
+                    match action {
+                        A::Ceiling5h => format!("{:.0}", p.five_hour_max * 100.0),
+                        A::Ceiling7d => format!("{:.0}", p.seven_day_max * 100.0),
+                        A::CeilingFbl => format!("{:.0}", p.fable_weekly_max * 100.0),
+                        A::UsageMaxAge => p.usage_max_age.as_secs().to_string(),
+                        A::GradientSpeed => format!("{:.2}", f.gradient_speed),
+                        A::RoutingDefaultGroup => f.routing_default_group.clone(),
+                        A::RoutingOnEmptyGroup => f.routing_on_empty_group.clone(),
+                        A::RawIoRetention => f.raw_io_retention_days.to_string(),
+                        A::RawIoMaxBody => f.raw_io_max_body_bytes.to_string(),
+                        A::Upstream => v.upstream.clone().unwrap_or_default(),
+                        A::CodexUpstream => f.codex_upstream.clone(),
+                        A::ProxyPort => v.port.to_string(),
+                        A::ProxyMaxBody => f.proxy_max_request_bytes.to_string(),
+                        _ => String::new(),
+                    }
+                })
+                .unwrap_or_default();
+            self.mode = Mode::ConfigEdit { action };
+            return;
+        }
+        // Toggle actions: build the request from the CURRENT view value.
+        let req = self.toggle_settings_request(action, view);
+        let Some(req) = req else {
+            return self.set_status("config: value unavailable".into());
+        };
+        if action.needs_confirm() {
+            self.config_input = confirm_prompt(action, &req);
+            self.config_pending = Some(req);
+            self.mode = Mode::ConfigConfirm { action };
+        } else {
+            self.send_settings(req, view);
+        }
+    }
+
+    /// Build the SettingsRequest a TOGGLE row produces (inverse of the
+    /// current view value). `None` when the view is not available.
+    fn toggle_settings_request(
+        &self,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) -> Option<crate::proxy::server::SettingsRequest> {
+        use crate::proxy::server::SettingsRequest;
+        use ui::ConfigAction as A;
+        let view = view?;
+        let mut req = SettingsRequest::default();
+        match action {
+            A::SchedMode => {
+                // Route through the existing mode endpoint semantics: flip.
+                self.toggle_pending_sched()?;
+                return None; // unreachable — SchedMode handled in confirm apply
+            }
+            A::EmailMask => req.email_anonymous = Some(!view.email_anonymous),
+            A::QuotaFill => {
+                let cur = self.quota_display_override.unwrap_or(view.quota_display);
+                req.quota_display = Some(match cur {
+                    crate::config::QuotaDisplay::Used => "remaining".into(),
+                    crate::config::QuotaDisplay::Remaining => "used".into(),
+                });
+            }
+            A::TuiEffects => req.tui_effects = Some(!view.tui_effects),
+            A::FableWeekly => req.show_fable_weekly = Some(!view.show_fable_weekly),
+            A::RoutingEnabled => req.routing_enabled = Some(!view.config_facts.routing_enabled),
+            A::RawIoEnabled => req.raw_io_enabled = Some(!view.config_facts.raw_io_enabled),
+            _ => return None,
+        }
+        Some(req)
+    }
+
+    /// Placeholder used by `toggle_settings_request` for SchedMode (which is
+    /// applied through `toggle_scheduler_mode`, not the settings endpoint) —
+    /// always `None` so the caller falls through to the confirm gate below.
+    fn toggle_pending_sched(&self) -> Option<()> {
+        None
+    }
+
+    /// Keys while typing a config value (Mode::ConfigEdit).
+    fn on_key_config_edit(
+        &mut self,
+        code: KeyCode,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Esc => {
+                self.config_input.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                self.config_input.pop();
+            }
+            KeyCode::Char(ch) => self.config_input.push(ch),
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.config_input);
+                self.mode = Mode::Normal;
+                match parse_config_input(action, raw.trim(), view) {
+                    Err(err) => self.set_status(format!("config: {err}")),
+                    Ok(req) => {
+                        // Blast-radius confirms: endpoint changes always; a
+                        // ceiling driven to 0 (locks scheduling out); a
+                        // retention decrease (deletes history).
+                        let needs = action.needs_confirm()
+                            || matches!(
+                                action,
+                                ui::ConfigAction::Ceiling5h
+                                    | ui::ConfigAction::Ceiling7d
+                                    | ui::ConfigAction::CeilingFbl
+                            ) && [req.five_hour_max, req.seven_day_max, req.fable_weekly_max]
+                                .iter()
+                                .flatten()
+                                .any(|v| *v == 0.0)
+                            || action == ui::ConfigAction::RawIoRetention
+                                && view.is_some_and(|v| {
+                                    req.raw_io_retention_days.is_some_and(|days| {
+                                        days < v.config_facts.raw_io_retention_days
+                                    })
+                                });
+                        if needs {
+                            self.config_input = confirm_prompt(action, &req);
+                            self.config_pending = Some(req);
+                            self.mode = Mode::ConfigConfirm { action };
+                        } else {
+                            self.send_settings(req, view);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys on the confirm gate (Mode::ConfigConfirm): `y`/Enter applies the
+    /// pending request, anything declining cancels with no change.
+    fn on_key_config_confirm(
+        &mut self,
+        code: KeyCode,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.config_input.clear();
+                self.mode = Mode::Normal;
+                if action == ui::ConfigAction::SchedMode {
+                    self.config_pending = None;
+                    self.toggle_scheduler_mode(view);
+                    return;
+                }
+                if let Some(req) = self.config_pending.take() {
+                    self.send_settings(req, view);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.config_input.clear();
+                self.config_pending = None;
+                self.mode = Mode::Normal;
+                self.set_status("config: cancelled".into());
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a settings request: locally through the daemon's own
+    /// `apply_settings` (identical validation + persist + live flip), or
+    /// queued for the event loop to POST in attach mode. The status line
+    /// reports live-applied vs restart-required honestly.
+    fn send_settings(
+        &mut self,
+        req: crate::proxy::server::SettingsRequest,
+        _view: Option<&DashboardView>,
+    ) {
+        match &mut self.backend {
+            Backend::Local(state) => match crate::proxy::server::apply_settings(state, &req) {
+                Ok((applied, restart)) => self.set_status(settings_status(&applied, &restart)),
+                Err(err) => self.set_status(format!("config: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_settings = Some(req);
+                self.set_status("config: applying…".into());
+            }
+        }
+    }
+
+    fn take_pending_settings(&mut self) -> Option<crate::proxy::server::SettingsRequest> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_settings.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// POST a settings change to the attached daemon and report the honest
+    /// applied/restart split from its response.
+    async fn perform_remote_settings(&mut self, req: crate::proxy::server::SettingsRequest) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/settings", remote.base_url);
+        let mut request = remote.client.post(&url).json(&req);
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let names = |key: &str| -> Vec<String> {
+                            body[key]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        };
+                        let applied: Vec<String> = names("applied");
+                        let restart: Vec<String> = names("restart_required");
+                        settings_status(
+                            &applied.iter().map(String::as_str).collect::<Vec<_>>(),
+                            &restart.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )
+                    }
+                    Err(_) => "config: applied".into(),
+                }
+            }
+            Ok(response) => format!("config change failed: {}", response.status()),
+            Err(err) => format!("config change failed: {err}"),
+        };
+        self.set_status(message);
     }
 
     /// Open the surface a tab click selected (UI-3 U6). Stats and Sessions go
@@ -3291,6 +3634,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         connected: false,
         pending_switch: None,
         pending_codex: None,
+        pending_settings: None,
         pending_pause: None,
         pending_limits: None,
         pending_mode: None,
@@ -3451,6 +3795,10 @@ async fn event_loop(
             app.perform_remote_codex(codex).await;
             redraw = true;
         }
+        if let Some(settings) = app.take_pending_settings() {
+            app.perform_remote_settings(settings).await;
+            redraw = true;
+        }
         if let Some((account, paused)) = app.take_pending_pause() {
             app.perform_remote_pause(account, paused).await;
             redraw = true;
@@ -3506,6 +3854,7 @@ async fn event_loop(
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
             app.sessions_chrome = main.sessions_table;
+            app.config_chrome = main.config_rows;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
@@ -3782,6 +4131,107 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
 /// `5h, 7d, fbl` — `"90,98,98"`, `"90"` (5h only), `"90,,98"` (skip 7d),
 /// `""` (all global). Values are percents; `>1` divides by 100, `<=1` is
 /// taken as a fraction, so `0.9` and `90` mean the same ceiling.
+/// Human status line for a settings apply: live fields vs restart-required —
+/// a wrote-but-needs-restart change must never read as applied (contract C6).
+fn settings_status(applied: &[&str], restart: &[&str]) -> String {
+    match (applied.is_empty(), restart.is_empty()) {
+        (false, true) => format!("config: applied live — {}", applied.join(", ")),
+        (true, false) => format!(
+            "config: saved — takes effect on daemon restart ({})",
+            restart.join(", ")
+        ),
+        (false, false) => format!(
+            "config: {} applied live; {} on restart",
+            applied.join(", "),
+            restart.join(", ")
+        ),
+        (true, true) => "config: no change".into(),
+    }
+}
+
+/// The y/n confirm prompt for a blast-radius change.
+fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::SettingsRequest) -> String {
+    use ui::ConfigAction as A;
+    match action {
+        A::SchedMode => "flip scheduler mode (live scheduling policy)?".into(),
+        A::RoutingEnabled => format!(
+            "set routing.enabled = {} (reroutes LIVE traffic)?",
+            req.routing_enabled.unwrap_or_default()
+        ),
+        A::RawIoEnabled => format!(
+            "set raw-io capture = {} (payload capture gate)?",
+            req.raw_io_enabled.unwrap_or_default()
+        ),
+        A::Upstream => format!(
+            "set upstream = {} (restart required; wrong URL breaks ALL requests)?",
+            req.upstream.clone().unwrap_or_default()
+        ),
+        A::CodexUpstream => format!(
+            "set codex upstream = {} (restart required)?",
+            req.codex_upstream.clone().unwrap_or_default()
+        ),
+        A::Ceiling5h | A::Ceiling7d | A::CeilingFbl => {
+            "set a ceiling to 0% (locks that window's scheduling)?".into()
+        }
+        A::RawIoRetention => format!(
+            "reduce raw-io retention to {}d (older history will be pruned)?",
+            req.raw_io_retention_days.unwrap_or_default()
+        ),
+        _ => "apply this change?".into(),
+    }
+}
+
+/// Parse the edit-prompt text for `action` into a validated-enough
+/// [`SettingsRequest`] (the daemon re-validates authoritatively).
+fn parse_config_input(
+    action: ui::ConfigAction,
+    raw: &str,
+    _view: Option<&DashboardView>,
+) -> Result<crate::proxy::server::SettingsRequest, String> {
+    use crate::proxy::server::SettingsRequest;
+    use ui::ConfigAction as A;
+    let mut req = SettingsRequest::default();
+    let pct = || -> Result<f64, String> {
+        let v: f64 = raw.parse().map_err(|_| format!("not a number: {raw:?}"))?;
+        if !(0.0..=100.0).contains(&v) {
+            return Err("percent must be 0-100".into());
+        }
+        Ok(v / 100.0)
+    };
+    match action {
+        A::Ceiling5h => req.five_hour_max = Some(pct()?),
+        A::Ceiling7d => req.seven_day_max = Some(pct()?),
+        A::CeilingFbl => req.fable_weekly_max = Some(pct()?),
+        A::UsageMaxAge => {
+            req.usage_max_age_secs = Some(raw.parse().map_err(|_| format!("not seconds: {raw:?}"))?)
+        }
+        A::GradientSpeed => {
+            req.tui_gradient_speed =
+                Some(raw.parse().map_err(|_| format!("not a number: {raw:?}"))?)
+        }
+        A::RoutingDefaultGroup => req.routing_default_group = Some(raw.to_string()),
+        A::RoutingOnEmptyGroup => req.routing_on_empty_group = Some(raw.to_string()),
+        A::RawIoRetention => {
+            req.raw_io_retention_days = Some(raw.parse().map_err(|_| format!("not days: {raw:?}"))?)
+        }
+        A::RawIoMaxBody => {
+            req.raw_io_max_body_bytes =
+                Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
+        }
+        A::Upstream => req.upstream = Some(raw.to_string()),
+        A::CodexUpstream => req.codex_upstream = Some(raw.to_string()),
+        A::ProxyPort => {
+            req.proxy_port = Some(raw.parse().map_err(|_| format!("not a port: {raw:?}"))?)
+        }
+        A::ProxyMaxBody => {
+            req.proxy_max_request_bytes =
+                Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
+        }
+        _ => return Err("not an editable value".into()),
+    }
+    Ok(req)
+}
+
 fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String> {
     let mut vals: [Option<f64>; 3] = [None, None, None];
     let cleaned = raw.trim();
@@ -3851,6 +4301,7 @@ mod tests {
             connected: false,
             pending_switch: None,
             pending_codex: None,
+            pending_settings: None,
             pending_pause: None,
             pending_limits: None,
             pending_mode: None,
@@ -4330,7 +4781,7 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
         app.on_key_main(KeyCode::Char('c'), None);
         assert_eq!(app.overlay, Overlay::Config);
-        app.on_key_config(KeyCode::Char('c'));
+        app.on_key_config(KeyCode::Char('c'), None);
         assert_eq!(app.overlay, Overlay::None);
     }
 
@@ -5441,6 +5892,7 @@ mod tests {
             grok: Default::default(),
             daily_usage: Vec::new(),
             daily_perf: Vec::new(),
+            config_facts: Default::default(),
             usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
