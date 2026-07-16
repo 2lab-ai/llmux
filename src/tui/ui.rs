@@ -212,16 +212,18 @@ pub(crate) fn draw(
     // A summoned overlay (if any) is then drawn OVER MAIN. Each overlay clears
     // its own rect with `Clear` so MAIN shows through only outside it; because
     // MAIN was already drawn this frame, "MAIN keeps updating underneath" is
-    // automatic.
+    // automatic. The rect is computed HERE (not per-overlay) so every overlay
+    // shares the same top edge: right under the tab bar, banner-aware.
+    let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
     match chrome.overlay {
         Overlay::None => {}
-        Overlay::Accounts => draw_accounts_overlay(frame, view, &ctx, chrome),
-        Overlay::Stats => draw_stats_overlay(frame, view, &ctx, chrome),
-        Overlay::Usage => draw_usage_overlay(frame, view, chrome),
-        Overlay::Logs => draw_logs_overlay(frame, view),
-        Overlay::Sessions => draw_sessions_overlay(frame, &ctx, chrome),
-        Overlay::Misc => draw_misc_overlay(frame, view),
-        Overlay::Config => draw_config_overlay(frame, view, chrome),
+        Overlay::Accounts => draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome),
+        Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
+        Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
+        Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
+        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome),
+        Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
+        Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome),
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -581,23 +583,21 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
 /// table the priority slot plus the selected-account detail pane, over which
 /// the add/remove/switch/login interactions (issues #3/#4) run. Cleared so MAIN
-/// shows through only at the very edges.
-fn draw_accounts_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
-    let area = overlay_rect(frame.area());
+/// shows through only at the very edges. The quota table's own titled border is
+/// the overlay's top separator — the old extra bold " accounts " header line
+/// stacked a THIRD "accounts" row under the tab label (Z 2026-07-16).
+fn draw_accounts_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
-    let [header_area, table_area, detail_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(table_height),
-        Constraint::Min(3),
-    ])
-    .areas(area);
-    let title = Paragraph::new(Line::from(Span::styled(
-        " accounts ",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
-    frame.render_widget(title, header_area);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
@@ -614,8 +614,13 @@ fn draw_accounts_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx
 /// Stats overlay (`g`): the detailed per-model usage table + drill-down (req13;
 /// was the `show_models` full view). Keeps the account quota table above it for
 /// context, matching the old layout.
-fn draw_stats_overlay(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
-    let area = overlay_rect(frame.area());
+fn draw_stats_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
@@ -868,8 +873,7 @@ fn heatmap_panel_height(
 /// renderer only filters by the selected granularity, groups consecutive
 /// rows by bucket, and draws a bold per-bucket total row above the per-model
 /// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
-fn draw_usage_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) {
-    let area = overlay_rect(frame.area());
+fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     frame.render_widget(Clear, area);
     let gran = chrome.usage_gran;
     let rows: Vec<&crate::dashboard::UsageStatDoc> = view
@@ -1155,8 +1159,7 @@ fn group_thousands(n: u64) -> String {
 }
 
 /// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
-fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
-    let area = overlay_rect(frame.area());
+fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
     frame.render_widget(Clear, area);
     draw_logs(frame, area, view);
 }
@@ -1167,8 +1170,7 @@ fn draw_logs_overlay(frame: &mut Frame, view: &DashboardView) {
 /// on `Chrome` (taken when the overlay opened) — metadata only, no prompt
 /// content. On a side-by-side width the detail sits beside the list; otherwise
 /// the list takes the whole rect.
-fn draw_sessions_overlay(frame: &mut Frame, ctx: &FrameCtx, chrome: &Chrome) {
-    let area = overlay_rect(frame.area());
+fn draw_sessions_overlay(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &Chrome) {
     frame.render_widget(Clear, area);
     // The load runs on the blocking pool and streams progressive partials. Show
     // the full-screen spinner ONLY while loading AND no partial has arrived yet
@@ -1389,8 +1391,7 @@ fn ms_to_systemtime(ms: u64) -> SystemTime {
 /// drawn and the keybar stays visible under the overlay.
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
 /// keybindings and build/daemon facts. Read-only.
-fn draw_misc_overlay(frame: &mut Frame, view: &DashboardView) {
-    let area = overlay_rect(frame.area());
+fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
     frame.render_widget(Clear, area);
     let key = |k: &'static str, what: &'static str| {
         Line::from(vec![
@@ -1424,8 +1425,7 @@ fn draw_misc_overlay(frame: &mut Frame, view: &DashboardView) {
 /// Config overlay (`c`, UI-3 U6): the live daemon settings the dashboard
 /// document carries, each annotated with the key/surface that changes it.
 /// Read-only projection — mutations go through the same paths as always.
-fn draw_config_overlay(frame: &mut Frame, view: &DashboardView, chrome: &Chrome) {
-    let area = overlay_rect(frame.area());
+fn draw_config_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     frame.render_widget(Clear, area);
     let row = |label: &'static str, value: String, hint: &'static str| {
         Line::from(vec![
@@ -1617,15 +1617,16 @@ fn draw_context_menu(
     MenuChrome { area, items: rects }
 }
 
-/// Rows every overlay leaves visible at the top: header + tab strip (and the
-/// event banner when active). Keeping the tab row on screen is what makes its
-/// always-armed click targets legitimate (review R1 MUST-FIX 3: overlays used
-/// to paint over the tabs while their hit boxes stayed live — invisible
-/// navigation).
-const OVERLAY_TOP_RESERVED: u16 = 3;
-
-fn overlay_rect(area: Rect) -> Rect {
-    let top = OVERLAY_TOP_RESERVED.min(area.height);
+/// The rect an overlay draws into. Rows left visible at the top: header + tab
+/// strip, plus the event banner ONLY while one is active. Keeping the tab row
+/// on screen is what makes its always-armed click targets legitimate (review
+/// R1 MUST-FIX 3: overlays used to paint over the tabs while their hit boxes
+/// stayed live — invisible navigation). The reservation is banner-aware: a
+/// fixed 3-row reserve assumed the banner row, so with no active banner MAIN's
+/// accounts-table border (` accounts ────`) leaked through as a stale
+/// separator right under the tab bar on EVERY tab (Z 2026-07-16).
+fn overlay_rect(area: Rect, banner: bool) -> Rect {
+    let top = (2 + u16::from(banner)).min(area.height);
     Rect {
         x: area.x,
         y: area.y + top,
@@ -6205,6 +6206,78 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("sooner end"), "earliest-to wins: {text}");
         assert!(!text.contains("later end"), "other event hidden: {text}");
+    }
+
+    /// Z 2026-07-16: with no active banner the top chrome is 2 rows (header +
+    /// tabs), but the overlay reserve was a fixed 3 — MAIN's accounts-table
+    /// border (` accounts ────`) leaked through as a STALE separator right
+    /// under the tab bar on every overlay tab. The overlay must own the row
+    /// directly below the tabs.
+    #[test]
+    fn overlay_owns_the_row_under_the_tab_bar_when_no_banner_is_active() {
+        let view = view_with(Vec::new());
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(
+            rows[1].contains("dashboard"),
+            "tab bar on row 1 with no banner:\n{}",
+            rows[1]
+        );
+        assert!(
+            !rows[2].contains("accounts"),
+            "MAIN's accounts border must not leak under the tab bar:\n{}",
+            rows[2]
+        );
+        assert!(
+            rows[2].contains("usage"),
+            "the usage overlay's own titled border owns the row under the tabs:\n{}",
+            rows[2]
+        );
+    }
+
+    /// Counterpart: while a banner IS active it stays visible above the
+    /// header, and the overlay starts right under the (shifted) tab bar.
+    #[test]
+    fn overlay_reserves_the_banner_row_only_while_one_is_active() {
+        let mut view = view_with(Vec::new());
+        view.events = vec![banner(
+            "evt",
+            "2020-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+            "maintenance window",
+        )];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Usage), 160, 30);
+        assert!(
+            rows[0].contains("maintenance window"),
+            "banner pinned on top:\n{}",
+            rows[0]
+        );
+        assert!(rows[2].contains("dashboard"), "tab bar row:\n{}", rows[2]);
+        assert!(
+            rows[3].contains("usage") && !rows[3].contains("accounts"),
+            "overlay starts right under the tabs:\n{}",
+            rows[3]
+        );
+    }
+
+    /// Z 2026-07-16: the accounts overlay used to stack THREE "accounts" rows
+    /// (leaked MAIN border + its own bold header line + the table's titled
+    /// border). The table's titled border is the one and only separator.
+    #[test]
+    fn accounts_overlay_renders_exactly_one_accounts_separator() {
+        let view = view_with(Vec::new());
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 160, 30);
+        // A separator row is the titled top border (` accounts ────`) — the
+        // label followed by the border line. Hint TEXT mentioning the word
+        // ("no accounts — run `llmux login`…") is not a separator.
+        let hits: Vec<usize> = (2..rows.len() - 2)
+            .filter(|&y| rows[y].contains("accounts ─"))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![2],
+            "one accounts separator, directly under the tabs:\n{}",
+            rows[..6].join("\n")
+        );
     }
 
     #[test]
