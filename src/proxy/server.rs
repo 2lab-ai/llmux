@@ -1450,18 +1450,23 @@ async fn codex_config_endpoint(
     }
     // Persist FIRST (config-editor contract): a failed write leaves the
     // live shape untouched and surfaces the error — live-then-persist would
-    // let disk and runtime diverge behind a 200.
-    if let Some(path) = &state.config_path {
-        if let Err(err) = crate::config::update_path(path, |c| {
-            c.codex.default_model = shape.model.clone();
-            c.codex.fast = shape.fast;
-            c.codex.reasoning_effort = shape.effort.clone();
-        }) {
-            return relay_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("config write failed: {err}"),
-            );
-        }
+    // let disk and runtime diverge behind a 200. No config path = nothing to
+    // persist → refuse rather than diverge.
+    let Some(path) = &state.config_path else {
+        return relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config write failed: no config path — persistence unavailable",
+        );
+    };
+    if let Err(err) = crate::config::update_path(path, |c| {
+        c.codex.default_model = shape.model.clone();
+        c.codex.fast = shape.fast;
+        c.codex.reasoning_effort = shape.effort.clone();
+    }) {
+        return relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        );
     }
     state.codex.set_shape(shape.clone());
     (
@@ -1515,22 +1520,23 @@ async fn grok_config_endpoint(
         }
     }
     // Persist FIRST (config-editor contract): a failed write leaves the
-    // live shape untouched and surfaces the error.
-    let persisted = match &state.config_path {
-        Some(path) => {
-            if let Err(err) = crate::config::update_path(path, |c| {
-                c.grok.default_model = shape.model.clone();
-                c.grok.reasoning_effort = shape.effort.clone();
-            }) {
-                return relay_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("config write failed: {err}"),
-                );
-            }
-            true
-        }
-        None => false,
+    // live shape untouched and surfaces the error; no config path refuses.
+    let Some(path) = &state.config_path else {
+        return relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config write failed: no config path — persistence unavailable",
+        );
     };
+    if let Err(err) = crate::config::update_path(path, |c| {
+        c.grok.default_model = shape.model.clone();
+        c.grok.reasoning_effort = shape.effort.clone();
+    }) {
+        return relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        );
+    }
+    let persisted = true;
     state.grok.set_shape(shape.clone());
     (
         StatusCode::OK,
@@ -1605,6 +1611,16 @@ pub struct SettingsRequest {
     pub codex_upstream: Option<String>,
     pub proxy_port: Option<u16>,
     pub proxy_max_request_bytes: Option<u64>,
+}
+
+/// The `POST /llmux/settings` acknowledgment. TYPED on both sides: the TUI
+/// parses exactly this shape and treats anything else as UNVERIFIED — a
+/// malformed or empty 2xx must never read as a confirmed apply.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SettingsAck {
+    pub ok: bool,
+    pub applied: Vec<String>,
+    pub restart_required: Vec<String>,
 }
 
 /// One validated settings change, applied to config (read-merge-write) and,
@@ -1890,13 +1906,12 @@ async fn settings_endpoint(
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({
-            "ok": true,
-            "applied": applied,
-            "restart_required": restart_required,
-            "email_anonymous": state.email_anonymous.load(Ordering::Relaxed),
+        serde_json::to_string(&SettingsAck {
+            ok: true,
+            applied: applied.iter().map(|s| s.to_string()).collect(),
+            restart_required: restart_required.iter().map(|s| s.to_string()).collect(),
         })
-        .to_string(),
+        .unwrap_or_else(|_| "{\"ok\":true}".into()),
     )
         .into_response()
 }
@@ -3692,6 +3707,38 @@ mod tests {
         assert_eq!(
             doc["accounts"][0]["name"], "me@real-domain.com",
             "API names stay real; masking is a display concern"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_ack_round_trips_typed() {
+        // The TUI parses the endpoint's body as a TYPED SettingsAck and
+        // refuses to act on anything else — pin the wire contract here so
+        // the two sides cannot drift silently. An empty `{}` must FAIL the
+        // typed parse (unverified, never a confirmed no-change).
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        let response = settings_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SettingsRequest {
+                tui_effects: Some(false),
+                raw_io_retention_days: Some(7),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let ack: SettingsAck = serde_json::from_slice(&bytes).expect("typed ack parses");
+        assert!(ack.ok);
+        assert_eq!(ack.applied, vec!["tui_effects"]);
+        assert_eq!(ack.restart_required, vec!["raw_io_retention_days"]);
+        assert!(
+            serde_json::from_str::<SettingsAck>("{}").is_err(),
+            "an empty object must not read as a verified ack"
         );
     }
 

@@ -9967,6 +9967,8 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.proxy.api_key = Some("lm-test".into());
         config.codex.client_model = Some("gpt-5.5".into());
+        config.codex.reasoning_effort = Some("high".into());
+        config.grok.reasoning_effort = Some("high".into());
         config.grok.client_model = Some("grok-4".into());
         config.tui_gradient.max_effort = Some("#ffffff".into());
         config.remote.host = Some("example.com".into());
@@ -10005,30 +10007,64 @@ mod tests {
         );
         // Covering prefixes, each tied to an inventory row (or the dedicated
         // surface the row names). Keep in sync with `config_rows`.
+        // EXACT leaves (no broad struct prefixes — a NEW field under codex./
+        // grok./scheduler./… must fail here until classified). Collection
+        // fields keep a prefix because their leaf paths embed runtime keys.
         const COVERED: &[&str] = &[
             "version",
             "proxy.port",
             "proxy.max_request_bytes",
             "proxy.api_key",
             "proxy.forward_idle_timeout_secs",
-            "proxy.idle_probe",
+            "proxy.idle_probe.enabled",
+            "proxy.idle_probe.stale_after_secs",
+            "proxy.idle_probe.sweep_secs",
+            "proxy.idle_probe.per_account_cooldown_secs",
             "upstream",
-            "codex.",
-            "grok.",
-            "scheduler.",
-            "routing.",
-            "pricing",
-            "raw_io.",
+            "codex.upstream",
+            "codex.token_url",
+            "codex.default_model",
+            "codex.client_model",
+            "codex.fast",
+            "codex.reasoning_effort",
+            "codex.trace",
+            "grok.upstream",
+            "grok.default_model",
+            "grok.client_model",
+            "grok.reasoning_effort",
+            "grok.trace",
+            "scheduler.mode",
+            "scheduler.five_hour_max",
+            "scheduler.seven_day_max",
+            "scheduler.fable_weekly_max",
+            "scheduler.usage_max_age_secs",
+            "scheduler.usage_poll_secs",
+            "scheduler.refresh_ahead_secs",
+            "routing.enabled",
+            "routing.claude_models",
+            "routing.codex_models",
+            "routing.grok_models",
+            "routing.default_group",
+            "routing.on_empty_group",
+            "pricing.",
+            "raw_io.enabled",
+            "raw_io.retention_days",
+            "raw_io.max_body_bytes",
             "email_anonymous",
             "tui_effects",
-            "tui_gradient.",
+            "tui_gradient.speed",
+            "tui_gradient.claude",
+            "tui_gradient.codex",
+            "tui_gradient.max_effort",
             "show_fable_weekly",
-            "domain_abbrev",
+            "domain_abbrev.",
             "quota_display",
             "paused_accounts",
-            "account_limits",
+            "account_limits.",
             "events",
-            "remote.",
+            "remote.host",
+            "remote.port",
+            "remote.api_key",
             "accounts",
         ];
         for path in &paths {
