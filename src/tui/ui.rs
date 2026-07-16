@@ -222,7 +222,7 @@ pub(crate) fn draw(
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
-        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome),
+        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome),
@@ -413,6 +413,7 @@ fn draw_main(
         separators,
         account_rows,
         menu,
+        sessions_table: None,
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
@@ -1172,7 +1173,13 @@ fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
 /// on `Chrome` (taken when the overlay opened) — metadata only, no prompt
 /// content. On a side-by-side width the detail sits beside the list; otherwise
 /// the list takes the whole rect.
-fn draw_sessions_overlay(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &Chrome) {
+fn draw_sessions_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    hits: &mut Option<MainChrome>,
+) {
     frame.render_widget(Clear, area);
     // The load runs on the blocking pool and streams progressive partials. Show
     // the full-screen spinner ONLY while loading AND no partial has arrived yet
@@ -1199,13 +1206,17 @@ fn draw_sessions_overlay(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: 
         frame.render_widget(empty, area);
         return;
     }
-    if area.width >= SIDE_BY_SIDE_AT {
+    let table_chrome = if area.width >= SIDE_BY_SIDE_AT {
         let [list_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
-        draw_sessions_table(frame, list_area, ctx, chrome);
+        let tc = draw_sessions_table(frame, list_area, ctx, chrome);
         draw_session_detail(frame, detail_area, ctx, chrome);
+        tc
     } else {
-        draw_sessions_table(frame, area, ctx, chrome);
+        draw_sessions_table(frame, area, ctx, chrome)
+    };
+    if let Some(hits) = hits.as_mut() {
+        hits.sessions_table = table_chrome;
     }
 }
 
@@ -1213,7 +1224,12 @@ fn draw_sessions_overlay(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: 
 /// count, tokens in/out, distinct models, distinct accounts + rotation count,
 /// and the wall-clock span. The cursored row is highlighted; the title shows the
 /// cursor position so it is obvious more rows exist off-screen.
-fn draw_sessions_table(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &Chrome) {
+fn draw_sessions_table(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) -> Option<SessionsChrome> {
     let total = chrome.sessions.len();
     let cursor = chrome.session_cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
@@ -1267,20 +1283,32 @@ fn draw_sessions_table(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
     ];
     // While a progressive load is still streaming, append the read progress so
     // the growing table reads as "filling in", not stalled.
+    let sort = chrome.session_sort.label();
     let title = if chrome.sessions_loading {
         format!(
-            " sessions — {} of {total} — loading… {}% ",
+            " sessions — {} of {total} — sort {sort} (o) — loading… {}% ",
             cursor + 1,
             chrome.sessions_pct
         )
     } else {
-        format!(" sessions — {} of {total} ", cursor + 1)
+        format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
     };
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
     frame.render_widget(table, area);
+    // Data rows start under the top border + header row.
+    let rows_rect = Rect {
+        x: area.x,
+        y: area.y.saturating_add(2),
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    };
     let _ = ctx;
+    (rows_rect.height > 0).then_some(SessionsChrome {
+        rows: rows_rect,
+        start,
+    })
 }
 
 /// Drill-down pane for the cursored session: the grouping confidence, the full
@@ -4224,6 +4252,15 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("config", Overlay::Config),
 ];
 
+/// The sessions table's clickable data area for one frame: `rows` covers the
+/// data rows only (border + header excluded); a click at `rows.y + k` selects
+/// session `start + k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionsChrome {
+    pub rows: Rect,
+    pub start: usize,
+}
+
 /// One clickable tab label's rendered rect (UI-3 U6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TabHit {
@@ -4321,6 +4358,9 @@ pub(crate) struct MainChrome {
     pub account_rows: Vec<AccountRowHit>,
     pub menu: Option<MenuChrome>,
     pub settings: Vec<SettingHit>,
+    /// Sessions overlay table layout this frame (issue: sessions mouse
+    /// select): the data-row rect + the index of its first visible session.
+    pub sessions_table: Option<SessionsChrome>,
     /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some(max)`
     /// is the largest valid scroll offset (wrapped line count minus the modal's
     /// visible inner height) so the runtime can clamp its stored offset; `None`
@@ -6932,6 +6972,7 @@ mod tests {
             sessions_loading: false,
             sessions_pct: 100,
             session_cursor: 0,
+            session_sort: Default::default(),
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,

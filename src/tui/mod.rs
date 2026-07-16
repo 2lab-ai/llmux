@@ -289,6 +289,44 @@ pub(crate) enum Overlay {
     Config,
 }
 
+/// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
+/// timeline default), most tokens (in+out), or most requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SessionSort {
+    #[default]
+    Recent,
+    Tokens,
+    Requests,
+}
+
+impl SessionSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            SessionSort::Recent => SessionSort::Tokens,
+            SessionSort::Tokens => SessionSort::Requests,
+            SessionSort::Requests => SessionSort::Recent,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SessionSort::Recent => "recent",
+            SessionSort::Tokens => "tokens",
+            SessionSort::Requests => "requests",
+        }
+    }
+
+    /// Apply this order to a session list (stable within equal keys).
+    pub(crate) fn apply(self, sessions: &mut [crate::session::Session]) {
+        match self {
+            SessionSort::Recent => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_ms)),
+            SessionSort::Tokens => sessions
+                .sort_by_key(|s| std::cmp::Reverse(s.tokens_in.saturating_add(s.tokens_out))),
+            SessionSort::Requests => sessions.sort_by_key(|s| std::cmp::Reverse(s.requests)),
+        }
+    }
+}
+
 /// Session-local pane-height overrides (UI-3 U7/U8): `None` = the pane's
 /// automatic height (content-derived / fixed). Set by dragging the separator
 /// row (the NEXT pane's top border) with the mouse.
@@ -338,6 +376,8 @@ pub(crate) struct Chrome {
     pub sessions_pct: u8,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles).
+    pub session_sort: SessionSort,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -603,6 +643,8 @@ struct App {
     /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
     /// one rect per tab label. Same record/read cycle as `activity_chrome`.
     tab_chrome: Vec<ui::TabHit>,
+    /// Sessions table hit layout from the last frame (mouse row select).
+    sessions_chrome: Option<ui::SessionsChrome>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
     /// payload-tab rects + top-right action buttons. Same record/read cycle
     /// as `activity_chrome`; empty while the modal is closed.
@@ -661,6 +703,8 @@ struct App {
     sessions_tx: Option<mpsc::Sender<SessionsLoad>>,
     /// Cursor row in the Sessions overlay's session list.
     session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
+    session_sort: SessionSort,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -735,6 +779,7 @@ impl App {
             history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
+            sessions_chrome: None,
             raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
@@ -755,6 +800,7 @@ impl App {
             sessions_pct: 100,
             sessions_tx: None,
             session_cursor: 0,
+            session_sort: SessionSort::default(),
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
@@ -960,6 +1006,7 @@ impl App {
             sessions_loading: self.sessions_loading,
             sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
+            session_sort: self.session_sort,
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
@@ -1176,6 +1223,37 @@ impl App {
                 MouseEventKind::ScrollDown => {
                     self.on_key_usage(KeyCode::Down, view);
                     return true;
+                }
+                _ => {}
+            }
+        }
+        // Sessions overlay (issue: mouse select): click a row to move the
+        // cursor there (the detail pane follows); wheel scrolls the cursor.
+        if self.overlay == Overlay::Sessions && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_session_cursor(-1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_session_cursor(1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(t) = self.sessions_chrome {
+                        let r = t.rows;
+                        if mouse.row >= r.y
+                            && mouse.row < r.bottom()
+                            && mouse.column >= r.x
+                            && mouse.column < r.right()
+                        {
+                            let idx = t.start + (mouse.row - r.y) as usize;
+                            if idx < self.sessions.len() {
+                                self.session_cursor = idx;
+                            }
+                            return true;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2007,6 +2085,13 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('s') | KeyCode::Esc => self.overlay = Overlay::None,
+            // Sort cycle (recent → tokens → requests); cursor resets so the
+            // selection follows the ORDER, not a stale index.
+            KeyCode::Char('o') => {
+                self.session_sort = self.session_sort.next();
+                self.session_sort.apply(&mut self.sessions);
+                self.session_cursor = 0;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_session_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_session_cursor(1, len),
             KeyCode::PageUp => self.move_session_cursor(-10, len),
@@ -3290,6 +3375,9 @@ async fn event_loop(
             // read progress instead of appearing all-at-once at the end.
             Some(load) = sess_rx.recv() => {
                 app.sessions = load.sessions;
+                // Deliveries arrive in fold order — re-apply the user's sort
+                // so a mid-load `o` press survives the next partial.
+                app.session_sort.apply(&mut app.sessions);
                 app.sessions_pct = load.pct;
                 app.sessions_loading = !load.done;
                 true
@@ -3392,6 +3480,7 @@ async fn event_loop(
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
+            app.sessions_chrome = main.sessions_table;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
@@ -4170,6 +4259,40 @@ mod tests {
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
+    #[test]
+    fn session_sort_cycles_and_reorders() {
+        let mut app = remote_app();
+        let sess =
+            |uid: &str, last_ms: u64, tokens_out: u64, requests: u64| crate::session::Session {
+                user_id: Some(uid.into()),
+                requests,
+                tokens_in: 0,
+                tokens_out,
+                models: Vec::new(),
+                accounts: Vec::new(),
+                account_rotations: 0,
+                first_ms: 0,
+                last_ms,
+                confidence: crate::session::Confidence::High,
+            };
+        // recent order: b (newest) first; tokens order: c; requests order: a.
+        app.sessions = vec![
+            sess("a", 10, 5, 9),
+            sess("b", 30, 1, 1),
+            sess("c", 20, 99, 2),
+        ];
+        app.session_sort.apply(&mut app.sessions);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("b"), "recent");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Tokens);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("c"), "tokens");
+        assert_eq!(app.session_cursor, 0, "cursor resets with the order");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
     #[test]
     fn misc_and_config_keys_round_trip() {
         let mut app = remote_app();
