@@ -1847,16 +1847,22 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             .load(std::sync::atomic::Ordering::Relaxed),
         // Config-file display gate, same convention as show_fable_weekly: no
         // runtime toggle / endpoint, so read the loaded config snapshot.
-        tui_effects: state.config.tui_effects,
+        tui_effects: state
+            .settings_live
+            .tui_effects
+            .load(std::sync::atomic::Ordering::Relaxed),
         tui_gradient: state.config.tui_gradient.clone(),
         // Config-file gate (fable-usage U9a). No runtime toggle / endpoint by
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
-        show_fable_weekly: state.config.show_fable_weekly,
+        show_fable_weekly: state
+            .settings_live
+            .show_fable_weekly
+            .load(std::sync::atomic::Ordering::Relaxed),
         // Config-file display settings, same convention as show_fable_weekly:
         // no runtime endpoint; the TUI `u` key overrides quota_display locally.
         domain_abbrev: state.config.domain_abbrev.clone(),
-        quota_display: state.config.quota_display,
+        quota_display: state.settings_live.quota_display(),
         // Live event holder, not the config snapshot: a `POST /llmux/events`
         // must reflect on the very next frame/poll without restart.
         events: state
