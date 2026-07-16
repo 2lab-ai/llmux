@@ -122,6 +122,13 @@ fn derived_utilization(limit: Option<u64>, remaining: Option<u64>) -> Option<f64
 pub struct ParsedRateLimitHeaders {
     pub five_hour: Option<WindowReading>,
     pub seven_day: Option<WindowReading>,
+    /// The model-scoped weekly bucket from the
+    /// `anthropic-ratelimit-unified-7d_oi-*` headers (issue #123; live
+    /// capture 2026-07-16: `7d_oi-utilization: 0.0`, `7d_oi-reset` epoch
+    /// seconds — the bucket the usage poll reports as the "Fable" weekly
+    /// row). Response headers keep the scoped gauge live between polls, so
+    /// a COLD gauge heals on the first request through the account.
+    pub fable_weekly: Option<WindowReading>,
     pub unified_status: Option<UnifiedStatus>,
     pub standard: Option<StandardRateLimit>,
 }
@@ -132,6 +139,7 @@ impl ParsedRateLimitHeaders {
     pub fn is_empty(&self) -> bool {
         self.five_hour.is_none()
             && self.seven_day.is_none()
+            && self.fable_weekly.is_none()
             && self.unified_status.is_none()
             && self.standard.is_none()
     }
@@ -147,6 +155,7 @@ pub fn parse(headers: &HeaderMap) -> ParsedRateLimitHeaders {
     ParsedRateLimitHeaders {
         five_hour: unified_window(headers, "5h").or(codex_five),
         seven_day: unified_window(headers, "7d").or(codex_seven),
+        fable_weekly: unified_window(headers, "7d_oi"),
         unified_status: header_str(headers, "anthropic-ratelimit-unified-status")
             .and_then(parse_unified_status),
         standard: parse_standard(headers),
@@ -439,6 +448,33 @@ mod tests {
         ]));
         assert!(parsed.five_hour.is_none());
         assert!(parsed.seven_day.is_none());
+    }
+
+    /// Issue #123 (live capture 2026-07-16): the `7d_oi` scoped bucket rides
+    /// the same unified header shape — parse it into `fable_weekly` with the
+    /// same both-fields-required contract.
+    #[test]
+    fn unified_7d_oi_window_parses_into_fable_weekly() {
+        let parsed = parse(&map(&[
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "0.0"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "1784325600"),
+        ]));
+        let fable = parsed.fable_weekly.expect("7d_oi parsed");
+        assert_eq!(fable.utilization, 0.0);
+        assert_eq!(
+            fable.resets_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_784_325_600)
+        );
+        assert!(
+            !parsed.is_empty(),
+            "a lone 7d_oi reading counts as quota data"
+        );
+        // Both-fields contract holds for the scoped bucket too.
+        let partial = parse(&map(&[(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            "0.5",
+        )]));
+        assert!(partial.fable_weekly.is_none());
     }
 
     #[test]

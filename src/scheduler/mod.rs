@@ -462,6 +462,32 @@ impl PoolState {
                 WindowSource::Headers,
             );
         }
+        if let Some(reading) = parsed.fable_weekly {
+            // The `7d_oi` scoped bucket rides every response (issue #123), so
+            // the Fable gauge stays live between usage polls and a COLD gauge
+            // heals on the first request through the account. Severity is
+            // derived for DISPLAY only (`is_constraining` keys on utilization,
+            // never on these labels); the next usage poll's freshest-wins
+            // merge restores upstream's own labels.
+            let severity = if reading.utilization >= 0.95 {
+                window::LimitSeverity::Critical
+            } else if reading.utilization >= 0.80 {
+                window::LimitSeverity::Warning
+            } else {
+                window::LimitSeverity::Normal
+            };
+            recorded |= AccountState::merge_scoped(
+                &mut acct.scoped_limits,
+                &usage::ScopedLimitReading {
+                    scope_label: crate::routing::FABLE_SCOPE_LABEL.to_string(),
+                    reading,
+                    severity,
+                    is_active: false,
+                },
+                now,
+                WindowSource::Headers,
+            );
+        }
         if parsed.five_hour.is_none() && parsed.seven_day.is_none() {
             // The `x-ratelimit-*` fallback names are provider-generic, so a
             // codex/anthropic response carrying them without a reset would
@@ -1646,6 +1672,29 @@ mod tests {
         assert_eq!(acct.five_hour.unwrap().source, WindowSource::Headers);
         assert_eq!(acct.seven_day.unwrap().utilization, 0.87);
         assert_eq!(acct.five_hour.unwrap().fetched_at, now());
+    }
+
+    /// Issue #123: the `7d_oi` header reading lands in the Fable scoped slot
+    /// — a COLD gauge heals on the first response through the account, and
+    /// the scheduler's Fable exclusion sees the same number.
+    #[test]
+    fn record_headers_populates_the_fable_scoped_gauge() {
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        assert!(state.accounts[0].scoped_limits.is_empty(), "starts cold");
+        let parsed = ParsedRateLimitHeaders {
+            fable_weekly: Some(reading(0.97, NOW_SECS + 86_400)),
+            ..Default::default()
+        };
+        state.record_headers(&id("a"), &parsed, now());
+        let snap = state.snapshot();
+        let fable = snap.accounts[0].fable_weekly().expect("gauge healed");
+        assert_eq!(fable.window.utilization, 0.97);
+        assert_eq!(fable.window.source, WindowSource::Headers);
+        assert_eq!(fable.severity, window::LimitSeverity::Critical);
+        assert!(
+            snap.accounts[0].fable_weekly_exhausted(now(), 0.95),
+            "the header-fed gauge drives the preemptive Fable exclusion"
+        );
     }
 
     #[test]
