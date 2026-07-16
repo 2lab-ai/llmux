@@ -959,6 +959,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
+        .route("/llmux/reset-usage", post(reset_usage_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
         .route("/llmux/events", post(events_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
@@ -2005,6 +2006,23 @@ async fn account_limits_endpoint(
 struct SchedulerModeRequest {
     /// `"default"` or `"round-robin"`.
     mode: crate::config::SchedulerMode,
+}
+
+/// `POST /llmux/reset-usage` (issue #115) — force every account's usage
+/// windows, scoped limits and cooldowns back to COLD. For the operator case
+/// where the provider reset quota server-side: the in-memory gauges keep
+/// overstating utilization until they age out, so the scheduler re-learns
+/// from fresh polls/response headers instead. In-memory only — nothing is
+/// persisted, and health/pause/ceilings are untouched.
+async fn reset_usage_endpoint(State(state): State<AppState>) -> Response {
+    let accounts = state.pool.reset_usage();
+    tracing::info!(accounts, "usage force-reset to cold (operator command)");
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "ok": true, "accounts": accounts }).to_string(),
+    )
+        .into_response()
 }
 
 /// `POST /llmux/scheduler-mode` — flip the selection algorithm live (TUI `S`;
@@ -3344,6 +3362,32 @@ mod tests {
                 .expect("reload")
                 .email_anonymous
         );
+    }
+
+    /// Issue #115: the operator endpoint returns every account to cold —
+    /// verified through the same snapshot `/llmux/status` serves.
+    #[tokio::test]
+    async fn reset_usage_endpoint_returns_every_account_to_cold() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        state
+            .pool
+            .record_429(&AccountId("a".into()), None, SystemTime::now());
+        assert!(
+            state.pool.snapshot().accounts[0].cooldown_until.is_some(),
+            "seed took"
+        );
+
+        let response = reset_usage_endpoint(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["accounts"], 1, "reports the accounts reset");
+
+        let snap = &state.pool.snapshot().accounts[0];
+        assert!(snap.cooldown_until.is_none(), "cooldown cleared");
+        assert!(snap.five_hour.is_none() && snap.seven_day.is_none(), "cold");
     }
 
     #[tokio::test]
