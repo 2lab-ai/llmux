@@ -20,21 +20,87 @@ use super::{
 };
 use crate::config::AccountCredential;
 
-fn strip_client_context_suffix(body: bytes::Bytes) -> bytes::Bytes {
+/// Normalize an Anthropic-bound JSON body in ONE parse: strip the
+/// Claude-Code-local `[1m]` context-window suffix from `model`, and strip
+/// foreign (unsigned) thinking blocks from `messages` (issue #116). Returns
+/// the original bytes (refcounted, byte-identity) when nothing changed; a
+/// non-JSON body passes through untouched — passthrough never fails on body
+/// shape.
+fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
-    let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
+    let model = strip_client_context_suffix(&mut value);
+    let thinking = strip_foreign_thinking(&mut value);
+    if !(model || thinking) {
         return body;
-    };
-    let Some(base) = model.strip_suffix("[1m]") else {
-        return body;
-    };
-    value["model"] = serde_json::Value::String(base.to_string());
+    }
     match serde_json::to_vec(&value) {
         Ok(bytes) => bytes::Bytes::from(bytes),
         Err(_) => body,
     }
+}
+
+fn strip_client_context_suffix(value: &mut serde_json::Value) -> bool {
+    let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(base) = model.strip_suffix("[1m]") else {
+        return false;
+    };
+    let base = base.to_string();
+    value["model"] = serde_json::Value::String(base);
+    true
+}
+
+/// Strip `thinking` blocks the real Anthropic API cannot verify — blocks with
+/// a MISSING or EMPTY `signature` — from `messages` (issue #116). The
+/// responses-family translator (grok/codex) synthesizes thinking blocks
+/// without a signature (it has nothing to sign them with), the client stores
+/// them in session history, and after a mid-session model switch the replay
+/// reaches api.anthropic.com, which rejects the request with 400
+/// `Invalid signature in thinking block`. Anthropic-signed blocks carry a
+/// non-empty signature and pass through untouched; `redacted_thinking`
+/// (signed inside its `data`, no `signature` field by design) is never
+/// touched. A message whose content array is left EMPTY by the strip is
+/// dropped whole — a foreign thinking-only turn has nothing valid to replay,
+/// and an empty content array is itself an upstream 400.
+fn strip_foreign_thinking(value: &mut serde_json::Value) -> bool {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    messages.retain_mut(|message| {
+        let Some(content) = message
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return true;
+        };
+        let before = content.len();
+        content.retain(|block| {
+            block.get("type").and_then(serde_json::Value::as_str) != Some("thinking")
+                || block
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty())
+        });
+        if content.len() == before {
+            return true;
+        }
+        changed = true;
+        !content.is_empty()
+    });
+    if changed {
+        tracing::info!(
+            "stripped unsigned (translate-synthesized) thinking blocks from an \
+             anthropic-bound request (issue #116)"
+        );
+    }
+    changed
 }
 
 /// Client auth header stripped/replaced on the way upstream.
@@ -137,7 +203,8 @@ impl Provider for AnthropicPassthrough {
         })
     }
 
-    /// Normalize the Claude-Code-only context-window suffix, otherwise unwrap
+    /// Normalize the Claude-Code-only context-window suffix and strip foreign
+    /// (unsigned) thinking blocks (issue #116) in one parse; otherwise unwrap
     /// without reserializing (moves the original wire body out).
     fn request_in(&self, unified: UnifiedRequest) -> Result<ProviderRequest, ProviderError> {
         let wire = unified.wire;
@@ -145,7 +212,7 @@ impl Provider for AnthropicPassthrough {
             method: wire.method,
             path: wire.path,
             headers: wire.headers,
-            body: strip_client_context_suffix(wire.body),
+            body: normalize_body(wire.body),
         })
     }
 
@@ -227,6 +294,84 @@ mod tests {
         let upstream: serde_json::Value =
             serde_json::from_slice(&provider_req.body).expect("upstream json");
         assert_eq!(upstream["model"], "claude-opus-4-8");
+    }
+
+    /// Issue #116 RED shape: the exact replay a client sends after a grok
+    /// turn — the responses-family translator synthesized a `thinking` block
+    /// with NO signature, the client stored it, and the next (claude-routed)
+    /// request replays it. Passing it through verbatim is the production 400
+    /// (`Invalid signature in thinking block` from api.anthropic.com).
+    #[test]
+    fn request_in_strips_unsigned_foreign_thinking_blocks() {
+        let body = r#"{"model":"claude-sonnet-5","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"grok reasoning"},{"type":"text","text":"grok answer"}]},{"role":"user","content":"continue"}]}"#;
+        let p = provider();
+        let unified = p.request_out(request(body)).expect("out");
+        let provider_req = p.request_in(unified).expect("in");
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&provider_req.body).expect("upstream json");
+        let assistant = &upstream["messages"][1]["content"];
+        assert_eq!(
+            assistant.as_array().map(Vec::len),
+            Some(1),
+            "unsigned thinking stripped: {assistant}"
+        );
+        assert_eq!(assistant[0]["type"], "text", "the real content survives");
+        assert_eq!(
+            upstream["messages"].as_array().map(Vec::len),
+            Some(3),
+            "no message dropped when content remains"
+        );
+        // The `thinking` REQUEST PARAM is configuration, not a content block —
+        // untouched.
+        assert_eq!(upstream["thinking"]["type"], "disabled");
+    }
+
+    /// An empty-string signature is the other foreign shape (a client that
+    /// serializes the missing field as `""`) — same strip.
+    #[test]
+    fn request_in_strips_empty_signature_thinking_blocks() {
+        let body = r#"{"model":"claude-sonnet-5","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x","signature":""},{"type":"text","text":"t"}]}]}"#;
+        let p = provider();
+        let unified = p.request_out(request(body)).expect("out");
+        let provider_req = p.request_in(unified).expect("in");
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&provider_req.body).expect("upstream json");
+        assert_eq!(
+            upstream["messages"][0]["content"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// Anthropic's OWN thinking blocks (non-empty signature) and
+    /// `redacted_thinking` (no signature field by design) must ride through
+    /// byte-identical — the strip is for foreign blocks only.
+    #[test]
+    fn request_in_keeps_signed_and_redacted_thinking_byte_identical() {
+        let body = r#"{"model":"claude-sonnet-5","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"real","signature":"EqQBCkYIChgCIkDRV7..."},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"t"}]}]}"#;
+        let p = provider();
+        let unified = p.request_out(request(body)).expect("out");
+        let provider_req = p.request_in(unified).expect("in");
+        assert_eq!(
+            provider_req.body.as_ref(),
+            body.as_bytes(),
+            "nothing foreign → byte-identity fast path"
+        );
+    }
+
+    /// A foreign thinking-ONLY assistant turn has nothing valid left after
+    /// the strip; an empty content array is itself an upstream 400, so the
+    /// whole message is dropped.
+    #[test]
+    fn request_in_drops_a_message_left_empty_by_the_strip() {
+        let body = r#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"only"}]},{"role":"user","content":"next"}]}"#;
+        let p = provider();
+        let unified = p.request_out(request(body)).expect("out");
+        let provider_req = p.request_in(unified).expect("in");
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&provider_req.body).expect("upstream json");
+        let messages = upstream["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2, "thinking-only turn dropped: {upstream}");
+        assert!(messages.iter().all(|m| m["role"] == "user"));
     }
 
     #[tokio::test]
