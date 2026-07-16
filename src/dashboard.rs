@@ -244,6 +244,7 @@ impl DashboardHub {
             logs: state.console.tail(LOG_TAIL).cloned().collect(),
             session_labels: state.log.session_labels(),
             daily_usage: state.log.daily_usage(),
+            daily_perf: state.log.daily_perf(),
             usage_stats: state.log.usage_stats(now),
         }
     }
@@ -277,6 +278,8 @@ pub(crate) struct HubView {
     pub session_labels: HashMap<String, String>,
     /// Tokens-per-day chart rows (UI-3 U14).
     pub daily_usage: Vec<DailyUsageDoc>,
+    /// Observed-performance rows (perf telemetry v1).
+    pub daily_perf: Vec<DailyPerfDoc>,
     /// Usage-tab calendar rows (usage-stats), cost not yet priced (the doc
     /// build adds it — pricing overrides live in the app state, not the log).
     pub usage_stats: Vec<UsageStatDoc>,
@@ -374,6 +377,8 @@ fn trace_event(event: &ActivityEvent) {
             user_id,
             kind,
             excerpt: _,
+            ttfb_ms: _,
+            ttft_ms: _,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -395,7 +400,7 @@ fn trace_event(event: &ActivityEvent) {
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
                 effort = effort.as_deref().unwrap_or("-"),
-                fast = *fast,
+                fast = fast.unwrap_or(false),
                 client = user_id.as_deref().unwrap_or("unknown"),
                 kind = kind.as_deref().unwrap_or("-"),
                 "request finished"
@@ -515,6 +520,11 @@ pub struct DashboardDoc {
     /// Tokens-per-day chart rows (UI-3 U14), oldest first. Additive.
     #[serde(default)]
     pub daily_usage: Vec<DailyUsageDoc>,
+    /// Observed-performance rows (perf telemetry v1), oldest day first.
+    /// Additive: absent from an older daemon → empty Perf tab with a hint;
+    /// `skip_serializing_if` keeps it off the wire with no history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daily_perf: Vec<DailyPerfDoc>,
     /// Usage-tab calendar rows (usage-stats): every granularity flattened,
     /// newest bucket first, cost priced server-side (T6 — the attach client
     /// has no pricing overrides). Additive: absent from an older daemon →
@@ -674,6 +684,42 @@ pub struct DailyUsageDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+}
+
+/// One (day, group, model, fast) row of the observed-performance stats
+/// (perf telemetry v1 — the Perf tab). `day` is epoch DAYS (UTC, same
+/// bucketing as [`DailyUsageDoc`]). All counters are raw sums; clients derive
+/// throughput as `Σoutput/Σms` and NEVER average per-request rates. `fast`
+/// is three-state: `None` = recorded before the field existed ("unknown"),
+/// rendered as its own series — never merged into fast=off. Additive: absent
+/// in older docs → no perf rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyPerfDoc {
+    pub day: u64,
+    pub group: String,
+    pub model: String,
+    #[serde(default)]
+    pub fast: Option<bool>,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    /// Throughput samples (output > 0, duration > 0) and their raw sums.
+    pub tps_n: u64,
+    pub output_tokens: u64,
+    pub e2e_ms: u64,
+    /// Measured subset (ttft present, duration > ttft) and its raw sums —
+    /// the only samples in the "estimated post-delta" series.
+    #[serde(default)]
+    pub measured_n: u64,
+    #[serde(default)]
+    pub measured_output: u64,
+    #[serde(default)]
+    pub post_ttft_ms: u64,
+    /// TTFB observations.
+    #[serde(default)]
+    pub ttfb_n: u64,
+    #[serde(default)]
+    pub ttfb_ms_sum: u64,
 }
 
 /// One (bucket, group, model) row of the Usage tab (usage-stats).
@@ -1117,10 +1163,19 @@ pub enum CompletedDoc {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
-        /// Codex fast mode was in effect (always `false` for claude). Additive:
-        /// absent (→ `false`) in docs written before this field existed.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        fast: bool,
+        /// Codex fast mode was in effect (`Some(false)` for claude; `None` =
+        /// pre-field replayed history — "unknown"). Additive both ways:
+        /// absent (→ `None`) in docs written before this field existed, and
+        /// `None` is skipped on the wire so an OLDER attach client's plain
+        /// `bool` default still parses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
+        /// Perf telemetry v1 (additive): millis to first upstream body chunk
+        /// and to the first streamed output delta.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttfb_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
         /// Client identity / message kind / input excerpt (TUI UI-3 U1/U2).
         /// Additive: absent in docs written before these fields existed.
         ///
@@ -1568,6 +1623,8 @@ pub(crate) fn dashboard_doc(
                     model,
                     effort,
                     fast,
+                    ttfb_ms,
+                    ttft_ms,
                     user_id,
                     kind,
                     excerpt,
@@ -1597,6 +1654,8 @@ pub(crate) fn dashboard_doc(
                     model: model.clone(),
                     effort: effort.clone(),
                     fast: *fast,
+                    ttfb_ms: *ttfb_ms,
+                    ttft_ms: *ttft_ms,
                     user_id: user_id.clone(),
                     msg_kind: kind.clone(),
                     excerpt: excerpt.clone(),
@@ -1716,6 +1775,7 @@ pub(crate) fn dashboard_doc(
         codex: meta.codex.clone(),
         grok: meta.grok.clone(),
         daily_usage: hub.daily_usage.clone(),
+        daily_perf: hub.daily_perf.clone(),
         usage_stats,
         email_anonymous: meta.email_anonymous,
         tui_effects: meta.tui_effects,
@@ -1911,7 +1971,9 @@ mod tests {
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
                 effort: Some("high".into()),
-                fast: true,
+                fast: Some(true),
+                ttfb_ms: None,
+                ttft_ms: None,
                 user_id: Some("acct_seed".into()),
                 kind: None,
                 excerpt: None,
@@ -2200,7 +2262,10 @@ mod tests {
                 assert_eq!(group.as_deref(), Some("codex"));
                 assert_eq!(model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(effort.as_deref(), Some("high"));
-                assert!(*fast, "codex fast mode is carried into the doc");
+                assert!(
+                    matches!(fast, Some(true)),
+                    "codex fast mode is carried into the doc"
+                );
                 // The full token split rides the doc — cache counters included,
                 // so the ATTACH-mode detail row is not permanently `—`.
                 let t = tokens.expect("tokens");
@@ -2727,7 +2792,9 @@ mod tests {
                     group: None,
                     model: None,
                     effort: None,
-                    fast: false,
+                    fast: Some(false),
+                    ttfb_ms: None,
+                    ttft_ms: None,
                     user_id: None,
                     kind: None,
                     excerpt: None,
@@ -2773,7 +2840,9 @@ mod tests {
             group: Some("claude".into()),
             model: Some("sonnet".into()),
             effort: None,
-            fast: false,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
             user_id: None,
             kind: None,
             excerpt: None,

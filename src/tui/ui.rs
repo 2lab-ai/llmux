@@ -28,6 +28,7 @@ use crate::scheduler::window::{
 use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
+use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
@@ -2116,7 +2117,11 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
         .as_deref()
         .map(|e| format!(" · effort {e}"))
         .unwrap_or_default();
-    let fast_label = if *fast { " · fast" } else { "" };
+    let fast_label = match fast {
+        Some(true) => " · fast",
+        Some(false) => "",
+        None => " · fast?", // pre-field history: unknown, never claimed off
+    };
     let mut lines = vec![
         raw_section("general"),
         field("request", format!("{method} {path}")),
@@ -4020,6 +4025,30 @@ pub(crate) fn hit_test_activity(
 /// Per-frame column widths for the activity rows (Z 2026-07-15 "최대 넓이"):
 /// each column is padded to the WIDEST value visible this frame, so every row
 /// lines up, and the input excerpt takes whatever is left of the terminal.
+/// e2e observed output throughput for one finished request: `output /
+/// total_duration` — the always-available metric (perf telemetry v1). `None`
+/// when there is no output or no measurable duration (never fabricate a
+/// rate). NOT a model decode-speed claim; the expanded detail carries the
+/// estimated post-delta figure when the stream recorded one.
+fn e2e_tps(tokens: Option<&TokenCounts>, duration: Duration) -> Option<f64> {
+    let output = tokens.map(|t| t.output).unwrap_or(0);
+    let secs = duration.as_secs_f64();
+    if output == 0 || secs <= 0.0 {
+        return None;
+    }
+    Some(output as f64 / secs)
+}
+
+/// Collapsed-row cell for the throughput column: `45t/s` / `7.2t/s`, `—`
+/// when not a throughput sample.
+fn row_tps_label(tokens: Option<&TokenCounts>, duration: Duration) -> String {
+    match e2e_tps(tokens, duration) {
+        Some(tps) if tps >= 10.0 => format!("{tps:.0}t/s"),
+        Some(tps) => format!("{tps:.1}t/s"),
+        None => "—".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RowMetrics {
     /// Panel width in cells — the excerpt budget is derived from it.
@@ -4030,6 +4059,8 @@ struct RowMetrics {
     dur_w: usize,
     /// Token column (`269tok`).
     tok_w: usize,
+    /// Output-throughput column (`45t/s` — e2e observed output tokens/sec).
+    tps_w: usize,
     /// Cost column (`$0.0079`).
     cost_w: usize,
 }
@@ -4047,6 +4078,7 @@ impl RowMetrics {
             meta_w: 0,
             dur_w: 4,
             tok_w: 6,
+            tps_w: 5,
             cost_w: 7,
         };
         for request in in_flight {
@@ -4076,6 +4108,7 @@ impl RowMetrics {
                 m.tok_w = m
                     .tok_w
                     .max(format!("{}tok", format::human_count(tokens.total())).len());
+                m.tps_w = m.tps_w.max(row_tps_label(Some(tokens), *duration).len());
                 if let (Some(group), Some(model)) = (group, model) {
                     let cost = crate::pricing::cost_usd(
                         group,
@@ -4461,6 +4494,8 @@ fn completed_line(
             model,
             effort,
             fast: _,
+            ttfb_ms: _,
+            ttft_ms: _,
             user_id,
             kind,
             excerpt,
@@ -4537,9 +4572,10 @@ fn completed_line(
             spans.push(Span::styled(format!("{status:>3}"), status_style));
             spans.push(Span::styled(
                 format!(
-                    " {} {}",
+                    " {} {} {}",
                     pad_cells_left(&format::elapsed_secs(*duration), m.dur_w),
                     pad_cells_left(&tok, m.tok_w),
+                    pad_cells_left(&row_tps_label(tokens.as_ref(), *duration), m.tps_w),
                 ),
                 dim(),
             ));
@@ -4612,6 +4648,8 @@ fn completed_detail_lines(
         model,
         effort,
         fast,
+        ttfb_ms,
+        ttft_ms,
         user_id,
         kind,
         excerpt,
@@ -4691,11 +4729,48 @@ fn completed_detail_lines(
         .filter(|e| !e.is_empty() && *e != "-")
         .map(|e| format!(" · effort {e}"))
         .unwrap_or_default();
-    let fast_label = if *fast { " · fast" } else { "" };
+    let fast_label = match fast {
+        Some(true) => " · fast",
+        Some(false) => "",
+        None => " · fast?", // pre-field history: unknown, never claimed off
+    };
     lines.push(indent(
         "model",
         format!("{model_label}{effort_label}{fast_label}"),
     ));
+    // Perf telemetry v1: e2e observed throughput (always derivable when
+    // tokens+duration exist) + the ESTIMATED post-delta figure when the
+    // stream recorded a first output delta. "est" is deliberate — the first
+    // streamed delta is not a model-internal first token (hidden reasoning
+    // may precede it), so no decode-speed claim is made.
+    {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(tps) = e2e_tps(tokens.as_ref(), *duration) {
+            parts.push(format!("e2e {tps:.1} t/s"));
+        }
+        if let (Some(ttft), Some(t)) = (ttft_ms, tokens) {
+            let total_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            if t.output > 0 && total_ms > *ttft {
+                let est = t.output as f64 / ((total_ms - ttft) as f64 / 1000.0);
+                parts.push(format!("est {est:.1} t/s post-delta"));
+            }
+        }
+        if let Some(ttfb) = ttfb_ms {
+            parts.push(format!(
+                "ttfb {}",
+                format::elapsed_secs(Duration::from_millis(*ttfb))
+            ));
+        }
+        if let Some(ttft) = ttft_ms {
+            parts.push(format!(
+                "first output {}",
+                format::elapsed_secs(Duration::from_millis(*ttft))
+            ));
+        }
+        if !parts.is_empty() {
+            lines.push(indent("perf", parts.join("  ·  ")));
+        }
+    }
     match tokens {
         Some(t) => {
             lines.push(indent(
@@ -7848,7 +7923,9 @@ mod tests {
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
@@ -7910,7 +7987,9 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-opus-4-8".into()),
                 effort: Some("high".into()),
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
@@ -8031,7 +8110,9 @@ mod tests {
                 group: group.map(str::to_string),
                 model: model.map(str::to_string),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
                 user_id: None,
                 kind: None,
                 excerpt: None,
@@ -9182,7 +9263,9 @@ mod tests {
                     group: Some("claude".into()),
                     model: Some("claude-opus-4-8".into()),
                     effort: None,
-                    fast: false,
+                    fast: Some(false),
+                    ttfb_ms: None,
+                    ttft_ms: None,
                     user_id: None,
                     kind: None,
                     excerpt: None,

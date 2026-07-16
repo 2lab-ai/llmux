@@ -135,6 +135,54 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
     }
 }
 
+/// Wall-clock landmarks of one relayed stream, captured inside the pump and
+/// handed to `finish` for activity timing (perf telemetry v1):
+/// - `first_byte` — the instant the FIRST successful upstream body chunk
+///   arrived (TTFB).
+/// - `first_content` — the instant the FIRST `content_block_delta` event was
+///   observed on the downstream-normalized output ("first streamed output
+///   delta"; text_delta / thinking_delta / input_json_delta alike —
+///   deliberately NOT text-only, so thinking time stays inside the
+///   post-delta window and the numerator/denominator agree).
+///
+/// `None` means the stream ended before that landmark. Instants (not
+/// durations) so `finish` can compute offsets against the request's own
+/// start.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamTiming {
+    pub first_byte: Option<std::time::Instant>,
+    pub first_content: Option<std::time::Instant>,
+}
+
+impl StreamTiming {
+    /// Record a successful body-chunk arrival (first call wins).
+    pub fn on_chunk(&mut self) {
+        if self.first_byte.is_none() {
+            self.first_byte = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Observe an SSE payload headed to the client; latches `first_content`
+    /// on the first content delta.
+    pub fn on_payload(&mut self, payload: &[u8]) {
+        if self.first_content.is_none() && contains_content_delta(payload) {
+            self.first_content = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// Whether `payload` carries an Anthropic `content_block_delta` event — the
+/// "first streamed output delta" marker for [`StreamTiming`]. Substring
+/// match: the token appears in the `event:` line and the JSON `type` field of
+/// such events, while the other lifecycle events (`message_start`,
+/// `message_delta`, `content_block_start`/`_stop`, `ping`) never contain it.
+/// Model TEXT could echo the literal string, but only inside a content delta
+/// — which has already latched the timestamp by then.
+pub fn contains_content_delta(payload: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"content_block_delta";
+    payload.len() >= NEEDLE.len() && payload.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+}
+
 /// Stateful per-request SSE transformer: upstream events in, downstream SSE
 /// bytes out. The codex provider's Responses→Anthropic converter implements
 /// this; the Anthropic passthrough never goes through it (byte-identity path
@@ -186,7 +234,7 @@ where
     // `finish` also receives the finished transform (for converter-level detail
     // like the codex trace's raw usage / event count) and whether the relay
     // ended because the CLIENT disconnected (vs. upstream completing).
-    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, RawCapture, Option<String>, &T, bool)
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, RawCapture, Option<String>, &T, bool, StreamTiming)
         + Send
         + 'static,
 {
@@ -197,11 +245,13 @@ where
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut upstream_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
+        let mut timing = StreamTiming::default();
         let mut stream = Box::pin(upstream.bytes_stream());
         let mut client_gone = false;
         'pump: while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
+                    timing.on_chunk();
                     upstream_captured.push(&chunk);
                     for event in events.push(&chunk) {
                         let out = transform.on_event(&event);
@@ -213,6 +263,7 @@ where
                             client_gone = true;
                             break 'pump;
                         }
+                        timing.on_payload(&out);
                         capture(&mut captured, &out, capture_limit);
                         raw_captured.push(&out);
                     }
@@ -229,6 +280,7 @@ where
                 if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                     client_gone = true;
                 } else {
+                    timing.on_payload(&out);
                     capture(&mut captured, &out, capture_limit);
                     raw_captured.push(&out);
                 }
@@ -253,6 +305,7 @@ where
             error,
             &transform,
             client_gone,
+            timing,
         );
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -344,7 +397,7 @@ pub fn passthrough_body<F>(
     finish: F,
 ) -> axum::body::Body
 where
-    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>) + Send + 'static,
+    F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>, StreamTiming) + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
@@ -353,6 +406,7 @@ where
         let mut captured: Vec<u8> = Vec::new();
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
+        let mut timing = StreamTiming::default();
         let mut stream = Box::pin(upstream.bytes_stream());
         loop {
             let item = match tokio::time::timeout(idle_timeout, stream.next()).await {
@@ -373,7 +427,9 @@ where
             };
             match item {
                 Ok(chunk) => {
+                    timing.on_chunk();
                     for event in events.push(&chunk) {
+                        timing.on_payload(event.as_bytes());
                         if let Some(observed) = extract_usage(&event) {
                             usage.add(observed);
                         }
@@ -399,7 +455,7 @@ where
                 usage.add(observed);
             }
         }
-        finish(usage, captured, raw_captured, error);
+        finish(usage, captured, raw_captured, error, timing);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }

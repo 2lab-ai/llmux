@@ -1014,6 +1014,35 @@ mod tests {
     }
 
     #[test]
+    fn first_content_delta_detection_skips_framing_and_counts_thinking() {
+        // Perf telemetry v1 (trinity contract C1/C8, converter path): the
+        // pump latches TTFT on the first converter OUTPUT that carries a
+        // content_block_delta. Framing (`response.created` → message_start)
+        // must NOT trigger it; a reasoning-summary delta (thinking) MUST —
+        // thinking time belongs inside the post-delta window so the
+        // numerator (output_tokens, thinking included) and denominator agree.
+        let mut converter = CodexSseConverter::new();
+        let framing = converter.on_event(&event(
+            json!({"type": "response.created", "response": {"id": "resp_1"}}),
+        ));
+        assert!(
+            !framing.is_empty(),
+            "response.created emits message_start framing"
+        );
+        assert!(
+            !crate::proxy::sse::contains_content_delta(&framing),
+            "framing must not read as a content delta"
+        );
+        let thinking = converter.on_event(&event(
+            json!({"type": "response.reasoning_summary_text.delta", "delta": "hm"}),
+        ));
+        assert!(
+            crate::proxy::sse::contains_content_delta(&thinking),
+            "thinking delta IS the first streamed output delta"
+        );
+    }
+
+    #[test]
     fn text_only_stream_maps_to_anthropic_sequence() {
         let (converter, events) = run_converter(&[
             json!({"type": "response.created", "response": {"id": "resp_1"}}),

@@ -89,8 +89,14 @@ pub(crate) enum CompletedBody {
         group: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        /// Codex fast mode was in effect (always `false` for claude).
-        fast: bool,
+        /// Codex fast mode was in effect (`Some(false)` for claude; `None`
+        /// only for pre-field replayed history — "unknown", never coerced).
+        fast: Option<bool>,
+        /// Millis to first upstream body chunk / first streamed output delta
+        /// (perf telemetry v1). `None` on error paths, non-streaming relays,
+        /// and pre-field history.
+        ttfb_ms: Option<u64>,
+        ttft_ms: Option<u64>,
         /// Keyless client identity (`metadata.user_id`) — keys the derived
         /// session label shown on the row (TUI UI-3 U2).
         user_id: Option<String>,
@@ -293,6 +299,98 @@ impl Totals {
         self.errors = self.errors.saturating_add(other.errors);
         self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
         self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daily perf aggregation (perf telemetry v1): per (day, group, model, fast).
+// ---------------------------------------------------------------------------
+
+/// Key of one perf series: (group, model, fast) — `fast: None` = recorded
+/// before the field existed ("unknown"), its own series.
+type PerfKey = (String, String, Option<bool>);
+/// Day (epoch days, UTC) → series → raw perf sums.
+type PerfDays = std::collections::BTreeMap<u64, HashMap<PerfKey, PerfCell>>;
+
+/// One (day, group, model, fast) cell of the observed-performance stats
+/// (perf telemetry v1). All counters are RAW SUMS — throughput is derived at
+/// display time as `Σoutput/Σms` (never an average of per-request rates), so
+/// the cell stays mergeable and replay-rebuildable. `fast` is three-state:
+/// `Some(true|false)` from recorded requests, `None` = pre-field history
+/// ("unknown"), aggregated as its own series — never folded into fast=off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PerfCell {
+    /// Every attributed finished request (errors included).
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    /// Throughput samples: requests with `output > 0` and a positive
+    /// duration. `output_tokens`/`e2e_ms` sum over exactly these.
+    pub tps_n: u64,
+    pub output_tokens: u64,
+    pub e2e_ms: u64,
+    /// Measured subset: throughput samples that also carry `ttft_ms` with
+    /// `duration > ttft` — the only samples allowed into the "estimated
+    /// post-delta" series (approximate/legacy samples never mix in).
+    pub measured_n: u64,
+    pub measured_output: u64,
+    pub post_ttft_ms: u64,
+    /// TTFB observations (any finished request that recorded one).
+    pub ttfb_n: u64,
+    pub ttfb_ms_sum: u64,
+}
+
+impl PerfCell {
+    /// Fold one attributed finished request into the cell (see field docs for
+    /// the sample gates).
+    fn add(
+        &mut self,
+        status: u16,
+        tokens: Option<TokenCounts>,
+        duration_ms: u64,
+        ttfb_ms: Option<u64>,
+        ttft_ms: Option<u64>,
+    ) {
+        self.requests = self.requests.saturating_add(1);
+        if status < 400 {
+            self.ok = self.ok.saturating_add(1);
+        } else {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if let Some(ms) = ttfb_ms {
+            self.ttfb_n = self.ttfb_n.saturating_add(1);
+            self.ttfb_ms_sum = self.ttfb_ms_sum.saturating_add(ms);
+        }
+        let output = tokens.map(|t| t.output).unwrap_or(0);
+        if output == 0 || duration_ms == 0 {
+            return; // not a throughput sample (still counted above).
+        }
+        self.tps_n = self.tps_n.saturating_add(1);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.e2e_ms = self.e2e_ms.saturating_add(duration_ms);
+        if let Some(ttft) = ttft_ms {
+            if duration_ms > ttft {
+                self.measured_n = self.measured_n.saturating_add(1);
+                self.measured_output = self.measured_output.saturating_add(output);
+                self.post_ttft_ms = self.post_ttft_ms.saturating_add(duration_ms - ttft);
+            }
+        }
+    }
+
+    /// Fold another cell's raw sums into this one (background history
+    /// hydration — every counter is a sum, so merge = add).
+    fn merge(&mut self, other: &PerfCell) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.ok = self.ok.saturating_add(other.ok);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.tps_n = self.tps_n.saturating_add(other.tps_n);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.e2e_ms = self.e2e_ms.saturating_add(other.e2e_ms);
+        self.measured_n = self.measured_n.saturating_add(other.measured_n);
+        self.measured_output = self.measured_output.saturating_add(other.measured_output);
+        self.post_ttft_ms = self.post_ttft_ms.saturating_add(other.post_ttft_ms);
+        self.ttfb_n = self.ttfb_n.saturating_add(other.ttfb_n);
+        self.ttfb_ms_sum = self.ttfb_ms_sum.saturating_add(other.ttfb_ms_sum);
     }
 }
 
@@ -743,10 +841,21 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Codex fast mode was in effect (always `false` for claude). Additive:
-    /// lines persisted before this field default to `false`.
+    /// Codex fast mode was in effect (`Some(false)` for claude). Additive:
+    /// lines persisted before this field existed deserialize to `None` —
+    /// "unknown", deliberately NOT `false`, so legacy history can never be
+    /// misfiled into the fast=off statistics (perf telemetry v1).
     #[serde(default)]
-    pub fast: bool,
+    pub fast: Option<bool>,
+    /// Millis to the first successful upstream body chunk (TTFB). Additive:
+    /// `None` on pre-field lines, error paths, and non-streaming relays.
+    #[serde(default)]
+    pub ttfb_ms: Option<u64>,
+    /// Millis to the first streamed output delta (first
+    /// `content_block_delta`, any delta type). Additive: `None` on pre-field
+    /// lines, content-less streams, and non-streaming relays.
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
     /// Keyless per-client metering identity (issue #32). Additive: lines
     /// persisted before this field default to `None` and replay into the
     /// `unknown` client bucket.
@@ -777,6 +886,8 @@ impl PersistedRequest {
             model,
             effort,
             fast,
+            ttfb_ms,
+            ttft_ms,
             user_id,
             kind,
             excerpt,
@@ -802,6 +913,8 @@ impl PersistedRequest {
             model: model.clone(),
             effort: effort.clone(),
             fast: *fast,
+            ttfb_ms: *ttfb_ms,
+            ttft_ms: *ttft_ms,
             user_id: user_id.clone(),
             kind: kind.clone(),
             excerpt: excerpt.clone(),
@@ -824,6 +937,8 @@ impl PersistedRequest {
             model: self.model,
             effort: self.effort,
             fast: self.fast,
+            ttfb_ms: self.ttfb_ms,
+            ttft_ms: self.ttft_ms,
             user_id: self.user_id,
             kind: self.kind,
             excerpt: self.excerpt,
@@ -881,6 +996,11 @@ pub(crate) struct ActivityLog {
     usage_hourly: UsageBuckets,
     usage_daily: UsageBuckets,
     usage_monthly: UsageBuckets,
+    /// Observed-performance stats (perf telemetry v1): day (epoch days, UTC —
+    /// same bucketing as `daily`) → (group, model, fast) → raw perf sums. Fed
+    /// by the same RequestFinished fold (startup replay fills history), pruned
+    /// to [`DAILY_RETAIN_DAYS`] like the chart fold.
+    perf_daily: PerfDays,
     /// Monotonic high-water marks (newest hour / local day ever folded):
     /// retention prunes against THESE, never against an individual event's
     /// timestamp, so an out-of-order replayed event can't resurrect an
@@ -1103,6 +1223,14 @@ impl ActivityLog {
                 cell.cache_creation = cell.cache_creation.saturating_add(t.cache_creation);
             }
         }
+        // Perf buckets (perf telemetry v1) merge BY DAY like the chart fold —
+        // raw sums, so history + live add losslessly.
+        for (day, cells) in history.perf_daily {
+            let dst = self.perf_daily.entry(day).or_default();
+            for (key, cell) in cells {
+                dst.entry(key).or_default().merge(&cell);
+            }
+        }
         // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
         // history lands on its original hours/days/months — same reasoning
         // as the daily chart buckets above. Watermarks merge by max and the
@@ -1202,6 +1330,39 @@ impl ActivityLog {
                         cache_read: t.cache_read,
                         cache_creation: t.cache_creation,
                     })
+            })
+            .collect()
+    }
+
+    /// Observed-performance rows (perf telemetry v1), flattened for the
+    /// dashboard document. Deterministic order: day ascending, then
+    /// (group, model, fast) — the inner map is a HashMap, so rows are sorted
+    /// per day before flattening (replay-identity tests compare these).
+    pub(crate) fn daily_perf(&self) -> Vec<crate::dashboard::DailyPerfDoc> {
+        self.perf_daily
+            .iter()
+            .flat_map(|(day, cells)| {
+                let mut cells: Vec<_> = cells.iter().collect();
+                cells.sort_by_key(|&(k, _)| k);
+                cells.into_iter().map(move |((group, model, fast), c)| {
+                    crate::dashboard::DailyPerfDoc {
+                        day: *day,
+                        group: group.clone(),
+                        model: model.clone(),
+                        fast: *fast,
+                        requests: c.requests,
+                        ok: c.ok,
+                        errors: c.errors,
+                        tps_n: c.tps_n,
+                        output_tokens: c.output_tokens,
+                        e2e_ms: c.e2e_ms,
+                        measured_n: c.measured_n,
+                        measured_output: c.measured_output,
+                        post_ttft_ms: c.post_ttft_ms,
+                        ttfb_n: c.ttfb_n,
+                        ttfb_ms_sum: c.ttfb_ms_sum,
+                    }
+                })
             })
             .collect()
     }
@@ -1690,6 +1851,8 @@ impl ActivityLog {
                 model,
                 effort,
                 fast,
+                ttfb_ms,
+                ttft_ms,
                 user_id,
                 kind,
                 excerpt,
@@ -1772,6 +1935,22 @@ impl ActivityLog {
                     // its hour/day/month bucket (tokens or not), so the
                     // requests column matches the per-model row semantics.
                     self.record_usage(group, model, tokens, now);
+                    // Observed-performance fold (perf telemetry v1): raw sums
+                    // per (day, group, model, fast). Same UTC-day bucketing
+                    // and retention as the chart fold; replay fills history.
+                    let day = now
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    self.perf_daily
+                        .entry(day)
+                        .or_default()
+                        .entry((group.clone(), normalize_model(model), fast))
+                        .or_default()
+                        .add(status, tokens, duration_ms, ttfb_ms, ttft_ms);
+                    let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
+                    self.perf_daily.retain(|d, _| *d >= cutoff);
                 }
                 self.push_health(now, status);
                 self.push(Completed {
@@ -1788,6 +1967,8 @@ impl ActivityLog {
                         model,
                         effort,
                         fast,
+                        ttfb_ms,
+                        ttft_ms,
                         user_id,
                         kind,
                         excerpt,
@@ -1910,7 +2091,9 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-fable-5".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
                 user_id: Some(uid.into()),
                 kind: Some("user".into()),
                 excerpt: Some(excerpt.into()),
@@ -1986,7 +2169,9 @@ mod tests {
             group: None,
             model: None,
             effort: None,
-            fast: false,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -2017,7 +2202,9 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
-            fast: false,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -2047,7 +2234,9 @@ mod tests {
             group: None,
             model: None,
             effort: None,
-            fast: false,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
             user_id: user_id.map(str::to_string),
             kind: None,
             excerpt: None,
@@ -2957,7 +3146,11 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
-            fast: false,
+            // Vary fast/timing by id so the persistence round-trip exercises
+            // the perf-telemetry fields (Some/None mixes included).
+            fast: Some(id.is_multiple_of(2)),
+            ttfb_ms: (!id.is_multiple_of(3)).then_some(40 + id),
+            ttft_ms: (id % 3 == 1).then_some(200 + id),
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),
@@ -3012,6 +3205,11 @@ mod tests {
                 "per-account totals for {acct} must match after restore"
             );
         }
+        assert_eq!(
+            a.daily_perf(),
+            b.daily_perf(),
+            "daily perf sums must match after restore (perf telemetry v1)"
+        );
         // Usage calendar buckets (usage-stats): compare the STORES (maps +
         // watermarks) — the doc accessor takes a read-time `now` these
         // replay-identity tests have no single value for.
@@ -3047,7 +3245,9 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: None,
-            fast: false,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -3314,6 +3514,109 @@ mod tests {
                 .iter()
                 .all(|r| r.model == "m"),
             "future month bucket hidden at read time (months never prune)"
+        );
+    }
+
+    #[test]
+    fn legacy_persisted_line_reads_fast_and_timing_as_unknown() {
+        // Trinity contract C4/C8: a line persisted BEFORE the fast/timing
+        // fields existed must deserialize `fast` to `None` ("unknown") — not
+        // `Some(false)` — and the timing fields to `None`, so legacy history
+        // can never be misfiled into the fast=off / measured series.
+        let line = r#"{"v":1,"ts_ms":1000,"id":7,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null}"#;
+        let record: PersistedRequest = serde_json::from_str(line).expect("legacy line parses");
+        assert_eq!(
+            record.fast, None,
+            "absent fast is UNKNOWN, never Some(false)"
+        );
+        assert_eq!(record.ttfb_ms, None);
+        assert_eq!(record.ttft_ms, None);
+        // And a modern line keeps its recorded values through the round trip.
+        let modern = r#"{"v":1,"ts_ms":1000,"id":8,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null,"fast":true,"ttfb_ms":120,"ttft_ms":800}"#;
+        let record: PersistedRequest = serde_json::from_str(modern).expect("modern line parses");
+        assert_eq!(record.fast, Some(true));
+        assert_eq!(record.ttfb_ms, Some(120));
+        assert_eq!(record.ttft_ms, Some(800));
+    }
+
+    #[test]
+    fn perf_fold_gates_and_series_separation() {
+        // Trinity contract C3/C4: throughput samples need output>0; the
+        // measured series additionally needs ttft with duration>ttft; fast
+        // None/Some(false)/Some(true) aggregate as THREE separate keys.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let ev = |id: u64,
+                  status: u16,
+                  output: u64,
+                  duration_ms: u64,
+                  fast: Option<bool>,
+                  ttfb_ms: Option<u64>,
+                  ttft_ms: Option<u64>| {
+            ActivityEvent::RequestFinished {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a".into()),
+                status,
+                duration: Duration::from_millis(duration_ms),
+                tokens: Some(TokenCounts {
+                    input: 10,
+                    output,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: None,
+                fast,
+                ttfb_ms,
+                ttft_ms,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+            }
+        };
+        let now = at(1_000);
+        // measured sample: 30 output tokens over (2000-500)ms post-delta.
+        log.apply(
+            ev(1, 200, 30, 2_000, Some(false), Some(100), Some(500)),
+            now,
+        );
+        // tps-only sample (no ttft) in the SAME (group,model,fast) cell.
+        log.apply(ev(2, 200, 10, 1_000, Some(false), Some(80), None), now);
+        // output=0 → error-rate only, never a throughput sample.
+        log.apply(ev(3, 500, 0, 700, Some(false), None, None), now);
+        // duration <= ttft → tps sample but NOT measured (invalid span).
+        log.apply(ev(4, 200, 5, 400, Some(false), Some(50), Some(400)), now);
+        // fast=true and fast-unknown land in their own series.
+        log.apply(ev(5, 200, 50, 1_000, Some(true), Some(60), Some(200)), now);
+        log.apply(ev(6, 200, 40, 1_000, None, None, None), now);
+
+        let rows = log.daily_perf();
+        assert_eq!(rows.len(), 3, "off / on / unknown are separate series");
+        let cell = |fast: Option<bool>| {
+            rows.iter()
+                .find(|r| r.fast == fast && r.group == "codex" && r.model == "gpt-5.5")
+                .expect("series present")
+        };
+        let off = cell(Some(false));
+        assert_eq!(off.requests, 4);
+        assert_eq!(off.ok, 3);
+        assert_eq!(off.errors, 1);
+        assert_eq!(off.tps_n, 3, "output>0 samples only");
+        assert_eq!(off.output_tokens, 45);
+        assert_eq!(off.e2e_ms, 3_400);
+        assert_eq!(off.measured_n, 1, "duration<=ttft and ttft-less excluded");
+        assert_eq!(off.measured_output, 30);
+        assert_eq!(off.post_ttft_ms, 1_500);
+        assert_eq!(off.ttfb_n, 3);
+        assert_eq!(off.ttfb_ms_sum, 230);
+        let on = cell(Some(true));
+        assert_eq!((on.requests, on.tps_n, on.measured_n), (1, 1, 1));
+        let unknown = cell(None);
+        assert_eq!(
+            (unknown.requests, unknown.tps_n, unknown.measured_n),
+            (1, 1, 0)
         );
     }
 
