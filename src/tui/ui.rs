@@ -224,6 +224,7 @@ pub(crate) fn draw(
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
+        Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome),
     }
 
@@ -1390,6 +1391,451 @@ fn ms_to_systemtime(ms: u64) -> SystemTime {
 /// The rect a summoned overlay covers: the whole screen except the bottom two
 /// rows reserved for the footer keybar, so MAIN's footer slot is never double
 /// drawn and the keybar stays visible under the overlay.
+
+// ---------------------------------------------------------------------------
+// Perf overlay (perf telemetry v1): observed performance per provider/model.
+// ---------------------------------------------------------------------------
+
+/// One aggregated perf series over the selected window (perf telemetry v1):
+/// (group, model, fast) + the window's raw sums. Throughput is derived here
+/// as `Σoutput/Σms` — never an average of per-request rates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PerfAgg {
+    group: String,
+    model: String,
+    fast: Option<bool>,
+    requests: u64,
+    errors: u64,
+    tps_n: u64,
+    output_tokens: u64,
+    e2e_ms: u64,
+    measured_n: u64,
+    measured_output: u64,
+    post_ttft_ms: u64,
+    ttfb_n: u64,
+    ttfb_ms_sum: u64,
+}
+
+impl PerfAgg {
+    /// e2e observed throughput (`Σoutput/Σduration`) — `None` when the
+    /// window has no throughput sample (never fabricate a rate).
+    fn e2e_tps(&self) -> Option<f64> {
+        (self.tps_n > 0 && self.e2e_ms > 0)
+            .then(|| self.output_tokens as f64 * 1000.0 / self.e2e_ms as f64)
+    }
+
+    /// Estimated post-delta throughput — measured samples only, and the
+    /// summed post-delta span must clear the stability floor (a bucket with
+    /// <50ms of total span yields a numerically meaningless ratio; raw sums
+    /// are kept, so it fills in as data accrues).
+    fn est_tps(&self) -> Option<f64> {
+        (self.measured_n > 0 && self.post_ttft_ms >= 50)
+            .then(|| self.measured_output as f64 * 1000.0 / self.post_ttft_ms as f64)
+    }
+
+    fn err_pct(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            self.errors as f64 * 100.0 / self.requests as f64
+        }
+    }
+}
+
+/// `45t/s` / `7.2t/s` — or `—` for `None` (no sample / below the stability
+/// floor). The honest empty cell, never `0`.
+fn tps_cell(tps: Option<f64>) -> String {
+    match tps {
+        Some(t) if t >= 10.0 => format!("{t:.0}t/s"),
+        Some(t) => format!("{t:.1}t/s"),
+        None => "—".to_string(),
+    }
+}
+
+/// Series display label: `codex gpt-5.5⚡` / `claude opus?` — `⚡` = fast on,
+/// `?` = recorded before the fast field existed ("unknown", its own series).
+fn perf_series_label(group: &str, model: &str, fast: Option<bool>) -> String {
+    let marker = match fast {
+        Some(true) => "⚡",
+        Some(false) => "",
+        None => "?",
+    };
+    format!("{group} {model}{marker}")
+}
+
+/// The trailing-window day range `[start, today]` for a span of `days`.
+fn perf_window(now: SystemTime, days: u64) -> (u64, u64) {
+    let today = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    (today.saturating_sub(days.saturating_sub(1)), today)
+}
+
+/// Aggregate the window's perf rows into per-(group, model, fast) series,
+/// sorted by output tokens desc (ties: key order, deterministic).
+fn perf_series(view: &DashboardView, days: u64, now: SystemTime) -> Vec<PerfAgg> {
+    let (start, today) = perf_window(now, days);
+    let mut agg: std::collections::BTreeMap<(String, String, Option<bool>), PerfAgg> =
+        Default::default();
+    for r in view
+        .daily_perf
+        .iter()
+        .filter(|r| r.day >= start && r.day <= today)
+    {
+        let a = agg
+            .entry((r.group.clone(), r.model.clone(), r.fast))
+            .or_insert_with(|| PerfAgg {
+                group: r.group.clone(),
+                model: r.model.clone(),
+                fast: r.fast,
+                ..Default::default()
+            });
+        a.requests += r.requests;
+        a.errors += r.errors;
+        a.tps_n += r.tps_n;
+        a.output_tokens += r.output_tokens;
+        a.e2e_ms += r.e2e_ms;
+        a.measured_n += r.measured_n;
+        a.measured_output += r.measured_output;
+        a.post_ttft_ms += r.post_ttft_ms;
+        a.ttfb_n += r.ttfb_n;
+        a.ttfb_ms_sum += r.ttfb_ms_sum;
+    }
+    let mut rows: Vec<PerfAgg> = agg.into_values().collect();
+    rows.sort_by(|a, b| b.output_tokens.cmp(&a.output_tokens));
+    rows
+}
+
+/// Number of series rows the Perf overlay shows for the span — the key
+/// handler clamps its cursor with this.
+pub(crate) fn perf_series_count(view: &DashboardView, days: u64) -> usize {
+    perf_series(view, days, SystemTime::now()).len()
+}
+
+/// Colors for the perf chart series (rank order, distinct on dark terminals).
+const PERF_CHART_COLORS: [Color; 4] = [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
+
+/// Perf overlay (`p`, perf telemetry v1 — "observed performance"): a daily
+/// e2e tokens/sec chart for the top series, a date × provider health matrix,
+/// and the per-(model, fast) series table. Passive telemetry from real
+/// requests — deliberately NOT called a healthcheck; quiet days render `—`,
+/// never a fabricated `0 t/s`.
+fn draw_perf_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) {
+    frame.render_widget(Clear, area);
+    let days = chrome.perf_days.clamp(2, 366);
+    if view.daily_perf.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no perf data yet — collecting starts with this daemon version (metric v1); \
+             send requests through the proxy",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(Block::new().borders(Borders::TOP).title(" perf "));
+        frame.render_widget(empty, area);
+        return;
+    }
+    let series = perf_series(view, days, ctx.now);
+    let since_day = view.daily_perf.iter().map(|r| r.day).min().unwrap_or(0);
+    let since = day_label(since_day);
+    let title =
+        format!(" perf — observed, last {days}d · collecting since {since} · v1 · d cycles ");
+
+    let chart_h = if area.height >= 24 { 13 } else { 0 };
+    let table_h = (series.len().min(8) as u16).saturating_add(3);
+    let [chart_area, health_area, table_area] = Layout::vertical([
+        Constraint::Length(chart_h),
+        Constraint::Min(4),
+        Constraint::Length(table_h),
+    ])
+    .areas(area);
+    if chart_h > 0 {
+        draw_perf_chart(frame, chart_area, view, ctx, days, &title);
+        draw_perf_health(frame, health_area, view, ctx, days, None);
+    } else {
+        draw_perf_health(frame, health_area, view, ctx, days, Some(&title));
+    }
+    draw_perf_table(frame, table_area, &series, chrome.perf_cursor);
+}
+
+/// `MM-DD`-style label for an epoch day (UTC), reusing the month/day half of
+/// [`format::month_day_hm`].
+fn day_label(d: u64) -> String {
+    let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
+    let full = format::month_day_hm(at, 0);
+    full.split(' ').next().unwrap_or("").to_string()
+}
+
+/// Daily e2e tokens/sec line chart: one braille line per top series over the
+/// span. A day without throughput samples plots 0 (trend view; the tables
+/// stay the honest `—` surface).
+fn draw_perf_chart(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    days: u64,
+    title: &str,
+) {
+    let (start, today) = perf_window(ctx.now, days);
+    let in_span = |r: &&crate::dashboard::DailyPerfDoc| r.day >= start && r.day <= today;
+    // Rank series by window output; plot the top 4.
+    let ranked = {
+        let mut totals: std::collections::BTreeMap<(&str, &str, Option<bool>), u64> =
+            Default::default();
+        for r in view.daily_perf.iter().filter(&in_span) {
+            *totals
+                .entry((r.group.as_str(), r.model.as_str(), r.fast))
+                .or_default() += r.output_tokens;
+        }
+        let mut ranked: Vec<_> = totals.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(PERF_CHART_COLORS.len());
+        ranked
+    };
+    if ranked.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())))
+            .block(Block::new().borders(Borders::TOP).title(title.to_string()));
+        frame.render_widget(empty, area);
+        return;
+    }
+    let span_days = days as usize;
+    // Per-day per-series raw sums → tps points (0 on quiet days).
+    let mut sums: Vec<Vec<(u64, u64)>> = vec![vec![(0, 0); span_days]; ranked.len()];
+    for r in view.daily_perf.iter().filter(&in_span) {
+        if let Some(idx) = ranked
+            .iter()
+            .position(|((g, m, f), _)| *g == r.group && *m == r.model && *f == r.fast)
+        {
+            let x = (r.day - start) as usize;
+            sums[idx][x].0 += r.output_tokens;
+            sums[idx][x].1 += r.e2e_ms;
+        }
+    }
+    let mut y_max = 1f64;
+    let series: Vec<Vec<(f64, f64)>> = sums
+        .iter()
+        .map(|day_sums| {
+            day_sums
+                .iter()
+                .enumerate()
+                .map(|(x, (out, ms))| {
+                    let y = if *ms > 0 {
+                        *out as f64 * 1000.0 / *ms as f64
+                    } else {
+                        0.0
+                    };
+                    y_max = y_max.max(y);
+                    (x as f64, y)
+                })
+                .collect()
+        })
+        .collect();
+    let datasets: Vec<Dataset> = series
+        .iter()
+        .enumerate()
+        .map(|(i, data)| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(PERF_CHART_COLORS[i]))
+                .data(data)
+        })
+        .collect();
+    let x_axis = Axis::default()
+        .bounds([0.0, (span_days.saturating_sub(1)) as f64])
+        .labels(vec![
+            Span::styled(day_label(start), dim()),
+            Span::styled(day_label(start + days / 2), dim()),
+            Span::styled(day_label(today), dim()),
+        ])
+        .style(dim());
+    let y_axis = Axis::default()
+        .bounds([0.0, y_max])
+        .labels(vec![
+            Span::styled("0", dim()),
+            Span::styled(format!("{:.0}", y_max / 2.0), dim()),
+            Span::styled(format!("{y_max:.0} t/s"), dim()),
+        ])
+        .style(dim());
+    let [plot_area, legend_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let chart = Chart::new(datasets)
+        .block(Block::new().borders(Borders::TOP).title(title.to_string()))
+        .x_axis(x_axis)
+        .y_axis(y_axis);
+    frame.render_widget(chart, plot_area);
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim()));
+        }
+        spans.push(Span::styled("● ", Style::new().fg(PERF_CHART_COLORS[i])));
+        spans.push(Span::raw(perf_series_label(group, model, *fast)));
+    }
+    spans.push(Span::styled(
+        "   (e2e t/s — estimated post-delta rates in the table below)",
+        dim(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+}
+
+/// Date × provider health matrix: per day and backend group — sample count,
+/// error %, avg TTFB, e2e t/s. `—` = no data (never a fabricated 0); rows
+/// with n < 5 render dim (low confidence, still shown — low traffic is
+/// itself a signal).
+fn draw_perf_health(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    days: u64,
+    title: Option<&str>,
+) {
+    let (start, today) = perf_window(ctx.now, days);
+    let in_span = |r: &&crate::dashboard::DailyPerfDoc| r.day >= start && r.day <= today;
+    // Providers present in the window, stable order.
+    let mut groups: Vec<&str> = Vec::new();
+    for r in view.daily_perf.iter().filter(&in_span) {
+        if !groups.contains(&r.group.as_str()) {
+            groups.push(r.group.as_str());
+        }
+    }
+    groups.sort_unstable();
+    // Fold per (day, group).
+    let mut cells: std::collections::BTreeMap<(u64, &str), PerfAgg> = Default::default();
+    for r in view.daily_perf.iter().filter(&in_span) {
+        let a = cells.entry((r.day, r.group.as_str())).or_default();
+        a.requests += r.requests;
+        a.errors += r.errors;
+        a.tps_n += r.tps_n;
+        a.output_tokens += r.output_tokens;
+        a.e2e_ms += r.e2e_ms;
+        a.ttfb_n += r.ttfb_n;
+        a.ttfb_ms_sum += r.ttfb_ms_sum;
+    }
+    let capacity = (area.height.saturating_sub(2) as usize).max(1);
+    let mut rows: Vec<Row> = Vec::new();
+    // Newest day first; only days that have ANY data get a row.
+    let mut shown_days: Vec<u64> = cells.keys().map(|(d, _)| *d).collect();
+    shown_days.dedup();
+    shown_days.reverse();
+    for day in shown_days.into_iter().take(capacity) {
+        let mut row_cells: Vec<Cell> = vec![Cell::from(Span::styled(day_label(day), dim()))];
+        let mut day_n = 0;
+        for group in &groups {
+            match cells.get(&(day, *group)) {
+                Some(a) => {
+                    day_n += a.requests;
+                    let ttfb = (a.ttfb_n > 0)
+                        .then(|| {
+                            format::elapsed_secs(Duration::from_millis(a.ttfb_ms_sum / a.ttfb_n))
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    let err = a.err_pct();
+                    let err_style = if err >= 10.0 {
+                        Style::new().fg(Color::Red)
+                    } else if err > 0.0 {
+                        Style::new().fg(Color::Yellow)
+                    } else {
+                        Style::new().fg(Color::Green)
+                    };
+                    row_cells.push(Cell::from(Line::from(vec![
+                        Span::raw(format!("{:>4} ", format::human_count(a.requests))),
+                        Span::styled(format!("{err:>4.0}% "), err_style),
+                        Span::raw(format!("{ttfb:>6} {:>8}", tps_cell(a.e2e_tps()))),
+                    ])));
+                }
+                None => row_cells.push(Cell::from(Span::styled("—", dim()))),
+            }
+        }
+        let row = Row::new(row_cells);
+        rows.push(if day_n < 5 { row.style(dim()) } else { row });
+    }
+    let mut header: Vec<Cell> = vec![Cell::from("date")];
+    for group in &groups {
+        header.push(Cell::from(format!("{group}: n err% ttfb t/s")));
+    }
+    let mut constraints = vec![Constraint::Length(7)];
+    constraints.extend(groups.iter().map(|_| Constraint::Fill(1)));
+    let block = Block::new().borders(Borders::TOP).title(match title {
+        Some(t) => t.to_string(),
+        None => " provider health (observed) ".to_string(),
+    });
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(block);
+    frame.render_widget(table, area);
+}
+
+/// Per-(group, model, fast) series table over the span: samples, error %,
+/// output tokens, e2e + estimated post-delta t/s, avg TTFB, and measured
+/// coverage (`measured/tps` samples). The estimated column is derived from
+/// measured samples only — approximate/legacy samples never mix in.
+fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: usize) {
+    let total = series.len();
+    let cursor = cursor.min(total.saturating_sub(1));
+    let capacity = (area.height.saturating_sub(2) as usize).max(1);
+    let start = if cursor >= capacity {
+        cursor + 1 - capacity
+    } else {
+        0
+    };
+    let end = (start + capacity).min(total);
+    let rows = series[start..end].iter().enumerate().map(|(i, a)| {
+        let idx = start + i;
+        let ttfb = (a.ttfb_n > 0)
+            .then(|| format::elapsed_secs(Duration::from_millis(a.ttfb_ms_sum / a.ttfb_n)))
+            .unwrap_or_else(|| "—".into());
+        let coverage = format!("{}/{}", a.measured_n, a.tps_n);
+        let row = Row::new(vec![
+            Cell::from(perf_series_label(&a.group, &a.model, a.fast)),
+            Cell::from(format!("{:>5}", format::human_count(a.requests))),
+            Cell::from(format!("{:>5.1}%", a.err_pct())),
+            Cell::from(format!("{:>7}", format::human_count(a.output_tokens))),
+            Cell::from(format!("{:>8}", tps_cell(a.e2e_tps()))),
+            Cell::from(format!("{:>8}", tps_cell(a.est_tps()))),
+            Cell::from(format!("{ttfb:>6}")),
+            Cell::from(format!("{coverage:>7}")),
+        ]);
+        let row = if a.requests < 5 {
+            row.style(dim())
+        } else {
+            row
+        };
+        if idx == cursor {
+            row.style(Style::new().add_modifier(Modifier::REVERSED))
+        } else {
+            row
+        }
+    });
+    let header = vec![
+        "series", "req", "err%", "out", "e2e t/s", "est t/s", "ttfb", "meas",
+    ];
+    let constraints = vec![
+        Constraint::Fill(1),
+        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(8),
+    ];
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(format!(
+            " series — {} of {total} · est = post-first-delta (measured only) ",
+            cursor.saturating_add(1).min(total.max(1))
+        )));
+    frame.render_widget(table, area);
+}
+
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
 /// keybindings and build/daemon facts. Read-only.
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
@@ -3775,6 +4221,7 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("accounts", Overlay::Accounts),
     ("stats", Overlay::Stats),
     ("usage", Overlay::Usage),
+    ("perf", Overlay::Perf),
     ("logs", Overlay::Logs),
     ("sessions", Overlay::Sessions),
     ("misc", Overlay::Misc),
@@ -6024,6 +6471,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 key("q"),
                 Span::raw(" quit"),
             ]),
+            Overlay::Perf => Line::from(vec![
+                Span::raw(" perf — "),
+                key("d"),
+                Span::raw(" span  "),
+                key("↑/k ↓/j"),
+                Span::raw(" series  "),
+                key("p/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
             Overlay::Misc => Line::from(vec![
                 Span::raw(" misc — "),
                 key("?/Esc"),
@@ -6174,6 +6632,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            daily_perf: Vec::new(),
             usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
@@ -6458,6 +6917,8 @@ mod tests {
             menu_anchor: None,
             menu_account: None,
             chart_days: 14,
+            perf_days: 14,
+            perf_cursor: 0,
             usage_gran: Default::default(),
             usage_scroll: 0,
             input_modal: None,
@@ -8624,6 +9085,75 @@ mod tests {
         assert!(
             !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
             "no fallback to the row occupant"
+        );
+    }
+
+    #[test]
+    fn perf_overlay_renders_series_health_and_honest_gaps() {
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_secs()
+            / 86_400;
+        let row = |model: &str, fast: Option<bool>| crate::dashboard::DailyPerfDoc {
+            day: today,
+            group: "codex".into(),
+            model: model.into(),
+            fast,
+            requests: 10,
+            ok: 9,
+            errors: 1,
+            tps_n: 8,
+            output_tokens: 4_000,
+            e2e_ms: 20_000,
+            measured_n: 6,
+            measured_output: 3_000,
+            post_ttft_ms: 10_000,
+            ttfb_n: 8,
+            ttfb_ms_sum: 1_600,
+        };
+        view.daily_perf = vec![
+            row("gpt-5.5", Some(true)),
+            row("gpt-5.5", Some(false)),
+            // Legacy pre-field history: unknown fast, its own series.
+            row("gpt-5.5", None),
+            // A series with NO measured samples: est column must be `—`.
+            crate::dashboard::DailyPerfDoc {
+                measured_n: 0,
+                measured_output: 0,
+                post_ttft_ms: 0,
+                model: "opus".into(),
+                group: "claude".into(),
+                ..row("opus", Some(false))
+            },
+        ];
+        let text = render(&view, &chrome_overlay(Overlay::Perf), 200, 50);
+        assert!(text.contains("gpt-5.5⚡"), "fast=on series marked: {text}");
+        assert!(text.contains("gpt-5.5?"), "unknown-fast series marked");
+        assert!(
+            text.contains("collecting since"),
+            "collection-start labeled"
+        );
+        assert!(text.contains("est t/s"), "estimated column labeled est");
+        assert!(
+            text.contains("claude opus"),
+            "claude series present in table"
+        );
+        // est for the measured series = 3000 tokens / 10s = 300t/s; e2e =
+        // 4000/20s = 200t/s. The no-measured series renders `—` in est.
+        assert!(text.contains("300t/s"), "estimated post-delta rate shown");
+        assert!(text.contains("200t/s"), "e2e rate shown");
+        // Provider health matrix shows both groups.
+        assert!(text.contains("codex: n err% ttfb t/s"), "health columns");
+        assert!(text.contains("claude: n err% ttfb t/s"), "health columns");
+
+        // Empty state: honest hint, no fabricated zeros.
+        view.daily_perf.clear();
+        let text = render(&view, &chrome_overlay(Overlay::Perf), 200, 50);
+        assert!(
+            text.contains("no perf data yet"),
+            "empty perf tab explains collection"
         );
     }
 

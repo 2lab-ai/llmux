@@ -62,6 +62,8 @@ pub(crate) struct DashboardView {
     pub grok: crate::dashboard::GrokSettingsDoc,
     /// Tokens-per-day chart rows (UI-3 U14), straight from the document.
     pub daily_usage: Vec<crate::dashboard::DailyUsageDoc>,
+    /// Observed-performance rows (perf telemetry v1), oldest day first.
+    pub daily_perf: Vec<crate::dashboard::DailyPerfDoc>,
     /// Usage-tab calendar rows (usage-stats), straight from the document —
     /// labels and cost are server-rendered, the client only filters by
     /// granularity and draws.
@@ -374,6 +376,7 @@ impl DashboardView {
             session_labels: doc.session_labels.clone(),
             grok: doc.grok.clone(),
             daily_usage: doc.daily_usage.clone(),
+            daily_perf: doc.daily_perf.clone(),
             usage_stats: doc.usage_stats.clone(),
             version: doc.version.clone(),
             pid: doc.pid,

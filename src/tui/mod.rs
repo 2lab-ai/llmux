@@ -278,6 +278,9 @@ pub(crate) enum Overlay {
     /// Session timeline (issue #34): persisted raw-io grouped by
     /// `metadata.user_id` into confidence-labeled per-session aggregates.
     Sessions,
+    /// Observed-performance surface (perf telemetry v1): daily
+    /// tokens/sec chart + provider health matrix + per-(model, fast) table.
+    Perf,
     /// Everything-else surface (UI-3 U6 "기타"): keybindings, build info,
     /// daemon facts — the glance answers that fit no other tab.
     Misc,
@@ -359,6 +362,11 @@ pub(crate) struct Chrome {
     pub menu_account: Option<String>,
     /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
     pub chart_days: u64,
+    /// Perf-overlay chart/table span in days (perf telemetry v1), cycled with
+    /// `d` while the Perf overlay is open.
+    pub perf_days: u64,
+    /// Cursor row in the Perf overlay's series table.
+    pub perf_cursor: usize,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     pub usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
@@ -606,6 +614,9 @@ struct App {
     pane_heights: PaneHeights,
     /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
     chart_days: u64,
+    /// Perf overlay span (`d` cycles) + series-table cursor.
+    perf_days: u64,
+    perf_cursor: usize,
     /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
@@ -728,6 +739,8 @@ impl App {
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
+            perf_days: 14,
+            perf_cursor: 0,
             account_row_chrome: Vec::new(),
             menu_chrome: None,
             menu_anchor: None,
@@ -954,6 +967,8 @@ impl App {
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
             chart_days: self.chart_days,
+            perf_days: self.perf_days,
+            perf_cursor: self.perf_cursor,
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
             input_modal: self.input_modal.clone(),
@@ -1055,6 +1070,7 @@ impl App {
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
             Overlay::Misc => self.on_key_misc(key.code),
+            Overlay::Perf => self.on_key_perf(key.code, view),
             Overlay::Config => self.on_key_config(key.code),
         }
     }
@@ -1870,6 +1886,36 @@ impl App {
         }
     }
 
+    /// Key handling for the Perf overlay (`p`, perf telemetry v1): `d`
+    /// cycles the day span, arrows/`j`/`k` move the series cursor, `p`/`Esc`
+    /// closes, `q` quits.
+    fn on_key_perf(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let rows = view
+            .map(|v| ui::perf_series_count(v, self.perf_days))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('p') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.perf_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.perf_days = spans[next];
+                self.perf_cursor = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.perf_cursor = self.perf_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.perf_cursor = (self.perf_cursor + 1).min(rows.saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
     /// Key handling for the Misc overlay (`?`, UI-3 U6). `?`/`Esc` closes.
     fn on_key_misc(&mut self, code: KeyCode) {
         match code {
@@ -2025,6 +2071,8 @@ impl App {
             KeyCode::Char('a') => self.overlay = Overlay::Accounts,
             KeyCode::Char('g') => self.open_stats(view),
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
+            // Observed performance (perf telemetry v1): daily tok/s + health.
+            KeyCode::Char('p') => self.overlay = Overlay::Perf,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
             // Calendar usage table (usage-stats): hourly/daily/monthly × model
@@ -5230,6 +5278,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            daily_perf: Vec::new(),
             usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
