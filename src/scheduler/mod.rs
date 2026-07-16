@@ -370,7 +370,28 @@ pub struct PoolState {
     /// exhausted for that group. Draws from the same account pool as `current`
     /// — this isolates stickiness, not inventory.
     pub fable_current: BTreeMap<BackendGroup, AccountId>,
+    /// Manual operator pin PER backend group (issue #122): a manual switch is
+    /// an informed operator decision, so for [`MANUAL_PIN_DURATION`] the
+    /// selector keeps EVERY request of the group — Fable lane included — on
+    /// the chosen account. Thresholds, staleness and preemptive Fable
+    /// exclusion do not break the pin; only a real failure does (auth
+    /// failure, a recorded 429 park, operator pause) or expiry. Cleared on
+    /// the pinned account's 429.
+    pub manual_pin: BTreeMap<BackendGroup, ManualPin>,
 }
+
+/// One manual operator pin (issue #122): the chosen account and when the
+/// pin lapses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualPin {
+    pub account: AccountId,
+    pub until: SystemTime,
+}
+
+/// How long a manual switch pins its group (issue #122): long enough that
+/// the operator's deliberate choice survives the evaluation ticks, short
+/// enough that automatic quota scheduling resumes on its own.
+pub const MANUAL_PIN_DURATION: Duration = Duration::from_secs(300);
 
 /// Switch failed; nothing was mutated.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -396,6 +417,7 @@ impl PoolState {
             accounts: accounts.iter().map(AccountState::fresh).collect(),
             current: BTreeMap::new(),
             fable_current: BTreeMap::new(),
+            manual_pin: BTreeMap::new(),
         }
     }
 
@@ -539,6 +561,7 @@ impl PoolState {
         retry_after: Option<Duration>,
         now: SystemTime,
     ) {
+        self.clear_manual_pin_for(account);
         let Some(acct) = self.account_mut(account) else {
             return;
         };
@@ -578,6 +601,10 @@ impl PoolState {
         model: Option<&str>,
         now: SystemTime,
     ) -> Cooldown429Reason {
+        // A 429 on a manually pinned account is the real failure that ends
+        // the operator pin (issue #122) — every branch below parks something,
+        // so clear up front (idempotent).
+        self.clear_manual_pin_for(account);
         if retry_after.is_some() {
             self.record_429(account, retry_after, now);
             return Cooldown429Reason::HeaderRetryAfter;
@@ -610,8 +637,10 @@ impl PoolState {
     }
 
     /// Record an auth failure (second 401 after a forced refresh, or a
-    /// failed refresh). Marks the account `AuthFailed` until re-login.
+    /// failed refresh). Marks the account `AuthFailed` until re-login. An
+    /// auth failure on a manually pinned account ends the pin (issue #122).
     pub fn record_auth_failure(&mut self, account: &AccountId) {
+        self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
             acct.health = AccountHealth::AuthFailed;
         }
@@ -699,10 +728,20 @@ impl PoolState {
             heuristic_degraded,
             scope,
         ) {
-            return Err(SwitchError::TargetIneligible {
-                account: target.clone(),
-                reason,
-            });
+            // A target under an active manual pin (issue #122) is the
+            // operator's explicit choice: only a REAL failure refuses it —
+            // thresholds / staleness / the preemptive Fable exclusion were
+            // just overridden. Everything else keeps the full gate.
+            let pinned = self
+                .manual_pin
+                .get(&slot)
+                .is_some_and(|pin| &pin.account == target && pin.until > now);
+            if !pinned || reason.hard_failure() {
+                return Err(SwitchError::TargetIneligible {
+                    account: target.clone(),
+                    reason,
+                });
+            }
         }
         match scope {
             select::RequestScope::Fable => self.fable_current.insert(slot, target.clone()),
@@ -745,7 +784,15 @@ impl PoolState {
                 .collect(),
             current: self.current.clone(),
             fable_current: self.fable_current.clone(),
+            manual_pin: self.manual_pin.clone(),
         }
+    }
+
+    /// Drop a manual pin naming `account` (issue #122): a real failure on
+    /// the pinned account — a recorded 429 park or an auth failure — ends
+    /// the operator pin immediately; thresholds never call this.
+    fn clear_manual_pin_for(&mut self, account: &AccountId) {
+        self.manual_pin.retain(|_, pin| &pin.account != account);
     }
 }
 
@@ -753,6 +800,12 @@ impl PoolSnapshot {
     /// The current account for one backend group, if any.
     pub fn current_for_group(&self, group: BackendGroup) -> Option<&AccountId> {
         self.current.get(&group)
+    }
+
+    /// The manual operator pin for a (possibly legacy / group-less) slot
+    /// (issue #122) — same slot resolution as the current-slot readers.
+    pub fn manual_pin_for(&self, group: Option<BackendGroup>) -> Option<&ManualPin> {
+        self.manual_pin.get(&group.unwrap_or(LEGACY_GROUP))
     }
 
     /// The current account for the legacy / group-less path (routing
@@ -902,6 +955,8 @@ pub struct PoolSnapshot {
     pub current: BTreeMap<BackendGroup, AccountId>,
     /// Fable-scope current per backend group (see [`PoolState::fable_current`]).
     pub fable_current: BTreeMap<BackendGroup, AccountId>,
+    /// Manual operator pin per backend group (see [`PoolState::manual_pin`]).
+    pub manual_pin: BTreeMap<BackendGroup, ManualPin>,
 }
 
 /// Shared handle around `PoolState`. Cheap to clone; every method takes the
@@ -1012,6 +1067,13 @@ impl AccountPool {
         let Some(current) = scope_current.cloned() else {
             return Err(no_account(&state));
         };
+        // An active manual pin on the leased current (issue #122) relaxes
+        // the preemptive Fable-weekly exclusion below: the operator's
+        // explicit choice serves until a REAL failure.
+        let pinned_current = state
+            .manual_pin
+            .get(&slot)
+            .is_some_and(|pin| pin.account == current && pin.until > now);
         let snapshot = state.snapshot();
         let headers_only = select::headers_only_mode(&snapshot, params, group, now);
         let heuristic_degraded = select::heuristic_degraded_mode(&snapshot, params, group, now);
@@ -1029,14 +1091,18 @@ impl AccountPool {
             // used to keep leasing a paused sticky current indefinitely —
             // the NonFable slot healed on the next evaluation tick, but
             // nothing re-evaluated `fable_current`.
-            Some(acct) => matches!(
-                select::gate_scoped(acct, params, now, headers_only, heuristic_degraded, scope),
-                Some(select::IneligibleReason::AuthUnhealthy)
-                    | Some(select::IneligibleReason::Paused)
-                    | Some(select::IneligibleReason::CoolingDown)
-                    | Some(select::IneligibleReason::FableCoolingDown)
-                    | Some(select::IneligibleReason::FableWeeklyExhausted)
-            ),
+            Some(acct) => match select::gate_scoped(
+                acct,
+                params,
+                now,
+                headers_only,
+                heuristic_degraded,
+                scope,
+            ) {
+                Some(select::IneligibleReason::FableWeeklyExhausted) => !pinned_current,
+                Some(reason) => reason.hard_failure(),
+                None => false,
+            },
             None => true,
         };
         if unusable {
@@ -1146,7 +1212,34 @@ impl AccountPool {
             return Err(SwitchError::UnknownAccount(target.clone()));
         };
         let expected = state.current.get(&group).cloned();
-        state.commit_switch(Some(group), expected.as_ref(), target, params, now)
+        // A manual switch is an informed operator decision (issue #122):
+        // pin the group — Fable lane included — for MANUAL_PIN_DURATION, so
+        // the evaluation ticks cannot immediately override it. Only a real
+        // failure (429 park / auth failure / pause) or expiry releases it.
+        // The pin is inserted BEFORE the commit on purpose: the commit's
+        // re-validation relaxes to hard failures for a pinned target, which
+        // is exactly the operator-override contract — a manual switch to an
+        // over-threshold account must succeed ("send it until it actually
+        // errors"), while auth-dead / paused / parked targets still refuse.
+        // A refused commit rolls the pin back.
+        state.manual_pin.insert(
+            group,
+            ManualPin {
+                account: target.clone(),
+                until: now
+                    .checked_add(MANUAL_PIN_DURATION)
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            },
+        );
+        if let Err(err) = state.commit_switch(Some(group), expected.as_ref(), target, params, now) {
+            state.manual_pin.remove(&group);
+            return Err(err);
+        }
+        // The fable slot follows the operator's choice at once, so the very
+        // next fable request lands on the chosen account rather than
+        // waiting a tick.
+        state.fable_current.insert(group, target.clone());
+        Ok(())
     }
 
     pub fn record_headers(
@@ -1223,10 +1316,17 @@ impl AccountPool {
             })
             .collect();
         // Drop any group slot whose current account no longer exists; other
-        // slots keep their sticky selection.
+        // slots keep their sticky selection. Same for manual pins (#122) and
+        // the fable slot.
         state
             .current
             .retain(|_, current| next.iter().any(|a| &a.id == current));
+        state
+            .fable_current
+            .retain(|_, current| next.iter().any(|a| &a.id == current));
+        state
+            .manual_pin
+            .retain(|_, pin| next.iter().any(|a| a.id == pin.account));
         state.accounts = next;
     }
 
@@ -1427,6 +1527,65 @@ mod tests {
                 .expect("healed")
                 .id,
             id("b")
+        );
+    }
+
+    /// Issue #122: a manual switch pins BOTH scopes on the chosen account
+    /// for MANUAL_PIN_DURATION — the evaluation ticks stay, an
+    /// over-threshold target is accepted (operator override), and only a
+    /// real failure (recorded 429) releases the pin.
+    #[test]
+    fn manual_switch_pins_both_scopes_until_a_real_error() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        // Make "b" clearly over the 5h ceiling — automatic selection would
+        // never pick it, and the OLD manual switch would refuse it.
+        pool.record_usage(
+            &id("b"),
+            &usage(Some(reading(0.95, NOW_SECS + 3600)), None),
+            now(),
+        );
+        pool.switch_to(&id("b"), &params(), now())
+            .expect("operator override lands on an over-threshold account");
+        // Pinned: the evaluation tick must NOT move off b, either scope.
+        assert_eq!(pool.evaluate(None, &params(), now()), Decision::Stay);
+        assert_eq!(
+            pool.evaluate_scoped(None, &params(), now(), select::RequestScope::Fable),
+            Decision::Stay,
+            "the fable slot followed the manual switch"
+        );
+        assert_eq!(
+            pool.lease_for_scoped(None, &params(), select::RequestScope::Fable)
+                .expect("pinned account serves fable")
+                .id,
+            id("b")
+        );
+        // A real error releases the pin: automatic selection resumes.
+        pool.record_429(&id("b"), Some(Duration::from_secs(120)), now());
+        assert_eq!(
+            pool.evaluate(None, &params(), now()),
+            Decision::Switch { to: id("a") },
+            "the 429 broke the pin and selection moved on"
+        );
+    }
+
+    /// Issue #122: the pin lapses after MANUAL_PIN_DURATION — automatic
+    /// perishability scheduling resumes on its own.
+    #[test]
+    fn manual_pin_expires_after_its_duration() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        pool.record_usage(
+            &id("b"),
+            &usage(Some(reading(0.95, NOW_SECS + 3600)), None),
+            now(),
+        );
+        pool.switch_to(&id("b"), &params(), now()).expect("switch");
+        let later = now() + MANUAL_PIN_DURATION + Duration::from_secs(1);
+        assert_eq!(
+            pool.evaluate(None, &params(), later),
+            Decision::Switch { to: id("a") },
+            "after expiry the over-threshold account is abandoned again"
         );
     }
 

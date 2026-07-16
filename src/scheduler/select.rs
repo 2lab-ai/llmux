@@ -73,6 +73,24 @@ pub enum IneligibleReason {
     FableWeeklyExhausted,
 }
 
+impl IneligibleReason {
+    /// Whether the reason is a REAL failure — one that even a manual
+    /// operator pin (issue #122) must respect: auth failure, operator
+    /// pause, an account-wide 429/park, a Fable-scoped 429/park. The
+    /// remaining reasons (ceiling thresholds, staleness, the preemptive
+    /// Fable-weekly exclusion) are ADVISORY: an operator who manually
+    /// switched just overrode them ("send it until it actually errors").
+    pub fn hard_failure(self) -> bool {
+        matches!(
+            self,
+            IneligibleReason::AuthUnhealthy
+                | IneligibleReason::Paused
+                | IneligibleReason::CoolingDown
+                | IneligibleReason::FableCoolingDown
+        )
+    }
+}
+
 /// The Fable-scope classification of an inbound request (fable-usage W2). The
 /// selector threads this so a Fable request is additionally gated by an
 /// account's Fable-scoped cooldown / preemptive Fable exclusion, while a
@@ -396,6 +414,39 @@ pub fn pick_scoped(
         .filter(|a| in_group(a, group))
         .filter(|a| gate_scoped(a, params, now, headers_only, heuristic_degraded, scope).is_none())
         .collect();
+
+    // Manual operator pin (issue #122) outranks every automatic policy: a
+    // manual switch is an informed decision, so while the pin is alive both
+    // scopes stay on the chosen account. Deliberately NOT the full gate —
+    // thresholds, staleness and the preemptive Fable-weekly exclusion do
+    // not break a pin ("send it until it actually errors"); only a REAL
+    // failure does: auth failure, operator pause, an account-wide cooldown
+    // (a recorded 429 also clears the pin outright), or — for the Fable
+    // lane — a Fable-scoped cooldown. A hard-blocked or lapsed pin falls
+    // through to normal selection.
+    if let Some(pin) = snapshot.manual_pin_for(group) {
+        if pin.until > now {
+            if let Some(acct) = snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == pin.account && in_group(a, group))
+            {
+                let hard_blocked = !acct.healthy
+                    || acct.paused
+                    || acct.cooldown_until.is_some_and(|until| until > now)
+                    || (scope == RequestScope::Fable && acct.fable_cooldown_active(now));
+                if !hard_blocked {
+                    return if group_current(snapshot, group, scope) == Some(&pin.account) {
+                        Decision::Stay
+                    } else {
+                        Decision::Switch {
+                            to: pin.account.clone(),
+                        }
+                    };
+                }
+            }
+        }
+    }
 
     // The Fable lane schedules like the main lane, but on the FABLE weekly
     // window (issues #121/#8-report): candidates are ranked by
@@ -1227,6 +1278,7 @@ mod tests {
             accounts,
             current: map,
             fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1498,6 +1550,7 @@ mod tests {
             accounts,
             current: map,
             fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1604,6 +1657,7 @@ mod tests {
             accounts,
             current,
             fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
         }
     }
 
