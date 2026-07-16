@@ -4899,6 +4899,139 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
     }
 
+    /// One-shot HTTP responder for the attach settings round-trip tests:
+    /// binds an ephemeral loopback port, answers the first request with the
+    /// canned status+body, then closes. Small enough to not need a mock crate.
+    async fn one_shot_settings_daemon(status_line: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Drive [`App::perform_remote_settings`] against the canned daemon and
+    /// return the resulting status line. The app is seeded with a pending
+    /// quota override and a request that carries `quota_display` + a
+    /// restart-only origin, so every mutation site is observable.
+    async fn attach_settings_round_trip(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (App, String) {
+        let mut app = remote_app();
+        let base = one_shot_settings_daemon(status_line, body).await;
+        if let Backend::Remote(remote) = &mut app.backend {
+            remote.base_url = base;
+        }
+        app.quota_display_override = Some(crate::config::QuotaDisplay::Used);
+        app.config_saved.insert(
+            ui::ConfigAction::RawIoRetention,
+            "stale-from-last-time".into(),
+        );
+        let req = crate::proxy::server::SettingsRequest {
+            quota_display: Some("amount".into()),
+            raw_io_retention_days: Some(7),
+            ..Default::default()
+        };
+        let origin = Some((ui::ConfigAction::RawIoRetention, "7".into()));
+        app.perform_remote_settings(req, origin).await;
+        let status = app
+            .status
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        (app, status)
+    }
+
+    /// Attach HTTP round-trip, success branch: a verified typed ack applies —
+    /// the quota override drops (the doc now carries the truth) and the
+    /// restart-required origin lands in `config_saved`.
+    #[tokio::test]
+    async fn attach_settings_success_ack_applies_local_state() {
+        let (app, status) = attach_settings_round_trip(
+            "200 OK",
+            r#"{"ok":true,"applied":["quota_display"],"restart_required":["raw_io_retention_days"],"email_anonymous":false}"#,
+        )
+        .await;
+        assert!(
+            app.quota_display_override.is_none(),
+            "verified ack clears the local quota override"
+        );
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"7".to_string()),
+            "restart-required origin is noted for the config tab"
+        );
+        assert!(
+            status.contains("applied live") && status.contains("restart"),
+            "status reports the honest applied/restart split: {status:?}"
+        );
+    }
+
+    /// Attach round-trip, ok=false 2xx: NOTHING local moves.
+    #[tokio::test]
+    async fn attach_settings_ok_false_mutates_nothing() {
+        let (app, status) = attach_settings_round_trip(
+            "200 OK",
+            r#"{"ok":false,"applied":[],"restart_required":[],"email_anonymous":false}"#,
+        )
+        .await;
+        assert!(app.quota_display_override.is_some(), "override untouched");
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"stale-from-last-time".to_string()),
+            "pending-restart note untouched"
+        );
+        assert!(status.contains("ok=false"), "status: {status:?}");
+    }
+
+    /// Attach round-trip, malformed 2xx (`{}` fails the typed parse): the
+    /// apply is UNVERIFIED — no local mutation, honest "nothing assumed".
+    #[tokio::test]
+    async fn attach_settings_malformed_ack_mutates_nothing() {
+        let (app, status) = attach_settings_round_trip("200 OK", "{}").await;
+        assert!(app.quota_display_override.is_some(), "override untouched");
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"stale-from-last-time".to_string()),
+            "pending-restart note untouched"
+        );
+        assert!(status.contains("nothing assumed"), "status: {status:?}");
+    }
+
+    /// Attach round-trip, HTTP error statuses: reported, nothing mutated.
+    #[tokio::test]
+    async fn attach_settings_http_errors_mutate_nothing() {
+        for status_line in ["400 Bad Request", "500 Internal Server Error"] {
+            let (app, status) =
+                attach_settings_round_trip(status_line, r#"{"error":"nope"}"#).await;
+            assert!(app.quota_display_override.is_some(), "override untouched");
+            assert_eq!(
+                app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+                Some(&"stale-from-last-time".to_string()),
+                "pending-restart note untouched"
+            );
+            assert!(
+                status.contains("config change failed"),
+                "status for {status_line}: {status:?}"
+            );
+        }
+    }
+
     #[test]
     fn misc_and_config_keys_round_trip() {
         let mut app = remote_app();
