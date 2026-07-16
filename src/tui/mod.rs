@@ -5243,6 +5243,7 @@ mod tests {
                 accounts: Vec::new(),
                 current: std::collections::BTreeMap::new(),
                 fable_current: std::collections::BTreeMap::new(),
+                manual_pin: Default::default(),
             },
             last_switch: None,
             poll_health: std::collections::HashMap::new(),
