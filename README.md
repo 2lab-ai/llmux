@@ -57,10 +57,10 @@ llmux breaks the chain by standardizing on one harness and making the account/mo
 
 ## The accidental AI debugger
 
-llmux was built as a router. But once every request your agent makes flows through
-`localhost:3456`, and llmux keeps the raw bytes of both halves of every exchange,
-you get something you didn't install it for: **DevTools for your agent's wire
-traffic**.
+llmux was built as a router. But once every **model request** your agent makes
+flows through `localhost:3456`, and llmux keeps the raw bytes of both halves of
+every exchange, you get something you didn't install it for: **DevTools for your
+agent's model traffic**.
 
 ![llmux raw viewer demo — from the live activity feed into the raw request/response viewer: request body, then the Response tab with the SSE stream and rate-limit headers](screenshots/llmux-raw-viewer-demo.gif)
 
@@ -77,19 +77,22 @@ traffic**.
   llmux rewrote it into) → `Upstream Resp` (the provider's verbatim reply) →
   `Response` (what your client received). Headers, SSE events, rate-limit state,
   request bodies: scroll, pan, and read the actual bytes.
-- **Copy as curl.** Any leg exports as a replayable `curl` (credential values stay
-  `•••redacted`), raw bodies copy to the clipboard, and `save all` writes the whole
+- **Copy as curl.** One keypress reconstructs a `curl` for a tab's side of the
+  exchange — credential values stay `•••redacted`, so substitute your own before
+  replaying. Raw bodies copy to the clipboard, and `save all` writes the whole
   record JSON to `~/Downloads`. A provider bug report with the exact failing frame
-  attached is one keypress.
-- **Wire truth, archived.** The same capture path feeds `raw-io.jsonl` and the
-  [real captured system prompts](docs/system-prompts/) — what Claude Code actually
-  injects per model, not what the docs say it injects.
-- **Screen-share-safe.** `email_anonymous` masks every account email behind a fixed
-  pool of famous-CS-name fakes across the TUI and Islands, and credential headers
-  are redacted fail-safe at capture time. The recordings on this page were taken
-  live with masking on (remaining identifiers pixelated in post).
+  attached is one keypress away.
+- **Wire truth, archived.** Captures persist to `raw-io.jsonl`, and the repo's
+  [captured system prompts](docs/system-prompts/) were taken from this same wire —
+  what Claude Code actually injects per model, not what the docs say it injects.
+- **Email masking for screen shares.** `email_anonymous` masks every account email
+  behind a fixed pool of famous-CS-name fakes across the TUI and Islands, and
+  credential header values (`authorization`, keys/tokens/cookies) are redacted at
+  capture time. Raw payloads still contain whatever your session contained — treat
+  the viewer's body panes accordingly. The recordings on this page were taken live
+  with masking on, with remaining identifiers pixelated in post.
 
-![llmux usage & cost tab and raw request headers — calendar cost buckets per model, a poller-failure banner, and the request general/headers view](screenshots/llmux-usage-raw-demo.gif)
+![llmux usage & cost tab and raw request headers — calendar cost buckets per model, failure states surfaced honestly in the status banner, and the request general/headers view](screenshots/llmux-usage-raw-demo.gif)
 
 [Original usage-tab recording (mp4)](screenshots/llmux-usage-raw-demo.mp4)
 
