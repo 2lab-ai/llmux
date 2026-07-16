@@ -241,6 +241,7 @@ impl DashboardView {
             // slot not carried in the doc, so it is empty here (display marks
             // the non-Fable current; the churn fix lives in the daemon).
             fable_current: std::collections::BTreeMap::new(),
+            manual_pin: Default::default(),
         };
         let session_totals: HashMap<String, Totals> = doc
             .accounts

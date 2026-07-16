@@ -6120,6 +6120,7 @@ mod tests {
                 accounts: Vec::new(),
                 current: BTreeMap::new(),
                 fable_current: BTreeMap::new(),
+                manual_pin: Default::default(),
             },
             last_switch: None,
             poll_health: HashMap::new(),

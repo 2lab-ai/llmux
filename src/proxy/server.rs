@@ -766,6 +766,23 @@ pub async fn serve(
                         });
                     }
                 }
+                // The Fable slot heals on the same cadence (issue #121):
+                // `evaluate` above is NonFable-only, and before this the
+                // `fable_current` slot was NEVER re-evaluated — a paused or
+                // otherwise ineligible fable sticky current kept its pin
+                // forever while the account-wide slot moved off within one
+                // tick. Claude slot only (fable models route there); moves
+                // are logged, not event-emitted: the AccountSwitched feed
+                // row describes the primary current.
+                if slot == crate::routing::BackendGroup::Claude {
+                    let fable_decision = tick_pool.evaluate_scoped(
+                        group,
+                        &params,
+                        SystemTime::now(),
+                        crate::scheduler::select::RequestScope::Fable,
+                    );
+                    tracing::debug!(?group, ?fable_decision, "fable evaluation tick");
+                }
             }
         }
     });
