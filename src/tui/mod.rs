@@ -583,8 +583,13 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
-    /// Config-editor settings change awaiting POST (attach mode).
-    pending_settings: Option<crate::proxy::server::SettingsRequest>,
+    /// Config-editor settings change awaiting POST (attach mode), with
+    /// the originating row + display value so a restart-only save can pin
+    /// its pending note after the daemon confirms it.
+    pending_settings: Option<(
+        crate::proxy::server::SettingsRequest,
+        Option<(ui::ConfigAction, String)>,
+    )>,
     /// Pause/resume queued by the switcher's `p` key, performed by the event
     /// loop via `POST /llmux/pause-account`.
     pending_pause: Option<(String, bool)>,
@@ -2364,13 +2369,19 @@ impl App {
                 Err(err) => self.set_status(format!("config: {err}")),
             },
             Backend::Remote(remote) => {
-                remote.pending_settings = Some(req);
+                remote.pending_settings = Some((req, origin));
                 self.set_status("config: applying…".into());
             }
         }
     }
 
-    fn take_pending_settings(&mut self) -> Option<crate::proxy::server::SettingsRequest> {
+    #[allow(clippy::type_complexity)]
+    fn take_pending_settings(
+        &mut self,
+    ) -> Option<(
+        crate::proxy::server::SettingsRequest,
+        Option<(ui::ConfigAction, String)>,
+    )> {
         match &mut self.backend {
             Backend::Remote(remote) => remote.pending_settings.take(),
             Backend::Local(_) => None,
@@ -2379,7 +2390,11 @@ impl App {
 
     /// POST a settings change to the attached daemon and report the honest
     /// applied/restart split from its response.
-    async fn perform_remote_settings(&mut self, req: crate::proxy::server::SettingsRequest) {
+    async fn perform_remote_settings(
+        &mut self,
+        req: crate::proxy::server::SettingsRequest,
+        origin: Option<(ui::ConfigAction, String)>,
+    ) {
         let Backend::Remote(remote) = &mut self.backend else {
             return;
         };
@@ -2408,6 +2423,15 @@ impl App {
                         };
                         let applied: Vec<String> = names("applied");
                         let restart: Vec<String> = names("restart_required");
+                        // Pin the pending-restart note only once the daemon
+                        // CONFIRMED the save (attach parity with local).
+                        if let Some((action, value)) = origin {
+                            if restart.is_empty() {
+                                self.config_saved.remove(&action);
+                            } else {
+                                self.config_saved.insert(action, value);
+                            }
+                        }
                         settings_status(
                             &applied.iter().map(String::as_str).collect::<Vec<_>>(),
                             &restart.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2820,6 +2844,9 @@ impl App {
         match &mut self.backend {
             Backend::Local(state) => {
                 // Persist FIRST (config-editor contract) — see set_codex.
+                if state.config_path.is_none() {
+                    return self.set_status("grok change failed: persistence unavailable".into());
+                }
                 if let Some(path) = &state.config_path {
                     if let Err(err) = crate::config::update_path(path, |c| {
                         c.grok.reasoning_effort = effort.clone();
@@ -2877,6 +2904,9 @@ impl App {
                 // Persist FIRST (config-editor contract): a failed write
                 // leaves the live shape untouched and reports the error —
                 // live-then-persist would let disk and runtime diverge.
+                if state.config_path.is_none() {
+                    return self.set_status("codex change failed: persistence unavailable".into());
+                }
                 if let Some(path) = &state.config_path {
                     if let Err(err) = crate::config::update_path(path, |c| {
                         c.codex.default_model = new.model.clone();
@@ -3851,8 +3881,8 @@ async fn event_loop(
             app.perform_remote_codex(codex).await;
             redraw = true;
         }
-        if let Some(settings) = app.take_pending_settings() {
-            app.perform_remote_settings(settings).await;
+        if let Some((settings, origin)) = app.take_pending_settings() {
+            app.perform_remote_settings(settings, origin).await;
             redraw = true;
         }
         if let Some((account, paused)) = app.take_pending_pause() {
@@ -4215,7 +4245,7 @@ fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::Settings
             req.routing_enabled.unwrap_or_default()
         ),
         A::RawIoEnabled => format!(
-            "set raw-io capture = {} (payload capture gate)?",
+            "set raw-io capture = {} (writes FULL request/response payloads to disk)?",
             req.raw_io_enabled.unwrap_or_default()
         ),
         A::Upstream => format!(

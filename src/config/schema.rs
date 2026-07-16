@@ -544,7 +544,7 @@ pub struct ProxyConfig {
     /// Listen port. Default 3456.
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Proxy-level API key (`ta-...`), auto-generated on first run.
+    /// Proxy-level API key (`lm-...`), auto-generated on first run.
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,

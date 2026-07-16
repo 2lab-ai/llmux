@@ -9961,9 +9961,48 @@ mod tests {
                 _ => out.push(prefix.to_string()),
             }
         }
-        let config = serde_json::to_value(crate::config::Config::default()).expect("json");
+        // MAXIMAL fixture: every Option filled and every map/list non-empty,
+        // so `skip_serializing_if` fields (api key, remote, client models,
+        // events, pricing, limits…) appear as leaves and must be classified.
+        let mut config = crate::config::Config::default();
+        config.proxy.api_key = Some("lm-test".into());
+        config.codex.client_model = Some("gpt-5.5".into());
+        config.grok.client_model = Some("grok-4".into());
+        config.tui_gradient.max_effort = Some("#ffffff".into());
+        config.remote.host = Some("example.com".into());
+        config.remote.port = Some(3456);
+        config.remote.api_key = Some("lm-remote".into());
+        config.pricing.insert(
+            "gpt-5.5".into(),
+            crate::pricing::ModelPrice {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.1,
+                cache_creation: 1.25,
+            },
+        );
+        config.paused_accounts.insert("a@x.com".into());
+        config.account_limits.insert(
+            "a@x.com".into(),
+            crate::config::AccountLimits {
+                five_hour_max: Some(0.5),
+                seven_day_max: Some(0.5),
+                fable_weekly_max: Some(0.5),
+            },
+        );
+        config.events.push(crate::config::EventBanner {
+            id: "e1".into(),
+            from: "2026-01-01".into(),
+            to: "2026-01-02".into(),
+            content: "banner".into(),
+        });
+        let config = serde_json::to_value(&config).expect("json");
         let mut paths = Vec::new();
         leaves("", &config, &mut paths);
+        assert!(
+            paths.iter().any(|p| p == "proxy.api_key"),
+            "maximal fixture must surface skip-serialized leaves"
+        );
         // Covering prefixes, each tied to an inventory row (or the dedicated
         // surface the row names). Keep in sync with `config_rows`.
         const COVERED: &[&str] = &[
@@ -9997,6 +10036,14 @@ mod tests {
                 COVERED.iter().any(|c| path == c || path.starts_with(c)),
                 "schema leaf {path:?} is not classified in the config editor \
                  inventory — add a row (or covering entry) for it"
+            );
+        }
+        // Bidirectional: a COVERED entry matching no leaf is stale coverage
+        // (it would silently swallow future leaves under a dead prefix).
+        for c in COVERED {
+            assert!(
+                paths.iter().any(|p| p == c || p.starts_with(c)),
+                "coverage entry {c:?} matches no schema leaf — remove or fix it"
             );
         }
         // And the inventory renders with honest labels.
