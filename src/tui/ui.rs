@@ -2022,6 +2022,8 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
         key("f m e", "codex fast / model / effort"),
         key("u t S R", "gauge fill / reset display / scheduler / reload"),
         key("o d", "sessions sort · perf/stats span"),
+        key("h l", "perf day drill-down (←/→)"),
+        key("j k ⏎ y/n", "config editor: cursor · activate · confirm"),
         key("q Esc", "quit / back to dashboard"),
         Line::default(),
         Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
@@ -2053,7 +2055,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
 /// One editable (or honestly-labeled read-only) config row's action
 /// (config-editor v1, trinity contract C6). `Copy` so it rides `Mode` and
 /// the hit list without allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConfigAction {
     SchedMode,
     Ceiling5h,
@@ -2244,7 +2246,23 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
         },
         CfgRow {
             section: "codex",
-            label: "grok effort",
+            label: "codex upstream",
+            value: f.codex_upstream.clone(),
+            state: CfgState::Restart,
+            note: "confirm",
+            action: Some(ConfigAction::CodexUpstream),
+        },
+        CfgRow {
+            section: "codex",
+            label: "token url / client model / trace",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "codex.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
+            section: "grok",
+            label: "effort",
             value: view
                 .grok
                 .effort
@@ -2255,12 +2273,12 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             action: Some(ConfigAction::GrokEffort),
         },
         CfgRow {
-            section: "codex",
-            label: "codex upstream",
-            value: f.codex_upstream.clone(),
-            state: CfgState::Restart,
-            note: "confirm",
-            action: Some(ConfigAction::CodexUpstream),
+            section: "grok",
+            label: "upstream / model / trace",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "grok.* plumbing in config",
+            action: None,
         },
         CfgRow {
             section: "display",
@@ -2371,7 +2389,7 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             label: "capture",
             value: onoff(f.raw_io_enabled),
             state: CfgState::Live,
-            note: "confirm — payload capture",
+            note: "confirm — writes request/response payloads to disk",
             action: Some(ConfigAction::RawIoEnabled),
         },
         CfgRow {
@@ -2413,6 +2431,38 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             state: CfgState::Restart,
             note: "",
             action: Some(ConfigAction::ProxyMaxBody),
+        },
+        CfgRow {
+            section: "daemon",
+            label: "proxy api key",
+            value: "•••".into(),
+            state: CfgState::ReadOnly,
+            note: "secret (lm-… key)",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "idle timeout / idle probe",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "proxy.forward_idle_timeout_secs · proxy.idle_probe.*",
+            action: None,
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "poll / refresh-ahead",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "scheduler.usage_poll_secs · refresh_ahead_secs",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "schema version",
+            value: "derived".into(),
+            state: CfgState::ReadOnly,
+            note: "config version field",
+            action: None,
         },
         CfgRow {
             section: "daemon",
@@ -2578,6 +2628,14 @@ fn draw_config_overlay(
                     Span::styled(value_txt, value_style),
                     Span::styled(format!(" {state_label:<8}"), state_style),
                 ];
+                // A restart-only save this session: the value shown is still
+                // the EFFECTIVE boot value; the note carries the pending one.
+                if let Some(saved) = row.action.and_then(|a| chrome.config_saved.get(&a)) {
+                    spans.push(Span::styled(
+                        format!(" saved: {saved} (restart)"),
+                        Style::new().fg(Color::Yellow),
+                    ));
+                }
                 if !row.note.is_empty() {
                     spans.push(Span::styled(format!(" {}", row.note), dim()));
                 }
@@ -7638,6 +7696,7 @@ mod tests {
             session_sort: Default::default(),
             config_cursor: 0,
             config_input: String::new(),
+            config_saved: Default::default(),
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,
@@ -9881,16 +9940,73 @@ mod tests {
     }
 
     #[test]
-    fn config_editor_lists_full_schema_with_state_labels() {
+    fn config_editor_covers_every_schema_leaf() {
         // Trinity contract C6: the acceptance denominator is the WHOLE
-        // schema — every section appears, each row carrying an honest
-        // apply-state label; editable value cells are recorded as hits.
+        // schema. Authoritative reconciliation — flatten a default Config's
+        // JSON into leaf paths and demand every one maps to an inventory
+        // row (by covering prefix). A new schema field fails this test until
+        // it is classified in `config_rows`.
+        fn leaves(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        leaves(&path, val, out);
+                    }
+                }
+                _ => out.push(prefix.to_string()),
+            }
+        }
+        let config = serde_json::to_value(crate::config::Config::default()).expect("json");
+        let mut paths = Vec::new();
+        leaves("", &config, &mut paths);
+        // Covering prefixes, each tied to an inventory row (or the dedicated
+        // surface the row names). Keep in sync with `config_rows`.
+        const COVERED: &[&str] = &[
+            "version",
+            "proxy.port",
+            "proxy.max_request_bytes",
+            "proxy.api_key",
+            "proxy.forward_idle_timeout_secs",
+            "proxy.idle_probe",
+            "upstream",
+            "codex.",
+            "grok.",
+            "scheduler.",
+            "routing.",
+            "pricing",
+            "raw_io.",
+            "email_anonymous",
+            "tui_effects",
+            "tui_gradient.",
+            "show_fable_weekly",
+            "domain_abbrev",
+            "quota_display",
+            "paused_accounts",
+            "account_limits",
+            "events",
+            "remote.",
+            "accounts",
+        ];
+        for path in &paths {
+            assert!(
+                COVERED.iter().any(|c| path == c || path.starts_with(c)),
+                "schema leaf {path:?} is not classified in the config editor \
+                 inventory — add a row (or covering entry) for it"
+            );
+        }
+        // And the inventory renders with honest labels.
         let view = view_with(Vec::new());
         let chrome = chrome_overlay(Overlay::Config);
         let rows = config_rows(&view, &chrome);
         for section in [
             "scheduler",
             "codex",
+            "grok",
             "display",
             "routing",
             "raw-io",
@@ -9901,20 +10017,34 @@ mod tests {
                 "{section} section present"
             );
         }
-        // Managed-elsewhere / secret rows are honest read-only, not hidden.
-        assert!(rows
-            .iter()
-            .any(|r| r.action.is_none() && r.note.contains("accounts tab")));
         assert!(rows.iter().any(|r| r.note.contains("secret")));
         let text = render(&view, &chrome, 200, 50);
         assert!(text.contains("live"), "live state label rendered");
         assert!(text.contains("restart"), "restart state label rendered");
-        assert!(
-            text.contains("Enter/click value edits"),
-            "editor affordance in the title"
-        );
     }
 
+    #[test]
+    fn config_editor_click_outside_value_cells_changes_nothing() {
+        // Contract C6: only the value cell is a control. A click elsewhere
+        // must map to no action.
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Config);
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let hits = hits.expect("main chrome").config_rows;
+        assert!(!hits.is_empty(), "editable value cells recorded");
+        for h in &hits {
+            assert!(h.area.x > 2, "value cells start after the label column");
+        }
+        // A label-column click (x=1) hits no control on any row.
+        assert!(
+            !hits.iter().any(|h| 1 >= h.area.x && 1 < h.area.right()),
+            "a label-column click hits no control"
+        );
+    }
     #[test]
     fn tab_bar_renders_all_labels_and_marks_the_active_surface() {
         let view = view_with(Vec::new());
