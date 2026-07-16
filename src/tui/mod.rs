@@ -391,6 +391,11 @@ pub(crate) struct Chrome {
     /// Config-editor cursor row + the edit/confirm prompt text.
     pub config_cursor: usize,
     pub config_input: String,
+    /// Restart-only values saved THIS session (action → new value): the row
+    /// keeps showing the effective boot value, and this map drives an
+    /// explicit "saved: X (restart)" note — pending must never masquerade
+    /// as applied, and applied must never hide a pending save.
+    pub config_saved: std::collections::HashMap<ui::ConfigAction, String>,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -732,6 +737,10 @@ struct App {
     /// Pending confirmed settings request awaiting y/n (built at edit time so
     /// confirm applies EXACTLY what was validated).
     config_pending: Option<crate::proxy::server::SettingsRequest>,
+    /// Restart-only values saved this session (see `Chrome::config_saved`).
+    config_saved: std::collections::HashMap<ui::ConfigAction, String>,
+    /// The raw display value of the request parked in `config_pending`.
+    config_pending_value: Option<String>,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -833,6 +842,8 @@ impl App {
             config_cursor: 0,
             config_input: String::new(),
             config_pending: None,
+            config_pending_value: None,
+            config_saved: Default::default(),
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
@@ -1041,6 +1052,7 @@ impl App {
             session_sort: self.session_sort,
             config_cursor: self.config_cursor,
             config_input: self.config_input.clone(),
+            config_saved: self.config_saved.clone(),
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
@@ -2170,6 +2182,16 @@ impl App {
             self.mode = Mode::ConfigEdit { action };
             return;
         }
+        // Scheduler mode applies through its own live path
+        // (toggle_scheduler_mode) — enter the confirm gate directly.
+        if action == ui::ConfigAction::SchedMode {
+            self.config_input =
+                confirm_prompt(action, &crate::proxy::server::SettingsRequest::default());
+            self.config_pending = None;
+            self.config_pending_value = None;
+            self.mode = Mode::ConfigConfirm { action };
+            return;
+        }
         // Toggle actions: build the request from the CURRENT view value.
         let req = self.toggle_settings_request(action, view);
         let Some(req) = req else {
@@ -2180,7 +2202,7 @@ impl App {
             self.config_pending = Some(req);
             self.mode = Mode::ConfigConfirm { action };
         } else {
-            self.send_settings(req, view);
+            self.send_settings(req, None, view);
         }
     }
 
@@ -2196,11 +2218,6 @@ impl App {
         let view = view?;
         let mut req = SettingsRequest::default();
         match action {
-            A::SchedMode => {
-                // Route through the existing mode endpoint semantics: flip.
-                self.toggle_pending_sched()?;
-                return None; // unreachable — SchedMode handled in confirm apply
-            }
             A::EmailMask => req.email_anonymous = Some(!view.email_anonymous),
             A::QuotaFill => {
                 let cur = self.quota_display_override.unwrap_or(view.quota_display);
@@ -2216,13 +2233,6 @@ impl App {
             _ => return None,
         }
         Some(req)
-    }
-
-    /// Placeholder used by `toggle_settings_request` for SchedMode (which is
-    /// applied through `toggle_scheduler_mode`, not the settings endpoint) —
-    /// always `None` so the caller falls through to the confirm gate below.
-    fn toggle_pending_sched(&self) -> Option<()> {
-        None
     }
 
     /// Keys while typing a config value (Mode::ConfigEdit).
@@ -2260,18 +2270,26 @@ impl App {
                                 .iter()
                                 .flatten()
                                 .any(|v| *v == 0.0)
-                            || action == ui::ConfigAction::RawIoRetention
-                                && view.is_some_and(|v| {
-                                    req.raw_io_retention_days.is_some_and(|days| {
-                                        days < v.config_facts.raw_io_retention_days
-                                    })
-                                });
+                            || action == ui::ConfigAction::RawIoRetention && {
+                                // Compare against the latest SAVED value when
+                                // one is pending — the boot value would
+                                // misjudge repeat edits in one session.
+                                let baseline = self
+                                    .config_saved
+                                    .get(&ui::ConfigAction::RawIoRetention)
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .or_else(|| view.map(|v| v.config_facts.raw_io_retention_days));
+                                baseline.is_some_and(|base| {
+                                    req.raw_io_retention_days.is_some_and(|days| days < base)
+                                })
+                            };
                         if needs {
                             self.config_input = confirm_prompt(action, &req);
                             self.config_pending = Some(req);
+                            self.config_pending_value = Some(raw.trim().to_string());
                             self.mode = Mode::ConfigConfirm { action };
                         } else {
-                            self.send_settings(req, view);
+                            self.send_settings(req, Some((action, raw.trim().to_string())), view);
                         }
                     }
                 }
@@ -2298,12 +2316,14 @@ impl App {
                     return;
                 }
                 if let Some(req) = self.config_pending.take() {
-                    self.send_settings(req, view);
+                    let origin = self.config_pending_value.take().map(|v| (action, v));
+                    self.send_settings(req, origin, view);
                 }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.config_input.clear();
                 self.config_pending = None;
+                self.config_pending_value = None;
                 self.mode = Mode::Normal;
                 self.set_status("config: cancelled".into());
             }
@@ -2318,11 +2338,29 @@ impl App {
     fn send_settings(
         &mut self,
         req: crate::proxy::server::SettingsRequest,
+        origin: Option<(ui::ConfigAction, String)>,
         _view: Option<&DashboardView>,
     ) {
         match &mut self.backend {
             Backend::Local(state) => match crate::proxy::server::apply_settings(state, &req) {
-                Ok((applied, restart)) => self.set_status(settings_status(&applied, &restart)),
+                Ok((applied, restart)) => {
+                    // A persisted quota-fill change supersedes any session
+                    // `u` override — otherwise the screen keeps the stale
+                    // override while claiming "applied" (review MUST-FIX 5).
+                    if req.quota_display.is_some() {
+                        self.quota_display_override = None;
+                    }
+                    // Restart-only saves get a visible pending note on their
+                    // row (the effective value stays the boot value).
+                    if let Some((action, value)) = origin {
+                        if restart.is_empty() {
+                            self.config_saved.remove(&action);
+                        } else {
+                            self.config_saved.insert(action, value);
+                        }
+                    }
+                    self.set_status(settings_status(&applied, &restart));
+                }
                 Err(err) => self.set_status(format!("config: {err}")),
             },
             Backend::Remote(remote) => {
@@ -2350,8 +2388,12 @@ impl App {
         if let Some(key) = &remote.api_key {
             request = request.header("x-api-key", key);
         }
+        let quota_changed = req.quota_display.is_some();
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
+                if quota_changed {
+                    self.quota_display_override = None;
+                }
                 match response.json::<serde_json::Value>().await {
                     Ok(body) => {
                         let names = |key: &str| -> Vec<String> {
@@ -2371,7 +2413,11 @@ impl App {
                             &restart.iter().map(String::as_str).collect::<Vec<_>>(),
                         )
                     }
-                    Err(_) => "config: applied".into(),
+                    // A 2xx whose body we could not read is NOT a verified
+                    // apply — never claim plain success for it.
+                    Err(_) => "config: accepted by daemon, but the response was unreadable — \
+                         verify the value in the config tab"
+                        .into(),
                 }
             }
             Ok(response) => format!("config change failed: {}", response.status()),
@@ -2773,14 +2819,18 @@ impl App {
         let label = effort.clone().unwrap_or_else(|| "bypass".to_string());
         match &mut self.backend {
             Backend::Local(state) => {
+                // Persist FIRST (config-editor contract) — see set_codex.
+                if let Some(path) = &state.config_path {
+                    if let Err(err) = crate::config::update_path(path, |c| {
+                        c.grok.reasoning_effort = effort.clone();
+                    }) {
+                        self.set_status(format!("grok change failed: {err}"));
+                        return;
+                    }
+                }
                 let mut shape = state.grok.shape();
                 shape.effort = effort.clone();
                 state.grok.set_shape(shape);
-                if let Some(path) = &state.config_path {
-                    let _ = crate::config::update_path(path, |c| {
-                        c.grok.reasoning_effort = effort.clone();
-                    });
-                }
                 self.set_status(format!("grok effort: {label}"));
             }
             Backend::Remote(remote) => {
@@ -2824,6 +2874,19 @@ impl App {
     fn set_codex(&mut self, new: CodexSettingsDoc) {
         match &mut self.backend {
             Backend::Local(state) => {
+                // Persist FIRST (config-editor contract): a failed write
+                // leaves the live shape untouched and reports the error —
+                // live-then-persist would let disk and runtime diverge.
+                if let Some(path) = &state.config_path {
+                    if let Err(err) = crate::config::update_path(path, |c| {
+                        c.codex.default_model = new.model.clone();
+                        c.codex.fast = new.fast;
+                        c.codex.reasoning_effort = new.effort.clone();
+                    }) {
+                        self.set_status(format!("codex change failed: {err}"));
+                        return;
+                    }
+                }
                 // Carry the live `client_model` override forward: it is a
                 // config-only opt-in the TUI settings panel doesn't manage, so
                 // a model/fast/effort change here must not silently clear it.
@@ -2834,13 +2897,6 @@ impl App {
                     fast: new.fast,
                     effort: new.effort.clone(),
                 });
-                if let Some(path) = &state.config_path {
-                    let _ = crate::config::update_path(path, |c| {
-                        c.codex.default_model = new.model.clone();
-                        c.codex.fast = new.fast;
-                        c.codex.reasoning_effort = new.effort.clone();
-                    });
-                }
                 self.set_status(codex_status_line(&new));
             }
             Backend::Remote(remote) => {
@@ -4770,6 +4826,55 @@ mod tests {
         assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
         app.on_key_sessions(KeyCode::Char('o'));
         assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
+    #[test]
+    fn config_sched_mode_confirms_then_applies() {
+        // Review MUST-FIX: the scheduler-mode row must reach the confirm
+        // gate and then the existing live toggle — never "value unavailable".
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.activate_config_action(ui::ConfigAction::SchedMode, None);
+        assert!(
+            matches!(
+                app.mode,
+                Mode::ConfigConfirm {
+                    action: ui::ConfigAction::SchedMode
+                }
+            ),
+            "SchedMode enters the confirm gate, got {:?}",
+            app.mode
+        );
+        app.on_key_config_confirm(KeyCode::Char('y'), ui::ConfigAction::SchedMode, None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.take_pending_mode().is_some(),
+            "confirming queues the live scheduler-mode toggle (remote path)"
+        );
+    }
+
+    #[test]
+    fn config_ceiling_zero_requires_confirm() {
+        // Blast-radius rule: driving a ceiling to 0 locks that window's
+        // scheduling — it must pass the y/n gate, a normal value must not.
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "0".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        assert!(
+            matches!(app.mode, Mode::ConfigConfirm { .. }),
+            "ceiling→0 needs confirm"
+        );
+        app.on_key_config_confirm(KeyCode::Esc, ui::ConfigAction::Ceiling5h, None);
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "80".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
     }
 
     #[test]

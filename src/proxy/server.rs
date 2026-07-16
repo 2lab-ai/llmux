@@ -369,13 +369,15 @@ impl AppState {
         &self,
         mode: crate::config::SchedulerMode,
     ) -> Result<crate::config::SchedulerMode, crate::config::ConfigError> {
+        // Persist FIRST (config-editor contract): a failed write must leave
+        // the live scheduler untouched — never let disk and runtime diverge.
+        if let Some(path) = &self.config_path {
+            crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
+        }
         self.round_robin.store(
             mode == crate::config::SchedulerMode::RoundRobin,
             Ordering::Relaxed,
         );
-        if let Some(path) = &self.config_path {
-            crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
-        }
         tracing::info!(mode = mode.label(), "scheduler mode updated");
         Ok(mode)
     }
@@ -1656,8 +1658,14 @@ pub fn apply_settings(
         ("codex_upstream", req.codex_upstream.as_deref()),
     ] {
         if let Some(url) = url {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            // Structural validation, not a prefix check: a hostless
+            // "http://" or an unparsable URL would break EVERY request.
+            let parsed = reqwest::Url::parse(url).map_err(|e| format!("{name}: {e}"))?;
+            if !(parsed.scheme() == "http" || parsed.scheme() == "https") {
                 return Err(format!("{name}: must be an http(s) URL"));
+            }
+            if parsed.host_str().is_none() {
+                return Err(format!("{name}: URL has no host"));
             }
         }
     }
@@ -1673,6 +1681,12 @@ pub fn apply_settings(
     }
 
     // ---- persist all requested fields in ONE read-merge-write. ----
+    // A persistent editor must not pretend: with no config path there is
+    // nothing to write, and flipping holders anyway would silently diverge
+    // runtime from disk (review MUST-FIX 4).
+    if state.config_path.is_none() {
+        return Err("config write failed: no config path — persistence unavailable".into());
+    }
     if let Some(path) = &state.config_path {
         let req_clone = SettingsRequest {
             email_anonymous: req.email_anonymous,
