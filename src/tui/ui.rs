@@ -2002,14 +2002,26 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             Span::raw(what),
         ])
     };
+    let bytes = |b: Option<u64>| match b {
+        Some(b) => format!("{}B", format::human_count(b)),
+        None => "—".into(),
+    };
+    let f = &view.config_facts;
     let lines = vec![
         Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
-        key("a g l s", "accounts / stats / logs / sessions"),
-        key("? c", "this surface / config"),
-        key("click", "tabs switch · activity row expands"),
-        key("wheel", "activity history"),
+        key(
+            "a g U p l s",
+            "accounts / stats / usage / perf / logs / sessions",
+        ),
+        key("? c", "this surface / config editor"),
+        key(
+            "click",
+            "tabs switch · activity row expands · config value edits · session selects",
+        ),
+        key("wheel", "activity history · overlay cursors"),
         key("f m e", "codex fast / model / effort"),
         key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("o d", "sessions sort · perf/stats span"),
         key("q Esc", "quit / back to dashboard"),
         Line::default(),
         Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
@@ -2019,6 +2031,19 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             view.pid,
             view.port,
             format::countdown(view.uptime)
+        ))),
+        Line::default(),
+        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw(format!(
+            "   config {}",
+            view.config_path.clone().unwrap_or_else(|| "—".into())
+        ))),
+        Line::from(Span::raw(format!(
+            "   accounts {} · raw-io {} ({}) · activity log {}",
+            view.snapshot.accounts.len(),
+            if f.raw_io_enabled { "on" } else { "off" },
+            bytes(f.raw_io_bytes),
+            bytes(f.activity_log_bytes),
         ))),
     ];
     let block = Block::new().borders(Borders::TOP).title(" misc ");
@@ -9852,6 +9877,41 @@ mod tests {
         assert!(
             text.contains("no perf data yet"),
             "empty perf tab explains collection"
+        );
+    }
+
+    #[test]
+    fn config_editor_lists_full_schema_with_state_labels() {
+        // Trinity contract C6: the acceptance denominator is the WHOLE
+        // schema — every section appears, each row carrying an honest
+        // apply-state label; editable value cells are recorded as hits.
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Config);
+        let rows = config_rows(&view, &chrome);
+        for section in [
+            "scheduler",
+            "codex",
+            "display",
+            "routing",
+            "raw-io",
+            "daemon",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.section == section),
+                "{section} section present"
+            );
+        }
+        // Managed-elsewhere / secret rows are honest read-only, not hidden.
+        assert!(rows
+            .iter()
+            .any(|r| r.action.is_none() && r.note.contains("accounts tab")));
+        assert!(rows.iter().any(|r| r.note.contains("secret")));
+        let text = render(&view, &chrome, 200, 50);
+        assert!(text.contains("live"), "live state label rendered");
+        assert!(text.contains("restart"), "restart state label rendered");
+        assert!(
+            text.contains("Enter/click value edits"),
+            "editor affordance in the title"
         );
     }
 

@@ -46,6 +46,19 @@ The activity feed gains the same per-request view: a `t/s` column (e2e) on every
 
 In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
 
+### Config tab (the config editor)
+
+The `config` tab (`c`, or click the tab bar) is a mouse-driven config editor covering the **entire** config schema — every field appears with an honest apply-state label:
+
+- `live` — applies immediately (holder-backed; persisted read-merge-write first, then flipped in the running daemon). Covers scheduler mode + ceilings + usage max age, codex model/effort/fast, grok effort, routing on/off, raw-io capture on/off, email mask, quota fill, TUI effects, the Fable weekly gauge.
+- `restart` — persisted now, effective on the next daemon start (routing default/on-empty group, raw-io retention and body cap, gradient speed, upstreams, port, max request bytes). The status line always says which — a saved-but-not-yet-live change never reads as applied.
+- `session` — this TUI only (reset display).
+- `ro` — managed elsewhere, with the note saying where (accounts → Accounts tab, per-account limits → `L`, events → `POST /llmux/events`, pricing/gradient colors/domain abbreviations → config file, `remote.api_key` → secret).
+
+`j`/`k` (or the wheel) move the cursor; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — ask `y/n` first. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
+
+The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config path, account count, raw-io capture state and file size, and the activity-log size (sizes refresh at most every 30s).
+
 ## Install and launch details
 
 ### Homebrew channels
