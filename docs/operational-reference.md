@@ -36,14 +36,15 @@ The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: 
 Metric semantics (v1, deliberately conservative):
 
 - `e2e t/s` = output tokens / total request duration — always available, includes queueing and time-to-first-token.
-- `est t/s` = output tokens / (duration − time to the **first streamed output delta**, i.e. the first `content_block_delta`, thinking deltas included). Labeled *estimated* because hidden reasoning (e.g. Codex reasoning that streams only as summaries) may precede the first delta — this is **not** a model decode-speed claim. Derived only from requests that recorded a first delta; legacy/non-streaming requests never mix into it.
+- TTFB and the first-delta offset are measured from the **served attempt's upstream dispatch** (the moment the winning upstream request was sent) — request-body buffering, scheduling, token refreshes, and 429 parks never contaminate them.
+- `est t/s` = output tokens / the **stream-side span from the first streamed output delta to the end of the upstream stream** (the first `content_block_delta`, thinking deltas included; empty deltas never count). Labeled *estimated* because hidden reasoning (e.g. Codex reasoning that streams only as summaries) may precede the first delta — this is **not** a model decode-speed claim. Derived only from requests that recorded a first delta; legacy/non-streaming requests never mix into it.
 - Codex **fast mode** splits every series: `⚡` = fast on, no marker = off, `?` = history recorded before the field existed (unknown — kept separate, never counted as off).
-- Rows with fewer than 5 samples render dim (low confidence, still shown — low traffic is itself a signal); aggregates whose summed span can't support a stable ratio show `—`.
-- Data is rebuilt from the persisted request log on restart and retained 90 days; the tab title carries `collecting since <date>` because collection starts with the first daemon version that records timings.
+- Confidence is judged per statistic: `e2e` dims under its own throughput-sample count, `est` under its measured-sample count (fewer than 5 → dim; still shown — low traffic is itself a signal); aggregates whose summed span can't support a stable ratio show `—`. Quiet days are chart GAPS and `—` health rows, never a fabricated `0`. A mid-stream upstream abort counts as an error even though the client already held a 200.
+- Data is rebuilt from the persisted request log on restart and retained 90 days; the tab title carries `timing since <date>` — the first day that actually observed v1 timing, not the oldest replayed legacy row.
 
 The activity feed gains the same per-request view: a `t/s` column (e2e) on every completed row, and the click-expanded detail shows `e2e` / `est … post-delta` / `ttfb` / `first output` when recorded. Attach clients receive the same rows on `GET /llmux/dashboard` (`daily_perf`).
 
-In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer.
+In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
 
 ## Install and launch details
 

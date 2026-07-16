@@ -93,10 +93,14 @@ pub(crate) enum CompletedBody {
         /// only for pre-field replayed history — "unknown", never coerced).
         fast: Option<bool>,
         /// Millis to first upstream body chunk / first streamed output delta
-        /// (perf telemetry v1). `None` on error paths, non-streaming relays,
-        /// and pre-field history.
+        /// (both from the served attempt's upstream dispatch), plus the
+        /// stream-side post-delta span (perf telemetry v1). `None` on error
+        /// paths, non-streaming relays, and pre-field history.
         ttfb_ms: Option<u64>,
         ttft_ms: Option<u64>,
+        gen_ms: Option<u64>,
+        /// Upstream stream aborted mid-body (provider failure).
+        aborted: bool,
         /// Keyless client identity (`metadata.user_id`) — keys the derived
         /// session label shown on the row (TUI UI-3 U2).
         user_id: Option<String>,
@@ -346,13 +350,16 @@ impl PerfCell {
     fn add(
         &mut self,
         status: u16,
+        aborted: bool,
         tokens: Option<TokenCounts>,
         duration_ms: u64,
         ttfb_ms: Option<u64>,
-        ttft_ms: Option<u64>,
+        gen_ms: Option<u64>,
     ) {
         self.requests = self.requests.saturating_add(1);
-        if status < 400 {
+        // A mid-stream upstream abort is a provider failure even though the
+        // client already received a success status line (review MUST-FIX 8).
+        if status < 400 && !aborted {
             self.ok = self.ok.saturating_add(1);
         } else {
             self.errors = self.errors.saturating_add(1);
@@ -368,11 +375,13 @@ impl PerfCell {
         self.tps_n = self.tps_n.saturating_add(1);
         self.output_tokens = self.output_tokens.saturating_add(output);
         self.e2e_ms = self.e2e_ms.saturating_add(duration_ms);
-        if let Some(ttft) = ttft_ms {
-            if duration_ms > ttft {
+        // Measured series: the stream-side post-delta span — never derived
+        // from the request duration, so baselines cannot mix.
+        if let Some(gen) = gen_ms {
+            if gen > 0 {
                 self.measured_n = self.measured_n.saturating_add(1);
                 self.measured_output = self.measured_output.saturating_add(output);
-                self.post_ttft_ms = self.post_ttft_ms.saturating_add(duration_ms - ttft);
+                self.post_ttft_ms = self.post_ttft_ms.saturating_add(gen);
             }
         }
     }
@@ -852,10 +861,19 @@ pub(crate) struct PersistedRequest {
     #[serde(default)]
     pub ttfb_ms: Option<u64>,
     /// Millis to the first streamed output delta (first
-    /// `content_block_delta`, any delta type). Additive: `None` on pre-field
-    /// lines, content-less streams, and non-streaming relays.
+    /// `content_block_delta`, any delta type), measured from the served
+    /// attempt's upstream dispatch. Additive: `None` on pre-field lines,
+    /// content-less streams, and non-streaming relays.
     #[serde(default)]
     pub ttft_ms: Option<u64>,
+    /// Stream-side span (first delta → stream end), millis — the estimated
+    /// post-delta throughput denominator. Additive.
+    #[serde(default)]
+    pub gen_ms: Option<u64>,
+    /// Upstream stream aborted mid-body (provider failure the HTTP status
+    /// hides). Additive: pre-field lines load `false`.
+    #[serde(default)]
+    pub aborted: bool,
     /// Keyless per-client metering identity (issue #32). Additive: lines
     /// persisted before this field default to `None` and replay into the
     /// `unknown` client bucket.
@@ -888,6 +906,8 @@ impl PersistedRequest {
             fast,
             ttfb_ms,
             ttft_ms,
+            gen_ms,
+            aborted,
             user_id,
             kind,
             excerpt,
@@ -915,6 +935,8 @@ impl PersistedRequest {
             fast: *fast,
             ttfb_ms: *ttfb_ms,
             ttft_ms: *ttft_ms,
+            gen_ms: *gen_ms,
+            aborted: *aborted,
             user_id: user_id.clone(),
             kind: kind.clone(),
             excerpt: excerpt.clone(),
@@ -939,6 +961,8 @@ impl PersistedRequest {
             fast: self.fast,
             ttfb_ms: self.ttfb_ms,
             ttft_ms: self.ttft_ms,
+            gen_ms: self.gen_ms,
+            aborted: self.aborted,
             user_id: self.user_id,
             kind: self.kind,
             excerpt: self.excerpt,
@@ -1001,6 +1025,8 @@ pub(crate) struct ActivityLog {
     /// by the same RequestFinished fold (startup replay fills history), pruned
     /// to [`DAILY_RETAIN_DAYS`] like the chart fold.
     perf_daily: PerfDays,
+    /// Monotonic newest day ever folded into `perf_daily` (retention anchor).
+    perf_day_hwm: u64,
     /// Monotonic high-water marks (newest hour / local day ever folded):
     /// retention prunes against THESE, never against an individual event's
     /// timestamp, so an out-of-order replayed event can't resurrect an
@@ -1231,6 +1257,7 @@ impl ActivityLog {
                 dst.entry(key).or_default().merge(&cell);
             }
         }
+        self.perf_day_hwm = self.perf_day_hwm.max(history.perf_day_hwm);
         // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
         // history lands on its original hours/days/months — same reasoning
         // as the daily chart buckets above. Watermarks merge by max and the
@@ -1853,6 +1880,8 @@ impl ActivityLog {
                 fast,
                 ttfb_ms,
                 ttft_ms,
+                gen_ms,
+                aborted,
                 user_id,
                 kind,
                 excerpt,
@@ -1948,8 +1977,12 @@ impl ActivityLog {
                         .or_default()
                         .entry((group.clone(), normalize_model(model), fast))
                         .or_default()
-                        .add(status, tokens, duration_ms, ttfb_ms, ttft_ms);
-                    let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
+                        .add(status, aborted, tokens, duration_ms, ttfb_ms, gen_ms);
+                    // Retention prunes against a monotonic high-water mark —
+                    // a replayed out-of-order (or future-dated) event must
+                    // never rewind the window (same rule as the usage hwm).
+                    self.perf_day_hwm = self.perf_day_hwm.max(day);
+                    let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
                     self.perf_daily.retain(|d, _| *d >= cutoff);
                 }
                 self.push_health(now, status);
@@ -1969,6 +2002,8 @@ impl ActivityLog {
                         fast,
                         ttfb_ms,
                         ttft_ms,
+                        gen_ms,
+                        aborted,
                         user_id,
                         kind,
                         excerpt,
@@ -2094,6 +2129,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: Some(uid.into()),
                 kind: Some("user".into()),
                 excerpt: Some(excerpt.into()),
@@ -2172,6 +2209,8 @@ mod tests {
             fast: Some(false),
             ttfb_ms: None,
             ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -2205,6 +2244,8 @@ mod tests {
             fast: Some(false),
             ttfb_ms: None,
             ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -2237,6 +2278,8 @@ mod tests {
             fast: Some(false),
             ttfb_ms: None,
             ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: user_id.map(str::to_string),
             kind: None,
             excerpt: None,
@@ -3151,6 +3194,8 @@ mod tests {
             fast: Some(id.is_multiple_of(2)),
             ttfb_ms: (!id.is_multiple_of(3)).then_some(40 + id),
             ttft_ms: (id % 3 == 1).then_some(200 + id),
+            gen_ms: None,
+            aborted: false,
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),
@@ -3248,6 +3293,8 @@ mod tests {
             fast: Some(false),
             ttfb_ms: None,
             ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
             kind: None,
             excerpt: None,
@@ -3541,17 +3588,21 @@ mod tests {
 
     #[test]
     fn perf_fold_gates_and_series_separation() {
-        // Trinity contract C3/C4: throughput samples need output>0; the
-        // measured series additionally needs ttft with duration>ttft; fast
-        // None/Some(false)/Some(true) aggregate as THREE separate keys.
+        // Trinity contract C3/C4 (+ review MUST-FIX 8): throughput samples
+        // need output>0; the measured series needs a positive stream-side
+        // gen span; fast None/Some(false)/Some(true) aggregate as THREE
+        // separate keys; an upstream mid-stream abort counts as an error
+        // even under an HTTP 200.
         let mut log = ActivityLog::new(LOG_CAPACITY);
+        #[allow(clippy::too_many_arguments)]
         let ev = |id: u64,
                   status: u16,
                   output: u64,
                   duration_ms: u64,
                   fast: Option<bool>,
                   ttfb_ms: Option<u64>,
-                  ttft_ms: Option<u64>| {
+                  gen_ms: Option<u64>,
+                  aborted: bool| {
             ActivityEvent::RequestFinished {
                 id,
                 method: "POST".into(),
@@ -3570,27 +3621,44 @@ mod tests {
                 effort: None,
                 fast,
                 ttfb_ms,
-                ttft_ms,
+                ttft_ms: gen_ms.map(|_| 500),
+                gen_ms,
+                aborted,
                 user_id: None,
                 kind: None,
                 excerpt: None,
             }
         };
         let now = at(1_000);
-        // measured sample: 30 output tokens over (2000-500)ms post-delta.
+        // measured sample: 30 output tokens over a 1500ms stream-side span.
         log.apply(
-            ev(1, 200, 30, 2_000, Some(false), Some(100), Some(500)),
+            ev(
+                1,
+                200,
+                30,
+                2_000,
+                Some(false),
+                Some(100),
+                Some(1_500),
+                false,
+            ),
             now,
         );
-        // tps-only sample (no ttft) in the SAME (group,model,fast) cell.
-        log.apply(ev(2, 200, 10, 1_000, Some(false), Some(80), None), now);
+        // tps-only sample (no gen span) in the SAME (group,model,fast) cell.
+        log.apply(
+            ev(2, 200, 10, 1_000, Some(false), Some(80), None, false),
+            now,
+        );
         // output=0 → error-rate only, never a throughput sample.
-        log.apply(ev(3, 500, 0, 700, Some(false), None, None), now);
-        // duration <= ttft → tps sample but NOT measured (invalid span).
-        log.apply(ev(4, 200, 5, 400, Some(false), Some(50), Some(400)), now);
+        log.apply(ev(3, 500, 0, 700, Some(false), None, None, false), now);
+        // aborted stream under HTTP 200 → error, still a tps sample.
+        log.apply(ev(4, 200, 5, 400, Some(false), Some(50), None, true), now);
         // fast=true and fast-unknown land in their own series.
-        log.apply(ev(5, 200, 50, 1_000, Some(true), Some(60), Some(200)), now);
-        log.apply(ev(6, 200, 40, 1_000, None, None, None), now);
+        log.apply(
+            ev(5, 200, 50, 1_000, Some(true), Some(60), Some(800), false),
+            now,
+        );
+        log.apply(ev(6, 200, 40, 1_000, None, None, None, false), now);
 
         let rows = log.daily_perf();
         assert_eq!(rows.len(), 3, "off / on / unknown are separate series");
@@ -3601,14 +3669,17 @@ mod tests {
         };
         let off = cell(Some(false));
         assert_eq!(off.requests, 4);
-        assert_eq!(off.ok, 3);
-        assert_eq!(off.errors, 1);
+        assert_eq!(off.ok, 2, "abort under 200 is NOT ok");
+        assert_eq!(off.errors, 2, "500 + aborted stream");
         assert_eq!(off.tps_n, 3, "output>0 samples only");
         assert_eq!(off.output_tokens, 45);
         assert_eq!(off.e2e_ms, 3_400);
-        assert_eq!(off.measured_n, 1, "duration<=ttft and ttft-less excluded");
+        assert_eq!(off.measured_n, 1, "gen-span-less samples excluded");
         assert_eq!(off.measured_output, 30);
-        assert_eq!(off.post_ttft_ms, 1_500);
+        assert_eq!(
+            off.post_ttft_ms, 1_500,
+            "stream-side span, not duration−ttft"
+        );
         assert_eq!(off.ttfb_n, 3);
         assert_eq!(off.ttfb_ms_sum, 230);
         let on = cell(Some(true));

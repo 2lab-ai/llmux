@@ -379,6 +379,8 @@ fn trace_event(event: &ActivityEvent) {
             excerpt: _,
             ttfb_ms: _,
             ttft_ms: _,
+            gen_ms: _,
+            aborted: _,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -1176,6 +1178,12 @@ pub enum CompletedDoc {
         ttfb_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttft_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gen_ms: Option<u64>,
+        /// Upstream stream aborted mid-body. Skipped when false so older
+        /// attach clients keep parsing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        aborted: bool,
         /// Client identity / message kind / input excerpt (TUI UI-3 U1/U2).
         /// Additive: absent in docs written before these fields existed.
         ///
@@ -1625,6 +1633,8 @@ pub(crate) fn dashboard_doc(
                     fast,
                     ttfb_ms,
                     ttft_ms,
+                    gen_ms,
+                    aborted,
                     user_id,
                     kind,
                     excerpt,
@@ -1656,6 +1666,8 @@ pub(crate) fn dashboard_doc(
                     fast: *fast,
                     ttfb_ms: *ttfb_ms,
                     ttft_ms: *ttft_ms,
+                    gen_ms: *gen_ms,
+                    aborted: *aborted,
                     user_id: user_id.clone(),
                     msg_kind: kind.clone(),
                     excerpt: excerpt.clone(),
@@ -1858,6 +1870,60 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daily_perf_doc_wire_round_trip_preserves_every_field() {
+        // Attach parity (perf telemetry v1): the perf rows an attach client
+        // parses must be exactly what the daemon serialized — including the
+        // three-state `fast` (None must survive, never collapse to false).
+        let rows = vec![
+            super::DailyPerfDoc {
+                day: 20_600,
+                group: "codex".into(),
+                model: "gpt-5.5".into(),
+                fast: None,
+                requests: 3,
+                ok: 2,
+                errors: 1,
+                tps_n: 2,
+                output_tokens: 100,
+                e2e_ms: 2_000,
+                measured_n: 1,
+                measured_output: 60,
+                post_ttft_ms: 500,
+                ttfb_n: 2,
+                ttfb_ms_sum: 240,
+            },
+            super::DailyPerfDoc {
+                fast: Some(true),
+                ..{
+                    let mut r = super::DailyPerfDoc {
+                        day: 20_601,
+                        group: "claude".into(),
+                        model: "opus".into(),
+                        fast: Some(false),
+                        requests: 1,
+                        ok: 1,
+                        errors: 0,
+                        tps_n: 1,
+                        output_tokens: 10,
+                        e2e_ms: 100,
+                        measured_n: 0,
+                        measured_output: 0,
+                        post_ttft_ms: 0,
+                        ttfb_n: 0,
+                        ttfb_ms_sum: 0,
+                    };
+                    r.fast = Some(true);
+                    r
+                }
+            },
+        ];
+        let json = serde_json::to_string(&rows).expect("serialize");
+        let parsed: Vec<super::DailyPerfDoc> = serde_json::from_str(&json).expect("parse");
+        assert_eq!(rows, parsed, "wire round-trip is lossless");
+        assert_eq!(parsed[0].fast, None, "unknown fast survives the wire");
+    }
+
     use super::*;
     use crate::config::{AccountConfig, AccountCredential};
     use crate::scheduler::headers::{ParsedRateLimitHeaders, WindowReading};
@@ -1974,6 +2040,8 @@ mod tests {
                 fast: Some(true),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: Some("acct_seed".into()),
                 kind: None,
                 excerpt: None,
@@ -2795,6 +2863,8 @@ mod tests {
                     fast: Some(false),
                     ttfb_ms: None,
                     ttft_ms: None,
+                    gen_ms: None,
+                    aborted: false,
                     user_id: None,
                     kind: None,
                     excerpt: None,
@@ -2843,6 +2913,8 @@ mod tests {
             fast: Some(false),
             ttfb_ms: None,
             ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
             kind: None,
             excerpt: None,

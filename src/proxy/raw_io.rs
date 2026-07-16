@@ -125,6 +125,12 @@ pub struct RawIoRecord {
     /// HTTP status delivered to the client, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Total request duration, millis — lets the session timeline derive an
+    /// honest Σoutput/Σduration throughput (perf telemetry v1). Additive:
+    /// `None` on records written before the field existed (those requests
+    /// simply don't contribute to the session rate sums).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Verbatim request body (bounded + truncation-marked at capture time).
     pub request_body: String,
     /// Response body delivered to the client (bounded + truncation-marked).
@@ -211,6 +217,7 @@ impl RawIoRecord {
             model,
             account,
             status,
+            duration_ms: None,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body(response_body, max_body_bytes),
             request_headers,
@@ -308,6 +315,7 @@ pub fn capture(
     model: Option<String>,
     account: Option<String>,
     status: Option<u16>,
+    duration_ms: Option<u64>,
     request_body: &[u8],
     response_body: &[u8],
     max_body_bytes: usize,
@@ -318,7 +326,7 @@ pub fn capture(
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
     }
-    let record = RawIoRecord::new(
+    let mut record = RawIoRecord::new(
         id,
         now_ms(),
         group,
@@ -332,6 +340,7 @@ pub fn capture(
         response_headers,
         upstream,
     );
+    record.duration_ms = duration_ms;
     append(path, &record);
 }
 
@@ -368,6 +377,7 @@ impl RawIoRecord {
             model,
             account,
             status,
+            duration_ms: None,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body_streamed(response_kept, response_total),
             request_headers,
@@ -390,6 +400,7 @@ pub fn capture_streamed(
     model: Option<String>,
     account: Option<String>,
     status: Option<u16>,
+    duration_ms: Option<u64>,
     request_body: &[u8],
     response_kept: &[u8],
     response_total: usize,
@@ -401,7 +412,7 @@ pub fn capture_streamed(
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
     }
-    let record = RawIoRecord::new_streamed(
+    let mut record = RawIoRecord::new_streamed(
         id,
         now_ms(),
         group,
@@ -416,6 +427,7 @@ pub fn capture_streamed(
         response_headers,
         upstream,
     );
+    record.duration_ms = duration_ms;
     append(path, &record);
 }
 

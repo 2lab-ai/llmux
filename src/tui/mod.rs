@@ -4264,6 +4264,9 @@ mod tests {
         let mut app = remote_app();
         let sess =
             |uid: &str, last_ms: u64, tokens_out: u64, requests: u64| crate::session::Session {
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
                 user_id: Some(uid.into()),
                 requests,
                 tokens_in: 0,
@@ -4349,6 +4352,9 @@ mod tests {
             account_rotations: 0,
             first_ms: 0,
             last_ms: 0,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
             confidence: Confidence::High,
         };
         let mut app = remote_app();
@@ -4877,6 +4883,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
@@ -5096,6 +5104,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("count".into()),
                 excerpt: None,
@@ -5203,6 +5213,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 // Non-`count` kind → every entry renders 1:1 (no folding), so
                 // render row k maps to `completed[k]`.
@@ -5303,6 +5315,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,

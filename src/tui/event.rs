@@ -126,7 +126,21 @@ pub enum ActivityEvent {
         /// precede it (codex summaries), so throughput derived from it is
         /// labeled "estimated". `None` when the stream carried no content
         /// delta, on non-streaming relays, and on pre-field history.
+        /// Baseline for both timing fields = the served attempt's upstream
+        /// dispatch instant (never the client request start).
         ttft_ms: Option<u64>,
+        /// Stream-side span from the first streamed output delta to the end
+        /// of the upstream stream, millis. This is the "estimated" post-delta
+        /// throughput denominator — measured purely on the stream, so it can
+        /// never mix baselines with the request duration. `None` whenever
+        /// `ttft_ms` is.
+        gen_ms: Option<u64>,
+        /// The upstream stream ABORTED mid-body (transport error after the
+        /// headers). The recorded HTTP status is still what the client got
+        /// (usually 200), so provider error accounting must read this flag —
+        /// a mid-stream break is a provider failure a status filter would
+        /// miss. Client disconnects do NOT set it.
+        aborted: bool,
         /// Keyless per-client attribution identity (issue #32): the
         /// `metadata.user_id` parsed from the request body, when present
         /// (~98.9% of real requests). `None` requests are metered into the

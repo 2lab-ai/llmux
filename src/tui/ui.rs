@@ -1249,6 +1249,18 @@ fn draw_sessions_table(
                 crate::session::Confidence::High => Color::Green,
                 crate::session::Confidence::Low => Color::DarkGray,
             };
+            // Honest per-session output rate: Σtimed output / Σrecorded
+            // request duration (never tokens over the wall-clock span —
+            // idle time between requests is not generation time). `—` when
+            // no record carried a duration (pre-field raw-io history); dim
+            // under 5 timed samples.
+            let tps = (s.duration_ms_sum > 0)
+                .then(|| s.tokens_out_timed as f64 * 1000.0 / s.duration_ms_sum as f64);
+            let tps_style = if s.timed_requests < 5 {
+                dim()
+            } else {
+                Style::new()
+            };
             let cells = vec![
                 Cell::from(Span::styled(
                     s.confidence.label(),
@@ -1258,6 +1270,7 @@ fn draw_sessions_table(
                 Cell::from(format::human_count(s.requests)),
                 Cell::from(format::human_count(s.tokens_in)),
                 Cell::from(format::human_count(s.tokens_out)),
+                Cell::from(Span::styled(tps_cell(tps), tps_style)),
                 Cell::from(format::human_count(s.models.len() as u64)),
                 Cell::from(session_accounts_label(s)),
                 Cell::from(Span::styled(session_span_label(s), dim())),
@@ -1270,11 +1283,14 @@ fn draw_sessions_table(
             }
         });
 
-    let header = vec!["conf", "session", "req", "in", "out", "mdl", "acct", "span"];
+    let header = vec![
+        "conf", "session", "req", "in", "out", "t/s", "mdl", "acct", "span",
+    ];
     let constraints = vec![
         Constraint::Length(5),
         Constraint::Fill(1),
         Constraint::Length(7),
+        Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(5),
@@ -1448,10 +1464,12 @@ impl PerfAgg {
             .then(|| self.output_tokens as f64 * 1000.0 / self.e2e_ms as f64)
     }
 
-    /// Estimated post-delta throughput — measured samples only, and the
-    /// summed post-delta span must clear the stability floor (a bucket with
-    /// <50ms of total span yields a numerically meaningless ratio; raw sums
-    /// are kept, so it fills in as data accrues).
+    /// Estimated post-delta throughput — measured samples only (requests
+    /// whose STREAM recorded a positive first-delta→end span; the request
+    /// duration never enters this denominator), and the summed span must
+    /// clear the stability floor (a bucket with <50ms of total span yields a
+    /// numerically meaningless ratio; raw sums are kept, so it fills in as
+    /// data accrues).
     fn est_tps(&self) -> Option<f64> {
         (self.measured_n > 0 && self.post_ttft_ms >= 50)
             .then(|| self.measured_output as f64 * 1000.0 / self.post_ttft_ms as f64)
@@ -1565,10 +1583,22 @@ fn draw_perf_overlay(
         return;
     }
     let series = perf_series(view, days, ctx.now);
-    let since_day = view.daily_perf.iter().map(|r| r.day).min().unwrap_or(0);
-    let since = day_label(since_day);
-    let title =
-        format!(" perf — observed, last {days}d · collecting since {since} · v1 · d cycles ");
+    // "Collecting since" = the first day that actually observed v1 TIMING
+    // (ttfb or a measured span) — legacy replayed rows contribute e2e sums
+    // but must not backdate the collection start (review MUST-FIX).
+    let since = view
+        .daily_perf
+        .iter()
+        .filter(|r| r.ttfb_n > 0 || r.measured_n > 0)
+        .map(|r| r.day)
+        .min()
+        .map(day_label);
+    let title = match since {
+        Some(since) => {
+            format!(" perf — observed, last {days}d · timing since {since} · v1 · d cycles ")
+        }
+        None => format!(" perf — observed, last {days}d · no timing data yet · v1 · d cycles "),
+    };
 
     let chart_h = if area.height >= 24 { 13 } else { 0 };
     let table_h = (series.len().min(8) as u16).saturating_add(3);
@@ -1629,45 +1659,53 @@ fn draw_perf_chart(
         return;
     }
     let span_days = days as usize;
-    // Per-day per-series raw sums → tps points (0 on quiet days).
-    let mut sums: Vec<Vec<(u64, u64)>> = vec![vec![(0, 0); span_days]; ranked.len()];
+    // Per-day per-series raw sums → tps points. A day WITHOUT throughput
+    // samples is a GAP, never a fabricated 0 (contract C5): each series is
+    // split into contiguous sampled segments and each segment becomes its
+    // own same-colored dataset, so the line breaks over quiet days.
+    let mut sums: Vec<Vec<Option<(u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
     for r in view.daily_perf.iter().filter(&in_span) {
         if let Some(idx) = ranked
             .iter()
             .position(|((g, m, f), _)| *g == r.group && *m == r.model && *f == r.fast)
         {
             let x = (r.day - start) as usize;
-            sums[idx][x].0 += r.output_tokens;
-            sums[idx][x].1 += r.e2e_ms;
+            if r.tps_n > 0 {
+                let slot = sums[idx][x].get_or_insert((0, 0));
+                slot.0 += r.output_tokens;
+                slot.1 += r.e2e_ms;
+            }
         }
     }
     let mut y_max = 1f64;
-    let series: Vec<Vec<(f64, f64)>> = sums
-        .iter()
-        .map(|day_sums| {
-            day_sums
-                .iter()
-                .enumerate()
-                .map(|(x, (out, ms))| {
-                    let y = if *ms > 0 {
-                        *out as f64 * 1000.0 / *ms as f64
-                    } else {
-                        0.0
-                    };
+    let mut segments: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+    for (idx, day_sums) in sums.iter().enumerate() {
+        let mut current: Vec<(f64, f64)> = Vec::new();
+        for (x, slot) in day_sums.iter().enumerate() {
+            match slot {
+                Some((out, ms)) if *ms > 0 => {
+                    let y = *out as f64 * 1000.0 / *ms as f64;
                     y_max = y_max.max(y);
-                    (x as f64, y)
-                })
-                .collect()
-        })
-        .collect();
-    let datasets: Vec<Dataset> = series
+                    current.push((x as f64, y));
+                }
+                _ => {
+                    if !current.is_empty() {
+                        segments.push((idx, std::mem::take(&mut current)));
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            segments.push((idx, current));
+        }
+    }
+    let datasets: Vec<Dataset> = segments
         .iter()
-        .enumerate()
-        .map(|(i, data)| {
+        .map(|(idx, data)| {
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::new().fg(PERF_CHART_COLORS[i]))
+                .style(Style::new().fg(PERF_CHART_COLORS[*idx]))
                 .data(data)
         })
         .collect();
@@ -1740,22 +1778,21 @@ fn draw_perf_health(
         a.tps_n += r.tps_n;
         a.output_tokens += r.output_tokens;
         a.e2e_ms += r.e2e_ms;
+        a.measured_n += r.measured_n;
+        a.measured_output += r.measured_output;
+        a.post_ttft_ms += r.post_ttft_ms;
         a.ttfb_n += r.ttfb_n;
         a.ttfb_ms_sum += r.ttfb_ms_sum;
     }
     let capacity = (area.height.saturating_sub(2) as usize).max(1);
     let mut rows: Vec<Row> = Vec::new();
-    // Newest day first; only days that have ANY data get a row.
-    let mut shown_days: Vec<u64> = cells.keys().map(|(d, _)| *d).collect();
-    shown_days.dedup();
-    shown_days.reverse();
-    for day in shown_days.into_iter().take(capacity) {
+    // Newest day first, EVERY day in the span shown — a day with no traffic
+    // renders as an explicit `—` row, never silently dropped (contract C5).
+    for day in (start..=today).rev().take(capacity) {
         let mut row_cells: Vec<Cell> = vec![Cell::from(Span::styled(day_label(day), dim()))];
-        let mut day_n = 0;
         for group in &groups {
             match cells.get(&(day, *group)) {
                 Some(a) => {
-                    day_n += a.requests;
                     let ttfb = match a.ttfb_ms_sum.checked_div(a.ttfb_n) {
                         Some(avg) => format::elapsed_secs(Duration::from_millis(avg)),
                         None => "—".into(),
@@ -1768,21 +1805,31 @@ fn draw_perf_health(
                     } else {
                         Style::new().fg(Color::Green)
                     };
+                    // Confidence is judged PER CELL on the stat's own sample
+                    // count (e2e → tps_n, est → measured_n) — never on the
+                    // day total across providers (review MUST-FIX 3/5).
+                    let e2e_style = if a.tps_n < 5 { dim() } else { Style::new() };
+                    let est_style = if a.measured_n < 5 {
+                        dim()
+                    } else {
+                        Style::new()
+                    };
                     row_cells.push(Cell::from(Line::from(vec![
                         Span::raw(format!("{:>4} ", format::human_count(a.requests))),
                         Span::styled(format!("{err:>4.0}% "), err_style),
-                        Span::raw(format!("{ttfb:>6} {:>8}", tps_cell(a.e2e_tps()))),
+                        Span::raw(format!("{ttfb:>6} ")),
+                        Span::styled(format!("{:>8} ", tps_cell(a.e2e_tps())), e2e_style),
+                        Span::styled(format!("{:>8}", tps_cell(a.est_tps())), est_style),
                     ])));
                 }
                 None => row_cells.push(Cell::from(Span::styled("—", dim()))),
             }
         }
-        let row = Row::new(row_cells);
-        rows.push(if day_n < 5 { row.style(dim()) } else { row });
+        rows.push(Row::new(row_cells));
     }
     let mut header: Vec<Cell> = vec![Cell::from("date")];
     for group in &groups {
-        header.push(Cell::from(format!("{group}: n err% ttfb t/s")));
+        header.push(Cell::from(format!("{group}: n err% ttfb e2e est")));
     }
     let mut constraints = vec![Constraint::Length(7)];
     constraints.extend(groups.iter().map(|_| Constraint::Fill(1)));
@@ -1817,21 +1864,31 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
             None => "—".into(),
         };
         let coverage = format!("{}/{}", a.measured_n, a.tps_n);
+        // Per-cell confidence: e2e dims under its own tps_n, est under its
+        // measured_n — a busy series must not lend confidence to a sparse
+        // stat (review MUST-FIX 3/5). Rows are never hidden.
+        let e2e_style = if a.tps_n < 5 { dim() } else { Style::new() };
+        let est_style = if a.measured_n < 5 {
+            dim()
+        } else {
+            Style::new()
+        };
         let row = Row::new(vec![
             Cell::from(perf_series_label(&a.group, &a.model, a.fast)),
             Cell::from(format!("{:>5}", format::human_count(a.requests))),
             Cell::from(format!("{:>5.1}%", a.err_pct())),
             Cell::from(format!("{:>7}", format::human_count(a.output_tokens))),
-            Cell::from(format!("{:>8}", tps_cell(a.e2e_tps()))),
-            Cell::from(format!("{:>8}", tps_cell(a.est_tps()))),
+            Cell::from(Span::styled(
+                format!("{:>8}", tps_cell(a.e2e_tps())),
+                e2e_style,
+            )),
+            Cell::from(Span::styled(
+                format!("{:>8}", tps_cell(a.est_tps())),
+                est_style,
+            )),
             Cell::from(format!("{ttfb:>6}")),
             Cell::from(format!("{coverage:>7}")),
         ]);
-        let row = if a.requests < 5 {
-            row.style(dim())
-        } else {
-            row
-        };
         if idx == cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
         } else {
@@ -4979,6 +5036,8 @@ fn completed_line(
             fast: _,
             ttfb_ms: _,
             ttft_ms: _,
+            gen_ms: _,
+            aborted: _,
             user_id,
             kind,
             excerpt,
@@ -5133,6 +5192,8 @@ fn completed_detail_lines(
         fast,
         ttfb_ms,
         ttft_ms,
+        gen_ms,
+        aborted,
         user_id,
         kind,
         excerpt,
@@ -5231,10 +5292,9 @@ fn completed_detail_lines(
         if let Some(tps) = e2e_tps(tokens.as_ref(), *duration) {
             parts.push(format!("e2e {tps:.1} t/s"));
         }
-        if let (Some(ttft), Some(t)) = (ttft_ms, tokens) {
-            let total_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-            if t.output > 0 && total_ms > *ttft {
-                let est = t.output as f64 / ((total_ms - ttft) as f64 / 1000.0);
+        if let (Some(gen), Some(t)) = (gen_ms, tokens) {
+            if t.output > 0 && *gen > 0 {
+                let est = t.output as f64 * 1000.0 / *gen as f64;
                 parts.push(format!("est {est:.1} t/s post-delta"));
             }
         }
@@ -5249,6 +5309,9 @@ fn completed_detail_lines(
                 "first output {}",
                 format::elapsed_secs(Duration::from_millis(*ttft))
             ));
+        }
+        if *aborted {
+            parts.push("stream aborted".into());
         }
         if !parts.is_empty() {
             lines.push(indent("perf", parts.join("  ·  ")));
@@ -7499,6 +7562,9 @@ mod tests {
                 account_rotations: 3,
                 first_ms: 1_000_000,
                 last_ms: 1_600_000,
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
                 confidence: Confidence::High,
             },
             Session {
@@ -7511,6 +7577,9 @@ mod tests {
                 account_rotations: 0,
                 first_ms: 2_000_000,
                 last_ms: 2_000_000,
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
                 confidence: Confidence::Low,
             },
         ];
@@ -7562,6 +7631,9 @@ mod tests {
             account_rotations: 0,
             first_ms: 1_000_000,
             last_ms: 1_600_000,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
             confidence: crate::session::Confidence::High,
         }
     }
@@ -8424,6 +8496,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
@@ -8488,6 +8562,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
@@ -8611,6 +8687,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: None,
                 excerpt: None,
@@ -9169,8 +9247,8 @@ mod tests {
         assert!(text.contains("gpt-5.5⚡"), "fast=on series marked: {text}");
         assert!(text.contains("gpt-5.5?"), "unknown-fast series marked");
         assert!(
-            text.contains("collecting since"),
-            "collection-start labeled"
+            text.contains("timing since"),
+            "collection-start labeled from first TIMING day"
         );
         assert!(text.contains("est t/s"), "estimated column labeled est");
         assert!(
@@ -9182,8 +9260,14 @@ mod tests {
         assert!(text.contains("300t/s"), "estimated post-delta rate shown");
         assert!(text.contains("200t/s"), "e2e rate shown");
         // Provider health matrix shows both groups.
-        assert!(text.contains("codex: n err% ttfb t/s"), "health columns");
-        assert!(text.contains("claude: n err% ttfb t/s"), "health columns");
+        assert!(
+            text.contains("codex: n err% ttfb e2e est"),
+            "health columns"
+        );
+        assert!(
+            text.contains("claude: n err% ttfb e2e est"),
+            "health columns"
+        );
 
         // Empty state: honest hint, no fabricated zeros.
         view.daily_perf.clear();
@@ -9833,6 +9917,8 @@ mod tests {
                     fast: Some(false),
                     ttfb_ms: None,
                     ttft_ms: None,
+                    gen_ms: None,
+                    aborted: false,
                     user_id: None,
                     kind: None,
                     excerpt: None,
@@ -9883,6 +9969,9 @@ mod tests {
             account_rotations: 0,
             first_ms: 1,
             last_ms: 2,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
             confidence: crate::session::Confidence::High,
         }];
         chrome

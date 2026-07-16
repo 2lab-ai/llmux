@@ -171,16 +171,52 @@ impl StreamTiming {
     }
 }
 
-/// Whether `payload` carries an Anthropic `content_block_delta` event — the
-/// "first streamed output delta" marker for [`StreamTiming`]. Substring
-/// match: the token appears in the `event:` line and the JSON `type` field of
-/// such events, while the other lifecycle events (`message_start`,
-/// `message_delta`, `content_block_start`/`_stop`, `ping`) never contain it.
-/// Model TEXT could echo the literal string, but only inside a content delta
-/// — which has already latched the timestamp by then.
+/// Whether `payload` carries a NON-EMPTY Anthropic `content_block_delta`
+/// event — the "first streamed output delta" latch for [`StreamTiming`].
+/// Structured check (not a substring scan): each complete SSE event is
+/// identified by its `event:` name line or its JSON `data.type`, and only a
+/// delta whose `text` / `thinking` / `partial_json` value is non-empty
+/// counts — framing, empty deltas, and lifecycle events that merely CONTAIN
+/// the token (e.g. a tool named after it) can never latch. Called only until
+/// the first latch, so the per-event JSON parse is bounded.
 pub fn contains_content_delta(payload: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"content_block_delta";
-    payload.len() >= NEEDLE.len() && payload.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    for chunk in text.split("\n\n") {
+        let mut named_delta = false;
+        let mut data: Option<&str> = None;
+        for line in chunk.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                named_delta = name.trim() == "content_block_delta";
+            } else if let Some(d) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                data = Some(d.trim());
+            }
+        }
+        let Some(data) = data else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let typed_delta =
+            value.get("type").and_then(serde_json::Value::as_str) == Some("content_block_delta");
+        if !(named_delta || typed_delta) {
+            continue;
+        }
+        let non_empty = value.get("delta").is_some_and(|d| {
+            ["text", "thinking", "partial_json"].iter().any(|k| {
+                d.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+            })
+        });
+        if non_empty {
+            return true;
+        }
+    }
+    false
 }
 
 /// Stateful per-request SSE transformer: upstream events in, downstream SSE
@@ -259,11 +295,13 @@ where
                             continue;
                         }
                         // Send FIRST, then observe both buffers.
+                        // Observe timing BEFORE the client send: the latch
+                        // must not absorb client backpressure.
+                        timing.on_payload(&out);
                         if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                             client_gone = true;
                             break 'pump;
                         }
-                        timing.on_payload(&out);
                         capture(&mut captured, &out, capture_limit);
                         raw_captured.push(&out);
                     }
@@ -277,10 +315,10 @@ where
         if let Some(rest) = events.take_remainder() {
             let out = transform.on_event(&rest);
             if !out.is_empty() && !client_gone {
+                timing.on_payload(&out);
                 if tx.send(Ok(Bytes::from(out.clone()))).await.is_err() {
                     client_gone = true;
                 } else {
-                    timing.on_payload(&out);
                     capture(&mut captured, &out, capture_limit);
                     raw_captured.push(&out);
                 }
@@ -451,6 +489,7 @@ where
             }
         }
         if let Some(rest) = events.take_remainder() {
+            timing.on_payload(rest.as_bytes());
             if let Some(observed) = extract_usage(&rest) {
                 usage.add(observed);
             }

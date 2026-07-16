@@ -674,6 +674,8 @@ mod tests {
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: kind.map(str::to_string),
                 excerpt: None,

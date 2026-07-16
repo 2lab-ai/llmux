@@ -234,6 +234,14 @@ struct ForwardContext {
     /// Correlates RequestStarted → Routed → Finished in the activity feed.
     activity_id: u64,
     started: std::time::Instant,
+    /// The instant the SERVED upstream attempt was dispatched (set right
+    /// before each `send_upstream`; retries overwrite it, so the value the
+    /// relay sees belongs to the attempt that actually produced the
+    /// response). TTFB/TTFT are measured from THIS baseline — measuring from
+    /// `started` would fold body buffering, scheduling, token refreshes, and
+    /// 429 parks into a provider metric (review MUST-FIX 7). `None` only on
+    /// pre-dispatch failures, where no timing is emitted anyway.
+    dispatched: Option<std::time::Instant>,
     /// The model named in the request body (for the routing log line).
     model: Option<String>,
     /// The keyless per-client metering identity (`metadata.user_id`) parsed
@@ -356,6 +364,7 @@ impl ForwardContext {
             model,
             account.map(|a| a.0.clone()),
             Some(status.as_u16()),
+            Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             &self.body,
             response,
             state.config.raw_io.max_body_bytes,
@@ -407,8 +416,16 @@ impl ForwardContext {
             model,
             effort,
             fast: Some(fast),
-            ttfb_ms: timing.first_byte.map(|at| ms_since(self.started, at)),
-            ttft_ms: timing.first_content.map(|at| ms_since(self.started, at)),
+            ttfb_ms: self
+                .dispatched
+                .and_then(|d| timing.first_byte.map(|at| ms_since(d, at))),
+            ttft_ms: self
+                .dispatched
+                .and_then(|d| timing.first_content.map(|at| ms_since(d, at))),
+            gen_ms: timing
+                .first_content
+                .map(|fc| ms_since(fc, std::time::Instant::now())),
+            aborted: false,
             user_id: self.user_id.clone(),
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
@@ -718,6 +735,8 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 fast: Some(false),
                 ttfb_ms: None,
                 ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 // Body never read → no metering identity; metered as unknown.
                 user_id: None,
                 kind: None,
@@ -764,6 +783,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         sections: Vec::new(),
         activity_id,
         started,
+        dispatched: None,
         model,
         user_id,
         kind: Some(classified.kind.to_string()),
@@ -1125,6 +1145,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
+        ctx.dispatched = Some(std::time::Instant::now());
         let send_result = send_upstream(state, &endpoint, &upstream_req).await;
 
         let response = match send_result {
@@ -1921,6 +1942,7 @@ async fn relay(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
             group,
             model,
@@ -1958,6 +1980,7 @@ async fn relay(
             raw_io_max_body,
             std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
             move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
+                let upstream_error = error.is_some();
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -1970,6 +1993,7 @@ async fn relay(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(status.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
@@ -2004,8 +2028,12 @@ async fn relay(
                         model,
                         effort,
                         fast: Some(fast),
-                        ttfb_ms: timing.first_byte.map(|at| ms_since(started, at)),
-                        ttft_ms: timing.first_content.map(|at| ms_since(started, at)),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        gen_ms: timing
+                            .first_content
+                            .map(|fc| ms_since(fc, std::time::Instant::now())),
+                        aborted: upstream_error,
                         user_id,
                         kind,
                         excerpt,
@@ -2216,6 +2244,7 @@ async fn relay_translate(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
+        let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
             group,
             model,
@@ -2277,6 +2306,9 @@ async fn relay_translate(
                   converter,
                   client_gone,
                   timing: sse::StreamTiming| {
+                // Provider-health truth: a mid-stream upstream break is a
+                // failure even though the client already holds a 200 header.
+                let upstream_error = error.is_some();
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
@@ -2301,6 +2333,7 @@ async fn relay_translate(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(StatusCode::OK.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
@@ -2351,8 +2384,12 @@ async fn relay_translate(
                         model,
                         effort,
                         fast: Some(fast),
-                        ttfb_ms: timing.first_byte.map(|at| ms_since(started, at)),
-                        ttft_ms: timing.first_content.map(|at| ms_since(started, at)),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        gen_ms: timing
+                            .first_content
+                            .map(|fc| ms_since(fc, std::time::Instant::now())),
+                        aborted: upstream_error,
                         user_id,
                         kind,
                         excerpt,
@@ -2632,6 +2669,7 @@ mod tests {
             sections: Vec::new(),
             activity_id: 0,
             started: std::time::Instant::now(),
+            dispatched: Some(std::time::Instant::now()),
             model: Some(model.to_string()),
             user_id: None,
             kind: None,
