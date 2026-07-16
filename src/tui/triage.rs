@@ -429,6 +429,7 @@ mod tests {
             accounts,
             current: BTreeMap::new(),
             fable_current: BTreeMap::new(),
+            manual_pin: Default::default(),
         }
     }
 
