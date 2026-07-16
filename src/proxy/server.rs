@@ -1616,11 +1616,20 @@ pub struct SettingsRequest {
 /// The `POST /llmux/settings` acknowledgment. TYPED on both sides: the TUI
 /// parses exactly this shape and treats anything else as UNVERIFIED — a
 /// malformed or empty 2xx must never read as a confirmed apply.
+///
+/// `email_anonymous` is the pre-editor wire contract: the Islands client
+/// (llmux-islands-core `client.rs` `UpdateSettings`) requires the response to
+/// echo the current live value and rejects the ack otherwise — it stays
+/// always-serialized. It is `#[serde(default)]` on the parse side only so the
+/// TUI can read acks from a daemon predating the echo... which cannot happen
+/// forward, but keeps the field non-load-bearing for the TUI's verdict.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SettingsAck {
     pub ok: bool,
     pub applied: Vec<String>,
     pub restart_required: Vec<String>,
+    #[serde(default)]
+    pub email_anonymous: bool,
 }
 
 /// One validated settings change, applied to config (read-merge-write) and,
@@ -1910,6 +1919,7 @@ async fn settings_endpoint(
             ok: true,
             applied: applied.iter().map(|s| s.to_string()).collect(),
             restart_required: restart_required.iter().map(|s| s.to_string()).collect(),
+            email_anonymous: state.email_anonymous.load(Ordering::Relaxed),
         })
         .unwrap_or_else(|_| "{\"ok\":true}".into()),
     )
@@ -3829,7 +3839,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["ok"], true);
-        assert_eq!(body["email_anonymous"], true, "ack echoes the new value");
+        assert_eq!(body["applied"][0], "email_anonymous");
+        assert_eq!(
+            body["email_anonymous"], true,
+            "Islands contract: ack echoes the live value"
+        );
 
         // Live effect, no restart (E3).
         assert!(state.email_anonymous.load(Ordering::Relaxed));
