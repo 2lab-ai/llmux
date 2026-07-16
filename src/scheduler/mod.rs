@@ -1366,6 +1366,14 @@ impl AccountPool {
         for account in &mut state.accounts {
             account.paused = paused.contains(&account.id.0);
         }
+        // Pausing a manually pinned account ENDS the pin (issue #122 review
+        // M1): pause is a real operator failure signal, and a merely-blocked
+        // pin would re-grab the account the moment it is resumed inside the
+        // pin window — the resume must hand control back to automatic
+        // scheduling, not to a stale override.
+        state
+            .manual_pin
+            .retain(|_, pin| !paused.contains(&pin.account.0));
     }
 
     /// Apply the per-account ceiling overrides (config `account_limits`) to
@@ -1593,6 +1601,33 @@ mod tests {
             Decision::Switch { to: id("a") },
             "the 429 broke the pin and selection moved on"
         );
+    }
+
+    /// Review M1 (PR #124): PAUSING a pinned account ENDS the pin — a
+    /// resume inside the pin window must hand control back to automatic
+    /// scheduling, not to the stale override.
+    #[test]
+    fn pausing_a_pinned_account_clears_the_pin() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        pool.switch_to(&id("b"), &params(), now()).expect("switch");
+        // Pause b: the pin is hard-blocked AND cleared; the next evaluation
+        // moves off b.
+        pool.apply_paused(&std::collections::BTreeSet::from(["b".to_string()]));
+        assert_eq!(
+            pool.evaluate(None, &params(), now()),
+            Decision::Switch { to: id("a") },
+            "pause benches the pinned account"
+        );
+        // Resume b INSIDE the pin window: with the pin gone, stickiness
+        // keeps the traffic where automatic scheduling put it.
+        pool.apply_paused(&std::collections::BTreeSet::new());
+        assert_eq!(
+            pool.evaluate(None, &params(), now()),
+            Decision::Stay,
+            "resume must NOT re-grab the account through a stale pin"
+        );
+        assert_eq!(snap_legacy(&pool), Some(id("a")));
     }
 
     /// Issue #122: the pin lapses after MANUAL_PIN_DURATION — automatic
