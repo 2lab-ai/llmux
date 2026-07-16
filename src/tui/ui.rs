@@ -9998,6 +9998,99 @@ mod tests {
             to: "2026-01-02".into(),
             content: "banner".into(),
         });
+        // Compile-time exhaustiveness: destructure every schema struct with
+        // NO `..` rest pattern, so adding a field anywhere in the config
+        // schema fails to COMPILE here — forcing this fixture (fill new
+        // Options!) and the COVERED list below to be updated in the same
+        // change. This is what makes the maximal fixture trustworthy: a
+        // future default-None Option cannot silently skip serialization and
+        // dodge the leaf walk.
+        {
+            let crate::config::Config {
+                version: _,
+                proxy,
+                upstream: _,
+                codex,
+                grok,
+                scheduler,
+                routing,
+                pricing: _,
+                raw_io,
+                email_anonymous: _,
+                tui_effects: _,
+                tui_gradient,
+                show_fable_weekly: _,
+                domain_abbrev: _,
+                quota_display: _,
+                paused_accounts: _,
+                account_limits: _,
+                events: _,
+                remote,
+                accounts: _,
+            } = &config;
+            let crate::config::ProxyConfig {
+                port: _,
+                api_key: _,
+                forward_idle_timeout_secs: _,
+                max_request_bytes: _,
+                idle_probe,
+            } = proxy;
+            let crate::config::IdleProbeConfig {
+                enabled: _,
+                per_account_cooldown_secs: _,
+                sweep_secs: _,
+                stale_after_secs: _,
+            } = idle_probe;
+            let crate::config::CodexConfig {
+                upstream: _,
+                token_url: _,
+                default_model: _,
+                client_model: _,
+                fast: _,
+                reasoning_effort: _,
+                trace: _,
+            } = codex;
+            let crate::config::GrokConfig {
+                upstream: _,
+                default_model: _,
+                client_model: _,
+                reasoning_effort: _,
+                trace: _,
+            } = grok;
+            let crate::config::SchedulerConfig {
+                five_hour_max: _,
+                seven_day_max: _,
+                usage_poll_secs: _,
+                usage_max_age_secs: _,
+                refresh_ahead_secs: _,
+                fable_weekly_max: _,
+                mode: _,
+            } = scheduler;
+            let crate::config::RoutingConfig {
+                enabled: _,
+                claude_models: _,
+                codex_models: _,
+                grok_models: _,
+                default_group: _,
+                on_empty_group: _,
+            } = routing;
+            let crate::config::RawIoConfig {
+                enabled: _,
+                retention_days: _,
+                max_body_bytes: _,
+            } = raw_io;
+            let crate::config::TuiGradient {
+                speed: _,
+                claude: _,
+                codex: _,
+                max_effort: _,
+            } = tui_gradient;
+            let crate::config::RemoteConfig {
+                host: _,
+                port: _,
+                api_key: _,
+            } = remote;
+        }
         let config = serde_json::to_value(&config).expect("json");
         let mut paths = Vec::new();
         leaves("", &config, &mut paths);
@@ -10005,12 +10098,12 @@ mod tests {
             paths.iter().any(|p| p == "proxy.api_key"),
             "maximal fixture must surface skip-serialized leaves"
         );
-        // Covering prefixes, each tied to an inventory row (or the dedicated
-        // surface the row names). Keep in sync with `config_rows`.
-        // EXACT leaves (no broad struct prefixes — a NEW field under codex./
-        // grok./scheduler./… must fail here until classified). Collection
-        // fields keep a prefix because their leaf paths embed runtime keys.
-        const COVERED: &[&str] = &[
+        // Keep in sync with `config_rows`. EXACT leaves compared with `==`
+        // ONLY — a prefix comparison here would let a new sibling leaf be
+        // absorbed by an existing name (e.g. `codex.default_model_alias`
+        // vanishing into `codex.default_model`). Runtime-keyed collections
+        // live in COVERED_PREFIX below.
+        const COVERED_EXACT: &[&str] = &[
             "version",
             "proxy.port",
             "proxy.max_request_bytes",
@@ -10046,7 +10139,6 @@ mod tests {
             "routing.grok_models",
             "routing.default_group",
             "routing.on_empty_group",
-            "pricing.",
             "raw_io.enabled",
             "raw_io.retention_days",
             "raw_io.max_body_bytes",
@@ -10057,29 +10149,38 @@ mod tests {
             "tui_gradient.codex",
             "tui_gradient.max_effort",
             "show_fable_weekly",
-            "domain_abbrev.",
             "quota_display",
             "paused_accounts",
-            "account_limits.",
             "events",
             "remote.host",
             "remote.port",
             "remote.api_key",
             "accounts",
         ];
+        // Collections whose leaf paths embed RUNTIME keys (`pricing.<model>.
+        // input`…). The trailing dot bounds the match: `pricing.` can never
+        // absorb a future sibling like `pricing_mode`.
+        const COVERED_PREFIX: &[&str] = &["pricing.", "domain_abbrev.", "account_limits."];
         for path in &paths {
             assert!(
-                COVERED.iter().any(|c| path == c || path.starts_with(c)),
+                COVERED_EXACT.iter().any(|c| path == c)
+                    || COVERED_PREFIX.iter().any(|c| path.starts_with(c)),
                 "schema leaf {path:?} is not classified in the config editor \
                  inventory — add a row (or covering entry) for it"
             );
         }
         // Bidirectional: a COVERED entry matching no leaf is stale coverage
         // (it would silently swallow future leaves under a dead prefix).
-        for c in COVERED {
+        for c in COVERED_EXACT {
             assert!(
-                paths.iter().any(|p| p == c || p.starts_with(c)),
+                paths.iter().any(|p| p == c),
                 "coverage entry {c:?} matches no schema leaf — remove or fix it"
+            );
+        }
+        for c in COVERED_PREFIX {
+            assert!(
+                paths.iter().any(|p| p.starts_with(c)),
+                "coverage prefix {c:?} matches no schema leaf — remove or fix it"
             );
         }
         // And the inventory renders with honest labels.
