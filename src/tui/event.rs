@@ -45,6 +45,11 @@ impl TokenCounts {
 /// `RequestFinished` repeats `method`/`path`/`account` so a finish whose
 /// start was dropped (channel full, TUI attached late) still renders as a
 /// complete log line.
+// RequestFinished dwarfs the other variants by design: nearly every event IS
+// a finish (starts/routes are thin), so boxing the common variant would trade
+// one heap allocation per real event for slack in the rare ones — same
+// reasoning as `CompletedBody`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityEvent {
     /// A client request was accepted; shows as in-flight (spinner) until the
@@ -105,9 +110,37 @@ pub enum ActivityEvent {
         /// when known.
         effort: Option<String>,
         /// Whether codex fast mode (`service_tier: "priority"`) was in effect
-        /// for this request. Always `false` for claude requests and pre-routing
-        /// failures. Additive observability field.
-        fast: bool,
+        /// for this request. `Some(false)` for claude requests and pre-routing
+        /// failures; `None` ONLY for replayed history persisted before the
+        /// field existed ("unknown" — never coerced to off, so legacy lines
+        /// cannot pollute the fast=off statistics).
+        fast: Option<bool>,
+        /// Time to first successful upstream body chunk (TTFB), millis from
+        /// request start. `None` on non-streaming relays, pre-body failures,
+        /// and replayed history persisted before the field existed.
+        ttfb_ms: Option<u64>,
+        /// Time to the first streamed output delta — the first
+        /// `content_block_delta` event (text/thinking/tool alike) observed on
+        /// the downstream-normalized stream — millis from request start.
+        /// NOT a model-internal "first token" claim: hidden reasoning may
+        /// precede it (codex summaries), so throughput derived from it is
+        /// labeled "estimated". `None` when the stream carried no content
+        /// delta, on non-streaming relays, and on pre-field history.
+        /// Baseline for both timing fields = the served attempt's upstream
+        /// dispatch instant (never the client request start).
+        ttft_ms: Option<u64>,
+        /// Stream-side span from the first streamed output delta to the end
+        /// of the upstream stream, millis. This is the "estimated" post-delta
+        /// throughput denominator — measured purely on the stream, so it can
+        /// never mix baselines with the request duration. `None` whenever
+        /// `ttft_ms` is.
+        gen_ms: Option<u64>,
+        /// The upstream stream ABORTED mid-body (transport error after the
+        /// headers). The recorded HTTP status is still what the client got
+        /// (usually 200), so provider error accounting must read this flag —
+        /// a mid-stream break is a provider failure a status filter would
+        /// miss. Client disconnects do NOT set it.
+        aborted: bool,
         /// Keyless per-client attribution identity (issue #32): the
         /// `metadata.user_id` parsed from the request body, when present
         /// (~98.9% of real requests). `None` requests are metered into the

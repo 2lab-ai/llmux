@@ -278,12 +278,53 @@ pub(crate) enum Overlay {
     /// Session timeline (issue #34): persisted raw-io grouped by
     /// `metadata.user_id` into confidence-labeled per-session aggregates.
     Sessions,
+    /// Observed-performance surface (perf telemetry v1): daily
+    /// tokens/sec chart + provider health matrix + per-(model, fast) table.
+    Perf,
     /// Everything-else surface (UI-3 U6 "기타"): keybindings, build info,
     /// daemon facts — the glance answers that fit no other tab.
     Misc,
     /// Read-only config surface (UI-3 U6): the live daemon settings the
     /// dashboard knows (scheduler / codex / display), with their toggles.
     Config,
+}
+
+/// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
+/// timeline default), most tokens (in+out), or most requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SessionSort {
+    #[default]
+    Recent,
+    Tokens,
+    Requests,
+}
+
+impl SessionSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            SessionSort::Recent => SessionSort::Tokens,
+            SessionSort::Tokens => SessionSort::Requests,
+            SessionSort::Requests => SessionSort::Recent,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SessionSort::Recent => "recent",
+            SessionSort::Tokens => "tokens",
+            SessionSort::Requests => "requests",
+        }
+    }
+
+    /// Apply this order to a session list (stable within equal keys).
+    pub(crate) fn apply(self, sessions: &mut [crate::session::Session]) {
+        match self {
+            SessionSort::Recent => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_ms)),
+            SessionSort::Tokens => sessions
+                .sort_by_key(|s| std::cmp::Reverse(s.tokens_in.saturating_add(s.tokens_out))),
+            SessionSort::Requests => sessions.sort_by_key(|s| std::cmp::Reverse(s.requests)),
+        }
+    }
 }
 
 /// Session-local pane-height overrides (UI-3 U7/U8): `None` = the pane's
@@ -335,6 +376,8 @@ pub(crate) struct Chrome {
     pub sessions_pct: u8,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles).
+    pub session_sort: SessionSort,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
@@ -359,6 +402,14 @@ pub(crate) struct Chrome {
     pub menu_account: Option<String>,
     /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
     pub chart_days: u64,
+    /// Perf-overlay chart/table span in days (perf telemetry v1), cycled with
+    /// `d` while the Perf overlay is open.
+    pub perf_days: u64,
+    /// Cursor row in the Perf overlay's series table.
+    pub perf_cursor: usize,
+    /// Selected day for the series table, as an offset back from today
+    /// (`None` = whole-span aggregate; `h`/`l` or ←/→ move it).
+    pub perf_day_off: Option<u64>,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     pub usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
@@ -595,6 +646,8 @@ struct App {
     /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
     /// one rect per tab label. Same record/read cycle as `activity_chrome`.
     tab_chrome: Vec<ui::TabHit>,
+    /// Sessions table hit layout from the last frame (mouse row select).
+    sessions_chrome: Option<ui::SessionsChrome>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
     /// payload-tab rects + top-right action buttons. Same record/read cycle
     /// as `activity_chrome`; empty while the modal is closed.
@@ -606,6 +659,10 @@ struct App {
     pane_heights: PaneHeights,
     /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
     chart_days: u64,
+    /// Perf overlay span (`d` cycles) + series-table cursor + day select.
+    perf_days: u64,
+    perf_cursor: usize,
+    perf_day_off: Option<u64>,
     /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
@@ -650,6 +707,8 @@ struct App {
     sessions_tx: Option<mpsc::Sender<SessionsLoad>>,
     /// Cursor row in the Sessions overlay's session list.
     session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
+    session_sort: SessionSort,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -724,10 +783,14 @@ impl App {
             history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
+            sessions_chrome: None,
             raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
+            perf_days: 14,
+            perf_cursor: 0,
+            perf_day_off: None,
             account_row_chrome: Vec::new(),
             menu_chrome: None,
             menu_anchor: None,
@@ -742,6 +805,7 @@ impl App {
             sessions_pct: 100,
             sessions_tx: None,
             session_cursor: 0,
+            session_sort: SessionSort::default(),
             add_input: String::new(),
             pending_login: None,
             quota_display_override: None,
@@ -947,6 +1011,7 @@ impl App {
             sessions_loading: self.sessions_loading,
             sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
+            session_sort: self.session_sort,
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
@@ -954,6 +1019,9 @@ impl App {
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
             chart_days: self.chart_days,
+            perf_days: self.perf_days,
+            perf_cursor: self.perf_cursor,
+            perf_day_off: self.perf_day_off,
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
             input_modal: self.input_modal.clone(),
@@ -1055,6 +1123,7 @@ impl App {
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
             Overlay::Misc => self.on_key_misc(key.code),
+            Overlay::Perf => self.on_key_perf(key.code, view),
             Overlay::Config => self.on_key_config(key.code),
         }
     }
@@ -1160,6 +1229,37 @@ impl App {
                 MouseEventKind::ScrollDown => {
                     self.on_key_usage(KeyCode::Down, view);
                     return true;
+                }
+                _ => {}
+            }
+        }
+        // Sessions overlay (issue: mouse select): click a row to move the
+        // cursor there (the detail pane follows); wheel scrolls the cursor.
+        if self.overlay == Overlay::Sessions && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_session_cursor(-1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_session_cursor(1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(t) = self.sessions_chrome {
+                        let r = t.rows;
+                        if mouse.row >= r.y
+                            && mouse.row < r.bottom()
+                            && mouse.column >= r.x
+                            && mouse.column < r.right()
+                        {
+                            let idx = t.start + (mouse.row - r.y) as usize;
+                            if idx < self.sessions.len() {
+                                self.session_cursor = idx;
+                            }
+                            return true;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1870,6 +1970,55 @@ impl App {
         }
     }
 
+    /// Key handling for the Perf overlay (`p`, perf telemetry v1): `d`
+    /// cycles the day span, arrows/`j`/`k` move the series cursor, `p`/`Esc`
+    /// closes, `q` quits.
+    fn on_key_perf(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let rows = view
+            .map(|v| ui::perf_series_count(v, self.perf_days, self.perf_day_off))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('p') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.perf_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.perf_days = spans[next];
+                self.perf_cursor = 0;
+                self.perf_day_off = None;
+            }
+            // Day drill-down (contract C5: per-day model×fast detail):
+            // ←/h walks back a day, →/l walks forward; walking past today
+            // returns to the whole-span aggregate.
+            KeyCode::Left | KeyCode::Char('h') => {
+                let max_off = self.perf_days.saturating_sub(1);
+                self.perf_day_off = Some(match self.perf_day_off {
+                    None => 0,
+                    Some(off) => (off + 1).min(max_off),
+                });
+                self.perf_cursor = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.perf_day_off = match self.perf_day_off {
+                    None | Some(0) => None,
+                    Some(off) => Some(off - 1),
+                };
+                self.perf_cursor = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.perf_cursor = self.perf_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.perf_cursor = (self.perf_cursor + 1).min(rows.saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
     /// Key handling for the Misc overlay (`?`, UI-3 U6). `?`/`Esc` closes.
     fn on_key_misc(&mut self, code: KeyCode) {
         match code {
@@ -1961,6 +2110,13 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('s') | KeyCode::Esc => self.overlay = Overlay::None,
+            // Sort cycle (recent → tokens → requests); cursor resets so the
+            // selection follows the ORDER, not a stale index.
+            KeyCode::Char('o') => {
+                self.session_sort = self.session_sort.next();
+                self.session_sort.apply(&mut self.sessions);
+                self.session_cursor = 0;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_session_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_session_cursor(1, len),
             KeyCode::PageUp => self.move_session_cursor(-10, len),
@@ -2025,6 +2181,8 @@ impl App {
             KeyCode::Char('a') => self.overlay = Overlay::Accounts,
             KeyCode::Char('g') => self.open_stats(view),
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
+            // Observed performance (perf telemetry v1): daily tok/s + health.
+            KeyCode::Char('p') => self.overlay = Overlay::Perf,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
             // Calendar usage table (usage-stats): hourly/daily/monthly × model
@@ -3242,6 +3400,9 @@ async fn event_loop(
             // read progress instead of appearing all-at-once at the end.
             Some(load) = sess_rx.recv() => {
                 app.sessions = load.sessions;
+                // Deliveries arrive in fold order — re-apply the user's sort
+                // so a mid-load `o` press survives the next partial.
+                app.session_sort.apply(&mut app.sessions);
                 app.sessions_pct = load.pct;
                 app.sessions_loading = !load.done;
                 true
@@ -3344,6 +3505,7 @@ async fn event_loop(
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
+            app.sessions_chrome = main.sessions_table;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
@@ -4123,6 +4285,43 @@ mod tests {
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
     #[test]
+    fn session_sort_cycles_and_reorders() {
+        let mut app = remote_app();
+        let sess =
+            |uid: &str, last_ms: u64, tokens_out: u64, requests: u64| crate::session::Session {
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
+                user_id: Some(uid.into()),
+                requests,
+                tokens_in: 0,
+                tokens_out,
+                models: Vec::new(),
+                accounts: Vec::new(),
+                account_rotations: 0,
+                first_ms: 0,
+                last_ms,
+                confidence: crate::session::Confidence::High,
+            };
+        // recent order: b (newest) first; tokens order: c; requests order: a.
+        app.sessions = vec![
+            sess("a", 10, 5, 9),
+            sess("b", 30, 1, 1),
+            sess("c", 20, 99, 2),
+        ];
+        app.session_sort.apply(&mut app.sessions);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("b"), "recent");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Tokens);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("c"), "tokens");
+        assert_eq!(app.session_cursor, 0, "cursor resets with the order");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
+    #[test]
     fn misc_and_config_keys_round_trip() {
         let mut app = remote_app();
         app.on_key_main(KeyCode::Char('?'), None);
@@ -4178,6 +4377,9 @@ mod tests {
             account_rotations: 0,
             first_ms: 0,
             last_ms: 0,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
             confidence: Confidence::High,
         };
         let mut app = remote_app();
@@ -4703,7 +4905,11 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-opus-4-8".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
@@ -4920,7 +5126,11 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-fable-5".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("count".into()),
                 excerpt: None,
@@ -5025,7 +5235,11 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-opus-4-8".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 // Non-`count` kind → every entry renders 1:1 (no folding), so
                 // render row k maps to `completed[k]`.
@@ -5123,7 +5337,11 @@ mod tests {
                 group: Some("claude".into()),
                 model: Some("claude-opus-4-8".into()),
                 effort: None,
-                fast: false,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
@@ -5222,6 +5440,7 @@ mod tests {
             version: "llmux 0.0 (test)".into(),
             grok: Default::default(),
             daily_usage: Vec::new(),
+            daily_perf: Vec::new(),
             usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
