@@ -2406,41 +2406,33 @@ impl App {
         let quota_changed = req.quota_display.is_some();
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                if quota_changed {
-                    self.quota_display_override = None;
-                }
-                match response.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        let names = |key: &str| -> Vec<String> {
-                            body[key]
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|v| v.as_str().map(str::to_string))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        };
-                        let applied: Vec<String> = names("applied");
-                        let restart: Vec<String> = names("restart_required");
-                        // Pin the pending-restart note only once the daemon
-                        // CONFIRMED the save (attach parity with local).
+                // TYPED ack, parsed BEFORE any local state changes: a
+                // malformed / empty / ok=false 2xx is UNVERIFIED — neither
+                // the quota override nor the pending-restart map may move
+                // on an unconfirmed apply (review MUST-FIX).
+                match response.json::<crate::proxy::server::SettingsAck>().await {
+                    Ok(ack) if ack.ok => {
+                        if quota_changed {
+                            self.quota_display_override = None;
+                        }
                         if let Some((action, value)) = origin {
-                            if restart.is_empty() {
+                            if ack.restart_required.is_empty() {
                                 self.config_saved.remove(&action);
                             } else {
                                 self.config_saved.insert(action, value);
                             }
                         }
                         settings_status(
-                            &applied.iter().map(String::as_str).collect::<Vec<_>>(),
-                            &restart.iter().map(String::as_str).collect::<Vec<_>>(),
+                            &ack.applied.iter().map(String::as_str).collect::<Vec<_>>(),
+                            &ack.restart_required
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
                         )
                     }
-                    // A 2xx whose body we could not read is NOT a verified
-                    // apply — never claim plain success for it.
-                    Err(_) => "config: accepted by daemon, but the response was unreadable — \
-                         verify the value in the config tab"
+                    Ok(_) => "config change failed: daemon reported ok=false".into(),
+                    Err(_) => "config: accepted by daemon, but the ack was unreadable — \
+                               verify the value in the config tab (nothing assumed)"
                         .into(),
                 }
             }
