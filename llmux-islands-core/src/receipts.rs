@@ -101,7 +101,10 @@ pub(crate) fn from_activity_with_account_privacy(
                     provider: group.as_deref().map(Provider::from_group),
                     model: model.as_deref().map(sanitize_text),
                     effort: effort.as_deref().map(sanitize_text),
-                    fast: *fast,
+                    // Display-only surface: unknown (pre-field) history renders
+                    // as not-fast here; the three-state truth lives in the perf
+                    // stats, not the receipt badge.
+                    fast: fast.unwrap_or(false),
                     tokens: tokens.as_ref().map(|counts| ReceiptTokens {
                         input: counts.input,
                         output: counts.output,
