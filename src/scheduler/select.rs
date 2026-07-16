@@ -470,8 +470,18 @@ pub fn pick_scoped(
             .min_by(|a, b| fable_ranked(a, b, params, group, now));
         let chosen = match (anchor, best) {
             (Some(anchor), Some(best)) => {
+                // A COLD challenger can never be "clearly better" (review
+                // M2): with no live Fable window it scores a phantom FULL
+                // bucket at urgency 1.0, which would out-score a half-used
+                // far-reset anchor — hunting an evidence-free account splits
+                // prompt-cache locality for nothing. Cold is a valid ANCHOR
+                // (seed/stay) and a valid fallback when the anchor is
+                // ineligible, but a proactive switch requires live evidence.
+                let best_has_live_evidence =
+                    live_reset(&best.fable_weekly().map(|s| s.window), now).is_some();
                 let clearly_better = params.mode != crate::config::SchedulerMode::RoundRobin
                     && best.id != anchor.id
+                    && best_has_live_evidence
                     && fable_score(best, params, now)
                         > fable_score(anchor, params, now) * (1.0 + SWITCH_MARGIN);
                 if clearly_better {
@@ -2736,6 +2746,36 @@ mod tests {
         assert_eq!(
             pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
             Decision::Stay
+        );
+    }
+
+    /// Review M2 (PR #124): a COLD challenger must never hunt a known
+    /// anchor — no live Fable window means a phantom full bucket, not
+    /// evidence. The half-used far-reset anchor stays.
+    #[test]
+    fn fable_lane_never_hunts_a_cold_challenger_over_a_known_anchor() {
+        // Anchor: known mid-utilization, long runway (score ≈ 0.56).
+        let anchor = fable_bucket("anchor", 0.50, 6 * 24 * HOUR);
+        // Challenger: fable-COLD (phantom full headroom, score ≈ 0.9+).
+        let cold = account("cold");
+        let mut snap = pool(vec![anchor, cold], Some("anchor"));
+        snap.fable_current
+            .insert(BackendGroup::Claude, id("anchor"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Stay,
+            "cold is held by anchoring, never hunted"
+        );
+        // A KNOWN soon-resetting challenger still wins (the M2 guard must
+        // not disable real perishability evidence).
+        let anchor = fable_bucket("anchor", 0.50, 6 * 24 * HOUR);
+        let soon = fable_bucket("soon", 0.0, 3 * HOUR);
+        let mut snap = pool(vec![anchor, soon], Some("anchor"));
+        snap.fable_current
+            .insert(BackendGroup::Claude, id("anchor"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("soon") }
         );
     }
 
