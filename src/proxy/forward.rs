@@ -329,7 +329,11 @@ impl ForwardContext {
     /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
     /// and no record is built — so capture is genuinely off the hot path.
     fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
-        if state.config.raw_io.enabled {
+        if state
+            .settings_live
+            .raw_io_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             state.raw_io_path.as_deref()
         } else {
             None
@@ -756,7 +760,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
     // pattern; rides the RequestFinished event for the activity feed.
     let classified = crate::proxy::classify::classify(&path_query, &body);
-    let group = if state.config.routing.enabled {
+    let group = if state
+        .settings_live
+        .routing_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         Some(state.classifier.classify(model.as_deref()))
     } else {
         None
@@ -3313,7 +3321,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let raw_path = dir.join("raw-io.jsonl");
         state.raw_io_path = Some(raw_path.clone());
+        // The capture gate reads the LIVE holder (config-editor v1), seeded
+        // from config at boot — flip the holder like a runtime toggle would.
         state.config.raw_io.enabled = false;
+        state
+            .settings_live
+            .raw_io_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let response = forward(&state, client_request("{}")).await;
         assert_eq!(response.status(), StatusCode::OK);
