@@ -1,5 +1,7 @@
 # Configuration
 
+> Most settings are editable live from the TUI's `config` tab (see [operational-reference](operational-reference.md)); rows marked `restart` there persist here and apply on the next daemon start.
+
 llmux stores local configuration at `~/.config/llmux.json` by default. It respects `$XDG_CONFIG_HOME`, and `$LLMUX_CONFIG` can point at a different file.
 
 The config file is written with mode `0600`. Updates use atomic read-merge-write so the daemon and CLI can safely change different parts of the config while llmux is running.

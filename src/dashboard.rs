@@ -527,6 +527,9 @@ pub struct DashboardDoc {
     /// `skip_serializing_if` keeps it off the wire with no history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_perf: Vec<DailyPerfDoc>,
+    /// Config-editor facts (additive: defaults on older daemons).
+    #[serde(default)]
+    pub config_facts: ConfigFactsDoc,
     /// Usage-tab calendar rows (usage-stats): every granularity flattened,
     /// newest bucket first, cost priced server-side (T6 — the attach client
     /// has no pricing overrides). Additive: absent from an older daemon →
@@ -686,6 +689,66 @@ pub struct DailyUsageDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+}
+
+/// Config facts the TUI config editor renders that ride no other doc field
+/// (config-editor v1, additive). Live-holder-backed values report the
+/// EFFECTIVE state; restart-only values report the boot snapshot — after an
+/// edit the daemon keeps running on the old value, and the editor labels the
+/// row "restart required" instead of pretending it applied.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigFactsDoc {
+    #[serde(default)]
+    pub routing_enabled: bool,
+    #[serde(default)]
+    pub routing_default_group: String,
+    #[serde(default)]
+    pub routing_on_empty_group: String,
+    #[serde(default)]
+    pub raw_io_enabled: bool,
+    #[serde(default)]
+    pub raw_io_retention_days: u64,
+    #[serde(default)]
+    pub raw_io_max_body_bytes: u64,
+    #[serde(default)]
+    pub gradient_speed: f32,
+    #[serde(default)]
+    pub codex_upstream: String,
+    #[serde(default)]
+    pub proxy_max_request_bytes: u64,
+    /// On-disk sizes of the persistence files (bytes), refreshed at most
+    /// every 30s (never per frame — the misc tab reads these). `None` = file
+    /// absent or stat failed.
+    #[serde(default)]
+    pub raw_io_bytes: Option<u64>,
+    #[serde(default)]
+    pub activity_log_bytes: Option<u64>,
+}
+
+/// 30s-TTL cache for the persistence-file sizes shown on the misc tab — a
+/// stat per render frame would be wasteful; staleness up to the TTL is fine
+/// for a glance fact.
+fn persist_file_sizes(
+    raw_io: Option<&std::path::Path>,
+    activity: Option<&std::path::Path>,
+) -> (Option<u64>, Option<u64>) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    type SizesAt = (Instant, Option<u64>, Option<u64>);
+    static CACHE: Mutex<Option<SizesAt>> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, raw, act)) = *cache {
+        if at.elapsed() < std::time::Duration::from_secs(30) {
+            return (raw, act);
+        }
+    }
+    let stat =
+        |p: Option<&std::path::Path>| p.and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    let fresh = (stat(raw_io), stat(activity));
+    *cache = Some((Instant::now(), fresh.0, fresh.1));
+    fresh
 }
 
 /// One (day, group, model, fast) row of the observed-performance stats
@@ -1267,6 +1330,8 @@ pub struct DocMeta {
     /// [`crate::proxy::server::AppState::event_banners`] holder. See
     /// [`DashboardDoc::events`].
     pub events: Vec<crate::config::EventBanner>,
+    /// Config-editor facts (see [`ConfigFactsDoc`]).
+    pub config_facts: ConfigFactsDoc,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1743,6 +1808,7 @@ pub(crate) fn dashboard_doc(
             .map(|(group, id)| (group.as_str().to_string(), id.0.clone()))
             .collect(),
         upstream: meta.upstream.clone(),
+        config_facts: meta.config_facts.clone(),
         config_path: meta.config_path.clone(),
         select_params: SelectParamsDoc::from(params),
         refresh_ahead_secs: meta.refresh_ahead_secs,
@@ -1817,6 +1883,33 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(std::sync::atomic::Ordering::Relaxed),
         upstream: state.config.upstream.clone(),
+        config_facts: ConfigFactsDoc {
+            routing_enabled: state
+                .settings_live
+                .routing_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            routing_default_group: state.config.routing.default_group.clone(),
+            routing_on_empty_group: state.config.routing.on_empty_group.clone(),
+            raw_io_enabled: state
+                .settings_live
+                .raw_io_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            raw_io_retention_days: state.config.raw_io.retention_days,
+            raw_io_max_body_bytes: state.config.raw_io.max_body_bytes as u64,
+            gradient_speed: state.config.tui_gradient.speed,
+            codex_upstream: state.config.codex.upstream.clone(),
+            proxy_max_request_bytes: state.config.proxy.max_request_bytes as u64,
+            raw_io_bytes: persist_file_sizes(
+                state.raw_io_path.as_deref(),
+                state.activity_log_path.as_deref(),
+            )
+            .0,
+            activity_log_bytes: persist_file_sizes(
+                state.raw_io_path.as_deref(),
+                state.activity_log_path.as_deref(),
+            )
+            .1,
+        },
         config_path: state.config_path.as_ref().map(|p| p.display().to_string()),
         refresh_ahead_secs: state.config.scheduler.refresh_ahead_secs,
         evaluate_tick_secs: EVALUATE_TICK.as_secs(),
@@ -1847,16 +1940,22 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             .load(std::sync::atomic::Ordering::Relaxed),
         // Config-file display gate, same convention as show_fable_weekly: no
         // runtime toggle / endpoint, so read the loaded config snapshot.
-        tui_effects: state.config.tui_effects,
+        tui_effects: state
+            .settings_live
+            .tui_effects
+            .load(std::sync::atomic::Ordering::Relaxed),
         tui_gradient: state.config.tui_gradient.clone(),
         // Config-file gate (fable-usage U9a). No runtime toggle / endpoint by
         // design — a default-ON config field is the whole TUI-side ask — so
         // this reads the loaded config snapshot directly.
-        show_fable_weekly: state.config.show_fable_weekly,
+        show_fable_weekly: state
+            .settings_live
+            .show_fable_weekly
+            .load(std::sync::atomic::Ordering::Relaxed),
         // Config-file display settings, same convention as show_fable_weekly:
         // no runtime endpoint; the TUI `u` key overrides quota_display locally.
         domain_abbrev: state.config.domain_abbrev.clone(),
-        quota_display: state.config.quota_display,
+        quota_display: state.settings_live.quota_display(),
         // Live event holder, not the config snapshot: a `POST /llmux/events`
         // must reflect on the very next frame/poll without restart.
         events: state
@@ -1952,6 +2051,7 @@ mod tests {
             uptime_secs: 130,
             port: 3456,
             upstream: "https://api.anthropic.com".into(),
+            config_facts: Default::default(),
             config_path: Some("/tmp/llmux.json".into()),
             refresh_ahead_secs: 7 * 3600,
             evaluate_tick_secs: 60,

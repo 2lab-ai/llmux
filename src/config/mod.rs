@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, CodexConfig, Config, EventBanner, IdleProbeConfig, ProxyConfig, QuotaDisplay,
-    RawIoConfig, RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
-    DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
+    AccountLimits, CodexConfig, Config, EventBanner, GrokConfig, IdleProbeConfig, ProxyConfig,
+    QuotaDisplay, RawIoConfig, RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode,
+    TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT,
+    DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
@@ -35,6 +36,8 @@ pub enum ConfigError {
     UnsupportedVersion(u32),
     #[error("could not determine config directory")]
     NoConfigDir,
+    #[error("no config path — persistence unavailable")]
+    PersistenceUnavailable,
     #[error("invalid import data: {0}")]
     Invalid(String),
 }
@@ -297,7 +300,7 @@ where
     Ok(config)
 }
 
-/// Generate a proxy api key: `ta-` + 32 random bytes, base64url (no pad).
+/// Generate a proxy api key: `lm-` + 32 random bytes, base64url (no pad).
 pub fn generate_api_key() -> String {
     use base64::Engine as _;
     format!(

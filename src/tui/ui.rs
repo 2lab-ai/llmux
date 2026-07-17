@@ -225,7 +225,7 @@ pub(crate) fn draw(
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome),
+        Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -414,6 +414,7 @@ fn draw_main(
         account_rows,
         menu,
         sessions_table: None,
+        config_rows: Vec::new(),
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
@@ -2001,14 +2002,28 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             Span::raw(what),
         ])
     };
+    let bytes = |b: Option<u64>| match b {
+        Some(b) => format!("{}B", format::human_count(b)),
+        None => "—".into(),
+    };
+    let f = &view.config_facts;
     let lines = vec![
         Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
-        key("a g l s", "accounts / stats / logs / sessions"),
-        key("? c", "this surface / config"),
-        key("click", "tabs switch · activity row expands"),
-        key("wheel", "activity history"),
+        key(
+            "a g U p l s",
+            "accounts / stats / usage / perf / logs / sessions",
+        ),
+        key("? c", "this surface / config editor"),
+        key(
+            "click",
+            "tabs switch · activity row expands · config value edits · session selects",
+        ),
+        key("wheel", "activity history · overlay cursors"),
         key("f m e", "codex fast / model / effort"),
         key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("o d", "sessions sort · perf/stats span"),
+        key("h l", "perf day drill-down (←/→)"),
+        key("j k ⏎ y/n", "config editor: cursor · activate · confirm"),
         key("q Esc", "quit / back to dashboard"),
         Line::default(),
         Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
@@ -2019,106 +2034,643 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             view.port,
             format::countdown(view.uptime)
         ))),
+        Line::default(),
+        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw(format!(
+            "   config {}",
+            view.config_path.clone().unwrap_or_else(|| "—".into())
+        ))),
+        Line::from(Span::raw(format!(
+            "   accounts {} · raw-io {} ({}) · activity log {}",
+            view.snapshot.accounts.len(),
+            if f.raw_io_enabled { "on" } else { "off" },
+            bytes(f.raw_io_bytes),
+            bytes(f.activity_log_bytes),
+        ))),
     ];
     let block = Block::new().borders(Borders::TOP).title(" misc ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Config overlay (`c`, UI-3 U6): the live daemon settings the dashboard
-/// document carries, each annotated with the key/surface that changes it.
-/// Read-only projection — mutations go through the same paths as always.
-fn draw_config_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
-    frame.render_widget(Clear, area);
-    let row = |label: &'static str, value: String, hint: &'static str| {
-        Line::from(vec![
-            Span::styled(format!(" {label:<16}"), dim()),
-            Span::raw(value),
-            Span::styled(format!("   {hint}"), dim()),
-        ])
-    };
+/// One editable (or honestly-labeled read-only) config row's action
+/// (config-editor v1, trinity contract C6). `Copy` so it rides `Mode` and
+/// the hit list without allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ConfigAction {
+    SchedMode,
+    Ceiling5h,
+    Ceiling7d,
+    CeilingFbl,
+    UsageMaxAge,
+    CodexModel,
+    CodexEffort,
+    CodexFast,
+    GrokEffort,
+    EmailMask,
+    QuotaFill,
+    ResetDisplay,
+    TuiEffects,
+    FableWeekly,
+    GradientSpeed,
+    RoutingEnabled,
+    RoutingDefaultGroup,
+    RoutingOnEmptyGroup,
+    RawIoEnabled,
+    RawIoRetention,
+    RawIoMaxBody,
+    Upstream,
+    CodexUpstream,
+    ProxyPort,
+    ProxyMaxBody,
+}
+
+impl ConfigAction {
+    /// Whether activating this row needs the y/n confirm step (blast-radius
+    /// rule, not input-type rule): live traffic routing / scheduler policy /
+    /// capture gate / upstream endpoints.
+    pub(crate) fn needs_confirm(self) -> bool {
+        matches!(
+            self,
+            ConfigAction::SchedMode
+                | ConfigAction::RoutingEnabled
+                | ConfigAction::RawIoEnabled
+                | ConfigAction::Upstream
+                | ConfigAction::CodexUpstream
+        )
+    }
+
+    /// Input hint for the edit prompt (`None` = toggle/cycle, no text entry).
+    pub(crate) fn input_hint(self) -> Option<&'static str> {
+        match self {
+            ConfigAction::Ceiling5h | ConfigAction::Ceiling7d | ConfigAction::CeilingFbl => {
+                Some("percent 0-100")
+            }
+            ConfigAction::UsageMaxAge => Some("seconds 5-3600"),
+            ConfigAction::GradientSpeed => Some("0.01-10.0"),
+            ConfigAction::RoutingDefaultGroup => Some("claude | codex | grok"),
+            ConfigAction::RoutingOnEmptyGroup => Some("error | fallback"),
+            ConfigAction::RawIoRetention => Some("days 0-3650 (0 = keep forever)"),
+            ConfigAction::RawIoMaxBody | ConfigAction::ProxyMaxBody => Some("bytes"),
+            ConfigAction::Upstream | ConfigAction::CodexUpstream => Some("https://…"),
+            ConfigAction::ProxyPort => Some("port 1-65535"),
+            _ => None,
+        }
+    }
+}
+
+/// One clickable config value cell (config-editor v1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConfigHit {
+    pub area: Rect,
+    pub row: usize,
+    pub action: ConfigAction,
+}
+
+/// How a config row applies (trinity contract C6 3-state honesty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfgState {
+    /// Applies immediately (a live holder or an existing live path).
+    Live,
+    /// Persisted now, effective on the next daemon start.
+    Restart,
+    /// This TUI session only (not persisted).
+    Session,
+    /// Not editable here — the note says where/why.
+    ReadOnly,
+}
+
+/// One rendered config row: `None` action = read-only (note explains).
+struct CfgRow {
+    section: &'static str,
+    label: &'static str,
+    value: String,
+    state: CfgState,
+    note: &'static str,
+    action: Option<ConfigAction>,
+}
+
+/// Build the FULL config inventory (trinity contract C6: the acceptance
+/// denominator is the whole `config/schema.rs`, not the rows we felt like
+/// showing) — every top-level field appears here as editable, session,
+/// restart-required, or read-only-with-reason.
+fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
     let p = &view.select_params;
+    let f = &view.config_facts;
     let quota = chrome.quota_display_override.unwrap_or(view.quota_display);
-    let lines = vec![
-        Line::from(Span::styled(
-            " scheduler",
-            dim().add_modifier(Modifier::BOLD),
-        )),
-        row("mode", p.mode.label().to_string(), "[S]"),
-        row(
-            "ceilings",
-            format!(
-                "5h {:.0}% · 7d {:.0}% · fbl {:.0}%",
-                p.five_hour_max * 100.0,
-                p.seven_day_max * 100.0,
-                p.fable_weekly_max * 100.0
-            ),
-            "config / [L] per-account",
-        ),
-        row(
-            "usage max age",
-            format!("{}s", p.usage_max_age.as_secs()),
-            "config",
-        ),
-        Line::default(),
-        Line::from(Span::styled(" codex", dim().add_modifier(Modifier::BOLD))),
-        row(
-            "model",
-            view.codex.model.clone(),
-            "[m] cycle · groups bar click",
-        ),
-        row(
-            "effort",
-            view.codex
+    let pct = |v: f64| format!("{:.0}%", v * 100.0);
+    let onoff = |v: bool| if v { "on" } else { "off" }.to_string();
+    vec![
+        CfgRow {
+            section: "scheduler",
+            label: "mode",
+            value: p.mode.label().to_string(),
+            state: CfgState::Live,
+            note: "confirm",
+            action: Some(ConfigAction::SchedMode),
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "5h ceiling",
+            value: pct(p.five_hour_max),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::Ceiling5h),
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "7d ceiling",
+            value: pct(p.seven_day_max),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::Ceiling7d),
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "fbl ceiling",
+            value: pct(p.fable_weekly_max),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::CeilingFbl),
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "usage max age",
+            value: format!("{}s", p.usage_max_age.as_secs()),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::UsageMaxAge),
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "per-account limits",
+            value: "per account".into(),
+            state: CfgState::ReadOnly,
+            note: "accounts tab [L]",
+            action: None,
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "paused accounts",
+            value: "per account".into(),
+            state: CfgState::ReadOnly,
+            note: "accounts tab / context menu",
+            action: None,
+        },
+        CfgRow {
+            section: "codex",
+            label: "model",
+            value: view.codex.model.clone(),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::CodexModel),
+        },
+        CfgRow {
+            section: "codex",
+            label: "effort",
+            value: view
+                .codex
                 .effort
                 .clone()
                 .unwrap_or_else(|| "bypass (client)".into()),
-            "[e] cycle",
-        ),
-        row(
-            "fast",
-            if view.codex.fast { "on" } else { "off" }.into(),
-            "[f] toggle",
-        ),
-        Line::default(),
-        Line::from(Span::styled(" display", dim().add_modifier(Modifier::BOLD))),
-        row(
-            "quota fill",
-            match quota {
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::CodexEffort),
+        },
+        CfgRow {
+            section: "codex",
+            label: "fast",
+            value: onoff(view.codex.fast),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::CodexFast),
+        },
+        CfgRow {
+            section: "codex",
+            label: "codex upstream",
+            value: f.codex_upstream.clone(),
+            state: CfgState::Restart,
+            note: "confirm",
+            action: Some(ConfigAction::CodexUpstream),
+        },
+        CfgRow {
+            section: "codex",
+            label: "token url / client model / trace",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "codex.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
+            section: "grok",
+            label: "effort",
+            value: view
+                .grok
+                .effort
+                .clone()
+                .unwrap_or_else(|| "bypass (client)".into()),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::GrokEffort),
+        },
+        CfgRow {
+            section: "grok",
+            label: "upstream / model / trace",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "grok.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
+            section: "display",
+            label: "quota fill",
+            value: match quota {
                 crate::config::QuotaDisplay::Used => "used%".into(),
                 crate::config::QuotaDisplay::Remaining => "remaining%".into(),
             },
-            "[u]",
-        ),
-        row(
-            "reset display",
-            if chrome.reset_absolute {
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::QuotaFill),
+        },
+        CfgRow {
+            section: "display",
+            label: "reset display",
+            value: if chrome.reset_absolute {
                 "absolute UTC"
             } else {
                 "countdown"
             }
             .into(),
-            "[t]",
-        ),
-        row(
-            "email mask",
-            if view.email_anonymous { "on" } else { "off" }.into(),
-            "config email_anonymous",
-        ),
-        Line::default(),
-        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
-        row(
-            "upstream",
-            view.upstream.clone().unwrap_or_else(|| "—".into()),
-            "config",
-        ),
-        row(
-            "config path",
-            view.config_path.clone().unwrap_or_else(|| "—".into()),
-            "[R] reload (local)",
-        ),
-    ];
-    let block = Block::new().borders(Borders::TOP).title(" config ");
+            state: CfgState::Session,
+            note: "",
+            action: Some(ConfigAction::ResetDisplay),
+        },
+        CfgRow {
+            section: "display",
+            label: "email mask",
+            value: onoff(view.email_anonymous),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::EmailMask),
+        },
+        CfgRow {
+            section: "display",
+            label: "tui effects",
+            value: onoff(view.tui_effects),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::TuiEffects),
+        },
+        CfgRow {
+            section: "display",
+            label: "fable weekly gauge",
+            value: onoff(view.show_fable_weekly),
+            state: CfgState::Live,
+            note: "",
+            action: Some(ConfigAction::FableWeekly),
+        },
+        CfgRow {
+            section: "display",
+            label: "gradient speed",
+            value: format!("{:.2}", f.gradient_speed),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::GradientSpeed),
+        },
+        CfgRow {
+            section: "display",
+            label: "gradient colors",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "tui_gradient in config",
+            action: None,
+        },
+        CfgRow {
+            section: "display",
+            label: "domain abbrev",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "domain_abbrev map in config",
+            action: None,
+        },
+        CfgRow {
+            section: "routing",
+            label: "enabled",
+            value: onoff(f.routing_enabled),
+            state: CfgState::Live,
+            note: "confirm — reroutes live traffic",
+            action: Some(ConfigAction::RoutingEnabled),
+        },
+        CfgRow {
+            section: "routing",
+            label: "default group",
+            value: f.routing_default_group.clone(),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::RoutingDefaultGroup),
+        },
+        CfgRow {
+            section: "routing",
+            label: "on empty group",
+            value: f.routing_on_empty_group.clone(),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::RoutingOnEmptyGroup),
+        },
+        CfgRow {
+            section: "routing",
+            label: "model lists",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "routing.*_models in config",
+            action: None,
+        },
+        CfgRow {
+            section: "raw-io",
+            label: "capture",
+            value: onoff(f.raw_io_enabled),
+            state: CfgState::Live,
+            note: "confirm — writes request/response payloads to disk",
+            action: Some(ConfigAction::RawIoEnabled),
+        },
+        CfgRow {
+            section: "raw-io",
+            label: "retention",
+            value: format!("{}d", f.raw_io_retention_days),
+            state: CfgState::Restart,
+            note: "decrease deletes history",
+            action: Some(ConfigAction::RawIoRetention),
+        },
+        CfgRow {
+            section: "raw-io",
+            label: "max body bytes",
+            value: format::human_count(f.raw_io_max_body_bytes),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::RawIoMaxBody),
+        },
+        CfgRow {
+            section: "daemon",
+            label: "upstream",
+            value: view.upstream.clone().unwrap_or_else(|| "—".into()),
+            state: CfgState::Restart,
+            note: "confirm",
+            action: Some(ConfigAction::Upstream),
+        },
+        CfgRow {
+            section: "daemon",
+            label: "port",
+            value: view.port.to_string(),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::ProxyPort),
+        },
+        CfgRow {
+            section: "daemon",
+            label: "max request bytes",
+            value: format::human_count(f.proxy_max_request_bytes),
+            state: CfgState::Restart,
+            note: "",
+            action: Some(ConfigAction::ProxyMaxBody),
+        },
+        CfgRow {
+            section: "daemon",
+            label: "proxy api key",
+            value: "•••".into(),
+            state: CfgState::ReadOnly,
+            note: "secret (lm-… key)",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "idle timeout / idle probe",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "proxy.forward_idle_timeout_secs · proxy.idle_probe.*",
+            action: None,
+        },
+        CfgRow {
+            section: "scheduler",
+            label: "poll / refresh-ahead",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "scheduler.usage_poll_secs · refresh_ahead_secs",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "schema version",
+            value: "derived".into(),
+            state: CfgState::ReadOnly,
+            note: "config version field",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "accounts",
+            value: format!("{} configured", view.snapshot.accounts.len()),
+            state: CfgState::ReadOnly,
+            note: "accounts tab (a)",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "events",
+            value: format!("{} banner(s)", view.events.len()),
+            state: CfgState::ReadOnly,
+            note: "POST /llmux/events",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "pricing overrides",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "pricing map in config",
+            action: None,
+        },
+        CfgRow {
+            section: "daemon",
+            label: "remote",
+            value: "client-side".into(),
+            state: CfgState::ReadOnly,
+            note: "CLI-only; api_key is secret",
+            action: None,
+        },
+    ]
+}
+
+/// Number of rows the config editor shows — the key handler clamps its
+/// cursor with this (rows are static per view shape).
+pub(crate) fn config_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
+    config_rows(view, chrome).len()
+}
+
+/// The action on config row `idx`, if that row is editable.
+pub(crate) fn config_row_action(
+    view: &DashboardView,
+    chrome: &Chrome,
+    idx: usize,
+) -> Option<ConfigAction> {
+    config_rows(view, chrome).get(idx).and_then(|r| r.action)
+}
+
+/// Config overlay (`c`) — the config EDITOR (config-editor v1, trinity
+/// contract C6): every schema field listed with an honest apply-state label;
+/// editable rows activate on Enter or a click on the value cell. `live` =
+/// applies now (holder-backed), `restart` = persisted, effective next start,
+/// `session` = this TUI only, read-only rows say where the value is managed.
+fn draw_config_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+    hits: &mut Option<MainChrome>,
+) {
+    frame.render_widget(Clear, area);
+    let rows = config_rows(view, chrome);
+    let cursor = chrome.config_cursor.min(rows.len().saturating_sub(1));
+    // Reserve the last two rows for the edit/confirm prompt line + padding.
+    let body_h = area.height.saturating_sub(3) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut hit_rows: Vec<ConfigHit> = Vec::new();
+    let mut last_section = "";
+    // Build (section header + row) lines, tracking which screen line each row
+    // lands on for the hit list; scroll so the cursor stays visible.
+    let mut row_lines: Vec<(usize, Option<usize>)> = Vec::new(); // (line idx, row idx)
+    for (i, row) in rows.iter().enumerate() {
+        if row.section != last_section {
+            last_section = row.section;
+            row_lines.push((row_lines.len(), None));
+        }
+        row_lines.push((row_lines.len(), Some(i)));
+    }
+    // Find the cursor's line to derive scroll.
+    let cursor_line = row_lines
+        .iter()
+        .find(|(_, r)| *r == Some(cursor))
+        .map(|(l, _)| *l)
+        .unwrap_or(0);
+    let scroll = cursor_line.saturating_sub(body_h.saturating_sub(1));
+    for (line_idx, row_idx) in row_lines.iter().skip(scroll).take(body_h) {
+        match row_idx {
+            None => {
+                // Section header: derive from the first row at or after this line.
+                let section = rows
+                    .iter()
+                    .enumerate()
+                    .scan("", |prev, (_, r)| {
+                        let is_new = r.section != *prev;
+                        *prev = r.section;
+                        Some((is_new, r.section))
+                    })
+                    .filter(|(is_new, _)| *is_new)
+                    .map(|(_, s)| s)
+                    .nth(
+                        row_lines[..*line_idx]
+                            .iter()
+                            .filter(|(_, r)| r.is_none())
+                            .count(),
+                    )
+                    .unwrap_or("");
+                lines.push(Line::from(Span::styled(
+                    format!(" {section}"),
+                    dim().add_modifier(Modifier::BOLD),
+                )));
+            }
+            Some(i) => {
+                let row = &rows[*i];
+                let selected = *i == cursor;
+                let marker = if selected { "▸" } else { " " };
+                let (state_label, state_style) = match row.state {
+                    CfgState::Live => ("live", Style::new().fg(Color::Green)),
+                    CfgState::Restart => ("restart", Style::new().fg(Color::Yellow)),
+                    CfgState::Session => ("session", dim()),
+                    CfgState::ReadOnly => ("ro", dim()),
+                };
+                let value_style = if row.action.is_some() {
+                    if selected {
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(Color::Cyan)
+                    }
+                } else {
+                    dim()
+                };
+                let label_span = if selected {
+                    Span::styled(
+                        format!(" {marker} {:<18}", row.label),
+                        Style::new().add_modifier(Modifier::REVERSED),
+                    )
+                } else {
+                    Span::styled(format!(" {marker} {:<18}", row.label), dim())
+                };
+                let value_txt = pad_cells(&row.value, 28);
+                // Record the VALUE cell as the click target (contract: click
+                // the control, not the whole row).
+                if let Some(action) = row.action {
+                    let y = area.y + 1 + (lines.len() as u16);
+                    let x = area.x + 22;
+                    if y < area.bottom() {
+                        hit_rows.push(ConfigHit {
+                            area: Rect {
+                                x,
+                                y,
+                                width: 28,
+                                height: 1,
+                            },
+                            row: *i,
+                            action,
+                        });
+                    }
+                }
+                let mut spans = vec![
+                    label_span,
+                    Span::styled(value_txt, value_style),
+                    Span::styled(format!(" {state_label:<8}"), state_style),
+                ];
+                // A restart-only save this session: the value shown is still
+                // the EFFECTIVE boot value; the note carries the pending one.
+                if let Some(saved) = row.action.and_then(|a| chrome.config_saved.get(&a)) {
+                    spans.push(Span::styled(
+                        format!(" saved: {saved} (restart)"),
+                        Style::new().fg(Color::Yellow),
+                    ));
+                }
+                if !row.note.is_empty() {
+                    spans.push(Span::styled(format!(" {}", row.note), dim()));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    // Edit / confirm prompt line (config-editor v1).
+    match chrome.mode {
+        Mode::ConfigEdit { action } => {
+            let hint = action.input_hint().unwrap_or("");
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled(" edit ", Style::new().fg(Color::Cyan)),
+                Span::raw(format!("{}▏", chrome.config_input)),
+                Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
+            ]));
+        }
+        Mode::ConfigConfirm { .. } => {
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled(" confirm ", Style::new().fg(Color::Yellow)),
+                Span::raw(chrome.config_input.clone()),
+                Span::styled("   (y apply · n/Esc cancel)", dim()),
+            ]));
+        }
+        _ => {}
+    }
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" config — Enter/click value edits · live|restart|session|ro ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(hits) = hits.as_mut() {
+        hits.config_rows = hit_rows;
+    }
 }
 
 /// The right-click account context menu (UI-3 U11): a small floating list
@@ -3291,8 +3843,13 @@ fn draw_accounts(
         | Mode::ConfirmRemove { idx }
         | Mode::EditLimits { idx }
         | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
-        // NewLogin is a provider picker, not an account-row cursor.
-        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => None,
+        // NewLogin is a provider picker, not an account-row cursor; the
+        // config-editor modes live in the Config overlay.
+        Mode::Normal
+        | Mode::AddKey
+        | Mode::NewLogin { .. }
+        | Mode::ConfigEdit { .. }
+        | Mode::ConfigConfirm { .. } => None,
     };
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
@@ -4166,7 +4723,11 @@ fn draw_detail(
         | Mode::EditLimits { idx }
         | Mode::ContextMenu { idx, .. } => idx.min(ctx.order.len().saturating_sub(1)),
         // NewLogin keeps the detail pane on the current account.
-        Mode::Normal | Mode::AddKey | Mode::NewLogin { .. } => snapshot
+        Mode::Normal
+        | Mode::AddKey
+        | Mode::NewLogin { .. }
+        | Mode::ConfigEdit { .. }
+        | Mode::ConfigConfirm { .. } => snapshot
             .representative_current()
             .and_then(|cur| {
                 ctx.order
@@ -4492,6 +5053,9 @@ pub(crate) struct MainChrome {
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
     pub sessions_table: Option<SessionsChrome>,
+    /// Config overlay clickable value cells this frame (config-editor v1):
+    /// row index + action, so a click activates exactly like Enter.
+    pub config_rows: Vec<ConfigHit>,
     /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some(max)`
     /// is the largest valid scroll offset (wrapped line count minus the modal's
     /// visible inner height) so the runtime can clamp its stored offset; `None`
@@ -6558,6 +7122,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // host's config); the keybar shows what is actually available.
     let attached = chrome.attach.is_some();
     let keybar = match chrome.mode {
+        // Config-editor prompts render their own inline hint line inside the
+        // overlay; the keybar mirrors the essentials.
+        Mode::ConfigEdit { .. } => Line::from(vec![
+            Span::raw(" edit — "),
+            key("Enter"),
+            Span::raw(" apply  "),
+            key("Esc"),
+            Span::raw(" cancel"),
+        ]),
+        Mode::ConfigConfirm { .. } => Line::from(vec![
+            Span::raw(" confirm — "),
+            key("y"),
+            Span::raw(" apply  "),
+            key("n/Esc"),
+            Span::raw(" cancel"),
+        ]),
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
         Mode::Normal => match chrome.overlay {
@@ -6808,6 +7388,7 @@ mod tests {
             grok: Default::default(),
             daily_usage: Vec::new(),
             daily_perf: Vec::new(),
+            config_facts: Default::default(),
             usage_stats: Vec::new(),
             health: Default::default(),
             session_labels: Default::default(),
@@ -7113,6 +7694,9 @@ mod tests {
             sessions_pct: 100,
             session_cursor: 0,
             session_sort: Default::default(),
+            config_cursor: 0,
+            config_input: String::new(),
+            config_saved: Default::default(),
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,
@@ -9355,6 +9939,296 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_editor_covers_every_schema_leaf() {
+        // Trinity contract C6: the acceptance denominator is the WHOLE
+        // schema. Authoritative reconciliation — flatten a default Config's
+        // JSON into leaf paths and demand every one maps to an inventory
+        // row (by covering prefix). A new schema field fails this test until
+        // it is classified in `config_rows`.
+        fn leaves(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        leaves(&path, val, out);
+                    }
+                }
+                _ => out.push(prefix.to_string()),
+            }
+        }
+        // MAXIMAL fixture: every Option filled and every map/list non-empty,
+        // so `skip_serializing_if` fields (api key, remote, client models,
+        // events, pricing, limits…) appear as leaves and must be classified.
+        let mut config = crate::config::Config::default();
+        config.proxy.api_key = Some("lm-test".into());
+        config.codex.client_model = Some("gpt-5.5".into());
+        config.codex.reasoning_effort = Some("high".into());
+        config.grok.reasoning_effort = Some("high".into());
+        config.grok.client_model = Some("grok-4".into());
+        config.tui_gradient.max_effort = Some("#ffffff".into());
+        config.remote.host = Some("example.com".into());
+        config.remote.port = Some(3456);
+        config.remote.api_key = Some("lm-remote".into());
+        config.pricing.insert(
+            "gpt-5.5".into(),
+            crate::pricing::ModelPrice {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.1,
+                cache_creation: 1.25,
+            },
+        );
+        config.paused_accounts.insert("a@x.com".into());
+        config.account_limits.insert(
+            "a@x.com".into(),
+            crate::config::AccountLimits {
+                five_hour_max: Some(0.5),
+                seven_day_max: Some(0.5),
+                fable_weekly_max: Some(0.5),
+            },
+        );
+        config.events.push(crate::config::EventBanner {
+            id: "e1".into(),
+            from: "2026-01-01".into(),
+            to: "2026-01-02".into(),
+            content: "banner".into(),
+        });
+        // Compile-time exhaustiveness: destructure every schema struct with
+        // NO `..` rest pattern, so adding a field anywhere in the config
+        // schema fails to COMPILE here — forcing this fixture (fill new
+        // Options!) and the COVERED list below to be updated in the same
+        // change. This is what makes the maximal fixture trustworthy: a
+        // future default-None Option cannot silently skip serialization and
+        // dodge the leaf walk.
+        {
+            let crate::config::Config {
+                version: _,
+                proxy,
+                upstream: _,
+                codex,
+                grok,
+                scheduler,
+                routing,
+                pricing: _,
+                raw_io,
+                email_anonymous: _,
+                tui_effects: _,
+                tui_gradient,
+                show_fable_weekly: _,
+                domain_abbrev: _,
+                quota_display: _,
+                paused_accounts: _,
+                account_limits: _,
+                events: _,
+                remote,
+                accounts: _,
+            } = &config;
+            let crate::config::ProxyConfig {
+                port: _,
+                api_key: _,
+                forward_idle_timeout_secs: _,
+                max_request_bytes: _,
+                idle_probe,
+            } = proxy;
+            let crate::config::IdleProbeConfig {
+                enabled: _,
+                per_account_cooldown_secs: _,
+                sweep_secs: _,
+                stale_after_secs: _,
+            } = idle_probe;
+            let crate::config::CodexConfig {
+                upstream: _,
+                token_url: _,
+                default_model: _,
+                client_model: _,
+                fast: _,
+                reasoning_effort: _,
+                trace: _,
+            } = codex;
+            let crate::config::GrokConfig {
+                upstream: _,
+                default_model: _,
+                client_model: _,
+                reasoning_effort: _,
+                trace: _,
+            } = grok;
+            let crate::config::SchedulerConfig {
+                five_hour_max: _,
+                seven_day_max: _,
+                usage_poll_secs: _,
+                usage_max_age_secs: _,
+                refresh_ahead_secs: _,
+                fable_weekly_max: _,
+                mode: _,
+            } = scheduler;
+            let crate::config::RoutingConfig {
+                enabled: _,
+                claude_models: _,
+                codex_models: _,
+                grok_models: _,
+                default_group: _,
+                on_empty_group: _,
+            } = routing;
+            let crate::config::RawIoConfig {
+                enabled: _,
+                retention_days: _,
+                max_body_bytes: _,
+            } = raw_io;
+            let crate::config::TuiGradient {
+                speed: _,
+                claude: _,
+                codex: _,
+                max_effort: _,
+            } = tui_gradient;
+            let crate::config::RemoteConfig {
+                host: _,
+                port: _,
+                api_key: _,
+            } = remote;
+        }
+        let config = serde_json::to_value(&config).expect("json");
+        let mut paths = Vec::new();
+        leaves("", &config, &mut paths);
+        assert!(
+            paths.iter().any(|p| p == "proxy.api_key"),
+            "maximal fixture must surface skip-serialized leaves"
+        );
+        // Keep in sync with `config_rows`. EXACT leaves compared with `==`
+        // ONLY — a prefix comparison here would let a new sibling leaf be
+        // absorbed by an existing name (e.g. `codex.default_model_alias`
+        // vanishing into `codex.default_model`). Runtime-keyed collections
+        // live in COVERED_PREFIX below.
+        const COVERED_EXACT: &[&str] = &[
+            "version",
+            "proxy.port",
+            "proxy.max_request_bytes",
+            "proxy.api_key",
+            "proxy.forward_idle_timeout_secs",
+            "proxy.idle_probe.enabled",
+            "proxy.idle_probe.stale_after_secs",
+            "proxy.idle_probe.sweep_secs",
+            "proxy.idle_probe.per_account_cooldown_secs",
+            "upstream",
+            "codex.upstream",
+            "codex.token_url",
+            "codex.default_model",
+            "codex.client_model",
+            "codex.fast",
+            "codex.reasoning_effort",
+            "codex.trace",
+            "grok.upstream",
+            "grok.default_model",
+            "grok.client_model",
+            "grok.reasoning_effort",
+            "grok.trace",
+            "scheduler.mode",
+            "scheduler.five_hour_max",
+            "scheduler.seven_day_max",
+            "scheduler.fable_weekly_max",
+            "scheduler.usage_max_age_secs",
+            "scheduler.usage_poll_secs",
+            "scheduler.refresh_ahead_secs",
+            "routing.enabled",
+            "routing.claude_models",
+            "routing.codex_models",
+            "routing.grok_models",
+            "routing.default_group",
+            "routing.on_empty_group",
+            "raw_io.enabled",
+            "raw_io.retention_days",
+            "raw_io.max_body_bytes",
+            "email_anonymous",
+            "tui_effects",
+            "tui_gradient.speed",
+            "tui_gradient.claude",
+            "tui_gradient.codex",
+            "tui_gradient.max_effort",
+            "show_fable_weekly",
+            "quota_display",
+            "paused_accounts",
+            "events",
+            "remote.host",
+            "remote.port",
+            "remote.api_key",
+            "accounts",
+        ];
+        // Collections whose leaf paths embed RUNTIME keys (`pricing.<model>.
+        // input`…). The trailing dot bounds the match: `pricing.` can never
+        // absorb a future sibling like `pricing_mode`.
+        const COVERED_PREFIX: &[&str] = &["pricing.", "domain_abbrev.", "account_limits."];
+        for path in &paths {
+            assert!(
+                COVERED_EXACT.iter().any(|c| path == c)
+                    || COVERED_PREFIX.iter().any(|c| path.starts_with(c)),
+                "schema leaf {path:?} is not classified in the config editor \
+                 inventory — add a row (or covering entry) for it"
+            );
+        }
+        // Bidirectional: a COVERED entry matching no leaf is stale coverage
+        // (it would silently swallow future leaves under a dead prefix).
+        for c in COVERED_EXACT {
+            assert!(
+                paths.iter().any(|p| p == c),
+                "coverage entry {c:?} matches no schema leaf — remove or fix it"
+            );
+        }
+        for c in COVERED_PREFIX {
+            assert!(
+                paths.iter().any(|p| p.starts_with(c)),
+                "coverage prefix {c:?} matches no schema leaf — remove or fix it"
+            );
+        }
+        // And the inventory renders with honest labels.
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Config);
+        let rows = config_rows(&view, &chrome);
+        for section in [
+            "scheduler",
+            "codex",
+            "grok",
+            "display",
+            "routing",
+            "raw-io",
+            "daemon",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.section == section),
+                "{section} section present"
+            );
+        }
+        assert!(rows.iter().any(|r| r.note.contains("secret")));
+        let text = render(&view, &chrome, 200, 50);
+        assert!(text.contains("live"), "live state label rendered");
+        assert!(text.contains("restart"), "restart state label rendered");
+    }
+
+    #[test]
+    fn config_editor_click_outside_value_cells_changes_nothing() {
+        // Contract C6: only the value cell is a control. A click elsewhere
+        // must map to no action.
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Config);
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let hits = hits.expect("main chrome").config_rows;
+        assert!(!hits.is_empty(), "editable value cells recorded");
+        for h in &hits {
+            assert!(h.area.x > 2, "value cells start after the label column");
+        }
+        // A label-column click (x=1) hits no control on any row.
+        assert!(
+            !hits.iter().any(|h| 1 >= h.area.x && 1 < h.area.right()),
+            "a label-column click hits no control"
+        );
+    }
     #[test]
     fn tab_bar_renders_all_labels_and_marks_the_active_surface() {
         let view = view_with(Vec::new());
