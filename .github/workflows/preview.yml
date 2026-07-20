@@ -260,7 +260,12 @@ jobs:
           # no TOFU via ssh-keyscan.
           mkdir -p ~/.ssh
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
-          eval "$(ssh-agent -s)" >/dev/null
+          eval "$(env -u TAP_PUSH_KEY ssh-agent -s)" >/dev/null
+          # Kill the agent (and the key it holds) on every exit path — the
+          # credential must not outlive this step. Warn on unexpected failure
+          # so operators notice a broken best-effort propagation.
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          trap 'echo "::warning::tap bump failed mid-step; the 6h cron will catch up"' ERR
           ssh-add - <<< "$TAP_PUSH_KEY"
           unset TAP_PUSH_KEY
 
