@@ -12,7 +12,7 @@ on:
       - "llmux-islands-macos-bridge/**"
       - "src/**"
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - ".github/workflows/linux-islands.yml"
       - "Cargo.toml"
