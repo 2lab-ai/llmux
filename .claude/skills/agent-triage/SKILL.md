@@ -10,7 +10,7 @@ only when **all 7 gate items have citable evidence**. Everything else gets an ex
 **never silently skipped**. For each ready issue it opens a draft PR that acts as the work lock
 for `agent-resolve`. Pairs with `agent-resolve` (does the work) and `agent-loop` (orchestrates both).
 
-Repo: `2lab-ai/llmux`, base branch `master`. Labels were created already
+Repo: `2lab-ai/llmux`, base branch `main`. Labels were created already
 (`ready-to-agent` / `needs-human` / `needs-design` / `not-in-repo` / `agent-wip` / `agent-blocked`).
 
 ## Steps
@@ -37,11 +37,11 @@ Repo: `2lab-ai/llmux`, base branch `master`. Labels were created already
    - Idempotency: if `git ls-remote --heads origin "agent/issue-<N>-*"` returns a branch, **skip** (already tracked).
    - Else create the tracking branch in a **throwaway worktree** so the main tree is untouched
      (same path convention `agent-resolve` reuses — `<repo>/../llmux-wt/issue-<N>`):
-     `git -C <repo> worktree add -B agent/issue-<N>-<slug> "<repo>/../llmux-wt/issue-<N>" master`
+     `git -C <repo> worktree add -B agent/issue-<N>-<slug> "<repo>/../llmux-wt/issue-<N>" main`
      → `git -C "<wt>" commit --allow-empty -m "chore(agent): track #<N> <slug>"`
      → `git -C "<wt>" push -u origin agent/issue-<N>-<slug>`.
      Leave the worktree for `agent-resolve` to reuse, or `git worktree remove` it — the pushed branch is what the draft PR needs.
-   - `gh pr create --draft --base master --head agent/issue-<N>-<slug> --title "<type>: <issue title>" --body "Refs #<N>"`
+   - `gh pr create --draft --base main --head agent/issue-<N>-<slug> --title "<type>: <issue title>" --body "Refs #<N>"`
      (draft PR linking the issue; the draft state is the "not yet worked" signal `agent-resolve` keys on).
 6. **Report** a table: every open issue → assigned label → (branch + draft PR link if ready).
    **Surface borderline issues explicitly** (the `needs-*` / `not-in-repo` ones), don't bury them.

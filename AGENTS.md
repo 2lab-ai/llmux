@@ -36,8 +36,8 @@ Three operational skills live in `.claude/skills/` (shared mechanics in
 `.claude/skills/_shared/cd-reference.md`). Invoke by intent:
 
 - **build** (빌드) — local build → hot-deploy to the local daemon → commit → push to a
-  **feature branch** (never master).
-- **deploy** (배포 / "배포해줘") — push to **master** → CI **preview** prerelease → refresh
+  **feature branch** (never main).
+- **deploy** (배포 / "배포해줘") — push to **main** → CI **preview** prerelease → refresh
   `llmux-preview` brew formula → verify → hot-deploy + restart.
 - **release** (릴리즈 / "릴리즈해줘") — bump version → tag `v*` → CI **stable** release →
   refresh `llmux` brew formula → verify → hot-deploy + restart → `llmux status`

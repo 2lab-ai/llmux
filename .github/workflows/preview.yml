@@ -1,14 +1,14 @@
 name: Preview
 
 # Publishes a prerelease `preview-<YYYY-MM-DD-HHMM>-<sha12>` with 4 binaries
-# + SHA256SUMS on every push to main/master (and on demand). The tap's
+# + SHA256SUMS on every push to main (and on demand). The tap's
 # bump-llmux-preview job derives the brew version (YYYY.MM.DD.HHMM)
 # from this tag, so the tag format is load-bearing.
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main]
 
 permissions:
   contents: read
