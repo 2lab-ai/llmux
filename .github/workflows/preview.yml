@@ -179,12 +179,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      # Deploy key with write access to 2lab-ai/homebrew-tap (repo-scoped; NOT a
-      # personal token). Present -> the step below renders + pushes the preview
-      # formula/cask immediately after publishing. Absent -> the step no-ops and
-      # the tap's 6h cron catches up (no regression).
-      TAP_PUSH_KEY: ${{ secrets.TAP_PUSH_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -242,54 +236,87 @@ jobs:
         # key, so `brew upgrade llmux-preview` / `llmux-islands-preview` see
         # this build immediately instead of waiting on the tap's 6h cron
         # (which stays as backstop and no-ops on "already at TAG").
-        if: ${{ env.TAP_PUSH_KEY != '' }}
+        # Best-effort: the release is already published, so a tap failure must
+        # not fail the publish job (the cron catches up within 6h).
+        continue-on-error: true
+        env:
+          # Deploy key with write access to 2lab-ai/homebrew-tap (repo-scoped;
+          # NOT a personal token). Step-scoped so no other step or action can
+          # read it; unset right after loading into the agent.
+          TAP_PUSH_KEY: ${{ secrets.TAP_PUSH_KEY }}
         run: |
           set -euo pipefail
+          # Secret unset (fork PRs, fresh clones) -> no-op; the 6h cron bumps.
+          if [ -z "${TAP_PUSH_KEY:-}" ]; then
+            echo "TAP_PUSH_KEY unset; skipping tap bump"
+            exit 0
+          fi
           TAG="${{ needs.preflight.outputs.tag }}"
           BUILD_ID="${{ needs.preflight.outputs.build_id }}"
           # build_id = YYYY-MM-DD-HHMM-<sha12> -> brew version YYYY.MM.DD.HHMM
           VERSION="$(echo "$BUILD_ID" | awk -F- '{print $1"."$2"."$3"."$4}')"
 
+          # Pinned GitHub SSH host key (docs.github.com "SSH key fingerprints");
+          # no TOFU via ssh-keyscan.
           mkdir -p ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
           eval "$(ssh-agent -s)" >/dev/null
           ssh-add - <<< "$TAP_PUSH_KEY"
+          unset TAP_PUSH_KEY
 
           git clone --depth 1 git@github.com:2lab-ai/homebrew-tap.git tap-bump
+          git -C tap-bump config user.name "github-actions[bot]"
+          git -C tap-bump config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           declare -A SHAS
           for name in llmux-macos-aarch64 llmux-macos-x86_64 llmux-linux-aarch64 llmux-linux-x86_64; do
             SHAS[$name]=$(sha256sum "release/$name" | cut -d' ' -f1)
           done
-          sed -e "s/@VERSION@/$VERSION/g" \
-              -e "s/@TAG@/$TAG/g" \
-              -e "s/@SHA_MACOS_AARCH64@/${SHAS[llmux-macos-aarch64]}/" \
-              -e "s/@SHA_MACOS_X86_64@/${SHAS[llmux-macos-x86_64]}/" \
-              -e "s/@SHA_LINUX_AARCH64@/${SHAS[llmux-linux-aarch64]}/" \
-              -e "s/@SHA_LINUX_X86_64@/${SHAS[llmux-linux-x86_64]}/" \
-              tap-bump/Formula/llmux-preview.rb.tmpl > tap-bump/Formula/llmux-preview.rb
-          ruby -c tap-bump/Formula/llmux-preview.rb
-
           ZIP="release/LlmuxIslands-${VERSION}.zip"
-          [ -f "$ZIP" ] || { echo "missing $ZIP"; exit 1; }
+          [ -f "$ZIP" ] || { echo "::warning::missing $ZIP; skipping tap bump"; exit 0; }
           ISLANDS_SHA=$(sha256sum "$ZIP" | cut -d' ' -f1)
-          sed -e "s/@VERSION@/$VERSION/g" \
-              -e "s/@TAG@/$TAG/g" \
-              -e "s/@SHA@/$ISLANDS_SHA/" \
-              tap-bump/Casks/llmux-islands-preview.rb.tmpl > tap-bump/Casks/llmux-islands-preview.rb
-          ruby -c tap-bump/Casks/llmux-islands-preview.rb
 
-          cd tap-bump
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/llmux-preview.rb Casks/llmux-islands-preview.rb
-          git diff --cached --quiet && { echo "tap already current"; exit 0; }
-          git commit -m "llmux-preview + llmux-islands-preview $TAG"
-          # Commit before pulling (an unstaged render breaks --rebase), then rebase
-          # over anything the cron/other repos pushed meanwhile.
-          git pull --rebase
-          git push
-          echo "tap bumped to $TAG"
+          render() {
+            sed -e "s/@VERSION@/$VERSION/g" \
+                -e "s/@TAG@/$TAG/g" \
+                -e "s/@SHA_MACOS_AARCH64@/${SHAS[llmux-macos-aarch64]}/" \
+                -e "s/@SHA_MACOS_X86_64@/${SHAS[llmux-macos-x86_64]}/" \
+                -e "s/@SHA_LINUX_AARCH64@/${SHAS[llmux-linux-aarch64]}/" \
+                -e "s/@SHA_LINUX_X86_64@/${SHAS[llmux-linux-x86_64]}/" \
+                tap-bump/Formula/llmux-preview.rb.tmpl > tap-bump/Formula/llmux-preview.rb
+            sed -e "s/@VERSION@/$VERSION/g" \
+                -e "s/@TAG@/$TAG/g" \
+                -e "s/@SHA@/$ISLANDS_SHA/" \
+                tap-bump/Casks/llmux-islands-preview.rb.tmpl > tap-bump/Casks/llmux-islands-preview.rb
+            ruby -c tap-bump/Formula/llmux-preview.rb
+            ruby -c tap-bump/Casks/llmux-islands-preview.rb
+            # A surviving token means the template/render contract drifted.
+            ! grep -q "@[A-Z_]\+@" tap-bump/Formula/llmux-preview.rb tap-bump/Casks/llmux-islands-preview.rb
+          }
+
+          for attempt in 1 2 3; do
+            git -C tap-bump fetch origin master
+            git -C tap-bump reset --hard origin/master
+            # Freshness guard: preview-YYYY-MM-DD-HHMM-<sha12> sorts
+            # chronologically, so a delayed run never rolls the tap back over
+            # a newer cron/preview bump.
+            CURRENT=$(sed -n 's|^.*releases/download/\(preview-[^/]*\)/.*|\1|p' tap-bump/Formula/llmux-preview.rb 2>/dev/null | head -1 || true)
+            if [ -n "$CURRENT" ] && [[ "$CURRENT" > "$TAG" ]]; then
+              echo "tap already at newer $CURRENT; skipping"
+              exit 0
+            fi
+            render
+            git -C tap-bump add Formula/llmux-preview.rb Casks/llmux-islands-preview.rb
+            git -C tap-bump diff --cached --quiet && { echo "tap already current"; exit 0; }
+            git -C tap-bump commit -m "llmux-preview + llmux-islands-preview $TAG"
+            if git -C tap-bump push; then
+              echo "tap bumped to $TAG"
+              exit 0
+            fi
+            echo "push lost a race (attempt $attempt); refetching"
+          done
+          echo "::warning::tap push failed after 3 attempts; the 6h cron will catch up"
+          exit 0
 
       - name: Prune old preview prereleases (keep 15)
         env:
