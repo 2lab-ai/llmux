@@ -1301,14 +1301,24 @@ fn draw_sessions_table(
     // While a progressive load is still streaming, append the read progress so
     // the growing table reads as "filling in", not stalled.
     let sort = chrome.session_sort.label();
+    // An oversized log is scanned newest-tail-only (issue #127) — say so
+    // rather than implying the timeline is complete.
+    let tail = if chrome.sessions_truncated {
+        " — newest 1GiB only"
+    } else {
+        ""
+    };
     let title = if chrome.sessions_loading {
         format!(
-            " sessions — {} of {total} — sort {sort} (o) — loading… {}% ",
+            " sessions — {} of {total} — sort {sort} (o) — loading… {}%{tail} ",
             cursor + 1,
             chrome.sessions_pct
         )
     } else {
-        format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
+        format!(
+            " sessions — {} of {total} — sort {sort} (o){tail} ",
+            cursor + 1
+        )
     };
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
@@ -2078,6 +2088,7 @@ pub(crate) enum ConfigAction {
     RawIoEnabled,
     RawIoRetention,
     RawIoMaxBody,
+    RawIoMaxTotal,
     Upstream,
     CodexUpstream,
     ProxyPort,
@@ -2111,6 +2122,7 @@ impl ConfigAction {
             ConfigAction::RoutingOnEmptyGroup => Some("error | fallback"),
             ConfigAction::RawIoRetention => Some("days 0-3650 (0 = keep forever)"),
             ConfigAction::RawIoMaxBody | ConfigAction::ProxyMaxBody => Some("bytes"),
+            ConfigAction::RawIoMaxTotal => Some("bytes (0 = no cap)"),
             ConfigAction::Upstream | ConfigAction::CodexUpstream => Some("https://…"),
             ConfigAction::ProxyPort => Some("port 1-65535"),
             _ => None,
@@ -2407,6 +2419,18 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             state: CfgState::Restart,
             note: "",
             action: Some(ConfigAction::RawIoMaxBody),
+        },
+        CfgRow {
+            section: "raw-io",
+            label: "size cap",
+            value: if f.raw_io_max_total_bytes == 0 {
+                "no cap".into()
+            } else {
+                format::human_count(f.raw_io_max_total_bytes)
+            },
+            state: CfgState::Restart,
+            note: "decrease deletes oldest history",
+            action: Some(ConfigAction::RawIoMaxTotal),
         },
         CfgRow {
             section: "daemon",
@@ -7692,6 +7716,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_loading: false,
             sessions_pct: 100,
+            sessions_truncated: false,
             session_cursor: 0,
             session_sort: Default::default(),
             config_cursor: 0,
@@ -10078,6 +10103,7 @@ mod tests {
                 enabled: _,
                 retention_days: _,
                 max_body_bytes: _,
+                max_total_bytes: _,
             } = raw_io;
             let crate::config::TuiGradient {
                 speed: _,
@@ -10142,6 +10168,7 @@ mod tests {
             "raw_io.enabled",
             "raw_io.retention_days",
             "raw_io.max_body_bytes",
+            "raw_io.max_total_bytes",
             "email_anonymous",
             "tui_effects",
             "tui_gradient.speed",

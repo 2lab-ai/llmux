@@ -121,6 +121,47 @@ pub fn user_id_from_request_body(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Metadata-only projection of one [`RawIoRecord`] — everything the session
+/// fold needs, WITHOUT the payload bodies (issue #127).
+///
+/// The streaming session load used to accumulate full `RawIoRecord`s — each
+/// holding up to `max_body_bytes` of request + response text — for the whole
+/// file, which on a 19.5 GB log meant ~file-sized retention (18.6 GB RSS
+/// observed). Projecting each record to this struct at parse time (bodies are
+/// parsed for `user_id`/usage and immediately dropped) bounds the per-record
+/// retention to ~a hundred bytes. The absence of body fields here is the
+/// type-level guarantee that no accumulator can retain payload text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordMeta {
+    pub ts_ms: u64,
+    pub id: u64,
+    /// `metadata.user_id` extracted from the request body (grouping key).
+    pub user_id: Option<String>,
+    pub model: Option<String>,
+    pub account: Option<String>,
+    /// `usage.{input,output}_tokens` extracted from the response body.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub duration_ms: Option<u64>,
+}
+
+impl RecordMeta {
+    /// Project a full record to its fold metadata, dropping the bodies.
+    pub fn from_record(rec: &RawIoRecord) -> Self {
+        let (tokens_in, tokens_out) = tokens_from_response_body(&rec.response_body);
+        Self {
+            ts_ms: rec.ts_ms,
+            id: rec.id,
+            user_id: user_id_from_request_body(&rec.request_body),
+            model: rec.model.clone(),
+            account: rec.account.clone(),
+            tokens_in,
+            tokens_out,
+            duration_ms: rec.duration_ms,
+        }
+    }
+}
+
 /// Extract `(input_tokens, output_tokens)` from a persisted response body.
 ///
 /// The non-streaming Anthropic Messages JSON carries a top-level `usage` object
@@ -181,7 +222,46 @@ impl Acc {
         }
     }
 
-    fn into_session(self) -> Session {
+    /// Fold one record's metadata into this accumulator. The caller feeds
+    /// records in chronological order (the sorted fold in [`fold_sessions`],
+    /// or file/append order in [`SessionFolder`] — raw-io appends are in
+    /// capture-time order), so `prev_account` rotation detection and the
+    /// span min/max stay correct.
+    fn fold_meta(&mut self, meta: &RecordMeta) {
+        self.requests = self.requests.saturating_add(1);
+        self.tokens_in = self.tokens_in.saturating_add(meta.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(meta.tokens_out);
+        // Timed rate sums (perf telemetry v1): only records that recorded a
+        // duration contribute — numerator and denominator stay paired,
+        // pre-field history contributes nothing.
+        if let Some(ms) = meta.duration_ms {
+            self.duration_ms_sum = self.duration_ms_sum.saturating_add(ms);
+            self.timed_requests = self.timed_requests.saturating_add(1);
+            self.tokens_out_timed = self.tokens_out_timed.saturating_add(meta.tokens_out);
+        }
+        if let Some(model) = &meta.model {
+            self.models.insert(model.clone());
+        }
+        if let Some(account) = &meta.account {
+            self.accounts.insert(account.clone());
+            // A rotation is a change from the previous record's account.
+            if self
+                .prev_account
+                .as_ref()
+                .is_some_and(|prev| prev != account)
+            {
+                self.account_rotations = self.account_rotations.saturating_add(1);
+            }
+            self.prev_account = Some(account.clone());
+        }
+        self.first_ms = self.first_ms.min(meta.ts_ms);
+        self.last_ms = self.last_ms.max(meta.ts_ms);
+        if meta.user_id.is_none() {
+            self.any_missing_user_id = true;
+        }
+    }
+
+    fn to_session(&self) -> Session {
         // High only when the group is keyed by an explicit user_id AND no record
         // in it was missing one; the ungrouped bucket (and any group that somehow
         // mixed in a missing key) is Low.
@@ -191,12 +271,12 @@ impl Acc {
             Confidence::Low
         };
         Session {
-            user_id: self.user_id,
+            user_id: self.user_id.clone(),
             requests: self.requests,
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
-            models: self.models.into_iter().collect(),
-            accounts: self.accounts.into_iter().collect(),
+            models: self.models.iter().cloned().collect(),
+            accounts: self.accounts.iter().cloned().collect(),
             account_rotations: self.account_rotations,
             first_ms: self.first_ms,
             last_ms: self.last_ms,
@@ -205,6 +285,48 @@ impl Acc {
             tokens_out_timed: self.tokens_out_timed,
             confidence,
         }
+    }
+}
+
+/// Incremental session fold for the STREAMING loader (issue #127): push each
+/// record's [`RecordMeta`] exactly once as it is parsed, snapshot the current
+/// timeline at any point. Replaces the old accumulate-then-refold pattern,
+/// which re-ran [`fold_sessions`] over the ENTIRE accumulated vector on every
+/// progress chunk — O(n²) over the whole file (the observed 50–110% CPU burn
+/// on a 19.5 GB log) — while retaining every full-body record.
+///
+/// Ordering: records are folded in push order. The raw-io log appends in
+/// capture-time order (`raw_io.rs` `find_record` relies on the same
+/// invariant), so file order IS chronological order; the order-independent
+/// sorted fold remains available as [`fold_sessions`] for callers holding a
+/// full slice.
+#[derive(Default)]
+pub struct SessionFolder {
+    groups: BTreeMap<Option<String>, Acc>,
+}
+
+impl SessionFolder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one record's metadata (consumes only ~100 bytes of state; the
+    /// caller drops the full record right after projecting it).
+    pub fn push(&mut self, meta: &RecordMeta) {
+        self.groups
+            .entry(meta.user_id.clone())
+            .or_insert_with(|| Acc::new(meta.user_id.clone(), meta.ts_ms))
+            .fold_meta(meta);
+    }
+
+    /// Current timeline: most-recent session first, the ungrouped (`None`)
+    /// bucket always last — identical ordering contract to
+    /// [`fold_sessions`]. O(groups), independent of how many records were
+    /// pushed.
+    pub fn snapshot(&self) -> Vec<Session> {
+        let mut sessions: Vec<Session> = self.groups.values().map(Acc::to_session).collect();
+        sort_sessions(&mut sessions);
+        sessions
     }
 }
 
@@ -234,58 +356,35 @@ pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
 
     let mut sessions: Vec<Session> = groups
         .into_iter()
-        .map(|(user_id, mut recs)| {
-            // Process in timestamp order (then by id) so rotation detection and
-            // the span are independent of file/append order.
-            recs.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then(a.id.cmp(&b.id)));
-            let first_ts = recs.first().map(|r| r.ts_ms).unwrap_or(0);
+        .map(|(user_id, recs)| {
+            // Project to metadata, then process in timestamp order (then by
+            // id) so rotation detection and the span are independent of
+            // file/append order.
+            let mut metas: Vec<RecordMeta> =
+                recs.iter().map(|r| RecordMeta::from_record(r)).collect();
+            metas.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then(a.id.cmp(&b.id)));
+            let first_ts = metas.first().map(|m| m.ts_ms).unwrap_or(0);
             let mut acc = Acc::new(user_id, first_ts);
-            for rec in recs {
-                acc.requests = acc.requests.saturating_add(1);
-                let (tin, tout) = tokens_from_response_body(&rec.response_body);
-                acc.tokens_in = acc.tokens_in.saturating_add(tin);
-                acc.tokens_out = acc.tokens_out.saturating_add(tout);
-                // Timed rate sums (perf telemetry v1): only records that
-                // recorded a duration contribute — numerator and denominator
-                // stay paired, pre-field history contributes nothing.
-                if let Some(ms) = rec.duration_ms {
-                    acc.duration_ms_sum = acc.duration_ms_sum.saturating_add(ms);
-                    acc.timed_requests = acc.timed_requests.saturating_add(1);
-                    acc.tokens_out_timed = acc.tokens_out_timed.saturating_add(tout);
-                }
-                if let Some(model) = &rec.model {
-                    acc.models.insert(model.clone());
-                }
-                if let Some(account) = &rec.account {
-                    acc.accounts.insert(account.clone());
-                    // A rotation is a change from the previous record's account.
-                    if acc
-                        .prev_account
-                        .as_ref()
-                        .is_some_and(|prev| prev != account)
-                    {
-                        acc.account_rotations = acc.account_rotations.saturating_add(1);
-                    }
-                    acc.prev_account = Some(account.clone());
-                }
-                acc.first_ms = acc.first_ms.min(rec.ts_ms);
-                acc.last_ms = acc.last_ms.max(rec.ts_ms);
-                if user_id_from_request_body(&rec.request_body).is_none() {
-                    acc.any_missing_user_id = true;
-                }
+            for meta in &metas {
+                acc.fold_meta(meta);
             }
-            acc.into_session()
+            acc.to_session()
         })
         .collect();
 
-    // Most-recent session first; the ungrouped (None) bucket always sinks to the
-    // bottom so the confident rows lead.
+    sort_sessions(&mut sessions);
+    sessions
+}
+
+/// Most-recent session first; the ungrouped (`None`) bucket always sinks to
+/// the bottom so the confident rows lead. Shared by [`fold_sessions`] and
+/// [`SessionFolder::snapshot`].
+fn sort_sessions(sessions: &mut [Session]) {
     sessions.sort_by(|a, b| match (a.user_id.is_none(), b.user_id.is_none()) {
         (true, false) => std::cmp::Ordering::Greater,
         (false, true) => std::cmp::Ordering::Less,
         _ => b.last_ms.cmp(&a.last_ms).then(a.user_id.cmp(&b.user_id)),
     });
-    sessions
 }
 
 #[cfg(test)]
@@ -462,6 +561,55 @@ mod tests {
     #[test]
     fn empty_input_folds_to_no_sessions() {
         assert!(fold_sessions(&[]).is_empty());
+    }
+
+    /// Issue #127: the incremental [`SessionFolder`] (used by the streaming
+    /// loader — one fold per record, metadata only) produces the SAME timeline
+    /// as the slice-based [`fold_sessions`] when records arrive in append
+    /// (capture-time) order, which is the raw-io file's order invariant.
+    #[test]
+    fn incremental_folder_matches_slice_fold_in_append_order() {
+        let records = vec![
+            record(1, 100, Some("u-1"), "claude-sonnet-4", "acct-a", 10, 5),
+            record(2, 150, Some("u-2"), "claude-sonnet-4", "acct-a", 100, 40),
+            record(3, 200, Some("u-1"), "claude-opus-4", "acct-b", 20, 7),
+            record(4, 250, Some("u-2"), "claude-sonnet-4", "acct-a", 50, 20),
+            record(5, 300, Some("u-1"), "claude-sonnet-4", "acct-a", 5, 1),
+            record(6, 500, None, "claude-sonnet-4", "acct-c", 1, 1),
+        ];
+        let mut folder = SessionFolder::new();
+        for rec in &records {
+            folder.push(&RecordMeta::from_record(rec));
+        }
+        assert_eq!(
+            folder.snapshot(),
+            fold_sessions(&records),
+            "incremental fold == slice fold on append-ordered records"
+        );
+        // Snapshot mid-stream then continue: the final snapshot is unaffected
+        // by intermediate deliveries (each record folded exactly once).
+        let mut progressive = SessionFolder::new();
+        for (i, rec) in records.iter().enumerate() {
+            progressive.push(&RecordMeta::from_record(rec));
+            if i == 2 {
+                let _ = progressive.snapshot();
+            }
+        }
+        assert_eq!(progressive.snapshot(), fold_sessions(&records));
+    }
+
+    /// The projection carries no body text — only extracted metadata.
+    #[test]
+    fn record_meta_projects_fields_and_drops_bodies() {
+        let rec = record(7, 700, Some("u-9"), "claude-opus-4", "acct-z", 11, 3);
+        let meta = RecordMeta::from_record(&rec);
+        assert_eq!(meta.user_id.as_deref(), Some("u-9"));
+        assert_eq!(meta.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(meta.account.as_deref(), Some("acct-z"));
+        assert_eq!((meta.tokens_in, meta.tokens_out), (11, 3));
+        assert_eq!(meta.duration_ms, Some(1_000));
+        // No body fields exist on RecordMeta — the projection is the
+        // type-level guarantee; this test just pins the extracted values.
     }
 
     #[test]
