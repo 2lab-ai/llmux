@@ -4176,10 +4176,13 @@ fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
     (bytes_read.saturating_mul(100) / file_len).min(100) as u8
 }
 
-/// Streaming, progressive variant of the session load: reads the persisted
-/// raw-io log line by line, accumulating parsed records, and every
-/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
-/// and delivers a partial over `tx`. The final partial carries `done = true`.
+/// Streaming, progressive session load: reads the persisted raw-io log line
+/// by line (newest-tail window only when the file exceeds
+/// [`SESSIONS_SCAN_MAX_BYTES`]), projects each record to a body-free
+/// [`crate::session::RecordMeta`] and folds it ONCE into an incremental
+/// [`crate::session::SessionFolder`]; every `SESSIONS_CHUNK_RECORDS` (and
+/// always at EOF) an O(groups) snapshot is delivered over `tx`. The final
+/// partial carries `done = true`.
 /// A missing/unreadable file delivers a single empty, done partial so the
 /// overlay's loading state always clears. Runs on the blocking pool.
 fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {

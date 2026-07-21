@@ -872,44 +872,53 @@ pub async fn serve(
     // startup, and both are crash-safe mid-flight (hydration only reads;
     // prune renames atomically at the very end).
     //
+    // One background task, STRICTLY ordered (issue #127 review MUST-FIX 1):
+    //
     // 1. Activity history (req-persist A/C): replay `activity.jsonl` up to the
     //    pre-bind cut into a fresh log, then merge it BEHIND live traffic
     //    (`DashboardHub::hydrate_persisted` — live rows stay in front, sums
     //    commute, no double-count past the cut). Dashboards fill in as it
     //    lands; a "history loaded" note marks completion.
+    // 2. ONLY THEN the persisted-file lifetime prune (Feature B + issue #127),
+    //    re-run every [`PRUNE_SWEEP_SECS`]. The order is load-bearing: the
+    //    hydration cut is a byte offset captured at arm time, so a prune that
+    //    rewrote `activity.jsonl` smaller BEFORE hydration read it would put
+    //    live-appended records inside the cut window and double-count them
+    //    into the merged totals. After hydration the cut is dead and the
+    //    prune races only the append lock, which its commit already holds.
+    //
+    //    raw-io is pruned when capture is enabled; the ACTIVITY log is pruned
+    //    regardless of `raw_io.enabled` (review MUST-FIX 2 — activity keeps
+    //    appending with capture off, so its lifetime bound must not die with
+    //    the raw-io switch). `retention_days = 0` and `max_total_bytes = 0`
+    //    each disable their bound. Scans are streaming; commits preserve
+    //    records appended mid-pass (see `proxy::raw_io::prune_lifetime`).
     let hydrate_task = {
         let hub = state.hub.clone();
         let path = state.activity_log_path.clone();
-        tokio::task::spawn_blocking(move || hub.hydrate_persisted(path.as_deref(), hydrate_cut))
-    };
-    // 2. Persisted-file lifetime pruning (Feature B + issue #127): guarded by
-    //    config (`enabled = false` skips it; `retention_days = 0` and
-    //    `max_total_bytes = 0` each disable their bound). The scan is
-    //    streaming and the commit preserves records appended while it ran (see
-    //    `proxy::raw_io::prune`), so it is safe next to live traffic — and the
-    //    multi-GB payload log no longer stands between restart and readiness.
-    //    Startup-only pruning let a long-lived daemon regrow without bound, so
-    //    the same pass re-runs every [`PRUNE_SWEEP_SECS`]. The activity log
-    //    shares the identical lifetime contract (same knobs) — its lines are
-    //    small metadata, but startup replay cost grows with the file forever
-    //    if nothing bounds it.
-    let prune_task = state.config.raw_io.enabled.then(|| {
+        let raw_io_enabled = state.config.raw_io.enabled;
         let raw_io_path = state.raw_io_path.clone();
-        let activity_path = state.activity_log_path.clone();
         let retention_days = state.config.raw_io.retention_days;
         let max_total_bytes = state.config.raw_io.max_total_bytes;
         tokio::spawn(async move {
+            let hydrate_path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                hub.hydrate_persisted(hydrate_path.as_deref(), hydrate_cut)
+            })
+            .await;
             loop {
                 let raw_io_path = raw_io_path.clone();
-                let activity_path = activity_path.clone();
+                let activity_path = path.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let now = crate::proxy::raw_io::now_ms();
-                    crate::proxy::raw_io::prune(
-                        raw_io_path.as_deref(),
-                        retention_days,
-                        max_total_bytes,
-                        now,
-                    );
+                    if raw_io_enabled {
+                        crate::proxy::raw_io::prune(
+                            raw_io_path.as_deref(),
+                            retention_days,
+                            max_total_bytes,
+                            now,
+                        );
+                    }
                     crate::tui::activity::prune(
                         activity_path.as_deref(),
                         retention_days,
@@ -921,7 +930,7 @@ pub async fn serve(
                 tokio::time::sleep(std::time::Duration::from_secs(PRUNE_SWEEP_SECS)).await;
             }
         })
-    });
+    };
 
     let shutdown = state.shutdown.clone();
     let result = axum::serve(
@@ -939,14 +948,11 @@ pub async fn serve(
     if let Some(fold_task) = fold_task {
         fold_task.abort();
     }
-    // Blocking-pool tasks cannot be interrupted once running; `abort` here only
-    // cancels them if they have not started. Both are safe to leave finishing
-    // (read-only hydration; atomic-rename prune) — the runtime waits for them
-    // on shutdown.
+    // The hydrate-then-prune task's inner blocking work cannot be interrupted
+    // once running; `abort` only stops it between phases. Both phases are safe
+    // to leave finishing (read-only hydration; atomic-rename prune) — the
+    // runtime waits for them on shutdown.
     hydrate_task.abort();
-    if let Some(prune_task) = prune_task {
-        prune_task.abort();
-    }
     result.map_err(ProxyError::Io)
 }
 
@@ -3824,6 +3830,10 @@ mod tests {
             },
             SettingsRequest {
                 upstream: Some("ftp://nope".into()),
+                ..Default::default()
+            },
+            SettingsRequest {
+                raw_io_max_total_bytes: Some(1024), // < 1 MiB and not 0
                 ..Default::default()
             },
         ] {
