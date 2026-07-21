@@ -543,14 +543,24 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
     best.map(|(_, r)| r)
 }
 
-/// Prune the raw-io log to a retention window, best-effort.
+/// Prune the raw-io log to its lifetime contract (issue #127), best-effort.
 ///
-/// When `retention_days > 0`, the file is rewritten keeping only records whose
-/// `ts_ms >= now_ms - retention_days * 86_400_000`. `retention_days == 0` keeps
-/// everything (no-op). Corrupt lines (not JSON, or not the current
-/// [`RECORD_VERSION`]) are tolerated by being DROPPED — a rewrite is a natural
-/// point to shed unreadable history; the kept set is exactly the in-window,
-/// parseable records.
+/// Two independent bounds, either of which can trigger a rewrite:
+///
+/// - **Age** — when `retention_days > 0`, records whose
+///   `ts_ms < now_ms - retention_days * 86_400_000` are dropped. `0` = no age
+///   limit.
+/// - **Size** — when `max_total_bytes > 0` and the file is larger, the OLDEST
+///   records are dropped (whole lines, front of the file — appends are in
+///   capture-time order) until the kept set fits. `0` = no size cap. The cap
+///   is approximate under concurrent appends: bytes landing during the pass
+///   are always kept, so the file can transiently exceed the cap until the
+///   next pass.
+///
+/// Corrupt lines (not JSON, or not the current [`RECORD_VERSION`]) are
+/// tolerated by being DROPPED — a rewrite is a natural point to shed
+/// unreadable history; the kept set is exactly the in-window, parseable
+/// records.
 ///
 /// # Streaming + safe against concurrent appends
 ///
@@ -573,21 +583,73 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
 /// error on read/write leaves the file as-is (the temp file is discarded).
 /// Never panics. The rewrite goes through a sibling temp file + atomic rename
 /// so a crash mid-prune can't truncate the log.
-pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
-    if retention_days == 0 {
-        return; // keep forever
+pub fn prune(
+    path: Option<&std::path::Path>,
+    retention_days: u64,
+    max_total_bytes: u64,
+    now_ms: u64,
+) {
+    prune_lifetime(
+        path,
+        retention_days,
+        max_total_bytes,
+        now_ms,
+        &|line, cutoff| {
+            matches!(serde_json::from_str::<RawIoRecord>(line),
+                Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff)
+        },
+        &IO_LOCK,
+    );
+}
+
+/// The generic lifetime-prune driver behind [`prune`] — shared with the
+/// activity log ([`crate::tui::activity::prune`]), which has the identical
+/// contract (append-only JSONL, appends in capture-time order, its own append
+/// lock) but a different line schema. `keep(line, cutoff)` decides whether a
+/// trimmed, non-empty line survives an age pass; `lock` must be the SAME lock
+/// the file's appender takes, so the commit's tail copy + rename can't lose a
+/// concurrent append.
+pub(crate) fn prune_lifetime(
+    path: Option<&std::path::Path>,
+    retention_days: u64,
+    max_total_bytes: u64,
+    now_ms: u64,
+    keep: &dyn Fn(&str, u64) -> bool,
+    lock: &'static Mutex<()>,
+) {
+    if retention_days == 0 && max_total_bytes == 0 {
+        return; // keep forever, any size
     }
     let Some(path) = path else {
         return;
     };
-    let cutoff = now_ms.saturating_sub(retention_days.saturating_mul(MS_PER_DAY));
-    if !needs_prune(path, cutoff) {
-        return; // nothing to drop — no temp written, original untouched
+    // Age bound: 0 = no age limit (cutoff 0 keeps every real timestamp).
+    let cutoff = if retention_days == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(retention_days.saturating_mul(MS_PER_DAY))
+    };
+    // Size bound: every whole line ending at or before `drop_before` is
+    // dropped. Snapshotting the length here (not under the append lock) is
+    // fine — appends only grow the file, so the computed offset only ever
+    // UNDER-drops relative to the final length, never drops a fresh record.
+    let drop_before = match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(len) if max_total_bytes > 0 && len > max_total_bytes => len - max_total_bytes,
+        Ok(_) => 0,
+        Err(_) => return, // missing/unreadable — nothing to prune
+    };
+    if drop_before == 0 {
+        if retention_days == 0 {
+            return; // size within cap, no age bound — nothing to do
+        }
+        if !needs_prune(path, cutoff, keep) {
+            return; // nothing to drop — no temp written, original untouched
+        }
     }
-    let Some(stage) = prune_scan(path, cutoff) else {
+    let Some(stage) = prune_scan(path, cutoff, drop_before, keep) else {
         return; // nothing to drop, or scan failed — original left as-is
     };
-    prune_commit(path, stage);
+    prune_commit(path, stage, lock);
 }
 
 /// Read-only pre-pass: would the retention window drop anything? `true` on the
@@ -596,7 +658,7 @@ pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
 /// file or a torn final line (no trailing newline — crash artifact or an
 /// append racing this scan; the rewrite carries it over verbatim either way)
 /// is not by itself a reason to rewrite.
-fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
+fn needs_prune(path: &std::path::Path, cutoff: u64, keep: &dyn Fn(&str, u64) -> bool) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
@@ -614,9 +676,8 @@ fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
                 if trimmed.is_empty() {
                     return true;
                 }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {}
-                    _ => return true,
+                if !keep(trimmed, cutoff) {
+                    return true;
                 }
             }
             Err(_) => return false, // unreadable — leave the file as-is
@@ -633,10 +694,17 @@ struct PruneStage {
 }
 
 /// Phase 1 (unlocked, streaming): scan `path` line by line, writing in-window
-/// parseable records to a sibling temp file. Returns `None` when there is
-/// nothing to rewrite (every line kept verbatim, or any IO error — the temp is
-/// discarded either way).
-fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
+/// parseable records to a sibling temp file. Whole lines ending at or before
+/// `drop_before` (the size-cap prefix) are dropped regardless of age; a line
+/// straddling the boundary is kept (under-drop — the next pass converges).
+/// Returns `None` when there is nothing to rewrite (every line kept verbatim,
+/// or any IO error — the temp is discarded either way).
+fn prune_scan(
+    path: &std::path::Path,
+    cutoff: u64,
+    drop_before: u64,
+    keep: &dyn Fn(&str, u64) -> bool,
+) -> Option<PruneStage> {
     let file = std::fs::File::open(path).ok()?; // missing/unreadable = nothing to prune
     let mut reader = std::io::BufReader::new(file);
     let tmp = path.with_extension("jsonl.prune.tmp");
@@ -664,24 +732,29 @@ fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
                     break;
                 }
                 consumed += n as u64;
+                if consumed <= drop_before {
+                    // Inside the size-cap prefix: shed the whole line, oldest
+                    // first, without parsing it.
+                    changed = true;
+                    continue;
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     changed = true;
                     continue;
                 }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {
-                        if writer
-                            .write_all(trimmed.as_bytes())
-                            .and_then(|()| writer.write_all(b"\n"))
-                            .is_err()
-                        {
-                            discard(writer, &tmp);
-                            return None;
-                        }
+                if keep(trimmed, cutoff) {
+                    if writer
+                        .write_all(trimmed.as_bytes())
+                        .and_then(|()| writer.write_all(b"\n"))
+                        .is_err()
+                    {
+                        discard(writer, &tmp);
+                        return None;
                     }
+                } else {
                     // Out of window, wrong version, or unparseable → drop it.
-                    _ => changed = true,
+                    changed = true;
                 }
             }
             Err(_) => {
@@ -703,8 +776,8 @@ fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
 /// offset verbatim onto the temp file, then atomically rename it over the
 /// original. On any IO error the temp is discarded and the original is left
 /// as-is.
-fn prune_commit(path: &std::path::Path, stage: PruneStage) {
-    let _guard = IO_LOCK
+fn prune_commit(path: &std::path::Path, stage: PruneStage, lock: &'static Mutex<()>) {
+    let _guard = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let copied_tail = (|| -> std::io::Result<()> {
@@ -975,7 +1048,7 @@ mod tests {
         append(Some(&path), &rec(1, MS_PER_DAY));
         append(Some(&path), &rec(2, 99 * MS_PER_DAY));
 
-        prune(Some(&path), 90, now);
+        prune(Some(&path), 90, 0, now);
 
         let contents = std::fs::read_to_string(&path).expect("file kept");
         let ids: Vec<u64> = contents
@@ -987,6 +1060,105 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Issue #127: the size cap drops the OLDEST records (front of the file)
+    /// until the kept set fits, independent of age.
+    #[test]
+    fn prune_size_cap_drops_oldest_until_under_cap() {
+        let path = tmp_path("size-cap");
+        for id in 0..40 {
+            append(Some(&path), &rec(id, 1_000 + id));
+        }
+        let len = std::fs::metadata(&path).expect("meta").len();
+        let cap = len / 2;
+        // No age bound (retention 0) — only the size cap acts.
+        prune(Some(&path), 0, cap, u64::MAX);
+
+        let contents = std::fs::read_to_string(&path).expect("file kept");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert!(!ids.is_empty(), "newest records survive");
+        assert_eq!(*ids.last().expect("last"), 39, "newest record kept");
+        assert!(ids[0] > 0, "oldest records dropped");
+        let expected: Vec<u64> = (ids[0]..=39).collect();
+        assert_eq!(ids, expected, "kept set is a contiguous newest suffix");
+        // One straddling line of slack: the boundary line is kept, not torn.
+        let line_len = len / 40;
+        let after = std::fs::metadata(&path).expect("meta").len();
+        assert!(
+            after <= cap + line_len + 1,
+            "post-prune size {after} within cap {cap} + one line {line_len}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #127 / trinity P1 proof: after a size-cap rotation, the raw
+    /// viewer's [`find_record`] still resolves records in the KEPT window and
+    /// no longer finds the rotated-out oldest ones.
+    #[test]
+    fn find_record_after_size_prune_keeps_newest_window_only() {
+        let path = tmp_path("size-cap-find");
+        let base = 1_000_000;
+        for id in 0..40 {
+            append(Some(&path), &rec(id, base + id));
+        }
+        let len = std::fs::metadata(&path).expect("meta").len();
+        prune(Some(&path), 0, len / 2, u64::MAX);
+
+        let newest = find_record(Some(&path), 39, base + 39);
+        assert!(
+            newest.is_some_and(|r| r.id == 39),
+            "newest record still resolvable after rotation"
+        );
+        let oldest = find_record(Some(&path), 0, base);
+        assert!(oldest.is_none(), "rotated-out record is gone");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Size cap 0 = uncapped: a file over any hypothetical size is untouched
+    /// when retention is also 0.
+    #[test]
+    fn prune_size_cap_zero_keeps_everything() {
+        let path = tmp_path("size-cap-zero");
+        for id in 0..10 {
+            append(Some(&path), &rec(id, 1_000 + id));
+        }
+        let before = std::fs::metadata(&path).expect("meta").len();
+        prune(Some(&path), 0, 0, u64::MAX);
+        let after = std::fs::metadata(&path).expect("meta").len();
+        assert_eq!(before, after, "0/0 bounds never rewrite");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both bounds together: age drops the out-of-window head, size keeps the
+    /// total under the cap — the stricter of the two wins.
+    #[test]
+    fn prune_age_and_size_bounds_compose() {
+        let path = tmp_path("age-and-size");
+        let now = 100 * MS_PER_DAY;
+        // 2 ancient records (day 1) + 20 recent (day 99).
+        append(Some(&path), &rec(0, MS_PER_DAY));
+        append(Some(&path), &rec(1, MS_PER_DAY));
+        for id in 2..22 {
+            append(Some(&path), &rec(id, 99 * MS_PER_DAY));
+        }
+        let len = std::fs::metadata(&path).expect("meta").len();
+        // Cap that also forces dropping some RECENT records beyond the aged ones.
+        prune(Some(&path), 90, len / 4, now);
+        let contents = std::fs::read_to_string(&path).expect("file kept");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert!(!ids.contains(&0) && !ids.contains(&1), "aged records gone");
+        assert_eq!(*ids.last().expect("last"), 21, "newest kept");
+        assert!(ids.len() < 20, "size cap dropped recent records too");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn prune_with_zero_retention_keeps_all() {
         let path = tmp_path("prune-zero");
@@ -994,7 +1166,7 @@ mod tests {
         append(Some(&path), &rec(2, 2));
         let before = std::fs::read_to_string(&path).expect("file");
 
-        prune(Some(&path), 0, u64::MAX);
+        prune(Some(&path), 0, 0, u64::MAX);
 
         let after = std::fs::read_to_string(&path).expect("file");
         assert_eq!(before, after, "retention_days == 0 is a no-op");
@@ -1017,7 +1189,7 @@ mod tests {
         }
         append(Some(&path), &rec(1, MS_PER_DAY));
 
-        prune(Some(&path), 90, now);
+        prune(Some(&path), 90, 0, now);
 
         let contents = std::fs::read_to_string(&path).expect("file");
         let ids: Vec<u64> = contents
@@ -1037,7 +1209,7 @@ mod tests {
     fn prune_missing_file_is_a_noop() {
         let path = tmp_path("prune-missing");
         // Never created.
-        prune(Some(&path), 90, now_ms());
+        prune(Some(&path), 90, 0, now_ms());
         assert!(!path.exists(), "prune does not create the file");
     }
 
@@ -1049,7 +1221,7 @@ mod tests {
 
     #[test]
     fn prune_with_none_path_is_a_noop() {
-        prune(None, 90, now_ms());
+        prune(None, 90, 0, now_ms());
     }
 
     #[test]
@@ -1138,7 +1310,7 @@ mod tests {
         append(Some(&path), &rec(2, 99 * MS_PER_DAY));
         let before = std::fs::read_to_string(&path).expect("file");
 
-        prune(Some(&path), 90, now);
+        prune(Some(&path), 90, 0, now);
 
         let after = std::fs::read_to_string(&path).expect("file");
         assert_eq!(before, after, "log untouched");
@@ -1161,9 +1333,13 @@ mod tests {
 
         // Drive the two phases by hand to interleave an append deterministically.
         let cutoff = now.saturating_sub(90 * MS_PER_DAY);
-        let stage = prune_scan(&path, cutoff).expect("old record → rewrite staged");
+        let keep = |line: &str, cutoff: u64| {
+            matches!(serde_json::from_str::<RawIoRecord>(line),
+                Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff)
+        };
+        let stage = prune_scan(&path, cutoff, 0, &keep).expect("old record → rewrite staged");
         append(Some(&path), &rec(3, 99 * MS_PER_DAY)); // lands after the scan
-        prune_commit(&path, stage);
+        prune_commit(&path, stage, &IO_LOCK);
 
         let contents = std::fs::read_to_string(&path).expect("file");
         let ids: Vec<u64> = contents

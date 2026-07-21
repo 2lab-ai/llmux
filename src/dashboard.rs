@@ -711,6 +711,8 @@ pub struct ConfigFactsDoc {
     #[serde(default)]
     pub raw_io_max_body_bytes: u64,
     #[serde(default)]
+    pub raw_io_max_total_bytes: u64,
+    #[serde(default)]
     pub gradient_speed: f32,
     #[serde(default)]
     pub codex_upstream: String,
@@ -1896,6 +1898,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
                 .load(std::sync::atomic::Ordering::Relaxed),
             raw_io_retention_days: state.config.raw_io.retention_days,
             raw_io_max_body_bytes: state.config.raw_io.max_body_bytes as u64,
+            raw_io_max_total_bytes: state.config.raw_io.max_total_bytes,
             gradient_speed: state.config.tui_gradient.speed,
             codex_upstream: state.config.codex.upstream.clone(),
             proxy_max_request_bytes: state.config.proxy.max_request_bytes as u64,
