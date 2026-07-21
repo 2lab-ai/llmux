@@ -4113,6 +4113,86 @@ mod tests {
         assert_eq!(contents.lines().count(), 0, "aged-out lines all dropped");
     }
 
+    /// Issue #127 review MUST-FIX 1 (hydrate/prune ordering): the daemon
+    /// hydrates BEFORE the first prune because the hydration cut is a byte
+    /// offset captured at arm time — a prune that shrinks the file first
+    /// would pull live-appended lines inside the cut and double-count them.
+    /// This pins the SAFE order end-to-end: arm-time cut → live appends →
+    /// hydrate(cut) merges history behind live → prune afterwards; every
+    /// request is counted exactly once and the pruned file still holds the
+    /// newest lines.
+    #[test]
+    fn hydrate_before_prune_counts_each_request_exactly_once() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        // Pre-boot history: 10 persisted requests.
+        for id in 0..10 {
+            persist_request(
+                Some(&path),
+                &finished_full(
+                    id,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    10,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(10 + id),
+            );
+        }
+        // Arm time: capture the cut (pre-boot byte length).
+        let cut = std::fs::metadata(&path).expect("meta").len();
+        // Live traffic starts folding AND appending past the cut.
+        let mut live = ActivityLog::new(LOG_CAPACITY);
+        for id in 10..15 {
+            let event = finished_full(
+                id,
+                "b",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                20,
+                8,
+                None,
+                "/v1/messages",
+            );
+            live.apply(event.clone(), at(100 + id));
+            persist_request(Some(&path), &event, at(100 + id));
+        }
+        // Hydrate the pre-boot prefix only, merge behind live.
+        let mut history = ActivityLog::new(LOG_CAPACITY);
+        history
+            .load_persisted_prefix(&path, cut)
+            .expect("prefix load");
+        live.merge_history_behind(history);
+        assert_eq!(
+            live.totals_global().requests,
+            15,
+            "10 history + 5 live, each exactly once"
+        );
+        // Prune AFTER hydration: the cut is dead, so a size-cap rewrite can
+        // no longer interact with it — and the newest lines survive.
+        let len = std::fs::metadata(&path).expect("meta").len();
+        prune(Some(&path), 0, len / 2, u64::MAX);
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<PersistedRequest>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(*ids.last().expect("kept"), 14, "newest live line kept");
+        assert_eq!(
+            live.totals_global().requests,
+            15,
+            "in-memory totals untouched by the on-disk prune"
+        );
+    }
+
     #[test]
     fn persistence_is_best_effort_none_and_unwritable_paths_never_panic() {
         // None path: persist + load are silent no-ops, fold still works.
