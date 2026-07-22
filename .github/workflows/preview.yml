@@ -302,13 +302,23 @@ jobs:
           for attempt in 1 2 3; do
             git -C tap-bump fetch origin master
             git -C tap-bump reset --hard origin/master
-            # Freshness guard: preview-YYYY-MM-DD-HHMM-<sha12> sorts
-            # chronologically, so a delayed run never rolls the tap back over
-            # a newer cron/preview bump.
+            # Freshness guard: preview-YYYY-MM-DD-HHMM-<sha12> is chronological
+            # only down to the minute — the sha12 tail carries no time order.
+            # Compare minute prefixes; on an equal-minute different-sha tie the
+            # ordering is unknowable here, so leave it for the 6h cron instead
+            # of risking a rollback.
             CURRENT=$(sed -n 's|^.*releases/download/\(preview-[^/]*\)/.*|\1|p' tap-bump/Formula/llmux-preview.rb 2>/dev/null | head -1 || true)
-            if [ -n "$CURRENT" ] && [[ "$CURRENT" > "$TAG" ]]; then
-              echo "tap already at newer $CURRENT; skipping"
-              exit 0
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$TAG" ]; then
+              CUR_MIN="${CURRENT%-*}"
+              TAG_MIN="${TAG%-*}"
+              if [[ "$CUR_MIN" > "$TAG_MIN" ]]; then
+                echo "tap already at newer $CURRENT; skipping"
+                exit 0
+              fi
+              if [ "$CUR_MIN" = "$TAG_MIN" ]; then
+                echo "::warning::tap at $CURRENT from the same minute as $TAG; order ambiguous — leaving for the cron"
+                exit 0
+              fi
             fi
             render
             git -C tap-bump add Formula/llmux-preview.rb Casks/llmux-islands-preview.rb
