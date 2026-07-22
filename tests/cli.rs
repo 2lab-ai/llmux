@@ -670,7 +670,7 @@ fn dashboard_no_daemon_refuses_and_exits_1() {
         out.stderr
     );
     assert!(
-        out.stderr.contains("no llmux daemon on port 39117"),
+        out.stderr.contains("no llmux daemon at localhost:39117"),
         "stderr: {}",
         out.stderr
     );
