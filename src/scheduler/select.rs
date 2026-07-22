@@ -2594,10 +2594,12 @@ mod tests {
     // TRANSITIONS. Each test steps the SAME fixture from just-before to
     // just-after a fable weekly `resets_at` and asserts the invariant flips.
     // Static after-states are covered elsewhere (e.g.
-    // `reset_fable_window_no_longer_excludes_fable`); poll<->7d_oi
-    // freshest-wins is pinned by `stale_observation_does_not_overwrite_
-    // fresher_one` in scheduler/mod.rs. Guard: these tests VERIFY behavior,
-    // they do not redesign fable policy.
+    // `reset_fable_window_no_longer_excludes_fable`). Freshest-wins merge is
+    // pinned for the five-hour slot by `stale_observation_does_not_overwrite_
+    // fresher_one` in scheduler/mod.rs; the fable scoped merge shares the
+    // same policy (`merge_scoped`) but is not yet pinned by name — L2 follow
+    // -up. Guard: these tests VERIFY behavior, they do not redesign fable
+    // policy.
 
     /// #134 L1 invariants 1+2: crossing `resets_at` flips a critical/active
     /// bucket from preemptively-excluded to unconstraining in the same
@@ -2673,25 +2675,33 @@ mod tests {
             severity: LimitSeverity::Normal,
             is_active: true,
         }];
+        // Live challenger whose fable score RANKS ABOVE the cold anchor
+        // (~0.90) but inside the +25% SWITCH_MARGIN band (< 1.125):
+        // servable 0.78 x urgency ~1.28 (reset ~131h) ~= 1.00. Pure ranking
+        // would switch to it — only the margin stickiness keeps the anchor,
+        // so this fixture makes the stickiness itself load-bearing.
         let mut b = account("b");
         b.scoped_limits = vec![ScopedQuotaWindow {
             scope_label: "Fable".into(),
-            window: window(0.2, 200 * HOUR),
+            window: window(0.2, 131 * HOUR),
             severity: LimitSeverity::Normal,
             is_active: true,
         }];
+        let a_cold_at = at(NOW_SECS + 11);
+        let (sa, sb) = (
+            fable_score(&a, &params(), a_cold_at),
+            fable_score(&b, &params(), a_cold_at),
+        );
+        assert!(
+            sb > sa && sb < sa * (1.0 + SWITCH_MARGIN),
+            "fixture sanity: challenger outranks the cold anchor but sits inside the switch margin (sa={sa}, sb={sb})"
+        );
         let mut snap = pool(vec![a, b], None);
         snap.fable_current.insert(BackendGroup::Claude, id("a"));
         assert_eq!(
-            pick_scoped(
-                &snap,
-                &params(),
-                None,
-                at(NOW_SECS + 11),
-                RequestScope::Fable
-            ),
+            pick_scoped(&snap, &params(), None, a_cold_at, RequestScope::Fable),
             Decision::Stay,
-            "post-reset the anchor is cold AND eligible — stickiness keeps it"
+            "post-reset the anchor is cold AND eligible — margin stickiness keeps it against a rank-better live challenger"
         );
     }
 
@@ -2699,20 +2709,28 @@ mod tests {
     /// that falls inside the pin window — only the pin's own expiry ends it.
     #[test]
     fn reset_gate_manual_pin_survives_the_reset_boundary() {
-        let mut a = account("a");
-        a.scoped_limits = vec![ScopedQuotaWindow {
+        // The PINNED account itself carries the fable reset boundary
+        // (resets 10s from NOW) inside the 300s pin window — the FABLE lane
+        // must hold the pin straight through that boundary.
+        let mut b = account("b");
+        b.scoped_limits = vec![ScopedQuotaWindow {
             scope_label: "Fable".into(),
-            window: window(0.1, 10), // resets 10s from NOW, pin lasts 300s
+            window: window(0.1, 10),
             severity: LimitSeverity::Normal,
             is_active: true,
         }];
-        // Give `a` a decisively better default-lane score (barely used,
-        // soonest 7d reset) so that once the pin lapses, staying on `b`
-        // would contradict the perishability ranking.
-        a.seven_day = Some(window(0.06, 30 * HOUR));
-        let mut b = account("b");
-        b.seven_day = Some(window(0.02, 136 * HOUR));
-        let mut snap = pool(vec![a, b], Some("b"));
+        // Live challenger that clearly outranks the post-reset (cold) pinned
+        // account beyond the switch margin: once the pin lapses, staying
+        // would contradict the fable ranking.
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.1, 30 * HOUR),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        let mut snap = pool(vec![a, b], None);
+        snap.fable_current.insert(BackendGroup::Claude, id("b"));
         snap.manual_pin.insert(
             BackendGroup::Claude,
             crate::scheduler::ManualPin {
@@ -2720,15 +2738,22 @@ mod tests {
                 until: at(NOW_SECS + 300),
             },
         );
+        let fable_pick =
+            |now: SystemTime| pick_scoped(&snap, &params(), None, now, RequestScope::Fable);
         assert_eq!(
-            pick(&snap, &params(), None, at(NOW_SECS + 11)),
+            fable_pick(at(NOW_SECS + 5)),
             Decision::Stay,
-            "the reset boundary inside the pin window does not break the pin"
+            "before the boundary: pinned"
         );
         assert_eq!(
-            pick(&snap, &params(), None, at(NOW_SECS + 301)),
+            fable_pick(at(NOW_SECS + 11)),
+            Decision::Stay,
+            "the pinned account's own fable reset passing does not break the pin"
+        );
+        assert_eq!(
+            fable_pick(at(NOW_SECS + 301)),
             Decision::Switch { to: id("a") },
-            "past the pin's own expiry, automatic scheduling resumes"
+            "past the pin's own expiry, fable scheduling resumes on rank"
         );
     }
 
@@ -2745,8 +2770,9 @@ mod tests {
             severity: LimitSeverity::Normal,
             is_active: true,
         }];
-        assert!(
-            eligibility(&a, &params(), at(NOW_SECS + 11), false).is_some(),
+        assert_eq!(
+            eligibility(&a, &params(), at(NOW_SECS + 11), false),
+            Some(IneligibleReason::CoolingDown),
             "fable reset passed but the 429 park has not lapsed → still parked"
         );
         assert_eq!(
