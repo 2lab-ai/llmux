@@ -2590,6 +2590,172 @@ mod tests {
         );
     }
 
+    // ---- reset-gate L1 harness (issue #134): clock-injected BOUNDARY
+    // TRANSITIONS. Each test steps the SAME fixture from just-before to
+    // just-after a fable weekly `resets_at` and asserts the invariant flips.
+    // Static after-states are covered elsewhere (e.g.
+    // `reset_fable_window_no_longer_excludes_fable`); poll<->7d_oi
+    // freshest-wins is pinned by `stale_observation_does_not_overwrite_
+    // fresher_one` in scheduler/mod.rs. Guard: these tests VERIFY behavior,
+    // they do not redesign fable policy.
+
+    /// #134 L1 invariants 1+2: crossing `resets_at` flips a critical/active
+    /// bucket from preemptively-excluded to unconstraining in the same
+    /// fixture — the expired observation carries no utilization.
+    #[test]
+    fn reset_gate_preemptive_exclusion_lifts_crossing_the_boundary() {
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(1.0, 10), // resets 10s from NOW
+            severity: LimitSeverity::Critical,
+            is_active: true,
+        }];
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableWeeklyExhausted),
+            "just before reset: preemptive Fable exclusion holds"
+        );
+        assert_eq!(
+            gate_scoped(
+                &a,
+                &params(),
+                at(NOW_SECS + 11),
+                false,
+                false,
+                RequestScope::Fable
+            ),
+            None,
+            "just after reset: the expired bucket stops excluding"
+        );
+    }
+
+    /// #134 L1 invariant 4: the hyperbolic reset urgency collapses once the
+    /// boundary passes — an imminent-reset account's score is urgency-
+    /// dominated before, and drops to its cold (urgency=1) score after.
+    #[test]
+    fn reset_gate_urgency_collapses_after_the_boundary() {
+        let fable_acct = |reset_in: u64| {
+            let mut a = account("a");
+            a.scoped_limits = vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: window(0.5, reset_in),
+                severity: LimitSeverity::Normal,
+                is_active: true,
+            }];
+            a
+        };
+        let a = fable_acct(3600); // resets in 1h → near-max urgency
+        let before = fable_score(&a, &params(), now());
+        let after = fable_score(&a, &params(), at(NOW_SECS + 3601));
+        // Before: remaining fable headroom × ~capped urgency. After: the
+        // expired window reads utilization 0 and urgency 1 — a plain cold
+        // score, strictly below the urgency-amplified one.
+        assert!(
+            before > after * 10.0,
+            "urgency must dominate before the boundary (before={before}, after={after})"
+        );
+        assert!(
+            after > 0.0,
+            "after the boundary the account is cold-but-usable, not zero"
+        );
+    }
+
+    /// #134 L1 invariant 3 (cold anchoring): after its fable bucket resets,
+    /// the current account reads cold — and the fable lane's absolute
+    /// stickiness KEEPS the eligible anchor rather than hunting.
+    #[test]
+    fn reset_gate_cold_anchor_is_kept_after_its_reset() {
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.9, 10), // heavily used, resets in 10s
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        let mut b = account("b");
+        b.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.2, 200 * HOUR),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        let mut snap = pool(vec![a, b], None);
+        snap.fable_current.insert(BackendGroup::Claude, id("a"));
+        assert_eq!(
+            pick_scoped(
+                &snap,
+                &params(),
+                None,
+                at(NOW_SECS + 11),
+                RequestScope::Fable
+            ),
+            Decision::Stay,
+            "post-reset the anchor is cold AND eligible — stickiness keeps it"
+        );
+    }
+
+    /// #134 L1 invariant 5a: a manual pin outlives a fable reset boundary
+    /// that falls inside the pin window — only the pin's own expiry ends it.
+    #[test]
+    fn reset_gate_manual_pin_survives_the_reset_boundary() {
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.1, 10), // resets 10s from NOW, pin lasts 300s
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        // Give `a` a decisively better default-lane score (barely used,
+        // soonest 7d reset) so that once the pin lapses, staying on `b`
+        // would contradict the perishability ranking.
+        a.seven_day = Some(window(0.06, 30 * HOUR));
+        let mut b = account("b");
+        b.seven_day = Some(window(0.02, 136 * HOUR));
+        let mut snap = pool(vec![a, b], Some("b"));
+        snap.manual_pin.insert(
+            BackendGroup::Claude,
+            crate::scheduler::ManualPin {
+                account: id("b"),
+                until: at(NOW_SECS + 300),
+            },
+        );
+        assert_eq!(
+            pick(&snap, &params(), None, at(NOW_SECS + 11)),
+            Decision::Stay,
+            "the reset boundary inside the pin window does not break the pin"
+        );
+        assert_eq!(
+            pick(&snap, &params(), None, at(NOW_SECS + 301)),
+            Decision::Switch { to: id("a") },
+            "past the pin's own expiry, automatic scheduling resumes"
+        );
+    }
+
+    /// #134 L1 invariant 5b: a 429 cooldown clears on ITS clock, not the
+    /// fable reset's — the boundary passing does not un-park the account,
+    /// and the cooldown lapsing does.
+    #[test]
+    fn reset_gate_429_cooldown_is_independent_of_the_reset_boundary() {
+        let mut a = account("a");
+        a.cooldown_until = Some(at(NOW_SECS + 50));
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.9, 10),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        assert!(
+            eligibility(&a, &params(), at(NOW_SECS + 11), false).is_some(),
+            "fable reset passed but the 429 park has not lapsed → still parked"
+        );
+        assert_eq!(
+            eligibility(&a, &params(), at(NOW_SECS + 51), false),
+            None,
+            "the cooldown's own expiry frees the account"
+        );
+    }
+
     #[test]
     fn reset_fable_window_no_longer_excludes_fable() {
         // is_active=true but the weekly window has already reset → carries no
