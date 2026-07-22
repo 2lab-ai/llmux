@@ -179,12 +179,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      # PAT (or GitHub App token) with actions:write on 2lab-ai/homebrew-tap,
-      # so a fresh preview auto-bumps the tap formula instead of waiting on the
-      # tap's 6h cron. Optional: absent → the step below no-ops and the cron
-      # still catches up (no regression).
-      TAP_DISPATCH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -235,6 +229,110 @@ jobs:
             release/LlmuxIslands-*.zip
             release/SHA256SUMS
 
+      - name: Bump Homebrew tap to this preview
+        # Event-driven tap update: render Formula/llmux-preview.rb and
+        # Casks/llmux-islands-preview.rb from the assets just published (same
+        # sha256s brew will download) and push them to the tap over the deploy
+        # key, so `brew upgrade llmux-preview` / `llmux-islands-preview` see
+        # this build immediately instead of waiting on the tap's 6h cron
+        # (which stays as backstop and no-ops on "already at TAG").
+        # Best-effort: the release is already published, so a tap failure must
+        # not fail the publish job (the cron catches up within 6h).
+        continue-on-error: true
+        env:
+          # Deploy key with write access to 2lab-ai/homebrew-tap (repo-scoped;
+          # NOT a personal token). Step-scoped so no other step or action can
+          # read it; unset right after loading into the agent.
+          TAP_PUSH_KEY: ${{ secrets.TAP_PUSH_KEY }}
+        run: |
+          set -euo pipefail
+          # Secret unset (fork PRs, fresh clones) -> no-op; the 6h cron bumps.
+          if [ -z "${TAP_PUSH_KEY:-}" ]; then
+            echo "TAP_PUSH_KEY unset; skipping tap bump"
+            exit 0
+          fi
+          TAG="${{ needs.preflight.outputs.tag }}"
+          BUILD_ID="${{ needs.preflight.outputs.build_id }}"
+          # build_id = YYYY-MM-DD-HHMM-<sha12> -> brew version YYYY.MM.DD.HHMM
+          VERSION="$(echo "$BUILD_ID" | awk -F- '{print $1"."$2"."$3"."$4}')"
+
+          # Pinned GitHub SSH host key (docs.github.com "SSH key fingerprints");
+          # no TOFU via ssh-keyscan.
+          mkdir -p ~/.ssh
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
+          eval "$(env -u TAP_PUSH_KEY ssh-agent -s)" >/dev/null
+          # Kill the agent (and the key it holds) on every exit path — the
+          # credential must not outlive this step. Warn on unexpected failure
+          # so operators notice a broken best-effort propagation.
+          trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT
+          trap 'echo "::warning::tap bump failed mid-step; the 6h cron will catch up"' ERR
+          ssh-add - <<< "$TAP_PUSH_KEY"
+          unset TAP_PUSH_KEY
+
+          git clone --depth 1 git@github.com:2lab-ai/homebrew-tap.git tap-bump
+          git -C tap-bump config user.name "github-actions[bot]"
+          git -C tap-bump config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          declare -A SHAS
+          for name in llmux-macos-aarch64 llmux-macos-x86_64 llmux-linux-aarch64 llmux-linux-x86_64; do
+            SHAS[$name]=$(sha256sum "release/$name" | cut -d' ' -f1)
+          done
+          ZIP="release/LlmuxIslands-${VERSION}.zip"
+          [ -f "$ZIP" ] || { echo "::warning::missing $ZIP; skipping tap bump"; exit 0; }
+          ISLANDS_SHA=$(sha256sum "$ZIP" | cut -d' ' -f1)
+
+          render() {
+            sed -e "s/@VERSION@/$VERSION/g" \
+                -e "s/@TAG@/$TAG/g" \
+                -e "s/@SHA_MACOS_AARCH64@/${SHAS[llmux-macos-aarch64]}/" \
+                -e "s/@SHA_MACOS_X86_64@/${SHAS[llmux-macos-x86_64]}/" \
+                -e "s/@SHA_LINUX_AARCH64@/${SHAS[llmux-linux-aarch64]}/" \
+                -e "s/@SHA_LINUX_X86_64@/${SHAS[llmux-linux-x86_64]}/" \
+                tap-bump/Formula/llmux-preview.rb.tmpl > tap-bump/Formula/llmux-preview.rb
+            sed -e "s/@VERSION@/$VERSION/g" \
+                -e "s/@TAG@/$TAG/g" \
+                -e "s/@SHA@/$ISLANDS_SHA/" \
+                tap-bump/Casks/llmux-islands-preview.rb.tmpl > tap-bump/Casks/llmux-islands-preview.rb
+            ruby -c tap-bump/Formula/llmux-preview.rb
+            ruby -c tap-bump/Casks/llmux-islands-preview.rb
+            # A surviving token means the template/render contract drifted.
+            ! grep -q "@[A-Z_]\+@" tap-bump/Formula/llmux-preview.rb tap-bump/Casks/llmux-islands-preview.rb
+          }
+
+          for attempt in 1 2 3; do
+            git -C tap-bump fetch origin master
+            git -C tap-bump reset --hard origin/master
+            # Freshness guard: preview-YYYY-MM-DD-HHMM-<sha12> is chronological
+            # only down to the minute — the sha12 tail carries no time order.
+            # Compare minute prefixes; on an equal-minute different-sha tie the
+            # ordering is unknowable here, so leave it for the 6h cron instead
+            # of risking a rollback.
+            CURRENT=$(sed -n 's|^.*releases/download/\(preview-[^/]*\)/.*|\1|p' tap-bump/Formula/llmux-preview.rb 2>/dev/null | head -1 || true)
+            if [ -n "$CURRENT" ] && [ "$CURRENT" != "$TAG" ]; then
+              CUR_MIN="${CURRENT%-*}"
+              TAG_MIN="${TAG%-*}"
+              if [[ "$CUR_MIN" > "$TAG_MIN" ]]; then
+                echo "tap already at newer $CURRENT; skipping"
+                exit 0
+              fi
+              if [ "$CUR_MIN" = "$TAG_MIN" ]; then
+                echo "::warning::tap at $CURRENT from the same minute as $TAG; order ambiguous — leaving for the cron"
+                exit 0
+              fi
+            fi
+            render
+            git -C tap-bump add Formula/llmux-preview.rb Casks/llmux-islands-preview.rb
+            git -C tap-bump diff --cached --quiet && { echo "tap already current"; exit 0; }
+            git -C tap-bump commit -m "llmux-preview + llmux-islands-preview $TAG"
+            if git -C tap-bump push; then
+              echo "tap bumped to $TAG"
+              exit 0
+            fi
+            echo "push lost a race (attempt $attempt); refetching"
+          done
+          echo "::warning::tap push failed after 3 attempts; the 6h cron will catch up"
+          exit 0
+
       - name: Prune old preview prereleases (keep 15)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -257,15 +355,3 @@ jobs:
             [ -n "$tag" ] || continue
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < old-preview-tags.txt
-
-      - name: Bump Homebrew tap to this preview
-        # Fire-and-forget: kick the tap's bump.yml so `brew upgrade
-        # llmux-preview` sees this build immediately. Skipped when the token
-        # secret is unset (the tap's 6h cron still bumps eventually).
-        if: ${{ env.TAP_DISPATCH_TOKEN != '' }}
-        env:
-          GH_TOKEN: ${{ env.TAP_DISPATCH_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh workflow run bump.yml --repo 2lab-ai/homebrew-tap
-          echo "dispatched homebrew-tap bump.yml for ${{ needs.preflight.outputs.tag }}"
