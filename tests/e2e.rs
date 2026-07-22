@@ -3135,7 +3135,7 @@ async fn readiness_precedes_history_hydration_and_live_requests_survive_it() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("history never hydrated: totals stuck at {last}, expected {expected}");
-    }
+}
 
 // 14. OAuth token relay (PROXY-09)
 // ---------------------------------------------------------------------------
