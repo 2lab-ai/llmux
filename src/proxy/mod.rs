@@ -1,10 +1,12 @@
 //! The proxy core (FR1): axum listener, request rewrite + upstream forward,
 //! SSE passthrough, optional request logging.
 
+pub mod classify;
 pub mod codex_trace;
 pub mod forward;
 pub mod idle_probe;
 pub mod logging;
+pub mod login;
 pub mod raw_io;
 pub mod server;
 pub mod sse;

@@ -57,7 +57,11 @@ pub fn alias(name: &str) -> String {
 
 /// The pure mapping (no env read): a `provider:` tag (e.g. `codex:`) is kept and
 /// only the email after it is replaced; a value with no `@` is returned as-is.
-fn alias_always(name: &str) -> String {
+/// Public because the `email_anonymous` server setting reuses this exact
+/// mapping at the TUI RENDER layer (demo mode keeps its load-time substitution
+/// and therefore takes precedence — aliasing an already-aliased name still
+/// lands in the fake pool).
+pub fn alias_always(name: &str) -> String {
     let (prefix, email) = match name.split_once(':') {
         Some((tag, rest)) if rest.contains('@') => (format!("{tag}:"), rest),
         _ => (String::new(), name),
@@ -67,6 +71,51 @@ fn alias_always(name: &str) -> String {
     }
     let idx = (fnv1a(email) % POOL.len() as u64) as usize;
     format!("{prefix}{}", POOL[idx])
+}
+
+/// Replace every email-looking token inside free-form `text` with its
+/// deterministic alias — for TUI surfaces that carry emails EMBEDDED in a
+/// sentence (activity notes like `switch a@x.com → b@y.com (manual)`, tracing
+/// lines) where [`alias_always`]'s whole-name contract doesn't apply. A token
+/// is a maximal run of email-charset bytes (`[A-Za-z0-9._%+-@]`); runs
+/// containing `@` with a non-empty local part and a dot-bearing domain are
+/// swapped via [`alias_always`], everything else passes through byte-for-byte.
+pub fn mask_email_text(text: &str) -> String {
+    fn email_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-' | b'@')
+    }
+    fn looks_like_email(token: &str) -> bool {
+        match token.split_once('@') {
+            Some((local, domain)) => {
+                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+            }
+            None => false,
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if email_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && email_byte(bytes[i]) {
+                i += 1;
+            }
+            // The run is pure ASCII (email_byte admits only ASCII), so this
+            // slice is always on a char boundary.
+            let token = &text[start..i];
+            if looks_like_email(token) {
+                out.push_str(&alias_always(token));
+            } else {
+                out.push_str(token);
+            }
+        } else {
+            let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
 }
 
 /// FNV-1a over the bytes — a small, dependency-free, deterministic hash. (Not
@@ -88,8 +137,8 @@ mod tests {
     #[test]
     fn alias_is_stable_for_the_same_input() {
         assert_eq!(
-            alias_always("info@insightquest.io"),
-            alias_always("info@insightquest.io"),
+            alias_always("info@example.com"),
+            alias_always("info@example.com"),
             "same real name must always map to the same fake one"
         );
     }
@@ -118,14 +167,47 @@ mod tests {
     fn distinct_typical_accounts_get_distinct_aliases() {
         // The four demo accounts must read as four different people.
         let names = [
-            "ai2@insightquest.io",
-            "notify@insightquest.io",
-            "codex:ai@insightquest.io",
-            "codex:icedac@gmail.com",
+            "ai2@example.com",
+            "notify@example.com",
+            "codex:ai@example.com",
+            "codex:user@example.com",
         ];
         let aliased: Vec<String> = names.iter().map(|n| alias_always(n)).collect();
         let unique: std::collections::HashSet<&String> = aliased.iter().collect();
         assert_eq!(unique.len(), names.len(), "aliases collided: {aliased:?}");
+    }
+
+    #[test]
+    fn mask_email_text_replaces_embedded_emails_only() {
+        let masked = mask_email_text("switch a@real-x.com → b@real-y.io (manual), 3s ago");
+        assert!(!masked.contains("real-x"), "got {masked}");
+        assert!(!masked.contains("real-y"), "got {masked}");
+        assert!(masked.starts_with("switch "), "prose kept: {masked}");
+        assert!(masked.contains(" → "), "arrow kept: {masked}");
+        assert!(
+            masked.ends_with("(manual), 3s ago"),
+            "suffix kept: {masked}"
+        );
+        // Both replacements come from the fake pool.
+        for alias in masked
+            .split_whitespace()
+            .filter(|t| t.contains('@'))
+            .map(|t| t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '@' && c != '.'))
+        {
+            assert!(POOL.contains(&alias), "not a pool alias: {alias}");
+        }
+    }
+
+    #[test]
+    fn mask_email_text_leaves_non_email_text_alone() {
+        for text in [
+            "config reloaded: 3 account(s)",
+            "POST /v1/messages 200",
+            "utf-8 안전 · no emails here",
+            "half@ and @half stay", // no domain dot / no local part
+        ] {
+            assert_eq!(mask_email_text(text), text);
+        }
     }
 
     #[test]

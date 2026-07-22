@@ -1,0 +1,728 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://2lab.ai/schemas/llmux-islands/ui-contract-v1.json",
+  "title": "llmux-islands semantic UI contract",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "revision",
+    "lifecycle",
+    "window",
+    "navigation",
+    "connection",
+    "usage",
+    "statistics",
+    "settings",
+    "notices",
+    "verification_receipts"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "revision": { "type": "integer", "minimum": 0 },
+    "lifecycle": {
+      "enum": ["starting", "ready", "offline", "fatal"]
+    },
+    "window": { "$ref": "#/$defs/window" },
+    "navigation": {
+      "enum": ["usage", "statistics", "menu"]
+    },
+    "connection": { "$ref": "#/$defs/connection" },
+    "usage": { "$ref": "#/$defs/usage" },
+    "statistics": { "$ref": "#/$defs/statistics" },
+    "settings": { "$ref": "#/$defs/settings" },
+    "operation": {
+      "anyOf": [{ "$ref": "#/$defs/operation" }, { "type": "null" }]
+    },
+    "notices": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/notice" }
+    },
+    "verification_receipts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/verificationReceipt" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "window": {
+      "type": "object",
+      "required": [
+        "open",
+        "open_reason",
+        "selected_screen_id",
+        "presentation",
+        "width",
+        "content_height",
+        "provider_in_flight"
+      ],
+      "properties": {
+        "open": { "type": "boolean" },
+        "open_reason": {
+          "enum": [
+            "none",
+            "click",
+            "hover",
+            "notification",
+            "usage_alert",
+            "boot"
+          ]
+        },
+        "selected_screen_id": { "type": "string" },
+        "presentation": {
+          "enum": ["layer_shell", "positioned_x11", "regular"]
+        },
+        "width": { "type": "integer", "minimum": 240, "maximum": 3840 },
+        "content_height": { "type": "integer", "minimum": 44, "maximum": 2160 },
+        "provider_in_flight": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "connection": {
+      "type": "object",
+      "required": [
+        "endpoint_display",
+        "remote",
+        "authenticated",
+        "last_success_ms",
+        "retry_at_ms"
+      ],
+      "properties": {
+        "endpoint_display": { "type": "string" },
+        "remote": { "type": "boolean" },
+        "authenticated": { "type": "boolean" },
+        "daemon_version": { "type": ["string", "null"] },
+        "last_success_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "retry_at_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "error": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "accounts",
+        "current_by_group",
+        "provider_in_flight",
+        "login"
+      ],
+      "properties": {
+        "accounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/accountTile" }
+        },
+        "current_by_group": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "provider_in_flight": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "login": { "$ref": "#/$defs/login" }
+      },
+      "additionalProperties": true
+    },
+    "accountTile": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "provider",
+        "current",
+        "paused",
+        "healthy",
+        "status",
+        "in_flight",
+        "gauges",
+        "warning_level"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "display_name": { "type": "string" },
+        "provider": {
+          "enum": ["claude", "codex", "grok", "api", "unknown"]
+        },
+        "current": { "type": "boolean" },
+        "paused": { "type": "boolean" },
+        "healthy": { "type": "boolean" },
+        "status": { "type": "string" },
+        "blocked_reason": { "type": ["string", "null"] },
+        "in_flight": { "type": "integer", "minimum": 0 },
+        "token_expiry": { "$ref": "#/$defs/tokenExpiry" },
+        "gauges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/gauge" }
+        },
+        "warning_level": {
+          "enum": ["normal", "warning", "critical"]
+        },
+        "busy_action": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "tokenExpiry": {
+      "type": "object",
+      "required": ["state", "expires_at_ms", "countdown_text"],
+      "properties": {
+        "state": { "type": "string" },
+        "expires_at_ms": { "type": "integer", "minimum": 0 },
+        "countdown_text": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "gauge": {
+      "type": "object",
+      "required": [
+        "kind",
+        "available",
+        "used_fraction",
+        "remaining_fraction",
+        "constraining"
+      ],
+      "properties": {
+        "kind": {
+          "enum": ["five_hour", "seven_day", "fable_weekly"]
+        },
+        "available": { "type": "boolean" },
+        "used_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "remaining_fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "resets_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Quota reset as Unix epoch milliseconds"
+        },
+        "reset_text": { "type": ["string", "null"] },
+        "constraining": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "login": {
+      "type": "object",
+      "required": ["phase"],
+      "properties": {
+        "phase": {
+          "enum": [
+            "idle",
+            "starting",
+            "pending",
+            "cancelling",
+            "done",
+            "error",
+            "cancelled"
+          ]
+        },
+        "provider": { "type": ["string", "null"] },
+        "state": { "type": ["string", "null"] },
+        "verification_uri": { "type": ["string", "null"] },
+        "user_code": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "statistics": {
+      "type": "object",
+      "required": [
+        "overview",
+        "models",
+        "clients",
+        "health",
+        "heatmaps",
+        "activity_receipts",
+        "data_quality"
+      ],
+      "properties": {
+        "overview": { "$ref": "#/$defs/statisticsOverview" },
+        "models": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/modelStatistics" }
+        },
+        "clients": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/clientStatistics" }
+        },
+        "health": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/healthStatistics" }
+        },
+        "heatmaps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/heatmapStatistics" }
+        },
+        "activity_receipts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/activityReceipt" }
+        },
+        "data_quality": { "$ref": "#/$defs/dataQuality" }
+      },
+      "additionalProperties": true
+    },
+    "statisticsOverview": {
+      "type": "object",
+      "required": [
+        "requests",
+        "ok",
+        "errors",
+        "tokens_in",
+        "tokens_out",
+        "rpm_5m",
+        "in_flight",
+        "cost_usd"
+      ],
+      "properties": {
+        "requests": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "tokens_in": { "type": "integer", "minimum": 0 },
+        "tokens_out": { "type": "integer", "minimum": 0 },
+        "rpm_5m": { "type": "number", "minimum": 0 },
+        "in_flight": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "modelStatistics": {
+      "type": "object",
+      "required": [
+        "group",
+        "model",
+        "requests",
+        "ok",
+        "errors",
+        "tokens_in",
+        "tokens_out",
+        "cache_read",
+        "cache_creation",
+        "last_used_ms",
+        "in_flight",
+        "accounts",
+        "efforts",
+        "endpoints",
+        "cost_usd"
+      ],
+      "properties": {
+        "group": { "type": "string" },
+        "model": { "type": "string" },
+        "requests": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "tokens_in": { "type": "integer", "minimum": 0 },
+        "tokens_out": { "type": "integer", "minimum": 0 },
+        "cache_read": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_creation": { "type": ["integer", "null"], "minimum": 0 },
+        "last_used_ms": { "type": "integer", "minimum": 0 },
+        "in_flight": { "type": "integer", "minimum": 0 },
+        "accounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/modelAccountStatistics" }
+        },
+        "efforts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/statisticsCount" }
+        },
+        "endpoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/statisticsCount" }
+        },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "modelAccountStatistics": {
+      "type": "object",
+      "required": [
+        "display_name",
+        "requests",
+        "ok",
+        "errors",
+        "tokens_in",
+        "tokens_out"
+      ],
+      "properties": {
+        "display_name": { "type": "string" },
+        "requests": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "tokens_in": { "type": "integer", "minimum": 0 },
+        "tokens_out": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "statisticsCount": {
+      "type": "object",
+      "required": ["label", "requests"],
+      "properties": {
+        "label": { "type": "string" },
+        "requests": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "clientStatistics": {
+      "type": "object",
+      "required": [
+        "client",
+        "requests",
+        "ok",
+        "errors",
+        "tokens_in",
+        "tokens_out",
+        "cost_usd",
+        "last_seen_ms"
+      ],
+      "properties": {
+        "client": { "type": "string" },
+        "requests": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "tokens_in": { "type": "integer", "minimum": 0 },
+        "tokens_out": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 },
+        "last_seen_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "healthStatistics": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "kind",
+        "healthy",
+        "paused",
+        "status",
+        "blocked_reason",
+        "cooldown_until_ms",
+        "cooldown_source",
+        "in_flight",
+        "token_expires_at_ms",
+        "last_refresh_ms"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "display_name": { "type": "string" },
+        "kind": { "type": "string" },
+        "healthy": { "type": "boolean" },
+        "paused": { "type": "boolean" },
+        "status": { "type": "string" },
+        "blocked_reason": { "type": ["string", "null"] },
+        "cooldown_until_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Account cooldown deadline as Unix epoch milliseconds"
+        },
+        "cooldown_source": { "type": ["string", "null"] },
+        "in_flight": { "type": "integer", "minimum": 0 },
+        "token_expires_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "last_refresh_ms": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "heatmapStatistics": {
+      "type": "object",
+      "required": ["window", "window_secs", "cells"],
+      "properties": {
+        "window": { "type": "string" },
+        "window_secs": { "type": "integer", "minimum": 0 },
+        "cells": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/heatmapCell" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "heatmapCell": {
+      "type": "object",
+      "required": [
+        "group",
+        "model",
+        "account_display",
+        "requests",
+        "ok",
+        "errors",
+        "tokens_in",
+        "tokens_out",
+        "cache_read",
+        "cache_creation",
+        "tokens"
+      ],
+      "properties": {
+        "group": { "type": "string" },
+        "model": { "type": "string" },
+        "account_display": { "type": "string" },
+        "requests": { "type": "integer", "minimum": 0 },
+        "ok": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "tokens_in": { "type": "integer", "minimum": 0 },
+        "tokens_out": { "type": "integer", "minimum": 0 },
+        "cache_read": { "type": "integer", "minimum": 0 },
+        "cache_creation": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "dataQuality": {
+      "type": "object",
+      "required": ["model_usage", "windowed", "cost", "cache"],
+      "properties": {
+        "model_usage": { "type": "string" },
+        "windowed": { "type": "string" },
+        "cost": { "type": "string" },
+        "cache": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "activityReceipt": {
+      "type": "object",
+      "required": [
+        "receipt_id",
+        "kind",
+        "occurred_at_ms",
+        "fast",
+        "error"
+      ],
+      "properties": {
+        "receipt_id": { "type": "string" },
+        "kind": { "enum": ["in_flight", "request", "note"] },
+        "occurred_at_ms": { "type": "integer", "minimum": 0 },
+        "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "method": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "account_display": { "type": ["string", "null"] },
+        "provider": {
+          "enum": ["claude", "codex", "grok", "api", "unknown", null]
+        },
+        "model": { "type": ["string", "null"] },
+        "effort": { "type": ["string", "null"] },
+        "fast": { "type": "boolean" },
+        "tokens": {
+          "anyOf": [{ "$ref": "#/$defs/receiptTokens" }, { "type": "null" }]
+        },
+        "cache": {
+          "anyOf": [{ "$ref": "#/$defs/receiptCache" }, { "type": "null" }]
+        },
+        "cost_usd": { "type": ["number", "null"], "minimum": 0 },
+        "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "elapsed_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "message": { "type": ["string", "null"] },
+        "error": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "receiptTokens": {
+      "type": "object",
+      "required": ["input", "output"],
+      "properties": {
+        "input": { "type": "integer", "minimum": 0 },
+        "output": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "receiptCache": {
+      "type": "object",
+      "required": ["read", "creation"],
+      "properties": {
+        "read": { "type": ["integer", "null"], "minimum": 0 },
+        "creation": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "settings": {
+      "type": "object",
+      "required": [
+        "email_anonymous",
+        "show_fable_weekly",
+        "api_key_configured",
+        "sound_id",
+        "screens",
+        "sounds",
+        "events",
+        "autostart",
+        "maintenance",
+        "capabilities"
+      ],
+      "properties": {
+        "email_anonymous": { "type": "boolean" },
+        "show_fable_weekly": { "type": "boolean" },
+        "api_key_configured": { "type": "boolean" },
+        "sound_id": { "type": ["string", "null"] },
+        "screens": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/screenOption" }
+        },
+        "sounds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/soundOption" }
+        },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/event" }
+        },
+        "autostart": { "$ref": "#/$defs/autostart" },
+        "maintenance": { "$ref": "#/$defs/maintenance" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      },
+      "additionalProperties": true
+    },
+    "screenOption": {
+      "type": "object",
+      "required": ["id", "label", "selected"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "selected": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "soundOption": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "selected": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "required": ["id", "from", "to", "content"],
+      "properties": {
+        "id": { "type": "string" },
+        "from": { "type": "string" },
+        "to": { "type": "string" },
+        "content": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "autostart": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] },
+        "available": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "maintenance": {
+      "type": "object",
+      "required": [
+        "channel",
+        "version",
+        "islands_version",
+        "latest_version",
+        "update_available",
+        "install_owner",
+        "license",
+        "source_url"
+      ],
+      "properties": {
+        "channel": { "enum": ["stable", "preview", null] },
+        "version": { "type": ["string", "null"] },
+        "islands_version": { "type": "string" },
+        "latest_version": { "type": ["string", "null"] },
+        "update_available": { "type": ["boolean", "null"] },
+        "install_owner": { "type": ["string", "null"] },
+        "license": { "type": "string" },
+        "source_url": { "type": "string" },
+        "instructions": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["layer_shell", "tray", "notifications"],
+      "properties": {
+        "presentation": {
+          "enum": ["layer_shell", "positioned_x11", "regular"]
+        },
+        "remote": { "type": "boolean" },
+        "layer_shell": { "$ref": "#/$defs/capability" },
+        "tray": { "$ref": "#/$defs/capability" },
+        "notifications": { "$ref": "#/$defs/capability" }
+      },
+      "additionalProperties": true
+    },
+    "capability": {
+      "type": "object",
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "type": "object",
+      "required": ["id", "kind", "started_at_ms"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "type": "string" },
+        "target_display": { "type": ["string", "null"] },
+        "started_at_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "notice": {
+      "type": "object",
+      "required": ["id", "level", "message"],
+      "properties": {
+        "id": { "type": "string" },
+        "level": { "enum": ["info", "warning", "error"] },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "verificationReceipt": {
+      "type": "object",
+      "required": [
+        "id",
+        "operation",
+        "started_at_ms",
+        "finished_at_ms",
+        "outcome",
+        "message"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "operation": {
+          "enum": [
+            "login",
+            "add_account",
+            "remove_account",
+            "pause_account",
+            "settings",
+            "event",
+            "maintenance",
+            "autostart"
+          ]
+        },
+        "target_display": { "type": ["string", "null"] },
+        "started_at_ms": { "type": "integer", "minimum": 0 },
+        "finished_at_ms": { "type": "integer", "minimum": 0 },
+        "outcome": {
+          "enum": ["succeeded", "failed", "cancelled", "no_change"]
+        },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

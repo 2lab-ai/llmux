@@ -28,6 +28,13 @@ pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
 /// dropped event), the oldest in-flight entry is retired as an error note
 /// instead of leaking forever.
 const MAX_IN_FLIGHT: usize = 64;
+/// Rolling window the header health verdict aggregates over (glance-triage).
+pub(crate) const HEALTH_WINDOW: Duration = Duration::from_secs(300);
+/// One bucket per second of [`HEALTH_WINDOW`] (+1 for the partial current
+/// second): the aggregation is EXACT for any request rate at fixed memory —
+/// a raw per-event deque with a length cap would silently shorten the time
+/// window during a storm, exactly when accuracy matters.
+const HEALTH_BUCKET_CAP: usize = HEALTH_WINDOW.as_secs() as usize + 1;
 /// Age after which an in-flight row is presumed finished and swept, even if no
 /// `RequestFinished` event ever arrived (the event was dropped on a full
 /// activity channel). Real requests finish in well under 90s per the daemon
@@ -36,8 +43,9 @@ const MAX_IN_FLIGHT: usize = 64;
 const STALE_IN_FLIGHT: Duration = Duration::from_secs(300);
 
 /// A request that has started but not finished — rendered with a spinner.
-/// `group`/`model` are filled at routing time so the dashboard can attribute
-/// in-flight requests to a model row before they complete (req11).
+/// `group`/`model`/`effort`/`fast` are filled at routing time so the dashboard
+/// can attribute in-flight requests to a model row — and show the same
+/// metadata badge as completed rows — before they complete (req11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InFlight {
     pub id: u64,
@@ -46,13 +54,30 @@ pub(crate) struct InFlight {
     pub account: Option<String>,
     pub group: Option<String>,
     pub model: Option<String>,
+    /// Per-request effective reasoning effort, when known at routing time.
+    pub effort: Option<String>,
+    /// Codex fast mode in effect (always `false` for claude).
+    pub fast: bool,
+    /// Message-kind classification, known at start time (TUI UI-6 item 1) so
+    /// the in-flight row renders the same `kind` column as its completed row.
+    pub kind: Option<String>,
     pub started_at: SystemTime,
 }
 
 /// Body of a completed log entry.
+// Request dwarfs Note by design: nearly every entry IS a Request (Notes are
+// rare operator lines), so boxing the common variant would trade one heap
+// allocation per real entry for slack in the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletedBody {
     Request {
+        /// The request's activity id — the correlation key into the raw-io
+        /// log (`raw-io.jsonl`) for the raw request/response viewer. A
+        /// per-process counter (1-based; resets on daemon restart), so raw
+        /// lookups pair it with the completion timestamp. `0` = unknown
+        /// (an attach doc from a pre-UI-7 daemon).
+        id: u64,
         method: String,
         path: String,
         account: Option<String>,
@@ -64,6 +89,26 @@ pub(crate) enum CompletedBody {
         group: Option<String>,
         model: Option<String>,
         effort: Option<String>,
+        /// Codex fast mode was in effect (`Some(false)` for claude; `None`
+        /// only for pre-field replayed history — "unknown", never coerced).
+        fast: Option<bool>,
+        /// Millis to first upstream body chunk / first streamed output delta
+        /// (both from the served attempt's upstream dispatch), plus the
+        /// stream-side post-delta span (perf telemetry v1). `None` on error
+        /// paths, non-streaming relays, and pre-field history.
+        ttfb_ms: Option<u64>,
+        ttft_ms: Option<u64>,
+        gen_ms: Option<u64>,
+        /// Upstream stream aborted mid-body (provider failure).
+        aborted: bool,
+        /// Keyless client identity (`metadata.user_id`) — keys the derived
+        /// session label shown on the row (TUI UI-3 U2).
+        user_id: Option<String>,
+        /// Message-kind token from `proxy::classify` ("user"/"compact"/…).
+        kind: Option<String>,
+        /// Cleaned input excerpt (bounded), shown truncated on the row and
+        /// in full on the click-expanded detail line.
+        excerpt: Option<String>,
     },
     Note {
         text: String,
@@ -117,6 +162,122 @@ impl Completed {
     }
 }
 
+/// Days of per-day/per-model token history retained for the Tokens-per-Day
+/// chart (UI-3 U14).
+const DAILY_RETAIN_DAYS: u64 = 90;
+
+/// One (day, group, model) cell of the Tokens-per-Day chart (UI-3 U14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DailyTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+/// Calendar granularities of the Usage tab (usage-stats): hourly, daily,
+/// monthly buckets over the persisted request history. Distinct from
+/// [`StatsWindow`] (trailing 24h/72h windows) — these are CALENDAR buckets
+/// the operator reads like a bill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UsageGran {
+    Hour,
+    #[default]
+    Day,
+    Month,
+}
+
+impl UsageGran {
+    /// The next granularity in the `g` cycle (hour → day → month → hour).
+    pub(crate) fn next(self) -> UsageGran {
+        match self {
+            UsageGran::Hour => UsageGran::Day,
+            UsageGran::Day => UsageGran::Month,
+            UsageGran::Month => UsageGran::Hour,
+        }
+    }
+
+    /// Wire tag carried on [`crate::dashboard::UsageStatDoc::gran`]. Stable —
+    /// the attach client matches on it.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            UsageGran::Hour => "hour",
+            UsageGran::Day => "day",
+            UsageGran::Month => "month",
+        }
+    }
+
+    /// UI label for the Usage tab header.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UsageGran::Hour => "hourly",
+            UsageGran::Day => "daily",
+            UsageGran::Month => "monthly",
+        }
+    }
+}
+
+/// Hourly usage buckets retained for the Usage tab (72h — matches the widest
+/// [`StatsWindow`]). Older hours are answered by the daily/monthly rollups;
+/// arbitrary-past hourly drill-down needs the paged store (issue #107).
+const USAGE_HOURLY_RETAIN_HOURS: u64 = 72;
+/// Daily usage buckets retained for the Usage tab. Wider than the chart's
+/// [`DAILY_RETAIN_DAYS`] so the calendar table reaches back two quarters;
+/// months beyond this are still covered by the unbounded monthly rollup.
+const USAGE_DAILY_RETAIN_DAYS: u64 = 180;
+
+/// One (bucket, group, model) cell of the Usage tab: request count + the four
+/// token counters. Unlike [`DailyTokens`] (chart cells, token events only),
+/// a cell counts EVERY attributed finished request — a failed request with no
+/// usage block still shows up in the requests column, mirroring the
+/// per-model row semantics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UsageCell {
+    pub requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl UsageCell {
+    /// Fold one finished request into the cell.
+    fn add(&mut self, tokens: Option<TokenCounts>) {
+        self.requests = self.requests.saturating_add(1);
+        if let Some(t) = tokens {
+            self.input = self.input.saturating_add(t.input);
+            self.output = self.output.saturating_add(t.output);
+            self.cache_read = self.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+            self.cache_creation = self
+                .cache_creation
+                .saturating_add(t.cache_creation.unwrap_or(0));
+        }
+    }
+
+    /// Merge another cell (history-behind hydration).
+    fn merge(&mut self, other: &UsageCell) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+    }
+}
+
+/// One usage-bucket map: bucket key → (group, model) → cell. Hour keys are
+/// epoch HOURS (UTC); day keys are LOCAL civil days (epoch days of the
+/// offset-shifted clock); month keys are LOCAL civil `year*12 + month0`.
+type UsageBuckets = std::collections::BTreeMap<u64, HashMap<(String, String), UsageCell>>;
+
+/// First bucket key inside a trailing window of `retain` buckets ending at
+/// `anchor` INCLUSIVE: `anchor - (retain - 1)`. The `- 1` is the load-bearing
+/// inclusive-window semantic — every fold/merge/read site shares this one
+/// definition so retention and serving can never disagree at the boundary
+/// bucket (review CR).
+fn window_floor(anchor: u64, retain: u64) -> u64 {
+    anchor.saturating_sub(retain - 1)
+}
+
 /// Per-account lifetime counters for the table's totals columns and the
 /// global totals pane (ok/error split + in/out token split).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -146,6 +307,103 @@ impl Totals {
 }
 
 // ---------------------------------------------------------------------------
+// Daily perf aggregation (perf telemetry v1): per (day, group, model, fast).
+// ---------------------------------------------------------------------------
+
+/// Key of one perf series: (group, model, fast) — `fast: None` = recorded
+/// before the field existed ("unknown"), its own series.
+type PerfKey = (String, String, Option<bool>);
+/// Day (epoch days, UTC) → series → raw perf sums.
+type PerfDays = std::collections::BTreeMap<u64, HashMap<PerfKey, PerfCell>>;
+
+/// One (day, group, model, fast) cell of the observed-performance stats
+/// (perf telemetry v1). All counters are RAW SUMS — throughput is derived at
+/// display time as `Σoutput/Σms` (never an average of per-request rates), so
+/// the cell stays mergeable and replay-rebuildable. `fast` is three-state:
+/// `Some(true|false)` from recorded requests, `None` = pre-field history
+/// ("unknown"), aggregated as its own series — never folded into fast=off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PerfCell {
+    /// Every attributed finished request (errors included).
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    /// Throughput samples: requests with `output > 0` and a positive
+    /// duration. `output_tokens`/`e2e_ms` sum over exactly these.
+    pub tps_n: u64,
+    pub output_tokens: u64,
+    pub e2e_ms: u64,
+    /// Measured subset: throughput samples that also carry `ttft_ms` with
+    /// `duration > ttft` — the only samples allowed into the "estimated
+    /// post-delta" series (approximate/legacy samples never mix in).
+    pub measured_n: u64,
+    pub measured_output: u64,
+    pub post_ttft_ms: u64,
+    /// TTFB observations (any finished request that recorded one).
+    pub ttfb_n: u64,
+    pub ttfb_ms_sum: u64,
+}
+
+impl PerfCell {
+    /// Fold one attributed finished request into the cell (see field docs for
+    /// the sample gates).
+    fn add(
+        &mut self,
+        status: u16,
+        aborted: bool,
+        tokens: Option<TokenCounts>,
+        duration_ms: u64,
+        ttfb_ms: Option<u64>,
+        gen_ms: Option<u64>,
+    ) {
+        self.requests = self.requests.saturating_add(1);
+        // A mid-stream upstream abort is a provider failure even though the
+        // client already received a success status line (review MUST-FIX 8).
+        if status < 400 && !aborted {
+            self.ok = self.ok.saturating_add(1);
+        } else {
+            self.errors = self.errors.saturating_add(1);
+        }
+        if let Some(ms) = ttfb_ms {
+            self.ttfb_n = self.ttfb_n.saturating_add(1);
+            self.ttfb_ms_sum = self.ttfb_ms_sum.saturating_add(ms);
+        }
+        let output = tokens.map(|t| t.output).unwrap_or(0);
+        if output == 0 || duration_ms == 0 {
+            return; // not a throughput sample (still counted above).
+        }
+        self.tps_n = self.tps_n.saturating_add(1);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.e2e_ms = self.e2e_ms.saturating_add(duration_ms);
+        // Measured series: the stream-side post-delta span — never derived
+        // from the request duration, so baselines cannot mix.
+        if let Some(gen) = gen_ms {
+            if gen > 0 {
+                self.measured_n = self.measured_n.saturating_add(1);
+                self.measured_output = self.measured_output.saturating_add(output);
+                self.post_ttft_ms = self.post_ttft_ms.saturating_add(gen);
+            }
+        }
+    }
+
+    /// Fold another cell's raw sums into this one (background history
+    /// hydration — every counter is a sum, so merge = add).
+    fn merge(&mut self, other: &PerfCell) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.ok = self.ok.saturating_add(other.ok);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.tps_n = self.tps_n.saturating_add(other.tps_n);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.e2e_ms = self.e2e_ms.saturating_add(other.e2e_ms);
+        self.measured_n = self.measured_n.saturating_add(other.measured_n);
+        self.measured_output = self.measured_output.saturating_add(other.measured_output);
+        self.post_ttft_ms = self.post_ttft_ms.saturating_add(other.post_ttft_ms);
+        self.ttfb_n = self.ttfb_n.saturating_add(other.ttfb_n);
+        self.ttfb_ms_sum = self.ttfb_ms_sum.saturating_add(other.ttfb_ms_sum);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Model-usage aggregation (req1-20): per (group, served_model) row.
 // ---------------------------------------------------------------------------
 
@@ -168,6 +426,36 @@ struct ModelStats {
     efforts: HashMap<String, u64>,
     /// Endpoint class → request count (req20): `messages`/`count_tokens`/other.
     endpoints: HashMap<String, u64>,
+}
+
+impl ModelStats {
+    /// Fold another row's counters into this one (background history
+    /// hydration): every counter sums; `last_used` keeps the later of the two
+    /// (history is older, so a live row's timestamp survives the merge).
+    fn absorb(&mut self, other: ModelStats) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.ok = self.ok.saturating_add(other.ok);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
+        self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
+        self.last_used = match (self.last_used, other.last_used) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        for (name, totals) in other.accounts {
+            self.accounts.entry(name).or_default().add(&totals);
+        }
+        for (label, count) in other.efforts {
+            let entry = self.efforts.entry(label).or_default();
+            *entry = entry.saturating_add(count);
+        }
+        for (label, count) in other.endpoints {
+            let entry = self.endpoints.entry(label).or_default();
+            *entry = entry.saturating_add(count);
+        }
+    }
 }
 
 /// A finished aggregated model row (snapshot of [`ModelStats`]). Timestamps are
@@ -439,6 +727,39 @@ impl WindowedBuckets {
         }
     }
 
+    /// Merge another ring's buckets into this one BY EPOCH HOUR (background
+    /// history hydration). Each historical bucket lands in the hour it
+    /// originally covered — never the current hour — so the 24h/72h heatmaps
+    /// read the same as if history had been replayed before live traffic.
+    /// Rebuilds the deque hour-ascending, pruned to the retained range of the
+    /// newest hour present and capped at [`BUCKET_COUNT`], exactly the
+    /// invariant [`Self::roll_to`] maintains.
+    fn merge_behind(&mut self, other: WindowedBuckets) {
+        if other.buckets.is_empty() {
+            return;
+        }
+        let mut by_hour: std::collections::BTreeMap<u64, HashMap<WindowKey, WindowCounts>> =
+            std::collections::BTreeMap::new();
+        for bucket in self.buckets.drain(..).chain(other.buckets) {
+            let merged = by_hour.entry(bucket.hour).or_default();
+            for (key, counts) in bucket.counts {
+                merged.entry(key).or_default().add(&counts);
+            }
+        }
+        let Some(&newest) = by_hour.keys().next_back() else {
+            return;
+        };
+        let oldest_kept = newest.saturating_sub(BUCKET_COUNT as u64 - 1);
+        self.buckets = by_hour
+            .into_iter()
+            .filter(|&(hour, _)| hour >= oldest_kept)
+            .map(|(hour, counts)| Bucket { hour, counts })
+            .collect();
+        while self.buckets.len() > BUCKET_COUNT {
+            self.buckets.pop_front();
+        }
+    }
+
     /// Aggregate every key over the trailing `window` ending at `now`, summing
     /// the buckets whose hour falls inside it. Returns one [`WindowedRow`] per
     /// `(group, model, account)` with any activity in the window.
@@ -529,11 +850,41 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Codex fast mode was in effect (`Some(false)` for claude). Additive:
+    /// lines persisted before this field existed deserialize to `None` —
+    /// "unknown", deliberately NOT `false`, so legacy history can never be
+    /// misfiled into the fast=off statistics (perf telemetry v1).
+    #[serde(default)]
+    pub fast: Option<bool>,
+    /// Millis to the first successful upstream body chunk (TTFB). Additive:
+    /// `None` on pre-field lines, error paths, and non-streaming relays.
+    #[serde(default)]
+    pub ttfb_ms: Option<u64>,
+    /// Millis to the first streamed output delta (first
+    /// `content_block_delta`, any delta type), measured from the served
+    /// attempt's upstream dispatch. Additive: `None` on pre-field lines,
+    /// content-less streams, and non-streaming relays.
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
+    /// Stream-side span (first delta → stream end), millis — the estimated
+    /// post-delta throughput denominator. Additive.
+    #[serde(default)]
+    pub gen_ms: Option<u64>,
+    /// Upstream stream aborted mid-body (provider failure the HTTP status
+    /// hides). Additive: pre-field lines load `false`.
+    #[serde(default)]
+    pub aborted: bool,
     /// Keyless per-client metering identity (issue #32). Additive: lines
     /// persisted before this field default to `None` and replay into the
     /// `unknown` client bucket.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Message kind + input excerpt (TUI UI-3 U1). Additive: lines persisted
+    /// before these fields default to `None`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub excerpt: Option<String>,
 }
 
 impl PersistedRequest {
@@ -552,7 +903,14 @@ impl PersistedRequest {
             group,
             model,
             effort,
+            fast,
+            ttfb_ms,
+            ttft_ms,
+            gen_ms,
+            aborted,
             user_id,
+            kind,
+            excerpt,
         } = event
         else {
             return None;
@@ -574,7 +932,14 @@ impl PersistedRequest {
             group: group.clone(),
             model: model.clone(),
             effort: effort.clone(),
+            fast: *fast,
+            ttfb_ms: *ttfb_ms,
+            ttft_ms: *ttft_ms,
+            gen_ms: *gen_ms,
+            aborted: *aborted,
             user_id: user_id.clone(),
+            kind: kind.clone(),
+            excerpt: excerpt.clone(),
         })
     }
 
@@ -593,7 +958,14 @@ impl PersistedRequest {
             group: self.group,
             model: self.model,
             effort: self.effort,
+            fast: self.fast,
+            ttfb_ms: self.ttfb_ms,
+            ttft_ms: self.ttft_ms,
+            gen_ms: self.gen_ms,
+            aborted: self.aborted,
             user_id: self.user_id,
+            kind: self.kind,
+            excerpt: self.excerpt,
         };
         (event, ts)
     }
@@ -631,6 +1003,41 @@ pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: S
 pub(crate) struct ActivityLog {
     capacity: usize,
     in_flight: Vec<InFlight>,
+    /// Derived session titles (TUI UI-3 U2): client `user_id` → the first
+    /// plain user-input excerpt seen for it (≤48 chars). Insert-only, bounded
+    /// by [`MAX_CLIENTS`].
+    session_labels: HashMap<String, String>,
+    /// Tokens-per-day chart data (UI-3 U14): day (epoch days) → (group,
+    /// model) → summed token counts. Fed by the same RequestFinished fold
+    /// (startup replay of the persisted request log fills history), pruned to
+    /// [`DAILY_RETAIN_DAYS`].
+    daily: std::collections::BTreeMap<u64, HashMap<(String, String), DailyTokens>>,
+    /// Calendar-bucketed usage for the Usage tab (usage-stats): epoch-hour /
+    /// local-civil-day / local-civil-month keys → (group, model) → cell. Fed
+    /// by the same RequestFinished fold (startup replay fills history), pruned
+    /// to [`USAGE_HOURLY_RETAIN_HOURS`] / [`USAGE_DAILY_RETAIN_DAYS`]; the
+    /// monthly rollup is unbounded (12 keys/year).
+    usage_hourly: UsageBuckets,
+    usage_daily: UsageBuckets,
+    usage_monthly: UsageBuckets,
+    /// Observed-performance stats (perf telemetry v1): day (epoch days, UTC —
+    /// same bucketing as `daily`) → (group, model, fast) → raw perf sums. Fed
+    /// by the same RequestFinished fold (startup replay fills history), pruned
+    /// to [`DAILY_RETAIN_DAYS`] like the chart fold.
+    perf_daily: PerfDays,
+    /// Monotonic newest day ever folded into `perf_daily` (retention anchor).
+    perf_day_hwm: u64,
+    /// Monotonic high-water marks (newest hour / local day ever folded):
+    /// retention prunes against THESE, never against an individual event's
+    /// timestamp, so an out-of-order replayed event can't resurrect an
+    /// expired bucket or rewind the window (review R1 MUST-FIX 1).
+    usage_hour_hwm: u64,
+    usage_day_hwm: u64,
+    /// Fixed UTC offset for usage day/month bucketing in tests. `None` in
+    /// production — each event buckets with the offset in force at ITS
+    /// timestamp ([`crate::tui::format::local_offset_secs`]), so replayed
+    /// history lands on its original local calendar day across DST changes.
+    usage_offset_override: Option<i64>,
     /// Front = newest (the log renders newest-top).
     completed: VecDeque<Completed>,
     totals: HashMap<String, Totals>,
@@ -650,6 +1057,50 @@ pub(crate) struct ActivityLog {
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
     windowed: WindowedBuckets,
+    /// Per-second health buckets for the header health verdict (glance-triage
+    /// MUST-FIX 3): the verdict window must NEVER be derived from the
+    /// `completed` ring — [`LOG_CAPACITY`] truncation would undercount a storm
+    /// exactly when accuracy matters most. Back = newest second; pruned to
+    /// [`HEALTH_WINDOW`] on every push, at most [`HEALTH_BUCKET_CAP`] entries
+    /// regardless of request rate.
+    health: VecDeque<(u64, HealthCounts)>,
+}
+
+/// Status-class counts over the last [`HEALTH_WINDOW`], feeding the header
+/// health verdict. Serialized 1:1 into the dashboard document so local and
+/// attach render the identical verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HealthCounts {
+    pub requests: u64,
+    /// Status >= 400.
+    pub errors: u64,
+    pub s429: u64,
+    pub s401: u64,
+    pub s5xx: u64,
+}
+
+impl HealthCounts {
+    /// Fold one finished request's status into the counts.
+    fn add_status(&mut self, status: u16) {
+        self.requests += 1;
+        if status >= 400 {
+            self.errors += 1;
+        }
+        match status {
+            429 => self.s429 += 1,
+            401 => self.s401 += 1,
+            500..=599 => self.s5xx += 1,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &HealthCounts) {
+        self.requests += other.requests;
+        self.errors += other.errors;
+        self.s429 += other.s429;
+        self.s401 += other.s401;
+        self.s5xx += other.s5xx;
+    }
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -685,14 +1136,43 @@ impl ActivityLog {
     /// `completed` view — replaying a huge log keeps the totals but only the
     /// newest `capacity` request lines stay visible (req C keeps the FILE
     /// complete; the ring is the display window).
+    /// Production hydration goes through [`Self::load_persisted_prefix`] (the
+    /// cut-bounded reader); this unbounded convenience wrapper remains for the
+    /// replay round-trip tests.
+    #[cfg(test)]
     pub(crate) fn load_persisted(&mut self, path: Option<&Path>) {
         let Some(path) = path else {
             return;
         };
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            // Missing file (or unreadable) = nothing to resume from.
-            return;
+        // Best-effort: a missing/unreadable file = nothing to resume from.
+        let _ = self.load_persisted_prefix(path, u64::MAX);
+    }
+
+    /// [`Self::load_persisted`] bounded to the FIRST `up_to` bytes of the file.
+    ///
+    /// This is the double-count guard for background hydration: the daemon arms
+    /// persistence and starts appending LIVE finished requests to the same file
+    /// while history is still loading, so the loader must only replay what
+    /// existed BEFORE arming — the byte length captured at arm time. Appends
+    /// are whole lines, so the cut falls on a line boundary (a torn crash
+    /// artifact straddling it parses as corrupt and is skipped, same as on the
+    /// unbounded path).
+    ///
+    /// A missing file is `Ok` (first boot); any other IO error is returned so
+    /// the caller can surface the degraded (empty-history) start.
+    pub(crate) fn load_persisted_prefix(
+        &mut self,
+        path: &Path,
+        up_to: u64,
+    ) -> Result<(), std::io::Error> {
+        use std::io::Read as _;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
         };
+        let mut contents = String::new();
+        file.take(up_to).read_to_string(&mut contents)?;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -707,6 +1187,114 @@ impl ActivityLog {
             let (event, ts) = record.into_event();
             self.apply(event, ts);
         }
+        Ok(())
+    }
+
+    /// Merge a replayed HISTORY log behind this LIVE log (background hydration).
+    ///
+    /// The live log has been folding real traffic since boot; `history` is a
+    /// fresh log that replayed the persisted records from before boot (strictly
+    /// older than every live entry). Merge order is "history behind live":
+    ///
+    /// - `completed` ring: live rows stay in front, history extends behind
+    ///   (both are newest-first and history is uniformly older), truncated to
+    ///   this ring's capacity.
+    /// - cumulative totals / model rows / client rows: summed — addition
+    ///   commutes, so the result equals the old blocking replay-then-live fold.
+    /// - windowed hourly buckets: merged by epoch hour, so history lands in its
+    ///   ORIGINAL hours. (Folding old events through `apply` after live traffic
+    ///   would instead dump them into the CURRENT hour — `roll_to` never
+    ///   rewinds — inflating the heatmap; this by-hour merge is why hydration
+    ///   must not simply replay into the live log.)
+    /// - `in_flight` is untouched: history contains only finished requests, and
+    ///   a live in-flight row whose id collides with a historical id must not
+    ///   be swallowed by the replay's finish-matching.
+    ///
+    /// Returns how many historical requests were merged (for the operator note).
+    pub(crate) fn merge_history_behind(&mut self, history: ActivityLog) -> u64 {
+        let merged = history.totals_global().requests;
+        // Ring: live in front, history behind, capacity kept.
+        self.completed.extend(history.completed);
+        self.completed.truncate(self.capacity);
+        for (account, totals) in history.totals {
+            self.totals.entry(account).or_default().add(&totals);
+        }
+        self.unrouted.add(&history.unrouted);
+        for (key, stats) in history.models {
+            self.models.entry(key).or_default().absorb(stats);
+        }
+        // Per-client rows respect the same MAX_CLIENTS bound as the live fold:
+        // an unseen client past the cap folds into `unknown`.
+        for (client, totals) in history.clients {
+            let key = if client == UNKNOWN_CLIENT
+                || self.clients.contains_key(&client)
+                || self.clients.len() < MAX_CLIENTS
+            {
+                client
+            } else {
+                UNKNOWN_CLIENT.to_string()
+            };
+            self.clients.entry(key).or_default().add(&totals);
+        }
+        self.windowed.merge_behind(history.windowed);
+        // Tokens-per-day buckets (UI-3 U14) merge BY DAY so history lands on
+        // its original days — same reasoning as the hourly buckets above.
+        for (day, cells) in history.daily {
+            let dst = self.daily.entry(day).or_default();
+            for (key, t) in cells {
+                let cell = dst.entry(key).or_default();
+                cell.input = cell.input.saturating_add(t.input);
+                cell.output = cell.output.saturating_add(t.output);
+                cell.cache_read = cell.cache_read.saturating_add(t.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(t.cache_creation);
+            }
+        }
+        // Perf buckets (perf telemetry v1) merge BY DAY like the chart fold —
+        // raw sums, so history + live add losslessly.
+        for (day, cells) in history.perf_daily {
+            let dst = self.perf_daily.entry(day).or_default();
+            for (key, cell) in cells {
+                dst.entry(key).or_default().merge(&cell);
+            }
+        }
+        self.perf_day_hwm = self.perf_day_hwm.max(history.perf_day_hwm);
+        // Re-prune after the merge with the same clamped anchor.
+        if self.perf_day_hwm > 0 {
+            let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
+            self.perf_daily.retain(|d, _| *d >= cutoff);
+        }
+        // Usage-tab calendar buckets (usage-stats) merge BY BUCKET KEY so
+        // history lands on its original hours/days/months — same reasoning
+        // as the daily chart buckets above. Watermarks merge by max and the
+        // trailing windows re-prune, so historical buckets outside the LIVE
+        // window never survive the merge (review R1 MUST-FIX 1).
+        for (src, dst) in [
+            (history.usage_hourly, &mut self.usage_hourly),
+            (history.usage_daily, &mut self.usage_daily),
+            (history.usage_monthly, &mut self.usage_monthly),
+        ] {
+            for (bucket, cells) in src {
+                let slot = dst.entry(bucket).or_default();
+                for (key, cell) in cells {
+                    slot.entry(key).or_default().merge(&cell);
+                }
+            }
+        }
+        self.usage_hour_hwm = self.usage_hour_hwm.max(history.usage_hour_hwm);
+        self.usage_day_hwm = self.usage_day_hwm.max(history.usage_day_hwm);
+        let hour_cutoff = window_floor(self.usage_hour_hwm, USAGE_HOURLY_RETAIN_HOURS);
+        self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
+        let day_cutoff = window_floor(self.usage_day_hwm, USAGE_DAILY_RETAIN_DAYS);
+        self.usage_daily.retain(|d, _| *d >= day_cutoff);
+        // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
+        // replayed history for the same client; history fills the gaps under
+        // the same MAX_CLIENTS bound as the live fold.
+        for (uid, label) in history.session_labels {
+            if !self.session_labels.contains_key(&uid) && self.session_labels.len() < MAX_CLIENTS {
+                self.session_labels.insert(uid, label);
+            }
+        }
+        merged
     }
 
     pub(crate) fn in_flight(&self) -> &[InFlight] {
@@ -749,6 +1337,262 @@ impl ActivityLog {
     /// Completed entries, newest first.
     pub(crate) fn completed(&self) -> impl Iterator<Item = &Completed> {
         self.completed.iter()
+    }
+
+    /// Derived session titles (TUI UI-3 U2): client id → first user-input
+    /// excerpt. Cloned for the dashboard document.
+    pub(crate) fn session_labels(&self) -> HashMap<String, String> {
+        self.session_labels.clone()
+    }
+
+    /// Tokens-per-day rows (UI-3 U14), oldest day first. Flattened for the
+    /// dashboard document.
+    pub(crate) fn daily_usage(&self) -> Vec<crate::dashboard::DailyUsageDoc> {
+        self.daily
+            .iter()
+            .flat_map(|(day, cells)| {
+                cells
+                    .iter()
+                    .map(move |((group, model), t)| crate::dashboard::DailyUsageDoc {
+                        day: *day,
+                        group: group.clone(),
+                        model: model.clone(),
+                        tokens_in: t.input,
+                        tokens_out: t.output,
+                        cache_read: t.cache_read,
+                        cache_creation: t.cache_creation,
+                    })
+            })
+            .collect()
+    }
+
+    /// Observed-performance rows (perf telemetry v1), flattened for the
+    /// dashboard document. Deterministic order: day ascending, then
+    /// (group, model, fast) — the inner map is a HashMap, so rows are sorted
+    /// per day before flattening (replay-identity tests compare these).
+    pub(crate) fn daily_perf(&self) -> Vec<crate::dashboard::DailyPerfDoc> {
+        self.perf_daily
+            .iter()
+            .flat_map(|(day, cells)| {
+                let mut cells: Vec<_> = cells.iter().collect();
+                cells.sort_by_key(|&(k, _)| k);
+                cells.into_iter().map(move |((group, model, fast), c)| {
+                    crate::dashboard::DailyPerfDoc {
+                        day: *day,
+                        group: group.clone(),
+                        model: model.clone(),
+                        fast: *fast,
+                        requests: c.requests,
+                        ok: c.ok,
+                        errors: c.errors,
+                        tps_n: c.tps_n,
+                        output_tokens: c.output_tokens,
+                        e2e_ms: c.e2e_ms,
+                        measured_n: c.measured_n,
+                        measured_output: c.measured_output,
+                        post_ttft_ms: c.post_ttft_ms,
+                        ttfb_n: c.ttfb_n,
+                        ttfb_ms_sum: c.ttfb_ms_sum,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Fold one attributed finished request into the Usage-tab calendar
+    /// buckets (usage-stats). `now` is the event fold time — the startup
+    /// replay passes each record's PERSISTED timestamp, so history lands on
+    /// its real hour/day/month. Day/month keys use the LOCAL civil calendar
+    /// at the offset in force at that instant (tests pin a fixed offset via
+    /// [`Self::set_usage_offset`]).
+    fn record_usage(
+        &mut self,
+        group: &str,
+        model: &str,
+        tokens: Option<TokenCounts>,
+        now: SystemTime,
+    ) {
+        let epoch_secs = match now.duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return,
+        };
+        let offset = self
+            .usage_offset_override
+            .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
+        // Same row identity as the per-model table (`record_model`): the
+        // NORMALIZED served model. A raw wire variant (`...[1m]`) must not
+        // split into a parallel usage row the model table merges — and
+        // pricing normalizes anyway, so the cost is identical.
+        let key = (group.to_string(), normalize_model(model));
+
+        // Bucket time and retention time are DIFFERENT quantities (review R1
+        // MUST-FIX 1): the event's timestamp picks the bucket, but pruning
+        // runs against a monotonic high-water mark — an out-of-order OLD
+        // event (startup replay behind live traffic) must neither resurrect
+        // an expired bucket nor rewind the retention window. Same
+        // never-rewinds reasoning as the windowed ring's `roll_to`.
+        //
+        // The hwm advance is CLAMPED to the wall clock (review CR): the hwm
+        // never rewinds, so a single future-dated event (host clock skew, a
+        // corrupt persisted timestamp) would otherwise drag the cutoff years
+        // ahead and silently drop ALL real traffic from the hourly/daily
+        // stores until the wall clock caught up. A future event still folds
+        // into its own bucket — the read side hides buckets past `now`
+        // ([`Self::usage_stats`]) — it just can't move the retention window.
+        let wall_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        let hour = epoch_secs / 3_600;
+        self.usage_hour_hwm = self.usage_hour_hwm.max(hour.min(wall_secs / 3_600 + 1));
+        let hour_cutoff = window_floor(self.usage_hour_hwm, USAGE_HOURLY_RETAIN_HOURS);
+        if hour >= hour_cutoff {
+            self.usage_hourly
+                .entry(hour)
+                .or_default()
+                .entry(key.clone())
+                .or_default()
+                .add(tokens);
+        }
+        self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
+
+        let day = crate::tui::format::local_civil_day(epoch_secs as i64, offset);
+        let wall_day =
+            crate::tui::format::local_civil_day(wall_secs.min(i64::MAX as u64) as i64, offset);
+        self.usage_day_hwm = self.usage_day_hwm.max(day.min(wall_day + 1));
+        let day_cutoff = window_floor(self.usage_day_hwm, USAGE_DAILY_RETAIN_DAYS);
+        if day >= day_cutoff {
+            self.usage_daily
+                .entry(day)
+                .or_default()
+                .entry(key.clone())
+                .or_default()
+                .add(tokens);
+        }
+        self.usage_daily.retain(|d, _| *d >= day_cutoff);
+
+        let (year, month, _) = crate::tui::format::civil_from_days(day as i64);
+        let month_key = u64::try_from(year.saturating_mul(12) + i64::from(month) - 1).unwrap_or(0);
+        self.usage_monthly
+            .entry(month_key)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .add(tokens);
+    }
+
+    /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
+    /// production buckets with the per-event local offset).
+    #[cfg(test)]
+    pub(crate) fn set_usage_offset(&mut self, offset_secs: i64) {
+        self.usage_offset_override = Some(offset_secs);
+    }
+
+    /// Usage-tab rows (usage-stats), flattened for the dashboard document:
+    /// every granularity, newest bucket first, models within a bucket sorted
+    /// by (group, model) so the document is deterministic (the renderer
+    /// re-sorts by cost). Labels are rendered HERE — the daemon's civil
+    /// calendar is the single source of truth for what "a day" means, so
+    /// local and attach clients can never disagree.
+    ///
+    /// The hourly/daily windows are re-anchored to `now` at READ time (review
+    /// R1 MUST-FIX 1): fold-time pruning follows the event high-water mark
+    /// (bounded memory), but an idle daemon must not advertise stale buckets
+    /// as "trailing 72 h / 180 days" — the serve-side filter is the honest
+    /// window. Buckets PAST `now` (a future-dated persisted record) are
+    /// hidden on every granularity too — never rendered as top rows.
+    pub(crate) fn usage_stats(&self, now: SystemTime) -> Vec<crate::dashboard::UsageStatDoc> {
+        let now_secs = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let now_hour = now_secs / 3_600;
+        let hour_floor = window_floor(now_hour, USAGE_HOURLY_RETAIN_HOURS);
+        let now_offset = self
+            .usage_offset_override
+            .unwrap_or_else(|| crate::tui::format::local_offset_secs(now));
+        let today = crate::tui::format::local_civil_day(now_secs as i64, now_offset);
+        let day_floor = window_floor(today, USAGE_DAILY_RETAIN_DAYS);
+        let (this_year, this_month, _) = crate::tui::format::civil_from_days(today as i64);
+        let month_ceil =
+            u64::try_from(this_year.saturating_mul(12) + i64::from(this_month) - 1).unwrap_or(0);
+        fn sorted(
+            cells: &HashMap<(String, String), UsageCell>,
+        ) -> Vec<(&(String, String), &UsageCell)> {
+            let mut v: Vec<_> = cells.iter().collect();
+            v.sort_by(|a, b| a.0.cmp(b.0));
+            v
+        }
+        let row = |gran: UsageGran,
+                   bucket: u64,
+                   label: String,
+                   (group, model): &(String, String),
+                   c: &UsageCell| {
+            crate::dashboard::UsageStatDoc {
+                gran: gran.tag().to_string(),
+                bucket,
+                label,
+                group: group.clone(),
+                model: model.clone(),
+                requests: c.requests,
+                tokens_in: c.input,
+                tokens_out: c.output,
+                cache_read: c.cache_read,
+                cache_creation: c.cache_creation,
+                // Priced at doc-build time (the log holds no pricing config);
+                // conservative `false` here so a row that ever bypasses the
+                // doc build renders `—`, never a fabricated $0.
+                cost_usd: 0.0,
+                priced: false,
+            }
+        };
+        let mut docs = Vec::new();
+        for (hour, cells) in self.usage_hourly.iter().rev() {
+            if *hour > now_hour {
+                continue; // future-dated garbage: hidden, ages out
+            }
+            if *hour < hour_floor {
+                break; // BTreeMap rev: everything further back is older.
+            }
+            // Hour buckets are UTC hours; label them in the daemon's local
+            // wall clock at the bucket start.
+            let start = UNIX_EPOCH + Duration::from_secs(hour * 3_600);
+            let offset = self
+                .usage_offset_override
+                .unwrap_or_else(|| crate::tui::format::local_offset_secs(start));
+            let local = (hour * 3_600) as i64 + offset;
+            let (_, month, day) = crate::tui::format::civil_from_days(local.div_euclid(86_400));
+            let hh = local.rem_euclid(86_400) / 3_600;
+            let label = format!("{month:02}-{day:02} {hh:02}h");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Hour, *hour, label.clone(), key, cell));
+            }
+        }
+        for (day, cells) in self.usage_daily.iter().rev() {
+            if *day > today {
+                continue; // future-dated garbage: hidden, ages out
+            }
+            if *day < day_floor {
+                break;
+            }
+            let (y, m, d) = crate::tui::format::civil_from_days(*day as i64);
+            let label = format!("{y}-{m:02}-{d:02}");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Day, *day, label.clone(), key, cell));
+            }
+        }
+        for (month_key, cells) in self.usage_monthly.iter().rev() {
+            if *month_key > month_ceil {
+                continue; // future-dated garbage: hidden (months never prune)
+            }
+            let y = month_key / 12;
+            let m = month_key % 12 + 1;
+            let label = format!("{y}-{m:02}");
+            for (key, cell) in sorted(cells) {
+                docs.push(row(UsageGran::Month, *month_key, label.clone(), key, cell));
+            }
+        }
+        docs
     }
 
     /// Per-account totals lookup. The dashboard reads the whole map
@@ -892,8 +1736,11 @@ impl ActivityLog {
         rows
     }
 
-    /// Snapshot of every model row, sorted by total tokens desc, then requests,
-    /// then key (req14). The document builder overlays in-flight counts.
+    /// Snapshot of every model row, sorted by total tokens (fresh input +
+    /// output + cache read + cache write) desc, then requests, then key
+    /// (req14). Cache tokens count so the ranking matches the strip's `tok`
+    /// column (`ui::model_total`), which includes them. The document builder
+    /// overlays in-flight counts.
     pub(crate) fn model_usage(&self) -> Vec<ModelUsage> {
         let mut rows: Vec<ModelUsage> = self
             .models
@@ -929,9 +1776,15 @@ impl ActivityLog {
                 }
             })
             .collect();
+        let total = |r: &ModelUsage| {
+            r.tokens_in
+                .saturating_add(r.tokens_out)
+                .saturating_add(r.cache_read.unwrap_or(0))
+                .saturating_add(r.cache_creation.unwrap_or(0))
+        };
         rows.sort_by(|a, b| {
-            (b.tokens_in + b.tokens_out)
-                .cmp(&(a.tokens_in + a.tokens_out))
+            total(b)
+                .cmp(&total(a))
                 .then(b.requests.cmp(&a.requests))
                 .then(a.group.cmp(&b.group))
                 .then(a.model.cmp(&b.model))
@@ -972,7 +1825,12 @@ impl ActivityLog {
         // stale threshold is presumed finished before we fold the next event.
         self.prune_stale_in_flight(now);
         match event {
-            ActivityEvent::RequestStarted { id, method, path } => {
+            ActivityEvent::RequestStarted {
+                id,
+                method,
+                path,
+                kind,
+            } => {
                 if self.in_flight.len() >= MAX_IN_FLIGHT {
                     let lost = self.in_flight.remove(0);
                     self.push_note(
@@ -991,6 +1849,9 @@ impl ActivityLog {
                     account: None,
                     group: None,
                     model: None,
+                    effort: None,
+                    fast: false,
+                    kind,
                     started_at: now,
                 });
             }
@@ -999,11 +1860,15 @@ impl ActivityLog {
                 account,
                 group,
                 model,
+                effort,
+                fast,
             } => {
                 if let Some(entry) = self.in_flight.iter_mut().find(|r| r.id == id) {
                     entry.account = Some(account);
                     entry.group = group;
                     entry.model = model;
+                    entry.effort = effort;
+                    entry.fast = fast;
                 }
             }
             ActivityEvent::RequestFinished {
@@ -1017,7 +1882,14 @@ impl ActivityLog {
                 group,
                 model,
                 effort,
+                fast,
+                ttfb_ms,
+                ttft_ms,
+                gen_ms,
+                aborted,
                 user_id,
+                kind,
+                excerpt,
             } => {
                 let routed = self
                     .in_flight
@@ -1031,6 +1903,20 @@ impl ActivityLog {
                 // `unknown` bucket when absent), independent of routing — so
                 // pre-routing failures are attributed too, never dropped.
                 self.record_client(user_id.as_deref(), status, tokens);
+                // Session label (TUI UI-3 U2): the FIRST plain user-input
+                // excerpt seen for a client id becomes that session's derived
+                // title (nothing on the wire carries a real one). Bounded by
+                // MAX_CLIENTS via the same insert-guard as client buckets.
+                if let (Some(uid), Some("user"), Some(text)) =
+                    (user_id.as_deref(), kind.as_deref(), excerpt.as_deref())
+                {
+                    if !self.session_labels.contains_key(uid)
+                        && self.session_labels.len() < MAX_CLIENTS
+                    {
+                        self.session_labels
+                            .insert(uid.to_string(), text.chars().take(48).collect());
+                    }
+                }
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -1052,10 +1938,69 @@ impl ActivityLog {
                 // still increments the row's error count even with no tokens.
                 if let (Some(group), Some(model)) = (&group, &model) {
                     self.record_model(group, model, &account, status, tokens, &effort, &path, now);
+                    // Tokens-per-day chart fold (UI-3 U14). `now` is the event
+                    // fold time — the startup replay passes each record's
+                    // PERSISTED timestamp, so history lands on its real day.
+                    if let Some(t) = tokens {
+                        let day = now
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() / 86_400)
+                            .unwrap_or(0);
+                        let cell = self
+                            .daily
+                            .entry(day)
+                            .or_default()
+                            .entry((group.clone(), model.clone()))
+                            .or_default();
+                        cell.input = cell.input.saturating_add(t.input);
+                        cell.output = cell.output.saturating_add(t.output);
+                        cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+                        cell.cache_creation = cell
+                            .cache_creation
+                            .saturating_add(t.cache_creation.unwrap_or(0));
+                        // Keep exactly DAILY_RETAIN_DAYS buckets including
+                        // today (cutoff inclusive — the -1 avoids a 91-day
+                        // window, review R1 nice-to-have 2).
+                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
+                        self.daily.retain(|d, _| *d >= cutoff);
+                    }
+                    // Usage-tab calendar fold (usage-stats): unlike the chart
+                    // fold above, EVERY attributed finished request lands in
+                    // its hour/day/month bucket (tokens or not), so the
+                    // requests column matches the per-model row semantics.
+                    self.record_usage(group, model, tokens, now);
+                    // Observed-performance fold (perf telemetry v1): raw sums
+                    // per (day, group, model, fast). Same UTC-day bucketing
+                    // and retention as the chart fold; replay fills history.
+                    let day = now
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    self.perf_daily
+                        .entry(day)
+                        .or_default()
+                        .entry((group.clone(), normalize_model(model), fast))
+                        .or_default()
+                        .add(status, aborted, tokens, duration_ms, ttfb_ms, gen_ms);
+                    // Retention prunes against a monotonic high-water mark,
+                    // CLAMPED to the wall clock (+1 day of skew tolerance) —
+                    // an out-of-order replay can't rewind the window, and one
+                    // future-dated line can't prune real history (same rule
+                    // as the usage hwm).
+                    let wall_day = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    self.perf_day_hwm = self.perf_day_hwm.max(day.min(wall_day + 1));
+                    let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
+                    self.perf_daily.retain(|d, _| *d >= cutoff);
                 }
+                self.push_health(now, status);
                 self.push(Completed {
                     at: now,
                     body: CompletedBody::Request {
+                        id,
                         method,
                         path,
                         account,
@@ -1065,6 +2010,14 @@ impl ActivityLog {
                         group,
                         model,
                         effort,
+                        fast,
+                        ttfb_ms,
+                        ttft_ms,
+                        gen_ms,
+                        aborted,
+                        user_id,
+                        kind,
+                        excerpt,
                     },
                 });
             }
@@ -1110,10 +2063,113 @@ impl ActivityLog {
         self.completed.push_front(entry);
         self.completed.truncate(self.capacity);
     }
+
+    /// Record one finished request into its per-second health bucket and
+    /// prune buckets that have aged out of [`HEALTH_WINDOW`].
+    fn push_health(&mut self, at: SystemTime, status: u16) {
+        let sec = at
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match self.health.back_mut() {
+            // Same (or out-of-order, sub-second reordering) second: fold into
+            // the newest bucket — delivery is chronological, so this only
+            // ever merges same/adjacent-second arrivals.
+            Some((bucket_sec, counts)) if *bucket_sec >= sec => counts.add_status(status),
+            _ => {
+                let mut counts = HealthCounts::default();
+                counts.add_status(status);
+                self.health.push_back((sec, counts));
+            }
+        }
+        let newest = self.health.back().map(|&(sec, _)| sec).unwrap_or(0);
+        let horizon = newest.saturating_sub(HEALTH_WINDOW.as_secs());
+        while let Some(&(front, _)) = self.health.front() {
+            if front < horizon || self.health.len() > HEALTH_BUCKET_CAP {
+                self.health.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Status-class counts over the last [`HEALTH_WINDOW`] ending at `now`.
+    /// Reads filter by time (pruning happens on push), so a quiet log still
+    /// ages out: a bucket counts only while `now - HEALTH_WINDOW <= at`.
+    pub(crate) fn health_counts(&self, now: SystemTime) -> HealthCounts {
+        let now_sec = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let horizon = now_sec.saturating_sub(HEALTH_WINDOW.as_secs());
+        let mut total = HealthCounts::default();
+        for &(sec, counts) in self.health.iter().rev() {
+            if sec < horizon {
+                break;
+            }
+            total.merge(&counts);
+        }
+        total
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hydration_merges_daily_buckets_and_session_labels_behind_live() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let day = |d: u64| UNIX_EPOCH + Duration::from_secs(d * 86_400 + 3600);
+        let finished =
+            |_ts: u64, tok_in: u64, uid: &str, excerpt: &str| ActivityEvent::RequestFinished {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(100),
+                tokens: Some(TokenCounts {
+                    input: tok_in,
+                    output: 10,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("claude".into()),
+                model: Some("claude-fable-5".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: Some(uid.into()),
+                kind: Some("user".into()),
+                excerpt: Some(excerpt.into()),
+            };
+        let _ = day;
+        let mut live = ActivityLog::new(16);
+        live.apply(finished(0, 100, "s1", "live first input"), day(20_000));
+        let mut history = ActivityLog::new(16);
+        history.apply(finished(0, 40, "s1", "old input"), day(19_999));
+        history.apply(finished(0, 70, "s2", "history session"), day(19_998));
+        live.merge_history_behind(history);
+        let daily = live.daily_usage();
+        // Three distinct days, each with its own bucket — history landed on
+        // its ORIGINAL days.
+        assert_eq!(daily.len(), 3);
+        assert!(daily.iter().any(|r| r.day == 19_998 && r.tokens_in == 70));
+        assert!(daily.iter().any(|r| r.day == 20_000 && r.tokens_in == 100));
+        // Live label wins for s1; history fills s2.
+        let labels = live.session_labels();
+        assert_eq!(
+            labels.get("s1").map(String::as_str),
+            Some("live first input")
+        );
+        assert_eq!(
+            labels.get("s2").map(String::as_str),
+            Some("history session")
+        );
+    }
     use super::*;
 
     fn at(secs: u64) -> SystemTime {
@@ -1132,6 +2188,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            kind: None,
         }
     }
 
@@ -1160,7 +2217,14 @@ mod tests {
             group: None,
             model: None,
             effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1188,7 +2252,14 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: None,
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1215,7 +2286,14 @@ mod tests {
             group: None,
             model: None,
             effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
             user_id: user_id.map(str::to_string),
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -1255,12 +2333,17 @@ mod tests {
         assert_eq!(log.in_flight().len(), 1);
         assert_eq!(log.in_flight()[0].account, None);
 
+        assert_eq!(log.in_flight()[0].effort, None, "unknown before routing");
+        assert!(!log.in_flight()[0].fast, "fast off before routing");
+
         log.apply(
             ActivityEvent::RequestRouted {
                 id: 7,
                 account: "a@x.com".into(),
                 group: Some("claude".into()),
                 model: Some("claude-sonnet-4-5".into()),
+                effort: Some("low".into()),
+                fast: true,
             },
             at(1),
         );
@@ -1270,6 +2353,10 @@ mod tests {
             log.in_flight()[0].model.as_deref(),
             Some("claude-sonnet-4-5")
         );
+        // The routed event's per-request effort/fast land on the in-flight row
+        // so the running badge matches the eventual completed badge.
+        assert_eq!(log.in_flight()[0].effort.as_deref(), Some("low"));
+        assert!(log.in_flight()[0].fast);
 
         // Finish without an explicit account: the routed account is kept.
         log.apply(finished(7, None, Some((1_000, 200))), at(2));
@@ -1422,6 +2509,39 @@ mod tests {
         );
     }
 
+    // ---- health window (glance-triage) ----
+
+    #[test]
+    fn health_counts_survive_ring_truncation() {
+        // A storm 100 events past LOG_CAPACITY: the completed ring truncates,
+        // the health window must NOT (that undercount was the reason the
+        // verdict gets its own deque — MUST-FIX 3).
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let total = (LOG_CAPACITY + 100) as u64;
+        for i in 0..total {
+            log.apply(finished_status(i, Some("a"), None, 429), at(100 + i));
+        }
+        let now = at(100 + total);
+        assert_eq!(log.completed().count(), LOG_CAPACITY);
+        let counts = log.health_counts(now);
+        assert_eq!(counts.requests, total);
+        assert_eq!(counts.s429, total);
+        assert_eq!(counts.errors, total);
+    }
+
+    #[test]
+    fn health_counts_age_out_of_the_window() {
+        let mut log = ActivityLog::new(10);
+        log.apply(finished_status(1, Some("a"), None, 500), at(1_000 - 400)); // aged out
+        log.apply(finished_status(2, Some("a"), None, 429), at(1_000 - 100));
+        log.apply(finished_status(3, Some("a"), None, 200), at(1_000 - 10));
+        let counts = log.health_counts(at(1_000));
+        assert_eq!(counts.requests, 2);
+        assert_eq!(counts.s429, 1);
+        assert_eq!(counts.s5xx, 0, "outside the 5m window");
+        assert_eq!(counts.errors, 1);
+    }
+
     // ---- requests per minute ----
 
     #[test]
@@ -1535,6 +2655,46 @@ mod tests {
             (rows[1].group.as_str(), rows[1].model.as_str()),
             ("claude", "shared")
         );
+    }
+
+    #[test]
+    fn model_rows_sort_counts_cache_tokens() {
+        let mut log = ActivityLog::new(50);
+        // codex: 100 fresh in + 50 out = 150, no cache.
+        log.apply(
+            finished_model(
+                1,
+                Some("c"),
+                "codex",
+                "gpt-5.5",
+                None,
+                200,
+                tokens(100, 50, None),
+                "/v1/messages",
+            ),
+            at(1),
+        );
+        // claude: only 10 fresh in + 5 out, but 1_000 cache-read tokens →
+        // 1_015 total. Cache tokens count toward the "by tokens" ranking
+        // (they are what the `tok` column shows and the `$` column prices),
+        // so the cache-heavy row ranks FIRST despite the smaller fresh sum.
+        log.apply(
+            finished_model(
+                2,
+                Some("a"),
+                "claude",
+                "claude-opus-4-8",
+                None,
+                200,
+                tokens(10, 5, Some(1_000)),
+                "/v1/messages",
+            ),
+            at(2),
+        );
+        let rows = log.model_usage();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].group.as_str(), "claude");
+        assert_eq!(rows[1].group.as_str(), "codex");
     }
 
     #[test]
@@ -2040,9 +3200,18 @@ mod tests {
             group: Some(group.into()),
             model: Some(model.into()),
             effort: effort.map(str::to_string),
+            // Vary fast/timing by id so the persistence round-trip exercises
+            // the perf-telemetry fields (Some/None mixes included).
+            fast: Some(id.is_multiple_of(2)),
+            ttfb_ms: (!id.is_multiple_of(3)).then_some(40 + id),
+            ttft_ms: (id % 3 == 1).then_some(200 + id),
+            gen_ms: None,
+            aborted: false,
             // A per-client id so the persistence round-trip also exercises the
             // issue #32 client attribution (one client id per account here).
             user_id: Some(format!("client-{account}")),
+            kind: None,
+            excerpt: None,
         }
     }
 
@@ -2092,6 +3261,520 @@ mod tests {
                 "per-account totals for {acct} must match after restore"
             );
         }
+        assert_eq!(
+            a.daily_perf(),
+            b.daily_perf(),
+            "daily perf sums must match after restore (perf telemetry v1)"
+        );
+        // Usage calendar buckets (usage-stats): compare the STORES (maps +
+        // watermarks) — the doc accessor takes a read-time `now` these
+        // replay-identity tests have no single value for.
+        assert_eq!(
+            (a.usage_hourly.clone(), a.usage_hour_hwm),
+            (b.usage_hourly.clone(), b.usage_hour_hwm),
+            "hourly usage buckets must match after restore (usage-stats)"
+        );
+        assert_eq!(
+            (a.usage_daily.clone(), a.usage_day_hwm),
+            (b.usage_daily.clone(), b.usage_day_hwm),
+            "daily usage buckets must match after restore (usage-stats)"
+        );
+        assert_eq!(
+            a.usage_monthly, b.usage_monthly,
+            "monthly usage buckets must match after restore (usage-stats)"
+        );
+    }
+
+    // ---- usage calendar buckets (usage-stats) ----
+
+    /// A finished, attributed request with NO tokens (pre-completion failure):
+    /// must still count in the usage requests column.
+    fn finished_tokenless(id: u64, group: &str, model: &str) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("acct".into()),
+            status: 500,
+            duration: Duration::from_millis(10),
+            tokens: None,
+            group: Some(group.into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+        }
+    }
+
+    /// Rows of one granularity, in document order (newest bucket first),
+    /// read at `now` (the accessor's trailing hourly/daily windows anchor to
+    /// the read time — review R1 MUST-FIX 1).
+    fn usage_rows(
+        log: &ActivityLog,
+        gran: UsageGran,
+        now: SystemTime,
+    ) -> Vec<crate::dashboard::UsageStatDoc> {
+        log.usage_stats(now)
+            .into_iter()
+            .filter(|r| r.gran == gran.tag())
+            .collect()
+    }
+
+    /// 2024-01-01 is epoch day 19_723 (pinned by `format::civil_from_days`
+    /// tests). All usage tests bucket at a fixed +9h offset (KST — the
+    /// interesting case: local day ≠ UTC day for evening traffic).
+    const JAN1_2024: u64 = 19_723;
+    const KST: i64 = 9 * 3600;
+
+    fn at_day_hm(day: u64, hour: u64, minute: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(day * 86_400 + hour * 3_600 + minute * 60)
+    }
+
+    #[test]
+    fn usage_buckets_hour_day_month_at_local_offset() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(KST);
+        // 23:30 UTC Jan 1 → 08:30 KST Jan 2: local day rolls over.
+        log.apply(
+            finished_full(
+                1,
+                "a",
+                "claude",
+                "m-late",
+                None,
+                200,
+                100,
+                10,
+                Some(7),
+                "/v1/messages",
+            ),
+            at_day_hm(JAN1_2024, 23, 30),
+        );
+        // 10:00 UTC Jan 1 → 19:00 KST Jan 1: same local day.
+        log.apply(
+            finished_full(
+                2,
+                "a",
+                "claude",
+                "m-noon",
+                None,
+                200,
+                200,
+                20,
+                None,
+                "/v1/messages",
+            ),
+            at_day_hm(JAN1_2024, 10, 0),
+        );
+
+        let read_at = at_day_hm(JAN1_2024, 23, 30);
+        let hours = usage_rows(&log, UsageGran::Hour, read_at);
+        assert_eq!(hours.len(), 2, "one hour bucket per event");
+        // Newest first: the 23:00 UTC bucket leads, labeled in LOCAL wall
+        // clock (08h on Jan 2).
+        assert_eq!(hours[0].bucket, JAN1_2024 * 24 + 23);
+        assert_eq!(hours[0].label, "01-02 08h");
+        assert_eq!(hours[0].model, "m-late");
+        assert_eq!(
+            (hours[0].tokens_in, hours[0].tokens_out, hours[0].cache_read),
+            (100, 10, 7)
+        );
+        assert_eq!(hours[1].label, "01-01 19h");
+
+        let days = usage_rows(&log, UsageGran::Day, read_at);
+        assert_eq!(
+            days.len(),
+            2,
+            "the evening event lands on the NEXT local day"
+        );
+        assert_eq!(days[0].bucket, JAN1_2024 + 1);
+        assert_eq!(days[0].label, "2024-01-02");
+        assert_eq!(days[0].model, "m-late");
+        assert_eq!(days[1].label, "2024-01-01");
+        assert_eq!(days[1].model, "m-noon");
+
+        let months = usage_rows(&log, UsageGran::Month, read_at);
+        assert_eq!(months.len(), 2, "one month bucket, two model rows");
+        assert!(months.iter().all(|r| r.label == "2024-01"));
+        assert!(months.iter().all(|r| r.bucket == 2024 * 12));
+    }
+
+    #[test]
+    fn usage_month_year_rollover_follows_local_calendar() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(KST);
+        // 2023-12-31 23:00 UTC → 2024-01-01 08:00 KST: the LOCAL month is
+        // January even though the UTC month is December.
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/v1/messages"),
+            at_day_hm(JAN1_2024 - 1, 23, 0),
+        );
+        let read_at = at_day_hm(JAN1_2024 - 1, 23, 0);
+        let months = usage_rows(&log, UsageGran::Month, read_at);
+        assert_eq!(months.len(), 1);
+        assert_eq!(months[0].label, "2024-01");
+        let days = usage_rows(&log, UsageGran::Day, read_at);
+        assert_eq!(days[0].label, "2024-01-01");
+    }
+
+    #[test]
+    fn usage_counts_tokenless_requests_and_skips_unattributed() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_tokenless(1, "codex", "gpt-5.5"),
+            at_day_hm(JAN1_2024, 1, 0),
+        );
+        // Unattributed (no group/model) request: stays out of usage buckets,
+        // same rule as the per-model rows.
+        log.apply(
+            finished(2, Some("acct"), Some((5, 5))),
+            at_day_hm(JAN1_2024, 1, 5),
+        );
+        let hours = usage_rows(&log, UsageGran::Hour, at_day_hm(JAN1_2024, 1, 5));
+        assert_eq!(hours.len(), 1);
+        assert_eq!(hours[0].requests, 1, "tokenless request still counted");
+        assert_eq!(hours[0].tokens_in + hours[0].tokens_out, 0);
+    }
+
+    #[test]
+    fn usage_hourly_and_daily_retention_monthly_unbounded() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        // 200 days later: outside both the 72h hourly and the 180d daily
+        // retention of the FIRST event.
+        log.apply(
+            finished_full(2, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024 + 200, 0, 0),
+        );
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
+        assert_eq!(
+            usage_rows(&log, UsageGran::Hour, read_at).len(),
+            1,
+            "old hour pruned"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Day, read_at).len(),
+            1,
+            "old day pruned"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Month, read_at).len(),
+            2,
+            "months are never pruned"
+        );
+    }
+
+    /// Review R1 MUST-FIX 1a: an out-of-order OLD event folded AFTER newer
+    /// traffic (startup replay behind live requests) must not resurrect a
+    /// bucket outside the retention window or rewind it — pruning follows the
+    /// high-water mark, not the event's own timestamp.
+    #[test]
+    fn usage_out_of_order_old_event_cannot_resurrect_expired_buckets() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024 + 200, 0, 0),
+        );
+        // 200 days OLDER than the newest fold: outside both windows.
+        log.apply(
+            finished_full(2, "a", "claude", "m-old", None, 200, 9, 9, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
+        assert_eq!(
+            usage_rows(&log, UsageGran::Hour, read_at).len(),
+            1,
+            "expired hour not resurrected"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Day, read_at).len(),
+            1,
+            "expired day not resurrected"
+        );
+        assert_eq!(
+            usage_rows(&log, UsageGran::Month, read_at).len(),
+            2,
+            "months still keep all history"
+        );
+    }
+
+    /// Review R1 MUST-FIX 1b: the served hourly/daily windows anchor to the
+    /// READ time — an idle daemon must not advertise stale buckets as
+    /// "trailing 72 h / 180 days". Months are never filtered.
+    #[test]
+    fn usage_read_window_anchors_to_now_not_last_event() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            at_day_hm(JAN1_2024, 0, 0),
+        );
+        // Read 10 days later with NO new traffic: the hour is long gone from
+        // the trailing 72h, the day still sits inside 180d.
+        let read_at = at_day_hm(JAN1_2024 + 10, 0, 0);
+        assert!(usage_rows(&log, UsageGran::Hour, read_at).is_empty());
+        assert_eq!(usage_rows(&log, UsageGran::Day, read_at).len(), 1);
+        assert_eq!(usage_rows(&log, UsageGran::Month, read_at).len(), 1);
+        // Read 200 days later: the day has left the window too.
+        let read_at = at_day_hm(JAN1_2024 + 200, 0, 0);
+        assert!(usage_rows(&log, UsageGran::Day, read_at).is_empty());
+        assert_eq!(usage_rows(&log, UsageGran::Month, read_at).len(), 1);
+    }
+
+    /// Review CR (trinity R1 gpt-5.6 MUST-FIX): a single FUTURE-dated event
+    /// (clock skew, corrupt persisted line) must not drag the retention
+    /// window forward and drop real traffic — the hwm advance clamps to the
+    /// wall clock — and the future bucket itself must stay hidden at read
+    /// time (upper bound on every granularity).
+    #[test]
+    fn usage_future_event_cannot_poison_retention_or_render() {
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.set_usage_offset(0);
+        let real_now = SystemTime::now();
+        log.apply(
+            finished_full(1, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            real_now,
+        );
+        // 1000 days in the future — without the wall clamp this advances the
+        // hwm and prunes every real bucket.
+        log.apply(
+            finished_full(2, "a", "claude", "m-future", None, 200, 9, 9, None, "/p"),
+            real_now + Duration::from_secs(1000 * 86_400),
+        );
+        log.apply(
+            finished_full(3, "a", "claude", "m", None, 200, 1, 1, None, "/p"),
+            real_now,
+        );
+        let hours = usage_rows(&log, UsageGran::Hour, real_now);
+        assert_eq!(hours.len(), 1, "real bucket survives the future event");
+        assert_eq!(hours[0].model, "m");
+        assert_eq!(hours[0].requests, 2, "both real folds landed");
+        assert!(
+            usage_rows(&log, UsageGran::Day, real_now)
+                .iter()
+                .all(|r| r.model == "m"),
+            "future day bucket hidden at read time"
+        );
+        assert!(
+            usage_rows(&log, UsageGran::Month, real_now)
+                .iter()
+                .all(|r| r.model == "m"),
+            "future month bucket hidden at read time (months never prune)"
+        );
+    }
+
+    #[test]
+    fn legacy_persisted_line_reads_fast_and_timing_as_unknown() {
+        // Trinity contract C4/C8: a line persisted BEFORE the fast/timing
+        // fields existed must deserialize `fast` to `None` ("unknown") — not
+        // `Some(false)` — and the timing fields to `None`, so legacy history
+        // can never be misfiled into the fast=off / measured series.
+        let line = r#"{"v":1,"ts_ms":1000,"id":7,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null}"#;
+        let record: PersistedRequest = serde_json::from_str(line).expect("legacy line parses");
+        assert_eq!(
+            record.fast, None,
+            "absent fast is UNKNOWN, never Some(false)"
+        );
+        assert_eq!(record.ttfb_ms, None);
+        assert_eq!(record.ttft_ms, None);
+        // And a modern line keeps its recorded values through the round trip.
+        let modern = r#"{"v":1,"ts_ms":1000,"id":8,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null,"fast":true,"ttfb_ms":120,"ttft_ms":800}"#;
+        let record: PersistedRequest = serde_json::from_str(modern).expect("modern line parses");
+        assert_eq!(record.fast, Some(true));
+        assert_eq!(record.ttfb_ms, Some(120));
+        assert_eq!(record.ttft_ms, Some(800));
+    }
+
+    #[test]
+    fn perf_fold_gates_and_series_separation() {
+        // Trinity contract C3/C4 (+ review MUST-FIX 8): throughput samples
+        // need output>0; the measured series needs a positive stream-side
+        // gen span; fast None/Some(false)/Some(true) aggregate as THREE
+        // separate keys; an upstream mid-stream abort counts as an error
+        // even under an HTTP 200.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        #[allow(clippy::too_many_arguments)]
+        let ev = |id: u64,
+                  status: u16,
+                  output: u64,
+                  duration_ms: u64,
+                  fast: Option<bool>,
+                  ttfb_ms: Option<u64>,
+                  gen_ms: Option<u64>,
+                  aborted: bool| {
+            ActivityEvent::RequestFinished {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("a".into()),
+                status,
+                duration: Duration::from_millis(duration_ms),
+                tokens: Some(TokenCounts {
+                    input: 10,
+                    output,
+                    cache_read: None,
+                    cache_creation: None,
+                }),
+                group: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                effort: None,
+                fast,
+                ttfb_ms,
+                ttft_ms: gen_ms.map(|_| 500),
+                gen_ms,
+                aborted,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+            }
+        };
+        let now = at(1_000);
+        // measured sample: 30 output tokens over a 1500ms stream-side span.
+        log.apply(
+            ev(
+                1,
+                200,
+                30,
+                2_000,
+                Some(false),
+                Some(100),
+                Some(1_500),
+                false,
+            ),
+            now,
+        );
+        // tps-only sample (no gen span) in the SAME (group,model,fast) cell.
+        log.apply(
+            ev(2, 200, 10, 1_000, Some(false), Some(80), None, false),
+            now,
+        );
+        // output=0 → error-rate only, never a throughput sample.
+        log.apply(ev(3, 500, 0, 700, Some(false), None, None, false), now);
+        // aborted stream under HTTP 200 → error, still a tps sample.
+        log.apply(ev(4, 200, 5, 400, Some(false), Some(50), None, true), now);
+        // fast=true and fast-unknown land in their own series.
+        log.apply(
+            ev(5, 200, 50, 1_000, Some(true), Some(60), Some(800), false),
+            now,
+        );
+        log.apply(ev(6, 200, 40, 1_000, None, None, None, false), now);
+
+        let rows = log.daily_perf();
+        assert_eq!(rows.len(), 3, "off / on / unknown are separate series");
+        let cell = |fast: Option<bool>| {
+            rows.iter()
+                .find(|r| r.fast == fast && r.group == "codex" && r.model == "gpt-5.5")
+                .expect("series present")
+        };
+        let off = cell(Some(false));
+        assert_eq!(off.requests, 4);
+        assert_eq!(off.ok, 2, "abort under 200 is NOT ok");
+        assert_eq!(off.errors, 2, "500 + aborted stream");
+        assert_eq!(off.tps_n, 3, "output>0 samples only");
+        assert_eq!(off.output_tokens, 45);
+        assert_eq!(off.e2e_ms, 3_400);
+        assert_eq!(off.measured_n, 1, "gen-span-less samples excluded");
+        assert_eq!(off.measured_output, 30);
+        assert_eq!(
+            off.post_ttft_ms, 1_500,
+            "stream-side span, not duration−ttft"
+        );
+        assert_eq!(off.ttfb_n, 3);
+        assert_eq!(off.ttfb_ms_sum, 230);
+        let on = cell(Some(true));
+        assert_eq!((on.requests, on.tps_n, on.measured_n), (1, 1, 1));
+        let unknown = cell(None);
+        assert_eq!(
+            (unknown.requests, unknown.tps_n, unknown.measured_n),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn perf_retention_survives_future_dated_lines_and_day_boundaries() {
+        // Review MUST-FIX: one future-dated line must not prune real history
+        // (hwm clamps to wall+1), and days age out at exactly 90 days.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let ev = |id: u64| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(1_000),
+            tokens: Some(TokenCounts {
+                input: 1,
+                output: 10,
+                cache_read: None,
+                cache_creation: None,
+            }),
+            group: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+        };
+        let now = SystemTime::now();
+        let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);
+        // Real history: today and 88 days back (inside the window even
+        // under the +1-day skew tolerance the hwm clamp allows).
+        log.apply(ev(1), day(88));
+        log.apply(ev(2), now);
+        assert_eq!(log.daily_perf().len(), 2);
+        // A future-dated line (clock skew / corrupt replay) 1000 days ahead:
+        // the clamped hwm keeps BOTH real days alive.
+        log.apply(ev(3), now + Duration::from_secs(1_000 * 86_400));
+        assert!(
+            log.daily_perf().len() >= 3,
+            "future line lands but prunes nothing real"
+        );
+        // A line just past the retention window prunes at the boundary.
+        log.apply(ev(4), day(DAILY_RETAIN_DAYS + 1));
+        let today_epoch = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        assert!(
+            log.daily_perf()
+                .iter()
+                .all(|r| r.day + DAILY_RETAIN_DAYS > today_epoch),
+            "expired day pruned at the boundary"
+        );
+    }
+
+    #[test]
+    fn modern_persisted_line_round_trips_gen_and_aborted() {
+        // Non-default gen_ms/aborted survive persist → parse → replay.
+        let line = r#"{"v":1,"ts_ms":1000,"id":9,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"codex","model":"gpt-5.5","effort":null,"fast":true,"ttfb_ms":120,"ttft_ms":800,"gen_ms":600,"aborted":true}"#;
+        let record: PersistedRequest = serde_json::from_str(line).expect("parses");
+        assert_eq!(record.gen_ms, Some(600));
+        assert!(record.aborted);
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let (event, ts) = record.into_event();
+        log.apply(event, ts);
+        let rows = log.daily_perf();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].errors, 1, "aborted counts as a provider error");
+        assert_eq!(rows[0].measured_n, 1);
+        assert_eq!(rows[0].post_ttft_ms, 600, "gen span is the denominator");
     }
 
     #[test]
@@ -2373,6 +4056,225 @@ mod tests {
             log2.totals_global().requests,
             0,
             "unwritable path wrote nothing"
+        );
+    }
+
+    /// Background hydration must equal the old blocking replay: a live log
+    /// that folded traffic FIRST and merged history BEHIND it afterwards
+    /// carries the same aggregates, ring order, and windowed buckets as a log
+    /// that replayed history before the live events (the pre-lazy behavior).
+    /// History sits 30h before live so the 24h window would EXPOSE misplaced
+    /// buckets: folding old events through `apply` after live traffic would
+    /// dump them into the current hour (`roll_to` never rewinds) and
+    /// contaminate the 24h heatmap.
+    #[test]
+    fn merge_history_behind_matches_blocking_replay_and_keeps_hours() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        let history_events = vec![
+            (
+                finished_full(
+                    1,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    Some("16k"),
+                    200,
+                    100,
+                    40,
+                    Some(10),
+                    "/v1/messages",
+                ),
+                at(10),
+            ),
+            (
+                finished_full(
+                    2,
+                    "b",
+                    "codex",
+                    "gpt-5.5",
+                    None,
+                    529,
+                    0,
+                    0,
+                    None,
+                    "/v1/messages/count_tokens",
+                ),
+                at(20),
+            ),
+        ];
+        let now = at(30 * 3600); // live traffic 30h later
+        let live_events = vec![
+            (
+                finished_full(
+                    3,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    300,
+                    90,
+                    None,
+                    "/v1/messages",
+                ),
+                now,
+            ),
+            (
+                finished_full(
+                    4,
+                    "c",
+                    "claude",
+                    "opus",
+                    None,
+                    200,
+                    5,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                now,
+            ),
+        ];
+
+        // Oracle: the old blocking order — history replayed first, live after.
+        let mut all = history_events.clone();
+        all.extend(live_events.clone());
+        let oracle = live_log(&all);
+
+        // Lazy path: live folds first; history replays from disk into a fresh
+        // log and merges behind.
+        let merged = {
+            let mut live = live_log(&live_events);
+            let history = persisted_then_loaded(&path, &history_events);
+            let n = live.merge_history_behind(history);
+            assert_eq!(n, 2, "reports the number of merged historical requests");
+            live
+        };
+
+        assert_same_aggregates(&oracle, &merged, &["a", "b", "c"]);
+        assert_eq!(
+            oracle.completed().cloned().collect::<Vec<_>>(),
+            merged.completed().cloned().collect::<Vec<_>>(),
+            "ring order: live rows in front, history behind"
+        );
+        for window in StatsWindow::ALL {
+            assert_eq!(
+                oracle.windowed_rows(window, now),
+                merged.windowed_rows(window, now),
+                "{} heatmap: history lands in its ORIGINAL hours",
+                window.label()
+            );
+        }
+        // The guard the equality above encodes: 30h-old history is visible in
+        // the 72h window but absent from the 24h one.
+        assert!(
+            !merged
+                .windowed_rows(StatsWindow::Day, now)
+                .iter()
+                .any(|r| r.account == "b"),
+            "24h window excludes 30h-old history"
+        );
+        assert!(
+            merged
+                .windowed_rows(StatsWindow::ThreeDay, now)
+                .iter()
+                .any(|r| r.account == "b"),
+            "72h window includes it"
+        );
+    }
+
+    /// A live in-flight request whose id collides with a historical record
+    /// (activity ids restart at boot) must survive hydration: the merge never
+    /// routes history through `apply`, so the replayed finish can't swallow
+    /// the live row.
+    #[test]
+    fn merge_history_behind_never_touches_live_in_flight() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        let history = persisted_then_loaded(
+            &path,
+            &[(
+                finished_full(
+                    7,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    10,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(10),
+            )],
+        );
+
+        let now = at(1000);
+        let mut live = ActivityLog::new(LOG_CAPACITY);
+        live.apply(started(7), now); // same id as the historical record
+        live.merge_history_behind(history);
+
+        assert_eq!(live.in_flight().len(), 1, "live in-flight row survives");
+        assert_eq!(live.in_flight()[0].id, 7);
+        assert_eq!(
+            live.totals_global().requests,
+            1,
+            "history still counted exactly once"
+        );
+    }
+
+    /// The hydration cut: only bytes before `up_to` are replayed, so a live
+    /// request appended to the same file DURING hydration (it is past the cut
+    /// and already folded live) is never double-counted.
+    #[test]
+    fn load_persisted_prefix_stops_at_the_cut() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        persist_request(
+            Some(&path),
+            &finished_full(
+                1,
+                "a",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                10,
+                5,
+                None,
+                "/v1/messages",
+            ),
+            at(10),
+        );
+        let cut = std::fs::metadata(&path).expect("metadata").len();
+        // A live append lands past the cut while "hydration" is in flight.
+        persist_request(
+            Some(&path),
+            &finished_full(
+                2,
+                "b",
+                "codex",
+                "gpt-5.5",
+                None,
+                200,
+                20,
+                8,
+                None,
+                "/v1/messages",
+            ),
+            at(20),
+        );
+
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted_prefix(&path, cut).expect("readable");
+        assert_eq!(log.totals_global().requests, 1, "only pre-cut history");
+        assert_eq!(log.totals_for("a").requests, 1);
+        assert_eq!(
+            log.totals_for("b").requests,
+            0,
+            "post-cut line not replayed"
         );
     }
 }

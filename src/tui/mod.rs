@@ -27,11 +27,13 @@
 
 pub(crate) mod activity;
 mod anim;
+mod clip;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
 // `llmux status` output and the dashboard agree on the display.
 pub(crate) mod format;
 pub(crate) mod logs;
+mod triage;
 mod ui;
 mod view;
 
@@ -66,9 +68,22 @@ use view::DashboardView;
 
 /// Codex models the dashboard cycles through with `m` (req8.1). Any model can
 /// still be set via config / the control endpoint; this is the quick-pick set.
-const CODEX_MODELS: &[&str] = &["gpt-5.5", "gpt-5.5-codex", "gpt-5-codex"];
-/// Reasoning-effort levels cycled with `e`; "" = unset (backend default).
-const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+const CODEX_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+    "gpt-5.5-codex",
+    "gpt-5-codex",
+];
+/// Reasoning-effort levels cycled with `e` (and the group-settings bar);
+/// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
+/// U12). A concrete value OVERRIDES every request. `max` is native on the
+/// gpt-5.6 family and clamps to `xhigh` on older models.
+const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
+/// Values are the config superset (`none|low|medium|high`) — per-model
+/// clamping happens at request time in the provider.
+const GROK_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
 
 /// One-line summary of codex settings for the status bar.
 fn codex_status_line(c: &CodexSettingsDoc) -> String {
@@ -76,8 +91,24 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
         "codex {} · fast {} · effort {}",
         c.model,
         if c.fast { "on" } else { "off" },
-        c.effort.as_deref().unwrap_or("default"),
+        c.effort.as_deref().unwrap_or("bypass"),
     )
+}
+
+/// Distinct buckets of one granularity on the view (usage-stats): the Usage
+/// overlay's scroll bound. Rows arrive grouped by bucket (newest first), so
+/// counting key CHANGES equals counting distinct buckets — the same grouping
+/// the renderer applies.
+fn usage_bucket_count(view: &DashboardView, gran: activity::UsageGran) -> usize {
+    let mut count = 0;
+    let mut last: Option<u64> = None;
+    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
+        if last != Some(r.bucket) {
+            count += 1;
+            last = Some(r.bucket);
+        }
+    }
+    count
 }
 
 /// Can this client open a browser for an OAuth flow? The login dance (browser
@@ -207,6 +238,29 @@ pub(crate) enum Mode {
     NewLogin {
         idx: usize,
     },
+    /// Editing per-account ceiling overrides for the switcher's highlighted
+    /// row (`L`). The typed text lives in [`App::add_input`]; format
+    /// `5h,7d,fbl` percents, empty = back to the global ceilings.
+    EditLimits {
+        idx: usize,
+    },
+    /// Right-click context menu on an accounts row (UI-3 U11): `idx` is the
+    /// display row, `item` the highlighted menu entry. The anchor cell lives
+    /// in [`App::menu_anchor`] (Mode stays `Copy`).
+    ContextMenu {
+        idx: usize,
+        item: usize,
+    },
+    /// Typing a new value for a config-editor row (config-editor v1). The
+    /// buffer lives in [`App::config_input`] (Mode stays `Copy`).
+    ConfigEdit {
+        action: ui::ConfigAction,
+    },
+    /// y/n gate before a blast-radius config change (config-editor v1). The
+    /// human-readable description lives in [`App::config_input`].
+    ConfigConfirm {
+        action: ui::ConfigAction,
+    },
 }
 
 /// A summoned surface drawn OVER the always-rendered MAIN view (issue #5). MAIN
@@ -226,11 +280,71 @@ pub(crate) enum Overlay {
     Accounts,
     /// The detailed per-model usage table + drill-down (req13; was `show_models`).
     Stats,
+    /// Calendar usage table (usage-stats): hourly/daily/monthly buckets ×
+    /// model with token breakdown + API-equivalent cost.
+    Usage,
     /// Full-screen log tail (was the `l` log-panel size cycle).
     Logs,
     /// Session timeline (issue #34): persisted raw-io grouped by
     /// `metadata.user_id` into confidence-labeled per-session aggregates.
     Sessions,
+    /// Observed-performance surface (perf telemetry v1): daily
+    /// tokens/sec chart + provider health matrix + per-(model, fast) table.
+    Perf,
+    /// Everything-else surface (UI-3 U6 "기타"): keybindings, build info,
+    /// daemon facts — the glance answers that fit no other tab.
+    Misc,
+    /// Read-only config surface (UI-3 U6): the live daemon settings the
+    /// dashboard knows (scheduler / codex / display), with their toggles.
+    Config,
+}
+
+/// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
+/// timeline default), most tokens (in+out), or most requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SessionSort {
+    #[default]
+    Recent,
+    Tokens,
+    Requests,
+}
+
+impl SessionSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            SessionSort::Recent => SessionSort::Tokens,
+            SessionSort::Tokens => SessionSort::Requests,
+            SessionSort::Requests => SessionSort::Recent,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SessionSort::Recent => "recent",
+            SessionSort::Tokens => "tokens",
+            SessionSort::Requests => "requests",
+        }
+    }
+
+    /// Apply this order to a session list (stable within equal keys).
+    pub(crate) fn apply(self, sessions: &mut [crate::session::Session]) {
+        match self {
+            SessionSort::Recent => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_ms)),
+            SessionSort::Tokens => sessions
+                .sort_by_key(|s| std::cmp::Reverse(s.tokens_in.saturating_add(s.tokens_out))),
+            SessionSort::Requests => sessions.sort_by_key(|s| std::cmp::Reverse(s.requests)),
+        }
+    }
+}
+
+/// Session-local pane-height overrides (UI-3 U7/U8): `None` = the pane's
+/// automatic height (content-derived / fixed). Set by dragging the separator
+/// row (the NEXT pane's top border) with the mouse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PaneHeights {
+    pub accounts: Option<u16>,
+    pub middle: Option<u16>,
+    pub strip: Option<u16>,
 }
 
 /// UI-local state the renderer needs besides the data view: cursor, panes,
@@ -249,6 +363,11 @@ pub(crate) struct Chrome {
     /// method + path + status) so it survives new rows prepending — never a
     /// list index.
     pub expanded_activity: Option<activity::ActivityKey>,
+    /// The folded `count` run (if any) currently click-opened (UI-5). Distinct
+    /// from `expanded_activity` so a member row inside an open run can show
+    /// its OWN detail without the click reading as "collapse the group"
+    /// (Z 2026-07-15). Keyed by any member's `ActivityKey`.
+    pub expanded_run: Option<activity::ActivityKey>,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -257,16 +376,164 @@ pub(crate) struct Chrome {
     /// Folded session timeline for the Sessions overlay (issue #34), snapshotted
     /// from the persisted raw-io log when the overlay was opened. Empty otherwise.
     pub sessions: Vec<crate::session::Session>,
-    /// True while a background `load_sessions` is in flight (issue: `s` froze the
-    /// TUI ~10s). The overlay shows a spinner instead of the table/empty hint.
+    /// True while a background `stream_sessions` load is in flight (issue: `s`
+    /// froze the TUI ~10s). The overlay shows a full-screen spinner only while
+    /// this is set AND no partial has arrived yet; once partials land the table
+    /// renders with a `loading… N%` title until the final delivery clears this.
     pub sessions_loading: bool,
+    /// Percent of the raw-io file consumed by the in-flight streaming load
+    /// (`bytes_read*100/file_len`), shown in the overlay title. 100 at rest.
+    pub sessions_pct: u8,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles).
+    pub session_sort: SessionSort,
+    /// Config-editor cursor row + the edit/confirm prompt text.
+    pub config_cursor: usize,
+    pub config_input: String,
+    /// Restart-only values saved THIS session (action → new value): the row
+    /// keeps showing the effective boot value, and this map drives an
+    /// explicit "saved: X (restart)" note — pending must never masquerade
+    /// as applied, and applied must never hide a pending save.
+    pub config_saved: std::collections::HashMap<ui::ConfigAction, String>,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
     /// Number of characters typed so far in `Mode::AddKey` — the footer shows
     /// a masked prompt (`••••`) of this width, never the raw key.
     pub add_input_len: usize,
+    /// Session-local `u`-key override of the quota-gauge fill direction;
+    /// `None` = the config default carried on the view applies.
+    pub quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
+    pub reset_absolute: bool,
+    /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
+    /// Rendered raw in the footer (percent ceilings are not secrets).
+    pub limits_input: String,
+    /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
+    /// layout.
+    pub pane_heights: PaneHeights,
+    /// Anchor cell of the open right-click context menu (UI-3 U11).
+    pub menu_anchor: Option<(u16, u16)>,
+    /// The pinned account id the open context menu targets — the SINGLE
+    /// source of truth for both the menu's rendering and its execution
+    /// (display indexes reorder every frame; review R2 MUST-FIX).
+    pub menu_account: Option<String>,
+    /// Tokens-per-day chart span in days (`d` cycles, UI-3 U14).
+    pub chart_days: u64,
+    /// Perf-overlay chart/table span in days (perf telemetry v1), cycled with
+    /// `d` while the Perf overlay is open.
+    pub perf_days: u64,
+    /// Cursor row in the Perf overlay's series table.
+    pub perf_cursor: usize,
+    /// Selected day for the series table, as an offset back from today
+    /// (`None` = whole-span aggregate; `h`/`l` or ←/→ move it).
+    pub perf_day_off: Option<u64>,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    pub usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
+    /// recent at the top).
+    pub usage_scroll: usize,
+    /// The click-opened input-text modal (UI-6 item 3), or `None` when closed.
+    /// Drawn last over MAIN; its content is looked up from `view.completed` by
+    /// the stored key every frame, so it works identically in local and attach
+    /// mode and closes gracefully when the entry ages out of the ring.
+    pub input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7), or `None` when
+    /// closed. Content-owning (cheap to clone — the body lines sit behind an
+    /// `Arc`), drawn last like the input modal.
+    pub raw_modal: Option<RawModal>,
+}
+
+/// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
+/// entry's STABLE identity (never a list index — rows prepend) plus the vertical
+/// scroll offset in wrapped lines; the excerpt text itself is re-read from
+/// `view.completed` each frame, so nothing goes stale and no wire field is added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputModal {
+    pub key: activity::ActivityKey,
+    pub scroll: u16,
+}
+
+/// Content state of the raw viewer: the fetch is asynchronous (a backwards
+/// scan of a possibly-huge `raw-io.jsonl`, or an HTTP round-trip in attach
+/// mode), so the modal opens Loading and resolves to Ready/Failed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RawModalState {
+    Loading,
+    Failed(String),
+    /// Prebuilt per-tab lines behind an `Arc` — `Chrome` is cloned every
+    /// frame, and a Ready body can be megabytes of styled lines.
+    Ready(std::sync::Arc<ui::RawContent>),
+}
+
+/// The click-opened raw request/response viewer (UI-7). Unlike [`InputModal`]
+/// it owns its content (fetched once) — it never goes stale and survives the
+/// entry aging out of the activity ring.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawModal {
+    pub key: activity::ActivityKey,
+    /// Activity id, used by the save-file names (`llmux-raw-<id>…`).
+    pub id: u64,
+    /// Monotonic open-generation (UI-8): bumped every time a modal opens, so a
+    /// stale background delivery (a slow raw fetch or a queued export) for a
+    /// PRIOR open can't land on the modal the user reopened. Keyed on this,
+    /// not just [`ActivityKey`] — the key omits the activity id and a
+    /// close→reopen of the SAME row would otherwise accept the old fetch.
+    pub generation: u64,
+    pub title: String,
+    /// Index into the Ready content's tab list (2 or 4 tabs, UI-8); clamped
+    /// at draw/use time so a stale index can never panic.
+    pub tab: usize,
+    pub scroll: u16,
+    /// Horizontal pan in display cells (UI-8; clamped like `scroll`).
+    pub hscroll: u16,
+    /// Animation frame for the Loading spinner (advances with the shared tick).
+    pub spin: usize,
+    /// Action feedback ("copied … → pbcopy" / "saved → …"), shown in place of
+    /// the key legend until it expires (drawn ~3 s).
+    pub flash: Option<(String, std::time::Instant)>,
+    pub state: RawModalState,
+}
+
+/// A queued raw-record fetch: the clicked entry's stable key (its `at_ms` is
+/// the timestamp half of the raw-io lookup), the activity id, and what the
+/// content builder needs from open time (general lines + curl context).
+struct RawFetchReq {
+    generation: u64,
+    id: u64,
+    general: ui::RawGeneral,
+    /// The lookup key's timestamp half (the record's `at_ms`).
+    at_ms: u64,
+}
+
+/// Result of a background raw fetch, delivered on the raw channel.
+struct RawLoad {
+    generation: u64,
+    result: Result<std::sync::Arc<ui::RawContent>, String>,
+}
+
+/// A queued export (copy/save) action (UI-8): run on the blocking pool so a
+/// wedged clipboard tool or a slow Downloads mount can never freeze the TUI
+/// event loop. Carries the modal generation so a late result flashes only on
+/// the modal that requested it.
+struct ClipReq {
+    generation: u64,
+    button: ui::RawButton,
+    id: u64,
+    /// Prebuilt payload for the chosen action (body / curl / all / record).
+    payload: String,
+    /// File-name label for the save actions (tab slug, empty for save-all).
+    label: String,
+    /// Whether this action writes a file (vs. copies to the clipboard).
+    is_save: bool,
+    /// File extension for a save action.
+    ext: &'static str,
+}
+
+/// Outcome of a background export, delivered on the clip channel.
+struct ClipResult {
+    generation: u64,
+    message: String,
 }
 
 /// Attach-mode banner state.
@@ -316,6 +583,22 @@ struct Remote {
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
+    /// Config-editor settings change awaiting POST (attach mode), with
+    /// the originating row + display value so a restart-only save can pin
+    /// its pending note after the daemon confirms it.
+    pending_settings: Option<(
+        crate::proxy::server::SettingsRequest,
+        Option<(ui::ConfigAction, String)>,
+    )>,
+    /// Pause/resume queued by the switcher's `p` key, performed by the event
+    /// loop via `POST /llmux/pause-account`.
+    pending_pause: Option<(String, bool)>,
+    /// Limits change queued by the switcher's `L` editor, performed by the
+    /// event loop via `POST /llmux/account-limits`.
+    pending_limits: Option<(String, crate::config::AccountLimits)>,
+    /// Scheduler-mode change queued by `S`, performed by the event loop via
+    /// `POST /llmux/scheduler-mode`.
+    pending_mode: Option<crate::config::SchedulerMode>,
     /// API key for a new account, queued by the `a` flow and performed by the
     /// event loop via `POST /llmux/add-account`. Held only until the POST
     /// fires; never logged or rendered raw.
@@ -323,6 +606,10 @@ struct Remote {
     /// Account name queued for removal (`r` confirm), performed by the event
     /// loop via `POST /llmux/remove-account`.
     pending_remove: Option<String>,
+    /// Grok effort change queued by the group-settings bar (UI-3 U12),
+    /// performed by the event loop via `POST /llmux/grok`. Inner `None` =
+    /// clear to bypass.
+    pending_grok: Option<Option<String>>,
 }
 
 /// One message from the remote fetch task.
@@ -344,13 +631,85 @@ struct App {
     overlay: Overlay,
     /// Activity-log scroll offset (newest entries skipped; 0 = live tail).
     activity_scroll: usize,
+    /// Viewport anchor for UI-6 item 4: the newest completed REQUEST's stable
+    /// identity as of the last rendered frame, plus the render-row index it sat
+    /// at THEN (`last_top_row`). Notes carry no key yet occupy their own render
+    /// row, so the newest keyed request can sit at row ≥1 — the anchor's index
+    /// must therefore be a DELTA (`new_index - last_top_row`), not an absolute,
+    /// or a leading note would bump the offset every idle tick (runaway). When
+    /// new entries prepend while scrolled into history, the anchor's new render
+    /// row minus its seeded row = the prepend count; bumping the offset by that
+    /// keeps the page under the cursor put. Robust at ring capacity (append
+    /// evicts oldest → folded-row COUNT is flat, so a length delta would be
+    /// dead). `None` = no keyed frame observed yet.
+    last_top_key: Option<activity::ActivityKey>,
+    last_top_row: usize,
     /// The click-expanded activity entry (Feature B), keyed by stable identity
     /// so it survives new rows prepending. `None` = nothing expanded.
     expanded_activity: Option<activity::ActivityKey>,
+    /// The click-opened folded `count` run (UI-5), keyed by any member's
+    /// stable identity. Separate from `expanded_activity` (see `Chrome`).
+    expanded_run: Option<activity::ActivityKey>,
+    /// Older completed entries hydrated from the persisted activity log
+    /// (`activity.jsonl`) once the operator scrolls near the end of the live
+    /// window (UI-5 infinite scroll, Z 2026-07-15). Newest-first; merged
+    /// strictly-older-than-live at render time. `None` = not loaded yet.
+    history_completed: Option<Vec<activity::Completed>>,
+    /// How many of those history entries are MATERIALIZED into the frame's
+    /// view. Grown only on state transitions — scroll events and history
+    /// arrival ([`Self::grow_history_take`]) — so the folding work needed to
+    /// pick the amount never runs on the per-frame render path (review R3-2).
+    history_take: usize,
+    /// True while the background history load is in flight.
+    history_loading: bool,
+    /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
+    history_tx: Option<mpsc::Sender<Vec<activity::Completed>>>,
     /// The activity panel's hit-test layout from the LAST rendered frame: the
     /// panel rect + the clickable request rows. Recorded by the event loop after
     /// each `draw`, read by the mouse handler to map a click to an entry.
     activity_chrome: ui::ActivityChrome,
+    /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
+    /// one rect per tab label. Same record/read cycle as `activity_chrome`.
+    tab_chrome: Vec<ui::TabHit>,
+    /// Sessions table hit layout from the last frame (mouse row select).
+    sessions_chrome: Option<ui::SessionsChrome>,
+    /// Config-editor value-cell hits from the last frame.
+    config_chrome: Vec<ui::ConfigHit>,
+    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
+    /// payload-tab rects + top-right action buttons. Same record/read cycle
+    /// as `activity_chrome`; empty while the modal is closed.
+    raw_chrome: ui::RawModalChrome,
+    /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
+    /// top-border row of a pane, dragging it resizes the pane ABOVE it.
+    separator_chrome: Vec<ui::SeparatorHit>,
+    /// Session-local pane-height overrides set by separator drags.
+    pane_heights: PaneHeights,
+    /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
+    chart_days: u64,
+    /// Perf overlay span (`d` cycles) + series-table cursor + day select.
+    perf_days: u64,
+    perf_cursor: usize,
+    perf_day_off: Option<u64>,
+    /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
+    /// right-click target map.
+    account_row_chrome: Vec<ui::AccountRowHit>,
+    /// The rendered context menu's hit layout (UI-3 U11), when open.
+    menu_chrome: Option<ui::MenuChrome>,
+    /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
+    setting_chrome: Vec<ui::SettingHit>,
+    /// Anchor cell of the open context menu (col, row).
+    menu_anchor: Option<(u16, u16)>,
+    /// The REAL account id the open context menu targets, captured at open
+    /// time. Display indexes reorder every frame (selection order follows
+    /// live quota state), so actions re-resolve this name to the CURRENT
+    /// display row at execution — a reorder between open and click can never
+    /// retarget another account (review R1 MUST-FIX 6).
+    menu_account: Option<String>,
+    /// Whether the limits editor was opened FROM the context menu (then it
+    /// exits to Normal, not back into the switcher).
+    limits_from_menu: bool,
+    /// The separator currently being dragged, if any (mouse button held).
+    drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -361,15 +720,32 @@ struct App {
     /// A point-in-time snapshot — re-opening re-reads the file. Empty otherwise.
     sessions: Vec<crate::session::Session>,
     /// True while the background load kicked off by `open_sessions` is running
-    /// (read+parse+fold of the multi-MB raw-io log). Cleared when the loaded
-    /// timeline arrives over `sessions_tx`. Drives the overlay loading spinner.
+    /// (streaming read+parse+fold of the multi-MB raw-io log). Cleared when the
+    /// final (`done`) partial arrives over `sessions_tx`. Drives the overlay
+    /// loading spinner (while empty) and the `loading… N%` title (once filling).
     sessions_loading: bool,
+    /// Percent of the raw-io file the in-flight streaming load has consumed,
+    /// carried on each partial and shown in the overlay title. 100 at rest.
+    sessions_pct: u8,
     /// Sender handed to the `spawn_blocking` load task by `open_sessions`; the
-    /// event loop owns the receiver and applies the result. `None` only in unit
-    /// tests that never run `event_loop` (they drive overlay state directly).
-    sessions_tx: Option<mpsc::Sender<Vec<crate::session::Session>>>,
+    /// event loop owns the receiver and applies each progressive partial. `None`
+    /// only in unit tests that never run `event_loop` (they drive overlay state
+    /// directly).
+    sessions_tx: Option<mpsc::Sender<SessionsLoad>>,
     /// Cursor row in the Sessions overlay's session list.
     session_cursor: usize,
+    /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
+    session_sort: SessionSort,
+    /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
+    config_cursor: usize,
+    config_input: String,
+    /// Pending confirmed settings request awaiting y/n (built at edit time so
+    /// confirm applies EXACTLY what was validated).
+    config_pending: Option<crate::proxy::server::SettingsRequest>,
+    /// Restart-only values saved this session (see `Chrome::config_saved`).
+    config_saved: std::collections::HashMap<ui::ConfigAction, String>,
+    /// The raw display value of the request parked in `config_pending`.
+    config_pending_value: Option<String>,
     /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
     /// stays `Copy` and the secret is owned in exactly one place; cleared on
     /// submit/cancel. Never rendered raw — the footer shows a masked width.
@@ -381,6 +757,47 @@ struct App {
     /// difference is where the minted credential is injected. `None` on a
     /// headless client (the picker shows the `llmux login` fallback instead).
     pending_login: Option<LoginKind>,
+    /// Session-local override of the quota-gauge fill direction, flipped with
+    /// `u` (MAIN and the Accounts overlay). `None` until the first press — the
+    /// config default carried on the view applies.
+    quota_display_override: Option<crate::config::QuotaDisplay>,
+    /// Session toggle (`t`): quota bars show the reset as an absolute UTC
+    /// stamp instead of the countdown.
+    reset_absolute: bool,
+    /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
+    usage_gran: activity::UsageGran,
+    /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
+    /// the granularity changes so a deep hourly scroll can't strand the
+    /// monthly table past its last row.
+    usage_scroll: usize,
+    /// The click-opened input-text modal (UI-6 item 3); `None` when closed. The
+    /// scroll offset is clamped after each draw against the wrapped line count
+    /// the render pass reports (`MainChrome::input_modal_max_scroll`).
+    input_modal: Option<InputModal>,
+    /// The click-opened raw request/response viewer (UI-7); `None` when closed.
+    raw_modal: Option<RawModal>,
+    /// A queued raw-record fetch, drained by the event loop into a background
+    /// task (same pattern as the other `pending_*` remote ops).
+    pending_raw: Option<RawFetchReq>,
+    /// Sender the background raw fetch delivers its [`RawLoad`] on; installed
+    /// by the event loop (mirrors `sessions_tx`).
+    raw_tx: Option<mpsc::Sender<RawLoad>>,
+    /// Monotonic raw-modal open counter (UI-8); the next modal's generation.
+    raw_generation: u64,
+    /// Queued exports (UI-8 copy/save), dispatched SINGLE-FLIGHT and in order.
+    /// A `VecDeque`, not a single slot: two export actions in one input burst
+    /// (ready events drain before the event loop spawns them) must both run —
+    /// a single `Option` silently dropped the earlier one. But the loop spawns
+    /// only ONE at a time (`clip_inflight`), so clipboard writes execute in
+    /// press order (last-writer is the last press, not a race) and a slow/
+    /// wedged exporter applies backpressure instead of piling unbounded work
+    /// onto the blocking pool. Capped at [`CLIP_QUEUE_MAX`].
+    pending_clip: std::collections::VecDeque<ClipReq>,
+    /// True while one export runs on the blocking pool; cleared when its
+    /// [`ClipResult`] arrives. Gates the next dispatch (single-flight).
+    clip_inflight: bool,
+    /// Sender the background export delivers its [`ClipResult`] on.
+    clip_tx: Option<mpsc::Sender<ClipResult>>,
 }
 
 impl App {
@@ -393,16 +810,59 @@ impl App {
             status: None,
             overlay: Overlay::None,
             activity_scroll: 0,
+            last_top_key: None,
+            last_top_row: 0,
             expanded_activity: None,
+            expanded_run: None,
+            history_completed: None,
+            history_take: 0,
+            history_loading: false,
+            history_tx: None,
             activity_chrome: ui::ActivityChrome::default(),
+            tab_chrome: Vec::new(),
+            sessions_chrome: None,
+            config_chrome: Vec::new(),
+            raw_chrome: ui::RawModalChrome::default(),
+            separator_chrome: Vec::new(),
+            pane_heights: PaneHeights::default(),
+            chart_days: 14,
+            perf_days: 14,
+            perf_cursor: 0,
+            perf_day_off: None,
+            account_row_chrome: Vec::new(),
+            menu_chrome: None,
+            menu_anchor: None,
+            menu_account: None,
+            setting_chrome: Vec::new(),
+            limits_from_menu: false,
+            drag: None,
             model_cursor: 0,
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
             sessions_loading: false,
+            sessions_pct: 100,
             sessions_tx: None,
             session_cursor: 0,
+            session_sort: SessionSort::default(),
+            config_cursor: 0,
+            config_input: String::new(),
+            config_pending: None,
+            config_pending_value: None,
+            config_saved: Default::default(),
             add_input: String::new(),
             pending_login: None,
+            quota_display_override: None,
+            usage_gran: activity::UsageGran::default(),
+            usage_scroll: 0,
+            input_modal: None,
+            raw_modal: None,
+            pending_raw: None,
+            raw_tx: None,
+            raw_generation: 0,
+            pending_clip: std::collections::VecDeque::new(),
+            clip_inflight: false,
+            clip_tx: None,
+            reset_absolute: false,
         }
     }
 
@@ -416,11 +876,167 @@ impl App {
     /// Build the view-model for one frame. `None` only in remote mode before
     /// the first document arrives.
     fn view(&self, now: SystemTime) -> Option<DashboardView> {
-        match &self.backend {
+        let mut view = match &self.backend {
+            // The event banner rides the dashboard document from the daemon's
+            // live event holder, so both backends get it through `from_doc` —
+            // no local-only special case.
             Backend::Local(state) => Some(DashboardView::from_doc(&crate::dashboard::build_doc(
                 state, now,
             ))),
             Backend::Remote(remote) => remote.doc.as_ref().map(DashboardView::from_doc),
+        }?;
+        self.extend_with_history(&mut view);
+        Some(view)
+    }
+
+    /// Append lazily-hydrated history behind the live window (UI-5 infinite
+    /// scroll): only entries strictly OLDER than the oldest live row (the
+    /// persisted tail overlaps the live ring — the timestamp cut dedupes),
+    /// and only as many as the current scroll depth can reach plus one page,
+    /// so the per-frame clone stays bounded by how deep the operator actually
+    /// scrolled rather than the whole persisted file.
+    fn extend_with_history(&self, view: &mut DashboardView) {
+        if let Some(history) = &self.history_completed {
+            extend_completed_with_history(&mut view.completed, history, self.history_take);
+        }
+    }
+
+    /// Keep a scrolled-into-history viewport anchored when new completed entries
+    /// arrive (UI-6 item 4). Rows are newest-first and the scroll window counts
+    /// render rows from the newest, so a freshly prepended entry would slide the
+    /// page the operator is reading down. While `activity_scroll > 0`, locate
+    /// the row that carries last frame's anchor key in THIS frame's folded rows:
+    /// its new index MINUS the index it was seeded at (`last_top_row`) is the
+    /// number of rows prepended above it, so bumping the offset by that delta
+    /// leaves the same rows under the cursor. The delta (not the absolute index)
+    /// is essential: a Note occupies its own render row but has no key, so the
+    /// newest keyed request can sit at row ≥1 — an absolute bump would then add
+    /// that offset on every idle redraw tick (runaway). Robust at ring capacity,
+    /// where each append evicts the oldest and the folded-row COUNT never
+    /// changes. Key not found (evicted / edge) → leave the offset alone. At
+    /// `scroll == 0` we keep live-tail (no bump) AND skip the fold — re-seeding
+    /// the anchor needs only the cheap leading scan. Called once per rendered
+    /// frame, before `chrome()` snapshots the offset.
+    fn preserve_scroll_on_new_activity(&mut self, view: &DashboardView) {
+        if self.activity_scroll > 0 {
+            if let Some(anchor) = self.last_top_key.clone() {
+                let rows = triage::collapse_completed(&view.completed);
+                if let Some(new_index) = Self::render_row_of_key(&view.completed, &rows, &anchor) {
+                    let prepended = new_index.saturating_sub(self.last_top_row);
+                    if prepended > 0 {
+                        let ceiling = rows.len().saturating_sub(1);
+                        self.activity_scroll =
+                            self.activity_scroll.saturating_add(prepended).min(ceiling);
+                    }
+                }
+            }
+        }
+        // Re-seed to the newest keyed (request) entry and the render row it now
+        // occupies. That row index is exactly the count of leading Note entries
+        // ahead of the first request (Notes are unfoldable 1:1 rows and any run
+        // fold sits BELOW the first request), so no second fold is needed.
+        match view
+            .completed
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| c.activity_key().map(|k| (k, i)))
+        {
+            Some((key, row)) => {
+                self.last_top_key = Some(key);
+                self.last_top_row = row;
+            }
+            None => {
+                self.last_top_key = None;
+                self.last_top_row = 0;
+            }
+        }
+    }
+
+    /// The index of the render row containing `key`, or `None` if no row does.
+    /// For a folded run, ANY member matching counts (the run is one render row).
+    fn render_row_of_key(
+        completed: &[activity::Completed],
+        rows: &[triage::ActivityRow],
+        key: &activity::ActivityKey,
+    ) -> Option<usize> {
+        rows.iter().position(|row| match row {
+            triage::ActivityRow::Single(i) => completed[*i].activity_key().as_ref() == Some(key),
+            triage::ActivityRow::Run { start, len } => completed[*start..*start + *len]
+                .iter()
+                .any(|c| c.activity_key().as_ref() == Some(key)),
+        })
+    }
+
+    /// Grow the materialized-history window (`history_take`) until the FOLDED
+    /// render-row count reaches `activity_scroll + HISTORY_PAGE` — capped at
+    /// [`HISTORY_GROW_CHUNKS`] chunks per call so one giant folded `count`
+    /// wall cannot make a single event traverse the whole 100k-entry history
+    /// (review R3-2; further scrolling fires further calls, so loading stays
+    /// progressive). Runs ONLY on state transitions — a scroll event or the
+    /// history arrival — never per frame. Folding happens here, on a scratch
+    /// copy; the frame path then just appends the first `history_take`
+    /// strictly-older entries. Called on arrival even at `scroll == 0` so a
+    /// live window that folds to a single row (whose scroll ceiling is 0)
+    /// still gets its first history page and the ceiling can rise
+    /// (review R3-1 deadlock).
+    fn grow_history_take(&mut self, view: &DashboardView) {
+        let Some(history) = &self.history_completed else {
+            return;
+        };
+        let target_rows = self.activity_scroll.saturating_add(HISTORY_PAGE);
+        let mut scratch = view.completed.clone();
+        let mut rows = triage::collapse_completed(&scratch).len();
+        let mut chunks = 0;
+        while rows < target_rows && chunks < HISTORY_GROW_CHUNKS {
+            let oldest = scratch.last().map(|c| c.at);
+            let before = scratch.len();
+            scratch.extend(
+                history
+                    .iter()
+                    .filter(|c| oldest.is_none_or(|o| c.at < o))
+                    .take(HISTORY_CHUNK)
+                    .cloned(),
+            );
+            let appended = scratch.len() - before;
+            if appended == 0 {
+                return; // history exhausted
+            }
+            self.history_take += appended;
+            rows = triage::collapse_completed(&scratch).len();
+            chunks += 1;
+        }
+    }
+
+    /// Whether infinite-scroll hydration may read the LOCAL `activity.jsonl`
+    /// (review M1): the file belongs to THIS host's daemon, so it is the
+    /// right history for the in-process backend and for a LOOPBACK attach
+    /// (the standard `llmux` → localhost:3456 topology — same machine, same
+    /// state file). Attached to a daemon on another host, the local file is a
+    /// DIFFERENT daemon's activity — splicing it under the remote live rows
+    /// would show wrong data, so hydration stays off until the remote paging
+    /// endpoint exists (issue #107).
+    fn history_is_local(&self) -> bool {
+        match &self.backend {
+            Backend::Local(_) => true,
+            Backend::Remote(remote) => base_url_is_loopback(&remote.base_url),
+        }
+    }
+
+    /// Kick off the one-shot background hydration of the persisted activity
+    /// log for infinite scroll (UI-5). Read+parse+replay is blocking IO/CPU
+    /// over a multi-MB file → blocking pool, result over `history_tx`
+    /// (mirrors `open_sessions`). Idempotent: no-op while loading or loaded,
+    /// and refused entirely for a cross-host attach (see
+    /// [`Self::history_is_local`]).
+    fn request_history(&mut self) {
+        if self.history_loading || self.history_completed.is_some() || !self.history_is_local() {
+            return;
+        }
+        self.history_loading = true;
+        if let Some(tx) = self.history_tx.clone() {
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.blocking_send(load_history());
+            });
         }
     }
 
@@ -431,12 +1047,41 @@ impl App {
             overlay: self.overlay,
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
+            expanded_run: self.expanded_run.clone(),
             model_cursor: self.model_cursor,
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
             sessions_loading: self.sessions_loading,
+            sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
+            session_sort: self.session_sort,
+            config_cursor: self.config_cursor,
+            config_input: self.config_input.clone(),
+            config_saved: self.config_saved.clone(),
             add_input_len: self.add_input.chars().count(),
+            quota_display_override: self.quota_display_override,
+            reset_absolute: self.reset_absolute,
+            pane_heights: self.pane_heights,
+            menu_anchor: self.menu_anchor,
+            menu_account: self.menu_account.clone(),
+            chart_days: self.chart_days,
+            perf_days: self.perf_days,
+            perf_cursor: self.perf_cursor,
+            perf_day_off: self.perf_day_off,
+            usage_gran: self.usage_gran,
+            usage_scroll: self.usage_scroll,
+            input_modal: self.input_modal.clone(),
+            // The Loading spinner rides the shared frame counter (set here so
+            // the stored modal itself never needs a per-tick mutation).
+            raw_modal: self.raw_modal.clone().map(|mut m| {
+                m.spin = self.frame;
+                m
+            }),
+            limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
+                self.add_input.clone()
+            } else {
+                String::new()
+            },
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -488,14 +1133,34 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // The input modal (UI-6 item 3), when open, swallows every key beneath
+        // it: Esc/q/Enter close it, the arrows/PgUp/PgDn scroll it. It sits
+        // above overlays and modes so a stray key never leaks to MAIN.
+        if self.input_modal.is_some() {
+            self.on_key_input_modal(key.code);
+            return;
+        }
+        // The raw viewer (UI-7) swallows keys the same way when open.
+        if self.raw_modal.is_some() {
+            self.on_key_raw_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
         match self.mode {
             Mode::Select { idx } => return self.on_key_select(key.code, idx, view),
+            Mode::EditLimits { idx } => return self.on_key_edit_limits(key.code, idx, view),
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
+            Mode::ContextMenu { idx, item } => {
+                return self.on_key_context_menu(key.code, idx, item, view)
+            }
+            Mode::ConfigEdit { action } => return self.on_key_config_edit(key.code, action, view),
+            Mode::ConfigConfirm { action } => {
+                return self.on_key_config_confirm(key.code, action, view)
+            }
             Mode::Normal => {}
         }
         // Otherwise (Mode::Normal): the active overlay, if any, gets the key;
@@ -504,8 +1169,12 @@ impl App {
             Overlay::None => self.on_key_main(key.code, view),
             Overlay::Accounts => self.on_key_accounts(key.code, view),
             Overlay::Stats => self.on_key_stats(key.code, view),
+            Overlay::Usage => self.on_key_usage(key.code, view),
             Overlay::Logs => self.on_key_logs(key.code),
             Overlay::Sessions => self.on_key_sessions(key.code),
+            Overlay::Misc => self.on_key_misc(key.code),
+            Overlay::Perf => self.on_key_perf(key.code, view),
+            Overlay::Config => self.on_key_config(key.code, view),
         }
     }
 
@@ -521,19 +1190,310 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
-        // Only MAIN (no overlay, no pending mode interaction) gets the mouse.
+        // The input modal (UI-6 item 3), when open, owns the mouse: the wheel
+        // scrolls it (clamped after draw) and every click is swallowed so it
+        // can't reach a row beneath the modal.
+        if let Some(modal) = self.input_modal.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(1),
+                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(1),
+                _ => {}
+            }
+            return true;
+        }
+        // The raw viewer (UI-7) owns the mouse the same way when open; UI-8
+        // adds clickable payload tabs + the top-right action buttons and a
+        // horizontal wheel pan.
+        if self.raw_modal.is_some() {
+            let hit = |r: &ratatui::layout::Rect| {
+                mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let button = self
+                        .raw_chrome
+                        .buttons
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(b, _)| b);
+                    let tab = self
+                        .raw_chrome
+                        .tabs
+                        .iter()
+                        .find(|(_, r)| hit(r))
+                        .map(|&(i, _)| i);
+                    if let Some(btn) = button {
+                        self.raw_modal_action(btn);
+                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
+                        modal.tab = idx;
+                        modal.scroll = 0;
+                        modal.hscroll = 0;
+                    }
+                }
+                kind => {
+                    if let Some(modal) = self.raw_modal.as_mut() {
+                        match kind {
+                            MouseEventKind::ScrollUp => {
+                                modal.scroll = modal.scroll.saturating_sub(3)
+                            }
+                            MouseEventKind::ScrollDown => {
+                                modal.scroll = modal.scroll.saturating_add(3)
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN)
+                            }
+                            MouseEventKind::ScrollRight => {
+                                modal.hscroll = modal.hscroll.saturating_add(RAW_PAN)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
+        // interaction is pending — the tab bar is how the mouse navigates.
+        if self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
+                self.open_tab(tab, view);
+                return true;
+            }
+        }
+        // Wheel scrolling in the Usage overlay (usage-stats): its primary
+        // interaction IS bucket scrolling, so the wheel must work where the
+        // mouse opened the tab (review CR — the tab was mouse-openable but
+        // keyboard-only to scroll). Routed through the key handler so the
+        // stored-offset clamp applies identically.
+        if self.overlay == Overlay::Usage && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.on_key_usage(KeyCode::Up, view);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.on_key_usage(KeyCode::Down, view);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Config editor (config-editor v1): click a value cell to activate
+        // that row (same path as Enter); wheel moves the cursor.
+        if self.overlay == Overlay::Config && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.config_cursor = self.config_cursor.saturating_sub(1);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    let rows = view
+                        .map(|v| {
+                            let chrome = self.chrome();
+                            ui::config_row_count(v, &chrome)
+                        })
+                        .unwrap_or(0);
+                    self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(hit) = self
+                        .config_chrome
+                        .iter()
+                        .find(|h| {
+                            mouse.row == h.area.y
+                                && mouse.column >= h.area.x
+                                && mouse.column < h.area.right()
+                        })
+                        .copied()
+                    {
+                        self.config_cursor = hit.row;
+                        self.activate_config_action(hit.action, view);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Sessions overlay (issue: mouse select): click a row to move the
+        // cursor there (the detail pane follows); wheel scrolls the cursor.
+        if self.overlay == Overlay::Sessions && self.mode == Mode::Normal {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_session_cursor(-1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_session_cursor(1, self.sessions.len());
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(t) = self.sessions_chrome {
+                        let r = t.rows;
+                        if mouse.row >= r.y
+                            && mouse.row < r.bottom()
+                            && mouse.column >= r.x
+                            && mouse.column < r.right()
+                        {
+                            let idx = t.start + (mouse.row - r.y) as usize;
+                            if idx < self.sessions.len() {
+                                self.session_cursor = idx;
+                            }
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An open context menu (UI-3 U11) owns the mouse: click an item to
+        // run it, click anywhere else to dismiss.
+        if let Mode::ContextMenu { idx, .. } = self.mode {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+            ) {
+                match self
+                    .menu_chrome
+                    .as_ref()
+                    .and_then(|m| m.hit_item(mouse.column, mouse.row))
+                {
+                    Some(item) => self.run_menu_item(idx, item, view),
+                    None => self.close_menu(),
+                }
+                return true;
+            }
+            return false;
+        }
+        // Right-click on an accounts row opens its context menu (UI-3 U11).
+        if self.overlay == Overlay::None
+            && self.mode == Mode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+        {
+            if let Some(idx) = self
+                .account_row_chrome
+                .iter()
+                .find(|r| {
+                    mouse.row == r.area.y
+                        && mouse.column >= r.area.x
+                        && mouse.column < r.area.right()
+                })
+                .map(|r| r.display_idx)
+            {
+                // Pin the REAL account id now; display indexes reorder.
+                self.menu_account = view.and_then(|v| {
+                    let order = v.display_order(SystemTime::now());
+                    order
+                        .get(idx)
+                        .and_then(|&i| v.snapshot.accounts.get(i))
+                        .map(|a| a.id.0.clone())
+                });
+                self.mode = Mode::ContextMenu { idx, item: 0 };
+                self.menu_anchor = Some((mouse.column, mouse.row));
+                return true;
+            }
+            return false;
+        }
+        // Otherwise only MAIN (no overlay, no pending mode interaction) gets
+        // the mouse.
         if self.overlay != Overlay::None || self.mode != Mode::Normal {
             return false;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Separator rows first (UI-3 U7/U8): press starts a drag.
+                if let Some(sep) = self
+                    .separator_chrome
+                    .iter()
+                    .find(|s| s.y == mouse.row)
+                    .copied()
+                {
+                    self.drag = Some(sep);
+                    return true;
+                }
+                // Group-settings bar (UI-3 U9/U10): click a segment to
+                // rotate that setting.
+                if let Some(action) = self
+                    .setting_chrome
+                    .iter()
+                    .find(|h| {
+                        mouse.row == h.area.y
+                            && mouse.column >= h.area.x
+                            && mouse.column < h.area.right()
+                    })
+                    .map(|h| h.action)
+                {
+                    match action {
+                        ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
+                        ui::SettingAction::CodexModel => self.cycle_codex_model(view),
+                        ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
+                        ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
+                        ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                    }
+                    return true;
+                }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
-                    Some(key) => {
+                    // Clicking the `🔍 input` detail line opens the full-text
+                    // modal instead of collapsing the entry (UI-6 item 3).
+                    Some(ui::ActivityClick::OpenInput(key)) => {
+                        self.open_input_modal(key);
+                        true
+                    }
+                    // Clicking the `🔍 request` detail line opens the raw
+                    // request/response viewer (UI-7).
+                    Some(ui::ActivityClick::OpenRaw(key, id)) => {
+                        self.open_raw_modal(key, id, view);
+                        true
+                    }
+                    Some(ui::ActivityClick::Entry(key)) => {
                         self.toggle_expand(key);
                         true
                     }
+                    Some(ui::ActivityClick::RunToggle(key)) => {
+                        self.toggle_run(key);
+                        true
+                    }
+                    // Run-header body: expand-only — an open group is closed by
+                    // its marker, never by a stray body click (Z 2026-07-15).
+                    Some(ui::ActivityClick::RunExpand(key)) => {
+                        if self.expanded_run.as_ref() == Some(&key) {
+                            false
+                        } else {
+                            self.expanded_run = Some(key);
+                            true
+                        }
+                    }
                     None => false,
                 }
+            }
+            // Dragging a held separator resizes the pane above it: the pane's
+            // new height is the pointer row minus the pane's top row, clamped
+            // so a pane can never collapse below its border+header.
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(sep) = self.drag else { return false };
+                let height = mouse
+                    .row
+                    .saturating_sub(sep.pane_top)
+                    .clamp(ui::PANE_MIN_HEIGHT, ui::PANE_MAX_HEIGHT);
+                let slot = match sep.pane {
+                    ui::PaneId::Accounts => &mut self.pane_heights.accounts,
+                    ui::PaneId::Middle => &mut self.pane_heights.middle,
+                    ui::PaneId::Strip => &mut self.pane_heights.strip,
+                };
+                if *slot == Some(height) {
+                    return false;
+                }
+                *slot = Some(height);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag.take();
+                false
             }
             // Wheel up = into history, down = toward the live tail — same
             // direction as the ↑/↓ keys (a nice-to-have bonus).
@@ -560,6 +1520,427 @@ impl App {
         }
     }
 
+    /// Open the full-input modal (UI-6 item 3) on the clicked entry's stable
+    /// key, scrolled to the top. Re-opening on the same key resets the scroll.
+    fn open_input_modal(&mut self, key: activity::ActivityKey) {
+        self.input_modal = Some(InputModal { key, scroll: 0 });
+    }
+
+    /// Key handling while the input modal is open (UI-6 item 3). Esc/q/Enter
+    /// close it; the arrows/PgUp/PgDn adjust the scroll offset (over-scroll is
+    /// clamped after the next draw against the wrapped line count). Every other
+    /// key is swallowed so nothing leaks to MAIN beneath the modal.
+    fn on_key_input_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.input_modal.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.input_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    /// Open the raw request/response viewer (UI-7) on the clicked entry: build
+    /// the title + general metadata from the entry NOW (it may age out of the
+    /// ring while we fetch), queue the background raw-io lookup, and show the
+    /// modal in its Loading state. An entry from a pre-UI-7 daemon (`id == 0`)
+    /// fails immediately — there is no raw correlation key to look up.
+    fn open_raw_modal(
+        &mut self,
+        key: activity::ActivityKey,
+        id: u64,
+        view: Option<&DashboardView>,
+    ) {
+        // Select by the activity id, NOT just the key: the key omits the id,
+        // so two requests completing in the same millisecond with the same
+        // method/path/status would otherwise both resolve to the first match
+        // and the viewer could show/export the wrong request's record. The id
+        // is unique within a live view snapshot (per-process counter).
+        let entry = view.and_then(|v| {
+            v.completed
+                .iter()
+                .find(|c| {
+                    matches!(&c.body, activity::CompletedBody::Request { id: eid, .. } if *eid == id)
+                        && c.activity_key().as_ref() == Some(&key)
+                })
+                .cloned()
+        });
+        let Some(entry) = entry else {
+            return; // row vanished between draw and click — nothing to open
+        };
+        let activity::CompletedBody::Request { id, .. } = entry.body else {
+            return;
+        };
+        // A fresh open-generation invalidates any still-in-flight delivery for
+        // the PRIOR modal (raw fetch or queued export).
+        self.raw_generation = self.raw_generation.wrapping_add(1);
+        let generation = self.raw_generation;
+        let title = format!(
+            " 🔍 raw — {} {} · {} · {} ",
+            key.method,
+            key.path,
+            key.status,
+            format::clock_hms_utc(entry.at),
+        );
+        let state = if id == 0 {
+            RawModalState::Failed(
+                "no raw link: this entry was recorded by a daemon predating the raw viewer"
+                    .to_string(),
+            )
+        } else {
+            // The curl builder needs the client base URL — the record stores
+            // only bodies/headers. Local mode targets this process's own
+            // listen port; attach mode the daemon it is attached to.
+            let base_url = match &self.backend {
+                Backend::Local(state) => {
+                    // The ACTUAL listener port, not `config.proxy.port` — a
+                    // `port = 0` config binds an OS-assigned port stored here,
+                    // so the curl target must read `bound_port` or it would
+                    // say `localhost:0`.
+                    let port = state.bound_port.load(std::sync::atomic::Ordering::Relaxed);
+                    format!("http://localhost:{port}")
+                }
+                Backend::Remote(remote) => remote.base_url.clone(),
+            };
+            self.pending_raw = Some(RawFetchReq {
+                generation,
+                id,
+                at_ms: key.at_ms,
+                general: ui::RawGeneral {
+                    lines: ui::raw_general_lines(&entry),
+                    method: key.method.clone(),
+                    path: key.path.clone(),
+                    base_url,
+                },
+            });
+            RawModalState::Loading
+        };
+        self.raw_modal = Some(RawModal {
+            key,
+            id,
+            generation,
+            title,
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state,
+        });
+    }
+
+    /// Key handling while the raw viewer is open (UI-7/UI-8): Esc/q/Enter
+    /// close, ←/→/Tab/h/l walk the payload tabs (both offsets reset — tabs
+    /// have independent sizes), arrows/PgUp/PgDn/Home/End scroll, H/L pan
+    /// horizontally, and c/C/a/s/S fire the copy/curl/copy-all/save/save-all
+    /// actions (same as the top-right buttons). Everything else is swallowed
+    /// so nothing leaks beneath the modal.
+    fn on_key_raw_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        let tab_count = match &modal.state {
+            RawModalState::Ready(content) => content.tabs.len().max(1),
+            _ => 1,
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.raw_modal = None,
+            KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                modal.tab = (modal.tab + 1) % tab_count;
+                modal.scroll = 0;
+                modal.hscroll = 0;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                modal.tab = (modal.tab + tab_count - 1) % tab_count;
+                modal.scroll = 0;
+                modal.hscroll = 0;
+            }
+            KeyCode::Char('H') => modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN),
+            KeyCode::Char('L') => modal.hscroll = modal.hscroll.saturating_add(RAW_PAN),
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            KeyCode::Char('c') => self.raw_modal_action(ui::RawButton::Copy),
+            KeyCode::Char('C') => self.raw_modal_action(ui::RawButton::CopyCurl),
+            KeyCode::Char('a') => self.raw_modal_action(ui::RawButton::CopyAll),
+            KeyCode::Char('s') => self.raw_modal_action(ui::RawButton::Save),
+            KeyCode::Char('S') => self.raw_modal_action(ui::RawButton::SaveAll),
+            _ => {}
+        }
+    }
+
+    /// Queue one raw-viewer action button (UI-8) against the ACTIVE tab's
+    /// prebuilt payloads: the export itself (clipboard subprocess / file
+    /// write) runs on the blocking pool so a wedged clipboard tool or a slow
+    /// Downloads mount can never freeze the TUI event loop (the payload can be
+    /// tens of MiB). A not-yet-loaded modal flashes immediately; the real
+    /// outcome flashes when the background task reports back, gated on the
+    /// modal generation so a stale result never lands on a reopened modal.
+    fn raw_modal_action(&mut self, btn: ui::RawButton) {
+        let Some(modal) = self.raw_modal.as_mut() else {
+            return;
+        };
+        let generation = modal.generation;
+        let id = modal.id;
+        let RawModalState::Ready(content) = &modal.state else {
+            modal.flash = Some((
+                "raw record not loaded yet".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        };
+        let Some(tab) = content
+            .tabs
+            .get(modal.tab.min(content.tabs.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let ext = |text: &str| {
+            if text.trim_start().starts_with(['{', '[']) {
+                "json"
+            } else {
+                "txt"
+            }
+        };
+        // Move the (possibly large) payload string into the queued request —
+        // built once here, consumed by the blocking task. No work on the UI
+        // thread beyond this clone.
+        let (payload, is_save, ext, label) = match btn {
+            ui::RawButton::Copy => (tab.body_text.clone(), false, "", String::new()),
+            ui::RawButton::CopyCurl => (tab.curl.clone(), false, "", String::new()),
+            ui::RawButton::CopyAll => (content.all_text.clone(), false, "", String::new()),
+            ui::RawButton::Save => (
+                tab.body_text.clone(),
+                true,
+                ext(&tab.body_text),
+                tab.label.to_lowercase().replace(' ', "-"),
+            ),
+            ui::RawButton::SaveAll => (content.record_json.clone(), true, "json", String::new()),
+        };
+        if self.pending_clip.len() >= CLIP_QUEUE_MAX {
+            // Bounded: a wedged/slow exporter with a spamming user must not
+            // grow the queue without limit. Reject the newest with feedback.
+            modal.flash = Some((
+                "export busy — try again in a moment".to_string(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
+        self.pending_clip.push_back(ClipReq {
+            generation,
+            button: btn,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        });
+    }
+
+    /// Drain the queued export (event-loop side of [`Self::raw_modal_action`]).
+    /// Single-flight: hand the event loop the next export ONLY when none is
+    /// running, marking the slot busy. Cleared by [`Self::clip_finished`] when
+    /// the result arrives, so exports run one at a time, in FIFO press order.
+    fn next_clip_if_idle(&mut self) -> Option<ClipReq> {
+        if self.clip_inflight {
+            return None;
+        }
+        let req = self.pending_clip.pop_front()?;
+        self.clip_inflight = true;
+        Some(req)
+    }
+
+    /// Mark the in-flight export done (its result arrived), freeing the next.
+    fn clip_finished(&mut self) {
+        self.clip_inflight = false;
+    }
+
+    /// Resolve a delivered export outcome onto the open modal's flash line,
+    /// gated on the open-generation so a stale result never lands on a
+    /// reopened modal.
+    fn apply_clip_result(&mut self, result: ClipResult) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            if modal.generation == result.generation {
+                modal.flash = Some((result.message, std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Run one queued export on the blocking pool and deliver the flash
+    /// message on the clip channel. Never touches the UI thread; the payload
+    /// was already built at queue time.
+    fn spawn_clip(&mut self, req: ClipReq) {
+        let Some(tx) = self.clip_tx.clone() else {
+            return;
+        };
+        let ClipReq {
+            generation,
+            button,
+            id,
+            payload,
+            label,
+            is_save,
+            ext,
+        } = req;
+        tokio::task::spawn_blocking(move || {
+            let message = if is_save {
+                let stem = if label.is_empty() {
+                    format!("llmux-raw-{id}")
+                } else {
+                    format!("llmux-raw-{id}-{label}")
+                };
+                match clip::save(&stem, ext, &payload) {
+                    Ok(path) => match button {
+                        ui::RawButton::SaveAll => format!("saved record → {path}"),
+                        _ => format!("saved → {path}"),
+                    },
+                    Err(err) => err,
+                }
+            } else {
+                let n = payload.len();
+                match clip::copy(&payload) {
+                    Ok(dest) => match button {
+                        ui::RawButton::CopyCurl => format!("copied curl ({n} bytes) → {dest}"),
+                        ui::RawButton::CopyAll => format!("copied all {n} bytes → {dest}"),
+                        _ => format!("copied {n} bytes → {dest}"),
+                    },
+                    Err(err) => err,
+                }
+            };
+            let _ = tx.blocking_send(ClipResult {
+                generation,
+                message,
+            });
+        });
+    }
+
+    /// Drain the queued raw fetch (event-loop side of [`Self::open_raw_modal`]).
+    fn take_pending_raw(&mut self) -> Option<RawFetchReq> {
+        self.pending_raw.take()
+    }
+
+    /// Resolve a delivered raw load into the open modal. Ignored when the modal
+    /// was closed or re-targeted while the fetch ran (stale delivery).
+    fn apply_raw_load(&mut self, load: RawLoad) {
+        if let Some(modal) = self.raw_modal.as_mut() {
+            // Gate on the open-generation, not the key: the key omits the
+            // activity id, so a close→reopen of the same row (or two same-ms
+            // requests) could otherwise let a stale fetch's late result — even
+            // a stale 404 — clobber the reopened modal.
+            if modal.generation == load.generation && matches!(modal.state, RawModalState::Loading)
+            {
+                modal.state = match load.result {
+                    Ok(content) => RawModalState::Ready(content),
+                    Err(msg) => RawModalState::Failed(msg),
+                };
+            }
+        }
+    }
+
+    /// Spawn the background raw-record fetch for `req` and deliver the result
+    /// on the raw channel (never blocks the event loop — the local path is a
+    /// backwards file scan on the blocking pool, the attach path an HTTP GET to
+    /// `GET /llmux/raw-io`). Content lines are built in the task too: a Ready
+    /// body can be megabytes.
+    fn spawn_raw_fetch(&mut self, req: RawFetchReq) {
+        let Some(tx) = self.raw_tx.clone() else {
+            return;
+        };
+        let RawFetchReq {
+            generation,
+            id,
+            general,
+            at_ms,
+        } = req;
+        enum Source {
+            Local(Option<std::path::PathBuf>),
+            Remote {
+                client: reqwest::Client,
+                url: String,
+                api_key: Option<String>,
+            },
+        }
+        let source = match &self.backend {
+            Backend::Local(state) => Source::Local(
+                state
+                    .config
+                    .raw_io
+                    .enabled
+                    .then(|| state.raw_io_path.clone())
+                    .flatten(),
+            ),
+            Backend::Remote(remote) => Source::Remote {
+                client: remote.client.clone(),
+                url: format!("{}/llmux/raw-io?id={id}&at_ms={at_ms}", remote.base_url),
+                api_key: remote.api_key.clone(),
+            },
+        };
+        tokio::spawn(async move {
+            let not_found = || {
+                "no raw-io record for this request (capture disabled, pruned, or the daemon \
+                 restarted since)"
+                    .to_string()
+            };
+            let record = match source {
+                Source::Local(path) => tokio::task::spawn_blocking(move || {
+                    crate::proxy::raw_io::find_record(path.as_deref(), id, at_ms)
+                })
+                .await
+                .map_err(|err| format!("raw lookup task failed: {err}"))
+                .and_then(|found| found.ok_or_else(not_found)),
+                Source::Remote {
+                    client,
+                    url,
+                    api_key,
+                } => {
+                    let mut request = client.get(&url);
+                    if let Some(k) = &api_key {
+                        request = request.header("x-api-key", k);
+                    }
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .json::<crate::proxy::raw_io::RawIoRecord>()
+                            .await
+                            .map_err(|err| format!("raw-io response parse failed: {err}")),
+                        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                            Err(not_found())
+                        }
+                        Ok(response) => Err(format!("raw-io fetch failed: {}", response.status())),
+                        Err(err) => Err(format!("raw-io fetch failed: {err}")),
+                    }
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                record.map(|record| {
+                    std::sync::Arc::new(ui::raw_content_from_record(general, &record))
+                })
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("raw render task failed: {err}")));
+            let _ = tx.send(RawLoad { generation, result }).await;
+        });
+    }
+
+    /// Toggle the click-opened folded `count` run by any member's stable key
+    /// (UI-5): the marker opens a closed group and closes an open one.
+    fn toggle_run(&mut self, key: activity::ActivityKey) {
+        if self.expanded_run.as_ref() == Some(&key) {
+            self.expanded_run = None;
+        } else {
+            self.expanded_run = Some(key);
+        }
+    }
+
     /// Key handling for the Stats overlay (`g`). Arrows/`j`/`k` move the cursor
     /// through model rows; `g`/`Esc` closes back to MAIN; `q` quits.
     fn on_key_stats(&mut self, code: KeyCode, view: Option<&DashboardView>) {
@@ -569,6 +1950,16 @@ impl App {
             KeyCode::Char('g') | KeyCode::Esc => self.overlay = Overlay::None,
             // Cycle the heatmap window 24h ↔ 72h (issue #23).
             KeyCode::Char('w') => self.stats_window = self.stats_window.next(),
+            // Cycle the tokens-per-day chart span (UI-3 U14).
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.chart_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.chart_days = spans[next];
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_model_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_cursor(1, len),
             KeyCode::PageUp => self.move_model_cursor(-10, len),
@@ -585,6 +1976,523 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Number of context-menu entries (UI-3 U11): switch now / pause·resume /
+    /// set limit / delete.
+    const MENU_ITEMS: usize = 4;
+
+    /// Key handling for the context menu (UI-3 U11): ↑↓ move, Enter runs the
+    /// highlighted entry, Esc (or any other key) dismisses.
+    fn on_key_context_menu(
+        &mut self,
+        code: KeyCode,
+        idx: usize,
+        item: usize,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: item.saturating_sub(1),
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode = Mode::ContextMenu {
+                    idx,
+                    item: (item + 1).min(Self::MENU_ITEMS - 1),
+                };
+            }
+            KeyCode::Enter => self.run_menu_item(idx, item, view),
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Dismiss the context menu.
+    fn close_menu(&mut self) {
+        self.mode = Mode::Normal;
+        self.menu_anchor = None;
+        self.menu_account = None;
+    }
+
+    /// Run one context-menu entry against the account PINNED at menu-open
+    /// time. The display index is re-resolved from the pinned account id at
+    /// execution (rows reorder as live quota state changes); a vanished
+    /// account aborts with a status instead of acting on whoever moved into
+    /// the row. Every action reuses the exact key-flow path (switch / pause /
+    /// limits editor / remove confirm), so local and attach behave
+    /// identically.
+    fn run_menu_item(&mut self, fallback_idx: usize, item: usize, view: Option<&DashboardView>) {
+        let pinned = self.menu_account.clone();
+        self.close_menu();
+        let idx = match (&pinned, view) {
+            (Some(name), Some(v)) => {
+                let order = v.display_order(SystemTime::now());
+                match order
+                    .iter()
+                    .position(|&i| v.snapshot.accounts.get(i).is_some_and(|a| a.id.0 == *name))
+                {
+                    Some(pos) => pos,
+                    None => {
+                        self.set_status(format!("{name} is gone — menu action cancelled"));
+                        return;
+                    }
+                }
+            }
+            _ => fallback_idx,
+        };
+        match item {
+            0 => self.try_manual_switch(idx, view),
+            1 => self.toggle_pause_selected(idx, view),
+            2 => {
+                self.limits_from_menu = true;
+                self.open_limits_editor(idx, view);
+            }
+            // Destructive delete keeps its confirm gate (y/N) — never silent.
+            3 => self.mode = Mode::ConfirmRemove { idx },
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Perf overlay (`p`, perf telemetry v1): `d`
+    /// cycles the day span, arrows/`j`/`k` move the series cursor, `p`/`Esc`
+    /// closes, `q` quits.
+    fn on_key_perf(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let rows = view
+            .map(|v| ui::perf_series_count(v, self.perf_days, self.perf_day_off))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('p') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('d') => {
+                let spans = ui::DAILY_CHART_SPANS;
+                let next = spans
+                    .iter()
+                    .position(|d| *d == self.perf_days)
+                    .map(|i| (i + 1) % spans.len())
+                    .unwrap_or(0);
+                self.perf_days = spans[next];
+                self.perf_cursor = 0;
+                self.perf_day_off = None;
+            }
+            // Day drill-down (contract C5: per-day model×fast detail):
+            // ←/h walks back a day, →/l walks forward; walking past today
+            // returns to the whole-span aggregate.
+            KeyCode::Left | KeyCode::Char('h') => {
+                let max_off = self.perf_days.saturating_sub(1);
+                self.perf_day_off = Some(match self.perf_day_off {
+                    None => 0,
+                    Some(off) => (off + 1).min(max_off),
+                });
+                self.perf_cursor = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.perf_day_off = match self.perf_day_off {
+                    None | Some(0) => None,
+                    Some(off) => Some(off - 1),
+                };
+                self.perf_cursor = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.perf_cursor = self.perf_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.perf_cursor = (self.perf_cursor + 1).min(rows.saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Misc overlay (`?`, UI-3 U6). `?`/`Esc` closes.
+    fn on_key_misc(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
+    /// Key handling for the Config overlay (`c`, config-editor v1): arrows
+    /// move the cursor, Enter activates the row (toggle / cycle / edit
+    /// prompt), `c`/`Esc` closes.
+    fn on_key_config(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let rows = view.map(|v| {
+            let chrome = self.chrome();
+            ui::config_row_count(v, &chrome)
+        });
+        let rows = rows.unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.config_cursor = self.config_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let action = view.and_then(|v| {
+                    let chrome = self.chrome();
+                    ui::config_row_action(v, &chrome, self.config_cursor)
+                });
+                if let Some(action) = action {
+                    self.activate_config_action(action, view);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Activate one config row: toggles/cycles act (through the confirm gate
+    /// when the action is blast-radius); value rows open the edit prompt
+    /// prefilled with the current value.
+    fn activate_config_action(&mut self, action: ui::ConfigAction, view: Option<&DashboardView>) {
+        use ui::ConfigAction as A;
+        // Existing live paths keep their own flows (no settings round-trip).
+        match action {
+            A::CodexModel => return self.cycle_codex_model(view),
+            A::CodexEffort => return self.cycle_codex_effort(view),
+            A::CodexFast => return self.toggle_codex_fast(view),
+            A::GrokEffort => return self.cycle_grok_effort(view),
+            A::ResetDisplay => return self.toggle_reset_display(),
+            _ => {}
+        }
+        if action.input_hint().is_some() {
+            // Prefill with the current value where that is cheap to read.
+            self.config_input = view
+                .map(|v| {
+                    let f = &v.config_facts;
+                    let p = &v.select_params;
+                    match action {
+                        A::Ceiling5h => format!("{:.0}", p.five_hour_max * 100.0),
+                        A::Ceiling7d => format!("{:.0}", p.seven_day_max * 100.0),
+                        A::CeilingFbl => format!("{:.0}", p.fable_weekly_max * 100.0),
+                        A::UsageMaxAge => p.usage_max_age.as_secs().to_string(),
+                        A::GradientSpeed => format!("{:.2}", f.gradient_speed),
+                        A::RoutingDefaultGroup => f.routing_default_group.clone(),
+                        A::RoutingOnEmptyGroup => f.routing_on_empty_group.clone(),
+                        A::RawIoRetention => f.raw_io_retention_days.to_string(),
+                        A::RawIoMaxBody => f.raw_io_max_body_bytes.to_string(),
+                        A::Upstream => v.upstream.clone().unwrap_or_default(),
+                        A::CodexUpstream => f.codex_upstream.clone(),
+                        A::ProxyPort => v.port.to_string(),
+                        A::ProxyMaxBody => f.proxy_max_request_bytes.to_string(),
+                        _ => String::new(),
+                    }
+                })
+                .unwrap_or_default();
+            self.mode = Mode::ConfigEdit { action };
+            return;
+        }
+        // Scheduler mode applies through its own live path
+        // (toggle_scheduler_mode) — enter the confirm gate directly.
+        if action == ui::ConfigAction::SchedMode {
+            self.config_input =
+                confirm_prompt(action, &crate::proxy::server::SettingsRequest::default());
+            self.config_pending = None;
+            self.config_pending_value = None;
+            self.mode = Mode::ConfigConfirm { action };
+            return;
+        }
+        // Toggle actions: build the request from the CURRENT view value.
+        let req = self.toggle_settings_request(action, view);
+        let Some(req) = req else {
+            return self.set_status("config: value unavailable".into());
+        };
+        if action.needs_confirm() {
+            self.config_input = confirm_prompt(action, &req);
+            self.config_pending = Some(req);
+            self.mode = Mode::ConfigConfirm { action };
+        } else {
+            self.send_settings(req, None, view);
+        }
+    }
+
+    /// Build the SettingsRequest a TOGGLE row produces (inverse of the
+    /// current view value). `None` when the view is not available.
+    fn toggle_settings_request(
+        &self,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) -> Option<crate::proxy::server::SettingsRequest> {
+        use crate::proxy::server::SettingsRequest;
+        use ui::ConfigAction as A;
+        let view = view?;
+        let mut req = SettingsRequest::default();
+        match action {
+            A::EmailMask => req.email_anonymous = Some(!view.email_anonymous),
+            A::QuotaFill => {
+                let cur = self.quota_display_override.unwrap_or(view.quota_display);
+                req.quota_display = Some(match cur {
+                    crate::config::QuotaDisplay::Used => "remaining".into(),
+                    crate::config::QuotaDisplay::Remaining => "used".into(),
+                });
+            }
+            A::TuiEffects => req.tui_effects = Some(!view.tui_effects),
+            A::FableWeekly => req.show_fable_weekly = Some(!view.show_fable_weekly),
+            A::RoutingEnabled => req.routing_enabled = Some(!view.config_facts.routing_enabled),
+            A::RawIoEnabled => req.raw_io_enabled = Some(!view.config_facts.raw_io_enabled),
+            _ => return None,
+        }
+        Some(req)
+    }
+
+    /// Keys while typing a config value (Mode::ConfigEdit).
+    fn on_key_config_edit(
+        &mut self,
+        code: KeyCode,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Esc => {
+                self.config_input.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Backspace => {
+                self.config_input.pop();
+            }
+            KeyCode::Char(ch) => self.config_input.push(ch),
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.config_input);
+                self.mode = Mode::Normal;
+                match parse_config_input(action, raw.trim(), view) {
+                    Err(err) => self.set_status(format!("config: {err}")),
+                    Ok(req) => {
+                        // Blast-radius confirms: endpoint changes always; a
+                        // ceiling driven to 0 (locks scheduling out); a
+                        // retention decrease (deletes history).
+                        let needs = action.needs_confirm()
+                            || matches!(
+                                action,
+                                ui::ConfigAction::Ceiling5h
+                                    | ui::ConfigAction::Ceiling7d
+                                    | ui::ConfigAction::CeilingFbl
+                            ) && [req.five_hour_max, req.seven_day_max, req.fable_weekly_max]
+                                .iter()
+                                .flatten()
+                                .any(|v| *v == 0.0)
+                            || action == ui::ConfigAction::RawIoRetention && {
+                                // Compare against the latest SAVED value when
+                                // one is pending — the boot value would
+                                // misjudge repeat edits in one session.
+                                let baseline = self
+                                    .config_saved
+                                    .get(&ui::ConfigAction::RawIoRetention)
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .or_else(|| view.map(|v| v.config_facts.raw_io_retention_days));
+                                baseline.is_some_and(|base| {
+                                    req.raw_io_retention_days.is_some_and(|days| days < base)
+                                })
+                            };
+                        if needs {
+                            self.config_input = confirm_prompt(action, &req);
+                            self.config_pending = Some(req);
+                            self.config_pending_value = Some(raw.trim().to_string());
+                            self.mode = Mode::ConfigConfirm { action };
+                        } else {
+                            self.send_settings(req, Some((action, raw.trim().to_string())), view);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys on the confirm gate (Mode::ConfigConfirm): `y`/Enter applies the
+    /// pending request, anything declining cancels with no change.
+    fn on_key_config_confirm(
+        &mut self,
+        code: KeyCode,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.config_input.clear();
+                self.mode = Mode::Normal;
+                if action == ui::ConfigAction::SchedMode {
+                    self.config_pending = None;
+                    self.toggle_scheduler_mode(view);
+                    return;
+                }
+                if let Some(req) = self.config_pending.take() {
+                    let origin = self.config_pending_value.take().map(|v| (action, v));
+                    self.send_settings(req, origin, view);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.config_input.clear();
+                self.config_pending = None;
+                self.config_pending_value = None;
+                self.mode = Mode::Normal;
+                self.set_status("config: cancelled".into());
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a settings request: locally through the daemon's own
+    /// `apply_settings` (identical validation + persist + live flip), or
+    /// queued for the event loop to POST in attach mode. The status line
+    /// reports live-applied vs restart-required honestly.
+    fn send_settings(
+        &mut self,
+        req: crate::proxy::server::SettingsRequest,
+        origin: Option<(ui::ConfigAction, String)>,
+        _view: Option<&DashboardView>,
+    ) {
+        match &mut self.backend {
+            Backend::Local(state) => match crate::proxy::server::apply_settings(state, &req) {
+                Ok((applied, restart)) => {
+                    // A persisted quota-fill change supersedes any session
+                    // `u` override — otherwise the screen keeps the stale
+                    // override while claiming "applied" (review MUST-FIX 5).
+                    if req.quota_display.is_some() {
+                        self.quota_display_override = None;
+                    }
+                    // Restart-only saves get a visible pending note on their
+                    // row (the effective value stays the boot value).
+                    if let Some((action, value)) = origin {
+                        if restart.is_empty() {
+                            self.config_saved.remove(&action);
+                        } else {
+                            self.config_saved.insert(action, value);
+                        }
+                    }
+                    self.set_status(settings_status(&applied, &restart));
+                }
+                Err(err) => self.set_status(format!("config: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_settings = Some((req, origin));
+                self.set_status("config: applying…".into());
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn take_pending_settings(
+        &mut self,
+    ) -> Option<(
+        crate::proxy::server::SettingsRequest,
+        Option<(ui::ConfigAction, String)>,
+    )> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_settings.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// POST a settings change to the attached daemon and report the honest
+    /// applied/restart split from its response.
+    async fn perform_remote_settings(
+        &mut self,
+        req: crate::proxy::server::SettingsRequest,
+        origin: Option<(ui::ConfigAction, String)>,
+    ) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/settings", remote.base_url);
+        let mut request = remote.client.post(&url).json(&req);
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let quota_changed = req.quota_display.is_some();
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                // TYPED ack, parsed BEFORE any local state changes: a
+                // malformed / empty / ok=false 2xx is UNVERIFIED — neither
+                // the quota override nor the pending-restart map may move
+                // on an unconfirmed apply (review MUST-FIX).
+                match response.json::<crate::proxy::server::SettingsAck>().await {
+                    Ok(ack) if ack.ok => {
+                        if quota_changed {
+                            self.quota_display_override = None;
+                        }
+                        if let Some((action, value)) = origin {
+                            if ack.restart_required.is_empty() {
+                                self.config_saved.remove(&action);
+                            } else {
+                                self.config_saved.insert(action, value);
+                            }
+                        }
+                        settings_status(
+                            &ack.applied.iter().map(String::as_str).collect::<Vec<_>>(),
+                            &ack.restart_required
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    Ok(_) => "config change failed: daemon reported ok=false".into(),
+                    Err(_) => "config: accepted by daemon, but the ack was unreadable — \
+                               verify the value in the config tab (nothing assumed)"
+                        .into(),
+                }
+            }
+            Ok(response) => format!("config change failed: {}", response.status()),
+            Err(err) => format!("config change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Open the surface a tab click selected (UI-3 U6). Stats and Sessions go
+    /// through their openers (the guard / the background load); the rest are
+    /// plain overlay switches. Clicking the active tab returns to MAIN.
+    fn open_tab(&mut self, tab: Overlay, view: Option<&DashboardView>) {
+        if tab == self.overlay {
+            self.overlay = Overlay::None;
+            return;
+        }
+        match tab {
+            Overlay::None => self.overlay = Overlay::None,
+            Overlay::Stats => self.open_stats(view),
+            Overlay::Sessions => self.open_sessions(),
+            Overlay::Usage => {
+                self.usage_scroll = 0;
+                self.overlay = Overlay::Usage;
+            }
+            other => self.overlay = other,
+        }
+    }
+
+    /// Key handling for the Usage overlay (usage-stats). `g` cycles the
+    /// granularity (hour → day → month), arrows/`j`/`k` scroll by bucket,
+    /// `U`/Esc closes back to MAIN, `q` quits. The STORED offset is clamped
+    /// against the selected granularity's bucket count on every press —
+    /// clamping only a draw-time copy would let presses at the bottom
+    /// accumulate invisible overscroll debt (review R1 MUST-FIX 2).
+    fn on_key_usage(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        let max_scroll = view
+            .map(|v| usage_bucket_count(v, self.usage_gran).saturating_sub(1))
+            .unwrap_or(0);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('U') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('g') => {
+                self.usage_gran = self.usage_gran.next();
+                self.usage_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.usage_scroll = self.usage_scroll.saturating_sub(1).min(max_scroll);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.usage_scroll = self.usage_scroll.saturating_add(1).min(max_scroll);
+            }
+            KeyCode::PageUp => {
+                self.usage_scroll = self.usage_scroll.saturating_sub(10).min(max_scroll);
+            }
+            KeyCode::PageDown => {
+                self.usage_scroll = self.usage_scroll.saturating_add(10).min(max_scroll);
+            }
+            KeyCode::Home => self.usage_scroll = 0,
+            KeyCode::End => self.usage_scroll = max_scroll,
             _ => {}
         }
     }
@@ -607,6 +2515,13 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('s') | KeyCode::Esc => self.overlay = Overlay::None,
+            // Sort cycle (recent → tokens → requests); cursor resets so the
+            // selection follows the ORDER, not a stale index.
+            KeyCode::Char('o') => {
+                self.session_sort = self.session_sort.next();
+                self.session_sort.apply(&mut self.sessions);
+                self.session_cursor = 0;
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_session_cursor(-1, len),
             KeyCode::Down | KeyCode::Char('j') => self.move_session_cursor(1, len),
             KeyCode::PageUp => self.move_session_cursor(-10, len),
@@ -633,23 +2548,25 @@ impl App {
     /// overlay immediately with a loading spinner. The read+parse+fold is blocking
     /// IO/CPU over a multi-MB log, so running it inline inside the async event
     /// loop froze the whole TUI ~10s — it now runs on the blocking pool and the
-    /// loaded timeline arrives over `sessions_tx`, mirroring the remote-fetch
-    /// pattern. A missing/unreadable file folds to an empty timeline (the overlay
-    /// then shows the empty hint). The snapshot is point-in-time — re-opening
-    /// re-reads the file.
+    /// timeline arrives over `sessions_tx` as a stream of progressive partials
+    /// (`stream_sessions`), mirroring the remote-fetch pattern. Each partial
+    /// replaces `sessions`, so the table fills in as the file is read rather than
+    /// appearing all-at-once at the end. A missing/unreadable file delivers a
+    /// single empty, done partial (the overlay then shows the empty hint). The
+    /// snapshot is point-in-time — re-opening re-reads the file from scratch.
     fn open_sessions(&mut self) {
         self.overlay = Overlay::Sessions;
         self.session_cursor = 0;
         if self.sessions_loading {
-            return; // a load is already in flight
+            return; // a load is already in flight — no second reader (reopen guard)
         }
         self.sessions_loading = true;
+        self.sessions_pct = 0;
         if let Some(tx) = self.sessions_tx.clone() {
             // read + parse + fold is blocking IO/CPU → off the runtime onto the
             // blocking pool so the event loop keeps rendering and taking input.
             tokio::task::spawn_blocking(move || {
-                let sessions = load_sessions();
-                let _ = tx.blocking_send(sessions);
+                stream_sessions(&tx);
             });
         }
         // No tx (only in unit tests that never run `event_loop`) → stays in the
@@ -669,8 +2586,16 @@ impl App {
             KeyCode::Char('a') => self.overlay = Overlay::Accounts,
             KeyCode::Char('g') => self.open_stats(view),
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
+            // Observed performance (perf telemetry v1): daily tok/s + health.
+            KeyCode::Char('p') => self.overlay = Overlay::Perf,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
             KeyCode::Char('s') => self.open_sessions(),
+            // Calendar usage table (usage-stats): hourly/daily/monthly × model
+            // tokens + API-equivalent cost.
+            KeyCode::Char('U') => self.open_tab(Overlay::Usage, view),
+            // Misc (keys/build facts) + Config surfaces (UI-3 U6).
+            KeyCode::Char('?') => self.overlay = Overlay::Misc,
+            KeyCode::Char('c') => self.overlay = Overlay::Config,
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -685,8 +2610,102 @@ impl App {
             KeyCode::Char('f') => self.toggle_codex_fast(view),
             KeyCode::Char('m') => self.cycle_codex_model(view),
             KeyCode::Char('e') => self.cycle_codex_effort(view),
+            // Quota-gauge fill direction (used% grows / left% drains) —
+            // session-local override of config `quota_display`.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
+            // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
+            KeyCode::Char('t') => self.toggle_reset_display(),
+            // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
+            KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
         }
+    }
+
+    /// Flip the scheduler between default and round-robin (persisted server
+    /// side; see README "Schedulers").
+    fn toggle_scheduler_mode(&mut self, view: Option<&DashboardView>) {
+        use crate::config::SchedulerMode;
+        let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
+        let next = match current {
+            SchedulerMode::Default => SchedulerMode::RoundRobin,
+            SchedulerMode::RoundRobin => SchedulerMode::Default,
+        };
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_scheduler_mode(next) {
+                Ok(mode) => self.set_status(format!("scheduler mode: {}", mode.label())),
+                Err(err) => self.set_status(format!("scheduler mode change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_mode = Some(next);
+                self.set_status(format!("scheduler mode → {}…", next.label()));
+            }
+        }
+    }
+
+    fn take_pending_mode(&mut self) -> Option<crate::config::SchedulerMode> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_mode.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote mode change (`POST /llmux/scheduler-mode`).
+    async fn perform_remote_mode(&mut self, mode: crate::config::SchedulerMode) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/scheduler-mode", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "mode": mode.label() }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("scheduler mode: {}", mode.label())
+            }
+            Ok(response) => format!("scheduler mode change failed: {}", response.status()),
+            Err(err) => format!("scheduler mode change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Flip the quota bars between reset countdown and absolute UTC stamp.
+    fn toggle_reset_display(&mut self) {
+        self.reset_absolute = !self.reset_absolute;
+        self.set_status(
+            if self.reset_absolute {
+                "reset shown as absolute time (UTC)"
+            } else {
+                "reset shown as countdown"
+            }
+            .into(),
+        );
+    }
+
+    /// Flip the quota-gauge fill direction between used% and remaining%
+    /// (session-local override of config `quota_display`; the config default
+    /// applies until the first press). Color bands stay keyed on USED
+    /// utilization either way — this only flips what the fill length means.
+    fn toggle_quota_display(&mut self, view: Option<&DashboardView>) {
+        use crate::config::QuotaDisplay;
+        let current = self
+            .quota_display_override
+            .unwrap_or_else(|| view.map_or(QuotaDisplay::default(), |v| v.quota_display));
+        let next = match current {
+            QuotaDisplay::Used => QuotaDisplay::Remaining,
+            QuotaDisplay::Remaining => QuotaDisplay::Used,
+        };
+        self.quota_display_override = Some(next);
+        self.set_status(
+            match next {
+                QuotaDisplay::Used => "quota gauges fill: used%",
+                QuotaDisplay::Remaining => "quota gauges fill: remaining%",
+            }
+            .into(),
+        );
     }
 
     /// Key handling for the Accounts overlay (`a`). Houses the issue #3/#4
@@ -697,6 +2716,10 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.overlay = Overlay::None,
+            // Same fill-direction toggle as MAIN — the accounts overlay is
+            // where the gauges live full-width.
+            KeyCode::Char('u') => self.toggle_quota_display(view),
+            KeyCode::Char('t') => self.toggle_reset_display(),
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). Rows render in selection order; the current account
             // (when one exists) is always row 0 — start the cursor there.
@@ -793,11 +2816,99 @@ impl App {
         }
     }
 
+    /// Cycle the grok effort override (UI-3 U12): bypass → none → low →
+    /// medium → high → bypass. Local mode applies + persists in-process;
+    /// attach mode queues `POST /llmux/grok`.
+    fn cycle_grok_effort(&mut self, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        if !view.grok.available {
+            self.set_status("grok: no grok account".into());
+            return;
+        }
+        let cur = view.grok.effort.as_deref().unwrap_or("");
+        let next = GROK_EFFORTS
+            .iter()
+            .position(|e| *e == cur)
+            .map(|i| (i + 1) % GROK_EFFORTS.len())
+            .unwrap_or(0);
+        let effort = (!GROK_EFFORTS[next].is_empty()).then(|| GROK_EFFORTS[next].to_string());
+        let label = effort.clone().unwrap_or_else(|| "bypass".to_string());
+        match &mut self.backend {
+            Backend::Local(state) => {
+                // Persist FIRST (config-editor contract) — see set_codex.
+                if state.config_path.is_none() {
+                    return self.set_status("grok change failed: persistence unavailable".into());
+                }
+                if let Some(path) = &state.config_path {
+                    if let Err(err) = crate::config::update_path(path, |c| {
+                        c.grok.reasoning_effort = effort.clone();
+                    }) {
+                        self.set_status(format!("grok change failed: {err}"));
+                        return;
+                    }
+                }
+                let mut shape = state.grok.shape();
+                shape.effort = effort.clone();
+                state.grok.set_shape(shape);
+                self.set_status(format!("grok effort: {label}"));
+            }
+            Backend::Remote(remote) => {
+                remote.pending_grok = Some(effort);
+                self.set_status(format!("grok effort → {label}…"));
+            }
+        }
+    }
+
+    fn take_pending_grok(&mut self) -> Option<Option<String>> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_grok.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote grok effort change (`POST /llmux/grok`).
+    /// `None` clears to bypass (the endpoint's "unset" form).
+    async fn perform_remote_grok(&mut self, effort: Option<String>) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/grok", remote.base_url);
+        let label = effort.as_deref().unwrap_or("bypass").to_string();
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "reasoning_effort": effort.as_deref().unwrap_or("unset"),
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("grok effort: {label}"),
+            Ok(response) => format!("grok effort change failed: {}", response.status()),
+            Err(err) => format!("grok effort change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
     /// Apply a codex settings change: locally in-process, or queued for the
     /// event loop to POST in attach mode.
     fn set_codex(&mut self, new: CodexSettingsDoc) {
         match &mut self.backend {
             Backend::Local(state) => {
+                // Persist FIRST (config-editor contract): a failed write
+                // leaves the live shape untouched and reports the error —
+                // live-then-persist would let disk and runtime diverge.
+                if state.config_path.is_none() {
+                    return self.set_status("codex change failed: persistence unavailable".into());
+                }
+                if let Some(path) = &state.config_path {
+                    if let Err(err) = crate::config::update_path(path, |c| {
+                        c.codex.default_model = new.model.clone();
+                        c.codex.fast = new.fast;
+                        c.codex.reasoning_effort = new.effort.clone();
+                    }) {
+                        self.set_status(format!("codex change failed: {err}"));
+                        return;
+                    }
+                }
                 // Carry the live `client_model` override forward: it is a
                 // config-only opt-in the TUI settings panel doesn't manage, so
                 // a model/fast/effort change here must not silently clear it.
@@ -808,13 +2919,6 @@ impl App {
                     fast: new.fast,
                     effort: new.effort.clone(),
                 });
-                if let Some(path) = &state.config_path {
-                    let _ = crate::config::update_path(path, |c| {
-                        c.codex.default_model = new.model.clone();
-                        c.codex.fast = new.fast;
-                        c.codex.reasoning_effort = new.effort.clone();
-                    });
-                }
                 self.set_status(codex_status_line(&new));
             }
             Backend::Remote(remote) => {
@@ -828,6 +2932,193 @@ impl App {
         match &mut self.backend {
             Backend::Remote(remote) => remote.pending_codex.take(),
             Backend::Local(_) => None,
+        }
+    }
+
+    fn take_pending_pause(&mut self) -> Option<(String, bool)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_pause.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote pause/resume (`POST /llmux/pause-account`).
+    async fn perform_remote_pause(&mut self, account: String, paused: bool) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/pause-account", remote.base_url);
+        let mut request = remote
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "account": account, "paused": paused }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let verb = if paused { "paused" } else { "resumed" };
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => format!("{verb} {account}"),
+            Ok(response) => format!("pause change failed: {}", response.status()),
+            Err(err) => format!("pause change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    fn take_pending_limits(&mut self) -> Option<(String, crate::config::AccountLimits)> {
+        match &mut self.backend {
+            Backend::Remote(remote) => remote.pending_limits.take(),
+            Backend::Local(_) => None,
+        }
+    }
+
+    /// Perform the queued remote limits change (`POST /llmux/account-limits`).
+    async fn perform_remote_limits(
+        &mut self,
+        account: String,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Backend::Remote(remote) = &mut self.backend else {
+            return;
+        };
+        let url = format!("{}/llmux/account-limits", remote.base_url);
+        let mut request = remote.client.post(&url).json(&serde_json::json!({
+            "account": account,
+            "five_hour_max": limits.five_hour_max,
+            "seven_day_max": limits.seven_day_max,
+            "fable_weekly_max": limits.fable_weekly_max,
+        }));
+        if let Some(key) = &remote.api_key {
+            request = request.header("x-api-key", key);
+        }
+        let message = match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                format!("limits updated for {account}")
+            }
+            Ok(response) => format!("limits change failed: {}", response.status()),
+            Err(err) => format!("limits change failed: {err}"),
+        };
+        self.set_status(message);
+    }
+
+    /// Open the limits editor for the switcher's highlighted row (`L` in
+    /// `Mode::Select`). Input format: `5h,7d,fbl` as percents (`90,98,98`),
+    /// missing/empty positions keep no override, empty input = all-global.
+    fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let fmt = |v: Option<f64>| v.map_or("global".to_string(), |v| format!("{:.0}%", v * 100.0));
+        self.add_input.clear();
+        self.mode = Mode::EditLimits { idx };
+        self.set_status(format!(
+            "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
+            target.id,
+            fmt(target.limits.five_hour_max),
+            fmt(target.limits.seven_day_max),
+            fmt(target.limits.fable_weekly_max),
+        ));
+    }
+
+    /// Key handling for `Mode::EditLimits`: plain text entry (digits, `,`,
+    /// `.`, space), Enter parses + applies, Esc cancels back to the switcher.
+    fn on_key_edit_limits(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
+        match code {
+            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' || c == '.' || c == ' ' => {
+                self.add_input.push(c);
+            }
+            KeyCode::Backspace => {
+                self.add_input.pop();
+            }
+            KeyCode::Esc => {
+                self.add_input.clear();
+                self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                    Mode::Normal
+                } else {
+                    Mode::Select { idx }
+                };
+            }
+            KeyCode::Enter => {
+                let raw = std::mem::take(&mut self.add_input);
+                match parse_limits_input(&raw) {
+                    Ok(limits) => {
+                        self.apply_limits_selected(idx, view, limits);
+                        self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                            Mode::Normal
+                        } else {
+                            Mode::Select { idx }
+                        };
+                    }
+                    Err(err) => {
+                        // Keep editing — restore the text so it can be fixed.
+                        self.add_input = raw;
+                        self.set_status(err);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply parsed limits to the highlighted row (local: in-process persist;
+    /// attach: queue the POST).
+    fn apply_limits_selected(
+        &mut self,
+        idx: usize,
+        view: Option<&DashboardView>,
+        limits: crate::config::AccountLimits,
+    ) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        match &mut self.backend {
+            Backend::Local(state) => match state.set_account_limits(&name, limits) {
+                Ok(true) => self.set_status(format!("limits updated for {name}")),
+                Ok(false) => self.set_status(format!("account {name} not found")),
+                Err(err) => self.set_status(format!("limits change failed: {err}")),
+            },
+            Backend::Remote(remote) => {
+                remote.pending_limits = Some((name.clone(), limits));
+                self.set_status(format!("updating limits for {name}…"));
+            }
+        }
+    }
+
+    /// Toggle the operator pause on the switcher's highlighted row (`p` in
+    /// `Mode::Select`). Local mode applies + persists in-process; attach mode
+    /// queues the POST for the event loop.
+    fn toggle_pause_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        // The cursor indexes DISPLAY rows (selection order), not config order.
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let name = target.id.0.clone();
+        let next = !target.paused;
+        match &mut self.backend {
+            Backend::Local(state) => {
+                let verb = if next { "paused" } else { "resumed" };
+                match state.set_account_paused(&name, next) {
+                    Ok(true) => self.set_status(format!("{verb} {name}")),
+                    Ok(false) => self.set_status(format!("account {name} not found")),
+                    Err(err) => self.set_status(format!("pause change failed: {err}")),
+                }
+            }
+            Backend::Remote(remote) => {
+                remote.pending_pause = Some((name.clone(), next));
+                self.set_status(format!(
+                    "{} {name}…",
+                    if next { "pausing" } else { "resuming" }
+                ));
+            }
         }
     }
 
@@ -854,12 +3145,23 @@ impl App {
     }
 
     /// Move the activity scroll offset by `delta` rows (positive = older),
-    /// clamped to `[0, completed_len - 1]`. `view` supplies the live length.
+    /// clamped to `[0, rendered_rows - 1]`. The unit is the FOLDED render
+    /// row (glance-triage atom 3) — the same model `ui::draw_activity`
+    /// windows by — so the offset can never strand past the last row.
+    /// Scrolling near the end of what's loaded arms the background history
+    /// hydration (UI-5 infinite scroll), after which the clamp ceiling grows
+    /// as [`Self::extend_with_history`] pages more rows in.
     fn scroll_activity(&mut self, delta: i64, view: Option<&DashboardView>) {
-        let len = view.map_or(0, |v| v.completed.len());
+        let len: usize = view.map_or(0, |v| triage::collapse_completed(&v.completed).len());
         let max = len.saturating_sub(1) as i64;
         let next = (self.activity_scroll as i64).saturating_add(delta);
         self.activity_scroll = next.clamp(0, max) as usize;
+        if delta > 0 && (self.activity_scroll as i64) >= max.saturating_sub(HISTORY_ARM_MARGIN) {
+            self.request_history();
+            if let Some(view) = view {
+                self.grow_history_take(view);
+            }
+        }
     }
 
     fn on_key_select(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
@@ -887,6 +3189,15 @@ impl App {
             // `n` from the switcher: start a brand-new login (issue #4's
             // headline path — "start a new login from the account switcher").
             KeyCode::Char('n') => self.open_new_login(),
+            // `p` from the switcher: pause/resume the highlighted account
+            // (operator pause — excluded from selection until resumed).
+            KeyCode::Char('p') => {
+                self.toggle_pause_selected(idx, view);
+                self.mode = Mode::Select { idx };
+            }
+            // `L` from the switcher: edit the highlighted account's ceiling
+            // overrides (config `account_limits`).
+            KeyCode::Char('L') => self.open_limits_editor(idx, view),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
@@ -1265,7 +3576,14 @@ impl App {
         let headers_only =
             select::headers_only_mode(&view.snapshot, &view.select_params, None, now);
         if let Some(reason) = select::eligibility(target, &view.select_params, now, headers_only) {
-            self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            if reason == select::IneligibleReason::Paused {
+                self.set_status(format!(
+                    "cannot switch to {}: paused — press p to resume",
+                    target.id
+                ));
+            } else {
+                self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
+            }
             return;
         }
         let target_id = target.id.clone();
@@ -1394,8 +3712,13 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         connected: false,
         pending_switch: None,
         pending_codex: None,
+        pending_settings: None,
+        pending_pause: None,
+        pending_limits: None,
+        pending_mode: None,
         pending_add: None,
         pending_remove: None,
+        pending_grok: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
     restore_terminal();
@@ -1445,8 +3768,21 @@ async fn event_loop(
     // Sessions overlay (`s`) loads the persisted raw-io log on the blocking pool
     // and delivers the folded timeline here — mirrors the remote fetch channel so
     // the read+parse+fold never blocks this select (it once froze the TUI ~10s).
-    let (sess_tx, mut sess_rx) = mpsc::channel::<Vec<crate::session::Session>>(4);
+    let (sess_tx, mut sess_rx) = mpsc::channel::<SessionsLoad>(4);
     app.sessions_tx = Some(sess_tx);
+    // Infinite-scroll history hydration (UI-5): the one-shot blocking load of
+    // `activity.jsonl` delivers here, same pattern as the sessions channel.
+    let (hist_tx, mut hist_rx) = mpsc::channel::<Vec<activity::Completed>>(1);
+    app.history_tx = Some(hist_tx);
+    // Raw request/response viewer (UI-7): the background raw-io lookup delivers
+    // here — same pattern as the sessions channel (never block this select).
+    let (raw_tx, mut raw_rx) = mpsc::channel::<RawLoad>(2);
+    app.raw_tx = Some(raw_tx);
+    // Raw-viewer exports (UI-8 copy/save): the blocking pool delivers the
+    // outcome flash here so a wedged clipboard tool / slow disk never freezes
+    // this select.
+    let (clip_tx, mut clip_rx) = mpsc::channel::<ClipResult>(4);
+    app.clip_tx = Some(clip_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -1480,14 +3816,55 @@ async fn event_loop(
                 }
                 true
             }
-            // The background session load finished — swap in the folded timeline
-            // and drop the loading state so the overlay shows the table/hint.
-            Some(sessions) = sess_rx.recv() => {
-                app.sessions = sessions;
-                app.sessions_loading = false;
+            // A progressive session-load partial arrived — replace the timeline
+            // with the fold-so-far and keep `sessions_loading` until the final
+            // (`done`) partial, so the overlay fills in and its title tracks the
+            // read progress instead of appearing all-at-once at the end.
+            Some(load) = sess_rx.recv() => {
+                app.sessions = load.sessions;
+                // Deliveries arrive in fold order — re-apply the user's sort
+                // so a mid-load `o` press survives the next partial.
+                app.session_sort.apply(&mut app.sessions);
+                app.sessions_pct = load.pct;
+                app.sessions_loading = !load.done;
+                true
+            }
+            // The background history load finished (UI-5 infinite scroll) —
+            // materialize the first page immediately so a live window that
+            // folds to a single row (scroll ceiling 0) can start scrolling
+            // (review R3-1), then scrolling pages the rest in.
+            Some(history) = hist_rx.recv() => {
+                app.history_completed = Some(history);
+                app.history_loading = false;
+                if let Some(view) = app.view(SystemTime::now()) {
+                    app.grow_history_take(&view);
+                }
+                true
+            }
+            // A background raw-record fetch resolved (UI-7) — hand it to the
+            // open modal (stale deliveries are ignored inside).
+            Some(load) = raw_rx.recv() => {
+                app.apply_raw_load(load);
+                true
+            }
+            // A background export (UI-8 copy/save) finished — free the
+            // single-flight slot so the next queued export can dispatch, then
+            // flash the outcome on the modal that requested it (the flash is
+            // gated on generation; freeing the slot is unconditional).
+            Some(result) = clip_rx.recv() => {
+                app.clip_finished();
+                app.apply_clip_result(result);
                 true
             }
         };
+        if let Some(req) = app.take_pending_raw() {
+            app.spawn_raw_fetch(req);
+            redraw = true;
+        }
+        if let Some(req) = app.next_clip_if_idle() {
+            app.spawn_clip(req);
+            redraw = true;
+        }
         if let Some(target) = app.take_pending_switch() {
             app.perform_remote_switch(target).await;
             redraw = true;
@@ -1496,12 +3873,32 @@ async fn event_loop(
             app.perform_remote_codex(codex).await;
             redraw = true;
         }
+        if let Some((settings, origin)) = app.take_pending_settings() {
+            app.perform_remote_settings(settings, origin).await;
+            redraw = true;
+        }
+        if let Some((account, paused)) = app.take_pending_pause() {
+            app.perform_remote_pause(account, paused).await;
+            redraw = true;
+        }
+        if let Some((account, limits)) = app.take_pending_limits() {
+            app.perform_remote_limits(account, limits).await;
+            redraw = true;
+        }
+        if let Some(mode) = app.take_pending_mode() {
+            app.perform_remote_mode(mode).await;
+            redraw = true;
+        }
         if let Some(api_key) = app.take_pending_add() {
             app.perform_remote_add(api_key).await;
             redraw = true;
         }
         if let Some(name) = app.take_pending_remove() {
             app.perform_remote_remove(name).await;
+            redraw = true;
+        }
+        if let Some(effort) = app.take_pending_grok() {
+            app.perform_remote_grok(effort).await;
             redraw = true;
         }
         // A new browser login needs the RAW terminal back: the OAuth flow
@@ -1521,12 +3918,47 @@ async fn event_loop(
         }
         if redraw {
             let view = app.view(SystemTime::now());
+            // Anchor a scrolled-into-history viewport against newly arrived rows
+            // (UI-6 item 4) before `chrome()` snapshots the scroll offset.
+            if let Some(view) = view.as_ref() {
+                app.preserve_scroll_on_new_activity(view);
+            }
             let chrome = app.chrome();
             // Capture the activity panel's hit-test layout from this frame so a
             // left-click in the next input drain maps to the right entry.
             let mut hits = None;
             terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome, &mut hits))?;
-            app.activity_chrome = hits.unwrap_or_default();
+            let main = hits.unwrap_or_default();
+            app.activity_chrome = main.activity;
+            app.tab_chrome = main.tabs;
+            app.sessions_chrome = main.sessions_table;
+            app.config_chrome = main.config_rows;
+            app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
+            app.separator_chrome = main.separators;
+            app.account_row_chrome = main.account_rows;
+            app.menu_chrome = main.menu;
+            app.setting_chrome = main.settings;
+            // Reconcile the input modal (UI-6 item 3) against what the frame
+            // could actually render: `Some(max)` clamps the scroll to the
+            // wrapped line count, `None` means the entry aged out of the ring
+            // (lookup failed) so the modal closes gracefully.
+            if app.input_modal.is_some() {
+                match main.input_modal_max_scroll {
+                    Some(max) => {
+                        if let Some(modal) = app.input_modal.as_mut() {
+                            modal.scroll = modal.scroll.min(max);
+                        }
+                    }
+                    None => app.input_modal = None,
+                }
+            }
+            // Clamp the raw viewer's scroll offsets against what this frame
+            // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
+            // clamp — the modal owns its content and never closes on aging.
+            if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
+                modal.scroll = modal.scroll.min(raw.max_scroll.0);
+                modal.hscroll = modal.hscroll.min(raw.max_scroll.1);
+            }
         }
     }
 }
@@ -1579,23 +4011,359 @@ fn apply_event(
 /// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
 /// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
 /// metadata each record carries is folded; no prompt content is retained.
-fn load_sessions() -> Vec<crate::session::Session> {
+/// UI-5 infinite-scroll knobs: how many FOLDED render rows past the current
+/// scroll depth [`App::grow_history_take`] targets, how many raw entries it
+/// appends per fold-recheck step, how many such steps ONE state transition
+/// may take (a folded wall then loads progressively across events instead of
+/// traversing the whole history in one), and how close to the loaded end the
+/// scroll must get before [`App::request_history`] arms.
+const HISTORY_PAGE: usize = 300;
+const HISTORY_CHUNK: usize = 512;
+const HISTORY_GROW_CHUNKS: usize = 4;
+const HISTORY_ARM_MARGIN: i64 = 40;
+
+/// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
+const MODAL_PAGE: u16 = 10;
+
+/// Horizontal pan step for the raw viewer (UI-8), in display cells.
+const RAW_PAN: u16 = 8;
+
+/// Cap on queued (not-yet-dispatched) exports (UI-8). Single-flight dispatch
+/// already bounds concurrent work to one; this bounds the BACKLOG so a user
+/// spamming the button against a slow/wedged exporter can't grow the deque
+/// without limit. Human-paced presses never approach it.
+const CLIP_QUEUE_MAX: usize = 8;
+
+/// Ceiling on hydrated history entries — far beyond any real scrolling
+/// session, purely a memory backstop against a huge persisted file.
+const HISTORY_CAP: usize = 100_000;
+
+/// True when an attach base URL points at THIS machine (review M1): host is
+/// `localhost` or a loopback IP (v4 `127.0.0.0/8`, v6 `::1`, bracketed or
+/// not). No `url`-crate dependency — the accepted inputs are the daemon
+/// base URLs llmux itself builds (`http://host:port`). Unparseable → false
+/// (fail closed: no local-history splice under an unknown remote).
+fn base_url_is_loopback(base_url: &str) -> bool {
+    let rest = match base_url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => base_url,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip :port — for bracketed IPv6 the bracket closes the host; for
+    // everything else the LAST ':' starts the port (bare IPv6 has many).
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        match authority.rsplit_once(':') {
+            // `a:b:c` with multiple ':' and no brackets = a bare IPv6 host.
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => h,
+            _ => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Pure merge for [`App::extend_with_history`] (unit-tested): append up to
+/// `take` history rows behind the live newest-first list — only entries
+/// strictly OLDER than the oldest loaded row (the persisted tail overlaps
+/// the live ring; the timestamp cut dedupes). A single linear pass, NO
+/// folding — how many rows to materialize (`take`) is decided on state
+/// transitions by [`App::grow_history_take`], keeping the per-frame path a
+/// bounded clone (review R3-2).
+fn extend_completed_with_history(
+    completed: &mut Vec<activity::Completed>,
+    history: &[activity::Completed],
+    take: usize,
+) {
+    if take == 0 {
+        return;
+    }
+    let oldest = completed.last().map(|c| c.at);
+    completed.extend(
+        history
+            .iter()
+            .filter(|c| oldest.is_none_or(|o| c.at < o))
+            .take(take)
+            .cloned(),
+    );
+}
+
+/// Blocking read+replay of the persisted activity log
+/// (`$XDG_STATE_HOME/llmux/activity.jsonl`) into a newest-first completed
+/// list for the infinite-scroll history (UI-5). Reuses the same
+/// `PersistedRequest` replay the daemon boots with, so schema/versioning
+/// tolerance is identical. Missing state dir / file → empty. NOTE: resolves
+/// the LOCAL state path — attaching to a daemon on another host yields
+/// nothing (that host's file isn't here); remote history paging is the
+/// sqlite/storage follow-up issue.
+fn load_history() -> Vec<activity::Completed> {
+    let Some(path) = crate::cli::daemon::activity_log_path() else {
+        return Vec::new();
+    };
+    let mut log = activity::ActivityLog::new(HISTORY_CAP);
+    // Unbounded replay (`up_to = u64::MAX`): unlike daemon boot hydration
+    // there is no concurrent-append double-count here — the ring is a
+    // point-in-time snapshot and the strictly-older merge cut dedupes any
+    // overlap with live rows.
+    let _ = log.load_persisted_prefix(&path, u64::MAX);
+    log.completed().cloned().collect()
+}
+
+/// One progressive delivery from the streaming session loader
+/// (`stream_sessions`). Each carries the fold of ALL records read so far (fold
+/// is pure and cheap, so re-folding the accumulator per chunk is fine), a `pct`
+/// of the file consumed for the overlay title, and `done` on the final (EOF)
+/// delivery so the receiver drops the loading state.
+struct SessionsLoad {
+    sessions: Vec<crate::session::Session>,
+    done: bool,
+    pct: u8,
+}
+
+/// Records accumulated between folds. Large enough that the per-chunk re-fold
+/// of the whole accumulator stays negligible (fold is a single linear pass)
+/// while partials still arrive often enough to feel progressive on a multi-MB
+/// log.
+const SESSIONS_CHUNK_RECORDS: usize = 4096;
+
+/// `bytes_read*100/file_len`, clamped to `0..=100`; 100 for an empty/unknown
+/// file so the title never shows a bogus overshoot.
+fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
+    if file_len == 0 {
+        return 100;
+    }
+    (bytes_read.saturating_mul(100) / file_len).min(100) as u8
+}
+
+/// Streaming, progressive variant of the session load: reads the persisted
+/// raw-io log line by line, accumulating parsed records, and every
+/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
+/// and delivers a partial over `tx`. The final partial carries `done = true`.
+/// A missing/unreadable file delivers a single empty, done partial so the
+/// overlay's loading state always clears. Runs on the blocking pool.
+fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
+    let send_empty_done = || {
+        let _ = tx.blocking_send(SessionsLoad {
+            sessions: Vec::new(),
+            done: true,
+            pct: 100,
+        });
+    };
     let Some(path) = crate::cli::daemon::raw_io_path() else {
-        return Vec::new();
+        send_empty_done();
+        return;
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let Ok(file) = std::fs::File::open(&path) else {
+        send_empty_done();
+        return;
     };
-    let records: Vec<crate::proxy::raw_io::RawIoRecord> = contents
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    crate::session::fold_sessions(&records)
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = std::io::BufReader::new(file);
+    let mut records: Vec<crate::proxy::raw_io::RawIoRecord> = Vec::new();
+    let mut line = String::new();
+    let mut bytes_read: u64 = 0;
+    let mut since_fold: usize = 0;
+    loop {
+        line.clear();
+        // `read_line` keeps the newline so `bytes_read` tracks real file offset
+        // for an accurate `pct`.
+        match std::io::BufRead::read_line(&mut reader, &mut line) {
+            Ok(0) => break, // EOF
+            Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
+            Err(_) => break, // truncated/unreadable tail → fold what we have
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
+            records.push(rec);
+            since_fold += 1;
+        }
+        if since_fold >= SESSIONS_CHUNK_RECORDS {
+            since_fold = 0;
+            let partial = SessionsLoad {
+                sessions: crate::session::fold_sessions(&records),
+                done: false,
+                pct: sessions_load_pct(bytes_read, file_len),
+            };
+            // Receiver gone (overlay closed / app exiting) → stop early.
+            if tx.blocking_send(partial).is_err() {
+                return;
+            }
+        }
+    }
+    // Final fold at EOF — always delivered (even for an empty file) so the
+    // loading state clears.
+    let _ = tx.blocking_send(SessionsLoad {
+        sessions: crate::session::fold_sessions(&records),
+        done: true,
+        pct: 100,
+    });
+}
+
+/// Parse the limits-editor input: comma/space-separated percents in order
+/// `5h, 7d, fbl` — `"90,98,98"`, `"90"` (5h only), `"90,,98"` (skip 7d),
+/// `""` (all global). Values are percents; `>1` divides by 100, `<=1` is
+/// taken as a fraction, so `0.9` and `90` mean the same ceiling.
+/// Human status line for a settings apply: live fields vs restart-required —
+/// a wrote-but-needs-restart change must never read as applied (contract C6).
+fn settings_status(applied: &[&str], restart: &[&str]) -> String {
+    match (applied.is_empty(), restart.is_empty()) {
+        (false, true) => format!("config: applied live — {}", applied.join(", ")),
+        (true, false) => format!(
+            "config: saved — takes effect on daemon restart ({})",
+            restart.join(", ")
+        ),
+        (false, false) => format!(
+            "config: {} applied live; {} on restart",
+            applied.join(", "),
+            restart.join(", ")
+        ),
+        (true, true) => "config: no change".into(),
+    }
+}
+
+/// The y/n confirm prompt for a blast-radius change.
+fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::SettingsRequest) -> String {
+    use ui::ConfigAction as A;
+    match action {
+        A::SchedMode => "flip scheduler mode (live scheduling policy)?".into(),
+        A::RoutingEnabled => format!(
+            "set routing.enabled = {} (reroutes LIVE traffic)?",
+            req.routing_enabled.unwrap_or_default()
+        ),
+        A::RawIoEnabled => format!(
+            "set raw-io capture = {} (writes FULL request/response payloads to disk)?",
+            req.raw_io_enabled.unwrap_or_default()
+        ),
+        A::Upstream => format!(
+            "set upstream = {} (restart required; wrong URL breaks ALL requests)?",
+            req.upstream.clone().unwrap_or_default()
+        ),
+        A::CodexUpstream => format!(
+            "set codex upstream = {} (restart required)?",
+            req.codex_upstream.clone().unwrap_or_default()
+        ),
+        A::Ceiling5h | A::Ceiling7d | A::CeilingFbl => {
+            "set a ceiling to 0% (locks that window's scheduling)?".into()
+        }
+        A::RawIoRetention => format!(
+            "reduce raw-io retention to {}d (older history will be pruned)?",
+            req.raw_io_retention_days.unwrap_or_default()
+        ),
+        _ => "apply this change?".into(),
+    }
+}
+
+/// Parse the edit-prompt text for `action` into a validated-enough
+/// [`SettingsRequest`] (the daemon re-validates authoritatively).
+fn parse_config_input(
+    action: ui::ConfigAction,
+    raw: &str,
+    _view: Option<&DashboardView>,
+) -> Result<crate::proxy::server::SettingsRequest, String> {
+    use crate::proxy::server::SettingsRequest;
+    use ui::ConfigAction as A;
+    let mut req = SettingsRequest::default();
+    let pct = || -> Result<f64, String> {
+        let v: f64 = raw.parse().map_err(|_| format!("not a number: {raw:?}"))?;
+        if !(0.0..=100.0).contains(&v) {
+            return Err("percent must be 0-100".into());
+        }
+        Ok(v / 100.0)
+    };
+    match action {
+        A::Ceiling5h => req.five_hour_max = Some(pct()?),
+        A::Ceiling7d => req.seven_day_max = Some(pct()?),
+        A::CeilingFbl => req.fable_weekly_max = Some(pct()?),
+        A::UsageMaxAge => {
+            req.usage_max_age_secs = Some(raw.parse().map_err(|_| format!("not seconds: {raw:?}"))?)
+        }
+        A::GradientSpeed => {
+            req.tui_gradient_speed =
+                Some(raw.parse().map_err(|_| format!("not a number: {raw:?}"))?)
+        }
+        A::RoutingDefaultGroup => req.routing_default_group = Some(raw.to_string()),
+        A::RoutingOnEmptyGroup => req.routing_on_empty_group = Some(raw.to_string()),
+        A::RawIoRetention => {
+            req.raw_io_retention_days = Some(raw.parse().map_err(|_| format!("not days: {raw:?}"))?)
+        }
+        A::RawIoMaxBody => {
+            req.raw_io_max_body_bytes =
+                Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
+        }
+        A::Upstream => req.upstream = Some(raw.to_string()),
+        A::CodexUpstream => req.codex_upstream = Some(raw.to_string()),
+        A::ProxyPort => {
+            req.proxy_port = Some(raw.parse().map_err(|_| format!("not a port: {raw:?}"))?)
+        }
+        A::ProxyMaxBody => {
+            req.proxy_max_request_bytes =
+                Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
+        }
+        _ => return Err("not an editable value".into()),
+    }
+    Ok(req)
+}
+
+fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String> {
+    let mut vals: [Option<f64>; 3] = [None, None, None];
+    let cleaned = raw.trim();
+    if !cleaned.is_empty() {
+        let parts: Vec<&str> = cleaned.split(',').collect();
+        if parts.len() > 3 {
+            return Err("at most 3 values: 5h,7d,fbl".into());
+        }
+        for (i, part) in parts.iter().enumerate() {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let n: f64 = part
+                .parse()
+                .map_err(|_| format!("not a number: {part:?}"))?;
+            let frac = if n > 1.0 { n / 100.0 } else { n };
+            if !(frac > 0.0 && frac <= 1.0) {
+                return Err(format!("{part:?} out of range (1..=100%)"));
+            }
+            vals[i] = Some(frac);
+        }
+    }
+    Ok(crate::config::AccountLimits {
+        five_hour_max: vals[0],
+        seven_day_max: vals[1],
+        fable_weekly_max: vals[2],
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
+        let p = super::parse_limits_input;
+        let l = p("90,98,98").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.90));
+        assert_eq!(l.seven_day_max, Some(0.98));
+        assert_eq!(l.fable_weekly_max, Some(0.98));
+        // Fractions work too; positions may be skipped.
+        let l = p("0.5,,97").unwrap();
+        assert_eq!(l.five_hour_max, Some(0.5));
+        assert_eq!(l.seven_day_max, None);
+        assert_eq!(l.fable_weekly_max, Some(0.97));
+        // Empty = clear all overrides.
+        assert!(p("").unwrap().is_empty());
+        assert!(p("  ").unwrap().is_empty());
+        // Errors: junk, out of range, too many.
+        assert!(p("abc").is_err());
+        assert!(p("0").is_err());
+        assert!(p("101").is_err());
+        assert!(p("1,2,3,4").is_err());
+    }
+
     use super::*;
 
     /// An `App` on a remote backend — buildable without a terminal, so the
@@ -1611,8 +4379,13 @@ mod tests {
             connected: false,
             pending_switch: None,
             pending_codex: None,
+            pending_settings: None,
+            pending_pause: None,
+            pending_limits: None,
+            pending_mode: None,
             pending_add: None,
             pending_remove: None,
+            pending_grok: None,
         })))
     }
 
@@ -1739,6 +4512,539 @@ mod tests {
         }
     }
 
+    /// UI-3 U6: tab clicks switch surfaces from ANY overlay; clicking the
+    /// active tab returns to MAIN; text-entry modes keep the mouse out.
+    #[test]
+    fn tab_click_switches_overlay_and_active_tab_toggles_back() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.tab_chrome = vec![
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 1,
+                    y: 2,
+                    width: 9,
+                    height: 1,
+                },
+                overlay: Overlay::None,
+            },
+            ui::TabHit {
+                area: ratatui::layout::Rect {
+                    x: 13,
+                    y: 2,
+                    width: 8,
+                    height: 1,
+                },
+                overlay: Overlay::Config,
+            },
+        ];
+        let click = |x: u16, y: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Click config tab from MAIN → Config opens.
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::Config);
+        // Tab clicks still work WITH an overlay open: click dashboard → MAIN.
+        assert!(app.on_mouse(click(2, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // Clicking the active tab toggles back to MAIN too.
+        app.overlay = Overlay::Config;
+        assert!(app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+        // A pending text-entry mode keeps the mouse out entirely.
+        app.mode = Mode::AddKey;
+        assert!(!app.on_mouse(click(14, 2), None));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// UI-3 U7/U8: pressing a separator row arms a drag; dragging resizes the
+    /// pane above it (clamped); release disarms.
+    #[test]
+    fn separator_drag_resizes_the_pane_above() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = remote_app();
+        app.separator_chrome = vec![ui::SeparatorHit {
+            y: 10,
+            pane: ui::PaneId::Accounts,
+            pane_top: 3,
+        }];
+        let ev = |kind, row| MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Press on the separator row arms the drag.
+        assert!(app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 10), None));
+        assert!(app.drag.is_some());
+        // Dragging to row 15 → accounts height 15 - 3 = 12.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 15), None));
+        assert_eq!(app.pane_heights.accounts, Some(12));
+        // Clamped at the minimum: dragging above the pane top.
+        assert!(app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 2), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+        // Release disarms; further drags do nothing.
+        app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 2), None);
+        assert!(app.drag.is_none());
+        assert!(!app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 20), None));
+        assert_eq!(app.pane_heights.accounts, Some(ui::PANE_MIN_HEIGHT));
+    }
+
+    /// UI-3 U11: right-click on an accounts row opens the context menu; the
+    /// items drive the SAME flows as the keys (pause queues the POST, set
+    /// limit opens the editor, delete opens the y/N confirm); Esc closes.
+    #[test]
+    fn right_click_menu_runs_the_account_flows() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = stats_view_with_account();
+        let row_rect = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 1,
+        };
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // pause (item 1): queues the remote pause POST.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
+        assert!(app.menu_anchor.is_some());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "menu closed after running");
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:me@example.com".into(), true))
+        );
+
+        // set limit (item 2): opens the limits editor; Esc exits to Normal
+        // (not into the switcher) because the menu opened it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+
+        // delete (item 3): opens the destructive confirm, never silent.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.on_key(press(KeyCode::End), Some(&view)); // unknown key → closes
+        assert_eq!(app.mode, Mode::Normal, "unknown key dismisses");
+        assert!(app.on_mouse(rclick, Some(&view)));
+        for _ in 0..3 {
+            app.on_key(press(KeyCode::Down), Some(&view));
+        }
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+
+        // Click outside the open menu dismisses it.
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: row_rect,
+            display_idx: 0,
+        }];
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_chrome = Some(ui::MenuChrome {
+            area: ratatui::layout::Rect {
+                x: 10,
+                y: 6,
+                width: 14,
+                height: 5,
+            },
+            items: vec![],
+        });
+        let lclick_outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 70,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(lclick_outside, Some(&view)));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// UI-3 U9/U10/U12: clicking a group-settings segment rotates that
+    /// setting; the codex effort cycle now includes `max`; the grok effort
+    /// cycle queues the `POST /llmux/grok` change with bypass in the loop.
+    #[test]
+    fn settings_bar_click_rotates_settings() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut view = stats_view_with_account();
+        view.grok.available = true;
+        view.grok.effort = None; // bypass
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        view.codex.effort = Some("xhigh".into());
+        let mut app = remote_app();
+        app.setting_chrome = vec![
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 30,
+                    width: 10,
+                    height: 1,
+                },
+                action: ui::SettingAction::CodexEffort,
+            },
+            ui::SettingHit {
+                area: ratatui::layout::Rect {
+                    x: 20,
+                    y: 30,
+                    width: 6,
+                    height: 1,
+                },
+                action: ui::SettingAction::GrokEffort,
+            },
+        ];
+        let click = |x: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        };
+        // codex effort: xhigh → max (the new top of the cycle).
+        assert!(app.on_mouse(click(3), Some(&view)));
+        assert_eq!(
+            app.take_pending_codex().map(|c| c.effort),
+            Some(Some("max".to_string())),
+            "xhigh cycles to max"
+        );
+        // grok effort: bypass → none (first concrete value), queued for the
+        // grok endpoint.
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(Some("none".to_string())));
+        // Cycling from the top of the grok list wraps back to bypass.
+        view.grok.effort = Some("high".into());
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(None), "high wraps to bypass");
+    }
+
+    /// Review R2 regression: rows reorder between menu-open and click — the
+    /// action must land on the PINNED account, and a vanished pin aborts.
+    #[test]
+    fn menu_action_follows_pinned_account_across_reorder() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let acct = |name: &str| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 5,
+                width: 80,
+                height: 1,
+            },
+            display_idx: 0,
+        }];
+        let rclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(rclick, Some(&view)));
+        assert_eq!(app.menu_account.as_deref(), Some("claude:a@x.com"));
+
+        // Reorder: `a` moves to display row 1. Running pause (item 1) must
+        // still act on `a`, not on whoever now sits at row 0.
+        view.snapshot.accounts.swap(0, 1);
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:a@x.com".into(), true)),
+            "action follows the pinned account across the reorder"
+        );
+
+        // A pinned account that VANISHED aborts with a status, acts on no one.
+        assert!(app.on_mouse(rclick, Some(&view)));
+        app.menu_account = Some("claude:gone@x.com".into());
+        app.on_key(press(KeyCode::Down), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            None,
+            "vanished pin acts on no one"
+        );
+        assert!(app.status_line().is_some_and(|s| s.contains("gone")));
+    }
+
+    /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
+    #[test]
+    fn session_sort_cycles_and_reorders() {
+        let mut app = remote_app();
+        let sess =
+            |uid: &str, last_ms: u64, tokens_out: u64, requests: u64| crate::session::Session {
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
+                user_id: Some(uid.into()),
+                requests,
+                tokens_in: 0,
+                tokens_out,
+                models: Vec::new(),
+                accounts: Vec::new(),
+                account_rotations: 0,
+                first_ms: 0,
+                last_ms,
+                confidence: crate::session::Confidence::High,
+            };
+        // recent order: b (newest) first; tokens order: c; requests order: a.
+        app.sessions = vec![
+            sess("a", 10, 5, 9),
+            sess("b", 30, 1, 1),
+            sess("c", 20, 99, 2),
+        ];
+        app.session_sort.apply(&mut app.sessions);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("b"), "recent");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Tokens);
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("c"), "tokens");
+        assert_eq!(app.session_cursor, 0, "cursor resets with the order");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
+        app.on_key_sessions(KeyCode::Char('o'));
+        assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
+    #[test]
+    fn config_sched_mode_confirms_then_applies() {
+        // Review MUST-FIX: the scheduler-mode row must reach the confirm
+        // gate and then the existing live toggle — never "value unavailable".
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.activate_config_action(ui::ConfigAction::SchedMode, None);
+        assert!(
+            matches!(
+                app.mode,
+                Mode::ConfigConfirm {
+                    action: ui::ConfigAction::SchedMode
+                }
+            ),
+            "SchedMode enters the confirm gate, got {:?}",
+            app.mode
+        );
+        app.on_key_config_confirm(KeyCode::Char('y'), ui::ConfigAction::SchedMode, None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.take_pending_mode().is_some(),
+            "confirming queues the live scheduler-mode toggle (remote path)"
+        );
+    }
+
+    #[test]
+    fn config_ceiling_zero_requires_confirm() {
+        // Blast-radius rule: driving a ceiling to 0 locks that window's
+        // scheduling — it must pass the y/n gate, a normal value must not.
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "0".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        assert!(
+            matches!(app.mode, Mode::ConfigConfirm { .. }),
+            "ceiling→0 needs confirm"
+        );
+        app.on_key_config_confirm(KeyCode::Esc, ui::ConfigAction::Ceiling5h, None);
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "80".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
+    }
+
+    /// One-shot HTTP responder for the attach settings round-trip tests:
+    /// binds an ephemeral loopback port, answers the first request with the
+    /// canned status+body, then closes. Small enough to not need a mock crate.
+    async fn one_shot_settings_daemon(status_line: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Drive [`App::perform_remote_settings`] against the canned daemon and
+    /// return the resulting status line. The app is seeded with a pending
+    /// quota override and a request that carries `quota_display` + a
+    /// restart-only origin, so every mutation site is observable.
+    async fn attach_settings_round_trip(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (App, String) {
+        let mut app = remote_app();
+        let base = one_shot_settings_daemon(status_line, body).await;
+        if let Backend::Remote(remote) = &mut app.backend {
+            remote.base_url = base;
+        }
+        app.quota_display_override = Some(crate::config::QuotaDisplay::Used);
+        app.config_saved.insert(
+            ui::ConfigAction::RawIoRetention,
+            "stale-from-last-time".into(),
+        );
+        let req = crate::proxy::server::SettingsRequest {
+            quota_display: Some("amount".into()),
+            raw_io_retention_days: Some(7),
+            ..Default::default()
+        };
+        let origin = Some((ui::ConfigAction::RawIoRetention, "7".into()));
+        app.perform_remote_settings(req, origin).await;
+        let status = app
+            .status
+            .as_ref()
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        (app, status)
+    }
+
+    /// Attach HTTP round-trip, success branch: a verified typed ack applies —
+    /// the quota override drops (the doc now carries the truth) and the
+    /// restart-required origin lands in `config_saved`.
+    #[tokio::test]
+    async fn attach_settings_success_ack_applies_local_state() {
+        let (app, status) = attach_settings_round_trip(
+            "200 OK",
+            r#"{"ok":true,"applied":["quota_display"],"restart_required":["raw_io_retention_days"],"email_anonymous":false}"#,
+        )
+        .await;
+        assert!(
+            app.quota_display_override.is_none(),
+            "verified ack clears the local quota override"
+        );
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"7".to_string()),
+            "restart-required origin is noted for the config tab"
+        );
+        assert!(
+            status.contains("applied live") && status.contains("restart"),
+            "status reports the honest applied/restart split: {status:?}"
+        );
+    }
+
+    /// Attach round-trip, ok=false 2xx: NOTHING local moves.
+    #[tokio::test]
+    async fn attach_settings_ok_false_mutates_nothing() {
+        let (app, status) = attach_settings_round_trip(
+            "200 OK",
+            r#"{"ok":false,"applied":[],"restart_required":[],"email_anonymous":false}"#,
+        )
+        .await;
+        assert!(app.quota_display_override.is_some(), "override untouched");
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"stale-from-last-time".to_string()),
+            "pending-restart note untouched"
+        );
+        assert!(status.contains("ok=false"), "status: {status:?}");
+    }
+
+    /// Attach round-trip, malformed 2xx (`{}` fails the typed parse): the
+    /// apply is UNVERIFIED — no local mutation, honest "nothing assumed".
+    #[tokio::test]
+    async fn attach_settings_malformed_ack_mutates_nothing() {
+        let (app, status) = attach_settings_round_trip("200 OK", "{}").await;
+        assert!(app.quota_display_override.is_some(), "override untouched");
+        assert_eq!(
+            app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+            Some(&"stale-from-last-time".to_string()),
+            "pending-restart note untouched"
+        );
+        assert!(status.contains("nothing assumed"), "status: {status:?}");
+    }
+
+    /// Attach round-trip, HTTP error statuses: reported, nothing mutated.
+    #[tokio::test]
+    async fn attach_settings_http_errors_mutate_nothing() {
+        for status_line in ["400 Bad Request", "500 Internal Server Error"] {
+            let (app, status) =
+                attach_settings_round_trip(status_line, r#"{"error":"nope"}"#).await;
+            assert!(app.quota_display_override.is_some(), "override untouched");
+            assert_eq!(
+                app.config_saved.get(&ui::ConfigAction::RawIoRetention),
+                Some(&"stale-from-last-time".to_string()),
+                "pending-restart note untouched"
+            );
+            assert!(
+                status.contains("config change failed"),
+                "status for {status_line}: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn misc_and_config_keys_round_trip() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('?'), None);
+        assert_eq!(app.overlay, Overlay::Misc);
+        app.on_key_misc(KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key_main(KeyCode::Char('c'), None);
+        assert_eq!(app.overlay, Overlay::Config);
+        app.on_key_config(KeyCode::Char('c'), None);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
     /// `a` opens the Accounts overlay; `Esc` returns to MAIN.
     #[test]
     fn a_opens_accounts_overlay_and_esc_returns_to_main() {
@@ -1782,6 +5088,9 @@ mod tests {
             account_rotations: 0,
             first_ms: 0,
             last_ms: 0,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
             confidence: Confidence::High,
         };
         let mut app = remote_app();
@@ -1808,6 +5117,66 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
     }
 
+    /// Usage-overlay scroll clamps the STORED offset at the last bucket
+    /// (review R1 MUST-FIX 2): pressing `j` at the bottom must not bank
+    /// invisible overscroll debt that later `k` presses have to pay off.
+    #[test]
+    fn usage_scroll_clamps_stored_offset_no_overscroll_debt() {
+        let row = |bucket: u64| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket,
+            label: format!("day-{bucket}"),
+            group: "claude".into(),
+            model: "m".into(),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.1,
+            priced: true,
+        };
+        let mut view = empty_view();
+        view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets
+        let mut app = remote_app();
+        app.overlay = Overlay::Usage;
+
+        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (2).
+        for _ in 0..5 {
+            app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        }
+        assert_eq!(app.usage_scroll, 2, "stored offset clamped at last bucket");
+        // ONE up moves immediately — no invisible debt to pay first.
+        app.on_key_usage(KeyCode::Char('k'), Some(&view));
+        assert_eq!(app.usage_scroll, 1);
+        // Granularity cycle resets the scroll; the next granularity (month)
+        // has no rows in this view, so the offset stays pinned at 0.
+        app.on_key_usage(KeyCode::Char('g'), Some(&view));
+        assert_eq!(app.usage_scroll, 0);
+        app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        assert_eq!(app.usage_scroll, 0, "empty granularity can't scroll");
+        // U closes back to MAIN.
+        app.on_key_usage(KeyCode::Char('U'), Some(&view));
+        assert_eq!(app.overlay, Overlay::None);
+
+        // Mouse wheel scrolls the Usage overlay (review CR) through the same
+        // clamped path — cycle back to the day granularity first.
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        app.usage_scroll = 0;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown), Some(&view)));
+        assert_eq!(app.usage_scroll, 1, "wheel down scrolls one bucket");
+        assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp), Some(&view)));
+        assert_eq!(app.usage_scroll, 0, "wheel up scrolls back");
+    }
+
     /// `open_sessions` must NOT block on the file read: it opens the overlay and
     /// flips into the loading state immediately, leaving `sessions` untouched.
     /// With no `sessions_tx` (the event loop never runs under test) the load is
@@ -1824,10 +5193,26 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Sessions);
         assert!(app.sessions_loading, "overlay enters the loading state");
         assert_eq!(app.session_cursor, 0);
+        assert_eq!(app.sessions_pct, 0, "progress resets to 0 on a fresh open");
         assert!(
             app.sessions.is_empty(),
             "no tx under test → load not kicked off, sessions stay empty"
         );
+    }
+
+    /// `pct = bytes_read*100/file_len`, clamped, with an empty/unknown file
+    /// pinned to 100 so the title never overshoots or divides by zero.
+    #[test]
+    fn sessions_load_pct_clamps_and_guards_empty() {
+        assert_eq!(
+            sessions_load_pct(0, 0),
+            100,
+            "empty file → 100, no div-by-0"
+        );
+        assert_eq!(sessions_load_pct(0, 200), 0, "nothing read yet → 0%");
+        assert_eq!(sessions_load_pct(100, 200), 50, "half read → 50%");
+        assert_eq!(sessions_load_pct(200, 200), 100, "fully read → 100%");
+        assert_eq!(sessions_load_pct(300, 200), 100, "overshoot clamps to 100");
     }
 
     /// Reopening while a load is still in flight is a no-op guard, not a second
@@ -1978,6 +5363,7 @@ mod tests {
                 key: key.clone(),
                 y_start: 6,
                 height: 1,
+                kind: ui::ActivityHitKind::Entry,
             }],
         };
         key
@@ -1994,6 +5380,506 @@ mod tests {
         // Click it again → collapses (re-click toggles).
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 6), None);
         assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn run_header_marker_toggles_and_body_expands_only(/* UI-5, Z 2026-07-15 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::RunHeader { expanded: false };
+        // Marker-zone click (col < RUN_MARKER_ZONE) → opens the run.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Marker click again → closes.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
+        assert_eq!(app.expanded_run, None);
+        // Body click → opens.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 6), None);
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Body click while open → does NOT collapse (only the marker closes).
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 6), None);
+        assert!(!changed, "body click on an open run is a no-op");
+        assert_eq!(app.expanded_run.as_ref(), Some(&key));
+        // Entry detail state is untouched throughout.
+        assert_eq!(app.expanded_activity, None);
+    }
+
+    #[test]
+    fn click_input_line_opens_modal_and_swallows_mouse_beneath(/* UI-6 item 3 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        // Make the seeded hit the 🔍 input detail line.
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::InputLine;
+        // Click it → opens the modal on that key WITHOUT expanding the row.
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
+        assert!(changed, "opening the modal warrants a redraw");
+        assert_eq!(app.input_modal.as_ref().map(|m| &m.key), Some(&key));
+        assert_eq!(
+            app.expanded_activity, None,
+            "the input click does not expand"
+        );
+        // A click beneath is now swallowed: nothing toggles, the modal stays.
+        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::Entry;
+        let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
+        assert!(changed, "the modal consumes the click (redraw)");
+        assert_eq!(
+            app.expanded_activity, None,
+            "no row toggles beneath the modal"
+        );
+        assert!(app.input_modal.is_some(), "the modal stays open");
+    }
+
+    #[test]
+    fn input_modal_keys_scroll_and_close(/* UI-6 item 3 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.open_input_modal(key);
+        // Arrows adjust the offset (clamped post-draw against the render pass).
+        app.on_key(press(KeyCode::Down), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, 1);
+        app.on_key(press(KeyCode::Up), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, 0);
+        app.on_key(press(KeyCode::PageDown), None);
+        assert_eq!(app.input_modal.as_ref().unwrap().scroll, MODAL_PAGE);
+        // Any other key is swallowed — MAIN's activity scroll must not move.
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(
+            app.activity_scroll, before,
+            "keys don't leak beneath the modal"
+        );
+        assert!(
+            app.input_modal.is_some(),
+            "an unbound key keeps the modal open"
+        );
+        // Esc closes.
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.input_modal.is_none(), "esc closes the modal");
+    }
+
+    #[test]
+    fn raw_modal_keys_tabs_scroll_and_close(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        // Ready content: a plain (no-upstream) record renders the classic
+        // 2 tabs; the upstream pair appears only on translated exchanges.
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            None,
+            None,
+            None,
+            Some(200),
+            b"{}",
+            b"{}",
+            1024,
+            None,
+            None,
+            None,
+        );
+        let content = ui::raw_content_from_record(
+            ui::RawGeneral {
+                lines: Vec::new(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                base_url: "http://localhost:3456".into(),
+            },
+            &record,
+        );
+        assert_eq!(content.tabs.len(), 2, "no upstream half → 2 payload tabs");
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            id: 7,
+            generation: 1,
+            title: "raw".into(),
+            tab: 0,
+            scroll: 3,
+            hscroll: 5,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        // Tab advances and resets BOTH offsets (tabs have independent sizes).
+        app.on_key(press(KeyCode::Tab), None);
+        let modal = app.raw_modal.as_ref().unwrap();
+        assert_eq!(modal.tab, 1);
+        assert_eq!(modal.scroll, 0);
+        assert_eq!(modal.hscroll, 0);
+        // ← wraps back around the 2-tab ring; H/L pan horizontally.
+        app.on_key(press(KeyCode::Left), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().tab, 0);
+        app.on_key(press(KeyCode::Char('L')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, RAW_PAN);
+        app.on_key(press(KeyCode::Char('H')), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, 0);
+        // Scroll keys move; unbound keys are swallowed beneath the modal.
+        app.on_key(press(KeyCode::Down), None);
+        assert_eq!(app.raw_modal.as_ref().unwrap().scroll, 1);
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), None);
+        assert_eq!(app.activity_scroll, before, "keys don't leak beneath");
+        assert!(app.raw_modal.is_some());
+        // The wheel scrolls it too (and the click is swallowed).
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 6), None);
+        assert!(app.raw_modal.as_ref().unwrap().scroll > 1);
+        // Esc closes.
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.raw_modal.is_none(), "esc closes the raw viewer");
+    }
+
+    #[test]
+    fn raw_load_applies_only_to_the_matching_loading_modal(/* UI-7 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let _ = &key;
+        app.raw_modal = Some(RawModal {
+            key: key.clone(),
+            id: 7,
+            generation: 5,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Loading,
+        });
+        // A stale delivery for a PRIOR generation is ignored — this is the
+        // close→reopen race guard (a late fetch must not clobber the reopen).
+        app.apply_raw_load(RawLoad {
+            generation: 4,
+            result: Err("nope".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Loading
+        ));
+        // The matching generation resolves it (a miss becomes Failed).
+        app.apply_raw_load(RawLoad {
+            generation: 5,
+            result: Err("miss".into()),
+        });
+        assert!(matches!(
+            app.raw_modal.as_ref().unwrap().state,
+            RawModalState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn clip_result_flashes_only_on_the_requesting_generation(/* UI-8 */) {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 9,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Loading,
+        });
+        // A stale export result (older generation) never flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 8,
+            message: "stale".into(),
+        });
+        assert!(app.raw_modal.as_ref().unwrap().flash.is_none());
+        // The requesting generation's result flashes.
+        app.apply_clip_result(ClipResult {
+            generation: 9,
+            message: "copied 4 bytes → pbcopy".into(),
+        });
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "copied 4 bytes → pbcopy"
+        );
+    }
+
+    #[test]
+    fn open_raw_modal_selects_by_id_under_same_ms_key_collision(/* MUST-FIX */) {
+        // Two requests completing in the SAME millisecond with identical
+        // method/path/status share an ActivityKey (which omits the id). The
+        // opener must fetch the CLICKED row's record, not the first match.
+        let req = |id: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_millis(42),
+            body: activity::CompletedBody::Request {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let first = req(7);
+        let second = req(8);
+        let key = first.activity_key().unwrap();
+        assert_eq!(key, second.activity_key().unwrap(), "keys collide");
+        let mut view = empty_view();
+        view.completed = vec![first, second];
+
+        // Click resolved to the SECOND row's id → the modal must open on id 8,
+        // not the first-match id 7.
+        let mut app = remote_app();
+        app.open_raw_modal(key, 8, Some(&view));
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().id,
+            8,
+            "opener pinned the clicked row via id, not the first key match"
+        );
+    }
+
+    #[test]
+    fn burst_of_exports_all_queue_none_dropped(/* MUST-FIX */) {
+        // Two export actions before the event loop drains the queue must both
+        // run — the async path used to be a single slot and silently dropped
+        // the first (a regression from synchronous execution).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        app.raw_modal_action(ui::RawButton::Copy);
+        app.raw_modal_action(ui::RawButton::Save);
+        assert_eq!(
+            app.pending_clip.len(),
+            2,
+            "both queued — the second must not overwrite the first"
+        );
+        // Single-flight FIFO: the first dispatch pops Copy and marks the slot
+        // busy; a second dispatch attempt while busy yields nothing (no
+        // concurrent clipboard write / no last-writer race).
+        assert!(matches!(
+            app.next_clip_if_idle().map(|r| r.button),
+            Some(ui::RawButton::Copy)
+        ));
+        assert!(app.clip_inflight, "slot busy after dispatch");
+        assert!(
+            app.next_clip_if_idle().is_none(),
+            "single-flight: no second dispatch while one is in flight"
+        );
+        // Its result frees the slot → the next (Save) dispatches, in order.
+        app.clip_finished();
+        assert!(matches!(
+            app.next_clip_if_idle().map(|r| r.button),
+            Some(ui::RawButton::Save)
+        ));
+        app.clip_finished();
+        assert!(app.next_clip_if_idle().is_none());
+    }
+
+    #[test]
+    fn export_queue_is_bounded_and_rejects_overflow_with_feedback(/* MUST-FIX */) {
+        // A spamming user against a wedged exporter must not grow the queue
+        // without limit: past the cap the newest is rejected with feedback
+        // (already-queued actions are preserved, growth is bounded).
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let content = ui::RawContent {
+            tabs: vec![ui::RawTabContent {
+                label: "Request",
+                lines: Vec::new(),
+                width: 0,
+                body_text: "body".into(),
+                curl: "curl".into(),
+            }],
+            record_json: "{}".into(),
+            all_text: "all".into(),
+        };
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: String::new(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        for _ in 0..(CLIP_QUEUE_MAX + 5) {
+            app.raw_modal_action(ui::RawButton::Copy);
+        }
+        assert_eq!(
+            app.pending_clip.len(),
+            CLIP_QUEUE_MAX,
+            "queue capped, never grows past CLIP_QUEUE_MAX"
+        );
+        assert_eq!(
+            app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
+            "export busy — try again in a moment",
+            "overflow rejected with feedback, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn history_hydration_refused_for_cross_host_attach(/* review M1 */) {
+        // Loopback attach (the standard `llmux` → localhost:3456 topology)
+        // shares this machine's state file → allowed.
+        for url in [
+            "http://localhost:3456",
+            "http://127.0.0.1:3456",
+            "http://[::1]:3456",
+            "http://127.9.9.9:3456/path",
+        ] {
+            assert!(base_url_is_loopback(url), "{url} is this machine");
+        }
+        // A daemon on another host has a DIFFERENT activity.jsonl — splicing
+        // the local file under its live rows would show wrong data.
+        for url in [
+            "http://oudwood-512:3456",
+            "http://100.98.240.111:3456",
+            "http://[2001:db8::1]:3456",
+            "not a url",
+        ] {
+            assert!(!base_url_is_loopback(url), "{url} is another host");
+        }
+        // And the App-level gate wires it up: a cross-host remote never arms.
+        let mut app = remote_app();
+        if let Backend::Remote(remote) = &mut app.backend {
+            remote.base_url = "http://oudwood-512:3456".into();
+        }
+        app.request_history();
+        assert!(!app.history_loading, "cross-host attach must not hydrate");
+    }
+
+    #[test]
+    fn extend_completed_with_history_pages_older_rows(/* UI-5 infinite scroll */) {
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        // Live window: newest-first 100..91; history overlaps (100..91) then
+        // continues older (90..1).
+        let live: Vec<_> = (91..=100).rev().map(note).collect();
+        let history: Vec<_> = (1..=100).rev().map(note).collect();
+
+        // Nothing materialized (`take == 0`) → nothing appended.
+        let mut completed = live.clone();
+        extend_completed_with_history(&mut completed, &history, 0);
+        assert_eq!(completed.len(), live.len());
+
+        // take = 5 appends exactly the 5 NEWEST strictly-older entries (the
+        // overlap dedupes by timestamp cut).
+        let mut completed = live.clone();
+        extend_completed_with_history(&mut completed, &history, 5);
+        assert_eq!(completed.len(), live.len() + 5);
+        assert_eq!(
+            completed[live.len()].at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(90),
+            "first appended row is the newest strictly-older history entry"
+        );
+        // No duplicates across the seam.
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            completed.iter().all(|c| seen.insert(c.at)),
+            "live+history merge must not duplicate the overlap"
+        );
+    }
+
+    #[test]
+    fn folded_wall_deadlock_is_broken_on_history_arrival(/* review R3-1 */) {
+        // 350 raw `count` entries sharing one fold key collapse to ONE render
+        // row, so the scroll ceiling is 0 and `activity_scroll` can never
+        // leave 0 on its own. The arrival-time `grow_history_take` must
+        // materialize the first history page in that exact state — otherwise
+        // loaded history stays permanently unreachable (the R2 regression
+        // test injected an unreachable scroll=5 and proved nothing).
+        let count_req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages/count_tokens".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-fable-5".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: Some("count".into()),
+                excerpt: None,
+            },
+        };
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        let live: Vec<_> = (1_000..1_350).rev().map(count_req).collect();
+        assert_eq!(
+            triage::collapse_completed(&live).len(),
+            1,
+            "precondition: the live wall folds to one render row"
+        );
+        let history: Vec<_> = (1..=50).rev().map(note).collect();
+
+        let mut app = remote_app();
+        app.history_completed = Some(history.clone());
+        let mut view = empty_view();
+        view.completed = live.clone();
+        // Arrival-time materialization at scroll == 0 (the deadlock state).
+        assert_eq!(app.activity_scroll, 0);
+        app.grow_history_take(&view);
+        assert!(app.history_take > 0, "first page materialized at scroll 0");
+
+        // The frame path now extends the view and the scroll ceiling rises.
+        extend_completed_with_history(&mut view.completed, &history, app.history_take);
+        assert!(
+            triage::collapse_completed(&view.completed).len() > 1,
+            "history rows are reachable — the folded wall no longer pins the ceiling"
+        );
+        // And a wheel-down actually moves now.
+        app.scroll_activity(1, Some(&view));
+        assert_eq!(app.activity_scroll, 1, "scroll escapes 0 after hydration");
     }
 
     #[test]
@@ -2038,6 +5924,181 @@ mod tests {
         assert_eq!(app.activity_scroll, 0, "wheel down returns to the tail");
     }
 
+    /// UI-6 item 4: while scrolled into history (`scroll > 0`), a freshly
+    /// arrived completed entry prepends (newest-first) and would slide the page
+    /// being read down. The offset must auto-bump by the prepended render-row
+    /// count so the row under the cursor stays put — including AT RING CAPACITY,
+    /// where each append evicts the oldest and the folded-row COUNT never
+    /// changes (a length delta would be dead there). At `scroll == 0` it must
+    /// NOT bump (live-tail is preserved).
+    #[test]
+    fn new_activity_does_not_shift_a_scrolled_viewport() {
+        let req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                // Non-`count` kind → every entry renders 1:1 (no folding), so
+                // render row k maps to `completed[k]`.
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let mut app = remote_app();
+        let mut view = empty_view();
+        // Newest-first: secs 10 down to 1 → 10 distinct render rows.
+        view.completed = (1..=10).rev().map(req).collect();
+        assert_eq!(
+            triage::collapse_completed(&view.completed).len(),
+            10,
+            "precondition: 10 distinct render rows"
+        );
+
+        // --- Below capacity: append GROWS the list. ------------------------
+        // Operator scrolls 3 rows in; this frame records the newest-key anchor.
+        app.activity_scroll = 3;
+        app.preserve_scroll_on_new_activity(&view);
+        // The row currently at the top of the visible page.
+        let anchored_key = view.completed[3].activity_key();
+        // A new request lands (prepends as the newest row) and the next frame
+        // observes it: the offset bumps by the one prepended render row.
+        view.completed.insert(0, req(11));
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "below capacity: offset bumped by one row"
+        );
+        assert_eq!(
+            view.completed[app.activity_scroll].activity_key(),
+            anchored_key,
+            "below capacity: the row under the cursor stayed in place"
+        );
+
+        // --- At ring capacity: append EVICTS the oldest, len stays FLAT. ----
+        app.activity_scroll = 3;
+        app.preserve_scroll_on_new_activity(&view);
+        let anchored_key = view.completed[3].activity_key();
+        let before_len = triage::collapse_completed(&view.completed).len();
+        view.completed.insert(0, req(100)); // newest arrives
+        view.completed.pop(); // oldest evicted (ring full)
+        assert_eq!(
+            triage::collapse_completed(&view.completed).len(),
+            before_len,
+            "precondition: at capacity the folded render-row count is flat"
+        );
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "at capacity: key anchor bumps offset even though len is flat"
+        );
+        assert_eq!(
+            view.completed[app.activity_scroll].activity_key(),
+            anchored_key,
+            "at capacity: the row under the cursor stayed in place"
+        );
+
+        // --- Live tail (scroll == 0) never bumps. --------------------------
+        app.activity_scroll = 0;
+        app.preserve_scroll_on_new_activity(&view);
+        view.completed.insert(0, req(200));
+        view.completed.pop();
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(app.activity_scroll, 0, "live tail is not bumped");
+    }
+
+    /// UI-6 item 4 regression: a Note occupies its own render row but has no
+    /// key, so the newest KEYED request sits at row ≥1. An ABSOLUTE-index bump
+    /// would add that offset on every idle redraw tick (no new arrivals) →
+    /// runaway to the ceiling in ~1-2s. The DELTA anchor must hold the offset
+    /// steady with no arrivals, then bump by exactly the prepended-row count
+    /// when a real request lands above the note.
+    #[test]
+    fn leading_note_does_not_runaway_a_scrolled_viewport() {
+        let note = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Note {
+                text: format!("n{secs}"),
+                error: false,
+            },
+        };
+        let req = |secs: u64| activity::Completed {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            body: activity::CompletedBody::Request {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:a@x".into()),
+                status: 200,
+                duration: Duration::from_millis(10),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: Some("user".into()),
+                excerpt: None,
+            },
+        };
+        let top_key =
+            |v: &DashboardView, row: usize| match triage::collapse_completed(&v.completed)[row] {
+                triage::ActivityRow::Single(i) => v.completed[i].activity_key(),
+                triage::ActivityRow::Run { start, .. } => v.completed[start].activity_key(),
+            };
+
+        let mut app = remote_app();
+        let mut view = empty_view();
+        // Newest-first: a Note on top (render row 0, no key), then 9 requests →
+        // 10 render rows. The newest KEYED request is at render row 1.
+        view.completed = std::iter::once(note(100))
+            .chain((1..=9).rev().map(req))
+            .collect();
+        app.activity_scroll = 3;
+
+        // Many idle redraw ticks, NO new arrivals: the offset must NOT drift
+        // (this is exactly what the absolute-index bump got wrong).
+        for _ in 0..5 {
+            app.preserve_scroll_on_new_activity(&view);
+            assert_eq!(
+                app.activity_scroll, 3,
+                "idle ticks with a leading note must not drift the offset"
+            );
+        }
+        let anchored_key = top_key(&view, 3);
+
+        // A real request now lands as the newest entry (the note is pushed down
+        // to render row 1): exactly one new render row prepended → offset += 1.
+        view.completed.insert(0, req(200));
+        app.preserve_scroll_on_new_activity(&view);
+        assert_eq!(
+            app.activity_scroll, 4,
+            "note-then-request arrival bumps by exactly the one new render row"
+        );
+        assert_eq!(
+            top_key(&view, app.activity_scroll),
+            anchored_key,
+            "the row under the cursor stayed in place"
+        );
+    }
+
     fn stats_view() -> DashboardView {
         let mut v = empty_view();
         v.model_usage = vec![crate::dashboard::ModelUsageDoc {
@@ -2055,6 +6116,7 @@ mod tests {
             accounts: Vec::new(),
             efforts: Vec::new(),
             endpoints: Vec::new(),
+            cost_usd: 0.0,
         }];
         v
     }
@@ -2070,11 +6132,15 @@ mod tests {
             group: BackendGroup::Claude,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
         }];
         v
     }
@@ -2083,6 +6149,13 @@ mod tests {
         use crate::scheduler::PoolSnapshot;
         DashboardView {
             version: "llmux 0.0 (test)".into(),
+            grok: Default::default(),
+            daily_usage: Vec::new(),
+            daily_perf: Vec::new(),
+            config_facts: Default::default(),
+            usage_stats: Vec::new(),
+            health: Default::default(),
+            session_labels: Default::default(),
             pid: 1,
             uptime: Duration::from_secs(1),
             port: 3456,
@@ -2091,6 +6164,8 @@ mod tests {
             select_params: select::SelectParams {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
+                fable_weekly_max: 0.98,
+                mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -2098,6 +6173,8 @@ mod tests {
             snapshot: PoolSnapshot {
                 accounts: Vec::new(),
                 current: std::collections::BTreeMap::new(),
+                fable_current: std::collections::BTreeMap::new(),
+                manual_pin: Default::default(),
             },
             last_switch: None,
             poll_health: std::collections::HashMap::new(),
@@ -2111,6 +6188,14 @@ mod tests {
             client_usage: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
+            email_anonymous: false,
+            tui_effects: true,
+            gradient: ui::GradientCfg::default(),
+            show_fable_weekly: true,
+            domain_abbrev: crate::config::default_domain_abbrev(),
+            quota_display: crate::config::QuotaDisplay::default(),
+            data_quality: crate::dashboard::DataQualityDoc::default(),
+            events: Vec::new(),
         }
     }
 }

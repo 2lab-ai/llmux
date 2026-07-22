@@ -1,7 +1,7 @@
 //! Config schema v1 for `~/.config/llmux.json` (see `.prd/02-architecture.md`).
 //! These structs are the on-disk contract; they are complete and purely declarative.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,10 @@ pub struct Config {
     /// OpenAI Codex backend endpoints (used only by `type: "codex"` accounts).
     #[serde(default)]
     pub codex: CodexConfig,
+    /// xAI Grok backend endpoints (used only by `type: "grok"` accounts).
+    /// Additive (`#[serde(default)]`): pre-grok configs load with defaults.
+    #[serde(default)]
+    pub grok: GrokConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Model→backend-group routing (default: disabled — exactly today's
@@ -62,8 +66,183 @@ pub struct Config {
     /// with the defaults (capture on, 90-day retention).
     #[serde(default)]
     pub raw_io: RawIoConfig,
+    /// Render account emails masked on DISPLAY surfaces (the TUI and
+    /// llmux-islands' pixelization), reusing the deterministic
+    /// [`crate::demo::alias_always`] mapping at the render layer. This is a
+    /// display-only concern: API responses (`/llmux/status`,
+    /// `/llmux/dashboard`) keep REAL account names — clients that mask do so
+    /// themselves per surface (islands needs the real data for its OFF state).
+    /// Settable at runtime via `POST /llmux/settings` (persisted
+    /// read-merge-write + applied live, no restart). Independent of
+    /// `LLMUX_DEMO_MODE`, which keeps its load-time aliasing and therefore
+    /// takes precedence when both are on. Additive (`#[serde(default)]`): a
+    /// config written before this field loads with masking OFF.
+    #[serde(default)]
+    pub email_anonymous: bool,
+    /// TUI cosmetic animations: the effort-token rainbow marquee (`max`) and
+    /// the headline-model name gradient (`fable-5*`/`gpt-5.6-sol*`). Display-
+    /// only, default ON. Set `false` for a calmer, still-legible board — the
+    /// effort/model tokens keep a distinct STATIC color+bold instead of
+    /// cycling. Working spinners animate regardless (they predate this knob).
+    /// Carried on the dashboard document so BOTH TUI backends honor it, same
+    /// convention as `email_anonymous`/`show_fable_weekly`. Additive
+    /// (`#[serde(default = "default_true")]`): a config written before this
+    /// field loads with effects ON.
+    #[serde(default = "default_true")]
+    pub tui_effects: bool,
+    /// TUI gradient animation tuning (UI-8): drift speed + per-group base
+    /// colors for the headline-model gradient, and an optional solid override
+    /// for the `max` effort token. Display-only, carried on the dashboard
+    /// document like `tui_effects` so both TUI backends honor it. Additive
+    /// (`#[serde(default)]`): older configs load the defaults.
+    #[serde(default)]
+    pub tui_gradient: TuiGradient,
+    /// Render the model-scoped "Fable" weekly gauge in the dashboard accounts
+    /// table (fable-usage U9a). Display-only, default ON. This feature is
+    /// TEMPORARY — the upstream Fable weekly limit is expected to disappear
+    /// within ~a week — so it is opt-OUT: set `false` to render the accounts
+    /// table exactly as before (no `Fbl` column / marker, no width taken). The
+    /// daemon always COLLECTS and emits the scoped data (`/llmux/status`,
+    /// `/llmux/dashboard`); this flag only gates the TUI's rendering of it.
+    /// Additive (`#[serde(default = "default_true")]`): a config written before
+    /// this field loads with the gauge ON.
+    #[serde(default = "default_true")]
+    pub show_fable_weekly: bool,
+    /// TUI display: shorten well-known email domains in the accounts table
+    /// (`ai3@insightquest.io` → `ai3@iq.io`). Render-only — API documents and
+    /// interactive targets (switch/remove) keep real ids, same layering as
+    /// `email_anonymous`. Additive
+    /// (`#[serde(default = "default_domain_abbrev")]`): a config without this
+    /// field loads the built-in `{"insightquest.io": "iq.io"}` map; set `{}`
+    /// explicitly to disable abbreviation.
+    #[serde(default = "default_domain_abbrev")]
+    pub domain_abbrev: BTreeMap<String, String>,
+    /// Which quantity the TUI quota gauges FILL with: `"remaining"` (default
+    /// — a fresh account is a full green bar that drains as quota burns, per
+    /// Z's 2026-07-09 direction) or `"used"` (the bar grows instead). Color
+    /// bands stay keyed on USED utilization either way. The TUI `u` key
+    /// overrides this live for the session; this field is the boot default.
+    /// Additive (`#[serde(default)]`): older configs load as `remaining`.
+    #[serde(default)]
+    pub quota_display: QuotaDisplay,
+    /// Account names the scheduler must NOT auto-select (operator pause).
+    /// A paused account is ineligible for automatic selection AND manual
+    /// switch (resume it first); its live windows keep polling so the gauges
+    /// stay truthful. Kept as a top-level set (not a per-account field) so
+    /// the on-disk account entries stay pure credentials. Additive
+    /// (`#[serde(default)]`): older configs load with nothing paused.
+    #[serde(default)]
+    pub paused_accounts: std::collections::BTreeSet<String>,
+    /// Per-account overrides of the scheduler's utilization ceilings, keyed by
+    /// account name. Absent fields fall back to the global `scheduler.*`
+    /// values. Kept as a top-level map (like `paused_accounts`) so account
+    /// entries stay pure credentials. Additive: older configs load empty.
+    #[serde(default)]
+    pub account_limits: BTreeMap<String, AccountLimits>,
+    /// Dashboard event banners (config `events`). Each entry is an
+    /// [`EventBanner`] with an active window `[from, to)`; the TUI renders the
+    /// active one with the EARLIEST `to` as a single top line, and nothing when
+    /// none is active. Managed at runtime via `POST /llmux/events` (upsert by
+    /// `id`) and remove. Additive (`#[serde(default)]`): older configs — and a
+    /// config still carrying the removed singular `event` key — load with an
+    /// empty list (the orphan key is ignored and dropped on the next save).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventBanner>,
+    /// Point the CLI *client* commands at a remote llmux daemon instead of a
+    /// local one (issue: remote proxy support). When `remote.host` is set,
+    /// `llmux run` exports `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` for the
+    /// remote and does NOT auto-start a local daemon; `llmux server`,
+    /// `llmux dashboard`, `llmux status`, and `llmux env` attach to / describe
+    /// the remote. This is the CLI analogue of what llmux-islands already does
+    /// (host/port + `x-api-key`). The `--remote host[:port]` global flag
+    /// overrides it per-invocation. Additive (`#[serde(default)]`): a config
+    /// written before this field loads with remote OFF (all-local behavior).
+    #[serde(default)]
+    pub remote: RemoteConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// One dashboard event banner (an element of config `events`). Display-only:
+/// the TUI renders the active banner (`from <= now < to`) with the earliest
+/// `to` as a single top line. `id` is the stable upsert key (`POST
+/// /llmux/events` replaces the entry with the same `id`); `from`/`to` are
+/// timestamps in EITHER RFC3339-with-offset (`2026-07-12T23:59:59-07:00`) or
+/// compact `YYYYMMDDHHMM` (12 digits, LOCAL wall-clock) form — see
+/// [`crate::event::parse_event_time`]; `content` is the rendered message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBanner {
+    /// Stable identifier, the upsert/remove key (e.g. `20260712-fable5`).
+    pub id: String,
+    /// Window start (inclusive). RFC3339-with-offset or compact
+    /// `YYYYMMDDHHMM` (local time).
+    pub from: String,
+    /// Window end (exclusive). Same two accepted forms as `from`; must parse
+    /// to an instant strictly after `from`.
+    pub to: String,
+    /// Rendered banner text, e.g. `Fable 5 Available until 7/12`.
+    pub content: String,
+}
+
+/// Per-account utilization-ceiling overrides (config `account_limits`); every
+/// field optional — `None` falls back to the global scheduler value.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct AccountLimits {
+    /// Override of `scheduler.five_hour_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_max: Option<f64>,
+    /// Override of `scheduler.seven_day_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_max: Option<f64>,
+    /// Override of `scheduler.fable_weekly_max` (0..=1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable_weekly_max: Option<f64>,
+}
+
+impl AccountLimits {
+    /// True when no field overrides anything — the map entry can be dropped.
+    pub fn is_empty(&self) -> bool {
+        self.five_hour_max.is_none()
+            && self.seven_day_max.is_none()
+            && self.fable_weekly_max.is_none()
+    }
+}
+
+/// Fill direction for the TUI quota gauges (config `quota_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaDisplay {
+    /// Fill = fraction of the window already used (the bar grows).
+    Used,
+    /// Fill = fraction still available before the ceiling (default — a full
+    /// green bar drains toward the reset).
+    #[default]
+    Remaining,
+}
+
+/// Built-in domain abbreviations for the accounts table (`domain_abbrev`).
+pub fn default_domain_abbrev() -> BTreeMap<String, String> {
+    BTreeMap::from([("insightquest.io".to_string(), "iq.io".to_string())])
+}
+
+/// Remote-daemon target for the CLI client commands. All fields optional:
+/// `host` unset (the default) means "operate against the local daemon" and the
+/// whole section is inert. When `host` is set, off-loopback access requires the
+/// remote's proxy `api_key` presented as `x-api-key` — so `api_key` is
+/// effectively mandatory unless the remote runs with no key configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// Remote daemon host (e.g. `llmux-host` or `100.64.0.1`). Unset →
+    /// remote mode OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Remote daemon port. Unset → [`DEFAULT_PORT`] (3456).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Proxy `api_key` presented to the remote as `x-api-key`. Required
+    /// off-loopback unless the remote has no api_key configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 impl Default for Config {
@@ -73,10 +252,21 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             upstream: default_upstream(),
             codex: CodexConfig::default(),
+            grok: GrokConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),
             raw_io: RawIoConfig::default(),
+            email_anonymous: false,
+            tui_effects: true,
+            tui_gradient: TuiGradient::default(),
+            show_fable_weekly: true,
+            domain_abbrev: default_domain_abbrev(),
+            quota_display: QuotaDisplay::default(),
+            paused_accounts: std::collections::BTreeSet::new(),
+            account_limits: BTreeMap::new(),
+            events: Vec::new(),
+            remote: RemoteConfig::default(),
             accounts: Vec::new(),
         }
     }
@@ -130,6 +320,60 @@ impl Default for RawIoConfig {
     }
 }
 
+/// TUI gradient animation tuning (UI-8): how fast the headline-model /
+/// max-effort gradients drift and which base colors the solid (per-group)
+/// gradient breathes. Display-only — carried on the dashboard document (like
+/// `tui_effects`) so the local AND attach TUIs honor it; read at boot from
+/// the config file.
+///
+/// ```json
+/// "tui_gradient": { "speed": 2.0, "claude": "#ff79c6", "codex": "#56dcdc" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuiGradient {
+    /// Speed multiplier for the temporal drift of BOTH gradient modes.
+    /// `1.0` (default) is the baseline drift; `2.0` doubles it, `0.5` halves
+    /// it. Non-finite or non-positive values fall back to `1.0` at render
+    /// time (the TUI never freezes on a bad config).
+    #[serde(default = "default_gradient_speed")]
+    pub speed: f32,
+    /// Base color (hex `#rrggbb`) the claude headline-model gradient breathes
+    /// around. Unparseable values fall back to the built-in default.
+    #[serde(default = "default_gradient_claude")]
+    pub claude: String,
+    /// Base color (hex `#rrggbb`) for the codex headline-model gradient.
+    #[serde(default = "default_gradient_codex")]
+    pub codex: String,
+    /// Optional hex base for the `max` effort token: when set, the rainbow is
+    /// replaced by a solid gradient on this color; `None` (default) keeps the
+    /// 3-phase sine rainbow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_effort: Option<String>,
+}
+
+impl Default for TuiGradient {
+    fn default() -> Self {
+        Self {
+            speed: default_gradient_speed(),
+            claude: default_gradient_claude(),
+            codex: default_gradient_codex(),
+            max_effort: None,
+        }
+    }
+}
+
+fn default_gradient_speed() -> f32 {
+    1.0
+}
+
+fn default_gradient_claude() -> String {
+    "#ff79c6".to_string()
+}
+
+fn default_gradient_codex() -> String {
+    "#56dcdc".to_string()
+}
+
 /// Model→backend-group routing config. When `enabled` is false (the
 /// default), routing is OFF and the scheduler behaves exactly as before:
 /// no group filter anywhere, codex accounts stay the cross-group overflow
@@ -159,12 +403,19 @@ pub struct RoutingConfig {
     /// Models routed to the codex group (empty → builtin codex rules).
     #[serde(default)]
     pub codex_models: Vec<String>,
+    /// Models routed to the grok group (empty → builtin grok rules).
+    /// Additive: pre-grok configs load with the builtin `grok` prefix rule.
+    #[serde(default)]
+    pub grok_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.
     #[serde(default = "default_routing_group")]
     pub default_group: String,
-    /// What to do when the matched group has no eligible/configured account:
-    /// `"error"` (default) returns a clean 404 not_found_error; `"fallback"`
-    /// falls back to the other group's normal selection.
+    /// What to do when the matched group has ZERO CONFIGURED accounts
+    /// (parked/limited accounts still count as configured): `"error"`
+    /// (default) returns a clean 404 not_found_error; `"fallback"` tries the
+    /// remaining groups in the fixed `Claude → Codex → Grok` order and the
+    /// first group with ≥1 configured account serves the request under its
+    /// own provider semantics (docs/grok/spec.md §R5).
     #[serde(default = "default_on_empty_group")]
     pub on_empty_group: String,
 }
@@ -175,6 +426,7 @@ impl Default for RoutingConfig {
             enabled: true,
             claude_models: Vec::new(),
             codex_models: Vec::new(),
+            grok_models: Vec::new(),
             default_group: default_routing_group(),
             on_empty_group: default_on_empty_group(),
         }
@@ -244,12 +496,55 @@ impl Default for CodexConfig {
     }
 }
 
+/// xAI Grok backend endpoints + request defaults (docs/grok/spec.md §R1/§R4).
+/// The chat upstream defaults to the Grok-CLI chat proxy (the subscription
+/// path); the OAuth endpoints are discovered via OIDC at login time and the
+/// token endpoint is persisted PER ACCOUNT (`AccountCredential::Grok`), so no
+/// token URL lives here. No `fast` — xAI has no service tier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrokConfig {
+    /// Base URL the Responses request is POSTed to (`{upstream}/responses`).
+    /// The Grok-CLI identity headers are only attached when this is the
+    /// official cli-chat-proxy host (docs/grok/spec.md §R1).
+    #[serde(default = "default_grok_upstream")]
+    pub upstream: String,
+    /// Model slug the grok provider requests upstream when the client's
+    /// requested model is not grok-shaped. Settable from `POST /llmux/grok`.
+    #[serde(default = "default_grok_model")]
+    pub default_model: String,
+    /// When set, llmux reports THIS model name to the client instead of the
+    /// real grok model (same contract as `codex.client_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_model: Option<String>,
+    /// Reasoning effort default: superset `none|low|medium|high`; the
+    /// per-model clamp happens at request time (docs/grok/spec.md §R1).
+    /// `None` → omit `reasoning` and let the backend default (high) apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Append a JSON-line trace of every grok request/response, mirroring
+    /// `codex.trace`. Default `false` (flip on while diagnosing).
+    #[serde(default)]
+    pub trace: bool,
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_grok_upstream(),
+            default_model: default_grok_model(),
+            client_model: None,
+            reasoning_effort: None,
+            trace: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// Listen port. Default 3456.
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Proxy-level API key (`ta-...`), auto-generated on first run.
+    /// Proxy-level API key (`lm-...`), auto-generated on first run.
     /// Localhost clients are exempt from presenting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -299,26 +594,38 @@ impl Default for ProxyConfig {
     }
 }
 
-/// On-demand idle-account usage probe (issue #21). An account with no known
-/// 5h/7d window produces no usage data for the scheduler's ranking/display.
-/// When this is enabled, such an account can be populated on demand by a
-/// single `max_tokens = 1` `POST /v1/messages` through its own credential: the
-/// response's `anthropic-ratelimit-*` headers feed the existing
-/// [`crate::scheduler::window::WindowSource::Headers`] path. This is strictly
-/// ON-DEMAND and per-account cooldown-gated — NEVER a background poll loop —
-/// because it spends real (if minimal) quota on an otherwise-idle account.
+/// Idle-account usage probe (issue #21, extended by #45). An account with no
+/// known 5h/7d window produces no usage data for the scheduler's
+/// ranking/display. When this is enabled, such an account can be populated by a
+/// single `max_tokens = 1` request through its own credential (`POST
+/// /v1/messages` for oauth/apikey, `POST /responses` for codex): the response's
+/// `anthropic-ratelimit-*` / `x-codex-*` headers feed the existing
+/// [`crate::scheduler::window::WindowSource::Headers`] path.
 ///
-/// Two guards: a global kill-switch (`enabled = false` disables ALL probing)
-/// and a per-account cooldown so a single account is probed at most once per
-/// `per_account_cooldown_secs`. Defaults are conservative: probing OFF, and a
-/// 1-hour cooldown if it is turned on.
+/// Two delivery modes, both behind the SAME guards:
+/// - **On demand** (#21): the forward path probes idle accounts so the next
+///   ranking/display has real data.
+/// - **Timer sweep** (#45): when `sweep_secs > 0`, a background task fires the
+///   same probe for EVERY cold account (any provider) on a timer, so their
+///   windows stay populated with ZERO client traffic. The usage poller already
+///   covers cold oauth accounts, so in practice the sweep is what keeps cold
+///   Codex and api-key accounts (which have no poller) visible; an oauth account
+///   the poller already warmed is skipped because it already has a window.
+///
+/// Both modes share a global kill-switch (`enabled = false` disables ALL
+/// probing) and a per-account cooldown so a single account is probed at most
+/// once per `per_account_cooldown_secs`. Defaults are ALWAYS-ON (issue #45):
+/// probing enabled with an hourly sweep, so cold accounts populate their
+/// windows out of the box; the kill-switch remains for operators who want
+/// zero probe traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdleProbeConfig {
-    /// Master kill-switch. `false` (the default) disables all idle probing;
-    /// `true` allows a single gated probe per idle account. Conservative
-    /// default: a real (if minimal) request is only ever sent when the
-    /// operator opts in.
-    #[serde(default)]
+    /// Master kill-switch. `true` (the default, per issue #45's always-on
+    /// mandate) allows a single gated probe per idle account; `false` disables
+    /// all idle probing (on-demand AND the timer sweep). Cost when on is
+    /// bounded by the per-account cooldown: at most one `max_tokens = 1`
+    /// request per cold account per hour, and only while it has no window.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Minimum wall-clock gap between two probes of the SAME account, seconds.
     /// Once an account is probed, a second probe is suppressed until this
@@ -326,13 +633,36 @@ pub struct IdleProbeConfig {
     /// account never bursts a probe per request. Default 3600 (1 hour).
     #[serde(default = "default_idle_probe_cooldown_secs")]
     pub per_account_cooldown_secs: u64,
+    /// Timer-sweep cadence for keeping ALL cold accounts (any provider) warm
+    /// (issue #45), seconds. Default 900 (15 min — one tick per default
+    /// cooldown). `0` disables the sweep entirely; the probe then stays purely
+    /// on-demand. When `> 0` and `enabled = true`, a background task probes
+    /// every cold account every `sweep_secs` seconds, reusing the same
+    /// kill-switch + per-account cooldown (so the cooldown — not this cadence
+    /// — bounds cost: at most one probe per account per
+    /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
+    #[serde(default = "default_idle_probe_sweep_secs")]
+    pub sweep_secs: u64,
+    /// Age (seconds) past which an account's freshest 5h/7d observation counts
+    /// as STALE and the account becomes probe-eligible again (Z 2026-07-15:
+    /// cold subscriptions must keep refreshing, not freeze at their last
+    /// reading). Before this knob an account was probed only while it had NO
+    /// window at all, so one successful probe froze its display forever unless
+    /// real traffic or the oauth poller touched it — codex/apikey accounts
+    /// have no poller, so their gauges went permanently stale. Default 900
+    /// (15 min). `0` disables staleness re-probing (windowless-only, the old
+    /// behavior).
+    #[serde(default = "default_idle_probe_stale_after_secs")]
+    pub stale_after_secs: u64,
 }
 
 impl Default for IdleProbeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_true(),
             per_account_cooldown_secs: default_idle_probe_cooldown_secs(),
+            sweep_secs: default_idle_probe_sweep_secs(),
+            stale_after_secs: default_idle_probe_stale_after_secs(),
         }
     }
 }
@@ -359,6 +689,43 @@ pub struct SchedulerConfig {
     /// tokens live ~8h).
     #[serde(default = "default_refresh_ahead_secs")]
     pub refresh_ahead_secs: u64,
+    /// Max Fable-weekly (7d Fbl) utilization before the account is
+    /// preemptively excluded for FABLE requests (non-Fable traffic is never
+    /// gated by this). Default 0.98. Additive: older configs load 0.98.
+    #[serde(default = "default_fable_weekly_max")]
+    pub fable_weekly_max: f64,
+    /// Which selection algorithm runs (see README "Schedulers"): `default`
+    /// (quota-maximizing perishability score) or `round-robin` (sequential
+    /// exhaust in roster order — the fewest-switches mode; each account
+    /// switch invalidates the upstream prompt cache, so fewer switches =
+    /// fewer re-read tokens). Toggle live from the TUI with `S`. Additive:
+    /// older configs load `default`.
+    #[serde(default)]
+    pub mode: SchedulerMode,
+}
+
+/// Selection algorithm (config `scheduler.mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerMode {
+    /// Quota-maximizing: perishability-scored pick with damped proactive
+    /// switching (the historical behavior).
+    #[default]
+    Default,
+    /// Sequential exhaust: stay on the current account until it is hard
+    /// ineligible, then move to the NEXT account in roster order (wrapping).
+    /// Minimizes account switches (prompt-cache friendly).
+    RoundRobin,
+}
+
+impl SchedulerMode {
+    /// Stable wire/display label (matches the serde encoding).
+    pub fn label(self) -> &'static str {
+        match self {
+            SchedulerMode::Default => "default",
+            SchedulerMode::RoundRobin => "round-robin",
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -369,6 +736,8 @@ impl Default for SchedulerConfig {
             usage_poll_secs: default_usage_poll_secs(),
             usage_max_age_secs: default_usage_max_age_secs(),
             refresh_ahead_secs: default_refresh_ahead_secs(),
+            fable_weekly_max: default_fable_weekly_max(),
+            mode: SchedulerMode::default(),
         }
     }
 }
@@ -425,6 +794,31 @@ pub enum AccountCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_refresh_ms: Option<u64>,
     },
+    /// xAI Grok subscription (device-code OAuth against auth.x.ai,
+    /// docs/grok/spec.md §R1). Served by the grok provider.
+    ///
+    /// NOTE downgrade contract: a config containing this variant does not
+    /// parse under pre-grok binaries (internally-tagged enum) — remove
+    /// `grok:*` accounts before downgrading (spec §Compatibility & rollback).
+    Grok {
+        /// `sub` claim from the id_token; dedup key across logins.
+        /// Empty string = unknown.
+        #[serde(default)]
+        subject: String,
+        access_token: String,
+        refresh_token: String,
+        /// Access-token expiry, epoch milliseconds. `0` = unknown.
+        expires_at_ms: u64,
+        /// OAuth token endpoint resolved via OIDC discovery at login time and
+        /// persisted so refreshes don't re-discover (CLIProxyAPI parity).
+        /// Empty string → re-discover on the next refresh.
+        #[serde(default)]
+        token_endpoint: String,
+        /// Epoch ms of the last successful token refresh; see the `Oauth`
+        /// variant's field of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_refresh_ms: Option<u64>,
+    },
 }
 
 impl AccountCredential {
@@ -434,6 +828,7 @@ impl AccountCredential {
             Self::Oauth { .. } => "oauth",
             Self::Apikey { .. } => "apikey",
             Self::Codex { .. } => "codex",
+            Self::Grok { .. } => "grok",
         }
     }
 
@@ -447,6 +842,9 @@ impl AccountCredential {
             }
             | Self::Codex {
                 last_refresh_ms, ..
+            }
+            | Self::Grok {
+                last_refresh_ms, ..
             } => *last_refresh_ms,
             Self::Apikey { .. } => None,
         }
@@ -459,6 +857,7 @@ impl AccountCredential {
         match self {
             Self::Oauth { account_uuid, .. } if !account_uuid.is_empty() => Some(account_uuid),
             Self::Codex { account_id, .. } if !account_id.is_empty() => Some(account_id),
+            Self::Grok { subject, .. } if !subject.is_empty() => Some(subject),
             _ => None,
         }
     }
@@ -549,6 +948,13 @@ impl Config {
                 expires_at_ms: exp,
                 last_refresh_ms: lr,
                 ..
+            }
+            | AccountCredential::Grok {
+                access_token: at,
+                refresh_token: rt,
+                expires_at_ms: exp,
+                last_refresh_ms: lr,
+                ..
             } => {
                 *at = access_token.to_string();
                 if let Some(new_rt) = refresh_token {
@@ -580,8 +986,22 @@ fn default_codex_token_url() -> String {
 }
 
 /// Default codex model slug (the value `CODEX_MODEL` used to hardcode).
+/// Must stay in sync with `provider::codex::CODEX_MODEL`.
 fn default_codex_model() -> String {
-    "gpt-5.5".to_string()
+    "gpt-5.6-sol".to_string()
+}
+
+/// Default grok chat upstream: the Grok-CLI chat proxy (subscription path,
+/// CLIProxyAPI `internal/auth/xai/types.go:13`). Must stay in sync with
+/// `provider::grok::GROK_CHAT_PROXY_UPSTREAM`.
+fn default_grok_upstream() -> String {
+    "https://cli-chat-proxy.grok.com/v1".to_string()
+}
+
+/// Default grok model slug. Must stay in sync with
+/// `provider::grok::GROK_MODEL`.
+fn default_grok_model() -> String {
+    "grok-4.5".to_string()
 }
 
 fn default_port() -> u16 {
@@ -606,6 +1026,10 @@ fn default_upstream() -> String {
     DEFAULT_UPSTREAM.to_string()
 }
 
+pub fn default_fable_weekly_max() -> f64 {
+    0.98
+}
+
 fn default_five_hour_max() -> f64 {
     0.90
 }
@@ -626,10 +1050,26 @@ fn default_refresh_ahead_secs() -> u64 {
     7 * 3600
 }
 
-/// Default per-account idle-probe cooldown: 1 hour. Conservative — an idle
-/// account is probed at most once an hour even when probing is enabled.
+/// Default per-account idle-probe cooldown: 15 min — one probe per tick of
+/// the default sweep, so cold gauges refresh continuously (Z 2026-07-15)
+/// while cost stays bounded at four 1-token probes per account per hour.
 fn default_idle_probe_cooldown_secs() -> u64 {
-    3600
+    900
+}
+
+/// Default idle-probe timer-sweep cadence: 15 min (issue #45's always-on
+/// mandate, tightened for the staleness re-probe) — one tick per default
+/// `per_account_cooldown_secs`, so the steady state is at most one 1-token
+/// probe per cold account per tick.
+fn default_idle_probe_sweep_secs() -> u64 {
+    900
+}
+
+/// Default idle-probe staleness horizon: 15 min. An account whose freshest
+/// window observation is older than this is probed again on the next
+/// sweep/on-demand trigger, so cold subscriptions keep live gauges.
+fn default_idle_probe_stale_after_secs() -> u64 {
+    900
 }
 
 /// Default raw-io retention window: 90 days (per Feature B).

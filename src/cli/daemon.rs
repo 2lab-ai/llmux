@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::{proxy_base_url, CliError, StopArgs};
+use super::{proxy_base_url, CliError, ResetUsageArgs, StopArgs};
 use crate::config::Config;
 
 /// Probe timeout: long enough for a loaded localhost server, short enough
@@ -18,8 +18,11 @@ use crate::config::Config;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Max wait for a spawned daemon to answer the status endpoint (and for a
-/// stopped server to release the port).
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// stopped server to release the port). A daemon loading many accounts takes
+/// ~10s to answer; 5s produced false "not ready" failures that tempted users
+/// into a second restart which drained the healthy new daemon. Polling is
+/// every [`POLL_INTERVAL`], so a fast startup is not slowed by the headroom.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Drain budget for a version-gated restart: longer than `stop`'s 5s so an
 /// in-flight request on the old daemon (it may hold several live accounts,
@@ -37,6 +40,11 @@ pub enum ServerProbe {
     Running { status: serde_json::Value },
     /// Connection refused / timed out — nothing is listening.
     NotRunning,
+    /// A llmux daemon answered but rejected the credential (HTTP 401): the
+    /// endpoint requires an `x-api-key` we did not present (or presented
+    /// wrong). Distinct from `Foreign` so remote commands can point at
+    /// `remote.api_key` instead of claiming the port is not llmux.
+    Unauthorized,
     /// Something answered, but it is not llmux — never spawn over it.
     Foreign { detail: String },
 }
@@ -53,14 +61,15 @@ pub enum EnsureOutcome {
     Restarted { pid: u32 },
 }
 
-/// Probe the configured port for a running llmux server.
-pub async fn probe_server(port: u16, api_key: Option<&str>) -> Result<ServerProbe, CliError> {
+/// Probe `base_url` (e.g. `http://localhost:3456` or a remote host) for a
+/// running llmux server.
+pub async fn probe_server(base_url: &str, api_key: Option<&str>) -> Result<ServerProbe, CliError> {
     let client = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .build()
         .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
-    let url = format!("{}/llmux/status", proxy_base_url(port));
+    let url = format!("{base_url}/llmux/status");
     let mut request = client.get(&url);
     if let Some(api_key) = api_key {
         // Localhost is exempt, but sending it is harmless and keeps this
@@ -95,6 +104,11 @@ pub fn status_pid(status: &serde_json::Value) -> Option<u32> {
 /// Classify a status-endpoint response: only a 2xx carrying a
 /// llmux-shaped document counts as a running server.
 fn classify_probe(status: http::StatusCode, body: &str) -> ServerProbe {
+    if status == http::StatusCode::UNAUTHORIZED {
+        // llmux's own client-auth gate (FR1) — the endpoint IS llmux, it just
+        // wants the api key. Off-loopback that means `remote.api_key`.
+        return ServerProbe::Unauthorized;
+    }
     if !status.is_success() {
         return ServerProbe::Foreign {
             detail: format!("status endpoint returned {status}"),
@@ -141,21 +155,37 @@ fn should_restart(running_version: Option<&str>, current_version: &str, force: b
 pub async fn ensure_server_running(
     config: &Config,
     force: bool,
+    server_exe: Option<PathBuf>,
 ) -> Result<EnsureOutcome, CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
     let mut restarting = false;
-    match probe_server(port, api_key).await? {
+    let mut exe: Option<PathBuf> = None;
+    match probe_server(&proxy_base_url(port), api_key).await? {
         ServerProbe::Running { status } => {
             let current = crate::build_info::version_string();
             let running = status.get("version").and_then(serde_json::Value::as_str);
             if should_restart(running, &current, force) {
+                // Resolve and verify the spawn target BEFORE draining:
+                // killing the old daemon and then failing to spawn would
+                // leave the user with no server at all (exactly what a
+                // channel switch did when it spawned the keg brew had just
+                // uninstalled). Only spawn-reaching paths resolve — the
+                // reuse path above must keep working from an unlinked
+                // binary against a healthy daemon.
+                exe = Some(resolve_server_exe(server_exe.clone())?);
                 // Drain the old daemon cooperatively before we spawn over it.
                 shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT).await?;
                 restarting = true;
             } else {
                 return Ok(EnsureOutcome::AlreadyRunning);
             }
+        }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "a llmux daemon on port {port} rejected the local api key (401) — \
+                 check proxy.api_key in the config"
+            )));
         }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
@@ -177,8 +207,14 @@ pub async fn ensure_server_running(
                 .into(),
         ));
     }
+    let exe = match exe {
+        Some(exe) => exe,
+        // Nothing was drained above (fresh start) — resolve just before the
+        // spawn, still failing cleanly with no daemon harmed.
+        None => resolve_server_exe(server_exe)?,
+    };
     let log_path = server_log_path()?;
-    let pid = spawn_server_daemon(&log_path)?;
+    let pid = spawn_server_daemon(&log_path, &exe)?;
     wait_until_ready(port, api_key, READY_TIMEOUT)
         .await
         .map_err(|err| CliError::Message(format!("{err}\nServer log: {}", log_path.display())))?;
@@ -191,12 +227,27 @@ pub async fn ensure_server_running(
 
 /// `llmux restart` — explicitly drain-if-running and (re)spawn the daemon,
 /// then print status. Unlike `run`, this never execs `claude`: it is just the
-/// server-lifecycle half, with `force` so a same-version daemon is replaced too.
-pub async fn restart() -> Result<(), CliError> {
+/// server-lifecycle half, with `force` so a same-version daemon is replaced
+/// too. `server_exe` overrides which binary is spawned (`update`/`channel`
+/// pass the freshly installed one); `None` spawns this CLI's own image.
+pub async fn restart(server_exe: Option<PathBuf>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let port = config.proxy.port;
-    let version = crate::build_info::version_string();
-    match ensure_server_running(&config, true).await? {
+    let outcome = ensure_server_running(&config, true, server_exe).await?;
+    // Report the version the daemon actually runs, not this CLI's: after an
+    // update/switch the spawned binary is newer than the invoking process.
+    // Display-only, so a transient probe miss must never fail a restart that
+    // already succeeded (a "failed" report invites the second restart that
+    // drains the healthy new daemon).
+    let version = match probe_server(&proxy_base_url(port), config.proxy.api_key.as_deref()).await {
+        Ok(ServerProbe::Running { status }) => status
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(crate::build_info::version_string),
+        _ => crate::build_info::version_string(),
+    };
+    match outcome {
         EnsureOutcome::Started { pid } => {
             println!("started llmux server (pid {pid}) on port {port} → {version}");
         }
@@ -211,11 +262,32 @@ pub async fn restart() -> Result<(), CliError> {
     Ok(())
 }
 
-/// Spawn `current_exe() server --no-tui` fully detached: own process group
+/// The executable a (re)spawned daemon runs: the caller's override or this
+/// CLI's own image — verified to exist. `current_exe()` can name a path that
+/// no longer exists (macOS keeps answering after the file is unlinked), e.g.
+/// the brew keg an update/switch just removed; spawning it would ENOENT
+/// *after* the old daemon was already drained.
+fn resolve_server_exe(server_exe: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let exe = match server_exe {
+        Some(exe) => exe,
+        None => std::env::current_exe()?,
+    };
+    if exe.exists() {
+        Ok(exe)
+    } else {
+        Err(CliError::Message(format!(
+            "server binary no longer exists at {} (removed by an update/uninstall?)\n\
+             The running daemon was left untouched. Re-run from the installed \
+             binary: llmux restart",
+            exe.display()
+        )))
+    }
+}
+
+/// Spawn `<exe> server --no-tui` fully detached: own process group
 /// (survives this CLI and its terminal), stdin/stdout null, stderr appended
 /// to the log file (the non-TUI server logs to stderr). Never waited on.
-fn spawn_server_daemon(log_path: &Path) -> Result<u32, CliError> {
-    let exe = std::env::current_exe()?;
+fn spawn_server_daemon(log_path: &Path, exe: &Path) -> Result<u32, CliError> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -296,7 +368,7 @@ async fn wait_until_ready(
 ) -> Result<(), CliError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let ServerProbe::Running { .. } = probe_server(port, api_key).await? {
+        if let ServerProbe::Running { .. } = probe_server(&proxy_base_url(port), api_key).await? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -343,7 +415,7 @@ async fn shutdown_and_wait(
 
     let deadline = Instant::now() + timeout;
     loop {
-        if let ServerProbe::NotRunning = probe_server(port, api_key).await? {
+        if let ServerProbe::NotRunning = probe_server(&proxy_base_url(port), api_key).await? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -356,6 +428,72 @@ async fn shutdown_and_wait(
     }
 }
 
+/// `llmux reset-usage` — `POST /llmux/reset-usage` on the target daemon
+/// (local, or the remote in remote mode): force every account's usage
+/// windows, scoped limits and cooldowns back to cold after a provider-side
+/// quota reset (issue #115). Gauges repopulate from the next usage poll /
+/// response headers. A missing server is an error — there is no live usage
+/// to reset without a daemon.
+pub async fn reset_usage(_args: ResetUsageArgs, remote: Option<String>) -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let endpoint = super::resolve_endpoint(remote.as_deref(), &config)?;
+    match probe_server(&endpoint.base_url, endpoint.api_key.as_deref()).await? {
+        ServerProbe::NotRunning => {
+            return Err(CliError::Message(format!(
+                "server not running on {}:{} — no live usage to reset",
+                endpoint.host, endpoint.port
+            )));
+        }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "llmux on {}:{} rejected the api key (401) — check `remote.api_key` \
+                 (remote) or `proxy.api_key` (local) in the config",
+                endpoint.host, endpoint.port
+            )));
+        }
+        ServerProbe::Foreign { detail } => {
+            return Err(CliError::Message(format!(
+                "port {} answers but is not llmux: {detail}",
+                endpoint.port
+            )));
+        }
+        ServerProbe::Running { .. } => {}
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| CliError::Message(format!("http client init failed: {err}")))?;
+    let url = format!("{}/llmux/reset-usage", endpoint.base_url);
+    let mut request = client.post(&url);
+    if let Some(api_key) = endpoint.api_key.as_deref() {
+        request = request.header("x-api-key", api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| CliError::Message(format!("reset-usage request failed: {err}")))?;
+    if !response.status().is_success() {
+        return Err(CliError::Message(format!(
+            "server returned {} for {url}",
+            response.status()
+        )));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|err| CliError::Message(format!("reset-usage response parse failed: {err}")))?;
+    let accounts = body
+        .get("accounts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!(
+        "usage reset to cold for {accounts} account(s) on {}:{} — gauges repopulate on the next poll",
+        endpoint.host, endpoint.port
+    );
+    Ok(())
+}
+
 /// `llmux stop` — cooperatively shut down the running server and wait for
 /// the port to release (5s budget). A missing server is not an error
 /// (idempotent stop); a foreign listener is refused.
@@ -364,10 +502,16 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
 
-    match probe_server(port, api_key).await? {
+    match probe_server(&proxy_base_url(port), api_key).await? {
         ServerProbe::NotRunning => {
             println!("server not running on port {port}");
             return Ok(());
+        }
+        ServerProbe::Unauthorized => {
+            return Err(CliError::Message(format!(
+                "a llmux daemon on port {port} rejected the api key (401) — \
+                 check proxy.api_key in the config"
+            )));
         }
         ServerProbe::Foreign { detail } => {
             return Err(CliError::Message(format!(
@@ -402,6 +546,14 @@ mod tests {
     fn classify_probe_accepts_llmux_shape() {
         let probe = classify_probe(StatusCode::OK, &llmux_status_body());
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
+    }
+
+    #[test]
+    fn classify_probe_maps_401_to_unauthorized() {
+        // A remote llmux that wants an api_key we didn't present: NOT foreign.
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"Invalid proxy API key"}}"#;
+        let probe = classify_probe(StatusCode::UNAUTHORIZED, body);
+        assert!(matches!(probe, ServerProbe::Unauthorized), "{probe:?}");
     }
 
     #[test]
@@ -479,6 +631,51 @@ mod tests {
         );
     }
 
+    /// The spawn target is verified up front: a caller-provided path that no
+    /// longer exists (a brew keg removed by update/switch) must error out
+    /// BEFORE any running daemon would be drained.
+    #[test]
+    fn resolve_server_exe_rejects_missing_override() {
+        let missing = std::env::temp_dir().join("llmux-test-definitely-missing/bin/llmux");
+        let err = resolve_server_exe(Some(missing.clone())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "error names the missing path: {msg}"
+        );
+        assert!(
+            msg.contains("left untouched"),
+            "error promises the daemon was not drained: {msg}"
+        );
+    }
+
+    /// Regression: a healthy same-version daemon must be REUSED even when the
+    /// spawn target doesn't exist (e.g. this CLI's keg was unlinked by a brew
+    /// upgrade in another shell). The resolve must only run on spawn-reaching
+    /// paths — never in front of the read-only reuse path.
+    #[tokio::test]
+    async fn already_running_reuses_without_resolving_missing_exe() {
+        let port = spawn_status_mock(llmux_status_body()).await;
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "proxy": { "port": port }
+        }))
+        .unwrap();
+        let missing = std::env::temp_dir().join("llmux-test-missing-reuse/bin/llmux");
+        let outcome = ensure_server_running(&config, false, Some(missing))
+            .await
+            .unwrap();
+        assert_eq!(outcome, EnsureOutcome::AlreadyRunning);
+    }
+
+    #[test]
+    fn resolve_server_exe_accepts_existing_override_and_self() {
+        // An existing override passes through unchanged.
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(resolve_server_exe(Some(exe.clone())).unwrap(), exe);
+        // No override → this binary (the test runner exists by definition).
+        assert_eq!(resolve_server_exe(None).unwrap(), exe);
+    }
+
     /// Serve `body` (200) at `/llmux/status` on 127.0.0.1:0.
     async fn spawn_status_mock(body: String) -> u16 {
         let app = Router::new().route("/llmux/status", get(move || async move { body }));
@@ -493,14 +690,16 @@ mod tests {
     #[tokio::test]
     async fn probe_detects_running_llmux() {
         let port = spawn_status_mock(llmux_status_body()).await;
-        let probe = probe_server(port, Some("lm-key")).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), Some("lm-key"))
+            .await
+            .unwrap();
         assert!(matches!(probe, ServerProbe::Running { .. }), "{probe:?}");
     }
 
     #[tokio::test]
     async fn probe_flags_foreign_listener() {
         let port = spawn_status_mock("welcome to my blog".into()).await;
-        let probe = probe_server(port, None).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), None).await.unwrap();
         assert!(matches!(probe, ServerProbe::Foreign { .. }), "{probe:?}");
     }
 
@@ -510,7 +709,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let probe = probe_server(port, None).await.unwrap();
+        let probe = probe_server(&proxy_base_url(port), None).await.unwrap();
         assert!(matches!(probe, ServerProbe::NotRunning), "{probe:?}");
     }
 

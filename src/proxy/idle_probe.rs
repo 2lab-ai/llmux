@@ -85,6 +85,13 @@ impl ReqwestProber {
                     .map_err(|err| ProbeError::Build(err.to_string()))?;
                 Ok((req, self.codex.endpoint().to_string()))
             }
+            // Grok exposes no quota headers and no usage endpoint (spec
+            // §R3): a probe can never learn anything, so it is never built.
+            // The scheduler also gates grok out (`probe_if_idle`); this is
+            // the backstop.
+            AccountCredential::Grok { .. } => Err(ProbeError::Build(
+                "grok accounts expose no quota headers; idle probe skipped".into(),
+            )),
             AccountCredential::Oauth { .. } | AccountCredential::Apikey { .. } => {
                 let mut headers = HeaderMap::new();
                 headers.insert(

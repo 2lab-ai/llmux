@@ -34,7 +34,7 @@ use crate::config::AccountCredential;
 use crate::provider::{anthropic, AnthropicRequest, Provider as _, ProviderRequest};
 use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
-use crate::scheduler::{headers as rl_headers, AccountId};
+use crate::scheduler::{headers as rl_headers, AccountId, DEFAULT_HEURISTIC_COOLDOWN};
 use crate::tui::{ActivityEvent, TokenCounts};
 
 /// Hop-by-hop headers stripped from the client request before forwarding
@@ -63,6 +63,52 @@ const REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 /// `retry-after` surfaced to the client when the pool is exhausted and no
 /// reset is known (Node default).
 const DEFAULT_CLIENT_RETRY_AFTER_SECS: u64 = 60;
+
+/// When the pool is only cooldown-blocked and the soonest park expires within
+/// this bound, wait it out inside the request instead of failing (issue #71
+/// F5). Bounds each INDIVIDUAL grace park — longer recoveries belong to the
+/// client's own retry (the transient 502 tells it to).
+const MAX_EXHAUST_PARK: Duration = Duration::from_secs(3);
+
+/// Total in-request grace-park budget (issue #71 F5, extended). A single park
+/// proved insufficient under a multi-second org-level 429 burst (2026-07-10
+/// incident: one fable-5 request swept all 8 claude accounts in ~5s, the one
+/// 3s grace park woke into a still-parked pool, and the client saw 502 pairs).
+/// Cooldowns free account by account, so riding out such a burst takes
+/// CONSECUTIVE short parks; they accumulate up to this budget before the
+/// request falls back to the deliberate transient 502 (unchanged semantics —
+/// that 502 stays the terminal answer once waiting stops being cheap).
+const EXHAUST_PARK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Grace-park policy for a cooldown-blocked pool (issue #71 F5 + budget):
+/// park only while recovery is imminent (`min_expiry` within
+/// [`MAX_EXHAUST_PARK`]) AND completing THIS park keeps the request within its
+/// [`EXHAUST_PARK_BUDGET`]. The budget is a hard cap on TOTAL parked time, so
+/// the check is pre-emptive: `already_parked + min_expiry` must fit. We refuse
+/// (rather than clamp to the remaining budget) because `min_expiry` is the
+/// soonest a cooldown lifts — a shorter sleep would wake into a still-locked
+/// pool, pure waste that only delays the transient 502. Pure, so the budget
+/// policy is unit-testable without a 20-second sleep.
+fn should_park_exhausted(min_expiry: Duration, already_parked: Duration) -> bool {
+    min_expiry <= MAX_EXHAUST_PARK && already_parked + min_expiry <= EXHAUST_PARK_BUDGET
+}
+
+/// Grace-park policy for a COMPLETED retry-after-less 429 sweep (2026-07-13T23:01Z
+/// incident). A non-Fable burst never reaches the cooldown-blocked path above:
+/// `heuristic_degraded_mode` keeps leasing through the Heuristic cooldowns the
+/// sweep just recorded, so the pool never goes `Exhausted` and `should_park_
+/// exhausted`'s trigger never fires — the request instead hammers all in-group
+/// accounts 429→switch→429 with no sleep and 502s in seconds, while the upstream
+/// burst clears ~20-30s later (measured: 1 opus-4-8 request, 8 accounts, 13 hops
+/// in ~8s). Once the forward loop detects the completed sweep it paces on the
+/// full [`DEFAULT_HEURISTIC_COOLDOWN`] (the soonest a heuristic park lifts).
+/// Same budget philosophy as [`should_park_exhausted`]: park only while the
+/// accumulated parked time stays within [`EXHAUST_PARK_BUDGET`], and REFUSE
+/// (never clamp) past it — a shorter sleep would just wake into a still-bursting
+/// pool. Pure, so the budget cutoff is unit-testable without an 8-second sleep.
+fn should_park_swept(already_parked: Duration) -> bool {
+    already_parked + DEFAULT_HEURISTIC_COOLDOWN <= EXHAUST_PARK_BUDGET
+}
 
 /// Classification of an upstream response/failure, driving the retry
 /// decision table in the architecture doc.
@@ -152,6 +198,19 @@ pub fn rewrite_headers(headers: &mut HeaderMap, credential: &AccountCredential) 
     }
 }
 
+/// The free-tier rolling window cli-chat-proxy advertises ("Usage resets
+/// over a rolling 24-hour window") — an ESTIMATE used as probe-not-before
+/// when a grok 429 carries the exhaustion marker but no Retry-After
+/// (CLIProxyAPI xai_executor.go:2521-2545; docs/grok/spec.md §R1).
+pub(crate) const GROK_FREE_USAGE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether a grok 429 error body names free-tier exhaustion. Substring match
+/// on the detail text, mirroring CLIProxyAPI's `code`/`error` scan.
+pub(crate) fn grok_free_usage_exhausted(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("free-usage-exhausted") || lower.contains("included free usage")
+}
+
 /// Parse a `retry-after` header (delta-seconds form). The HTTP-date form is
 /// not parsed — Anthropic sends seconds; an unparseable value falls back to
 /// the heuristic cooldown via `None`.
@@ -175,22 +234,35 @@ struct ForwardContext {
     /// Correlates RequestStarted → Routed → Finished in the activity feed.
     activity_id: u64,
     started: std::time::Instant,
+    /// The instant the SERVED upstream attempt was dispatched (set right
+    /// before each `send_upstream`; retries overwrite it, so the value the
+    /// relay sees belongs to the attempt that actually produced the
+    /// response). TTFB/TTFT are measured from THIS baseline — measuring from
+    /// `started` would fold body buffering, scheduling, token refreshes, and
+    /// 429 parks into a provider metric (review MUST-FIX 7). `None` only on
+    /// pre-dispatch failures, where no timing is emitted anyway.
+    dispatched: Option<std::time::Instant>,
     /// The model named in the request body (for the routing log line).
     model: Option<String>,
     /// The keyless per-client metering identity (`metadata.user_id`) parsed
     /// from the request body once at entry (issue #32). `None` → the request is
     /// attributed to the `unknown` bucket. Counting only; never gates routing.
     user_id: Option<String>,
+    /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
+    /// at entry from the buffered body by [`crate::proxy::classify`]. Display
+    /// only; never gates routing.
+    kind: Option<String>,
+    excerpt: Option<String>,
     /// The backend group this request routes to, OR `None` when routing is
     /// disabled (the legacy single-slot / cross-group-overflow path). When
     /// `Some`, the scheduler is filtered to that group and the leased
     /// credential must belong to it.
     group: Option<BackendGroup>,
-    /// Whether the request was actually served by the codex provider, set once
-    /// the account is leased and the provider path is chosen (`None` before
+    /// The backend group that actually SERVED the request, set once the
+    /// account is leased and the provider path is chosen (`None` before
     /// then, e.g. a pre-routing failure). Drives the activity log's
     /// group/model/effort columns even when `group` is `None` (routing off).
-    served_codex: Option<bool>,
+    served_by: Option<BackendGroup>,
 }
 
 impl ForwardContext {
@@ -208,26 +280,47 @@ impl ForwardContext {
         }
     }
 
-    /// The (group, model, effort) triple shown in the activity log. Codex: the
-    /// configured model + effort; Claude: the inbound model + the thinking
-    /// budget. All `None` before the provider path is chosen (early failures).
-    fn finished_meta(&self, state: &AppState) -> (Option<String>, Option<String>, Option<String>) {
-        match self.served_codex {
-            Some(true) => (
-                Some("codex".to_string()),
-                Some(state.codex.model()),
-                state.codex.effort(),
-            ),
-            Some(false) => (
-                Some("claude".to_string()),
-                self.model.clone(),
-                effort_from_thinking(&self.body),
-            ),
-            None => (
-                self.group.map(|g| g.as_str().to_string()),
-                self.model.clone(),
-                effort_from_thinking(&self.body),
-            ),
+    /// The `(group, model, effort, fast)` shown in the activity log. Codex: the
+    /// PER-REQUEST resolved upstream model + effective effort/fast that went
+    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model +
+    /// the thinking budget, never fast. All `None`/`false` before the provider
+    /// path is chosen (early failures).
+    fn finished_meta(&self, state: &AppState) -> FinishedMeta {
+        match self.served_by {
+            Some(BackendGroup::Codex) => {
+                // Per-request effective model + effort + fast (matches the
+                // wire), not the static shape defaults: a request for gpt-5.5
+                // under a gpt-5.6-sol pin records gpt-5.5, and a FAILED
+                // request still names the model that failed.
+                let (model, effort, fast) = state.codex.request_meta(&self.body);
+                FinishedMeta {
+                    group: Some("codex".to_string()),
+                    model: Some(model),
+                    effort,
+                    fast,
+                }
+            }
+            Some(BackendGroup::Grok) => {
+                let (model, effort) = state.grok.request_meta(&self.body);
+                FinishedMeta {
+                    group: Some("grok".to_string()),
+                    model: Some(model),
+                    effort,
+                    fast: false,
+                }
+            }
+            Some(BackendGroup::Claude) => FinishedMeta {
+                group: Some("claude".to_string()),
+                model: self.model.clone(),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
+            None => FinishedMeta {
+                group: self.group.map(|g| g.as_str().to_string()),
+                model: self.model.clone(),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
         }
     }
 
@@ -236,7 +329,11 @@ impl ForwardContext {
     /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
     /// and no record is built — so capture is genuinely off the hot path.
     fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
-        if state.config.raw_io.enabled {
+        if state
+            .settings_live
+            .raw_io_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             state.raw_io_path.as_deref()
         } else {
             None
@@ -247,19 +344,23 @@ impl ForwardContext {
     /// buffered terminal points (codex aggregate, codex error, the JSON relay
     /// path). The streaming relays capture inside their `finish` closures with
     /// the teed bytes instead, because `ctx` is moved into the closure there.
-    /// `response` is the body delivered to the client (or the error body). A
-    /// `None` path makes this a complete no-op.
+    /// `response` is the body delivered to the client (or the error body).
+    /// `upstream` is the proxy→API half of a TRANSLATED exchange (`None` on
+    /// the byte-identity passthrough — the 2-payload case). A `None` path
+    /// makes this a complete no-op.
     fn capture_raw_io(
         &self,
         state: &AppState,
         account: Option<&AccountId>,
         status: StatusCode,
         response: &[u8],
+        response_headers: Option<&HeaderMap>,
+        upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
     ) {
         let Some(path) = self.raw_io_path(state) else {
             return;
         };
-        let (group, model, _effort) = self.finished_meta(state);
+        let FinishedMeta { group, model, .. } = self.finished_meta(state);
         crate::proxy::raw_io::capture(
             Some(path),
             self.activity_id,
@@ -267,13 +368,19 @@ impl ForwardContext {
             model,
             account.map(|a| a.0.clone()),
             Some(status.as_u16()),
+            Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             &self.body,
             response,
             state.config.raw_io.max_body_bytes,
+            Some(redacted_header_pairs(&self.headers)),
+            response_headers.map(redacted_header_pairs),
+            upstream,
         );
     }
 
-    /// Emit the terminal activity event for this request.
+    /// Emit the terminal activity event for this request (no stream timing —
+    /// error paths and non-streaming relays, where TTFB/first-delta were never
+    /// observed).
     fn emit_finished(
         &self,
         state: &AppState,
@@ -281,7 +388,26 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
     ) {
-        let (group, model, effort) = self.finished_meta(state);
+        self.emit_finished_timed(state, account, status, tokens, sse::StreamTiming::default());
+    }
+
+    /// Emit the terminal activity event with the stream-timing landmarks the
+    /// relay pump observed (perf telemetry v1): TTFB + first streamed output
+    /// delta, both as millis offsets from this request's start.
+    fn emit_finished_timed(
+        &self,
+        state: &AppState,
+        account: Option<&AccountId>,
+        status: StatusCode,
+        tokens: Option<TokenCounts>,
+        timing: sse::StreamTiming,
+    ) {
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = self.finished_meta(state);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
             method: self.method.to_string(),
@@ -293,14 +419,59 @@ impl ForwardContext {
             group,
             model,
             effort,
+            fast: Some(fast),
+            ttfb_ms: self
+                .dispatched
+                .and_then(|d| timing.first_byte.map(|at| ms_since(d, at))),
+            ttft_ms: self
+                .dispatched
+                .and_then(|d| timing.first_content.map(|at| ms_since(d, at))),
+            // Fixed inside the pump at upstream EOF (StreamTiming::gen_ms) —
+            // JSON assembly / raw-io capture never inflates the span.
+            gen_ms: timing.gen_ms(),
+            aborted: timing.saw_error_event,
             user_id: self.user_id.clone(),
+            kind: self.kind.clone(),
+            excerpt: self.excerpt.clone(),
         });
     }
 }
 
+/// The backend group / served model / per-request effort / fast flag attributed
+/// to a finished request, for the activity event and raw-io capture. Codex
+/// carries the effective per-request effort and fast; Claude the thinking
+/// budget and `fast = false`.
+struct FinishedMeta {
+    group: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    fast: bool,
+}
+
+/// The per-request effort recorded for a CLAUDE request: the raw
+/// `output_config.effort` string the client sent (Claude Code sends
+/// low/medium/high/xhigh/max on the wire), when present; otherwise the
+/// extended-thinking budget label ([`effort_from_thinking`]). `None` when
+/// neither is present. Codex effort comes from the codex resolution instead.
+fn claude_effort(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let output_config = value
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(|e| e.as_str())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string);
+    output_config.or_else(|| effort_from_thinking(body))
+}
+
 /// Map the inbound Anthropic `thinking` block to a compact effort label for
 /// the activity log: `{budget/1000}k` when extended thinking is enabled, else
-/// `None`. (For codex the effort comes from config, not the body.)
+/// `None`. (For codex the effort comes from the per-request resolution, not the
+/// body's thinking block.)
 fn effort_from_thinking(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let thinking = v.get("thinking")?;
@@ -319,6 +490,75 @@ fn format_headers(headers: &HeaderMap) -> String {
         .map(|(name, value)| format!("  {name}: {}", value.to_str().unwrap_or("<binary>")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Substrings that mark a header NAME as credential-shaped: its VALUE is
+/// redacted before raw-io capture. The name stays visible — the raw viewer
+/// still shows the header was sent, CDT-style — but the secret never lands
+/// on disk.
+const REDACTED_NAME_MARKS: [&str; 5] = ["auth", "key", "token", "secret", "cookie"];
+
+/// Whether a header's value must be redacted from raw-io capture, by name
+/// (lowercase per `HeaderName`). A substring heuristic instead of a fixed
+/// name list (trinity review R2): the known llmux inbound surface is
+/// `authorization` / `x-api-key` / cookies, but a future backend introducing
+/// e.g. `x-goog-api-key` or `x-amz-security-token` must fail SAFE (redacted)
+/// rather than silently persist to the append-only log until someone
+/// remembers to extend a list.
+fn header_is_sensitive(name: &str) -> bool {
+    REDACTED_NAME_MARKS.iter().any(|mark| name.contains(mark))
+}
+
+/// Flatten a header map into `(name, value)` pairs in wire order for raw-io
+/// capture, redacting credential values ([`header_is_sensitive`]) and
+/// rendering non-UTF-8 values as a placeholder. Pure; never panics.
+pub(crate) fn redacted_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let v = if header_is_sensitive(name.as_str()) {
+                "•••redacted".to_string()
+            } else {
+                value.to_str().unwrap_or("<non-utf8>").to_string()
+            };
+            (name.as_str().to_string(), v)
+        })
+        .collect()
+}
+
+/// The proxy→API request half, captured at dispatch for raw-io's 4-payload
+/// viewer (UI-8). Built ONLY on the translate path (codex/grok — the proxy
+/// rewrites the payload there) and only while capture is enabled; the claude
+/// passthrough forwards the client's bytes verbatim, so it stays `None` and
+/// the raw viewer renders 2 payloads. Headers arrive pre-redacted; the `Bytes`
+/// body clone is refcounted (cheap).
+struct UpstreamMeta {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+}
+
+impl UpstreamMeta {
+    /// Join this request half with the upstream RESPONSE half observed at the
+    /// terminal capture point. `response_body` must already be bounded
+    /// (`raw_io::bounded_body` / `bounded_body_streamed`).
+    fn into_raw(
+        self,
+        max_body_bytes: usize,
+        response_body: Option<String>,
+        response_headers: Option<Vec<(String, String)>>,
+    ) -> crate::proxy::raw_io::UpstreamRaw {
+        crate::proxy::raw_io::UpstreamRaw {
+            url: Some(self.url),
+            request_body: Some(crate::proxy::raw_io::bounded_body(
+                &self.body,
+                max_body_bytes,
+            )),
+            request_headers: Some(self.headers),
+            response_body,
+            response_headers,
+        }
+    }
 }
 
 fn body_excerpt(body: &[u8]) -> String {
@@ -342,6 +582,20 @@ async fn upstream_error_detail(response: reqwest::Response) -> String {
 fn condense_error_body(body: &[u8]) -> String {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(err) = v.get("error") {
+            // xAI/grok error shape: `error` is a plain STRING (optionally
+            // beside a `code`), e.g. `{"code":"subscription:free-usage-
+            // exhausted","error":"You have exhausted…"}`. Preserve both —
+            // the grok 429 marker match reads this condensed detail
+            // (live receipt 2026-07-14: collapsing it to "error" made
+            // free-usage-exhausted invisible and the 24h park unreachable).
+            if let Some(msg) = err.as_str() {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                return if code.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{code}: {msg}")
+                };
+            }
             let ty = err.get("type").and_then(|t| t.as_str()).unwrap_or("error");
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
             return if msg.is_empty() {
@@ -392,15 +646,16 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     response
 }
 
-/// Pool exhausted: 429 + `retry-after` = soonest reset (FR3.5).
-fn exhausted_response(retry_after: Option<Duration>, accounts: usize) -> Response {
+/// Pool exhausted: 429 + `retry-after` = soonest reset (FR3.5). `eligible` is
+/// the in-scope account count — never the whole multi-group pool (issue #71).
+fn exhausted_response(retry_after: Option<Duration>, eligible: usize) -> Response {
     let secs = retry_after
         .map(|d| d.as_secs().max(1))
         .unwrap_or(DEFAULT_CLIENT_RETRY_AFTER_SECS);
     let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
-        &format!("All {accounts} accounts are rate-limited right now; retry in {secs}s."),
+        &format!("All {eligible} eligible accounts are rate-limited right now; retry in {secs}s."),
     );
     if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -442,11 +697,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| parts.uri.path().to_string());
-    state.emit(ActivityEvent::RequestStarted {
-        id: activity_id,
-        method: parts.method.to_string(),
-        path: path_query.clone(),
-    });
+    // NOTE: RequestStarted is emitted AFTER the body is buffered + classified
+    // (below), not here, so the in-flight row carries its `kind` column and
+    // lines up with completed rows (TUI UI-6 item 1). Safe: a body-read failure
+    // early-returns with only a RequestFinished (which renders complete on its
+    // own), so no start is ever left dangling.
     let body = match axum::body::to_bytes(body, state.config.proxy.max_request_bytes).await {
         Ok(body) => body,
         Err(err) => {
@@ -481,8 +736,15 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 group: None,
                 model: None,
                 effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
                 // Body never read → no metering identity; metered as unknown.
                 user_id: None,
+                kind: None,
+                excerpt: None,
             });
             return error_response(status, error_type, &message);
         }
@@ -495,11 +757,26 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Keyless per-client metering identity (issue #32): parsed once from the
     // buffered body, same pattern as `model`. Counting only — never routes.
     let user_id = crate::routing::user_id_from_body(&body);
-    let group = if state.config.routing.enabled {
+    // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
+    // pattern; rides the RequestFinished event for the activity feed.
+    let classified = crate::proxy::classify::classify(&path_query, &body);
+    let group = if state
+        .settings_live
+        .routing_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         Some(state.classifier.classify(model.as_deref()))
     } else {
         None
     };
+    // Now that the body is classified, announce the in-flight row WITH its kind
+    // so its `kind` column aligns with the completed rows (TUI UI-6 item 1).
+    state.emit(ActivityEvent::RequestStarted {
+        id: activity_id,
+        method: parts.method.to_string(),
+        path: path_query.clone(),
+        kind: Some(classified.kind.to_string()),
+    });
     let mut ctx = ForwardContext {
         method: parts.method,
         path_query,
@@ -514,10 +791,13 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         sections: Vec::new(),
         activity_id,
         started,
+        dispatched: None,
         model,
         user_id,
+        kind: Some(classified.kind.to_string()),
+        excerpt: classified.excerpt,
         group,
-        served_codex: None,
+        served_by: None,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -533,17 +813,49 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     let params = state.select_params();
     let snapshot = state.pool.snapshot();
     let accounts = snapshot.accounts.len();
-    let max_switches = accounts.max(1);
+    // Claude Code's per-session "quota" status ping (classify kind `quota`)
+    // gets ONE attempt, no pool sweep and no grace park (Z 2026-07-15,
+    // startup-set bug): the ratelimit headers it wants are per-account anyway,
+    // so failing over 9 accounts for a status probe only fanned one client
+    // ping into a 429 row per account on every session start.
+    let status_probe = ctx.kind.as_deref() == Some("quota");
+    let max_switches = if status_probe { 0 } else { accounts.max(1) };
     let mut switches = 0usize;
     let mut same_account_waits = 0u32;
+    // In-request grace parks when the pool is only cooldown-blocked and
+    // recovery is imminent (issue #71 F5): each park waits out the soonest
+    // cooldown (at most MAX_EXHAUST_PARK) and a request may park REPEATEDLY —
+    // an org-level 429 burst frees accounts one by one, so a single park wakes
+    // into a still-parked pool (2026-07-10 incident). The accumulated parked
+    // time is capped by EXHAUST_PARK_BUDGET; past it (or when recovery is not
+    // imminent) the request takes the deliberate transient-502 fallback below.
+    let mut exhaust_parked = Duration::ZERO;
+    let mut exhaust_parks = 0u32;
     // Accounts already granted their one forced post-401 refresh.
     let mut force_refreshed: HashSet<AccountId> = HashSet::new();
+    // Accounts this request has hit with a retry-after-LESS 429 (the None
+    // branch below). When this set covers every leasable candidate the request
+    // has swept the whole pool and must pace, not hammer (2026-07-13 incident;
+    // see `should_park_swept`). Only retry-after-less 429s populate it —
+    // retry-after 429s and other errors are unrelated.
+    let mut swept: HashSet<AccountId> = HashSet::new();
 
     // Resolve the effective routing group, applying `on_empty_group` when the
     // model's group has no configured account. `None` = legacy path.
     let group = match resolve_group(state, ctx, &snapshot) {
         Ok(group) => group,
         Err(response) => return *response,
+    };
+
+    // Fable-scope classification of this request (fable-usage W2): a Fable
+    // request is additionally gated by an account's Fable-scoped cooldown /
+    // preemptive Fable-critical exclusion, so a Fable-exhausted account is
+    // skipped for Fable while it keeps serving non-Fable traffic. Non-Fable
+    // requests ignore all Fable-scoped state (unchanged behavior).
+    let scope = if crate::routing::is_fable_model(ctx.model.as_deref()) {
+        select::RequestScope::Fable
+    } else {
+        select::RequestScope::NonFable
     };
 
     // On-demand idle probe (issue #21): real traffic to this group is the
@@ -556,18 +868,83 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     loop {
         // 1. Lease the current account for the group (evaluate on demand when
         // none).
-        let lease = match acquire_lease(state, group, &params) {
-            Ok(lease) => lease,
-            Err(retry_after) => {
-                ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
-                ctx.flush_log(state);
-                state.emit(ActivityEvent::Error {
-                    context: Some("scheduler".into()),
-                    message: format!("all {accounts} accounts exhausted"),
-                });
-                ctx.emit_finished(state, None, StatusCode::TOO_MANY_REQUESTS, None);
-                return exhausted_response(retry_after, accounts);
+        let lease = match acquire_lease(state, group, &params, scope) {
+            Ok(lease) => {
+                // Forensics for the multi-park path: one quiet line per park
+                // episode when the pool recovered after grace park(s) — never
+                // one line per park.
+                if exhaust_parks > 0 {
+                    tracing::debug!(
+                        parks = exhaust_parks,
+                        parked_ms = exhaust_parked.as_millis() as u64,
+                        "pool recovered after in-request exhaustion grace park(s)"
+                    );
+                    // Reset the episode counter (not the budget) so a later
+                    // fallback logs only its own episode.
+                    exhaust_parks = 0;
+                }
+                lease
             }
+            Err(info) => match info.kind {
+                select::ExhaustionKind::CooldownBlocked {
+                    min_expiry,
+                    upstream_mandated: false,
+                } => {
+                    // Transient park, NOT quota exhaustion: the pool recovers
+                    // in seconds. While recovery is imminent, wait it out
+                    // in-request (issue #71 F5) — repeatedly, because a burst
+                    // frees accounts one by one — accumulating parked time up
+                    // to EXHAUST_PARK_BUDGET. Budget spent or recovery not
+                    // imminent → the same transient 502 as the switch-cap
+                    // exit below, so the client retries promptly instead of
+                    // honoring a bogus half-hour retry-after. A status probe
+                    // never parks — the harness wants an answer now, not in
+                    // ~5s, and it retries on its own cadence anyway.
+                    if !status_probe && should_park_exhausted(min_expiry, exhaust_parked) {
+                        exhaust_parked += min_expiry;
+                        exhaust_parks += 1;
+                        tokio::time::sleep(min_expiry).await;
+                        continue;
+                    }
+                    if exhaust_parks > 0 {
+                        tracing::info!(
+                            parks = exhaust_parks,
+                            parked_ms = exhaust_parked.as_millis() as u64,
+                            "exhaustion grace parks did not outlast the burst; answering transient 502"
+                        );
+                    }
+                    ctx.log(
+                        "=== ERROR ===\nall eligible accounts transiently rate-limited".to_string(),
+                    );
+                    ctx.flush_log(state);
+                    state.emit(ActivityEvent::Error {
+                        context: Some("scheduler".into()),
+                        message: format!(
+                            "{} eligible account(s) transiently rate-limited; recovers in ~{}s",
+                            info.eligible,
+                            min_expiry.as_secs().max(1)
+                        ),
+                    });
+                    ctx.emit_finished(state, None, StatusCode::BAD_GATEWAY, None);
+                    return transient_response(
+                        "upstream is temporarily rate-limiting (not a usage limit)",
+                    );
+                }
+                _ => {
+                    // Real exhaustion (quota windows) or upstream-mandated
+                    // retry-after parks: a 429 carrying the honest wait —
+                    // `info.retry_after` is the min park expiry for mandated
+                    // parks, the soonest window reset otherwise.
+                    ctx.log("=== ERROR ===\nall accounts exhausted".to_string());
+                    ctx.flush_log(state);
+                    state.emit(ActivityEvent::Error {
+                        context: Some("scheduler".into()),
+                        message: format!("all {} in-scope account(s) exhausted", info.eligible),
+                    });
+                    ctx.emit_finished(state, None, StatusCode::TOO_MANY_REQUESTS, None);
+                    return exhausted_response(info.retry_after, info.eligible);
+                }
+            },
         };
         let account = lease.account_id().clone();
         let mut credential = lease.credential().clone();
@@ -609,18 +986,35 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             group.map(|g| g.as_str()).unwrap_or("legacy"),
             account,
         );
-        // Served (group, model) for in-flight model attribution (req11): codex
-        // → the configured upstream model; claude → the inbound model. Mirrors
-        // `finished_meta` so the in-flight row matches its eventual finish.
-        let (served_group, served_model) = match BackendGroup::from_kind(credential.kind()) {
-            BackendGroup::Codex => (Some("codex".to_string()), Some(state.codex.model())),
-            _ => (Some("claude".to_string()), ctx.model.clone()),
-        };
+        // Served (group, model, effort, fast) for in-flight attribution
+        // (req11): codex → the PER-REQUEST resolved upstream model + effective
+        // effort/fast; claude → the inbound model + client effort, never fast.
+        // Mirrors `finished_meta` so the in-flight row matches its eventual
+        // finish (same badge while running as when done).
+        let (served_group, served_model, served_effort, served_fast) =
+            match BackendGroup::from_kind(credential.kind()) {
+                BackendGroup::Codex => {
+                    let (model, effort, fast) = state.codex.request_meta(&ctx.body);
+                    (Some("codex".to_string()), Some(model), effort, fast)
+                }
+                BackendGroup::Grok => {
+                    let (model, effort) = state.grok.request_meta(&ctx.body);
+                    (Some("grok".to_string()), Some(model), effort, false)
+                }
+                BackendGroup::Claude => (
+                    Some("claude".to_string()),
+                    ctx.model.clone(),
+                    claude_effort(&ctx.body),
+                    false,
+                ),
+            };
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
             account: account.0.clone(),
             group: served_group,
             model: served_model,
+            effort: served_effort,
+            fast: served_fast,
         });
 
         // 2. Proactive refresh: oauth-style tokens (anthropic oauth AND
@@ -655,37 +1049,37 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 3. Codex accounts serve the Messages API only: count_tokens is
-        // answered locally with a naive estimate (no upstream equivalent);
-        // any other endpoint is a clear 501.
+        // 3. Translate-path accounts (codex, grok) serve the Messages API
+        // only: count_tokens is answered locally with a naive estimate (no
+        // upstream equivalent); any other endpoint is a clear 501.
         //
-        // With routing ON the codex path is driven by the request's GROUP
-        // (`group == Codex`) — which, by the invariant asserted above, always
-        // matches the leased credential's kind. With routing OFF (`group` is
-        // `None`) it falls back to the legacy credential check (codex stays
-        // the cross-group overflow pool).
-        let is_codex = match group {
-            Some(g) => g == BackendGroup::Codex,
-            None => matches!(credential, AccountCredential::Codex { .. }),
-        };
+        // With routing ON the translate path is driven by the request's GROUP
+        // — which, by the invariant asserted above, always matches the leased
+        // credential's kind. With routing OFF (`group` is `None`) it falls
+        // back to the legacy credential check (translate accounts stay the
+        // cross-group overflow pool).
+        let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
+        let is_translate = served != BackendGroup::Claude;
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
-        ctx.served_codex = Some(is_codex);
-        if is_codex {
+        ctx.served_by = Some(served);
+        if is_translate {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
                 drop(lease);
-                return codex_count_tokens_response(state, ctx, &account);
+                return translate_count_tokens_response(state, ctx, &account, served);
             }
             if path != "/v1/messages" {
                 drop(lease);
-                ctx.log(format!("=== ERROR ===\ncodex account cannot serve {path}"));
+                ctx.log(format!(
+                    "=== ERROR ===\n{served} account cannot serve {path}"
+                ));
                 ctx.flush_log(state);
                 ctx.emit_finished(state, Some(&account), StatusCode::NOT_IMPLEMENTED, None);
                 return error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "not_supported_error",
-                    &format!("codex accounts only serve /v1/messages (requested {path})"),
+                    &format!("{served} accounts only serve /v1/messages (requested {path})"),
                 );
             }
         }
@@ -701,14 +1095,25 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 &format!("request rewrite failed: {err}"),
             )
         };
-        // `Some(client_stream)` marks the codex transform path; `None` is the
-        // untouched byte-identity passthrough.
-        let mut codex_stream: Option<bool> = None;
-        let (upstream_req, endpoint) = if is_codex {
-            match state.codex.build_request(&ctx.body, &credential) {
-                Ok((req, client_stream)) => {
-                    codex_stream = Some(client_stream);
-                    (req, state.codex.endpoint().to_string())
+        // `Some(client_stream)` marks the translate (codex/grok) transform
+        // path; `None` is the untouched byte-identity passthrough.
+        let mut translate_stream: Option<bool> = None;
+        let (upstream_req, endpoint) = if is_translate {
+            let built = match served {
+                BackendGroup::Codex => state
+                    .codex
+                    .build_request(&ctx.body, &credential)
+                    .map(|out| (out, state.codex.endpoint().to_string())),
+                BackendGroup::Grok => state
+                    .grok
+                    .build_request(&ctx.body, &credential)
+                    .map(|out| (out, state.grok.endpoint().to_string())),
+                BackendGroup::Claude => unreachable!("is_translate excludes claude"),
+            };
+            match built {
+                Ok(((req, client_stream), endpoint)) => {
+                    translate_stream = Some(client_stream);
+                    (req, endpoint)
                 }
                 Err(err) => {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
@@ -724,6 +1129,21 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
             }
         };
+        // Raw-io 4-payload capture (UI-8): on the translate path the proxy
+        // REWRITES the payload, so the upstream request differs from the
+        // client's — keep the rewritten half for the raw viewer. The
+        // passthrough forwards the client's bytes verbatim → `None` (the
+        // 2-payload case). Built only when capture is on (`Bytes` clone is
+        // refcounted — cheap either way).
+        let upstream_meta = if is_translate && ctx.raw_io_path(state).is_some() {
+            Some(UpstreamMeta {
+                url: format!("{}{}", endpoint.trim_end_matches('/'), upstream_req.path),
+                headers: redacted_header_pairs(&upstream_req.headers),
+                body: upstream_req.body.clone(),
+            })
+        } else {
+            None
+        };
         if ctx.log_enabled {
             ctx.log(format!(
                 "=== REQUEST (account: {account}, switches: {switches}) ===\n{} {}{}\n{}",
@@ -733,6 +1153,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
+        ctx.dispatched = Some(std::time::Instant::now());
         let send_result = send_upstream(state, &endpoint, &upstream_req).await;
 
         let response = match send_result {
@@ -788,9 +1209,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // 5. Taxonomy.
         match classify(response.status(), response.headers()) {
             UpstreamSignal::Relay => {
-                return match codex_stream {
+                return match translate_stream {
                     Some(client_stream) => {
-                        relay_codex(state, ctx, lease, account, response, client_stream).await
+                        relay_translate(
+                            state,
+                            ctx,
+                            lease,
+                            account,
+                            response,
+                            client_stream,
+                            served,
+                            upstream_meta,
+                        )
+                        .await
                     }
                     None => relay(state, ctx, lease, account, response).await,
                 };
@@ -801,6 +1232,21 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 ctx.log(format!(
                     "=== RESPONSE 429 (retry-after: {retry_after:?}) ===\n{headers_log}\n{detail}"
                 ));
+                // Grok free-tier exhaustion (docs/grok/spec.md §R1, C9): no
+                // Retry-After header, but the body names the rolling 24h
+                // window. Header wins when present (unchanged path); the
+                // marker parks with an ESTIMATED probe-not-before — the true
+                // reset time is unknowable from the 429.
+                let retry_after = match retry_after {
+                    None if served == BackendGroup::Grok && grok_free_usage_exhausted(&detail) => {
+                        tracing::info!(
+                            account = %account,
+                            "grok free usage exhausted; parking ~24h (estimated rolling window)"
+                        );
+                        Some(GROK_FREE_USAGE_COOLDOWN)
+                    }
+                    other => other,
+                };
                 let retry_note = match retry_after {
                     Some(d) => format!(" · retry-after {}s", d.as_secs()),
                     None => String::new(),
@@ -823,15 +1269,27 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     Some(wait) => {
                         // Real rate limit with explicit timing: park exactly
                         // that long, switch. Exhaustion here is a genuine "no
-                        // quota" 429 → tell the client when to come back.
-                        state
-                            .pool
-                            .record_429(&account, Some(wait), SystemTime::now());
+                        // quota" 429 → tell the client when to come back. A
+                        // retry-after 429 still parks account-wide (W2), whether
+                        // or not the request was Fable.
+                        state.pool.record_429_classified(
+                            &account,
+                            Some(wait),
+                            ctx.model.as_deref(),
+                            SystemTime::now(),
+                        );
                         drop(lease);
                         switches += 1;
                         if switches > max_switches {
-                            let retry =
-                                select::soonest_reset(&state.pool.snapshot(), SystemTime::now());
+                            let snapshot = state.pool.snapshot();
+                            let now = SystemTime::now();
+                            let retry = select::soonest_reset(&snapshot, now);
+                            // Honest count: these parks are upstream-mandated
+                            // (retry-after present), so the 429 stands — but
+                            // the message speaks for the in-scope accounts,
+                            // not the whole multi-group pool.
+                            let (_, eligible) =
+                                select::classify_exhaustion(&snapshot, &params, group, scope, now);
                             ctx.flush_log(state);
                             ctx.emit_finished(
                                 state,
@@ -839,18 +1297,136 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                                 StatusCode::TOO_MANY_REQUESTS,
                                 None,
                             );
-                            return exhausted_response(retry, accounts);
+                            return exhausted_response(retry, eligible.max(1));
                         }
                         continue;
                     }
                     None => {
-                        // No retry-after = transient, server-side limit (not the
-                        // account's quota). Brief self-healing park, switch. If
-                        // EVERY account is momentarily limited, return a
-                        // transient 502 so the client retries promptly — never a
-                        // long "quota exhausted" park on a server-side blip.
-                        state.pool.record_429(&account, None, SystemTime::now());
+                        // No retry-after = transient/scope-blind limit (not
+                        // necessarily the account's whole quota). Scope-aware
+                        // classification (W2): a Fable request parks ONLY the
+                        // Fable scope (account keeps serving non-Fable) unless
+                        // the 5h/7d windows corroborate; a non-Fable request
+                        // parks account-wide as before. If EVERY account is
+                        // momentarily limited, return a transient 502 so the
+                        // client retries promptly — never a long "quota
+                        // exhausted" park on a server-side blip.
+                        let reason = state.pool.record_429_classified(
+                            &account,
+                            None,
+                            ctx.model.as_deref(),
+                            SystemTime::now(),
+                        );
+                        tracing::debug!(
+                            account = %account,
+                            model = ctx.model.as_deref().unwrap_or("<none>"),
+                            ?reason,
+                            "recorded scope-aware 429 cooldown"
+                        );
                         drop(lease);
+                        // Sweep-detect (2026-07-13T23:01Z incident): a
+                        // retry-after-less 429 records a Heuristic cooldown, but
+                        // `heuristic_degraded_mode` leases straight through it, so
+                        // the pool never goes Exhausted and #83's grace-park path
+                        // is unreachable for a non-Fable burst — the request just
+                        // hammers every account with no sleep. Count the accounts
+                        // this request could still lease (ignoring the transient
+                        // heuristic cooldowns it is recording); once we have swept
+                        // all of them, pace on the heuristic cooldown instead of
+                        // burning the switch budget.
+                        swept.insert(account.clone());
+                        let sweep_snapshot = state.pool.snapshot();
+                        let sweep_now = SystemTime::now();
+                        // The bug is specific to an ACCOUNT-WIDE heuristic lockout:
+                        // only then does `heuristic_degraded_mode` keep leasing
+                        // through the cooldowns so the pool never exhausts. A Fable
+                        // request records a MODEL-SCOPED cooldown and leaves the
+                        // account-wide state eligible (mod.rs record_429_classified),
+                        // so it does NOT enter heuristic-degraded mode and is handled
+                        // by the #83 CooldownBlocked path above — don't hijack it.
+                        // Candidate count then confirms EVERY leasable account was
+                        // actually swept (an account another request already parked
+                        // is still leasable in degraded mode, so must be probed too).
+                        let candidates = select::degraded_candidate_count(
+                            &sweep_snapshot,
+                            &params,
+                            group,
+                            scope,
+                            sweep_now,
+                        );
+                        // Deliberately a CARDINALITY compare (`swept.len() >=
+                        // candidates`), not a set-inclusion check that `swept`
+                        // ⊇ the exact candidate ids. When the guard holds,
+                        // heuristic-degraded mode is active, which by its own
+                        // definition means every in-scope candidate is CURRENTLY
+                        // heuristic-parked — evidence the burst is org-level, not
+                        // one bad account. At that point WHO did the parking is
+                        // irrelevant to the decision (this request or a sibling
+                        // under the same burst); all that matters is that the
+                        // whole candidate pool is transiently down. The only way
+                        // cardinality and true membership disagree is if a
+                        // candidate churned in/out between the per-429 snapshots
+                        // (a sibling recovers/parks an account mid-sweep); the
+                        // worst case is one unnecessary park (~8s) — strictly the
+                        // safe side (pace, never hammer), and self-correcting on
+                        // the next probe. A membership check would instead risk
+                        // MISSING completion under churn and resume hammering.
+                        let swept_whole_pool = select::heuristic_degraded_mode(
+                            &sweep_snapshot,
+                            &params,
+                            group,
+                            sweep_now,
+                        ) && swept.len() >= candidates.max(1);
+                        if swept_whole_pool {
+                            if should_park_swept(exhaust_parked) {
+                                let park = DEFAULT_HEURISTIC_COOLDOWN;
+                                exhaust_parked += park;
+                                exhaust_parks += 1;
+                                // Reset the switch counter: the post-park reprobe
+                                // is a fresh attempt at a (hopefully) recovered
+                                // pool, not another hop in the sweep. Without this
+                                // the reprobe trips `switches > max_switches` and
+                                // 502s the very request we parked to rescue.
+                                switches = 0;
+                                tracing::info!(
+                                    parks = exhaust_parks,
+                                    parked_ms = exhaust_parked.as_millis() as u64,
+                                    candidates,
+                                    "429 burst swept every in-scope account; pacing on heuristic cooldown before reprobe"
+                                );
+                                tokio::time::sleep(park).await;
+                                // Keep `swept` intact: if the reprobe 429s again
+                                // the burst is still on and we re-detect the
+                                // completed sweep immediately (re-park within
+                                // budget, else the 502 below).
+                                continue;
+                            }
+                            // Budget spent: stop paying for parks and hand back the
+                            // same deliberate transient 502 as the #83 cooldown
+                            // path, so the client retries promptly instead of
+                            // honoring a bogus quota-exhausted wait.
+                            tracing::info!(
+                                parks = exhaust_parks,
+                                parked_ms = exhaust_parked.as_millis() as u64,
+                                "429-burst sweep parks did not outlast the burst; answering transient 502"
+                            );
+                            ctx.log(
+                                "=== ERROR ===\nall eligible accounts transiently rate-limited"
+                                    .to_string(),
+                            );
+                            ctx.flush_log(state);
+                            state.emit(ActivityEvent::Error {
+                                context: Some("scheduler".into()),
+                                message: format!(
+                                    "{} eligible account(s) transiently rate-limited",
+                                    candidates.max(1)
+                                ),
+                            });
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            return transient_response(
+                                "upstream is temporarily rate-limiting (not a usage limit)",
+                            );
+                        }
                         switches += 1;
                         if switches > max_switches {
                             ctx.flush_log(state);
@@ -967,14 +1543,26 @@ fn reevaluate_if_current_ineligible(
     }
 }
 
+/// Why `acquire_lease` failed, for the client-facing failure mode (issue
+/// #71): a transient cooldown park must never be answered with a
+/// window-reset-scale `retry-after`.
+#[derive(Debug)]
+struct ExhaustInfo {
+    retry_after: Option<Duration>,
+    kind: select::ExhaustionKind,
+    eligible: usize,
+}
+
 /// Lease the current account for `group`; when that fails, run one selection
-/// pass and try once more. `Err` carries the soonest-reset hint for the
-/// client 429.
+/// pass and try once more. `Err` carries why the pool is exhausted plus the
+/// honest recovery hint (seconds for a cooldown park, window reset for real
+/// exhaustion).
 fn acquire_lease(
     state: &AppState,
     group: Option<BackendGroup>,
     params: &crate::scheduler::select::SelectParams,
-) -> Result<crate::scheduler::AccountLease, Option<Duration>> {
+    scope: select::RequestScope,
+) -> Result<crate::scheduler::AccountLease, ExhaustInfo> {
     let now = SystemTime::now();
     // Heuristic-degraded selection MUST go through `pick`, not the sticky
     // fast-path. `lease_for` deliberately ignores the 5h/7d ceilings for the
@@ -988,16 +1576,38 @@ fn acquire_lease(
         select::heuristic_degraded_mode(&snapshot, params, group, now)
     };
     if !degraded {
-        if let Ok(lease) = state.pool.lease_for(group, params) {
+        // Scope-aware lease: a Fable request refuses a Fable-dead sticky current
+        // (Fable cooldown / preemptive exclusion) and falls through to a
+        // scope-aware selection pass below; non-Fable is the sticky fast-path.
+        if let Ok(lease) = state.pool.lease_for_scoped(group, params, scope) {
             return Ok(lease);
         }
     }
-    match state.pool.evaluate(group, params, now) {
-        Decision::Exhausted { retry_after } => Err(retry_after),
+    match state.pool.evaluate_scoped(group, params, now, scope) {
+        Decision::Exhausted { retry_after } => {
+            // `Decision::Exhausted` predates the reason split; classify on a
+            // fresh snapshot so a cooldown park answers with its own expiry.
+            let snapshot = state.pool.snapshot();
+            let (kind, eligible) =
+                select::classify_exhaustion(&snapshot, params, group, scope, SystemTime::now());
+            let retry_after = match kind {
+                select::ExhaustionKind::CooldownBlocked { min_expiry, .. } => Some(min_expiry),
+                select::ExhaustionKind::WindowBlocked => retry_after,
+            };
+            Err(ExhaustInfo {
+                retry_after,
+                kind,
+                eligible,
+            })
+        }
         Decision::Stay | Decision::Switch { .. } => state
             .pool
-            .lease_for(group, params)
-            .map_err(|err| err.retry_after),
+            .lease_for_scoped(group, params, scope)
+            .map_err(|err| ExhaustInfo {
+                retry_after: err.retry_after,
+                kind: err.kind,
+                eligible: err.eligible,
+            }),
     }
 }
 
@@ -1029,30 +1639,35 @@ fn resolve_group(
         .on_empty_group
         .eq_ignore_ascii_case("fallback")
     {
-        let other = match group {
-            BackendGroup::Claude => BackendGroup::Codex,
-            BackendGroup::Codex => BackendGroup::Claude,
-        };
-        if has_account(other) {
-            tracing::info!(
-                model, from = %group, to = %other,
-                "routing: matched group empty; on_empty_group=fallback → other group"
-            );
-            return Ok(Some(other));
+        // Fixed fallback scan order Claude → Codex → Grok (spec §R5, C2b):
+        // the first OTHER group with ≥1 configured account serves the
+        // request under its own provider semantics.
+        for &other in BackendGroup::ALL {
+            if other == group {
+                continue;
+            }
+            if has_account(other) {
+                tracing::info!(
+                    model, from = %group, to = %other,
+                    "routing: matched group empty; on_empty_group=fallback → other group"
+                );
+                return Ok(Some(other));
+            }
         }
-        // Neither group has an account — fall through to the 404.
+        // No group has an account — fall through to the 404.
     }
     let message = format!("no {group} account configured for model {model}");
     tracing::warn!(model, %group, "routing: {message}");
     Err(Box::new(not_found_response(&message)))
 }
 
-/// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth` and
-/// `Codex` both rotate access tokens; `Apikey` never expires.
+/// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth`,
+/// `Codex`, and `Grok` all rotate access tokens; `Apikey` never expires.
 fn refreshable_expiry(credential: &AccountCredential) -> Option<u64> {
     match credential {
         AccountCredential::Oauth { expires_at_ms, .. }
-        | AccountCredential::Codex { expires_at_ms, .. } => Some(*expires_at_ms),
+        | AccountCredential::Codex { expires_at_ms, .. }
+        | AccountCredential::Grok { expires_at_ms, .. } => Some(*expires_at_ms),
         AccountCredential::Apikey { .. } => None,
     }
 }
@@ -1108,6 +1723,16 @@ pub(crate) async fn refresh_credential(
             )
             .await
         }
+        AccountCredential::Grok {
+            refresh_token,
+            token_endpoint,
+            ..
+        } => {
+            // Grok refreshes hit the token endpoint persisted at login
+            // (OIDC-discovered; re-discovered inside when blank). Same
+            // no-coalescer rationale as codex (C8).
+            crate::auth::grok::refresh_grok_at(&state.client, token_endpoint, refresh_token).await
+        }
         AccountCredential::Apikey { .. } => return RefreshOutcome::Failed,
     };
     match outcome {
@@ -1151,6 +1776,25 @@ pub(crate) async fn refresh_credential(
                         last_refresh_ms: Some(refreshed_at_ms),
                     },
                     non_empty_or(account_id, &account.0),
+                ),
+                AccountCredential::Grok {
+                    subject,
+                    refresh_token,
+                    token_endpoint,
+                    ..
+                } => (
+                    AccountCredential::Grok {
+                        subject: subject.clone(),
+                        access_token: tokens.access_token.clone(),
+                        refresh_token: tokens
+                            .refresh_token
+                            .clone()
+                            .unwrap_or_else(|| refresh_token.clone()),
+                        expires_at_ms: tokens.expires_at_ms,
+                        token_endpoint: token_endpoint.clone(),
+                        last_refresh_ms: Some(refreshed_at_ms),
+                    },
+                    non_empty_or(subject, &account.0),
                 ),
                 AccountCredential::Apikey { .. } => unreachable!("filtered above"),
             };
@@ -1306,8 +1950,16 @@ async fn relay(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
-        let (group, model, effort) = ctx.finished_meta(state);
+        let dispatched = ctx.dispatched.unwrap_or(started);
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let kind = ctx.kind.clone();
+        let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
         // body + a tee of the bytes streamed to the client. The relay keeps TWO
         // observe-only buffers, both filled AFTER each chunk is forwarded (never
@@ -1321,6 +1973,12 @@ async fn relay(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        let raw_io_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&headers));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
@@ -1329,7 +1987,15 @@ async fn relay(
             BODY_LOG_LIMIT,
             raw_io_max_body,
             std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
-            move |usage, captured, raw_captured, error| {
+            move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
+                // Provider failure = transport break OR a protocol-level SSE
+                // `error` event (arrives under a clean HTTP 200).
+                let upstream_error = provider_failure(
+                    timing.client_gone,
+                    error.is_some(),
+                    false,
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
@@ -1342,10 +2008,14 @@ async fn relay(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(status.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
+                    None, // byte-identity passthrough — client IS the upstream exchange
                 );
                 if log_enabled {
                     sections.push(format!(
@@ -1372,7 +2042,16 @@ async fn relay(
                         group,
                         model,
                         effort,
+                        fast: Some(fast),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        // Fixed INSIDE the pump at upstream EOF — finish-side
+                        // raw-io/log work never inflates the span.
+                        gen_ms: timing.gen_ms(),
+                        aborted: upstream_error,
                         user_id,
+                        kind,
+                        excerpt,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -1404,7 +2083,9 @@ async fn relay(
         ctx.flush_log(state);
         // Raw-io capture (Feature B): the full non-streaming body, already
         // materialized to relay it — no extra read, no hot-path effect.
-        ctx.capture_raw_io(state, Some(&account), status, &bytes);
+        // Byte-identity passthrough: client and upstream exchange are the same
+        // bytes → no separate upstream half (2-payload case).
+        ctx.capture_raw_io(state, Some(&account), status, &bytes, Some(&headers), None);
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
@@ -1424,16 +2105,17 @@ async fn relay(
 /// "hung vs completed" question and no real upstream usage to record — the
 /// trace exists to diagnose the `/v1/messages` relay path. Tracing it would
 /// only add instant, usage-less noise to the file.
-fn codex_count_tokens_response(
+fn translate_count_tokens_response(
     state: &AppState,
     ctx: &mut ForwardContext,
     account: &AccountId,
+    served: BackendGroup,
 ) -> Response {
     let estimate = serde_json::from_slice::<serde_json::Value>(&ctx.body)
-        .map(|v| crate::provider::codex::estimate_input_tokens(&v))
+        .map(|v| crate::provider::responses::estimate_input_tokens(&v))
         .unwrap_or(1);
     ctx.log(format!(
-        "=== RESPONSE (codex count_tokens estimate: {estimate}) ==="
+        "=== RESPONSE ({served} count_tokens estimate: {estimate}) ==="
     ));
     ctx.flush_log(state);
     ctx.emit_finished(state, Some(account), StatusCode::OK, None);
@@ -1446,43 +2128,59 @@ fn codex_count_tokens_response(
     response
 }
 
-/// Terminal relay for a codex upstream response. Every request goes upstream
-/// with `stream: true`, so a 2xx from `/responses` IS a Responses SSE stream
-/// by contract — the real chatgpt.com backend sends streaming 200s with NO
-/// `content-type` header at all (live capture 2026-06-12), so sniffing the
-/// header would misclassify good streams. 2xx therefore always enters the
-/// transform path: converted to Anthropic SSE on the fly (streaming clients)
-/// or aggregated into one Messages JSON document (non-streaming clients); a
-/// 2xx body that is not actually SSE terminates with a clean Anthropic
-/// `error` event from the converter. Non-2xx bodies are wrapped into
-/// Anthropic error shapes — codex bytes are NEVER relayed verbatim (the
-/// client speaks the Anthropic wire format only).
-async fn relay_codex(
+/// Terminal relay for a translate-path (codex/grok) upstream response. Every
+/// request goes upstream with `stream: true`, so a 2xx from `/responses` IS a
+/// Responses SSE stream by contract — the real chatgpt.com backend sends
+/// streaming 200s with NO `content-type` header at all (live capture
+/// 2026-06-12), so sniffing the header would misclassify good streams. 2xx
+/// therefore always enters the transform path: converted to Anthropic SSE on
+/// the fly (streaming clients) or aggregated into one Messages JSON document
+/// (non-streaming clients); a 2xx body that is not actually SSE terminates
+/// with a clean Anthropic `error` event from the converter. Non-2xx bodies
+/// are wrapped into Anthropic error shapes — upstream bytes are NEVER relayed
+/// verbatim (the client speaks the Anthropic wire format only).
+#[allow(clippy::too_many_arguments)]
+async fn relay_translate(
     state: &AppState,
     ctx: &mut ForwardContext,
     lease: crate::scheduler::AccountLease,
     account: AccountId,
     response: reqwest::Response,
     client_stream: bool,
+    served: BackendGroup,
+    upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
     let status = response.status();
-    // Codex trace (best-effort): input breakdown captured now from the inbound
-    // body, terminal outcome written at each return below. `model` is what the
-    // request is served as (codex's configured model).
+    // Request trace (best-effort): input breakdown captured now from the
+    // inbound body, terminal outcome written at each return below. `model` is
+    // what the request is served as (the per-request resolved upstream
+    // model). Grok rides the same trace file as codex (model field
+    // identifies the provider).
+    let (trace_enabled, trace_model) = match served {
+        BackendGroup::Grok => (
+            state.config.grok.trace,
+            state.grok.request_meta(&ctx.body).0,
+        ),
+        _ => (
+            state.config.codex.trace,
+            state.codex.request_meta(&ctx.body).0,
+        ),
+    };
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
-        state.config.codex.trace,
+        trace_enabled,
         ctx.activity_id,
         &ctx.path_query,
-        Some(state.codex.model()),
+        Some(trace_model),
         &ctx.body,
     );
     ctx.log(format!(
-        "=== RESPONSE {status} (codex) ===\n{}",
+        "=== RESPONSE {status} ({served}) ===\n{}",
         format_headers(response.headers())
     ));
     if !status.is_success() {
         // classify() already diverted 401/429/5xx; what lands here is a 4xx
         // error body — wrapped into an Anthropic-shaped error.
+        let error_headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap_or_default();
         ctx.log(format!(
             "=== RESPONSE BODY ({} bytes) ===\n{}",
@@ -1496,26 +2194,61 @@ async fn relay_codex(
             (status, "api_error")
         };
         trace.write_error(
-            &format!("codex upstream {out_status}: {}", body_excerpt(&bytes)),
+            &format!("{served} upstream {out_status}: {}", body_excerpt(&bytes)),
             0,
             ctx.started.elapsed().as_millis(),
         );
-        // Raw-io capture: request + the upstream error body (already read).
-        ctx.capture_raw_io(state, Some(&account), out_status, &bytes);
+        // Raw-io 4-payload capture: the CLIENT leg is the Anthropic-shaped
+        // error the client actually receives (built once below and returned),
+        // NOT the provider's verbatim bytes — those are the exchange llmux
+        // never forwards. The upstream half carries the rewritten request +
+        // the provider's real error reply.
+        let max_body = state.config.raw_io.max_body_bytes;
+        let upstream_raw = upstream_meta.map(|m| {
+            m.into_raw(
+                max_body,
+                Some(crate::proxy::raw_io::bounded_body(&bytes, max_body)),
+                Some(redacted_header_pairs(&error_headers)),
+            )
+        });
+        let client_message = format!("{served} upstream: {}", body_excerpt(&bytes));
+        let client_json = serde_json::json!({
+            "type": "error",
+            "error": { "type": error_type, "message": client_message },
+        })
+        .to_string();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        ctx.capture_raw_io(
+            state,
+            Some(&account),
+            out_status,
+            client_json.as_bytes(),
+            Some(&client_headers),
+            upstream_raw,
+        );
         ctx.emit_finished(state, Some(&account), out_status, None);
         drop(lease);
-        return error_response(
-            out_status,
-            error_type,
-            &format!("codex upstream: {}", body_excerpt(&bytes)),
+        let mut client_error = Response::new(axum::body::Body::from(client_json));
+        *client_error.status_mut() = out_status;
+        client_error.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
         );
+        return client_error;
     }
 
     if client_stream {
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
-        let converter = state.codex.converter();
+        let converter = match served {
+            BackendGroup::Grok => state.grok.converter(),
+            _ => state.codex.converter(),
+        };
         let totals = state.totals.clone();
         let logger = state.logger.clone();
         let request_id = ctx.request_id;
@@ -1526,8 +2259,16 @@ async fn relay_codex(
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
         let started = ctx.started;
-        let (group, model, effort) = ctx.finished_meta(state);
+        let dispatched = ctx.dispatched.unwrap_or(started);
+        let FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
+        } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let kind = ctx.kind.clone();
+        let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
         // body + a tee of the Anthropic-SSE bytes EMITTED to the client. The
         // relay keeps TWO observe-only buffers, both filled after each chunk is
@@ -1540,20 +2281,73 @@ async fn relay_codex(
             .as_ref()
             .map(|_| ctx.body.clone())
             .unwrap_or_default();
+        let raw_io_req_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(&ctx.headers));
+        // 4-payload split (UI-8): the transform relay synthesizes its own SSE
+        // response, so the CLIENT response headers are the synthesized ones
+        // (mirroring what `out` sets below); the upstream's real headers
+        // (request ids, ratelimits) ride in the record's `upstream` half.
+        let raw_io_res_headers = raw_io_path.as_ref().map(|_| {
+            vec![
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("cache-control".to_string(), "no-cache".to_string()),
+            ]
+        });
+        let raw_io_upstream_res_headers = raw_io_path
+            .as_ref()
+            .map(|_| redacted_header_pairs(response.headers()));
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        // With capture off, a 0 tee limit keeps the relay from copying (and
+        // pinning up to 2×max_body_bytes of) stream bytes that `finish` would
+        // only throw away (hotpath review).
+        let raw_io_tee_limit = if raw_io_path.is_some() {
+            raw_io_max_body
+        } else {
+            0
+        };
         let body = sse::transform_body(
             response,
             converter,
             BODY_LOG_LIMIT,
-            raw_io_max_body,
-            move |usage, captured, raw_captured, error, converter, client_gone| {
+            raw_io_tee_limit,
+            move |usage,
+                  captured,
+                  raw_captured,
+                  upstream_captured,
+                  error,
+                  converter,
+                  client_gone,
+                  timing: sse::StreamTiming| {
+                // Provider-health truth: a transport break, a converter-
+                // level protocol failure (codex/grok `response.failed` — the
+                // converter preserves its message), or an SSE `error` event
+                // is a provider failure even under a client-200.
+                let upstream_error = provider_failure(
+                    client_gone,
+                    error.is_some(),
+                    converter.error_message().is_some(),
+                    timing.saw_error_event,
+                );
                 totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
                 // `raw_captured` carries the bounded prefix + the total emitted
                 // length, so an over-cap body is marker-truncated accurately.
+                // The upstream half joins the rewritten request with the
+                // verbatim pre-transform reply tee (same bounded shape).
+                let upstream_raw = upstream_meta.map(|m| {
+                    m.into_raw(
+                        raw_io_max_body,
+                        Some(crate::proxy::raw_io::bounded_body_streamed(
+                            upstream_captured.bytes(),
+                            upstream_captured.total(),
+                        )),
+                        raw_io_upstream_res_headers,
+                    )
+                });
                 crate::proxy::raw_io::capture_streamed(
                     raw_io_path.as_deref(),
                     activity_id,
@@ -1561,10 +2355,14 @@ async fn relay_codex(
                     raw_io_model,
                     Some(account.0.clone()),
                     Some(StatusCode::OK.as_u16()),
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
                     &raw_io_request,
                     raw_captured.bytes(),
                     raw_captured.total(),
                     raw_io_max_body,
+                    raw_io_req_headers,
+                    raw_io_res_headers,
+                    upstream_raw,
                 );
                 // Codex trace: terminal outcome of the streamed request. A
                 // client disconnect mid-stream, an upstream stream error, or a
@@ -1584,7 +2382,7 @@ async fn relay_codex(
                 }
                 if log_enabled {
                     sections.push(format!(
-                        "=== RESPONSE BODY (codex→anthropic, first {} bytes) ===\n{}",
+                        "=== RESPONSE BODY (translate→anthropic, first {} bytes) ===\n{}",
                         captured.len(),
                         String::from_utf8_lossy(&captured)
                     ));
@@ -1607,7 +2405,14 @@ async fn relay_codex(
                         group,
                         model,
                         effort,
+                        fast: Some(fast),
+                        ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
+                        ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
+                        gen_ms: timing.gen_ms(),
+                        aborted: upstream_error,
                         user_id,
+                        kind,
+                        excerpt,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -1628,14 +2433,33 @@ async fn relay_codex(
     // Non-streaming client: consume the whole upstream stream through the
     // converter, then answer with the aggregated Messages JSON.
     use tokio_stream::StreamExt as _;
-    let mut converter = state.codex.converter();
+    let mut converter = match served {
+        BackendGroup::Grok => state.grok.converter(),
+        _ => state.codex.converter(),
+    };
+    // Cloned before `bytes_stream()` consumes the response — the aggregate
+    // raw-io capture below wants the upstream response headers.
+    let upstream_headers = response.headers().clone();
+    // Upstream tee (UI-8, 4-payload): the verbatim pre-transform reply, bounded
+    // like every other raw-io body. Only observed when capture is on.
+    let raw_io_max_body = state.config.raw_io.max_body_bytes;
+    let mut upstream_tee = ctx
+        .raw_io_path(state)
+        .is_some()
+        .then(|| sse::RawCapture::new(raw_io_max_body));
     let mut events = sse::EventBuffer::new();
+    let mut timing = sse::StreamTiming::default();
     let mut stream = Box::pin(response.bytes_stream());
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => {
+                timing.on_chunk();
+                if let Some(tee) = upstream_tee.as_mut() {
+                    tee.push(&chunk);
+                }
                 for event in events.push(&chunk) {
-                    let _ = converter.on_event(&event);
+                    let out = converter.on_event(&event);
+                    timing.on_payload(&out);
                 }
             }
             Err(err) => {
@@ -1653,8 +2477,10 @@ async fn relay_codex(
             }
         }
     }
+    timing.on_stream_end();
     if let Some(rest) = events.take_remainder() {
-        let _ = converter.on_event(&rest);
+        let out = converter.on_event(&rest);
+        timing.on_payload(&out);
     }
     let _ = converter.on_end();
     let usage = converter.usage();
@@ -1677,19 +2503,38 @@ async fn relay_codex(
                 trace_duration_ms,
             );
             // Raw-io capture: request + the aggregated Messages JSON the client
-            // receives.
+            // receives. Client response headers are the synthesized ones
+            // (mirroring `out` below); the upstream's real headers + verbatim
+            // pre-transform reply ride in the record's `upstream` half (UI-8).
             let message_bytes = message.to_string();
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let upstream_raw = upstream_meta.map(|m| {
+                m.into_raw(
+                    raw_io_max_body,
+                    upstream_tee.take().map(|tee| {
+                        crate::proxy::raw_io::bounded_body_streamed(tee.bytes(), tee.total())
+                    }),
+                    Some(redacted_header_pairs(&upstream_headers)),
+                )
+            });
             ctx.capture_raw_io(
                 state,
                 Some(&account),
                 StatusCode::OK,
                 message_bytes.as_bytes(),
+                Some(&client_headers),
+                upstream_raw,
             );
-            ctx.emit_finished(
+            ctx.emit_finished_timed(
                 state,
                 Some(&account),
                 StatusCode::OK,
                 Some(token_counts(usage)),
+                timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
             out.headers_mut().insert(
@@ -1710,6 +2555,28 @@ async fn relay_codex(
     ctx.flush_log(state);
     drop(lease);
     result
+}
+
+/// Whether a finished relay counts as a PROVIDER failure for perf accounting
+/// (the `aborted` flag): any upstream termination — transport break,
+/// converter-level protocol failure, or an SSE `error` event — but NEVER a
+/// client disconnect: when the client walked away, every downstream signal
+/// (including a converter truncation error) describes OUR cancellation, not
+/// the provider. Pure so the exact production decision is unit-testable.
+fn provider_failure(
+    client_gone: bool,
+    transport_error: bool,
+    converter_error: bool,
+    saw_error_event: bool,
+) -> bool {
+    !client_gone && (transport_error || converter_error || saw_error_event)
+}
+
+/// Millis from `start` to `at`, saturating (the pump's landmarks are always
+/// at-or-after the request start; clamp instead of panicking if clocks say
+/// otherwise).
+fn ms_since(start: std::time::Instant, at: std::time::Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Usage from a non-streaming JSON response body (`{"usage": {...}}`),
@@ -1761,11 +2628,234 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn redacted_header_pairs_hide_credentials_keep_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("x-api-key", HeaderValue::from_static("sk-secret"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let pairs = redacted_header_pairs(&headers);
+        let get = |n: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("content-type"), Some("application/json"));
+        assert_eq!(get("anthropic-version"), Some("2023-06-01"));
+        // Credential VALUES never reach the record; the names stay visible.
+        assert_eq!(get("x-api-key"), Some("•••redacted"));
+        assert_eq!(get("authorization"), Some("•••redacted"));
+        // The name heuristic fails SAFE on credential headers llmux does not
+        // (yet) receive — no silent persistence when a new backend shows up.
+        let mut extra = HeaderMap::new();
+        extra.insert("x-goog-api-key", HeaderValue::from_static("g-secret"));
+        extra.insert("x-amz-security-token", HeaderValue::from_static("a-tok"));
+        extra.insert("x-auth-token", HeaderValue::from_static("t"));
+        extra.insert("request-id", HeaderValue::from_static("req_1"));
+        let extra_pairs = redacted_header_pairs(&extra);
+        let get2 = |n: &str| {
+            extra_pairs
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get2("x-goog-api-key"), Some("•••redacted"));
+        assert_eq!(get2("x-amz-security-token"), Some("•••redacted"));
+        assert_eq!(get2("x-auth-token"), Some("•••redacted"));
+        assert_eq!(
+            get2("request-id"),
+            Some("req_1"),
+            "benign names stay visible"
+        );
+        assert!(pairs
+            .iter()
+            .all(|(_, v)| !v.contains("secret") && !v.contains("tok")));
+    }
     use crate::config::{AccountConfig, Config};
     use crate::proxy::server::AppState;
     use crate::scheduler::AccountPool;
 
     // ---- pure unit tests ----
+
+    fn grok_account(name: &str, token: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Grok {
+                subject: format!("sub-{name}"),
+                access_token: token.to_string(),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: far_future_ms(),
+                token_endpoint: "https://auth.x.ai/token".to_string(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    fn ctx_for_group(model: &str, group: BackendGroup) -> ForwardContext {
+        ForwardContext {
+            method: Method::POST,
+            path_query: "/v1/messages".to_string(),
+            headers: HeaderMap::new(),
+            body: Bytes::from(format!(r#"{{"model":"{model}","messages":[]}}"#)),
+            request_id: 0,
+            log_enabled: false,
+            sections: Vec::new(),
+            activity_id: 0,
+            started: std::time::Instant::now(),
+            dispatched: Some(std::time::Instant::now()),
+            model: Some(model.to_string()),
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            group: Some(group),
+            served_by: None,
+        }
+    }
+
+    // ---- C9: grok free-usage-exhausted marker ----
+    #[test]
+    fn c9_free_usage_marker_matches_code_and_message_forms() {
+        assert!(grok_free_usage_exhausted(
+            r#"{"code":"subscription:free-usage-exhausted"}"#
+        ));
+        assert!(grok_free_usage_exhausted(
+            "You have exhausted your included free usage."
+        ));
+        assert!(grok_free_usage_exhausted("FREE-USAGE-EXHAUSTED"));
+        assert!(!grok_free_usage_exhausted("rate limited, slow down"));
+        assert_eq!(GROK_FREE_USAGE_COOLDOWN, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn c9_marker_survives_the_real_condense_chain() {
+        // The live path matches on `upstream_error_detail`'s CONDENSED
+        // output, not the raw body — the xAI shape's string-valued `error`
+        // must survive condensation (live receipt 7, 2026-07-14: it did
+        // not, and the 24h park was unreachable).
+        let xai_429 = br#"{"code":"subscription:free-usage-exhausted","error":"You have exhausted your included free usage. Usage resets over a rolling 24-hour window."}"#;
+        let detail = condense_error_body(xai_429);
+        assert!(
+            detail.contains("free-usage-exhausted") && detail.contains("included free usage"),
+            "condensed detail keeps the marker: {detail}"
+        );
+        assert!(grok_free_usage_exhausted(&detail));
+        // Anthropic/codex object shape unchanged.
+        let anthropic = br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        assert_eq!(
+            condense_error_body(anthropic),
+            "rate_limit_error: slow down"
+        );
+    }
+
+    // ---- C2b: on_empty_group fallback fixed order + parked ≠ empty ----
+    #[test]
+    fn c2b_empty_grok_group_falls_back_in_fixed_order() {
+        // fallback configured, grok group EMPTY, claude + codex configured →
+        // Claude wins (first in the fixed order).
+        let mut config = Config {
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        };
+        config.routing.on_empty_group = "fallback".to_string();
+        config.proxy.idle_probe.enabled = false;
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        let resolved = resolve_group(&state, &ctx, &snapshot).expect("fallback resolves");
+        assert_eq!(
+            resolved,
+            Some(BackendGroup::Claude),
+            "fixed order: Claude first"
+        );
+    }
+
+    #[test]
+    fn c2b_empty_grok_group_errors_without_fallback() {
+        let mut config = Config {
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        };
+        config.routing.on_empty_group = "error".to_string();
+        config.proxy.idle_probe.enabled = false;
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        assert!(
+            resolve_group(&state, &ctx, &snapshot).is_err(),
+            "on_empty_group=error → 404"
+        );
+    }
+
+    #[test]
+    fn c2b_configured_grok_group_resolves_even_if_all_parked() {
+        // A grok account EXISTS → the group is not empty; resolve_group
+        // returns Grok regardless of park/limit state (parked ≠ empty —
+        // in-group all-limited behavior applies downstream, spec §R5).
+        let config = Config {
+            accounts: vec![oauth_account("a", "at-a"), grok_account("g", "at-g")],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        state.pool.record_429_classified(
+            &AccountId("g".into()),
+            Some(Duration::from_secs(86_400)),
+            Some("grok-4.5"),
+            SystemTime::now(),
+        );
+        let ctx = ctx_for_group("grok-4.5", BackendGroup::Grok);
+        let snapshot = state.pool.snapshot();
+        let resolved = resolve_group(&state, &ctx, &snapshot).expect("resolves");
+        assert_eq!(
+            resolved,
+            Some(BackendGroup::Grok),
+            "parked but configured stays in-group"
+        );
+    }
+
+    #[test]
+    fn claude_effort_prefers_output_config_then_thinking_budget() {
+        // The raw output_config.effort string is recorded verbatim.
+        assert_eq!(
+            claude_effort(br#"{"output_config":{"effort":"low"},"messages":[]}"#).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            claude_effort(br#"{"output_config":{"effort":"max"}}"#).as_deref(),
+            Some("max")
+        );
+        // Absent output_config → fall back to the extended-thinking budget.
+        assert_eq!(
+            claude_effort(br#"{"thinking":{"type":"enabled","budget_tokens":16000}}"#).as_deref(),
+            Some("16k")
+        );
+        // output_config wins over a thinking block when both are present.
+        assert_eq!(
+            claude_effort(
+                br#"{"output_config":{"effort":"high"},"thinking":{"type":"enabled","budget_tokens":16000}}"#
+            )
+            .as_deref(),
+            Some("high")
+        );
+        // Neither present, empty effort, or non-JSON → absent.
+        assert_eq!(claude_effort(br#"{"messages":[]}"#), None);
+        assert_eq!(claude_effort(br#"{"output_config":{"effort":"  "}}"#), None);
+        assert_eq!(claude_effort(b"not json"), None);
+    }
 
     fn oauth_credential(token: &str) -> AccountCredential {
         AccountCredential::Oauth {
@@ -2156,11 +3246,14 @@ mod tests {
     }
 
     fn test_state(upstream: &str, accounts: Vec<AccountConfig>) -> AppState {
-        let config = Config {
+        let mut config = Config {
             upstream: upstream.to_string(),
             accounts,
             ..Default::default()
         };
+        // Idle probing is always-on by default (#45); left enabled it would
+        // spawn background max_tokens=1 probes that race this test's upstream.
+        config.proxy.idle_probe.enabled = false;
         let pool = AccountPool::new(&config.accounts);
         let mut state = AppState::new(config, pool, None, None).expect("state");
         state.config_path = None; // never touch the real user config in tests
@@ -2288,7 +3381,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let raw_path = dir.join("raw-io.jsonl");
         state.raw_io_path = Some(raw_path.clone());
+        // The capture gate reads the LIVE holder (config-editor v1), seeded
+        // from config at boot — flip the holder like a runtime toggle would.
         state.config.raw_io.enabled = false;
+        state
+            .settings_live
+            .raw_io_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let response = forward(&state, client_request("{}")).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2728,6 +3827,397 @@ mod tests {
         assert_eq!(value["error"]["type"], "rate_limit_error");
     }
 
+    #[tokio::test]
+    async fn headerless_fable_429_burst_returns_transient_502_not_window_retry() {
+        // Issue #71 regression: one Fable request walks every eligible
+        // account, each answering a header-LESS 429 (transient burst). The
+        // scoped parks last 8s — the client must get the prompt-retry
+        // transient 502, NEVER a 429 whose retry-after points at a quota
+        // window reset (the observed 2160s/1251s aborts).
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::Rate { retry_after: None });
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-fable-5","max_tokens":1}"#),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "cooldown-blocked pool must answer the transient 502, not 429"
+        );
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "no fabricated window-scale retry-after"
+        );
+        let body = response_body(response).await;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("temporarily rate-limiting"),
+            "transient wording expected, got: {text}"
+        );
+    }
+
+    #[test]
+    fn exhaust_park_policy_parks_within_budget_only() {
+        // Imminent recovery, budget untouched → park (issue #71 F5).
+        assert!(should_park_exhausted(
+            Duration::from_secs(2),
+            Duration::ZERO
+        ));
+        // Consecutive parks keep going while the accumulated time stays under
+        // the budget — this is the 2026-07-10 incident fix (one park is not
+        // enough when a burst frees accounts one by one). Boundary: a park that
+        // lands the accumulated total EXACTLY on the budget is still allowed
+        // (17s + 3s == 20s).
+        assert!(should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK
+        ));
+        // But 1ms of overshoot is refused — the budget is a hard cap on TOTAL
+        // parked time, checked BEFORE the sleep (MUST-FIX ①): starting this 3s
+        // park would push the total to 20s + 1ms.
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - MAX_EXHAUST_PARK + Duration::from_millis(1)
+        ));
+        // With only 1ms of budget left, a full 3s park overshoots and is
+        // refused (this assertion was TRUE under the pre-check-order bug, which
+        // let the worst-case total reach ~23s).
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK,
+            EXHAUST_PARK_BUDGET - Duration::from_millis(1)
+        ));
+        // Budget spent → the transient 502 fallback, exactly as before.
+        assert!(!should_park_exhausted(
+            Duration::from_secs(1),
+            EXHAUST_PARK_BUDGET
+        ));
+        assert!(!should_park_exhausted(
+            Duration::from_millis(100),
+            EXHAUST_PARK_BUDGET + Duration::from_secs(5)
+        ));
+        // Recovery not imminent → 502 regardless of remaining budget.
+        assert!(!should_park_exhausted(
+            MAX_EXHAUST_PARK + Duration::from_millis(1),
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn swept_park_policy_paces_within_budget_then_refuses() {
+        // 2026-07-13T23:01Z incident: a completed retry-after-less 429 sweep
+        // paces on the full DEFAULT_HEURISTIC_COOLDOWN (8s). The budget cutoff
+        // is unit-tested here so the 20s EXHAUST_PARK_BUDGET reject is proven
+        // WITHOUT three real 8s sleeps in an e2e test.
+        // First two parks fit (0+8=8, 8+8=16 ≤ 20).
+        assert!(should_park_swept(Duration::ZERO));
+        assert!(should_park_swept(DEFAULT_HEURISTIC_COOLDOWN));
+        // Boundary: a park landing the total EXACTLY on the budget is allowed
+        // (12s + 8s == 20s).
+        assert!(should_park_swept(
+            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN
+        ));
+        // 1ms of overshoot is refused — the budget is a hard, pre-checked cap
+        // on TOTAL parked time (not clamped): starting this park would push the
+        // total past 20s.
+        assert!(!should_park_swept(
+            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN + Duration::from_millis(1)
+        ));
+        // A third 8s park (16s already parked → 24s) overshoots → transient 502.
+        assert!(!should_park_swept(
+            DEFAULT_HEURISTIC_COOLDOWN + DEFAULT_HEURISTIC_COOLDOWN
+        ));
+        assert!(!should_park_swept(EXHAUST_PARK_BUDGET));
+    }
+
+    #[tokio::test]
+    async fn fable_429_burst_rides_out_consecutive_grace_parks_to_200() {
+        // 2026-07-10 incident regression: under an org-level 429 burst the
+        // fable-scoped cooldowns free account by account, so ONE grace park
+        // wakes into a still-parked pool. The old one-shot `parked_exhausted`
+        // bool then answered the transient 502; the park BUDGET must instead
+        // keep waiting (each park ≤ MAX_EXHAUST_PARK, total ≤
+        // EXHAUST_PARK_BUDGET) until an account frees and the request ends 200.
+        //
+        // Timeline (parks backdated so each remaining wait is ~1s):
+        //   t≈0   both accounts fable-parked → exhaustion → grace park #1 (~1s)
+        //   t≈1   a frees → leased → upstream 429s again (burst not over) →
+        //         a re-parked 8s → exhaustion again → grace park #2 (~1s)
+        //         [before the fix: 502 HERE — the one-shot park was spent]
+        //   t≈2   b frees → leased → upstream 200 → request succeeds.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // Round-2 429 for the first account to free; the script then
+            // empties and the mock's default 200 serves the third attempt.
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+        // Backdate the burst's first sweep: fable-scoped parks are 8s long
+        // (DEFAULT_HEURISTIC_COOLDOWN), so recording them 7s/6s in the past
+        // leaves ~1s/~2s remaining — both within MAX_EXHAUST_PARK.
+        let now = SystemTime::now();
+        state.pool.record_429_classified(
+            &AccountId("a".into()),
+            None,
+            Some("claude-fable-5"),
+            now - Duration::from_secs(7),
+        );
+        state.pool.record_429_classified(
+            &AccountId("b".into()),
+            None,
+            Some("claude-fable-5"),
+            now - Duration::from_secs(6),
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-fable-5","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "consecutive grace parks must ride out the burst, not 502"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1_800),
+            "both parks were actually waited out (~1s + ~1s), took {elapsed:?}"
+        );
+        // a freed first and 429'd (round 2 of the burst); b served the 200.
+        let seen: Vec<String> = shared
+            .seen
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter_map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["Bearer at-a".to_string(), "Bearer at-b".to_string()],
+            "park #1 → a retried (429), park #2 → b served"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_fable_opus_429_burst_paces_on_cooldown_then_200_not_instant_502() {
+        // 2026-07-13T23:01Z incident: a NON-Fable request (claude-opus-4-8)
+        // records ACCOUNT-WIDE heuristic cooldowns on a retry-after-less 429,
+        // but `heuristic_degraded_mode` keeps leasing straight through them, so
+        // the pool never reaches CooldownBlocked exhaustion and the #83
+        // grace-park budget is unreachable. Production saw one opus-4-8 request
+        // sweep 8 accounts 13× in ~8s and 502 the client, while the upstream
+        // burst cleared ~20-30s later (a wait would have returned 200).
+        //
+        // The fix: once the request has 429-swept every in-scope candidate
+        // (here both accounts) it paces on DEFAULT_HEURISTIC_COOLDOWN (8s)
+        // instead of hammering, then reprobes into the recovered pool → 200.
+        //   attempt 1: a → 429 (heuristic cooldown), swept={a}, b still free
+        //   attempt 2: b → 429 (heuristic cooldown), swept={a,b} == whole pool
+        //              → pace 8s (switch counter reset so the reprobe isn't
+        //              cap-killed)
+        //   attempt 3: script empty → default 200 (burst cleared). Stickiness
+        //              keeps the reprobe on b (the last-leased, now-eligible
+        //              account) — the load-bearing facts are that both were
+        //              swept first and the reprobe served a 200, not which of
+        //              the two eligible accounts it stuck to.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::Rate { retry_after: None });
+            script.push_back(Scripted::Rate { retry_after: None });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "swept pool must pace on the cooldown and reprobe to 200, not instant 502"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(7_500),
+            "the request waited out ~one heuristic cooldown (~8s), took {elapsed:?}"
+        );
+        let seen: Vec<String> = shared
+            .seen
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter_map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            seen.len(),
+            3,
+            "two 429 sweep hops + one reprobe, got {seen:?}"
+        );
+        assert_eq!(
+            &seen[..2],
+            &["Bearer at-a".to_string(), "Bearer at-b".to_string()],
+            "attempts 1-2 swept the whole pool (both 429) before any park"
+        );
+        assert!(
+            seen[2] == "Bearer at-a" || seen[2] == "Bearer at-b",
+            "the post-park reprobe hit one of the recovered accounts, got {:?}",
+            seen[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_non_fable_429_bursts_stay_within_aggregate_attempt_cap() {
+        // gpt56 MUST-FIX: the sweep-pacing must not AMPLIFY load under
+        // concurrency. Three non-Fable (opus-4-8) requests hit the same
+        // 2-account pool while it is bursting; each must sweep at most one lap
+        // (2 accounts) and reprobe once, so the aggregate upstream attempt
+        // count stays bounded (no thundering herd of retries) and every request
+        // still rides the burst out to 200. Interleaving is nondeterministic,
+        // so ONLY the aggregate cap + all-200 are asserted, never per-request
+        // ordering.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // Enough 429s to 429 every sweep hop across all three requests
+            // (3 requests × 2-account sweep = 6); the script then empties and
+            // the default 200 serves each request's reprobe.
+            for _ in 0..6 {
+                script.push_back(Scripted::Rate { retry_after: None });
+            }
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let (r1, r2, r3) = tokio::join!(
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+            forward(
+                &state,
+                client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+            ),
+        );
+        let elapsed = started.elapsed();
+
+        for (i, r) in [&r1, &r2, &r3].iter().enumerate() {
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "request {i} must ride the burst out to 200, not 502"
+            );
+        }
+        let attempts = shared.seen.lock().expect("seen lock").len();
+        assert!(
+            attempts <= 9,
+            "aggregate upstream attempts must stay bounded (≤ 3×sweep(2) + 3×probe(1) = 9); \
+             a hammer would blow far past this. got {attempts}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(25),
+            "pacing (not hammering) must not stall the batch, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_fable_429_sweep_exhausts_park_budget_then_transient_502() {
+        // gpt56 nice-to-have: the second-park → budget-reject state machine for
+        // a single non-Fable request whose burst OUTLASTS the park budget.
+        //   att1,2:  a→429, b→429  → whole pool swept  → park #1 (+8s, 0+8≤20)
+        //   att3,4:  b→429, a→429  → whole pool swept  → park #2 (+8s, 8+8≤20)
+        //   att5,6:  a→429, b→429  → whole pool swept  → park #3 REFUSED
+        //            (16+8 = 24 > 20 budget) → deliberate transient 502.
+        //
+        // NB: a park lasts DEFAULT_HEURISTIC_COOLDOWN (8s) — exactly the cooldown
+        // it records — so BOTH accounts' cooldowns expire during the park. The
+        // post-park reprobe therefore re-cools ONE account (still eligible), then
+        // must switch to re-cool the OTHER before `heuristic_degraded_mode`
+        // re-engages and the sweep is re-detected. So each re-establishment is
+        // TWO upstream attempts, not one → 6 total attempts across 2 real parks,
+        // not the 4 a "one-probe-per-park" model would predict.
+        //
+        // Uses REAL time (~16s): paused-time (`start_paused`) is flaky in
+        // combination with the real-TCP mock upstream (the sleep advances
+        // instantly but the socket round-trips don't), so we accept the wall
+        // clock here rather than fight that interaction.
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // 3 sweep laps × 2 accounts = 6 429s; the request 502s on the 3rd
+            // (budget-refused) sweep completion, so no Ok is ever reached.
+            for _ in 0..6 {
+                script.push_back(Scripted::Rate { retry_after: None });
+            }
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = test_state(
+            &upstream,
+            vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
+        );
+
+        let started = std::time::Instant::now();
+        let response = forward(
+            &state,
+            client_request(r#"{"model":"claude-opus-4-8","max_tokens":1}"#),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "a burst that outlasts the park budget must fall back to the transient 502"
+        );
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "no fabricated window-scale retry-after on the transient fallback"
+        );
+        let attempts = shared.seen.lock().expect("seen lock").len();
+        assert_eq!(
+            attempts, 6,
+            "3 two-hop sweep laps (each park expires both cooldowns); the 3rd \
+             lap's completion is budget-refused before any further upstream call"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(15_500),
+            "two full 8s parks were actually waited out (~16s), took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn heuristic_429_lockout_still_leases_an_account_not_a_hard_refuse() {
         // The bug: a retry-after-less (Heuristic) 429 burst parks the WHOLE
@@ -2746,7 +4236,7 @@ mod tests {
         state.pool.record_429(&AccountId("b".into()), None, now);
 
         // Degraded mode: a lease is still granted (no hard pool refuse).
-        let lease = acquire_lease(&state, None, &params)
+        let lease = acquire_lease(&state, None, &params, select::RequestScope::NonFable)
             .expect("degraded mode must still lease an account");
         // It is one of the two parked accounts (the soonest-freed; here both
         // were parked at the same instant so the stable id tiebreak picks "a").
@@ -2766,7 +4256,13 @@ mod tests {
             .pool
             .record_429(&AccountId("b".into()), Some(Duration::from_secs(120)), now);
         assert!(
-            acquire_lease(&state2, None, &state2.select_params()).is_err(),
+            acquire_lease(
+                &state2,
+                None,
+                &state2.select_params(),
+                select::RequestScope::NonFable
+            )
+            .is_err(),
             "RetryAfter parks are a real quota signal and must NOT be bypassed"
         );
     }
@@ -2817,7 +4313,7 @@ mod tests {
 
         // Acquisition must NOT re-lease the over-quota sticky current "a"; it
         // must serve the quota-clean, heuristic-only peer "b" that `pick` ranks.
-        let lease = acquire_lease(&state, None, &params)
+        let lease = acquire_lease(&state, None, &params, select::RequestScope::NonFable)
             .expect("degraded mode must lease the quota-clean soonest-freed account");
         assert_eq!(
             lease.account_id(),
@@ -2865,6 +4361,217 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.input_tokens, 25);
         assert_eq!(totals.output_tokens, 42);
+    }
+
+    /// Drive `sse::transform_body` with a REAL HTTP response (the scripted
+    /// mock) through the REAL codex converter and capture what `finish`
+    /// receives — the integration chain the closures build RequestFinished
+    /// from (review MUST-FIX 4).
+    async fn run_transform(
+        body: String,
+        drop_client: bool,
+    ) -> (crate::proxy::sse::StreamTiming, bool, Option<String>, bool) {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSseOwned { body });
+        let upstream = spawn_mock(shared.clone()).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{upstream}/v1/responses"))
+            .send()
+            .await
+            .expect("mock reachable");
+        let converter = crate::provider::responses::ResponsesSseConverter::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = crate::proxy::sse::transform_body(
+            response,
+            converter,
+            BODY_LOG_LIMIT,
+            0,
+            move |_usage, _cap, _raw, _up, error, converter, client_gone, timing| {
+                let _ = tx.send((
+                    timing,
+                    client_gone,
+                    converter.error_message().map(str::to_string),
+                    error.is_some(),
+                ));
+            },
+        );
+        if drop_client {
+            drop(body); // client walks away → tx.send fails inside the pump
+        } else {
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("finish ran")
+            .expect("finish delivered")
+    }
+
+    #[tokio::test]
+    async fn transform_pump_latches_thinking_first_ttft_and_gen_span() {
+        // Codex wire: reasoning summary delta arrives FIRST — it must latch
+        // first_content (thinking counts) and yield a positive gen span at
+        // upstream EOF, with no failure signals.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hm\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, false).await;
+        assert!(timing.first_byte.is_some(), "ttfb latched");
+        assert!(
+            timing.first_content.is_some(),
+            "thinking delta latches first_content"
+        );
+        assert!(timing.gen_ms().is_some(), "gen span present at EOF");
+        assert!(!timing.saw_error_event && !client_gone);
+        assert!(converter_error.is_none() && !transport_error);
+    }
+
+    #[tokio::test]
+    async fn transform_pump_reports_protocol_failure_not_client_disconnect() {
+        // response.failed under a clean HTTP 200 → the converter preserves
+        // the failure; the closure's provider-error signal comes from it.
+        let body = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n\n".to_string();
+        let (timing, client_gone, converter_error, _) = run_transform(body, false).await;
+        assert!(!client_gone);
+        assert!(
+            converter_error.is_some(),
+            "protocol failure preserved by the converter"
+        );
+        assert!(
+            timing.first_content.is_none(),
+            "no content delta before the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_pump_client_disconnect_never_claims_gen_or_failure() {
+        // The CLIENT walks away mid-stream — deterministically: the mpsc
+        // channel holds 16 events, the stream carries 30+ output deltas, and
+        // the receiver is dropped without reading, so the pump MUST block on
+        // a full channel and then fail its send. No conditional asserts.
+        let mut body = String::from(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
+        );
+        for i in 0..30 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk {i}\"}}\n\n"
+            ));
+        }
+        body.push_str(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        );
+        let (timing, client_gone, converter_error, transport_error) =
+            run_transform(body, true).await;
+        assert!(client_gone, "dropped receiver must surface as client_gone");
+        assert!(timing.client_gone);
+        assert_eq!(
+            timing.gen_ms(),
+            None,
+            "client truncation never becomes a measured span"
+        );
+        // The exact production decision: whatever the converter thinks of
+        // the truncation WE caused, a client disconnect is never a provider
+        // failure (RequestFinished.aborted = false).
+        assert!(
+            !provider_failure(
+                client_gone,
+                transport_error,
+                converter_error.is_some(),
+                timing.saw_error_event,
+            ),
+            "client disconnect must not count as a provider failure"
+        );
+    }
+    #[tokio::test]
+    async fn sse_passthrough_records_ttfb_and_first_output_delta() {
+        // Perf telemetry v1 (trinity contract C1/C8, passthrough path): the
+        // finished event carries TTFB (first body chunk) and TTFT (first
+        // content_block_delta — thinking deltas count) as millis offsets.
+        const SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSse { body: SSE_BODY });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response_body(response).await;
+
+        // Drain events until the finish (the closure fires after last chunk).
+        let finished = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await.expect("events channel open") {
+                    ActivityEvent::RequestFinished {
+                        fast,
+                        ttfb_ms,
+                        ttft_ms,
+                        tokens,
+                        ..
+                    } => break (fast, ttfb_ms, ttft_ms, tokens),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("finished event");
+        let (fast, ttfb_ms, ttft_ms, tokens) = finished;
+        assert_eq!(fast, Some(false), "claude passthrough: fast recorded off");
+        assert!(ttfb_ms.is_some(), "TTFB captured on first body chunk");
+        assert!(
+            ttft_ms.is_some(),
+            "TTFT captured on first content_block_delta (thinking counts)"
+        );
+        assert!(
+            ttft_ms.unwrap() >= ttfb_ms.unwrap(),
+            "first output delta cannot precede first byte"
+        );
+        assert_eq!(tokens.expect("usage").output, 42);
+    }
+
+    #[tokio::test]
+    async fn sse_passthrough_without_content_delta_leaves_ttft_none() {
+        // A stream that never emits a content delta (usage frames only) must
+        // stay honest: ttfb recorded, ttft absent — the request stays in the
+        // approximate (e2e-only) series, never fabricated into measured.
+        const SSE_BODY: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::OkSse { body: SSE_BODY });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+
+        let response = forward(&state, client_request(r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response_body(response).await;
+
+        let (ttfb_ms, ttft_ms) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await.expect("events channel open") {
+                    ActivityEvent::RequestFinished {
+                        ttfb_ms, ttft_ms, ..
+                    } => break (ttfb_ms, ttft_ms),
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("finished event");
+        assert!(ttfb_ms.is_some(), "TTFB still captured");
+        assert_eq!(ttft_ms, None, "no content delta → no first-output claim");
     }
 
     #[tokio::test]

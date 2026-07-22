@@ -8,6 +8,12 @@ description: Use when the user says "릴리즈", "릴리즈해줘", "release", "
 Cut a formal **stable** release: version bump → tag `v*` → CI stable release → brew
 `llmux` → local deploy → `llmux status` (client AND server).
 
+A `v*` release ships **both** the CLI binaries and the macOS app
+(`LlmuxIslands-<version>.zip`, built by the `islands` job in `release.yml`), and the tap
+`bump.yml` then refreshes **both** the `llmux` formula and the `llmux-islands` cask — so
+`brew install llmux` (CLI only) and `brew install llmux-islands` (app + CLI via `depends_on`)
+track the same version. After step 6, also confirm `brew info --cask llmux-islands` == `<new>`.
+
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
 procedure B = publish+verify brew).
 
@@ -21,8 +27,8 @@ procedure B = publish+verify brew).
 2. **Bump.** Set `version = "<new>"` in `Cargo.toml`; run `just check` so `Cargo.lock`
    updates and the gate passes. The release workflow **fails if tag `v<new>` ≠ Cargo.toml
    version** — they must match exactly.
-3. **Commit + push master.** `git commit -am "chore: release v<new>"`; `git push origin
-   master` (token fallback if needed). Confirm with the user if a PR (not direct master) is
+3. **Commit + push main.** `git commit -am "chore: release v<new>"`; `git push origin
+   main` (token fallback if needed). Confirm with the user if a PR (not direct main) is
    required.
 4. **Tag + push the tag** (this triggers `release.yml`):
    `git tag v<new> && git push origin v<new>` (token fallback:
@@ -52,5 +58,5 @@ procedure B = publish+verify brew).
 - Reusing an existing version (e.g. `v0.1.0`) — always go forward.
 - Forgetting to dispatch the tap `bump.yml` — brew stays on the old stable.
 - "Already up-to-date" → `brew update` then re-check `brew info` before trusting it.
-- Pushing master/PR without the user's go-ahead (version itself defaults to a patch bump —
+- Pushing main/PR without the user's go-ahead (version itself defaults to a patch bump —
   see step 1).

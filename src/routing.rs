@@ -2,10 +2,11 @@
 //!
 //! An inbound Anthropic Messages request names a `model`; this module maps
 //! that name to a [`BackendGroup`] — the pool of accounts that can serve it.
-//! Two groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
-//! served by the Anthropic provider) and [`BackendGroup::Codex`] (chatgpt
-//! oauth accounts, served by the codex provider). The scheduler then picks
-//! the best eligible account *within* that group, sticky per group.
+//! Three groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
+//! served by the Anthropic provider), [`BackendGroup::Codex`] (chatgpt
+//! oauth accounts, served by the codex provider), and [`BackendGroup::Grok`]
+//! (xAI grok oauth accounts, served by the grok provider). The scheduler then
+//! picks the best eligible account *within* that group, sticky per group.
 //!
 //! Everything here is a deterministic function of its inputs — no IO, no
 //! clock, no shared state — so it is unit-test heavy by design. The
@@ -15,31 +16,41 @@
 /// Which backend pool an account belongs to / a model routes to.
 ///
 /// `Ord` is derived so the group can key a `BTreeMap` (per-group stickiness)
-/// with a stable, total order: `Claude < Codex`. That order also makes
+/// with a stable, total order: `Claude < Codex < Grok`. That order also makes
 /// `Claude` the representative group when a scalar must be chosen (status
-/// output picks the claude slot first).
+/// output picks the claude slot first) and fixes the `on_empty_group`
+/// fallback scan order (docs/grok/spec.md §R5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackendGroup {
     Claude,
     Codex,
+    Grok,
 }
 
 impl BackendGroup {
     /// Group an account belongs to, derived from its credential `kind`
-    /// (`"oauth" | "apikey" | "codex"` — see [`crate::config::AccountCredential::kind`]).
-    /// Codex credentials are the Codex group; everything else is Claude.
+    /// (`"oauth" | "apikey" | "codex" | "grok"` — see
+    /// [`crate::config::AccountCredential::kind`]). Codex credentials are the
+    /// Codex group, grok credentials the Grok group; everything else is Claude.
     pub fn from_kind(kind: &str) -> Self {
         match kind {
             "codex" => Self::Codex,
+            "grok" => Self::Grok,
             _ => Self::Claude,
         }
     }
+
+    /// Every group, in the canonical `Ord` order (`Claude < Codex < Grok`).
+    /// Single source for "scan all groups" loops (fallback resolution,
+    /// status rendering).
+    pub const ALL: &'static [BackendGroup] = &[Self::Claude, Self::Codex, Self::Grok];
 
     /// Lowercase label for logs / status output.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
         }
     }
 
@@ -49,6 +60,7 @@ impl BackendGroup {
     pub fn from_label(label: &str) -> Self {
         match label {
             "codex" => Self::Codex,
+            "grok" => Self::Grok,
             _ => Self::Claude,
         }
     }
@@ -99,9 +111,12 @@ impl Rule {
     }
 }
 
-/// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, and
-/// the exact `gpt-5.5` (covered by `gpt-` already, but kept explicit so the
-/// intent survives a future prefix change).
+/// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, the
+/// exact `gpt-5.5` / `gpt-5.6` family ids (covered by `gpt-` already, but kept
+/// explicit so the intent survives a future prefix change), and the bare
+/// variant aliases `sol` / `terra` / `luna` (which the codex provider resolves
+/// to the latest gpt generation of that variant — see
+/// [`crate::provider::codex`]).
 fn builtin_codex_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gpt-".to_string()),
@@ -110,6 +125,11 @@ fn builtin_codex_rules() -> Vec<Rule> {
         Rule::Prefix("o4".to_string()),
         Rule::Substring("codex".to_string()),
         Rule::Exact("gpt-5.5".to_string()),
+        Rule::Exact("gpt-5.6".to_string()),
+        Rule::Exact("gpt-5.6-sol".to_string()),
+        Rule::Exact("sol".to_string()),
+        Rule::Exact("terra".to_string()),
+        Rule::Exact("luna".to_string()),
     ]
 }
 
@@ -124,6 +144,11 @@ fn builtin_claude_rules() -> Vec<Rule> {
     ]
 }
 
+/// Builtin grok rules: the xAI model family (`grok-4.5`, `grok-build-0.1`, …).
+fn builtin_grok_rules() -> Vec<Rule> {
+    vec![Rule::Prefix("grok".to_string())]
+}
+
 /// Compiled model→group classifier. First-match-wins over the codex rules
 /// then the claude rules; an unmatched (or absent) model falls back to
 /// `default_group`. Built from config overrides when present, else builtins.
@@ -131,6 +156,7 @@ fn builtin_claude_rules() -> Vec<Rule> {
 pub struct Classifier {
     codex_rules: Vec<Rule>,
     claude_rules: Vec<Rule>,
+    grok_rules: Vec<Rule>,
     default_group: BackendGroup,
 }
 
@@ -142,6 +168,7 @@ impl Default for Classifier {
         Self {
             codex_rules: builtin_codex_rules(),
             claude_rules: builtin_claude_rules(),
+            grok_rules: builtin_grok_rules(),
             default_group: BackendGroup::Claude,
         }
     }
@@ -156,6 +183,7 @@ impl Classifier {
     pub fn from_config(
         claude_models: &[String],
         codex_models: &[String],
+        grok_models: &[String],
         default_group: &str,
     ) -> Self {
         let claude_rules = if claude_models.is_empty() {
@@ -168,11 +196,18 @@ impl Classifier {
         } else {
             codex_models.iter().map(|m| Rule::parse(m)).collect()
         };
+        let grok_rules = if grok_models.is_empty() {
+            builtin_grok_rules()
+        } else {
+            grok_models.iter().map(|m| Rule::parse(m)).collect()
+        };
         Self {
             codex_rules,
             claude_rules,
+            grok_rules,
             default_group: match default_group.trim().to_ascii_lowercase().as_str() {
                 "codex" => BackendGroup::Codex,
+                "grok" => BackendGroup::Grok,
                 _ => BackendGroup::Claude,
             },
         }
@@ -180,8 +215,11 @@ impl Classifier {
 
     /// Classify a model name (case-insensitive) to a group. `None` (no model
     /// in the body) routes to the configured default group. Codex rules are
-    /// checked first, then claude rules; an unrecognized model falls back to
-    /// `default_group`.
+    /// checked first, then claude, then grok; an unrecognized model falls
+    /// back to `default_group`. (The rule families are disjoint by
+    /// construction — `gpt-`/`o*` vs Anthropic names vs `grok` — so the check
+    /// order only decides ties a user creates with overlapping config
+    /// overrides.)
     pub fn classify(&self, model: Option<&str>) -> BackendGroup {
         let Some(model) = model else {
             return self.default_group;
@@ -192,6 +230,9 @@ impl Classifier {
         }
         if self.claude_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Claude;
+        }
+        if self.grok_rules.iter().any(|r| r.matches(&lower)) {
+            return BackendGroup::Grok;
         }
         self.default_group
     }
@@ -207,6 +248,40 @@ pub fn model_from_body(body: &[u8]) -> Option<String> {
         .get("model")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The scope label the Anthropic usage poll uses for the per-model weekly
+/// bucket that governs Fable requests (`limits[].scope.model.display_name`,
+/// verbatim "Fable" — `.prd/13-usage-raw-sources.md` §Carrier 1). Single source
+/// of the label that keys Fable-scoped cooldowns and the `fable_weekly`
+/// accessor; matched case-insensitively everywhere it is used.
+pub const FABLE_SCOPE_LABEL: &str = "Fable";
+
+/// Model families that route to the Fable weekly bucket. CENTRAL registry —
+/// the ONLY place a model string is decided to be Fable-scoped, so the
+/// scheduler never grows ad-hoc `contains("fable")` checks. Extend here when a
+/// new Fable-family id appears.
+const FABLE_FAMILIES: &[&str] = &["fable"];
+
+/// Whether a requested model is Fable-family (case-insensitive). `None` (no
+/// model in the body) is NOT Fable — such a request routes by the default group
+/// and must never be treated as Fable-scoped. The scheduler uses this to decide
+/// whether a request is additionally gated by an account's Fable-scoped
+/// cooldown / preemptive Fable-critical exclusion; non-Fable requests ignore
+/// that state entirely.
+///
+/// Uses `contains` (not `starts_with`) deliberately: the only observed id is
+/// `fable-5` but a vendor-prefixed variant (`claude-fable-…`) must still be
+/// caught, and "fable" is distinctive enough that a false positive is
+/// negligible. Being conservative here would wrongly park a Fable-exhausted
+/// account's whole capacity — the exact bug W2 fixes — so the classifier errs
+/// toward recognizing Fable.
+pub fn is_fable_model(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let lower = model.to_ascii_lowercase();
+    FABLE_FAMILIES.iter().any(|fam| lower.contains(fam))
 }
 
 /// Extract `metadata.user_id` from an Anthropic Messages JSON body, if any.
@@ -301,6 +376,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_variant_aliases_route_to_codex() {
+        // The bare variant aliases resolve upstream to the latest gpt
+        // generation of that variant; routing classifies them to codex.
+        assert_eq!(builtin().classify(Some("sol")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("terra")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("luna")), BackendGroup::Codex);
+        // Exact, case-insensitive like the rest.
+        assert_eq!(builtin().classify(Some("SOL")), BackendGroup::Codex);
+        // Not a substring rule: a name merely containing "sol" is unaffected.
+        assert_eq!(
+            builtin().classify(Some("solar-flare")),
+            BackendGroup::Claude
+        );
+    }
+
+    #[test]
     fn codex_substring_routes_to_codex() {
         assert_eq!(builtin().classify(Some("codex")), BackendGroup::Codex);
         assert_eq!(
@@ -370,10 +461,55 @@ mod tests {
 
     // ---- config override beats builtin ----
 
+    // ---- C2: grok routing ----
+
+    #[test]
+    fn c2_grok_prefix_routes_grok_and_others_unchanged() {
+        let c = builtin();
+        assert_eq!(c.classify(Some("grok-4.5")), BackendGroup::Grok);
+        assert_eq!(c.classify(Some("GROK-BUILD-0.1")), BackendGroup::Grok);
+        assert_eq!(c.classify(Some("gpt-5.6-sol")), BackendGroup::Codex);
+        assert_eq!(c.classify(Some("claude-sonnet-5")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("mystery-model")), BackendGroup::Claude);
+        assert_eq!(c.classify(None), BackendGroup::Claude);
+    }
+
+    #[test]
+    fn c2_grok_kind_and_label_round_trip() {
+        assert_eq!(BackendGroup::from_kind("grok"), BackendGroup::Grok);
+        assert_eq!(BackendGroup::Grok.as_str(), "grok");
+        assert_eq!(BackendGroup::from_label("grok"), BackendGroup::Grok);
+        assert_eq!(
+            BackendGroup::ALL,
+            &[
+                BackendGroup::Claude,
+                BackendGroup::Codex,
+                BackendGroup::Grok
+            ]
+        );
+    }
+
+    #[test]
+    fn c2_config_grok_list_replaces_builtin() {
+        let c = Classifier::from_config(&[], &[], &["mega-".to_string()], "claude");
+        assert_eq!(c.classify(Some("mega-1")), BackendGroup::Grok);
+        assert_eq!(
+            c.classify(Some("grok-4.5")),
+            BackendGroup::Claude,
+            "builtin grok prefix dropped when config provides its own grok list"
+        );
+    }
+
+    #[test]
+    fn c2_default_group_grok_parses() {
+        let c = Classifier::from_config(&[], &[], &[], "grok");
+        assert_eq!(c.classify(None), BackendGroup::Grok);
+    }
+
     #[test]
     fn config_codex_list_replaces_builtin() {
         // Config says ONLY "wizard-" is codex; gpt-5.5 is no longer codex.
-        let c = Classifier::from_config(&[], &["wizard-".to_string()], "claude");
+        let c = Classifier::from_config(&[], &["wizard-".to_string()], &[], "claude");
         assert_eq!(c.classify(Some("wizard-7b")), BackendGroup::Codex);
         assert_eq!(
             c.classify(Some("gpt-5.5")),
@@ -384,7 +520,7 @@ mod tests {
 
     #[test]
     fn config_claude_list_replaces_builtin() {
-        let c = Classifier::from_config(&["acme-".to_string()], &[], "claude");
+        let c = Classifier::from_config(&["acme-".to_string()], &[], &[], "claude");
         assert_eq!(c.classify(Some("acme-1")), BackendGroup::Claude);
         // opus is no longer a claude model under the override; with no codex
         // match it falls back to the default group (claude).
@@ -398,7 +534,7 @@ mod tests {
     fn config_can_move_a_model_across_groups() {
         // Make "opus" a CODEX model via config — config override wins over
         // the builtin claude prefix.
-        let c = Classifier::from_config(&[], &["=opus".to_string()], "claude");
+        let c = Classifier::from_config(&[], &["=opus".to_string()], &[], "claude");
         assert_eq!(c.classify(Some("opus")), BackendGroup::Codex);
     }
 
@@ -407,6 +543,7 @@ mod tests {
         let c = Classifier::from_config(
             &[],
             &["~special".to_string(), "=exact-model".to_string()],
+            &[],
             "claude",
         );
         assert_eq!(c.classify(Some("my-special-build")), BackendGroup::Codex);
@@ -420,7 +557,7 @@ mod tests {
 
     #[test]
     fn config_default_group_codex_changes_fallback() {
-        let c = Classifier::from_config(&[], &[], "codex");
+        let c = Classifier::from_config(&[], &[], &[], "codex");
         assert_eq!(
             c.classify(None),
             BackendGroup::Codex,
@@ -455,6 +592,34 @@ mod tests {
     fn model_from_body_tolerates_non_json() {
         assert_eq!(model_from_body(b"not json at all"), None);
         assert_eq!(model_from_body(b""), None);
+    }
+
+    // ---- is_fable_model (central Fable classifier, fable-usage W2) ----
+
+    #[test]
+    fn is_fable_model_matches_fable_family_case_insensitively() {
+        assert!(is_fable_model(Some("fable-5")));
+        assert!(is_fable_model(Some("Fable")));
+        assert!(is_fable_model(Some("FABLE-5-20251001")));
+        // Vendor-prefixed variant is still recognized (contains, not prefix).
+        assert!(is_fable_model(Some("claude-fable-5")));
+    }
+
+    #[test]
+    fn is_fable_model_rejects_non_fable_and_absent_models() {
+        assert!(!is_fable_model(Some("claude-haiku-4-5-20251001")));
+        assert!(!is_fable_model(Some("claude-sonnet-4-5")));
+        assert!(!is_fable_model(Some("gpt-5.5")));
+        assert!(!is_fable_model(Some("")));
+        // No model in the body must NOT be treated as Fable-scoped.
+        assert!(!is_fable_model(None));
+    }
+
+    #[test]
+    fn fable_scope_label_is_the_upstream_display_name() {
+        // The label used to key Fable-scoped cooldowns must equal the usage
+        // poll's `scope.model.display_name` (`.prd/13` §Carrier 1).
+        assert_eq!(FABLE_SCOPE_LABEL, "Fable");
     }
 
     // ---- user_id_from_body (issue #32 metering identity) ----

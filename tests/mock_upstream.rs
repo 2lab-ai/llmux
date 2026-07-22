@@ -56,6 +56,9 @@ pub enum ScriptedResponse {
     RateLimited { retry_after: Option<u64> },
     /// 401 (expired/invalid token).
     AuthRejected,
+    /// Arbitrary 4xx client error (e.g. a Responses-API 400) with a verbatim
+    /// JSON body — the branch `relay_translate` wraps into an Anthropic error.
+    ClientError { status: u16, body: String },
 }
 
 impl ScriptedResponse {
@@ -396,6 +399,12 @@ async fn catch_all(
                 r#"{"type":"error","error":{"type":"authentication_error","message":"expired"}}"#,
             ))
             .expect("401 response"),
+        ScriptedResponse::ClientError { status, body } => http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .header("x-request-id", "req_mock_4xx")
+            .body(axum::body::Body::from(body))
+            .expect("4xx response"),
     }
 }
 

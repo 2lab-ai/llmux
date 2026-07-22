@@ -1,6 +1,6 @@
 [package]
 name = "llmux"
-version = "0.2.3"
+version = "0.2.19"
 edition = "2021"
 license = "MIT"
 description = "Multi-account, multi-provider LLM proxy for Claude Code with quota-maximizing scheduling"
@@ -34,6 +34,13 @@ tokio-stream = "0.1.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "1.2.1"
+# Display-cell width for the fixed-width activity badge (UI-4 V5) — must
+# match ratatui's own column accounting (already in the tree via ratatui).
+unicode-width = "0.2.2"
+# Grapheme-cluster segmentation for the input modal's wrap accounting (UI-6
+# item 3) — measure/split by the SAME unit ratatui renders (e.g. an emoji +
+# VS16 is one 2-cell cluster, not two scalars). Already in the tree via ratatui.
+unicode-segmentation = "1.13"
 
 [target.'cfg(unix)'.dependencies]
 # Local UTC offset for the dashboard's absolute reset times (localtime_r);

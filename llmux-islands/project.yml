@@ -1,0 +1,100 @@
+# XcodeGen spec for the llmux-islands macOS app.
+# Regenerate the Xcode project with:  cd llmux-islands && xcodegen generate
+name: LlmuxIslands
+options:
+  bundleIdPrefix: ai.2lab
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.2.3"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    # NOTE: do NOT use SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor — that is an
+    # Xcode 26 setting and CI (macos-latest) runs Xcode 16.4, where it is ignored
+    # and the lifted UI fails to compile. Portability comes from explicit
+    # `@MainActor` on the AppKit-bridge classes instead.
+    # The Release `-O` SIL inliner can crash swift-frontend on the lifted SwiftUI
+    # views; a menu-bar app needs no optimization, so disable it.
+    SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+targets:
+  LlmuxIslands:
+    type: application
+    platform: macOS
+    sources:
+      - path: LlmuxIslands
+    preBuildScripts:
+      - name: Build shared Rust UI core
+        script: /bin/sh "${PROJECT_DIR}/scripts/build-rust-core.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(DERIVED_FILE_DIR)/libllmux_islands_macos_bridge.a"
+    settings:
+      base:
+        PRODUCT_NAME: LlmuxIslands
+        PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslands
+        INFOPLIST_FILE: LlmuxIslands/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: LlmuxIslands/Resources/LlmuxIslands.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: "NO"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        SWIFT_OBJC_BRIDGING_HEADER: LlmuxIslands/SharedCore/LlmuxIslands-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)/../llmux-islands-macos-bridge/include"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(DERIVED_FILE_DIR)"
+        OTHER_LDFLAGS: "$(inherited) -lllmux_islands_macos_bridge -framework Security -framework CoreFoundation"
+  # Logic tests for the llmux HTTP DTO contract (issue #62 U27). Deliberately
+  # NOT hosted in the app (no TEST_HOST): the DTO sources are compiled directly
+  # into the bundle, so `xcodebuild test` never has to launch the menu-bar app
+  # headless. Add app-behavior tests as a hosted target later if needed.
+  LlmuxIslandsTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: LlmuxIslandsTests
+      - path: LlmuxIslands/Llmux/LlmuxStatus.swift
+      # exception-beacon: pure resolver (signal priority, thresholds,
+      # tie-breaks, debounce) — Foundation-only by design.
+      - path: LlmuxIslands/Llmux/GlanceSignal.swift
+      - path: LlmuxIslands/Llmux/LegacyStatusDashboardAdapter.swift
+      - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
+      # Foundation-only `llmux` CLI output parsing (CLIParse / ReleaseChannel /
+      # UpdateOutcome). The Process-spawning CLIRunner lives here too but is
+      # never invoked by the tests — they feed canned strings only.
+      - path: LlmuxIslands/Llmux/CLIRunner.swift
+      # Events DTO + pure time parsing/rendering + echo-list decoding
+      # (LlmuxEvent / LlmuxEventTime / LlmuxEventList). No networking in tests.
+      - path: LlmuxIslands/Llmux/LlmuxEvents.swift
+      # Security policy for daemon connections (HTTPS remote, strict loopback,
+      # redirect denial) plus its UserDefaults-backed configuration.
+      - path: LlmuxIslands/Llmux/LlmuxClient.swift
+      - path: LlmuxIslands/Llmux/DaemonLauncher.swift
+      - path: LlmuxIslands/Settings/LlmuxSettings.swift
+      # Pure Swift decode mirror of Rust's versioned UiState JSON contract.
+      - path: LlmuxIslands/SharedCore/SharedUiState.swift
+      - path: LlmuxIslands/SharedCore/SharedCoreEffect.swift
+      # Foundation-only analytics logic (issue #62 S4): formatting, the
+      # health-warning rule, data-quality fallbacks, (group, model) keying.
+      - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests
+        GENERATE_INFOPLIST_FILE: YES
+# Explicit schemes so headless `xcodebuild -scheme … build|test` works right
+# after `xcodegen generate` (no reliance on Xcode's auto-created schemes).
+schemes:
+  LlmuxIslands:
+    build:
+      targets:
+        LlmuxIslands: all
+        LlmuxIslandsTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - LlmuxIslandsTests

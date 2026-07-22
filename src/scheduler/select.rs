@@ -18,6 +18,10 @@ pub struct SelectParams {
     pub five_hour_max: f64,
     /// 7d utilization ceiling (default 0.99).
     pub seven_day_max: f64,
+    /// Fable-weekly utilization ceiling for FABLE requests (default 0.98).
+    pub fable_weekly_max: f64,
+    /// Selection algorithm (config `scheduler.mode`).
+    pub mode: crate::config::SchedulerMode,
     /// Usage data older than this makes an account ineligible — unless ALL
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
@@ -29,6 +33,8 @@ impl From<&SchedulerConfig> for SelectParams {
         Self {
             five_hour_max: cfg.five_hour_max,
             seven_day_max: cfg.seven_day_max,
+            fable_weekly_max: cfg.fable_weekly_max,
+            mode: cfg.mode,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
         }
     }
@@ -51,10 +57,51 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IneligibleReason {
     AuthUnhealthy,
+    /// Operator pause (config `paused_accounts`): absolute — gates automatic
+    /// selection, manual switch, and every degraded mode alike, until resumed.
+    Paused,
     CoolingDown,
     FiveHourOverThreshold,
     SevenDayOverThreshold,
     UsageStale,
+    /// A Fable request only: the account holds a live Fable-scoped cooldown
+    /// (fable-usage W2). Non-Fable requests never see this.
+    FableCoolingDown,
+    /// A Fable request only: the account's Fable weekly bucket is currently
+    /// constraining (preemptive Fable-critical avoidance, W2 point 4).
+    /// Non-Fable requests never see this.
+    FableWeeklyExhausted,
+}
+
+impl IneligibleReason {
+    /// Whether the reason is a REAL failure — one that even a manual
+    /// operator pin (issue #122) must respect: auth failure, operator
+    /// pause, an account-wide 429/park, a Fable-scoped 429/park. The
+    /// remaining reasons (ceiling thresholds, staleness, the preemptive
+    /// Fable-weekly exclusion) are ADVISORY: an operator who manually
+    /// switched just overrode them ("send it until it actually errors").
+    pub fn hard_failure(self) -> bool {
+        matches!(
+            self,
+            IneligibleReason::AuthUnhealthy
+                | IneligibleReason::Paused
+                | IneligibleReason::CoolingDown
+                | IneligibleReason::FableCoolingDown
+        )
+    }
+}
+
+/// The Fable-scope classification of an inbound request (fable-usage W2). The
+/// selector threads this so a Fable request is additionally gated by an
+/// account's Fable-scoped cooldown / preemptive Fable exclusion, while a
+/// non-Fable request IGNORES that state (identical to pre-W2 behavior — the
+/// default for every display / status / degraded-mode caller too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestScope {
+    /// Not a Fable-family request — ignores all Fable-scoped state.
+    NonFable,
+    /// A Fable-family request — also gated by Fable cooldown + exclusion.
+    Fable,
 }
 
 /// Single-account eligibility gate (FR3 step 1). Returns the first failing
@@ -64,6 +111,19 @@ pub enum IneligibleReason {
 /// Boundary semantics: a window AT the threshold is still eligible
 /// (`utilization <= max`); only strictly-over crosses the gate. A missing
 /// window is a cold account — utilization 0, immediately eligible.
+/// The 5h/7d/Fable ceilings that apply to THIS account: the per-account
+/// override (config `account_limits`) when set, else the global params.
+pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64, f64) {
+    (
+        account.limits.five_hour_max.unwrap_or(params.five_hour_max),
+        account.limits.seven_day_max.unwrap_or(params.seven_day_max),
+        account
+            .limits
+            .fable_weekly_max
+            .unwrap_or(params.fable_weekly_max),
+    )
+}
+
 pub fn eligibility(
     account: &AccountSnapshot,
     params: &SelectParams,
@@ -94,6 +154,12 @@ pub fn gate(
     if !account.healthy {
         return Some(IneligibleReason::AuthUnhealthy);
     }
+    // Operator pause is absolute: it gates in every mode (including the
+    // headers-only and heuristic-degraded fallbacks) — a paused account only
+    // returns to service when the operator resumes it.
+    if account.paused {
+        return Some(IneligibleReason::Paused);
+    }
     // A cooldown gates UNLESS we are in heuristic-degraded mode and this park
     // is a Heuristic one — a RetryAfter park is an explicit upstream
     // instruction and always gates.
@@ -102,16 +168,17 @@ pub fn gate(
     {
         return Some(IneligibleReason::CoolingDown);
     }
+    let (five_max, seven_max, _) = effective_limits(account, params);
     let five = account
         .five_hour
         .map_or(0.0, |w| w.effective_utilization(now));
-    if five > params.five_hour_max {
+    if five > five_max {
         return Some(IneligibleReason::FiveHourOverThreshold);
     }
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    if seven > params.seven_day_max {
+    if seven > seven_max {
         return Some(IneligibleReason::SevenDayOverThreshold);
     }
     // Codex accounts are exempt from the staleness gate: there is no usage
@@ -121,6 +188,43 @@ pub fn gate(
     let staleness_applies = account.credential_kind != "codex";
     if !headers_only && staleness_applies && usage_is_stale(account, now, params.usage_max_age) {
         return Some(IneligibleReason::UsageStale);
+    }
+    None
+}
+
+/// Scope-aware eligibility gate (fable-usage W2, the core U8 mechanism). Layers
+/// the Fable-scope checks ON TOP of the account-wide [`gate`], so:
+///
+/// - The account-wide gate runs first and unchanged: no AccountWide cooldown,
+///   auth-healthy, under the 5h/7d ceilings, not stale.
+/// - THEN, for a [`RequestScope::Fable`] request ONLY, the account is also
+///   refused if it holds a live Fable-scoped cooldown ([`IneligibleReason::
+///   FableCoolingDown`]) or its Fable weekly bucket is preemptively
+///   constraining ([`IneligibleReason::FableWeeklyExhausted`]).
+/// - A [`RequestScope::NonFable`] request is byte-for-byte the old [`gate`]:
+///   Fable-scoped state is IGNORED, so a Fable-exhausted account still serves
+///   non-Fable traffic — the whole point of U8.
+pub fn gate_scoped(
+    account: &AccountSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+    headers_only: bool,
+    heuristic_degraded: bool,
+    scope: RequestScope,
+) -> Option<IneligibleReason> {
+    if let Some(reason) = gate(account, params, now, headers_only, heuristic_degraded) {
+        return Some(reason);
+    }
+    if scope == RequestScope::Fable {
+        // The Fable-scoped cooldown is a distinct park from the account-wide
+        // one and is NOT bypassed by heuristic-degraded mode (that mode is about
+        // account-wide transient 429 lockouts, a different mechanism).
+        if account.fable_cooldown_active(now) {
+            return Some(IneligibleReason::FableCoolingDown);
+        }
+        if account.fable_weekly_exhausted(now, effective_limits(account, params).2) {
+            return Some(IneligibleReason::FableWeeklyExhausted);
+        }
     }
     None
 }
@@ -230,6 +334,36 @@ pub fn heuristic_degraded_mode(
     !any_eligible && any_heuristic_only
 }
 
+/// Count of in-group accounts this request could lease IF the transient
+/// heuristic cooldowns were ignored — i.e. how many accounts a retry-after-less
+/// 429 burst can sweep before the pool is genuinely out of candidates. Counts
+/// via [`gate_scoped`] with `heuristic_degraded = true`, so paused / auth-dead /
+/// real-quota (5h/7d) / RetryAfter-parked accounts are naturally excluded (they
+/// still gate in degraded mode) — only the Heuristic cooldown is looked through.
+///
+/// The forward loop uses this to detect "I have now 429-swept every candidate in
+/// this request" and pace instead of hammer: [`heuristic_degraded_mode`] keeps
+/// handing out leases THROUGH the heuristic cooldown gate, so for a non-Fable
+/// burst the pool never reaches `Exhausted` and the #83 grace-park budget path is
+/// unreachable (2026-07-13T23:01Z incident: one opus-4-8 request swept 8 accounts
+/// 13× in ~8s and 502'd the client while the upstream burst cleared ~20-30s
+/// later). `headers_only` mirrors what the degraded selection path sees.
+pub fn degraded_candidate_count(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+    now: SystemTime,
+) -> usize {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    snapshot
+        .accounts
+        .iter()
+        .filter(|account| in_group(account, group))
+        .filter(|account| gate_scoped(account, params, now, headers_only, true, scope).is_none())
+        .count()
+}
+
 /// Whether an account is in the selection scope: every account when `group`
 /// is `None` (routing off), only same-group accounts when `Some`.
 fn in_group(account: &AccountSnapshot, group: Option<BackendGroup>) -> bool {
@@ -256,22 +390,138 @@ pub fn pick(
     group: Option<BackendGroup>,
     now: SystemTime,
 ) -> Decision {
+    pick_scoped(snapshot, params, group, now, RequestScope::NonFable)
+}
+
+/// Scope-aware [`pick`] (fable-usage W2): identical selection, but the
+/// eligibility filter and the stickiness re-check use [`gate_scoped`] with the
+/// request's [`RequestScope`], so a Fable request excludes Fable-cooling /
+/// Fable-critical accounts (and switches off a Fable-dead sticky current) while
+/// non-Fable selection is unchanged. `RequestScope::NonFable` reproduces the
+/// pre-W2 [`pick`] exactly.
+pub fn pick_scoped(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    now: SystemTime,
+    scope: RequestScope,
+) -> Decision {
     let headers_only = headers_only_mode(snapshot, params, group, now);
     let heuristic_degraded = heuristic_degraded_mode(snapshot, params, group, now);
     let eligible: Vec<&AccountSnapshot> = snapshot
         .accounts
         .iter()
         .filter(|a| in_group(a, group))
-        .filter(|a| gate(a, params, now, headers_only, heuristic_degraded).is_none())
+        .filter(|a| gate_scoped(a, params, now, headers_only, heuristic_degraded, scope).is_none())
         .collect();
+
+    // Manual operator pin (issue #122) outranks every automatic policy: a
+    // manual switch is an informed decision, so while the pin is alive both
+    // scopes stay on the chosen account. Deliberately NOT the full gate —
+    // thresholds, staleness and the preemptive Fable-weekly exclusion do
+    // not break a pin ("send it until it actually errors"); only a REAL
+    // failure does: auth failure, operator pause, an account-wide cooldown
+    // (a recorded 429 also clears the pin outright), or — for the Fable
+    // lane — a Fable-scoped cooldown. A hard-blocked or lapsed pin falls
+    // through to normal selection.
+    if let Some(pin) = snapshot.manual_pin_for(group) {
+        if pin.until > now {
+            if let Some(acct) = snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == pin.account && in_group(a, group))
+            {
+                let hard_blocked = !acct.healthy
+                    || acct.paused
+                    || acct.cooldown_until.is_some_and(|until| until > now)
+                    || (scope == RequestScope::Fable && acct.fable_cooldown_active(now));
+                if !hard_blocked {
+                    return if group_current(snapshot, group, scope) == Some(&pin.account) {
+                        Decision::Stay
+                    } else {
+                        Decision::Switch {
+                            to: pin.account.clone(),
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    // The Fable lane schedules like the main lane, but on the FABLE weekly
+    // window (issues #121/#8-report): candidates are ranked by
+    // [`fable_score`] (Fable headroom × Fable reset urgency — the exact
+    // `account_score` shape with the 7d window swapped for the Fable
+    // bucket), so a soon-resetting full Fable bucket is burned before a
+    // far-reset one (use-it-or-lose-it). Stickiness anchors on the fable
+    // slot, SEEDED from the account-wide current when the slot is empty —
+    // so with no clearly-better candidate (SWITCH_MARGIN, same damping as
+    // the main lane) fable traffic stays on the account the operator sees
+    // as current, a COLD Fable bucket included, instead of splitting
+    // prompt-cache locality across subscriptions. Round-robin keeps its
+    // absolute-stickiness contract: an eligible anchor is never abandoned.
+    if scope == RequestScope::Fable && !heuristic_degraded {
+        let anchor_id = group_current(snapshot, group, RequestScope::Fable)
+            .or_else(|| group_current(snapshot, group, RequestScope::NonFable));
+        let anchor = anchor_id.and_then(|id| eligible.iter().copied().find(|a| &a.id == id));
+        let best = eligible
+            .iter()
+            .copied()
+            .min_by(|a, b| fable_ranked(a, b, params, group, now));
+        let chosen = match (anchor, best) {
+            (Some(anchor), Some(best)) => {
+                // A COLD challenger can never be "clearly better" (review
+                // M2): with no live Fable window it scores a phantom FULL
+                // bucket at urgency 1.0, which would out-score a half-used
+                // far-reset anchor — hunting an evidence-free account splits
+                // prompt-cache locality for nothing. Cold is a valid ANCHOR
+                // (seed/stay) and a valid fallback when the anchor is
+                // ineligible, but a proactive switch requires live evidence.
+                let best_has_live_evidence =
+                    live_reset(&best.fable_weekly().map(|s| s.window), now).is_some();
+                let clearly_better = params.mode != crate::config::SchedulerMode::RoundRobin
+                    && best.id != anchor.id
+                    && best_has_live_evidence
+                    && fable_score(best, params, now)
+                        > fable_score(anchor, params, now) * (1.0 + SWITCH_MARGIN);
+                if clearly_better {
+                    best
+                } else {
+                    anchor
+                }
+            }
+            (None, Some(best)) => best,
+            (_, None) => {
+                return Decision::Exhausted {
+                    retry_after: soonest_reset(snapshot, now),
+                }
+            }
+        };
+        // `Stay` only when the FABLE slot itself already points at the
+        // choice — a seeded/fallback anchor must materialize as a Switch so
+        // the commit writes `fable_current` and the lease fast-path works.
+        return if group_current(snapshot, group, RequestScope::Fable) == Some(&chosen.id) {
+            Decision::Stay
+        } else {
+            Decision::Switch {
+                to: chosen.id.clone(),
+            }
+        };
+    }
 
     // In heuristic-degraded mode every candidate is heuristic-parked: rank by
     // soonest `cooldown_until` so the next request lands on the soonest-freed
-    // account. Otherwise use the normal perishability comparator.
-    let best = eligible
-        .iter()
-        .copied()
-        .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded));
+    // account. Otherwise use the mode's comparator: round-robin picks the next
+    // ROSTER-order account after the current (wrapping) — deterministic,
+    // score-free — while default uses the perishability comparator.
+    let best = if params.mode == crate::config::SchedulerMode::RoundRobin && !heuristic_degraded {
+        round_robin_next(snapshot, &eligible, group_current(snapshot, group, scope))
+    } else {
+        eligible
+            .iter()
+            .copied()
+            .min_by(|a, b| ranked(a, b, params, group, now, heuristic_degraded))
+    };
 
     // Stickiness with a perishability override: stay on an eligible current
     // unless some account is worth CLEARLY more right now — its score exceeds
@@ -285,8 +535,20 @@ pub fn pick(
     // soonest-`cooldown_until` choice instead of camping the (also-parked)
     // current.
     if !heuristic_degraded {
-        if let Some(current_id) = group_current(snapshot, group) {
-            if let Some(current) = eligible.iter().copied().find(|a| &a.id == current_id) {
+        if let Some(current_id) = group_current(snapshot, group, scope) {
+            if eligible.iter().any(|a| &a.id == current_id) {
+                // Round-robin stickiness is ABSOLUTE: an eligible current is
+                // never proactively abandoned — the whole point of the mode is
+                // to preserve upstream prompt-cache locality until the account
+                // is hard ineligible.
+                if params.mode == crate::config::SchedulerMode::RoundRobin {
+                    return Decision::Stay;
+                }
+                let current = eligible
+                    .iter()
+                    .copied()
+                    .find(|a| &a.id == current_id)
+                    .expect("checked above");
                 let clearly_better = match best {
                     Some(best) if &best.id != current_id => {
                         account_score(best, params, now)
@@ -311,12 +573,36 @@ pub fn pick(
     }
 }
 
+/// Round-robin choice: the first ELIGIBLE account after the current one in
+/// roster (snapshot/config) order, wrapping; with no current, the first
+/// eligible account in roster order. `eligible` preserves roster order
+/// because it filters `snapshot.accounts` in place.
+fn round_robin_next<'a>(
+    snapshot: &'a PoolSnapshot,
+    eligible: &[&'a AccountSnapshot],
+    current: Option<&AccountId>,
+) -> Option<&'a AccountSnapshot> {
+    let is_eligible = |id: &AccountId| eligible.iter().any(|a| &a.id == id);
+    let start = current
+        .and_then(|cur| snapshot.accounts.iter().position(|a| &a.id == cur))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let n = snapshot.accounts.len();
+    (0..n)
+        .map(|offset| &snapshot.accounts[(start + offset) % n])
+        .find(|a| is_eligible(&a.id))
+}
+
 /// The current account for the active selection scope: the group's slot when
 /// `Some`, the legacy slot when `None`.
-fn group_current(snapshot: &PoolSnapshot, group: Option<BackendGroup>) -> Option<&AccountId> {
+fn group_current(
+    snapshot: &PoolSnapshot,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+) -> Option<&AccountId> {
     match group {
-        Some(g) => snapshot.current_for_group(g),
-        None => snapshot.legacy_current(),
+        Some(g) => snapshot.current_for_scope(g, scope),
+        None => snapshot.legacy_current_scoped(scope),
     }
 }
 
@@ -333,7 +619,18 @@ pub fn next_in_line(
     group: Option<BackendGroup>,
 ) -> Option<AccountId> {
     let headers_only = headers_only_mode(snapshot, params, group, now);
-    let current = group_current(snapshot, group);
+    // The per-group "next" line is a display reader over the non-Fable current.
+    let current = group_current(snapshot, group, RequestScope::NonFable);
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        let eligible: Vec<&AccountSnapshot> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| in_group(a, group))
+            .filter(|a| Some(&a.id) != current)
+            .filter(|a| eligibility(a, params, now, headers_only).is_none())
+            .collect();
+        return round_robin_next(snapshot, &eligible, current).map(|a| a.id.clone());
+    }
     snapshot
         .accounts
         .iter()
@@ -388,8 +685,9 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    let r5 = (params.five_hour_max - five).max(0.0);
-    let r7 = (params.seven_day_max - seven).max(0.0);
+    let (five_max, seven_max, _) = effective_limits(account, params);
+    let r5 = (five_max - five).max(0.0);
+    let r7 = (seven_max - seven).max(0.0);
     let servable_now = r5.min(r7);
     let urgency = match live_reset(&account.seven_day, now) {
         Some(reset) => {
@@ -405,6 +703,82 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
         None => 1.0,
     };
     servable_now * urgency
+}
+
+/// [`account_score`] for the FABLE lane (issue #121 follow-up): the same
+/// servable × urgency shape with the Fable weekly bucket taking the 7d
+/// window's roles. `servable_now = min(5h, 7d, Fable headroom)` — a Fable
+/// request burns all three budgets, so the binding one wins.
+///
+/// `urgency` is HYPERBOLIC (`week / time-left`, clamped), not the main
+/// lane's linear ramp: the linear ramp under-discriminates near the reset
+/// (38h-left vs 3h-left differ by ×1.19 — inside `SWITCH_MARGIN`, so the
+/// live defect this fixes — a FULL bucket resetting in 3h ignored in favor
+/// of a 93% bucket resetting in 1d14h — would survive a linear ramp). The
+/// hyperbola is the required burn RATE: remaining budget over the time
+/// left to burn it (3h-left ≈ 56×, 38h ≈ 4.4×, 6d ≈ 1.2×), so imminent
+/// resets win decisively while far resets leave stickiness in charge. A
+/// COLD bucket (never observed) has no known perishability and scores 1.0×
+/// — held by anchoring, never hunted.
+pub fn fable_score(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> f64 {
+    let five = account
+        .five_hour
+        .map_or(0.0, |w| w.effective_utilization(now));
+    let seven = account
+        .seven_day
+        .map_or(0.0, |w| w.effective_utilization(now));
+    let fable_window = account.fable_weekly().map(|s| s.window);
+    let fable = fable_window.map_or(0.0, |w| w.effective_utilization(now));
+    let (five_max, seven_max, fable_max) = effective_limits(account, params);
+    let r5 = (five_max - five).max(0.0);
+    let r7 = (seven_max - seven).max(0.0);
+    let rf = (fable_max - fable).max(0.0);
+    let servable_now = r5.min(r7).min(rf);
+    let urgency = match live_reset(&fable_window, now) {
+        Some(reset) => {
+            let secs_left = reset
+                .duration_since(now)
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f64()
+                .max(1.0);
+            (SEVEN_DAY_PERIOD.as_secs_f64() / secs_left).clamp(1.0, FABLE_URGENCY_CAP)
+        }
+        None => 1.0,
+    };
+    servable_now * urgency
+}
+
+/// Ceiling for the hyperbolic Fable urgency: a reset ≤ ~100 minutes out is
+/// already maximally urgent — an unbounded hyperbola near zero would just
+/// amplify float noise between two both-imminent buckets.
+const FABLE_URGENCY_CAP: f64 = 100.0;
+
+/// [`rank`] for the FABLE lane: higher [`fable_score`] first, then soonest
+/// live Fable reset (known before unknown), then lower 5h utilization, then
+/// stable id. The codex tier rule is irrelevant here (fable models route to
+/// the claude group).
+fn fable_ranked(
+    a: &AccountSnapshot,
+    b: &AccountSnapshot,
+    params: &SelectParams,
+    _group: Option<BackendGroup>,
+    now: SystemTime,
+) -> Ordering {
+    let fable_reset = |x: &AccountSnapshot| live_reset(&x.fable_weekly().map(|s| s.window), now);
+    fable_score(b, params, now)
+        .total_cmp(&fable_score(a, params, now))
+        .then_with(|| match (fable_reset(a), fable_reset(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| {
+            let five =
+                |x: &AccountSnapshot| x.five_hour.map_or(0.0, |w| w.effective_utilization(now));
+            five(a).total_cmp(&five(b))
+        })
+        .then_with(|| a.id.cmp(&b.id))
 }
 
 /// Ranking comparator: provider tier first (codex accounts are the overflow
@@ -515,15 +889,23 @@ pub fn selection_order(
             ineligible.push(idx);
         }
     }
-    eligible.sort_by(|&a, &b| {
-        rank(
-            &snapshot.accounts[a],
-            &snapshot.accounts[b],
-            params,
-            group,
-            now,
-        )
-    });
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        // Display the literal rotation: roster order starting after the
+        // current account (wrapping) — the order round_robin_next serves.
+        let start = current.first().map(|&i| i + 1).unwrap_or(0);
+        let n = snapshot.accounts.len().max(1);
+        eligible.sort_by_key(|&i| (i + n - (start % n)) % n);
+    } else {
+        eligible.sort_by(|&a, &b| {
+            rank(
+                &snapshot.accounts[a],
+                &snapshot.accounts[b],
+                params,
+                group,
+                now,
+            )
+        });
+    }
     current
         .into_iter()
         .chain(eligible)
@@ -543,6 +925,7 @@ pub fn blocking_reason(
 ) -> String {
     match reason {
         IneligibleReason::AuthUnhealthy => "auth failed".to_string(),
+        IneligibleReason::Paused => "paused".to_string(),
         IneligibleReason::CoolingDown => {
             match account
                 .cooldown_until
@@ -559,7 +942,7 @@ pub fn blocking_reason(
             format!(
                 "5h {:.1}% > {:.0}%",
                 util * 100.0,
-                params.five_hour_max * 100.0
+                effective_limits(account, params).0 * 100.0
             )
         }
         IneligibleReason::SevenDayOverThreshold => {
@@ -569,7 +952,7 @@ pub fn blocking_reason(
             format!(
                 "7d {:.1}% > {:.0}%",
                 util * 100.0,
-                params.seven_day_max * 100.0
+                effective_limits(account, params).1 * 100.0
             )
         }
         IneligibleReason::UsageStale => {
@@ -578,6 +961,22 @@ pub fn blocking_reason(
                 None => "usage stale".to_string(),
             }
         }
+        IneligibleReason::FableCoolingDown => {
+            match account
+                .fable_cooldown_until(now)
+                .and_then(|until| until.duration_since(now).ok())
+            {
+                Some(left) => format!("fable cooldown {}", compact_duration(left)),
+                None => "fable cooldown".to_string(),
+            }
+        }
+        IneligibleReason::FableWeeklyExhausted => match account.fable_weekly() {
+            Some(fable) => format!(
+                "fable {:.0}% critical",
+                fable.window.effective_utilization(now) * 100.0
+            ),
+            None => "fable critical".to_string(),
+        },
     }
 }
 
@@ -623,11 +1022,113 @@ pub fn soonest_reset(snapshot: &PoolSnapshot, now: SystemTime) -> Option<Duratio
         .min()
 }
 
+/// Why a (group, scope) pool has no eligible account (issue #71). Every
+/// blocker being a cooldown means the pool recovers in seconds — the proxy
+/// must answer with a prompt-retry signal, never a window-reset-scale
+/// `retry-after`. Anything else is a genuine quota/health exhaustion for
+/// which the window-reset answer is honest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExhaustionKind {
+    /// Every otherwise-usable in-group account is parked ONLY by an
+    /// account-wide or requested-scope cooldown; `min_expiry` is the soonest
+    /// recovery across those parks. `upstream_mandated` is true when that
+    /// soonest park came from an upstream `retry-after`
+    /// ([`CooldownSource::RetryAfter`]) — a wait upstream itself dictated, so
+    /// a 429 carrying it is honest. False means the soonest park is our own
+    /// heuristic guess on a header-less 429 (or a model-scoped park), i.e. a
+    /// transient the client should just retry through.
+    CooldownBlocked {
+        min_expiry: Duration,
+        upstream_mandated: bool,
+    },
+    /// At least part of the pool is gated by quota windows / auth health /
+    /// staleness — not a transient park.
+    WindowBlocked,
+}
+
+/// Classify WHY the (group, scope) pool is exhausted right now, plus how many
+/// accounts the answer speaks for (the honest count for the client-facing
+/// message — never the whole multi-group pool size).
+///
+/// - Any account blocked only by `CoolingDown`/`FableCoolingDown` counts as
+///   transiently parked; if at least one such account exists the pool is
+///   [`ExhaustionKind::CooldownBlocked`] (it recovers when the soonest park
+///   lapses, regardless of how the rest is gated).
+/// - Otherwise [`ExhaustionKind::WindowBlocked`], counting every in-group
+///   account.
+pub fn classify_exhaustion(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+    now: SystemTime,
+) -> (ExhaustionKind, usize) {
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    let heuristic_degraded = heuristic_degraded_mode(snapshot, params, group, now);
+    let mut in_group_total = 0usize;
+    let mut cooldown_blocked = 0usize;
+    // (expiry, came-from-upstream-retry-after) of the soonest park seen.
+    let mut min_park: Option<(Duration, bool)> = None;
+    for a in snapshot.accounts.iter().filter(|a| in_group(a, group)) {
+        in_group_total += 1;
+        match gate_scoped(a, params, now, headers_only, heuristic_degraded, scope) {
+            Some(IneligibleReason::CoolingDown) | Some(IneligibleReason::FableCoolingDown) => {
+                cooldown_blocked += 1;
+                let mandated = matches!(
+                    a.cooldown_source,
+                    Some(crate::scheduler::CooldownSource::RetryAfter)
+                );
+                let account_wide = a
+                    .cooldown_until
+                    .and_then(|t| t.duration_since(now).ok())
+                    .map(|d| (d, mandated));
+                // Model-scoped parks are always our own header-less-429
+                // heuristic — never upstream-mandated.
+                let scoped = a
+                    .scoped_cooldowns
+                    .iter()
+                    .filter(|c| match scope {
+                        RequestScope::Fable => {
+                            c.scope.matches_label(crate::routing::FABLE_SCOPE_LABEL)
+                        }
+                        _ => false,
+                    })
+                    .filter_map(|c| c.until.duration_since(now).ok())
+                    .min()
+                    .map(|d| (d, false));
+                for cand in account_wide.into_iter().chain(scoped) {
+                    min_park = Some(match min_park {
+                        Some(cur) if cur.0 <= cand.0 => cur,
+                        _ => cand,
+                    });
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    if cooldown_blocked > 0 {
+        // A gate can say CoolingDown while the snapshot's timestamps have
+        // already lapsed mid-race; fall back to the heuristic park length so
+        // the caller still answers seconds, not window resets.
+        let (min_expiry, upstream_mandated) =
+            min_park.unwrap_or((crate::scheduler::DEFAULT_HEURISTIC_COOLDOWN, false));
+        (
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            },
+            cooldown_blocked,
+        )
+    } else {
+        (ExhaustionKind::WindowBlocked, in_group_total)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::window::{QuotaWindow, WindowSource};
-    use crate::scheduler::CooldownSource;
+    use crate::scheduler::window::{LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource};
+    use crate::scheduler::{Cooldown429Reason, CooldownScope, CooldownSource, ModelScopedCooldown};
 
     const HOUR: u64 = 3600;
     const NOW_SECS: u64 = 1_000_000;
@@ -644,6 +1145,8 @@ mod tests {
         SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 0.99,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -670,12 +1173,108 @@ mod tests {
             group: BackendGroup::Claude,
             five_hour: None,
             seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
             cooldown_until: None,
             cooldown_source: None,
             in_flight: 0,
             token_expires_at_ms: None,
             last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
         }
+    }
+
+    #[test]
+    fn round_robin_stays_until_hard_ineligible_then_takes_roster_order() {
+        let rr = || {
+            let mut p = params();
+            p.mode = crate::config::SchedulerMode::RoundRobin;
+            p
+        };
+        // Three accounts in roster order a, b, c; current = b.
+        let mut a = account("a");
+        a.seven_day = Some(window(0.10, 600_000));
+        let mut b = account("b");
+        b.seven_day = Some(window(0.95, 1_000)); // resets soon → default mode would prefer burning it? b IS current
+        let mut c = account("c");
+        c.seven_day = Some(window(0.20, 500_000));
+        // Current b is still eligible → absolute stay, even though other
+        // accounts may score higher.
+        let snap = pool(vec![a.clone(), b.clone(), c.clone()], Some("b"));
+        assert_eq!(pick(&snap, &rr(), None, now()), Decision::Stay);
+        // Current b crosses its 7d ceiling → hard ineligible → the NEXT
+        // roster account after b is c (wrap would continue to a).
+        let mut b_dead = b.clone();
+        b_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a.clone(), b_dead, c.clone()], Some("b"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("c".into())
+            },
+            "roster order after the current, not the best score"
+        );
+        // Wrapping: current = c (last) → next is a.
+        let mut c_dead = c.clone();
+        c_dead.seven_day = Some(window(0.995, 1_000));
+        let snap = pool(vec![a, account("b2"), c_dead], Some("c"));
+        assert_eq!(
+            pick(&snap, &rr(), None, now()),
+            Decision::Switch {
+                to: AccountId("a".into())
+            },
+            "rotation wraps to the roster head"
+        );
+    }
+
+    #[test]
+    fn per_account_limit_overrides_beat_the_global_ceilings() {
+        // Global 5h ceiling is 0.90; this account overrides it down to 0.50.
+        let mut a = account("alpha");
+        a.five_hour = Some(window(0.60, 3_600));
+        a.limits.five_hour_max = Some(0.50);
+        assert_eq!(
+            eligibility(&a, &params(), now(), false),
+            Some(IneligibleReason::FiveHourOverThreshold),
+            "0.60 > per-account 0.50 even though the global ceiling is 0.90"
+        );
+        // The blocking reason reports the EFFECTIVE ceiling.
+        let reason = blocking_reason(
+            &a,
+            IneligibleReason::FiveHourOverThreshold,
+            &params(),
+            now(),
+        );
+        assert!(
+            reason.contains("> 50%"),
+            "effective ceiling in text: {reason}"
+        );
+        // Clearing the override restores the global ceiling.
+        a.limits.five_hour_max = None;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
+    }
+
+    #[test]
+    fn paused_account_is_ineligible_in_every_mode_and_reads_paused() {
+        let mut a = account("alpha");
+        a.paused = true;
+        // Normal, headers-only, and heuristic-degraded modes all refuse it.
+        for (headers_only, degraded) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                gate(&a, &params(), now(), headers_only, degraded),
+                Some(IneligibleReason::Paused),
+                "headers_only={headers_only} degraded={degraded}"
+            );
+        }
+        assert_eq!(
+            blocking_reason(&a, IneligibleReason::Paused, &params(), now()),
+            "paused"
+        );
+        // Resumed → eligible again.
+        a.paused = false;
+        assert_eq!(eligibility(&a, &params(), now(), false), None);
     }
 
     /// Build a snapshot whose legacy current slot is `current` (the
@@ -688,6 +1287,8 @@ mod tests {
         PoolSnapshot {
             accounts,
             current: map,
+            fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
         }
     }
 
@@ -958,6 +1559,8 @@ mod tests {
         PoolSnapshot {
             accounts,
             current: map,
+            fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1060,7 +1663,12 @@ mod tests {
         for (g, c) in slots {
             current.insert(*g, AccountId(c.to_string()));
         }
-        PoolSnapshot { accounts, current }
+        PoolSnapshot {
+            accounts,
+            current,
+            fable_current: std::collections::BTreeMap::new(),
+            manual_pin: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -1848,6 +2456,8 @@ mod tests {
         let p = SelectParams {
             five_hour_max: 0.90,
             seven_day_max: 1.0,
+            fable_weekly_max: 0.98,
+            mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
         };
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
@@ -1922,5 +2532,380 @@ mod tests {
             "headroom policy wastes a soon-resetting account's budget: \
              old dropped {old_dropped} vs new {new_dropped}"
         );
+    }
+
+    // ---- scope-aware gating: Fable cooldown ≠ whole-account cooldown (W2) ----
+
+    /// An account holding a live Fable-scoped cooldown freeing `free_in` secs
+    /// out (account-wide state otherwise clean).
+    fn fable_cooling(id_: &str, free_in: u64) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_cooldowns = vec![ModelScopedCooldown {
+            scope: CooldownScope::ModelScoped("Fable".into()),
+            until: at(NOW_SECS + free_in),
+            set_at: at(NOW_SECS),
+            reason: Cooldown429Reason::FableSuspectSnapshotMismatch,
+        }];
+        a
+    }
+
+    /// An account whose Fable weekly bucket reads critical/active (preemptive
+    /// exclusion territory), account-wide state otherwise clean.
+    fn fable_critical(id_: &str) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(1.0, 24 * HOUR),
+            severity: LimitSeverity::Critical,
+            is_active: true,
+        }];
+        a
+    }
+
+    #[test]
+    fn gate_scoped_benches_fable_but_not_non_fable_on_a_fable_cooldown() {
+        let a = fable_cooling("a", 8);
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::NonFable),
+            None,
+            "non-Fable request ignores the Fable-scoped cooldown"
+        );
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableCoolingDown)
+        );
+    }
+
+    #[test]
+    fn gate_scoped_preemptively_excludes_fable_critical_from_fable_only() {
+        let a = fable_critical("a");
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::NonFable),
+            None,
+            "a Fable-critical account still serves non-Fable traffic"
+        );
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableWeeklyExhausted)
+        );
+    }
+
+    #[test]
+    fn reset_fable_window_no_longer_excludes_fable() {
+        // is_active=true but the weekly window has already reset → carries no
+        // constraint (reset-aware via effective_utilization).
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: QuotaWindow {
+                utilization: 1.0,
+                resets_at: at(NOW_SECS - 1),
+                fetched_at: at(NOW_SECS - 10),
+                source: WindowSource::UsagePoll,
+            },
+            severity: LimitSeverity::Critical,
+            is_active: true,
+        }];
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::Fable),
+            None,
+            "a reset Fable window stops excluding Fable"
+        );
+    }
+
+    /// An account whose Fable weekly bucket is at 76% / `warning` /
+    /// `is_active: true` — the live-evidence regression shape: `is_active` marks
+    /// the representative limit, NOT an exhausted one, so ~24% headroom remains.
+    fn fable_headroom(id_: &str) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.76, 24 * HOUR),
+            severity: LimitSeverity::Warning,
+            is_active: true,
+        }];
+        a
+    }
+
+    #[test]
+    fn fable_request_is_allowed_to_an_account_with_fable_headroom() {
+        // Regression (W2 `is_active` misread): a Fable weekly at
+        // 76%/warning/is_active=true is NOT exhausted — `is_active` means "the
+        // governing limit", not "rejecting". The account keeps ~24% headroom, so
+        // a Fable request must be ALLOWED (gate returns None).
+        let ok = fable_headroom("ok");
+        assert!(
+            !ok.fable_weekly_exhausted(now(), 0.98),
+            "76%/warning/is_active is NOT exhausted — it still has headroom"
+        );
+        assert_eq!(
+            gate_scoped(&ok, &params(), now(), false, false, RequestScope::Fable),
+            None,
+            "a Fable request to a 76% (is_active, warning) account is eligible"
+        );
+        // Contrast: a genuinely exhausted Fable account (100%/Critical/is_active)
+        // IS still excluded from Fable routing.
+        let dead = fable_critical("dead");
+        assert!(dead.fable_weekly_exhausted(now(), 0.98));
+        assert_eq!(
+            gate_scoped(&dead, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableWeeklyExhausted),
+            "a util=1.0/Critical/is_active Fable account stays excluded"
+        );
+    }
+
+    #[test]
+    fn pick_scoped_fable_avoids_a_fable_dead_current_non_fable_stays() {
+        // a is the sticky current and Fable-dead (scoped cooldown) but
+        // account-wide clean; b is clean. A non-Fable request stays on a; a
+        // Fable request switches off a to b.
+        let a = fable_cooling("a", 60);
+        let b = account("b");
+        let snap = pool(vec![a, b], Some("a"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::NonFable),
+            Decision::Stay,
+            "non-Fable stays on the sticky current"
+        );
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("b") },
+            "Fable switches off the Fable-dead current"
+        );
+    }
+
+    #[test]
+    fn pick_scoped_fable_exhausts_when_every_account_is_fable_dead() {
+        // The only account is Fable-critical: a Fable request exhausts, while a
+        // non-Fable request still selects it.
+        let a = fable_critical("a");
+        let snap = pool(vec![a], None);
+        assert!(matches!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Exhausted { .. }
+        ));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::NonFable),
+            Decision::Switch { to: id("a") },
+            "non-Fable capacity is untouched"
+        );
+    }
+
+    fn fable_bucket(id_: &str, utilization: f64, resets_in_secs: u64) -> AccountSnapshot {
+        let mut a = account(id_);
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(utilization, resets_in_secs),
+            severity: LimitSeverity::Normal,
+            is_active: false,
+        }];
+        a
+    }
+
+    /// Live defect 2026-07-16: two subscriptions — the fable lane camped a
+    /// 93%-remaining bucket resetting in 1d14h while a FULL bucket resetting
+    /// in 3h went unburned and expired. Use-it-or-lose-it must win: the
+    /// hyperbolic urgency (needed burn rate) makes the imminent reset
+    /// decisive over stickiness.
+    #[test]
+    fn fable_lane_burns_the_soon_resetting_full_bucket_first() {
+        let far = fable_bucket("far", 0.07, 38 * HOUR);
+        let soon = fable_bucket("soon", 0.0, 3 * HOUR);
+        // `far` is the account current AND the sticky fable current.
+        let mut snap = pool(vec![far, soon], Some("far"));
+        snap.fable_current.insert(BackendGroup::Claude, id("far"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("soon") },
+            "a full bucket resetting in 3h outranks a camped 93% bucket at 1d14h"
+        );
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::NonFable),
+            Decision::Stay,
+            "the main lane is untouched by fable perishability"
+        );
+    }
+
+    /// Issue #121: with no clearly-better bucket, the fable lane anchors on
+    /// the account-wide current — a COLD fable bucket included — and the
+    /// seeded anchor materializes as a Switch so `fable_current` commits.
+    #[test]
+    fn fable_lane_seeds_its_slot_from_the_account_current_when_cold() {
+        // Both accounts fable-cold: no perishability evidence anywhere.
+        let a = account("a");
+        let b = account("b");
+        let snap = pool(vec![a, b], Some("b"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("b") },
+            "empty fable slot seeds from the account current, not the ranker's pick"
+        );
+        // Once the slot points at the anchor, the lane stays.
+        let mut snap = pool(vec![account("a"), account("b")], Some("b"));
+        snap.fable_current.insert(BackendGroup::Claude, id("b"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Stay
+        );
+    }
+
+    /// Review M2 (PR #124): a COLD challenger must never hunt a known
+    /// anchor — no live Fable window means a phantom full bucket, not
+    /// evidence. The half-used far-reset anchor stays.
+    #[test]
+    fn fable_lane_never_hunts_a_cold_challenger_over_a_known_anchor() {
+        // Anchor: known mid-utilization, long runway (score ≈ 0.56).
+        let anchor = fable_bucket("anchor", 0.50, 6 * 24 * HOUR);
+        // Challenger: fable-COLD (phantom full headroom, score ≈ 0.9+).
+        let cold = account("cold");
+        let mut snap = pool(vec![anchor, cold], Some("anchor"));
+        snap.fable_current
+            .insert(BackendGroup::Claude, id("anchor"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Stay,
+            "cold is held by anchoring, never hunted"
+        );
+        // A KNOWN soon-resetting challenger still wins (the M2 guard must
+        // not disable real perishability evidence).
+        let anchor = fable_bucket("anchor", 0.50, 6 * 24 * HOUR);
+        let soon = fable_bucket("soon", 0.0, 3 * HOUR);
+        let mut snap = pool(vec![anchor, soon], Some("anchor"));
+        snap.fable_current
+            .insert(BackendGroup::Claude, id("anchor"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("soon") }
+        );
+    }
+
+    /// Paused is absolute for the fable lane too (issue #121): a paused
+    /// anchor is never followed — the lane picks among the remaining
+    /// eligible accounts.
+    #[test]
+    fn fable_lane_never_follows_a_paused_anchor() {
+        let mut a = account("a");
+        a.paused = true;
+        let b = account("b");
+        let mut snap = pool(vec![a, b], Some("a"));
+        snap.fable_current.insert(BackendGroup::Claude, id("a"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, now(), RequestScope::Fable),
+            Decision::Switch { to: id("b") },
+            "a paused fable sticky current is abandoned at the next evaluation"
+        );
+    }
+
+    #[test]
+    fn blocking_reason_covers_the_fable_scoped_states() {
+        let cooling = fable_cooling("a", 192);
+        assert_eq!(
+            blocking_reason(
+                &cooling,
+                IneligibleReason::FableCoolingDown,
+                &params(),
+                now()
+            ),
+            "fable cooldown 3m12s"
+        );
+        let critical = fable_critical("b");
+        assert_eq!(
+            blocking_reason(
+                &critical,
+                IneligibleReason::FableWeeklyExhausted,
+                &params(),
+                now()
+            ),
+            "fable 100% critical"
+        );
+    }
+
+    // ---- exhaustion classification (issue #71): transient park ≠ quota ----
+
+    #[test]
+    fn burst_fable_cooldowns_classify_as_cooldown_blocked_with_seconds_expiry() {
+        // Two fable-parked accounts (8s + 5s) with 5h/7d resets HOURS away:
+        // the answer must be the 5s park, never a window-reset-scale value.
+        let mut a = fable_cooling("a", 8);
+        a.five_hour = Some(window(0.10, 2 * HOUR));
+        let mut b = fable_cooling("b", 5);
+        b.five_hour = Some(window(0.10, 2 * HOUR));
+        let snap = pool(vec![a, b], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::Fable, now());
+        assert_eq!(eligible, 2);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(5));
+                assert!(!upstream_mandated, "scoped parks are our own heuristic");
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_capped_pool_classifies_as_window_blocked() {
+        let mut a = account("a");
+        a.seven_day = Some(window(1.0, 24 * HOUR));
+        let mut b = account("b");
+        b.seven_day = Some(window(1.0, 24 * HOUR));
+        let snap = pool(vec![a, b], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::NonFable, now());
+        assert_eq!(kind, ExhaustionKind::WindowBlocked);
+        assert_eq!(
+            eligible, 2,
+            "window-blocked speaks for the whole in-group pool"
+        );
+    }
+
+    #[test]
+    fn mixed_pool_recovers_when_the_park_lapses_so_cooldown_wins() {
+        // One account fable-parked 8s out, one fable-weekly-capped for days:
+        // the pool is usable again in 8s — CooldownBlocked, counting only the
+        // parked account.
+        let cooled = fable_cooling("a", 8);
+        let capped = fable_critical("b");
+        let snap = pool(vec![cooled, capped], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::Fable, now());
+        assert_eq!(eligible, 1);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(8));
+                assert!(!upstream_mandated);
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_retry_after_park_classifies_as_mandated_cooldown() {
+        // An upstream-mandated park (retry-after header) is still
+        // CooldownBlocked, but flagged mandated: the proxy answers 429 with
+        // exactly that wait — upstream's own number is honest.
+        let mut a = account("a");
+        a.cooldown_until = Some(at(NOW_SECS + 1800));
+        a.cooldown_source = Some(CooldownSource::RetryAfter);
+        let snap = pool(vec![a], Some("a"));
+        let (kind, eligible) =
+            classify_exhaustion(&snap, &params(), None, RequestScope::NonFable, now());
+        assert_eq!(eligible, 1);
+        match kind {
+            ExhaustionKind::CooldownBlocked {
+                min_expiry,
+                upstream_mandated,
+            } => {
+                assert_eq!(min_expiry, Duration::from_secs(1800));
+                assert!(upstream_mandated);
+            }
+            other => panic!("expected CooldownBlocked, got {other:?}"),
+        }
     }
 }

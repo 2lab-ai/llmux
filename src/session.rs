@@ -84,6 +84,17 @@ pub struct Session {
     pub first_ms: u64,
     /// Latest record timestamp (ms since epoch) in the session.
     pub last_ms: u64,
+    /// Σ request duration over records that RECORDED one (raw-io
+    /// `duration_ms` is additive — pre-field records contribute nothing),
+    /// plus how many did. The honest per-session output rate is
+    /// `Σtokens_out_timed / Σduration` — never tokens over the wall-clock
+    /// span (idle time between requests is not generation time).
+    pub duration_ms_sum: u64,
+    pub timed_requests: u64,
+    /// Σ `usage.output_tokens` over exactly the timed records — the matching
+    /// numerator for `duration_ms_sum` (mixing all-records output with
+    /// timed-only duration would inflate the rate).
+    pub tokens_out_timed: u64,
     /// Grouping confidence for this session row.
     pub confidence: Confidence,
 }
@@ -145,6 +156,9 @@ struct Acc {
     prev_account: Option<String>,
     /// Whether any record in this group lacked a `user_id` (forces `Low`).
     any_missing_user_id: bool,
+    duration_ms_sum: u64,
+    timed_requests: u64,
+    tokens_out_timed: u64,
 }
 
 impl Acc {
@@ -161,6 +175,9 @@ impl Acc {
             last_ms: ts_ms,
             prev_account: None,
             any_missing_user_id: false,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
         }
     }
 
@@ -183,6 +200,9 @@ impl Acc {
             account_rotations: self.account_rotations,
             first_ms: self.first_ms,
             last_ms: self.last_ms,
+            duration_ms_sum: self.duration_ms_sum,
+            timed_requests: self.timed_requests,
+            tokens_out_timed: self.tokens_out_timed,
             confidence,
         }
     }
@@ -225,6 +245,14 @@ pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
                 let (tin, tout) = tokens_from_response_body(&rec.response_body);
                 acc.tokens_in = acc.tokens_in.saturating_add(tin);
                 acc.tokens_out = acc.tokens_out.saturating_add(tout);
+                // Timed rate sums (perf telemetry v1): only records that
+                // recorded a duration contribute — numerator and denominator
+                // stay paired, pre-field history contributes nothing.
+                if let Some(ms) = rec.duration_ms {
+                    acc.duration_ms_sum = acc.duration_ms_sum.saturating_add(ms);
+                    acc.timed_requests = acc.timed_requests.saturating_add(1);
+                    acc.tokens_out_timed = acc.tokens_out_timed.saturating_add(tout);
+                }
                 if let Some(model) = &rec.model {
                     acc.models.insert(model.clone());
                 }
@@ -293,8 +321,15 @@ mod tests {
             model: Some(model.into()),
             account: Some(account.into()),
             status: Some(200),
+            duration_ms: Some(1_000),
             request_body,
             response_body,
+            request_headers: Some(vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-api-key".into(), "•••redacted".into()),
+            ]),
+            response_headers: Some(vec![("request-id".into(), format!("req_{id}"))]),
+            upstream: None,
         }
     }
 

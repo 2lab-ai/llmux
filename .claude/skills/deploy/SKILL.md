@@ -1,11 +1,11 @@
 ---
 name: deploy
-description: Use when the user says "배포", "배포해줘", "deploy", or "ship a preview" for llmux. Pushes to master, lets CI publish a preview prerelease, refreshes the llmux-preview brew formula, verifies brew actually updated, then hot-deploys that build locally and restarts.
+description: Use when the user says "배포", "배포해줘", "deploy", or "ship a preview" for llmux. Pushes to main, lets CI publish a preview prerelease, refreshes the llmux-preview brew formula, verifies brew actually updated, then hot-deploys that build locally and restarts.
 ---
 
 # deploy (배포) — preview channel
 
-Ship the current work as a **preview**: master → CI preview build → brew `llmux-preview`
+Ship the current work as a **preview**: main → CI preview build → brew `llmux-preview`
 → local. For a local-only dev loop use `build`; for a stable release use `release`.
 
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
@@ -15,9 +15,9 @@ procedure B = publish+verify brew).
 
 1. **Pre-flight.** `just check` green; know what's uncommitted (`git status`). If dirty, ask
    whether to commit (and the message) or stash. *(Decision point.)*
-2. **Land on master.** If on a branch, merge/fast-forward into master per repo norm.
-   **Confirm with the user before pushing master** (public preview channel), then
-   `git push origin master` (token fallback if needed).
+2. **Land on main.** If on a branch, merge/fast-forward into main per repo norm.
+   **Confirm with the user before pushing main** (public preview channel), then
+   `git push origin main` (token fallback if needed).
 3. **Watch the preview build.**
    ```bash
    rid=$(gh run list --repo 2lab-ai/llmux --workflow preview.yml -L1 --json databaseId -q '.[0].databaseId')

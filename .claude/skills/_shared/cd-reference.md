@@ -5,9 +5,9 @@ All facts verified 2026-06-14.
 
 ## Topology
 
-- Repo: `2lab-ai/llmux`, default branch `master`. 4-target build matrix
+- Repo: `2lab-ai/llmux`, default branch `main`. 4-target build matrix
   (macos aarch64/x86_64, linux aarch64/x86_64).
-- `.github/workflows/preview.yml` — on **push to master** → prerelease
+- `.github/workflows/preview.yml` — on **push to main** → prerelease
   `preview-<YYYY-MM-DD-HHMM>-<sha12>` (4 binaries + SHA256SUMS).
 - `.github/workflows/release.yml` — on **push of tag `v*`** → verifies tag == `Cargo.toml`
   version, then a stable release `v<x.y.z>`.

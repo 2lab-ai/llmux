@@ -1,0 +1,170 @@
+name: Islands parity
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-islands.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "llmux-islands/**"
+      - "llmux-islands-core/**"
+      - "llmux-islands-linux/**"
+      - "llmux-islands-macos-bridge/**"
+      - "src/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/linux-islands.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "llmux-islands/**"
+      - "llmux-islands-core/**"
+      - "llmux-islands-linux/**"
+      - "llmux-islands-macos-bridge/**"
+      - "src/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: islands-parity-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semantic-core:
+    name: semantic core
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: llmux-islands-core
+          key: linux-islands-core
+
+      - name: Format
+        run: cargo fmt --manifest-path llmux-islands-core/Cargo.toml --check
+
+      - name: Lint
+        run: cargo clippy --manifest-path llmux-islands-core/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --manifest-path llmux-islands-core/Cargo.toml --locked
+
+  arch-kde:
+    name: Arch KDE shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build and smoke-test in clean Arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: llmux-islands-linux/packaging/arch/Dockerfile
+          target: evidence
+          outputs: type=local,dest=llmux-islands-evidence
+
+      - name: Upload deterministic surface evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmux-islands-kde-snapshots
+          path: llmux-islands-evidence/snapshots
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-shell:
+    name: macOS shared-core shell
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            llmux-islands-core
+            llmux-islands-macos-bridge
+          key: macos-islands-bridge
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Check the Rust macOS bridge
+        run: |
+          cargo fmt --manifest-path llmux-islands-macos-bridge/Cargo.toml --check
+          cargo clippy --manifest-path llmux-islands-macos-bridge/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path llmux-islands-macos-bridge/Cargo.toml --locked
+
+      - name: Link and run the C ABI smoke test
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          cargo build --manifest-path llmux-islands-macos-bridge/Cargo.toml --release --locked
+          cc -std=c11 -Wall -Wextra -Werror -mmacosx-version-min=14.0 \
+            -Wl,-fatal_warnings \
+            -I llmux-islands-macos-bridge/include \
+            llmux-islands-macos-bridge/tests/abi_smoke.c \
+            llmux-islands-macos-bridge/target/release/libllmux_islands_macos_bridge.a \
+            -framework Security -framework CoreFoundation \
+            -o "$RUNNER_TEMP/llmux-islands-abi-smoke"
+          "$RUNNER_TEMP/llmux-islands-abi-smoke"
+
+      - name: Generate and test the macOS app
+        working-directory: llmux-islands
+        run: |
+          xcodegen generate
+          xcodebuild -project LlmuxIslands.xcodeproj -scheme LlmuxIslands \
+            -configuration Debug -derivedDataPath "$RUNNER_TEMP/LlmuxIslandsDerivedData" \
+            CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+            test
+
+      - name: Capture deterministic macOS surface evidence
+        env:
+          LLMUX_ISLANDS_SNAPSHOT_DIR: ${{ runner.temp }}/llmux-islands-macos-snapshots
+        run: |
+          mkdir -p "$LLMUX_ISLANDS_SNAPSHOT_DIR"
+          app="$RUNNER_TEMP/LlmuxIslandsDerivedData/Build/Products/Debug/LlmuxIslands.app/Contents/MacOS/LlmuxIslands"
+          test -x "$app"
+          "$app" -emailAnonymousEnabled YES
+          for surface in menu.png usage-anon-on.png stats.png receipts-detail.png; do
+            file="$LLMUX_ISLANDS_SNAPSHOT_DIR/$surface"
+            test -s "$file"
+            test "$(stat -f%z "$file")" -gt 20000
+            test "$(od -An -tx1 -N8 "$file" | tr -d ' \n')" = "89504e470d0a1a0a"
+          done
+          cd "$LLMUX_ISLANDS_SNAPSHOT_DIR"
+          shasum -a 256 *.png > SHA256SUMS
+          test "$(shasum -a 256 menu.png usage-anon-on.png stats.png receipts-detail.png | cut -d ' ' -f 1 | sort -u | wc -l | tr -d ' ')" -eq 4
+
+      - name: Upload deterministic macOS surface evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmux-islands-macos-snapshots
+          path: ${{ runner.temp }}/llmux-islands-macos-snapshots
+          if-no-files-found: error
+          retention-days: 14

@@ -105,8 +105,36 @@ impl Proxy {
 
     /// [`Self::spawn`] over a fully custom config (codex tests point
     /// `config.codex` at the mock).
-    async fn spawn_config(mut config: Config) -> Self {
+    async fn spawn_config(config: Config) -> Self {
+        Self::spawn_prepared(config, |_| {}).await
+    }
+
+    /// [`Self::spawn_config`] with a hook that runs against the tempdir BEFORE
+    /// the server starts — the seam for pre-seeding persisted state (e.g. an
+    /// `activity.jsonl` from a "previous run") that startup must hydrate.
+    ///
+    /// Idle probing is force-disabled on this path: the probe is always-on by
+    /// default (issue #45), and its background 1-token requests would race the
+    /// scripted mock queues of tests that are not about probing. The probe
+    /// acceptance tests use [`Self::spawn_probing`], which honors the caller's
+    /// `idle_probe` config verbatim.
+    async fn spawn_prepared(mut config: Config, prepare: impl FnOnce(&std::path::Path)) -> Self {
+        config.proxy.idle_probe.enabled = false;
+        Self::spawn_probing_prepared(config, prepare).await
+    }
+
+    /// Probe acceptance tests only: spawn with the caller's `idle_probe`
+    /// config taking effect (enabled, kill-switch, sweep cadence).
+    async fn spawn_probing(config: Config) -> Self {
+        Self::spawn_probing_prepared(config, |_| {}).await
+    }
+
+    async fn spawn_probing_prepared(
+        mut config: Config,
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let tmp = TempDir::new();
+        prepare(tmp.path());
         let config_path = tmp.path().join("llmux.json");
         config.proxy.port = 0; // OS-assigned; `serve` reports it via `ready`
         config::save_path(&config_path, &config).expect("seed config");
@@ -1071,7 +1099,7 @@ fn parse_anthropic_sse(body: &str) -> Vec<(String, serde_json::Value)> {
 
 /// C1: a streaming Anthropic request served by a codex account comes back as
 /// well-formed Anthropic SSE including a full tool_use round, while the
-/// upstream saw a Responses-API request (model pinned to gpt-5.5, codex
+/// upstream saw a Responses-API request (model pinned to the default codex
 /// headers, translated body) — even with the upstream stream fragmented
 /// across awkward chunk boundaries.
 #[tokio::test]
@@ -1118,7 +1146,7 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
         ],
         "full body:\n{body}"
     );
-    assert_eq!(events[0].1["message"]["model"], "gpt-5.5");
+    assert_eq!(events[0].1["message"]["model"], "gpt-5.6-sol");
     assert_eq!(events[2].1["delta"]["text"], "Let me check.");
     assert_eq!(events[4].1["content_block"]["type"], "tool_use");
     assert_eq!(events[4].1["content_block"]["id"], "call_w1");
@@ -1138,7 +1166,10 @@ async fn codex_account_serves_anthropic_stream_with_tool_use() {
     assert_eq!(seen[0].originator.as_deref(), Some("codex_cli_rs"));
     assert_eq!(seen[0].x_api_key, None, "client x-api-key never leaks");
     let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
-    assert_eq!(upstream_body["model"], "gpt-5.5", "model always rewritten");
+    assert_eq!(
+        upstream_body["model"], "gpt-5.6-sol",
+        "model always rewritten"
+    );
     assert_eq!(upstream_body["instructions"], "Be helpful.");
     assert_eq!(upstream_body["stream"], true);
     assert_eq!(upstream_body["store"], false);
@@ -1211,7 +1242,7 @@ async fn codex_account_aggregates_non_streaming_requests() {
     );
     let message: serde_json::Value = response.json().await.expect("json");
     assert_eq!(message["type"], "message");
-    assert_eq!(message["model"], "gpt-5.5");
+    assert_eq!(message["model"], "gpt-5.6-sol");
     assert_eq!(message["stop_reason"], "tool_use");
     assert_eq!(message["content"][0]["type"], "text");
     assert_eq!(message["content"][0]["text"], "Let me check.");
@@ -1603,6 +1634,315 @@ async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Respons
     request.send().await.expect("dashboard reachable")
 }
 
+/// A driven request is captured to raw-io (bodies + headers with credential
+/// values redacted) and `GET /llmux/raw-io?id=&at_ms=` serves it back — the
+/// raw request/response viewer's data path (TUI UI-7), proven end to end:
+/// forward capture → jsonl → backwards lookup → endpoint.
+#[tokio::test]
+async fn raw_io_endpoint_serves_the_captured_exchange() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok_with(
+        r#"{"id":"msg_raw","type":"message","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        (0.20, 3_600),
+        (0.20, 12 * 3_600),
+    ));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, r#"{"model":"claude-opus-4-8"}"#).await;
+    assert_eq!(response.status(), 200);
+
+    // Read the completed entry's (id, at_ms) — the raw-io correlation pair the
+    // TUI clicks with — off the dashboard document.
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"]
+                .as_u64()
+                .expect("completed entries carry the id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "the completed doc entry carries a live activity id");
+
+    // The endpoint returns the captured exchange for that (id, at_ms) pair.
+    let raw: serde_json::Value = client
+        .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable")
+        .error_for_status()
+        .expect("raw-io 200")
+        .json()
+        .await
+        .expect("raw-io json");
+    assert_eq!(raw["id"].as_u64(), Some(id));
+    assert!(
+        raw["request_body"]
+            .as_str()
+            .expect("request body")
+            .contains("claude-opus-4-8"),
+        "verbatim request body served: {raw}"
+    );
+    assert!(
+        raw["response_body"]
+            .as_str()
+            .expect("response body")
+            .contains("msg_raw"),
+        "response body as delivered to the client: {raw}"
+    );
+    // Request headers captured in wire order; the client credential value is
+    // REDACTED while its name stays visible.
+    let req_headers = raw["request_headers"].as_array().expect("request headers");
+    let header = |n: &str| {
+        req_headers
+            .iter()
+            .find(|p| p[0] == n)
+            .map(|p| p[1].as_str().unwrap().to_string())
+    };
+    assert_eq!(header("content-type").as_deref(), Some("application/json"));
+    assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
+    assert_eq!(header("x-api-key").as_deref(), Some("•••redacted"));
+    assert!(
+        raw["response_headers"].as_array().is_some(),
+        "response headers captured: {raw}"
+    );
+    // The claude passthrough is byte-identity — no separate upstream half
+    // (the raw viewer's 2-payload case, UI-8).
+    assert!(
+        raw["upstream"].is_null(),
+        "passthrough records carry no upstream half: {raw}"
+    );
+
+    // An unknown id (or an id from another daemon run's window) is a 404.
+    let miss = client
+        .get(proxy.url(&format!("/llmux/raw-io?id=777777&at_ms={at_ms}")))
+        .send()
+        .await
+        .expect("raw-io reachable");
+    assert_eq!(miss.status(), 404);
+}
+
+/// A TRANSLATED (codex) exchange captures all four payload legs (UI-8): the
+/// client request, the REWRITTEN Responses-API request llmux sent upstream,
+/// the verbatim upstream reply BEFORE transformation, and the Anthropic-SSE
+/// response delivered to the client — with upstream credentials redacted.
+#[tokio::test]
+async fn raw_io_translated_exchange_captures_the_upstream_half() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 64));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    // Drain the client stream so the relay finishes and flushes the record.
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    assert!(body.contains("message_start"), "anthropic SSE out:\n{body}");
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().expect("id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "completed entry landed on the dashboard");
+
+    // The record may flush a beat after the activity event — poll briefly.
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let response = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .send()
+            .await
+            .expect("raw-io reachable");
+        if response.status().is_success() {
+            raw = response.json().await.expect("raw-io json");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let upstream = &raw["upstream"];
+    assert!(
+        upstream.is_object(),
+        "translated exchange carries the upstream half: {raw}"
+    );
+    assert!(
+        upstream["url"]
+            .as_str()
+            .expect("upstream url")
+            .contains("/responses"),
+        "rewritten target URL: {upstream}"
+    );
+    assert!(
+        upstream["request_body"]
+            .as_str()
+            .expect("upstream request body")
+            .contains("\"input\""),
+        "the REWRITTEN Responses-API body, not the client's: {upstream}"
+    );
+    assert!(
+        upstream["response_body"]
+            .as_str()
+            .expect("upstream response body")
+            .contains("response.completed"),
+        "verbatim pre-transform upstream reply: {upstream}"
+    );
+    let up_req_headers = upstream["request_headers"]
+        .as_array()
+        .expect("upstream request headers");
+    let auth = up_req_headers
+        .iter()
+        .find(|p| p[0] == "authorization")
+        .map(|p| p[1].as_str().unwrap().to_string());
+    assert_eq!(
+        auth.as_deref(),
+        Some("•••redacted"),
+        "upstream bearer never lands on disk: {upstream}"
+    );
+    // Client legs keep their own shapes: verbatim inbound body, synthesized
+    // outbound headers (the transform relay writes its own SSE response).
+    assert!(raw["request_body"]
+        .as_str()
+        .expect("client request body")
+        .contains("claude-sonnet-4-5"));
+    assert!(raw["response_body"]
+        .as_str()
+        .expect("client response body")
+        .contains("message_start"));
+    let res_headers = raw["response_headers"]
+        .as_array()
+        .expect("client response headers");
+    assert!(
+        res_headers
+            .iter()
+            .any(|p| p[0] == "content-type" && p[1] == "text/event-stream"),
+        "client response headers are the synthesized SSE ones: {raw}"
+    );
+}
+
+/// A translated (codex) 4xx: the raw record's CLIENT `Response` leg must hold
+/// the Anthropic-shaped error llmux SYNTHESIZED for the client — not the
+/// provider's verbatim body, which belongs only in the upstream half (UI-8
+/// fidelity fix: the 4-leg trace must not duplicate the provider error into
+/// the client leg).
+#[tokio::test]
+async fn raw_io_translated_4xx_client_leg_is_the_synthesized_error() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 400,
+        body: r#"{"error":{"type":"invalid_request","message":"provider-side detail 0xDEADBEEF"}}"#
+            .to_string(),
+    });
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 400, "client sees the wrapped 4xx");
+    let client_body = String::from_utf8(response.bytes().await.unwrap().to_vec()).unwrap();
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None).await.json().await.unwrap();
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().unwrap();
+            at_ms = entry["at_ms"].as_u64().unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0);
+
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let r = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .send()
+            .await
+            .unwrap();
+        if r.status().is_success() {
+            raw = r.json().await.unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Client leg == what the client received (the synthesized wrapper),
+    // NOT the provider's raw body.
+    assert_eq!(
+        raw["response_body"].as_str().unwrap(),
+        client_body,
+        "client Response leg mirrors the delivered wrapper: {raw}"
+    );
+    // The client leg is the WRAPPED Anthropic error llmux synthesized
+    // (`type: error` + `invalid_request_error`), not the provider's bare
+    // shape. llmux does surface the provider detail inside the wrapper's
+    // message — that's what the client genuinely received.
+    let client_leg: serde_json::Value =
+        serde_json::from_str(raw["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        client_leg["type"], "error",
+        "synthesized Anthropic error shape"
+    );
+    assert_eq!(client_leg["error"]["type"], "invalid_request_error");
+    // The upstream leg is the provider's BARE body (its own error shape),
+    // distinct from the client wrapper — the 4 legs are not duplicates.
+    let up = &raw["upstream"];
+    let up_body: serde_json::Value =
+        serde_json::from_str(up["response_body"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        up_body["error"]["type"], "invalid_request",
+        "upstream leg keeps the provider's own error shape: {up}"
+    );
+    assert!(
+        up["response_body"].as_str().unwrap().contains("0xDEADBEEF"),
+        "provider detail present in the upstream leg: {up}"
+    );
+    assert_ne!(
+        raw["response_body"].as_str().unwrap(),
+        up["response_body"].as_str().unwrap(),
+        "client and upstream legs are distinct payloads, not a duplicate"
+    );
+}
+
 /// The dashboard endpoint serves a status superset: accounts in selection
 /// order, the meta fields (version/pid/port/uptime/upstream/config_path),
 /// the activity tail (a driven request shows up as completed), the scheduler
@@ -1852,8 +2192,10 @@ async fn codex_settings_endpoint_changes_the_upstream_request() {
     assert_eq!(echoed["default_model"], "gpt-5.5-codex");
     assert_eq!(echoed["reasoning_effort"], "high");
 
-    // The next codex request reflects the new shape on the wire.
-    let body = r#"{"model":"gpt-5.5","max_tokens":16,"stream":true,
+    // The next codex request reflects the new shape on the wire. The request
+    // names a codex-routed but UNKNOWN model id — known-valid slugs (e.g.
+    // gpt-5.5) now pass through verbatim and would bypass the pin.
+    let body = r#"{"model":"gpt-imaginary","max_tokens":16,"stream":true,
         "messages":[{"role":"user","content":"hi"}]}"#;
     let response = post_messages(&client, &proxy, body).await;
     assert_eq!(response.status(), 200);
@@ -1945,7 +2287,7 @@ async fn gpt_5_5_request_leases_codex_account() {
     let upstream_body: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
     assert_eq!(
         upstream_body["model"], "gpt-5.5",
-        "codex provider pins gpt-5.5 upstream"
+        "known-valid slugs pass through verbatim (the client chose gpt-5.5)"
     );
 
     // The codex slot is current; the claude slot is independent.
@@ -2260,7 +2602,7 @@ async fn idle_probe_populates_windows_once_and_respects_cooldown() {
     let mock = MockUpstream::spawn().await;
     // Probe responses (and the served request) all return unified headers by
     // default — b's 5h reads 0.10 from `ScriptedResponse::ok`.
-    let proxy = Proxy::spawn_config(idle_probe_config(&mock, 3600)).await;
+    let proxy = Proxy::spawn_probing(idle_probe_config(&mock, 3600)).await;
 
     // Sanity: b starts windowless (poller's /api/oauth/usage 404s).
     assert!(
@@ -2315,7 +2657,7 @@ async fn idle_probe_kill_switch_disables_probing() {
     let mock = MockUpstream::spawn().await;
     let mut config = idle_probe_config(&mock, 3600);
     config.proxy.idle_probe.enabled = false; // kill-switch
-    let proxy = Proxy::spawn_config(config).await;
+    let proxy = Proxy::spawn_probing(config).await;
 
     let client = reqwest::Client::new();
     let response = post_messages(&client, &proxy, "{}").await;
@@ -2341,6 +2683,245 @@ async fn idle_probe_kill_switch_disables_probing() {
 }
 
 // ---------------------------------------------------------------------------
+// 11d. Timer-driven idle probe keeps cold Codex accounts warm (issue #45)
+// ---------------------------------------------------------------------------
+
+/// Codex-only config with the idle probe enabled AND the timer sweep on a tight
+/// cadence (issue #45). Both codex endpoints point at the mock. With no client
+/// traffic the ONLY thing that can populate the codex account's windows is the
+/// background sweep firing a `/responses` probe.
+fn codex_sweep_config(mock: &MockUpstream, sweep_secs: u64) -> Config {
+    let mut config = codex_config(mock, vec![codex_account("cx", "at-codex")]);
+    config.proxy.idle_probe.enabled = true;
+    config.proxy.idle_probe.per_account_cooldown_secs = 3600;
+    config.proxy.idle_probe.sweep_secs = sweep_secs;
+    config
+}
+
+/// `x-codex-*` quota headers for a healthy codex account (primary 5h, secondary
+/// 7d), shaped like the live capture so the probe response feeds both windows.
+fn codex_quota_headers() -> Vec<(String, String)> {
+    let primary_reset = epoch_secs_in(275).to_string();
+    let secondary_reset = epoch_secs_in(465_379).to_string();
+    [
+        ("x-codex-primary-used-percent", "5"),
+        ("x-codex-primary-window-minutes", "300"),
+        ("x-codex-primary-reset-at", primary_reset.as_str()),
+        ("x-codex-secondary-used-percent", "20"),
+        ("x-codex-secondary-window-minutes", "10080"),
+        ("x-codex-secondary-reset-at", secondary_reset.as_str()),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// Count the `/responses` probe requests the mock saw bearing `bearer` (the
+/// codex idle probe path). The codex provider translates the `max_tokens = 1`
+/// Anthropic body into the Responses shape — which drops `max_tokens` — so the
+/// probe is identified by its endpoint (`/responses`) + the account's own
+/// bearer, the same surface the codex provider tests assert on.
+fn codex_probe_count(mock: &MockUpstream, bearer: &str) -> usize {
+    mock.seen()
+        .into_iter()
+        .filter(|s| s.path == "/responses" && s.authorization.as_deref() == Some(bearer))
+        .count()
+}
+
+/// Acceptance (#45): a cold Codex account with ZERO client traffic gains its
+/// 5h/7d windows within one sweep interval once the probe is enabled and a
+/// positive `sweep_secs` is configured. No `post_messages` is ever sent — the
+/// background timer alone drives the `/responses` probe whose `x-codex-*`
+/// headers populate the windows.
+#[tokio::test]
+async fn timer_sweep_warms_cold_codex_account_without_traffic() {
+    let mock = MockUpstream::spawn().await;
+    // Every probe response carries codex quota headers (sse_codex shape: no
+    // content-type, x-codex-* attached). 8 queued so an early sweep tick (and
+    // any cooldown-suppressed retry) is always answered.
+    for _ in 0..8 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    // 1s sweep cadence so the test does not wait long for the first tick.
+    let proxy = Proxy::spawn_probing(codex_sweep_config(&mock, 1)).await;
+
+    // The codex account starts cold (no traffic, no oauth poll for codex).
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx is cold (no window) before any sweep"
+    );
+
+    // The background sweep fires the codex `/responses` probe; its x-codex-*
+    // headers populate the 5h window via record_headers — with NO client
+    // request ever sent.
+    let util = await_five_hour(&proxy, "cx")
+        .await
+        .expect("the timer sweep populated cx's 5h window with zero traffic");
+    assert!(
+        (util - 0.05).abs() < 1e-9,
+        "window came from the sweep probe's x-codex-* headers"
+    );
+
+    // The 7d window is populated too, and the probe really was the codex
+    // `/responses` path bearing the account's own credential.
+    let account = status_account(&proxy, "cx").await;
+    assert!(
+        account["seven_day"].is_object(),
+        "7d window populated by the sweep probe: {account}"
+    );
+    assert!(
+        codex_probe_count(&mock, "Bearer at-codex") >= 1,
+        "at least one /responses probe was sent by the sweep"
+    );
+}
+
+/// Acceptance (#45, generalized): the sweep warms ANY cold account, not just
+/// Codex. A cold OAuth (Claude) account with ZERO client traffic gains its
+/// windows from a background `max_tokens=1` probe — proving the sweep covers
+/// all backend groups (`trigger_idle_probes(None)`), not the Codex group alone.
+#[tokio::test]
+async fn timer_sweep_warms_cold_oauth_account_without_traffic() {
+    let mock = MockUpstream::spawn().await;
+    // Probe responses carry unified ratelimit headers (5h util 0.10 from ok()).
+    for _ in 0..8 {
+        mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    }
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account("a", "at-a")],
+        ..Default::default()
+    };
+    config.proxy.idle_probe.enabled = true;
+    config.proxy.idle_probe.per_account_cooldown_secs = 3600;
+    config.proxy.idle_probe.sweep_secs = 1; // tight cadence so the test is quick
+    let proxy = Proxy::spawn_probing(config).await;
+
+    // `a` starts cold: its /api/oauth/usage poll 404s and there is no traffic.
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|x| x.id.0 == "a")
+            .and_then(|x| x.five_hour)
+            .is_none(),
+        "a is cold before any sweep"
+    );
+
+    // The all-groups sweep probes the cold oauth account with zero client traffic.
+    let util = await_five_hour(&proxy, "a")
+        .await
+        .expect("the timer sweep populated the cold oauth account's 5h window");
+    assert!(
+        (util - 0.10).abs() < 1e-9,
+        "window came from the sweep probe headers"
+    );
+    assert!(
+        probe_count(&mock, "Bearer at-a") >= 1,
+        "the sweep sent a max_tokens=1 probe to the cold oauth account"
+    );
+}
+
+/// Acceptance (#45): the master kill-switch (`enabled = false`) disables the
+/// timer sweep — a cold Codex account is never probed even with `sweep_secs`
+/// set, so its windows stay empty with no traffic.
+#[tokio::test]
+async fn timer_sweep_kill_switch_disables_sweep() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let mut config = codex_sweep_config(&mock, 1);
+    config.proxy.idle_probe.enabled = false; // kill-switch
+    let proxy = Proxy::spawn_probing(config).await;
+
+    // Give the sweep generous wall-clock time to fire several ticks were it
+    // ever going to — with the kill-switch on, none should.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        codex_probe_count(&mock, "Bearer at-codex"),
+        0,
+        "kill-switch: the sweep sends no /responses probe"
+    );
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx stays cold with probing disabled"
+    );
+}
+
+/// Acceptance (#45): `sweep_secs = 0` is an explicit opt-out that keeps the
+/// timer OFF even when the probe is `enabled` (the always-on default is a
+/// positive `sweep_secs`, so 0 must be set deliberately) — a cold Codex account
+/// stays cold with no traffic (on-demand probing is unaffected).
+#[tokio::test]
+async fn timer_sweep_disabled_when_sweep_secs_zero() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_codex(
+            CODEX_LIVE_SSE,
+            64,
+            &codex_quota_headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    // enabled = true but sweep_secs = 0 ⇒ no background sweep task is spawned.
+    let proxy = Proxy::spawn_probing(codex_sweep_config(&mock, 0)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        codex_probe_count(&mock, "Bearer at-codex"),
+        0,
+        "sweep_secs = 0: no background probe even with probing enabled"
+    );
+    assert!(
+        proxy
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == "cx")
+            .and_then(|a| a.five_hour)
+            .is_none(),
+        "cx stays cold when the sweep is off"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 12. Brew install (manual)
 // ---------------------------------------------------------------------------
 
@@ -2355,7 +2936,208 @@ async fn brew_installed_binary_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// 13. OAuth token relay (PROXY-09)
+// 13. GUI-initiated OAuth login endpoints (FR4, .prd/11-llmux-islands-spec.md)
+// ---------------------------------------------------------------------------
+
+/// The daemon's `/llmux/login/*` surface is wired and validates input WITHOUT
+/// opening a browser: an unknown provider is a 400, an unknown poll state is a
+/// 404, and cancelling an unknown state is an idempotent `{"cancelled":false}`.
+/// The happy-path browser flow is a manual acceptance step (spec §Acceptance
+/// #4), so only the no-browser paths are exercised here.
+#[tokio::test]
+async fn login_endpoints_validate_input_without_a_browser() {
+    let proxy = Proxy::spawn(
+        "http://127.0.0.1:9",
+        vec![oauth_account("claude:test", "tok")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Unknown provider → 400, no browser opened.
+    let resp = client
+        .post(proxy.url("/llmux/login/start"))
+        .header("content-type", "application/json")
+        .body(r#"{"provider":"nope"}"#)
+        .send()
+        .await
+        .expect("login/start reachable");
+    assert_eq!(resp.status().as_u16(), 400, "unknown provider is rejected");
+
+    // Unknown poll state → 404.
+    let resp = client
+        .get(proxy.url("/llmux/login/status?state=does-not-exist"))
+        .send()
+        .await
+        .expect("login/status reachable");
+    assert_eq!(resp.status().as_u16(), 404, "unknown login state is 404");
+
+    // Cancelling an unknown state is idempotent: 200 + cancelled:false.
+    let resp = client
+        .post(proxy.url("/llmux/login/cancel"))
+        .header("content-type", "application/json")
+        .body(r#"{"state":"does-not-exist"}"#)
+        .send()
+        .await
+        .expect("login/cancel reachable");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.expect("cancel json");
+    assert_eq!(body["cancelled"], serde_json::Value::Bool(false));
+}
+
+// ---------------------------------------------------------------------------
+// email_anonymous: status surface + remote flip + persistence (SSOT E1–E3)
+// ---------------------------------------------------------------------------
+
+/// Over a real socket: `/llmux/status` starts with `email_anonymous:false`,
+/// `POST /llmux/settings` flips it live (no restart), status reflects the new
+/// value, and the tempdir config now persists it — while account names in the
+/// status document stay REAL (T1). Loopback requests are api-key-exempt; the
+/// non-loopback key requirement is unit-covered in `proxy::server::tests`.
+#[tokio::test]
+async fn settings_flip_email_anonymous_live_and_persisted() {
+    let proxy = Proxy::spawn(
+        "http://127.0.0.1:1",
+        vec![oauth_account("me@real-mail.com", "at-real")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // (a) Initially off.
+    let status: serde_json::Value = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable")
+        .json()
+        .await
+        .expect("status json");
+    assert_eq!(status["email_anonymous"], serde_json::Value::Bool(false));
+
+    // (b) Flip on remotely.
+    let resp = client
+        .post(proxy.url("/llmux/settings"))
+        .header("content-type", "application/json")
+        .body(r#"{"email_anonymous":true}"#)
+        .send()
+        .await
+        .expect("settings reachable");
+    assert_eq!(resp.status().as_u16(), 200);
+    let ack: serde_json::Value = resp.json().await.expect("ack json");
+    assert_eq!(ack["ok"], serde_json::Value::Bool(true));
+    assert_eq!(ack["email_anonymous"], serde_json::Value::Bool(true));
+
+    // (c) Status reflects the flip with no restart — and names stay real.
+    let status: serde_json::Value = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable")
+        .json()
+        .await
+        .expect("status json");
+    assert_eq!(status["email_anonymous"], serde_json::Value::Bool(true));
+    assert_eq!(
+        status["accounts"][0]["name"], "me@real-mail.com",
+        "API data is never masked (T1)"
+    );
+
+    // (d) Persisted read-merge-write into the tempdir config; the account
+    // roster survived the write.
+    let on_disk = config::load_path(&proxy.config_path).expect("reload config");
+    assert!(on_disk.email_anonymous, "flag persisted");
+    assert_eq!(on_disk.accounts.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Lazy history hydration: serve first, hydrate later
+// ---------------------------------------------------------------------------
+
+/// One pre-boot persisted activity line (the stable v1 on-disk schema), as a
+/// previous daemon run would have appended it.
+fn persisted_line(id: u64, ts_ms: u64, account: &str) -> String {
+    format!(
+        r#"{{"v":1,"ts_ms":{ts_ms},"id":{id},"method":"POST","path":"/v1/messages","account":"{account}","status":200,"duration_ms":12,"tokens":{{"input":10,"output":5,"cache_read":null,"cache_creation":null}},"group":"claude","model":"claude-sonnet-4-5","effort":null,"user_id":null}}"#
+    )
+}
+
+/// Startup no longer waits on the persisted history (the lazy-load fix):
+/// `ready` fires and `/llmux/status` + proxy traffic answer with hydration
+/// still pending, the historical totals stream in BEHIND live traffic
+/// afterwards, and a request served during hydration is counted exactly once
+/// (the cut excludes live appends from the replay).
+#[tokio::test]
+async fn readiness_precedes_history_hydration_and_live_requests_survive_it() {
+    const HISTORY: u64 = 250;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(
+        r#"{"id":"msg_1","type":"message","usage":{"input_tokens":7,"output_tokens":3}}"#,
+    ));
+
+    // Seed a "previous run": 250 persisted requests for account a.
+    let proxy = Proxy::spawn_prepared(
+        Config {
+            upstream: mock.base_url(),
+            accounts: vec![oauth_account("a", "at-a")],
+            ..Default::default()
+        },
+        |dir| {
+            let lines: String = (0..HISTORY)
+                .map(|i| persisted_line(i, 1_000 + i, "a") + "\n")
+                .collect();
+            std::fs::write(dir.join("activity.jsonl"), lines).expect("seed history");
+        },
+    )
+    .await;
+
+    // (a) Readiness: `ready` has fired (spawn_prepared awaited it) and status
+    // answers regardless of hydration progress.
+    let client = reqwest::Client::new();
+    let status = client
+        .get(proxy.url("/llmux/status"))
+        .send()
+        .await
+        .expect("status reachable immediately after ready");
+    assert_eq!(status.status(), 200, "status serves before hydration");
+
+    // (b) Live traffic during/after hydration is served and counted.
+    let response = post_messages(&client, &proxy, "{}").await;
+    assert_eq!(response.status(), 200, "proxy serves during hydration");
+
+    // (c) History lands behind live: totals converge to history + live,
+    // exactly once each (no double count of the live append past the cut).
+    let expected = HISTORY + 1;
+    let mut last = 0;
+    for _ in 0..200 {
+        let doc: serde_json::Value = get_dashboard(&proxy, None)
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        last = doc["totals"]["requests"].as_u64().expect("totals");
+        if last >= expected {
+            assert_eq!(
+                last, expected,
+                "every request counted exactly once (history {HISTORY} + 1 live)"
+            );
+            // The hydration completion note surfaced in the activity feed.
+            let noted = doc["activity"]["completed"]
+                .as_array()
+                .expect("completed array")
+                .iter()
+                .any(|row| {
+                    row["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("history loaded: 250"))
+                });
+            assert!(noted, "hydration completion note visible: {doc}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("history never hydrated: totals stuck at {last}, expected {expected}");
+    }
+
+// 14. OAuth token relay (PROXY-09)
 // ---------------------------------------------------------------------------
 
 /// FR1: `POST /v1/oauth/token` is relayed RAW to the upstream — the client's

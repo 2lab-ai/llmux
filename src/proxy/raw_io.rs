@@ -67,10 +67,19 @@
 //! cap (then stop growing), and the non-streaming full-body path clips to it as
 //! the final backstop — one cap, every path, request and response alike.
 
-use std::io::Write as _;
+use std::io::{BufRead as _, Seek as _, Write as _};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// Serializes [`append`] against the commit step of a concurrent [`prune`].
+/// Since prune runs in the background after the listener is up (it no longer
+/// blocks readiness), live requests can append while a prune is rewriting the
+/// file; the commit holds this lock while copying the appended tail onto the
+/// pruned temp file and renaming it into place, so no live record is lost.
+/// Appends are short (one buffered line) — contention is negligible.
+static IO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Schema version of a [`RawIoRecord`] line. Bump on a breaking layout change;
 /// [`prune`] tolerates (skips) lines it cannot parse, so old/new lines coexist.
@@ -116,11 +125,67 @@ pub struct RawIoRecord {
     /// HTTP status delivered to the client, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Total request duration, millis — lets the session timeline derive an
+    /// honest Σoutput/Σduration throughput (perf telemetry v1). Additive:
+    /// `None` on records written before the field existed (those requests
+    /// simply don't contribute to the session rate sums).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Verbatim request body (bounded + truncation-marked at capture time).
     pub request_body: String,
     /// Response body delivered to the client (bounded + truncation-marked).
     pub response_body: String,
+    /// Inbound client request headers, in wire order, SENSITIVE VALUES
+    /// REDACTED at capture time (see `forward::redacted_header_pairs`).
+    /// Additive: `None` on records written before headers were captured —
+    /// the raw viewer renders that as "not captured", distinct from `Some([])`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Vec<(String, String)>>,
+    /// Response headers delivered to the client (upstream's, post-sanitize),
+    /// same redaction + additive semantics as `request_headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Vec<(String, String)>>,
+    /// The upstream (proxy→API) half of a TRANSLATED exchange (codex/grok):
+    /// the rewritten Responses-API request the proxy actually sent and the
+    /// verbatim upstream reply it transformed for the client. `None` on the
+    /// byte-identity claude passthrough — client and upstream payloads are the
+    /// same bytes, so the raw viewer renders 2 payloads instead of 4.
+    /// Additive: records written before this field load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamRaw>,
 }
+
+/// The proxy→API side of one translated exchange (see
+/// [`RawIoRecord::upstream`]). Bodies arrive PRE-BOUNDED by the caller (the
+/// forward path applies the same `max_body_bytes` cap + truncation marker as
+/// the client-side bodies); headers arrive pre-redacted
+/// (`forward::redacted_header_pairs`) so upstream bearer tokens never land on
+/// disk. Every field is optional — an upstream error path may know the request
+/// half but have no transformed response, and vice versa.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamRaw {
+    /// Full upstream URL (`endpoint` + provider path), the `copy as curl`
+    /// target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Rewritten request body the proxy sent upstream (bounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
+    /// Upstream request headers (wire order, credential values redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Vec<(String, String)>>,
+    /// Verbatim upstream response body BEFORE transformation (bounded; the
+    /// Responses-API SSE/JSON the converter consumed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    /// Upstream response headers (redacted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Vec<(String, String)>>,
+}
+
+/// Captured header pairs (wire order, values already redacted by the caller);
+/// `None` = headers not captured (pre-headers record or caller had none).
+pub type HeaderPairs = Option<Vec<(String, String)>>;
 
 impl RawIoRecord {
     /// Build a record from raw bytes, clipping each body to `max_body_bytes`
@@ -140,6 +205,9 @@ impl RawIoRecord {
         request_body: &[u8],
         response_body: &[u8],
         max_body_bytes: usize,
+        request_headers: HeaderPairs,
+        response_headers: HeaderPairs,
+        upstream: Option<UpstreamRaw>,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -149,16 +217,22 @@ impl RawIoRecord {
             model,
             account,
             status,
+            duration_ms: None,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body(response_body, max_body_bytes),
+            request_headers,
+            response_headers,
+            upstream,
         }
     }
 }
 
 /// Clip a body to `max_body_bytes` on a UTF-8 char boundary, appending a
 /// `…[truncated N bytes]` marker when it overflows. A body within the cap is
-/// returned whole (lossy UTF-8). Pure; never panics.
-fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
+/// returned whole (lossy UTF-8). Pure; never panics. `pub(crate)` so the
+/// forward path can pre-bound [`UpstreamRaw`] bodies with the SAME cap +
+/// marker as the client-side bodies.
+pub(crate) fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
     let s = String::from_utf8_lossy(body);
     if s.len() <= max_body_bytes {
         return s.into_owned();
@@ -178,8 +252,9 @@ fn bounded_body(body: &[u8], max_body_bytes: usize) -> String {
 /// marker with the exact dropped count — which `bounded_body` alone cannot
 /// compute, because the relay only handed us the bounded prefix, not the whole
 /// body. When nothing was dropped the prefix is returned whole (lossy UTF-8).
-/// Pure; never panics.
-fn bounded_body_streamed(kept: &[u8], total: usize) -> String {
+/// Pure; never panics. `pub(crate)` for the forward path's upstream tee (same
+/// bounded-prefix + total shape as the client-side stream tee).
+pub(crate) fn bounded_body_streamed(kept: &[u8], total: usize) -> String {
     let s = String::from_utf8_lossy(kept).into_owned();
     let dropped = total.saturating_sub(kept.len());
     if dropped == 0 {
@@ -211,6 +286,12 @@ pub fn append(path: Option<&std::path::Path>, record: &RawIoRecord) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Serialized against a background prune's commit (see [`IO_LOCK`]): an
+    // append lands either before the commit's tail copy (and is carried over)
+    // or after the rename (and lands in the pruned file) — never in between.
+    let _guard = IO_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -234,14 +315,18 @@ pub fn capture(
     model: Option<String>,
     account: Option<String>,
     status: Option<u16>,
+    duration_ms: Option<u64>,
     request_body: &[u8],
     response_body: &[u8],
     max_body_bytes: usize,
+    request_headers: HeaderPairs,
+    response_headers: HeaderPairs,
+    upstream: Option<UpstreamRaw>,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
     }
-    let record = RawIoRecord::new(
+    let mut record = RawIoRecord::new(
         id,
         now_ms(),
         group,
@@ -251,7 +336,11 @@ pub fn capture(
         request_body,
         response_body,
         max_body_bytes,
+        request_headers,
+        response_headers,
+        upstream,
     );
+    record.duration_ms = duration_ms;
     append(path, &record);
 }
 
@@ -276,6 +365,9 @@ impl RawIoRecord {
         response_kept: &[u8],
         response_total: usize,
         max_body_bytes: usize,
+        request_headers: HeaderPairs,
+        response_headers: HeaderPairs,
+        upstream: Option<UpstreamRaw>,
     ) -> Self {
         Self {
             v: RECORD_VERSION,
@@ -285,8 +377,12 @@ impl RawIoRecord {
             model,
             account,
             status,
+            duration_ms: None,
             request_body: bounded_body(request_body, max_body_bytes),
             response_body: bounded_body_streamed(response_kept, response_total),
+            request_headers,
+            response_headers,
+            upstream,
         }
     }
 }
@@ -304,15 +400,19 @@ pub fn capture_streamed(
     model: Option<String>,
     account: Option<String>,
     status: Option<u16>,
+    duration_ms: Option<u64>,
     request_body: &[u8],
     response_kept: &[u8],
     response_total: usize,
     max_body_bytes: usize,
+    request_headers: HeaderPairs,
+    response_headers: HeaderPairs,
+    upstream: Option<UpstreamRaw>,
 ) {
     if path.is_none() {
         return; // disabled / no state dir — skip building the record at all
     }
-    let record = RawIoRecord::new_streamed(
+    let mut record = RawIoRecord::new_streamed(
         id,
         now_ms(),
         group,
@@ -323,8 +423,124 @@ pub fn capture_streamed(
         response_kept,
         response_total,
         max_body_bytes,
+        request_headers,
+        response_headers,
+        upstream,
     );
+    record.duration_ms = duration_ms;
     append(path, &record);
+}
+
+/// How far a record's capture timestamp may sit from the activity entry's
+/// completion timestamp and still be "the same request" ([`find_record`]).
+/// Capture and finish happen on the same host within milliseconds of each
+/// other; 5 minutes absorbs any fold/flush lag while keeping id collisions
+/// from OTHER daemon runs (the activity id is a per-process counter that
+/// resets on restart) out of the match.
+const FIND_TS_WINDOW_MS: u64 = 300_000;
+
+/// Find the raw-io record for activity `id` completed around `at_ms`, reading
+/// the log BACKWARDS from the end (clicks land on recent entries; the file can
+/// be tens of GB, so a forward scan would read all of it for every lookup).
+///
+/// Among the in-window id matches the one with the CLOSEST capture timestamp
+/// to `at_ms` wins — never the first (= newest) match. The id alone is NOT
+/// unique across daemon restarts (per-process counter), and two runs less
+/// than the window apart can BOTH have an in-window record for the same id;
+/// capture and completion are stamped at the same terminal moment on the same
+/// host, so the true record sits within fold-lag milliseconds of `at_ms` and
+/// min-distance selection is effectively exact (trinity review R2, gpt-5.6
+/// MUST-FIX 1). Records are appended in capture-time order, so the scan
+/// early-exits once it walks past `at_ms - FIND_TS_WINDOW_MS` (or, with a
+/// candidate in hand, past the point where anything older must lose). Corrupt/
+/// foreign lines are skipped. Strictly best-effort and read-only: any IO
+/// error yields `None` (or the best candidate so far), never a panic.
+pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Option<RawIoRecord> {
+    let path = path?;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // Cheap pre-filter fragment: a matching line MUST contain `"id":<id>,`
+    // (field-named JSON, serde writes no spaces). Avoids parsing every line.
+    let needle = format!("\"id\":{id},");
+    let floor = at_ms.saturating_sub(FIND_TS_WINDOW_MS);
+    let ceil = at_ms.saturating_add(FIND_TS_WINDOW_MS);
+    let mut best: Option<(u64, RawIoRecord)> = None; // (distance to at_ms, record)
+    let keep_best = |candidate: RawIoRecord, best: &mut Option<(u64, RawIoRecord)>| {
+        let dist = candidate.ts_ms.abs_diff(at_ms);
+        if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+            *best = Some((dist, candidate));
+        }
+    };
+
+    const CHUNK: u64 = 256 * 1024;
+    let mut reader = file;
+    let mut pos = len;
+    // Bytes of the (possibly partial) line carried over from the newer chunk.
+    let mut carry: Vec<u8> = Vec::new();
+    while pos > 0 {
+        let take = CHUNK.min(pos);
+        pos -= take;
+        let mut buf = vec![0u8; usize::try_from(take).ok()?];
+        reader.seek(std::io::SeekFrom::Start(pos)).ok()?;
+        std::io::Read::read_exact(&mut reader, &mut buf).ok()?;
+        buf.extend_from_slice(&carry);
+        // Everything before the FIRST newline may be a partial line whose head
+        // lives in the next-older chunk — carry it over (unless at file start).
+        let first_nl = buf.iter().position(|&b| b == b'\n');
+        let (head, complete) = match first_nl {
+            Some(i) if pos > 0 => buf.split_at(i + 1),
+            _ => (&[][..], &buf[..]),
+        };
+        for line in complete.split(|&b| b == b'\n').rev() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if !text.contains(&needle) {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<RawIoRecord>(text.trim()) else {
+                continue;
+            };
+            if record.id != id || record.v != RECORD_VERSION {
+                continue;
+            }
+            let ts = record.ts_ms;
+            if ts >= floor && ts <= ceil {
+                keep_best(record, &mut best);
+                // Scanning backwards, timestamps only get older: once we are
+                // AT/BELOW at_ms with a candidate this close, nothing older
+                // can sit closer — done.
+                if let Some((dist, _)) = &best {
+                    if ts <= at_ms && at_ms.abs_diff(ts) >= *dist {
+                        return best.map(|(_, r)| r);
+                    }
+                }
+                continue;
+            }
+            if ts < floor {
+                // Append order: everything further back is older still.
+                return best.map(|(_, r)| r);
+            }
+        }
+        // Time-based early exit even when no id matched in this chunk: parse
+        // the OLDEST complete line here (one parse per 256 KiB); if it is
+        // already before the window, everything further back is older still.
+        if let Some(oldest) = complete
+            .split(|&b| b == b'\n')
+            .find(|l| !l.is_empty())
+            .and_then(|l| std::str::from_utf8(l).ok())
+            .and_then(|t| serde_json::from_str::<RawIoRecord>(t.trim()).ok())
+        {
+            if oldest.ts_ms < floor {
+                return best.map(|(_, r)| r);
+            }
+        }
+        carry = head.to_vec();
+    }
+    best.map(|(_, r)| r)
 }
 
 /// Prune the raw-io log to a retention window, best-effort.
@@ -336,10 +552,27 @@ pub fn capture_streamed(
 /// point to shed unreadable history; the kept set is exactly the in-window,
 /// parseable records.
 ///
+/// # Streaming + safe against concurrent appends
+///
+/// The log can be tens of GB (one line per proxied request, bodies up to
+/// `max_body_bytes` each), so every pass is STREAMING — line by line through a
+/// [`std::io::BufRead`], memory bounded by the longest line — never
+/// `read_to_string` of the whole file (which pinned ~2× the file size in RAM
+/// and blocked startup for its whole duration). A read-only pre-pass decides
+/// whether anything would be dropped at all, so the common "everything still
+/// in window" restart costs ONE sequential read and ZERO writes (a naive
+/// streaming rewrite would copy the whole multi-GB file to a temp only to
+/// discard it). Since the caller now runs this in the background AFTER the
+/// listener is ready, live requests may [`append`] while the rewrite runs: the
+/// commit step takes [`IO_LOCK`], copies any bytes appended past the scanned
+/// offset verbatim onto the pruned temp file, and only then renames — so a
+/// record appended mid-prune is never lost ("history behind live": kept-old
+/// records keep their order, the live tail follows).
+///
 /// Strictly best-effort: a `None` path, a missing/unreadable file, or any IO
-/// error on write leaves the file as-is (the temp file is discarded). Never
-/// panics. The rewrite goes through a sibling temp file + atomic rename so a
-/// crash mid-prune can't truncate the log.
+/// error on read/write leaves the file as-is (the temp file is discarded).
+/// Never panics. The rewrite goes through a sibling temp file + atomic rename
+/// so a crash mid-prune can't truncate the log.
 pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
     if retention_days == 0 {
         return; // keep forever
@@ -347,44 +580,145 @@ pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
     let Some(path) = path else {
         return;
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        // Missing/unreadable file = nothing to prune.
-        return;
-    };
     let cutoff = now_ms.saturating_sub(retention_days.saturating_mul(MS_PER_DAY));
+    if !needs_prune(path, cutoff) {
+        return; // nothing to drop — no temp written, original untouched
+    }
+    let Some(stage) = prune_scan(path, cutoff) else {
+        return; // nothing to drop, or scan failed — original left as-is
+    };
+    prune_commit(path, stage);
+}
 
-    // Keep only in-window, parseable, current-version records. A line we cannot
-    // parse is dropped (best-effort shedding of corruption on rewrite).
-    let mut kept = String::with_capacity(contents.len());
-    let mut changed = false;
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            changed = true;
-            continue;
-        }
-        match serde_json::from_str::<RawIoRecord>(line) {
-            Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {
-                kept.push_str(line);
-                kept.push('\n');
+/// Read-only pre-pass: would the retention window drop anything? `true` on the
+/// first out-of-window, wrong-version, unparseable, or blank line — exactly
+/// the lines [`prune_scan`] rewrites the file to shed. A missing/unreadable
+/// file or a torn final line (no trailing newline — crash artifact or an
+/// append racing this scan; the rewrite carries it over verbatim either way)
+/// is not by itself a reason to rewrite.
+fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false, // EOF, everything in window
+            Ok(_) => {
+                if !line.ends_with('\n') {
+                    return false; // torn final line — not a drop candidate
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return true;
+                }
+                match serde_json::from_str::<RawIoRecord>(trimmed) {
+                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {}
+                    _ => return true,
+                }
             }
-            // Out of window, wrong version, or unparseable → drop it.
-            _ => changed = true,
+            Err(_) => return false, // unreadable — leave the file as-is
         }
     }
-    // Nothing to do: every line was kept verbatim (no reorder, no drop).
-    if !changed {
-        return;
-    }
+}
 
-    // Atomic rewrite: write a sibling temp, then rename over the original. On
-    // any IO error, leave the original untouched.
+/// A staged prune rewrite: the pruned temp file plus how many bytes of the
+/// original were scanned to produce it (the tail past `consumed` is whatever
+/// concurrent appends added while scanning — [`prune_commit`] carries it over).
+struct PruneStage {
+    tmp: std::path::PathBuf,
+    consumed: u64,
+}
+
+/// Phase 1 (unlocked, streaming): scan `path` line by line, writing in-window
+/// parseable records to a sibling temp file. Returns `None` when there is
+/// nothing to rewrite (every line kept verbatim, or any IO error — the temp is
+/// discarded either way).
+fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
+    let file = std::fs::File::open(path).ok()?; // missing/unreadable = nothing to prune
+    let mut reader = std::io::BufReader::new(file);
     let tmp = path.with_extension("jsonl.prune.tmp");
-    if std::fs::write(&tmp, kept.as_bytes()).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
+    // `create` truncates a stale temp left by a crashed prune.
+    let out = std::fs::File::create(&tmp).ok()?;
+    let mut writer = std::io::BufWriter::new(out);
+
+    let mut consumed: u64 = 0;
+    let mut changed = false;
+    let mut line = String::new();
+    let discard = |writer: std::io::BufWriter<std::fs::File>, tmp: &std::path::Path| {
+        drop(writer);
+        let _ = std::fs::remove_file(tmp);
+    };
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                if !line.ends_with('\n') {
+                    // Partial final line: either a crash artifact or an append
+                    // racing this scan mid-write. Leave it for the commit's
+                    // verbatim tail copy (do NOT count it as consumed) so it is
+                    // carried over whole once the writer finishes.
+                    break;
+                }
+                consumed += n as u64;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    changed = true;
+                    continue;
+                }
+                match serde_json::from_str::<RawIoRecord>(trimmed) {
+                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {
+                        if writer
+                            .write_all(trimmed.as_bytes())
+                            .and_then(|()| writer.write_all(b"\n"))
+                            .is_err()
+                        {
+                            discard(writer, &tmp);
+                            return None;
+                        }
+                    }
+                    // Out of window, wrong version, or unparseable → drop it.
+                    _ => changed = true,
+                }
+            }
+            Err(_) => {
+                discard(writer, &tmp);
+                return None;
+            }
+        }
     }
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    // Nothing to do (every line kept verbatim), or the kept set failed to
+    // flush: discard the temp and leave the original untouched.
+    if !changed || writer.flush().is_err() {
+        discard(writer, &tmp);
+        return None;
+    }
+    Some(PruneStage { tmp, consumed })
+}
+
+/// Phase 2 (under [`IO_LOCK`]): copy any bytes appended past the scanned
+/// offset verbatim onto the temp file, then atomically rename it over the
+/// original. On any IO error the temp is discarded and the original is left
+/// as-is.
+fn prune_commit(path: &std::path::Path, stage: PruneStage) {
+    let _guard = IO_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let copied_tail = (|| -> std::io::Result<()> {
+        let mut src = std::fs::File::open(path)?;
+        let len = src.metadata()?.len();
+        if len > stage.consumed {
+            src.seek(std::io::SeekFrom::Start(stage.consumed))?;
+            let mut out = std::fs::OpenOptions::new().append(true).open(&stage.tmp)?;
+            std::io::copy(&mut src, &mut out)?;
+        }
+        Ok(())
+    })();
+    if copied_tail.is_err() || std::fs::rename(&stage.tmp, path).is_err() {
+        let _ = std::fs::remove_file(&stage.tmp);
     }
 }
 
@@ -403,6 +737,9 @@ mod tests {
             br#"{"model":"m","messages":[]}"#,
             br#"{"id":"msg_1"}"#,
             RESPONSE_CAP_BYTES,
+            Some(vec![("content-type".into(), "application/json".into())]),
+            Some(vec![("request-id".into(), "req_1".into())]),
+            None,
         )
     }
 
@@ -433,6 +770,33 @@ mod tests {
     }
 
     #[test]
+    fn upstream_half_round_trips_and_stays_off_passthrough_records(/* UI-8 */) {
+        let path = tmp_path("upstream");
+        // A translated exchange carries the rewritten upstream half…
+        let mut record = rec(9, 1_700_000_000_000);
+        record.upstream = Some(UpstreamRaw {
+            url: Some("https://api.example.com/responses".into()),
+            request_body: Some(r#"{"input":[]}"#.into()),
+            request_headers: Some(vec![("authorization".into(), "•••redacted".into())]),
+            response_body: Some("event: response.completed\n\n".into()),
+            response_headers: Some(vec![("x-request-id".into(), "req_9".into())]),
+        });
+        append(Some(&path), &record);
+        let line = std::fs::read_to_string(&path).expect("written");
+        let parsed: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
+        assert_eq!(parsed, record, "upstream half survives the round-trip");
+        // …while a passthrough record (upstream: None) serializes WITHOUT the
+        // key at all (additive schema), and a pre-UI-8 line parses to None.
+        let _ = std::fs::remove_file(&path);
+        append(Some(&path), &rec(1, 1));
+        let line = std::fs::read_to_string(&path).expect("written");
+        assert!(!line.contains("\"upstream\""), "absent, not null: {line}");
+        let old: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
+        assert_eq!(old.upstream, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn body_over_the_cap_is_truncated_with_a_marker() {
         let big = "a".repeat(RESPONSE_CAP_BYTES + 500);
         let record = RawIoRecord::new(
@@ -445,6 +809,9 @@ mod tests {
             big.as_bytes(),
             b"resp",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
+            None,
         );
         assert!(
             record.request_body.contains("…[truncated 500 bytes]"),
@@ -472,6 +839,9 @@ mod tests {
             exact.as_bytes(),
             b"",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
+            None,
         );
         assert_eq!(record.request_body.len(), RESPONSE_CAP_BYTES);
         assert!(!record.request_body.contains("truncated"));
@@ -492,6 +862,9 @@ mod tests {
             body.as_bytes(),
             b"",
             RESPONSE_CAP_BYTES,
+            None,
+            None,
+            None,
         );
         // The stored prefix (before the marker) must be valid UTF-8 by
         // construction (String), and must not include a partial '€'.
@@ -521,6 +894,9 @@ mod tests {
             body.as_bytes(),
             body.as_bytes(),
             32,
+            None,
+            None,
+            None,
         );
         assert!(
             record.request_body.contains("…[truncated 68 bytes]"),
@@ -533,7 +909,9 @@ mod tests {
             record.response_body
         );
         // And a body under the override is kept whole.
-        let small = RawIoRecord::new(1, 0, None, None, None, None, b"hi", b"hi", 32);
+        let small = RawIoRecord::new(
+            1, 0, None, None, None, None, b"hi", b"hi", 32, None, None, None,
+        );
         assert_eq!(small.request_body, "hi");
         assert_eq!(small.response_body, "hi");
     }
@@ -553,6 +931,9 @@ mod tests {
             kept,
             kept.len(),
             RESPONSE_CAP_BYTES,
+            None,
+            None,
+            None,
         );
         assert_eq!(record.response_body, String::from_utf8_lossy(kept));
         assert!(!record.response_body.contains("truncated"));
@@ -576,6 +957,9 @@ mod tests {
             kept,
             total,
             10, // cap (matches what the relay retained)
+            None,
+            None,
+            None,
         );
         assert_eq!(
             record.response_body, "0123456789…[truncated 990 bytes]",
@@ -666,5 +1050,132 @@ mod tests {
     #[test]
     fn prune_with_none_path_is_a_noop() {
         prune(None, 90, now_ms());
+    }
+
+    #[test]
+    fn find_record_matches_id_within_the_ts_window() {
+        let path = tmp_path("find");
+        // Two daemon runs reuse id 5: an old run at day 1 and a fresh run at
+        // day 2. Another id sits between them.
+        let day = MS_PER_DAY;
+        append(Some(&path), &rec(5, day));
+        append(Some(&path), &rec(9, day + 500_000));
+        append(Some(&path), &rec(5, 2 * day));
+
+        // Looked up near its own completion time, each run's record wins.
+        let new = find_record(Some(&path), 5, 2 * day + 1_000).expect("newest id-5");
+        assert_eq!(new.ts_ms, 2 * day);
+        let old = find_record(Some(&path), 5, day + 1_000).expect("oldest id-5");
+        assert_eq!(old.ts_ms, day);
+        // Headers written at capture time come back intact.
+        assert_eq!(
+            new.request_headers.as_deref(),
+            Some(&[("content-type".to_string(), "application/json".to_string())][..])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_record_prefers_the_closest_ts_within_one_window(/* trinity R2 */) {
+        // Two daemon runs 2 minutes apart reuse id=1 — BOTH records sit inside
+        // each other's ±5 min window, so the window alone cannot disambiguate.
+        // The lookup must return the record CLOSEST to the entry's completion
+        // time, not the first (= newest) match the backwards scan meets.
+        let path = tmp_path("find-closest");
+        let t_old = 100 * MS_PER_DAY; // "12:00" — pre-restart run
+        let t_new = t_old + 120_000; // "12:02" — post-restart run, same id
+        append(Some(&path), &rec(1, t_old));
+        append(Some(&path), &rec(1, t_new));
+
+        let old = find_record(Some(&path), 1, t_old + 500).expect("old entry resolves");
+        assert_eq!(old.ts_ms, t_old, "12:00 activity gets the 12:00 raw record");
+        let new = find_record(Some(&path), 1, t_new + 500).expect("new entry resolves");
+        assert_eq!(new.ts_ms, t_new, "12:02 activity gets the 12:02 raw record");
+        // Equidistant-ish query still lands on the strictly closer one.
+        let mid = find_record(Some(&path), 1, t_old + 50_000).expect("mid query");
+        assert_eq!(mid.ts_ms, t_old, "50s vs 70s away — closer record wins");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_record_misses_unknown_id_or_out_of_window() {
+        let path = tmp_path("find-miss");
+        append(Some(&path), &rec(5, MS_PER_DAY));
+        // Unknown id.
+        assert!(find_record(Some(&path), 6, MS_PER_DAY).is_none());
+        // Same id, completion time far outside the ±5 min window.
+        assert!(find_record(Some(&path), 5, 3 * MS_PER_DAY).is_none());
+        // Disabled capture (no path) is a silent miss.
+        assert!(find_record(None, 5, MS_PER_DAY).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_header_records_still_parse_with_headers_absent() {
+        // A line written before the header fields existed must deserialize
+        // with `None` headers (additive schema), and find_record must return it.
+        let path = tmp_path("pre-header");
+        let line = format!(
+            "{{\"v\":1,\"ts_ms\":{},\"id\":3,\"request_body\":\"{{}}\",\"response_body\":\"ok\"}}",
+            MS_PER_DAY
+        );
+        std::fs::write(&path, format!("{line}\n")).expect("write");
+        let record = find_record(Some(&path), 3, MS_PER_DAY).expect("old line found");
+        assert_eq!(record.request_headers, None);
+        assert_eq!(record.response_headers, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The common restart (nothing out of window) must be read-only: no temp
+    /// file written, the log byte-identical — the pre-pass decides without
+    /// staging a rewrite. (A multi-GB log would otherwise be fully copied to a
+    /// temp and discarded on every restart.)
+    #[test]
+    fn prune_with_nothing_to_drop_writes_nothing() {
+        let path = tmp_path("prune-noop");
+        let now = 100 * MS_PER_DAY;
+        append(Some(&path), &rec(1, 98 * MS_PER_DAY));
+        append(Some(&path), &rec(2, 99 * MS_PER_DAY));
+        let before = std::fs::read_to_string(&path).expect("file");
+
+        prune(Some(&path), 90, now);
+
+        let after = std::fs::read_to_string(&path).expect("file");
+        assert_eq!(before, after, "log untouched");
+        assert!(
+            !path.with_extension("jsonl.prune.tmp").exists(),
+            "no temp file staged for a no-op prune"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record appended BETWEEN the streaming scan and the commit (prune now
+    /// runs in the background next to live traffic) must survive the rewrite:
+    /// the commit copies the appended tail verbatim before renaming.
+    #[test]
+    fn prune_preserves_records_appended_during_scan() {
+        let path = tmp_path("prune-tail");
+        let now = 100 * MS_PER_DAY;
+        append(Some(&path), &rec(1, MS_PER_DAY)); // old → dropped
+        append(Some(&path), &rec(2, 99 * MS_PER_DAY)); // recent → kept
+
+        // Drive the two phases by hand to interleave an append deterministically.
+        let cutoff = now.saturating_sub(90 * MS_PER_DAY);
+        let stage = prune_scan(&path, cutoff).expect("old record → rewrite staged");
+        append(Some(&path), &rec(3, 99 * MS_PER_DAY)); // lands after the scan
+        prune_commit(&path, stage);
+
+        let contents = std::fs::read_to_string(&path).expect("file");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "old dropped; kept record first, mid-prune append preserved behind it"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

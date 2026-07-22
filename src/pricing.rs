@@ -67,6 +67,19 @@ const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
 /// `group == "codex"` unknown-model fallback.
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-sol (flagship, 2026-07-09 launch): same rates as gpt-5.5
+/// ($5 in / $30 out, cache read at 90% discount). Codex: no cache-creation
+/// charge.
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-terra (mid tier): $2.50 in / $15 out, cache read 0.25.
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
+/// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
+/// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
+/// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
+/// Like the codex rows, an API-list-price EQUIVALENT for subscription
+/// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
+const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -82,6 +95,10 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
+        "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
+        "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
+        "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
+        "grok-4.5" => Some(GROK_4_5),
         _ => None,
     };
     if exact.is_some() {
@@ -96,8 +113,20 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(HAIKU_TIER)
     } else if model_norm_lower.starts_with("claude-fable-") {
         Some(FABLE_TIER)
-    } else if model_norm_lower.starts_with("gpt-5.5") {
+    } else if model_norm_lower.starts_with("gpt-5.5-") {
+        // Generation boundary: bare `gpt-5.5` matched exactly above; the
+        // prefix branch requires the `-` so `gpt-5.50-*` never takes 5.5
+        // rates (mirrors codex.rs `supports_extended_efforts`).
         Some(GPT_5_5)
+    } else if model_norm_lower.starts_with("gpt-5.6-terra-") {
+        Some(GPT_5_6_TERRA)
+    } else if model_norm_lower.starts_with("gpt-5.6-luna-") {
+        Some(GPT_5_6_LUNA)
+    } else if model_norm_lower.starts_with("gpt-5.6-") {
+        // Sol is the flagship default: `gpt-5.6-sol` (exact, above) and any
+        // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
+        // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
+        Some(GPT_5_6_SOL)
     } else {
         None
     }
@@ -143,6 +172,7 @@ pub fn price_for(
     match group.to_ascii_lowercase().as_str() {
         "claude" => Some(OPUS_TIER),
         "codex" => Some(GPT_5_5),
+        "grok" => Some(GROK_4_5),
         _ => None,
     }
 }
@@ -183,19 +213,62 @@ pub fn cost_from_parts(
     cache_creation: Option<u64>,
     overrides: &HashMap<String, ModelPrice>,
 ) -> f64 {
-    let Some(price) = price_for(group, model, overrides) else {
-        return 0.0;
-    };
+    priced_cost(
+        group,
+        model,
+        tokens_in,
+        tokens_out,
+        cache_read,
+        cache_creation,
+        overrides,
+    )
+    .unwrap_or(0.0)
+}
+
+/// [`cost_from_parts`] without the `0.0` sentinel: `None` means "no rate
+/// known for this `(group, model)`", so a caller can never mistake a missing
+/// rate for a free request (usage-stats review — the `priced` flag and the
+/// cost must come from ONE lookup, not two calls that merely agree today).
+#[allow(clippy::too_many_arguments)]
+pub fn priced_cost(
+    group: &str,
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    overrides: &HashMap<String, ModelPrice>,
+) -> Option<f64> {
+    let price = price_for(group, model, overrides)?;
     let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
-    per_m(tokens_in, price.input)
-        + per_m(tokens_out, price.output)
-        + per_m(cache_read.unwrap_or(0), price.cache_read)
-        + per_m(cache_creation.unwrap_or(0), price.cache_creation)
+    Some(
+        per_m(tokens_in, price.input)
+            + per_m(tokens_out, price.output)
+            + per_m(cache_read.unwrap_or(0), price.cache_read)
+            + per_m(cache_creation.unwrap_or(0), price.cache_creation),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- C14: grok pricing ----
+    #[test]
+    fn c14_grok_prices_and_group_fallback() {
+        let overrides = std::collections::HashMap::new();
+        let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
+        assert_eq!(
+            (p.input, p.output, p.cache_read, p.cache_creation),
+            (2.0, 6.0, 0.5, 0.0)
+        );
+        let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
+        assert_eq!(
+            (f.input, f.output),
+            (2.0, 6.0),
+            "unknown grok model → grok fallback"
+        );
+    }
 
     const EPS: f64 = 1e-9;
 
@@ -265,6 +338,90 @@ mod tests {
             &empty(),
         );
         approx(cost, 0.0);
+    }
+
+    #[test]
+    fn gpt_5_6_sol_matches_exact_and_bare_and_prefix() {
+        // Exact `gpt-5.6-sol`, the bare `gpt-5.6` alias, and a future dated
+        // snapshot all resolve to sol rates ($5 in / $30 out / $0.5 cache read).
+        for model in ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-sol-20260709"] {
+            let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
+            approx(cost, 5.00);
+            let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
+            approx(out, 30.00);
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_terra_and_luna_have_tier_rates() {
+        let terra = cost_usd(
+            "codex",
+            "gpt-5.6-terra",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(terra, 2.50);
+        let luna = cost_usd(
+            "codex",
+            "gpt-5.6-luna",
+            &tc(0, 1_000_000, None, None),
+            &empty(),
+        );
+        approx(luna, 6.00);
+    }
+
+    #[test]
+    fn gpt_5_6_has_no_cache_creation_charge() {
+        let cost = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
+            &tc(0, 0, None, Some(1_000_000)),
+            &empty(),
+        );
+        approx(cost, 0.0);
+    }
+
+    #[test]
+    fn gpt_5_60_does_not_resolve_to_gpt_5_6_pricing() {
+        // Generation boundary: `gpt-5.60-sol` is NOT a gpt-5.6 model. It must
+        // miss the built-in table entirely (no bare `gpt-5.6` prefix match)
+        // and land on the codex group fallback (gpt-5.5 rates), same as any
+        // other unknown codex model.
+        assert_eq!(builtin_price("gpt-5.60-sol"), None);
+        assert_eq!(builtin_price("gpt-5.60-terra"), None);
+        assert_eq!(builtin_price("gpt-5.50-mini"), None);
+        assert_eq!(
+            price_for("codex", "gpt-5.60-sol", &empty()),
+            Some(GPT_5_5),
+            "unknown codex model takes the group fallback"
+        );
+        // The boundary must not break real dated snapshots of the family.
+        assert_eq!(builtin_price("gpt-5.6-sol-20260709"), Some(GPT_5_6_SOL));
+        assert_eq!(builtin_price("gpt-5.6-terra-20260709"), Some(GPT_5_6_TERRA));
+        assert_eq!(builtin_price("gpt-5.6-luna-20260709"), Some(GPT_5_6_LUNA));
+        assert_eq!(builtin_price("gpt-5.5-codex"), Some(GPT_5_5));
+    }
+
+    #[test]
+    fn gpt_5_6_sol_cache_read_is_ten_percent_of_input() {
+        // OpenAI bills cached input at the flat gpt-5.x discount (10% of the
+        // input rate). gpt-5.6-sol input is $5/1e6, so 1e6 cache-read tokens
+        // cost $0.50 — a third of a mostly-cached prompt is billed at a tenth,
+        // not the full input rate (the codex cache-read cost regression).
+        let cache = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
+            &tc(0, 0, Some(1_000_000), None),
+            &empty(),
+        );
+        approx(cache, 0.50);
+        let input = cost_usd(
+            "codex",
+            "gpt-5.6-sol",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(cache, input * 0.10);
     }
 
     #[test]
