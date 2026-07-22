@@ -155,4 +155,48 @@ mod tests {
             AuthError::ProfileIncomplete("account.email")
         ));
     }
+
+    // --- fetch_profile network path (AUTH-11) ------------------------------
+
+    /// Spawn a one-route mock serving `GET /api/oauth/profile`.
+    async fn spawn_profile_mock(status: u16, body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/api/oauth/profile",
+            axum::routing::get(move || async move {
+                (axum::http::StatusCode::from_u16(status).unwrap(), body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_profile_parses_success_response() {
+        let base = spawn_profile_mock(
+            200,
+            r#"{"account":{"uuid":"u-9","email":"z@x.com","has_claude_max":true},"organization":{"name":"Acme"}}"#,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let profile = fetch_profile(&client, &base, "tok").await.unwrap();
+        assert_eq!(profile.account_uuid, "u-9");
+        assert_eq!(profile.email, "z@x.com");
+        assert_eq!(profile.tier.as_deref(), Some("max"));
+        assert_eq!(profile.org_name.as_deref(), Some("Acme"));
+    }
+
+    #[tokio::test]
+    async fn fetch_profile_maps_non_2xx_to_profile_endpoint_error() {
+        let base = spawn_profile_mock(403, "forbidden").await;
+        let client = reqwest::Client::new();
+        let err = fetch_profile(&client, &base, "tok").await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::ProfileEndpoint { .. }),
+            "expected ProfileEndpoint, got {err:?}"
+        );
+    }
 }
