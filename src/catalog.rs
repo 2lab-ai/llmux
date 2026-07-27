@@ -10,12 +10,17 @@
 //! bit: the grok family alias `"grok"` attaches to whichever grok id is the
 //! live pin, mirroring [`crate::provider::grok`]'s bare-`grok` routing.
 //!
-//! Sources (evidence gathered 2026-07-14):
-//! - Claude rows: user-curated 2026-07-14 (Claude Code model picker; `[1m]`
+//! Sources (evidence gathered 2026-07-14; claude rows re-curated 2026-07-27):
+//! - Claude rows: user-curated 2026-07-27, and they live in [`CLAUDE_MODELS`]
+//!   — that const is the SSOT for both these rows and the alias→id resolution
+//!   in [`crate::provider::anthropic`] (Claude Code model picker; `[1m]`
 //!   suffix marks the 1M-context variant ids). The effort menus are the Claude
 //!   Code `/effort` levels, applied per the user contract — llmux itself does
-//!   NOT shape claude requests (bare names still merely ROUTE to the group),
-//!   these values are advertised metadata for clients.
+//!   NOT shape claude request PARAMETERS (effort/thinking are client metadata,
+//!   advertised here and passed through). It DOES normalize the outbound
+//!   `model` field: [`crate::provider::anthropic`] resolves a curated alias to
+//!   its catalog id and strips the `[1m]` context suffix, with
+//!   [`CLAUDE_MODELS`] as the mapping source.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol/terra`
 //!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh.
@@ -52,13 +57,65 @@ pub struct ModelEntry {
 }
 
 /// Claude effort menu — the Claude Code `/effort` levels, per the user
-/// contract (llmux does not shape claude requests; this is client metadata).
+/// contract (llmux shapes no claude request PARAMETERS, only the outbound
+/// `model`; these values are client metadata).
 const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 // ---- codex effort menus (openai/codex models.json, 2026-07-14) ----
 const CODEX_EFFORTS_SOL_TERRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS_LUNA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// The curated claude catalog — SSOT for BOTH the `/models` rows below and the
+/// alias→id resolution in [`crate::provider::anthropic`]. Before this table
+/// existed the aliases were advertised by `/models` but never honored upstream
+/// (a bare `opus` was forwarded verbatim and 404'd at api.anthropic.com).
+/// Adding a model = one row here; the alias follows automatically.
+/// Tuple = (id, aliases, display name, max_context).
+pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
+    (
+        "claude-fable-5[1m]",
+        &["fable"],
+        "Claude Fable 5",
+        1_000_000,
+    ),
+    (
+        "claude-opus-5[1m]",
+        &["opus", "opus-5"],
+        "Claude Opus 5 [1M]",
+        1_000_000,
+    ),
+    ("claude-opus-5", &[], "Claude Opus 5", 200_000),
+    ("claude-opus-4-8[1m]", &[], "Claude Opus 4.8", 1_000_000),
+    ("claude-opus-4-6[1m]", &[], "Claude Opus 4.6", 1_000_000),
+    (
+        "claude-sonnet-5[1m]",
+        &["sonnet", "sonnet-5"],
+        "Claude Sonnet 5 [1M]",
+        1_000_000,
+    ),
+    ("claude-sonnet-5", &[], "Claude Sonnet 5", 200_000),
+    ("claude-haiku-4-5", &["haiku"], "Claude Haiku 4.5", 200_000),
+];
+
+/// Resolve a curated claude ALIAS (`opus`, `opus-5`, `sonnet`, `haiku`, …) to
+/// its catalog id, or `None` when `model` is not an alias (a real id, or any
+/// foreign slug — those must pass through untouched). Trimmed and
+/// ASCII-lowercased before matching. [`CLAUDE_MODELS`] is the only mapping
+/// source, so a new curated row carries its aliases automatically.
+///
+/// Two consumers must agree on this, which is why it lives here rather than in
+/// either of them: `provider::anthropic` rewrites the outbound `model` so the
+/// alias `/models` advertises is honored upstream, and `tui::activity`'s
+/// `normalize_model` applies the same mapping so usage and pricing are booked
+/// against the id that actually served the request.
+pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
+    let needle = model.trim().to_ascii_lowercase();
+    CLAUDE_MODELS
+        .iter()
+        .find(|(_, aliases, _, _)| aliases.contains(&needle.as_str()))
+        .map(|&(id, _, _, _)| id)
+}
 
 /// The known model catalog in canonical group order (`claude < codex < grok`).
 /// `grok_pin` / `codex_pin` are the live provider model slugs; the entry whose
@@ -74,35 +131,8 @@ const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
 pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
     let mut entries = Vec::new();
 
-    // ---- claude (user-curated 2026-07-14) ----
-    for (id, aliases, name, ctx) in [
-        (
-            "claude-fable-5[1m]",
-            &["fable"][..],
-            "Claude Fable 5",
-            1_000_000u64,
-        ),
-        (
-            "claude-opus-4-8[1m]",
-            &["opus"][..],
-            "Claude Opus 4.8",
-            1_000_000,
-        ),
-        ("claude-opus-4-6[1m]", &[][..], "Claude Opus 4.6", 1_000_000),
-        (
-            "claude-sonnet-5[1m]",
-            &["sonnet"][..],
-            "Claude Sonnet 5 [1M]",
-            1_000_000,
-        ),
-        ("claude-sonnet-5", &[][..], "Claude Sonnet 5", 200_000),
-        (
-            "claude-haiku-4-5",
-            &["haiku"][..],
-            "Claude Haiku 4.5",
-            200_000,
-        ),
-    ] {
+    // ---- claude (user-curated 2026-07-27) ----
+    for &(id, aliases, name, ctx) in CLAUDE_MODELS {
         entries.push(ModelEntry {
             id: Cow::Borrowed(id),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
@@ -216,10 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_11_entries() {
-        // The pinned (curated) case: exactly 11 rows, claude ids in order.
+    fn catalog_matches_user_contract_13_entries() {
+        // The pinned (curated) case: exactly 13 rows, claude ids in order.
         let entries = catalog("grok-4.5", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 11);
+        assert_eq!(entries.len(), 13);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -229,6 +259,8 @@ mod tests {
             claude_ids,
             vec![
                 "claude-fable-5[1m]",
+                "claude-opus-5[1m]",
+                "claude-opus-5",
                 "claude-opus-4-8[1m]",
                 "claude-opus-4-6[1m]",
                 "claude-sonnet-5[1m]",
@@ -264,19 +296,106 @@ mod tests {
         }
         // Curated aliases and 1M-vs-standard context windows.
         assert_eq!(find(&entries, "claude-fable-5[1m]").aliases, vec!["fable"]);
-        assert_eq!(find(&entries, "claude-opus-4-8[1m]").aliases, vec!["opus"]);
+        assert_eq!(
+            find(&entries, "claude-opus-5[1m]").aliases,
+            vec!["opus", "opus-5"]
+        );
+        assert!(find(&entries, "claude-opus-5").aliases.is_empty());
+        // The `opus` alias MOVED off 4.8 onto opus-5 — this emptiness is the
+        // regression this test guards (a stale alias would keep bare `opus`
+        // resolving to the old model).
+        assert!(find(&entries, "claude-opus-4-8[1m]").aliases.is_empty());
         assert!(find(&entries, "claude-opus-4-6[1m]").aliases.is_empty());
         assert_eq!(
             find(&entries, "claude-sonnet-5[1m]").aliases,
-            vec!["sonnet"]
+            vec!["sonnet", "sonnet-5"]
         );
         assert!(find(&entries, "claude-sonnet-5").aliases.is_empty());
         assert_eq!(find(&entries, "claude-haiku-4-5").aliases, vec!["haiku"]);
+        assert_eq!(
+            find(&entries, "claude-opus-5[1m]").max_context,
+            Some(1_000_000)
+        );
+        assert_eq!(find(&entries, "claude-opus-5").max_context, Some(200_000));
         assert_eq!(
             find(&entries, "claude-sonnet-5[1m]").max_context,
             Some(1_000_000)
         );
         assert_eq!(find(&entries, "claude-sonnet-5").max_context, Some(200_000));
+    }
+
+    /// `CLAUDE_MODELS` is now ALSO the alias→id resolution source for
+    /// [`crate::provider::anthropic`], so a duplicated alias would silently
+    /// make one row unreachable (first/last match wins, depending on the
+    /// resolver's scan order) — the table must keep aliases globally unique.
+    #[test]
+    fn claude_aliases_are_unique_across_rows() {
+        let mut aliases: Vec<&str> = CLAUDE_MODELS
+            .iter()
+            .flat_map(|(_, aliases, _, _)| aliases.iter().copied())
+            .collect();
+        aliases.sort_unstable();
+        for pair in aliases.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate claude alias {:?}", pair[0]);
+        }
+    }
+
+    /// The companion invariant to alias uniqueness: no curated ID may ALSO be
+    /// an alias. `resolve_claude_alias` deliberately returns `None` for a real
+    /// id (the `[1m]` strip is a separate downstream step), and
+    /// `provider::anthropic`'s `resolve_client_alias` rewrites the outbound
+    /// `model` from whatever it returns — so an id captured as some other
+    /// row's alias would turn an explicitly chosen model into a different one.
+    /// The failure mode is SILENT model substitution, not an error, which is
+    /// why it is pinned here rather than left to review.
+    #[test]
+    fn no_curated_id_is_also_an_alias() {
+        for &(id, _, _, _) in CLAUDE_MODELS {
+            assert_eq!(
+                resolve_claude_alias(id),
+                None,
+                "curated id {id:?} is also an alias — requests for it would be \
+                 silently rewritten to {:?}",
+                resolve_claude_alias(id)
+            );
+        }
+    }
+
+    /// Table-driven: every alias of every curated row resolves to that row's
+    /// id. Adding a row cannot leave this test stale — it iterates the SSOT.
+    #[test]
+    fn resolve_claude_alias_maps_every_curated_alias_to_its_row() {
+        for &(id, aliases, _, _) in CLAUDE_MODELS {
+            for alias in aliases {
+                assert_eq!(
+                    resolve_claude_alias(alias),
+                    Some(id),
+                    "alias {alias:?} must resolve to {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_claude_alias_is_trimmed_and_case_insensitive() {
+        assert_eq!(resolve_claude_alias("  OPUS  "), Some("claude-opus-5[1m]"));
+    }
+
+    /// Deliberate asymmetry: a real id is NOT an alias (the `[1m]` strip is a
+    /// separate downstream step), and foreign slugs must pass through
+    /// untouched so non-claude routing is never rewritten.
+    #[test]
+    fn resolve_claude_alias_rejects_ids_and_foreign_slugs() {
+        for slug in [
+            "claude-opus-5",
+            "claude-opus-5[1m]",
+            "claude-opus-4-8[1m]",
+            "grok-4.5",
+            "gpt-5.6-sol",
+            "",
+        ] {
+            assert_eq!(resolve_claude_alias(slug), None, "{slug:?} is not an alias");
+        }
     }
 
     #[test]
@@ -301,9 +420,9 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 11.
+        // A curated pin: no synthesized row, alias on the static row, count 13.
         let entries = catalog("grok-4.5", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 11);
+        assert_eq!(entries.len(), 13);
         let owners: Vec<&str> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -317,7 +436,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 12);
+        assert_eq!(entries.len(), 14);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -338,7 +457,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 12);
+        assert_eq!(entries.len(), 14);
         let synth = find(&entries, "grok-4.3");
         assert_eq!(synth.efforts, &["none", "low", "medium", "high"]);
         assert_eq!(synth.max_context, None);

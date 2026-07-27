@@ -88,9 +88,8 @@ const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     // Exact (post-normalization) matches.
     let exact = match model_norm_lower {
-        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" | "claude-opus-4-5" => {
-            Some(OPUS_TIER)
-        }
+        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
+        | "claude-opus-4-5" => Some(OPUS_TIER),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
         "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5" => Some(FABLE_TIER),

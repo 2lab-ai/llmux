@@ -20,25 +20,47 @@ use super::{
 };
 use crate::config::AccountCredential;
 
-/// Normalize an Anthropic-bound JSON body in ONE parse: strip the
-/// Claude-Code-local `[1m]` context-window suffix from `model`, and strip
-/// foreign (unsigned) thinking blocks from `messages` (issue #116). Returns
-/// the original bytes (refcounted, byte-identity) when nothing changed; a
-/// non-JSON body passes through untouched — passthrough never fails on body
-/// shape.
+/// Normalize an Anthropic-bound JSON body in ONE parse: resolve a curated
+/// claude ALIAS in `model` to its catalog id, strip the Claude-Code-local
+/// `[1m]` context-window suffix from `model`, and strip foreign (unsigned)
+/// thinking blocks from `messages` (issue #116). The two model steps run in
+/// that order and compose (`opus` → `claude-opus-5[1m]` → `claude-opus-5`).
+/// Returns the original bytes (refcounted, byte-identity) when nothing
+/// changed; a non-JSON body passes through untouched — passthrough never
+/// fails on body shape.
 fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
+    let alias = resolve_client_alias(&mut value);
     let model = strip_client_context_suffix(&mut value);
     let thinking = strip_foreign_thinking(&mut value);
-    if !(model || thinking) {
+    if !(alias || model || thinking) {
         return body;
     }
     match serde_json::to_vec(&value) {
         Ok(bytes) => bytes::Bytes::from(bytes),
         Err(_) => body,
     }
+}
+
+/// Rewrite a client-supplied model that is a curated claude ALIAS (`opus`,
+/// `sonnet`, `haiku`, …) to its catalog id, so the alias `GET /models`
+/// advertises is actually honored upstream: before this hook a bare `opus` was
+/// forwarded verbatim and 404'd at api.anthropic.com. Mapping lives in
+/// [`crate::catalog::CLAUDE_MODELS`] behind
+/// [`crate::catalog::resolve_claude_alias`], so a new curated row carries its
+/// aliases automatically and anything that is not an alias (a real id, a
+/// foreign slug) passes through untouched — passthrough stays passthrough.
+fn resolve_client_alias(value: &mut serde_json::Value) -> bool {
+    let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(id) = crate::catalog::resolve_claude_alias(model) else {
+        return false;
+    };
+    value["model"] = serde_json::Value::String(id.to_string());
+    true
 }
 
 fn strip_client_context_suffix(value: &mut serde_json::Value) -> bool {
@@ -294,6 +316,70 @@ mod tests {
         let upstream: serde_json::Value =
             serde_json::from_slice(&provider_req.body).expect("upstream json");
         assert_eq!(upstream["model"], "claude-opus-4-8");
+    }
+
+    /// Run a `model` value through `normalize_body` and return what the
+    /// upstream would actually receive.
+    fn normalized_model(model: &str) -> String {
+        let body = serde_json::json!({"model": model, "messages": []}).to_string();
+        let out = normalize_body(bytes::Bytes::from(body));
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("upstream json");
+        value["model"].as_str().expect("model string").to_string()
+    }
+
+    /// The curated aliases `GET /models` advertises must be honored upstream:
+    /// a bare `opus` used to be forwarded verbatim and 404 at
+    /// api.anthropic.com. Alias resolution runs BEFORE the `[1m]` strip, so
+    /// the two compose into the real upstream id.
+    #[test]
+    fn normalize_body_resolves_curated_claude_aliases() {
+        assert_eq!(normalized_model("opus"), "claude-opus-5");
+        assert_eq!(normalized_model("opus-5"), "claude-opus-5");
+        assert_eq!(normalized_model("sonnet"), "claude-sonnet-5");
+        assert_eq!(normalized_model("sonnet-5"), "claude-sonnet-5");
+        assert_eq!(normalized_model("fable"), "claude-fable-5");
+    }
+
+    /// `haiku`'s catalog row carries NO `[1m]` suffix — proof the two steps
+    /// compose rather than both always firing.
+    #[test]
+    fn normalize_body_resolves_an_alias_whose_id_has_no_context_suffix() {
+        assert_eq!(normalized_model("haiku"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn normalize_body_resolves_aliases_case_insensitively_and_trimmed() {
+        assert_eq!(normalized_model("  OPUS  "), "claude-opus-5");
+    }
+
+    /// A real id is not an alias: only the pre-existing suffix strip applies.
+    #[test]
+    fn normalize_body_leaves_a_real_id_to_the_suffix_strip() {
+        assert_eq!(normalized_model("claude-opus-5[1m]"), "claude-opus-5");
+    }
+
+    /// A real id with no suffix and no alias match changes nothing — the body
+    /// must come back byte-identical (refcounted fast path).
+    #[test]
+    fn normalize_body_is_byte_identical_for_a_plain_id() {
+        let body = r#"{"model":"claude-opus-4-8","messages":[]}"#;
+        let out = normalize_body(bytes::Bytes::from_static(body.as_bytes()));
+        assert_eq!(out.as_ref(), body.as_bytes());
+    }
+
+    /// A non-claude slug is never rewritten (grok/codex own their own
+    /// resolution).
+    #[test]
+    fn normalize_body_never_rewrites_a_foreign_slug() {
+        let body = r#"{"model":"grok-4.5","messages":[]}"#;
+        let out = normalize_body(bytes::Bytes::from_static(body.as_bytes()));
+        assert_eq!(out.as_ref(), body.as_bytes());
+    }
+
+    #[test]
+    fn normalize_body_passes_non_json_through_byte_identical() {
+        let out = normalize_body(bytes::Bytes::from_static(b"not json"));
+        assert_eq!(out.as_ref(), b"not json");
     }
 
     /// Issue #116 RED shape: the exact replay a client sends after a grok
