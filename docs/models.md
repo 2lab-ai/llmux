@@ -50,11 +50,35 @@ not that it is zero.
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. These are advertised statically
   on the corresponding entries.
-- **claude aliases** — the claude rows carry short user-curated aliases
-  (`fable` / `opus` / `sonnet` / `haiku`) as client metadata. Note that llmux
-  itself does not *shape* claude requests: bare names merely ROUTE to the claude
-  group and are not resolved by the proxy to a concrete id. The `efforts` menu
-  on claude rows is the Claude Code `/effort` level list, per the user contract.
+- **claude aliases** — the claude rows carry short user-curated aliases that
+  both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
+  rewritten to its catalog id before the request leaves llmux, so the alias
+  `GET /models` advertises is actually honored upstream.
+
+  | request slug     | catalog id            | model on the wire  |
+  | ---------------- | --------------------- | ------------------ |
+  | `fable`          | `claude-fable-5[1m]`  | `claude-fable-5`   |
+  | `opus`, `opus-5` | `claude-opus-5[1m]`   | `claude-opus-5`    |
+  | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
+  | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
+
+  Matching is trimmed and case-insensitive (`"  OPUS  "` resolves). Only aliases
+  are rewritten: a real catalog id is not an alias and passes through untouched
+  — the `[1m]` suffix strip is a separate, subsequent step, which is why
+  `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` — and foreign
+  slugs (`grok-4.5`, `gpt-5.6-sol`) are never rewritten. The mapping has a
+  single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
+  `resolve_claude_alias`; adding a curated row carries its aliases
+  automatically. llmux still does not otherwise *shape* claude requests, and the
+  `efforts` menu on claude rows is the Claude Code `/effort` level list, per the
+  user contract.
+- **alias stability** — aliases float to the current generation, ids do not.
+  `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
+  `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
+  owns an alias). Anyone who needs one specific model must send its full catalog
+  id — that is the stable handle. Usage and pricing are booked against the
+  resolved id, not the alias, so alias traffic lands on the same row as id
+  traffic.
 
 ### Out-of-catalog grok pin
 
@@ -74,9 +98,11 @@ context/name for an id it does not curate.
 | id                  | aliases      | name                | efforts                              | max_context | group  |
 | ------------------- | ------------ | ------------------- | ------------------------------------ | ----------- | ------ |
 | claude-fable-5[1m]  | fable        | Claude Fable 5      | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-opus-4-8[1m] | opus         | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-opus-5[1m]   | opus, opus-5 | Claude Opus 5 [1M]  | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-sonnet-5[1m] | sonnet       | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
@@ -91,12 +117,15 @@ live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
 
 ## Sources
 
-Evidence gathered 2026-07-14.
+Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
+2026-07-27. The codex and grok evidence below is unchanged from 2026-07-14.
 
-- **Claude rows** — user-curated 2026-07-14 from the Claude Code model picker.
+- **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
   Claude Code `/effort` levels (`low, medium, high, xhigh, max`), applied per
-  the user contract; llmux does not itself shape claude requests.
+  the user contract; llmux does not itself shape claude requests. The claude
+  rows now live as the `CLAUDE_MODELS` const in `src/catalog.rs`, which is also
+  the source for alias→id resolution in `src/provider/anthropic.rs`.
 - **Codex context windows and effort menus** — the openai/codex model catalog
   (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` / `-terra`
   support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh (context
