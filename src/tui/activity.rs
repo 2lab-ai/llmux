@@ -495,9 +495,22 @@ pub(crate) struct ModelCount {
     pub requests: u64,
 }
 
-/// Strip a trailing display-only context suffix `…[1m]` so usage is not split
-/// by client window hints (req17): `claude-sonnet-4-5[1m]` → `claude-sonnet-4-5`.
+/// Canonicalize the accounting/pricing key for a served model, in two steps:
+///
+/// 1. Resolve a curated claude alias to its catalog id via
+///    [`crate::catalog::resolve_claude_alias`] (`opus` → `claude-opus-5[1m]`).
+///    [`crate::provider::anthropic`] rewrites the outbound `model` the same way,
+///    so the request is genuinely served by that id — usage and pricing must be
+///    booked against it too. Without this, a client sending `opus` produces a
+///    dashboard row literally named `opus` that matches no pricing entry (no
+///    `claude-…` prefix) and silently falls through to the group default.
+///    Non-aliases (real ids, codex/grok/unknown slugs) pass through untouched.
+/// 2. Strip a trailing display-only context suffix `…[1m]` so usage is not split
+///    by client window hints (req17): `claude-sonnet-4-5[1m]` →
+///    `claude-sonnet-4-5`. The steps compose: `opus` → `claude-opus-5[1m]` →
+///    `claude-opus-5`.
 pub(crate) fn normalize_model(model: &str) -> String {
+    let model = crate::catalog::resolve_claude_alias(model).unwrap_or(model);
     match model.split_once('[') {
         Some((base, _)) => base.trim().to_string(),
         None => model.trim().to_string(),
@@ -2612,6 +2625,39 @@ mod tests {
             "claude-sonnet-4-5"
         );
         assert_eq!(normalize_model("gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn normalize_model_resolves_curated_claude_aliases() {
+        assert_eq!(normalize_model("opus"), "claude-opus-5");
+        assert_eq!(normalize_model("opus-5"), "claude-opus-5");
+        assert_eq!(normalize_model("sonnet"), "claude-sonnet-5");
+        assert_eq!(normalize_model("sonnet-5"), "claude-sonnet-5");
+        assert_eq!(normalize_model("fable"), "claude-fable-5");
+        assert_eq!(normalize_model("haiku"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn normalize_model_alias_result_is_priceable() {
+        // Pricing keys off a `claude-…` prefix on the bare id; an unresolved
+        // alias would match nothing and fall through to the group default.
+        for alias in ["opus", "sonnet"] {
+            let key = normalize_model(alias);
+            assert!(key.starts_with("claude-"), "{alias} → {key}");
+            assert!(!key.contains('['), "{alias} → {key}");
+        }
+    }
+
+    #[test]
+    fn normalize_model_leaves_non_claude_slugs_alone() {
+        assert_eq!(normalize_model("grok-4.5"), "grok-4.5");
+        assert_eq!(normalize_model("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(normalize_model("gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn normalize_model_is_trimmed_and_case_insensitive_for_aliases() {
+        assert_eq!(normalize_model("  OPUS  "), "claude-opus-5");
     }
 
     #[test]

@@ -213,10 +213,19 @@ impl Classifier {
         }
     }
 
-    /// Classify a model name (case-insensitive) to a group. `None` (no model
-    /// in the body) routes to the configured default group. Codex rules are
-    /// checked first, then claude, then grok; an unrecognized model falls
-    /// back to `default_group`. (The rule families are disjoint by
+    /// Classify a model name to a group. The name is TRIMMED and
+    /// ASCII-lowercased before rule matching, so the rules see exactly the
+    /// string the alias resolvers see — `catalog::resolve_claude_alias` and
+    /// the Anthropic provider's `resolve_client_alias` both trim+lowercase,
+    /// and the alias contract is advertised as whitespace-tolerant. Without
+    /// the trim, `"  opus"` defeats `Rule::Prefix("opus")` (`starts_with`) and
+    /// only lands on claude by luck of `default_group` — under a non-claude
+    /// default it would route to the wrong backend. Leading/trailing
+    /// whitespace is never meaningful in a model slug for any group.
+    ///
+    /// `None` (no model in the body) routes to the configured default group.
+    /// Codex rules are checked first, then claude, then grok; an unrecognized
+    /// model falls back to `default_group`. (The rule families are disjoint by
     /// construction — `gpt-`/`o*` vs Anthropic names vs `grok` — so the check
     /// order only decides ties a user creates with overlapping config
     /// overrides.)
@@ -224,7 +233,7 @@ impl Classifier {
         let Some(model) = model else {
             return self.default_group;
         };
-        let lower = model.to_ascii_lowercase();
+        let lower = model.trim().to_ascii_lowercase();
         if self.codex_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Codex;
         }
@@ -427,6 +436,39 @@ mod tests {
             BackendGroup::Claude
         );
         assert_eq!(builtin().classify(Some("CODEX")), BackendGroup::Codex);
+    }
+
+    #[test]
+    fn classify_is_case_insensitive() {
+        let c = builtin();
+        assert_eq!(c.classify(Some("OPUS")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("Grok-4.5")), BackendGroup::Grok);
+    }
+
+    // ---- whitespace tolerance (agrees with catalog::resolve_claude_alias) ----
+
+    #[test]
+    fn classify_trims_whitespace_before_matching() {
+        let c = builtin();
+        assert_eq!(c.classify(Some("  opus  ")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("\topus")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("  gpt-5.6-sol ")), BackendGroup::Codex);
+        assert_eq!(c.classify(Some("  grok-4.5")), BackendGroup::Grok);
+
+        // The claude assertions above would also pass by luck of the default
+        // group being claude. Re-run them with a non-claude default so the
+        // padded alias must match the CLAUDE RULE, not the fallback.
+        let grok_default = Classifier::from_config(&[], &[], &[], "grok");
+        assert_eq!(
+            grok_default.classify(Some("  opus  ")),
+            BackendGroup::Claude,
+            "padded claude alias must route by rule, not by default_group"
+        );
+        assert_eq!(
+            grok_default.classify(Some("\topus")),
+            BackendGroup::Claude,
+            "padded claude alias must route by rule, not by default_group"
+        );
     }
 
     // ---- None / unknown → default fallback ----
