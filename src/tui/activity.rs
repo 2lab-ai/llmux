@@ -1078,9 +1078,10 @@ pub(crate) struct ActivityLog {
     /// Per-TENANT request attribution (multi-tenant #22), keyed by the auth
     /// gate's attribution id (`k-…` / `legacy` / `local`; `unknown` holds
     /// pre-tenant replayed history). Rebuilt from the persisted request log on
-    /// startup through the same fold, so restarts keep tenant history. P1
-    /// carries the simple counts; per-model/cost breakdown is the P2 layer.
-    tenants: BTreeMap<String, Totals>,
+    /// startup through the same fold, so restarts keep tenant history.
+    /// Carries the counts plus the per-model breakdown and first/last-seen
+    /// stamps the admin keys panel renders ("언제부터 언제까지").
+    tenants: BTreeMap<String, TenantStats>,
     /// Rolling hourly bucket ring for the windowed (24h/72h) per-account
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
@@ -1129,6 +1130,31 @@ impl HealthCounts {
         self.s401 += other.s401;
         self.s5xx += other.s5xx;
     }
+}
+
+/// Per-tenant aggregate (multi-tenant #22): lifetime counts, the summed
+/// token classes per served `(group, model)` (so API-equivalent cost can be
+/// priced at render time), and the first/last request timestamps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TenantStats {
+    pub totals: Totals,
+    /// First/last finished-request timestamps (epoch ms; replay passes each
+    /// record's persisted stamp, so history keeps its real span).
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// (group, model) → summed tokens + request count for priced breakdown.
+    /// Only requests attributed to a served model land here (pre-routing
+    /// failures keep group/model `None` and count in `totals` only).
+    pub models: BTreeMap<(String, String), TenantModelStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TenantModelStats {
+    pub requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1736,54 +1762,65 @@ impl ActivityLog {
     /// Per-tenant attribution (multi-tenant #22): every finished request is
     /// counted against the tenant id the auth gate resolved. `None` — only
     /// pre-tenant replayed history — lands in `unknown`, NEVER in `local`
-    /// (coercing would silently inflate a live bucket).
-    fn record_tenant(&mut self, tenant: Option<&str>, status: u16, tokens: Option<TokenCounts>) {
+    /// (coercing would silently inflate a live bucket). Model-attributed
+    /// requests additionally fold into the per-(group, model) breakdown the
+    /// keys panel prices; `now` stamps the first/last-seen span (replay
+    /// passes persisted timestamps, so restarts keep the real range).
+    #[allow(clippy::too_many_arguments)]
+    fn record_tenant(
+        &mut self,
+        tenant: Option<&str>,
+        status: u16,
+        tokens: Option<TokenCounts>,
+        group: Option<&str>,
+        model: Option<&str>,
+        now: SystemTime,
+    ) {
         let key = match tenant {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => UNKNOWN_CLIENT.to_string(),
         };
         let bucket = self.tenants.entry(key).or_default();
-        bucket.requests += 1;
+        bucket.totals.requests += 1;
         if status < 400 {
-            bucket.ok += 1;
+            bucket.totals.ok += 1;
         } else {
-            bucket.errors += 1;
+            bucket.totals.errors += 1;
         }
         if let Some(t) = tokens {
-            bucket.tokens_in = bucket.tokens_in.saturating_add(t.input);
-            bucket.tokens_out = bucket.tokens_out.saturating_add(t.output);
+            bucket.totals.tokens_in = bucket.totals.tokens_in.saturating_add(t.input);
+            bucket.totals.tokens_out = bucket.totals.tokens_out.saturating_add(t.output);
+        }
+        let at_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if bucket.first_ms == 0 || at_ms < bucket.first_ms {
+            bucket.first_ms = at_ms;
+        }
+        if at_ms > bucket.last_ms {
+            bucket.last_ms = at_ms;
+        }
+        if let (Some(group), Some(model)) = (group, model) {
+            let cell = bucket
+                .models
+                .entry((group.to_string(), normalize_model(model)))
+                .or_default();
+            cell.requests += 1;
+            if let Some(t) = tokens {
+                cell.input = cell.input.saturating_add(t.input);
+                cell.output = cell.output.saturating_add(t.output);
+                cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+                cell.cache_creation = cell
+                    .cache_creation
+                    .saturating_add(t.cache_creation.unwrap_or(0));
+            }
         }
     }
 
-    /// Per-tenant attribution rows (multi-tenant #22), sorted like
-    /// [`Self::client_usage`] (requests desc). Reuses the [`ClientUsage`] row
-    /// shape with `client` = the tenant attribution id; display layers
-    /// resolve ids to names at render time.
-    pub(crate) fn tenant_usage(&self) -> Vec<ClientUsage> {
-        let mut rows: Vec<ClientUsage> = self
-            .tenants
-            .iter()
-            .map(|(id, t)| ClientUsage {
-                client: id.clone(),
-                requests: t.requests,
-                ok: t.ok,
-                errors: t.errors,
-                tokens_in: t.tokens_in,
-                tokens_out: t.tokens_out,
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            b.requests
-                .cmp(&a.requests)
-                .then((b.tokens_in + b.tokens_out).cmp(&(a.tokens_in + a.tokens_out)))
-                .then(a.client.cmp(&b.client))
-        });
-        rows
-    }
-
-    /// Per-tenant totals snapshot (tenant id → counts), for tests.
-    #[cfg(test)]
-    pub(crate) fn tenant_totals(&self) -> &BTreeMap<String, Totals> {
+    /// Full per-tenant aggregates (counts + model breakdown + span), for the
+    /// dashboard document build.
+    pub(crate) fn tenant_stats(&self) -> &BTreeMap<String, TenantStats> {
         &self.tenants
     }
 
@@ -1987,7 +2024,14 @@ impl ActivityLog {
                 // pre-routing failures are attributed too, never dropped.
                 self.record_client(user_id.as_deref(), status, tokens);
                 // Per-tenant attribution (multi-tenant #22), same independence.
-                self.record_tenant(tenant.as_deref(), status, tokens);
+                self.record_tenant(
+                    tenant.as_deref(),
+                    status,
+                    tokens,
+                    group.as_deref(),
+                    model.as_deref(),
+                    now,
+                );
                 // Session label (TUI UI-3 U2): the FIRST plain user-input
                 // excerpt seen for a client id becomes that session's derived
                 // title (nothing on the wire carries a real one). Bounded by
@@ -3055,9 +3099,9 @@ mod tests {
             log.apply(event, at(id));
         }
         let expect = |log: &ActivityLog, key: &str, requests: u64, tokens_in: u64| {
-            let t = log.tenant_totals().get(key).copied().unwrap_or_default();
-            assert_eq!(t.requests, requests, "requests for {key}");
-            assert_eq!(t.tokens_in, tokens_in, "tokens_in for {key}");
+            let t = log.tenant_stats().get(key).cloned().unwrap_or_default();
+            assert_eq!(t.totals.requests, requests, "requests for {key}");
+            assert_eq!(t.totals.tokens_in, tokens_in, "tokens_in for {key}");
         };
         expect(&log, "k-aaaa", 2, 150);
         expect(&log, "k-bbbb", 1, 10);
@@ -3065,17 +3109,18 @@ mod tests {
         // Pre-tenant history lands in `unknown` — NEVER coerced into `local`
         // (that would silently inflate a live bucket).
         expect(&log, UNKNOWN_CLIENT, 1, 1);
-        assert_eq!(log.tenant_totals().get("k-aaaa").unwrap().errors, 1);
+        let ka = log.tenant_stats().get("k-aaaa").unwrap();
+        assert_eq!(ka.totals.errors, 1);
+        // First/last span reflects the fold timestamps (at(1)..at(2)).
+        assert!(ka.first_ms > 0 && ka.last_ms > ka.first_ms);
 
         // Replay from the persisted JSONL rebuilds identical tenant buckets
         // (the additive `tenant` field round-trips; None stays None).
         let mut replayed = ActivityLog::new(50);
         replayed.load_persisted(Some(&path));
-        assert_eq!(log.tenant_totals(), replayed.tenant_totals());
-        // And the wire rows resolve ids for the doc layer.
-        let rows = log.tenant_usage();
-        assert_eq!(rows.len(), 4);
-        let total: u64 = rows.iter().map(|r| r.requests).sum();
+        assert_eq!(log.tenant_stats(), replayed.tenant_stats());
+        // Every finished request is tenant-attributed across the buckets.
+        let total: u64 = log.tenant_stats().values().map(|t| t.totals.requests).sum();
         assert_eq!(total, 5, "every finished request tenant-attributed");
     }
 

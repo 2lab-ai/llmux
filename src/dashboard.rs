@@ -235,7 +235,7 @@ impl DashboardHub {
             rpm_5m: state.log.requests_per_minute(now, RPM_WINDOW),
             model_usage: state.log.model_usage(),
             client_usage: state.log.client_usage(),
-            tenant_usage: state.log.tenant_usage(),
+            tenant_stats: state.log.tenant_stats().clone(),
             // Windowed heatmap rows per window (issue #23). Computed under the
             // same lock as the rest of the view so one read is consistent.
             windowed: StatsWindow::ALL
@@ -269,9 +269,10 @@ pub(crate) struct HubView {
     pub model_usage: Vec<ModelUsage>,
     /// Per-client request attribution rows (issue #32), sorted by requests desc.
     pub client_usage: Vec<ClientUsage>,
-    /// Per-TENANT attribution rows (multi-tenant #22): `client` carries the
-    /// tenant attribution id (`k-…` / `legacy` / `local` / `unknown`).
-    pub tenant_usage: Vec<ClientUsage>,
+    /// Per-TENANT aggregates (multi-tenant #22), keyed by attribution id
+    /// (`k-…` / `legacy` / `local` / `unknown`): counts + per-model token
+    /// sums + first/last-seen span. Priced into the doc at build time.
+    pub tenant_stats: std::collections::BTreeMap<String, super::tui::activity::TenantStats>,
     /// Windowed heatmap rows per window (issue #23): one `(window, rows)` pair
     /// per [`StatsWindow`], each already sorted by total tokens desc.
     pub windowed: Vec<(StatsWindow, Vec<WindowedRow>)>,
@@ -1156,6 +1157,32 @@ pub struct TenantUsageDoc {
     pub errors: u64,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// API-equivalent USD cost, summed over the priced per-model cells.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// First/last finished-request stamps (epoch ms; 0 = no data) — the
+    /// "used from … to …" span the keys panel renders.
+    #[serde(default)]
+    pub first_ms: u64,
+    #[serde(default)]
+    pub last_ms: u64,
+    /// Per-(group, model) breakdown, sorted by total tokens desc.
+    #[serde(default)]
+    pub models: Vec<TenantModelDoc>,
+}
+
+/// One tenant's usage of one served model (multi-tenant #22).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantModelDoc {
+    pub group: String,
+    pub model: String,
+    pub requests: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    /// API-equivalent USD cost for this cell (0.0 when nothing prices it).
+    pub cost_usd: f64,
 }
 
 /// One issued client key's metadata for the dashboard (multi-tenant #22).
@@ -1848,28 +1875,68 @@ pub(crate) fn dashboard_doc(
         })
         .collect();
 
-    // Per-tenant rows (multi-tenant #22): join the hub's counts with the key
-    // metadata so display layers get names without another lookup. Builtin
-    // buckets (`local`/`legacy`/`unknown`) name themselves.
-    let tenant_usage: Vec<TenantUsageDoc> = hub
-        .tenant_usage
+    // Per-tenant rows (multi-tenant #22): join the hub's aggregates with the
+    // key metadata (names/emails) and price each model cell — same rate path
+    // as the model-usage rows, overrides included. Builtin buckets
+    // (`local`/`legacy`/`unknown`) name themselves.
+    let mut tenant_usage: Vec<TenantUsageDoc> = hub
+        .tenant_stats
         .iter()
-        .map(|t| {
-            let key = meta.client_keys.iter().find(|k| k.id == t.client);
+        .map(|(id, t)| {
+            let key = meta.client_keys.iter().find(|k| &k.id == id);
+            let mut models: Vec<TenantModelDoc> = t
+                .models
+                .iter()
+                .map(|((group, model), cell)| {
+                    let tokens = TokenCounts {
+                        input: cell.input,
+                        output: cell.output,
+                        cache_read: Some(cell.cache_read),
+                        cache_creation: Some(cell.cache_creation),
+                    };
+                    TenantModelDoc {
+                        group: group.clone(),
+                        model: model.clone(),
+                        requests: cell.requests,
+                        tokens_in: cell.input,
+                        tokens_out: cell.output,
+                        cache_read: cell.cache_read,
+                        cache_creation: cell.cache_creation,
+                        cost_usd: crate::pricing::cost_usd(
+                            group,
+                            model,
+                            &tokens,
+                            &meta.pricing_overrides,
+                        ),
+                    }
+                })
+                .collect();
+            models.sort_by(|a, b| {
+                (b.tokens_in + b.tokens_out + b.cache_read + b.cache_creation)
+                    .cmp(&(a.tokens_in + a.tokens_out + a.cache_read + a.cache_creation))
+            });
             TenantUsageDoc {
-                tenant: t.client.clone(),
-                name: key
-                    .map(|k| k.name.clone())
-                    .unwrap_or_else(|| t.client.clone()),
+                tenant: id.clone(),
+                name: key.map(|k| k.name.clone()).unwrap_or_else(|| id.clone()),
                 email: key.and_then(|k| k.email.clone()),
-                requests: t.requests,
-                ok: t.ok,
-                errors: t.errors,
-                tokens_in: t.tokens_in,
-                tokens_out: t.tokens_out,
+                requests: t.totals.requests,
+                ok: t.totals.ok,
+                errors: t.totals.errors,
+                tokens_in: t.totals.tokens_in,
+                tokens_out: t.totals.tokens_out,
+                cost_usd: models.iter().map(|m| m.cost_usd).sum(),
+                first_ms: t.first_ms,
+                last_ms: t.last_ms,
+                models,
             }
         })
         .collect();
+    tenant_usage.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then((b.tokens_in + b.tokens_out).cmp(&(a.tokens_in + a.tokens_out)))
+            .then(a.tenant.cmp(&b.tenant))
+    });
 
     DashboardDoc {
         version: crate::build_info::version_string(),
@@ -2122,6 +2189,7 @@ mod tests {
     use crate::config::{AccountConfig, AccountCredential};
     use crate::scheduler::headers::{ParsedRateLimitHeaders, WindowReading};
     use crate::scheduler::{AccountId, AccountPool};
+    use crate::tui::activity::UNKNOWN_CLIENT;
 
     const NOW_SECS: u64 = 1_000_000;
 
@@ -2317,6 +2385,98 @@ mod tests {
             now(),
             &meta(),
         )
+    }
+
+    /// Multi-tenant #22: the doc's tenant rows join hub aggregates with key
+    /// metadata (name/email), price the per-model cells, and carry the
+    /// first/last-seen span. Unknown ids (pre-tenant history) name themselves.
+    #[test]
+    fn doc_tenant_rows_are_priced_named_and_spanned() {
+        let hub = DashboardHub::default();
+        let finished = |id: u64, tenant: Option<&str>, at: SystemTime| {
+            (
+                ActivityEvent::RequestFinished {
+                    id,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    account: Some("a".into()),
+                    status: 200,
+                    duration: Duration::from_millis(900),
+                    tokens: Some(TokenCounts {
+                        input: 1_000_000,
+                        output: 0,
+                        cache_read: None,
+                        cache_creation: None,
+                    }),
+                    group: Some("claude".into()),
+                    model: Some("claude-opus-4-8".into()),
+                    effort: None,
+                    fast: Some(false),
+                    ttfb_ms: None,
+                    ttft_ms: None,
+                    gen_ms: None,
+                    aborted: false,
+                    user_id: None,
+                    kind: None,
+                    excerpt: None,
+                    tenant: tenant.map(str::to_string),
+                },
+                at,
+            )
+        };
+        let (e, at) = finished(1, Some("k-t1"), now() - Duration::from_secs(500));
+        hub.apply_event(e, at);
+        let (e, at) = finished(2, Some("k-t1"), now() - Duration::from_secs(50));
+        hub.apply_event(e, at);
+        let (e, at) = finished(3, None, now() - Duration::from_secs(10));
+        hub.apply_event(e, at);
+
+        let mut meta = meta();
+        meta.client_keys.push(KeyRowDoc {
+            id: "k-t1".into(),
+            name: "pc-a".into(),
+            email: Some("a@x.com".into()),
+            kind: "default".into(),
+            key_prefix: "lmk-aaaa".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        });
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta,
+        );
+
+        assert_eq!(doc.tenant_usage.len(), 2, "keyed tenant + unknown bucket");
+        let t1 = &doc.tenant_usage[0];
+        assert_eq!(t1.tenant, "k-t1");
+        assert_eq!(t1.name, "pc-a", "name joined from key metadata");
+        assert_eq!(t1.email.as_deref(), Some("a@x.com"));
+        assert_eq!(t1.requests, 2);
+        assert_eq!(t1.tokens_in, 2_000_000);
+        // Span covers both requests.
+        assert_eq!(t1.first_ms, (NOW_SECS - 500) * 1000);
+        assert_eq!(t1.last_ms, (NOW_SECS - 50) * 1000);
+        // Priced per-model breakdown: 2M input tokens of opus have a real
+        // API-equivalent cost (built-in rate table, no overrides).
+        assert_eq!(t1.models.len(), 1);
+        assert_eq!(t1.models[0].group, "claude");
+        assert_eq!(t1.models[0].requests, 2);
+        assert!(t1.models[0].cost_usd > 0.0, "priced from the rate table");
+        assert!((t1.cost_usd - t1.models[0].cost_usd).abs() < f64::EPSILON);
+        // Pre-tenant history: named after its bucket, never a live one.
+        let unk = &doc.tenant_usage[1];
+        assert_eq!(unk.tenant, UNKNOWN_CLIENT);
+        assert_eq!(unk.name, UNKNOWN_CLIENT);
+        // The doc's key list is metadata-only (no secret material fields).
+        assert_eq!(doc.client_keys.len(), 1);
+        let serialized = serde_json::to_string(&doc.client_keys).expect("json");
+        assert!(!serialized.contains("digest"));
     }
 
     #[test]
