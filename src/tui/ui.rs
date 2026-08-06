@@ -226,6 +226,7 @@ pub(crate) fn draw(
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
+        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view),
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -1994,6 +1995,146 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
 /// keybindings and build/daemon facts. Read-only.
+/// Client-key panel (multi-tenant #22, `K` / the "keys" tab): every issued
+/// key joined with its tenant usage — name, email, kind, state, requests,
+/// ok/err, tokens, API-equivalent cost, and the used-from → used-to span —
+/// followed by dim per-model breakdown rows. Builtin buckets (`local` /
+/// `legacy` / `unknown`) render when they carry usage, so the admin's view
+/// accounts for EVERY request, keyed or not. Read-only: mutations stay in
+/// the CLI/API (admin-gated), so the attach-mode panel is safe everywhere.
+fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
+    frame.render_widget(Clear, area);
+    let header = [
+        "key", "name", "kind", "state", "req", "ok/err", "in", "out", "cost", "used",
+    ];
+    let mut rows: Vec<Row> = Vec::new();
+    // Issued keys first (usage joined by id), then builtin buckets with usage.
+    let usage_of = |id: &str| view.tenant_usage.iter().find(|t| t.tenant == id);
+    let span_label = |first_ms: u64, last_ms: u64| {
+        if first_ms == 0 {
+            "never".to_string()
+        } else {
+            let stamp = |ms: u64| {
+                let at = SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+                format::month_day_hm(at, format::local_offset_secs(at))
+            };
+            format!("{} → {}", stamp(first_ms), stamp(last_ms))
+        }
+    };
+    let push_models = |rows: &mut Vec<Row>, tenant: Option<&crate::dashboard::TenantUsageDoc>| {
+        if let Some(t) = tenant {
+            for m in &t.models {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format!("  └ {}/{}", m.group, m.model)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(format::human_count(m.requests)),
+                        Cell::from(""),
+                        Cell::from(format::human_count(m.tokens_in)),
+                        Cell::from(format::human_count(m.tokens_out)),
+                        Cell::from(format!("${:.2}", m.cost_usd)),
+                        Cell::from(""),
+                    ])
+                    .style(dim()),
+                );
+            }
+        }
+    };
+    for key in &view.client_keys {
+        let usage = usage_of(&key.id);
+        let state = if key.revoked_at_ms.is_some() {
+            Span::styled("revoked", Style::new().fg(Color::Red))
+        } else if key.suspended {
+            Span::styled("suspended", Style::new().fg(Color::Yellow))
+        } else {
+            Span::styled("active", Style::new().fg(Color::Green))
+        };
+        let name = match &key.email {
+            Some(email) => format!("{} <{email}>", key.name),
+            None => key.name.clone(),
+        };
+        rows.push(Row::new(vec![
+            Cell::from(format!("{} ({}…)", key.id, key.key_prefix)),
+            Cell::from(name),
+            Cell::from(key.kind.clone()),
+            Cell::from(Line::from(state)),
+            Cell::from(format::human_count(usage.map(|t| t.requests).unwrap_or(0))),
+            Cell::from(match usage {
+                Some(t) => format!("{}/{}", t.ok, t.errors),
+                None => "—".into(),
+            }),
+            Cell::from(format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0))),
+            Cell::from(format::human_count(
+                usage.map(|t| t.tokens_out).unwrap_or(0),
+            )),
+            Cell::from(match usage {
+                Some(t) => format!("${:.2}", t.cost_usd),
+                None => "—".into(),
+            }),
+            Cell::from(match usage {
+                Some(t) => span_label(t.first_ms, t.last_ms),
+                None => "never".into(),
+            }),
+        ]));
+        push_models(&mut rows, usage);
+    }
+    for t in &view.tenant_usage {
+        // Builtin buckets — anything not matching an issued key row above.
+        if view.client_keys.iter().any(|k| k.id == t.tenant) {
+            continue;
+        }
+        rows.push(Row::new(vec![
+            Cell::from(t.tenant.clone()),
+            Cell::from(t.name.clone()),
+            Cell::from("builtin".to_string()),
+            Cell::from(""),
+            Cell::from(format::human_count(t.requests)),
+            Cell::from(format!("{}/{}", t.ok, t.errors)),
+            Cell::from(format::human_count(t.tokens_in)),
+            Cell::from(format::human_count(t.tokens_out)),
+            Cell::from(format!("${:.2}", t.cost_usd)),
+            Cell::from(span_label(t.first_ms, t.last_ms)),
+        ]));
+        push_models(&mut rows, Some(t));
+    }
+    if rows.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::default(),
+            Line::from("  No client keys issued and no tenant usage yet."),
+            Line::from(
+                "  Issue one on the server:  llmux key new --name <pc> [--email addr] [--admin]",
+            ),
+            Line::from(
+                "  Then on the client PC set  remote.host + remote.api_key  and `llmux run`.",
+            ),
+        ])
+        .block(Block::bordered().title(" keys — multi-tenant "));
+        frame.render_widget(empty, area);
+        return;
+    }
+    let constraints = [
+        Constraint::Length(22),
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(23),
+    ];
+    let issued = view.client_keys.len();
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::bordered().title(format!(
+            " keys — {issued} issued · per-tenant usage (admin view) "
+        )));
+    frame.render_widget(table, area);
+}
+
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
     frame.render_widget(Clear, area);
     let key = |k: &'static str, what: &'static str| {
@@ -2010,8 +2151,8 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
     let lines = vec![
         Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
         key(
-            "a g U p l s",
-            "accounts / stats / usage / perf / logs / sessions",
+            "a g U K p l s",
+            "accounts / stats / usage / keys / perf / logs / sessions",
         ),
         key("? c", "this surface / config editor"),
         key(
@@ -4937,6 +5078,7 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("accounts", Overlay::Accounts),
     ("stats", Overlay::Stats),
     ("usage", Overlay::Usage),
+    ("keys", Overlay::Keys),
     ("perf", Overlay::Perf),
     ("logs", Overlay::Logs),
     ("sessions", Overlay::Sessions),
@@ -7251,6 +7393,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 key("q"),
                 Span::raw(" quit"),
             ]),
+            // Keys overlay (multi-tenant #22): read-only; mutations live in
+            // the CLI (`llmux key …`).
+            Overlay::Keys => Line::from(vec![
+                Span::raw(" keys — issue/suspend/rotate via `llmux key …`  "),
+                key("K/Esc"),
+                Span::raw(" back  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
             // Sessions overlay (issue #34): navigation + back.
             Overlay::Sessions => Line::from(vec![
                 Span::raw(" sessions — "),
@@ -7422,6 +7573,8 @@ mod tests {
             logs: Vec::new(),
             model_usage,
             client_usage: Vec::new(),
+            tenant_usage: Vec::new(),
+            client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,
@@ -7547,6 +7700,89 @@ mod tests {
             rows[3].contains("usage") && !rows[3].contains("accounts"),
             "overlay starts right under the tabs:\n{}",
             rows[3]
+        );
+    }
+
+    /// Multi-tenant #22: the keys tab renders issued keys joined with their
+    /// tenant usage (name/email, state, counts, cost, span) plus dim
+    /// per-model breakdown rows, and builtin buckets with usage.
+    #[test]
+    fn keys_overlay_renders_key_rows_usage_and_model_breakdown() {
+        let mut view = view_with(Vec::new());
+        view.client_keys = vec![crate::dashboard::KeyRowDoc {
+            id: "k-aaaa".into(),
+            name: "pc-b".into(),
+            email: Some("b@x.com".into()),
+            kind: "default".into(),
+            key_prefix: "lmk-b1b2".into(),
+            suspended: true,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        }];
+        view.tenant_usage = vec![
+            crate::dashboard::TenantUsageDoc {
+                tenant: "k-aaaa".into(),
+                name: "pc-b".into(),
+                email: Some("b@x.com".into()),
+                requests: 12,
+                ok: 11,
+                errors: 1,
+                tokens_in: 3_400,
+                tokens_out: 900,
+                cost_usd: 1.25,
+                first_ms: 1_700_000_000_000,
+                last_ms: 1_700_100_000_000,
+                models: vec![crate::dashboard::TenantModelDoc {
+                    group: "claude".into(),
+                    model: "claude-opus-4-8".into(),
+                    requests: 12,
+                    tokens_in: 3_400,
+                    tokens_out: 900,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    cost_usd: 1.25,
+                }],
+            },
+            crate::dashboard::TenantUsageDoc {
+                tenant: "local".into(),
+                name: "local".into(),
+                email: None,
+                requests: 3,
+                ok: 3,
+                errors: 0,
+                tokens_in: 10,
+                tokens_out: 5,
+                cost_usd: 0.0,
+                first_ms: 1_700_000_000_000,
+                last_ms: 1_700_000_000_000,
+                models: Vec::new(),
+            },
+        ];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
+        let all = rows.join("\n");
+        assert!(all.contains("k-aaaa"), "key id row:\n{all}");
+        assert!(all.contains("pc-b <b@x.com>"), "name+email joined:\n{all}");
+        assert!(all.contains("suspended"), "state column:\n{all}");
+        assert!(all.contains("lmk-b1b2"), "display prefix only:\n{all}");
+        assert!(all.contains("$1.25"), "priced cost:\n{all}");
+        assert!(
+            all.contains("└ claude/claude-opus-4-8"),
+            "per-model breakdown row:\n{all}"
+        );
+        assert!(all.contains("local"), "builtin bucket with usage:\n{all}");
+        assert!(all.contains("→"), "used-from → used-to span:\n{all}");
+    }
+
+    /// The keys tab with nothing issued and no usage renders the how-to hint
+    /// instead of an empty table.
+    #[test]
+    fn keys_overlay_empty_state_carries_the_issue_hint() {
+        let view = view_with(Vec::new());
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
+        let all = rows.join("\n");
+        assert!(
+            all.contains("llmux key new --name"),
+            "empty-state hint:\n{all}"
         );
     }
 

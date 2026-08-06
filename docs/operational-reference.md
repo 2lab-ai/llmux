@@ -22,7 +22,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Usage tab (calendar usage + cost)
 
@@ -121,10 +121,14 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
 - HTTP surface (admin): `GET /llmux/keys`, `POST /llmux/keys/new`,
   `POST /llmux/keys/suspend` `{id, suspended}`, `POST /llmux/keys/remove`
   `{id}`, `POST /llmux/keys/rotate` `{id}`.
-- The dashboard document carries `tenant_usage` (per-tenant request/token
-  counts) and `client_keys` (metadata; never secrets). History persisted
-  before this feature shows as the `unknown` tenant — it is never folded
-  into a live bucket.
+- The dashboard's `keys` tab (`K`) is the admin view: every issued key with
+  its name/email, kind, state, requests, tokens, API-equivalent cost, the
+  used-from → used-to span, and a per-model breakdown — the builtin
+  `local`/`legacy` buckets included, so every request is accounted for.
+  The dashboard document carries the same data as `tenant_usage` and
+  `client_keys` (metadata; never secrets). History persisted before this
+  feature shows as the `unknown` tenant — it is never folded into a live
+  bucket.
 
 ## Daemon and dashboard
 
