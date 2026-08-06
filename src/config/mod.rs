@@ -196,7 +196,29 @@ pub fn load_or_init() -> Result<Config, ConfigError> {
 /// [`load_or_init`] against an explicit path.
 pub fn load_or_init_path(path: &Path) -> Result<Config, ConfigError> {
     if path.exists() {
-        return load_path(path);
+        let mut config = load_path(path)?;
+        // Admin-0 self-heal (multi-tenant #22 review MUST-FIX): since the
+        // control plane requires an admin credential EVEN on loopback, a
+        // pre-existing config with `api_key: null` and no active admin client
+        // key would boot a daemon whose entire `/llmux/*` surface is 403 with
+        // no in-band recovery (key issuance sits behind the same gate). Mint
+        // and persist the shared admin key here — the same one first-run
+        // would have created — so an admin credential always exists.
+        let has_admin_client_key = config.client_keys.iter().any(|k| {
+            matches!(k.kind, schema::ClientKeyKind::Admin)
+                && !k.suspended
+                && k.revoked_at_ms.is_none()
+        });
+        if config.proxy.api_key.is_none() && !has_admin_client_key {
+            config.proxy.api_key = Some(generate_api_key());
+            save_path(path, &config)?;
+            tracing::warn!(
+                path = %path.display(),
+                "no admin credential in config — generated proxy.api_key so \
+                 the control plane stays reachable"
+            );
+        }
+        return Ok(config);
     }
     let mut config = Config::default();
     config.proxy.api_key = Some(generate_api_key());
@@ -542,6 +564,45 @@ mod tests {
             let mode = fs::metadata(&path).expect("meta").permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
         }
+    }
+
+    /// Admin-0 self-heal (multi-tenant #22 review MUST-FIX): a PRE-EXISTING
+    /// config with no `proxy.api_key` and no admin client key would boot a
+    /// daemon whose whole control plane is 403 with no in-band recovery —
+    /// `load_or_init` must mint and persist the admin key instead. A plain
+    /// `load` (used by pure readers) stays non-writing.
+    #[test]
+    fn load_or_init_heals_admin_zero_config() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(&path, r#"{ "version": 1, "proxy": { "port": 9999 } }"#).expect("write");
+
+        let config = load_or_init_path(&path).expect("load_or_init");
+        let key = config.proxy.api_key.as_deref().expect("healed admin key");
+        assert!(key.starts_with("lm-"));
+        // Persisted, not just in-memory.
+        let reloaded = load_path(&path).expect("reload");
+        assert_eq!(reloaded.proxy.api_key.as_deref(), Some(key));
+        assert_eq!(reloaded.proxy.port, 9999, "rest of the config untouched");
+
+        // With an ACTIVE admin client key present, api_key stays None (the
+        // operator's explicit key is the admin credential).
+        let path2 = dir.path().join("llmux2.json");
+        let mut with_admin = Config::default();
+        with_admin.client_keys.push(schema::ClientKey {
+            id: "k-1".into(),
+            name: "boss".into(),
+            email: None,
+            kind: schema::ClientKeyKind::Admin,
+            key_prefix: "lmk-x".into(),
+            key_digest: "sha256:00".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        });
+        save_path(&path2, &with_admin).expect("seed");
+        let loaded = load_or_init_path(&path2).expect("load_or_init");
+        assert_eq!(loaded.proxy.api_key, None, "explicit admin key suffices");
     }
 
     #[test]

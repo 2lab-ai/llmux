@@ -525,15 +525,15 @@ impl AppState {
         Ok(known)
     }
 
-    /// Serialize one client-key mutation: read-merge-write the config on disk
-    /// FIRST, and only on success swap the live registry snapshot from the
-    /// merged config (persist-then-swap; multi-tenant #22 MUST-FIX 1).
-    /// `mutate` returns `Ok(())` to commit or a domain error to abort with the
-    /// file untouched. The whole sequence runs under the key-mutation lock so
-    /// concurrent admin calls can't lose updates.
-    fn mutate_client_keys<F>(&self, mutate: F) -> Result<(), KeyAdminError>
+    /// Serialize one client-key mutation: load the on-disk config, apply
+    /// `mutate`, and only if it succeeds write the file back and swap the
+    /// live registry snapshot (persist-then-swap; multi-tenant #22 MUST-FIX
+    /// 1). A domain error aborts BEFORE the write, so the file really is
+    /// untouched on failure. The whole sequence runs under the key-mutation
+    /// lock so concurrent admin calls can't lose updates.
+    fn mutate_client_keys<T, F>(&self, mutate: F) -> Result<T, KeyAdminError>
     where
-        F: FnOnce(&mut Config) -> Result<(), KeyAdminError>,
+        F: FnOnce(&mut Config) -> Result<T, KeyAdminError>,
     {
         let Some(path) = &self.config_path else {
             return Err(KeyAdminError::Config(
@@ -541,14 +541,11 @@ impl AppState {
             ));
         };
         let _guard = self.key_mutation.lock().unwrap_or_else(|e| e.into_inner());
-        let mut domain: Result<(), KeyAdminError> = Ok(());
-        let merged = crate::config::update_path(path, |c| {
-            domain = mutate(c);
-        })
-        .map_err(KeyAdminError::Config)?;
-        domain?;
-        self.keys.reload(&merged);
-        Ok(())
+        let mut config = crate::config::load_path(path).map_err(KeyAdminError::Config)?;
+        let value = mutate(&mut config)?;
+        crate::config::save_path(path, &config).map_err(KeyAdminError::Config)?;
+        self.keys.reload(&config);
+        Ok(value)
     }
 
     /// Count of ACTIVE admin credentials in `config`: the legacy shared
@@ -581,29 +578,38 @@ impl AppState {
             return Err(KeyAdminError::NameRequired);
         }
         let issued = crate::config::generate_client_key();
-        let row = crate::config::ClientKey {
-            id: crate::config::generate_client_key_id(),
-            name: name.to_string(),
-            email: email.filter(|e| !e.trim().is_empty()),
-            kind,
-            key_prefix: issued.prefix.clone(),
-            key_digest: issued.digest.clone(),
-            suspended: false,
-            created_at_ms: now_epoch_ms(),
-            revoked_at_ms: None,
-        };
-        let stored = row.clone();
-        self.mutate_client_keys(move |c| {
+        let name = name.to_string();
+        let prefix = issued.prefix.clone();
+        let digest = issued.digest.clone();
+        let stored = self.mutate_client_keys(move |c| {
             // Names must stay unique among non-revoked keys so the CLI can
             // resolve them unambiguously (mutations themselves are id-only).
             if c.client_keys
                 .iter()
-                .any(|k| k.revoked_at_ms.is_none() && k.name == row.name)
+                .any(|k| k.revoked_at_ms.is_none() && k.name == name)
             {
-                return Err(KeyAdminError::NameTaken(row.name.clone()));
+                return Err(KeyAdminError::NameTaken(name));
             }
-            c.client_keys.push(row);
-            Ok(())
+            // Attribution ids must be unique FOREVER (revoked rows included —
+            // history joins on them), so regenerate on the astronomically
+            // rare collision instead of silently merging two tenants.
+            let mut id = crate::config::generate_client_key_id();
+            while c.client_keys.iter().any(|k| k.id == id) {
+                id = crate::config::generate_client_key_id();
+            }
+            let row = crate::config::ClientKey {
+                id,
+                name,
+                email: email.filter(|e| !e.trim().is_empty()),
+                kind,
+                key_prefix: prefix,
+                key_digest: digest,
+                suspended: false,
+                created_at_ms: now_epoch_ms(),
+                revoked_at_ms: None,
+            };
+            c.client_keys.push(row.clone());
+            Ok(row)
         })?;
         tracing::info!(id = %stored.id, name = %stored.name, "client key issued");
         Ok((stored, issued.secret))
@@ -617,9 +623,7 @@ impl AppState {
         suspended: bool,
     ) -> Result<crate::config::ClientKey, KeyAdminError> {
         let id = id.to_string();
-        let mut updated: Option<crate::config::ClientKey> = None;
-        let out = &mut updated;
-        self.mutate_client_keys(move |c| {
+        let key = self.mutate_client_keys(move |c| {
             let i = c
                 .client_keys
                 .iter()
@@ -632,10 +636,8 @@ impl AppState {
                 return Err(KeyAdminError::LastAdmin);
             }
             c.client_keys[i].suspended = suspended;
-            *out = Some(c.client_keys[i].clone());
-            Ok(())
+            Ok(c.client_keys[i].clone())
         })?;
-        let key = updated.expect("mutation committed");
         tracing::info!(id = %key.id, name = %key.name, suspended, "client key suspend updated");
         Ok(key)
     }
@@ -645,9 +647,7 @@ impl AppState {
     /// attribution. Refuses to revoke the last active admin credential.
     pub fn revoke_client_key(&self, id: &str) -> Result<crate::config::ClientKey, KeyAdminError> {
         let id = id.to_string();
-        let mut updated: Option<crate::config::ClientKey> = None;
-        let out = &mut updated;
-        self.mutate_client_keys(move |c| {
+        let key = self.mutate_client_keys(move |c| {
             let i = c
                 .client_keys
                 .iter()
@@ -660,10 +660,8 @@ impl AppState {
                 return Err(KeyAdminError::LastAdmin);
             }
             c.client_keys[i].revoked_at_ms = Some(now_epoch_ms());
-            *out = Some(c.client_keys[i].clone());
-            Ok(())
+            Ok(c.client_keys[i].clone())
         })?;
-        let key = updated.expect("mutation committed");
         tracing::info!(id = %key.id, name = %key.name, "client key revoked");
         Ok(key)
     }
@@ -679,9 +677,7 @@ impl AppState {
         let issued = crate::config::generate_client_key();
         let prefix = issued.prefix.clone();
         let digest = issued.digest.clone();
-        let mut updated: Option<crate::config::ClientKey> = None;
-        let out = &mut updated;
-        self.mutate_client_keys(move |c| {
+        let key = self.mutate_client_keys(move |c| {
             let i = c
                 .client_keys
                 .iter()
@@ -689,10 +685,8 @@ impl AppState {
                 .ok_or(KeyAdminError::NotFound)?;
             c.client_keys[i].key_prefix = prefix;
             c.client_keys[i].key_digest = digest;
-            *out = Some(c.client_keys[i].clone());
-            Ok(())
+            Ok(c.client_keys[i].clone())
         })?;
-        let key = updated.expect("mutation committed");
         tracing::info!(id = %key.id, name = %key.name, "client key rotated");
         Ok((key, issued.secret))
     }
