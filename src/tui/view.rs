@@ -52,6 +52,11 @@ pub(crate) struct DashboardView {
     /// Per-client request attribution rows (issue #32), already sorted by
     /// requests desc. One representation used by both document and renderer.
     pub client_usage: Vec<crate::dashboard::ClientUsageDoc>,
+    /// Per-TENANT usage rows (multi-tenant #22): keyed attribution with
+    /// name/email joined, cost priced, span stamped — sorted by requests.
+    pub tenant_usage: Vec<crate::dashboard::TenantUsageDoc>,
+    /// Issued client keys (metadata only — never secrets).
+    pub client_keys: Vec<crate::dashboard::KeyRowDoc>,
     /// Windowed (24h/72h) per-account/per-model heatmap slices (issue #23),
     /// carried straight from the document so local + attach render the same.
     /// Best-effort: a lossy sample of the activity stream, not an exact ledger.
@@ -416,6 +421,8 @@ impl DashboardView {
             logs,
             model_usage: doc.model_usage.clone(),
             client_usage: doc.client_usage.clone(),
+            tenant_usage: doc.tenant_usage.clone(),
+            client_keys: doc.client_keys.clone(),
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
             email_anonymous: doc.email_anonymous,

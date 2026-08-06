@@ -297,6 +297,9 @@ pub(crate) enum Overlay {
     /// Read-only config surface (UI-3 U6): the live daemon settings the
     /// dashboard knows (scheduler / codex / display), with their toggles.
     Config,
+    /// Client-key panel (multi-tenant #22): issued keys joined with their
+    /// per-tenant usage (requests/tokens/cost/span) and per-model breakdown.
+    Keys,
 }
 
 /// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
@@ -1175,6 +1178,7 @@ impl App {
             Overlay::Misc => self.on_key_misc(key.code),
             Overlay::Perf => self.on_key_perf(key.code, view),
             Overlay::Config => self.on_key_config(key.code, view),
+            Overlay::Keys => self.on_key_keys(key.code),
         }
     }
 
@@ -2115,6 +2119,17 @@ impl App {
         }
     }
 
+    /// Key handling for the Keys overlay (`K`, multi-tenant #22): read-only
+    /// panel — `K`/`Esc` closes, `q` quits. Key MUTATIONS stay in the CLI
+    /// (`llmux key …`), matching the admin-filter decision (option A).
+    fn on_key_keys(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('K') | KeyCode::Esc => self.overlay = Overlay::None,
+            _ => {}
+        }
+    }
+
     /// Key handling for the Config overlay (`c`, config-editor v1): arrows
     /// move the cursor, Enter activates the row (toggle / cycle / edit
     /// prompt), `c`/`Esc` closes.
@@ -2596,6 +2611,8 @@ impl App {
             // Misc (keys/build facts) + Config surfaces (UI-3 U6).
             KeyCode::Char('?') => self.overlay = Overlay::Misc,
             KeyCode::Char('c') => self.overlay = Overlay::Config,
+            // Client keys / tenants (multi-tenant #22).
+            KeyCode::Char('K') => self.overlay = Overlay::Keys,
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -6186,6 +6203,8 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
+            tenant_usage: Vec::new(),
+            client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
             email_anonymous: false,

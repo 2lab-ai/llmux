@@ -156,6 +156,13 @@ pub enum ActivityEvent {
         /// [`crate::proxy::classify::EXCERPT_MAX_CHARS`]); `None` when the
         /// turn carried no text (tool-result-only) or the body never parsed.
         excerpt: Option<String>,
+        /// KEYED tenant attribution id (multi-tenant #22): the stable id the
+        /// auth gate resolved from the presented credential — a client-key id
+        /// (`k-…`), `legacy` (shared proxy key), or `local` (keyless
+        /// loopback). Distinct from `user_id` (keyless, body-derived).
+        /// `None` ONLY for replayed history persisted before the field
+        /// existed — displayed as `unknown`, never coerced into `local`.
+        tenant: Option<String>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

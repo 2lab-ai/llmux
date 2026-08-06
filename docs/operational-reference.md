@@ -17,9 +17,12 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `status [--json]` | Show client/server/update sections plus per-account quota; exits 1 when no server is running. |
 | `accounts [-v]` | List configured accounts; `-v` adds quota/cooldown detail. |
 | `remove <name> [--yes]` | Remove an account by name. |
+| `key new --name L [--email E] [--admin]` | Issue a downstream client key (multi-tenant). The secret is printed once and never stored. |
+| `key list` | List issued client keys (id, name, email, kind, state, prefix). |
+| `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Usage tab (calendar usage + cost)
 
@@ -92,6 +95,40 @@ Manual shell wiring:
 eval "$(llmux env)"
 claude
 ```
+
+## Multi-tenant client keys
+
+One llmux server can serve several machines, each with its OWN issued key, so
+usage is recorded per tenant (name + email) instead of one anonymous pool.
+
+- Issue on the server: `llmux key new --name z-macbook --email z@2lab.ai`.
+  The plaintext (`lmk-…`) is shown once; only its SHA-256 digest is stored.
+- On each client PC, point llmux at the server in `~/.config/llmux.json`:
+  `{ "remote": { "host": "<server>", "api_key": "lmk-…" } }` — `llmux run`
+  then works unchanged and every request is attributed to that key.
+- Authorization is two-axis: the key decides the *tenant* (attribution), its
+  kind decides the *scope*. `default` keys reach the data plane only
+  (`/v1/*`, `/models`); `admin` keys (and the config's own `proxy.api_key`)
+  also unlock the `/llmux/*` control plane — key management, account
+  mutation, dashboard/status reads. Loopback is NOT a privilege: control
+  calls need an admin credential even from localhost (the local CLI presents
+  `proxy.api_key` automatically). Keyless requests are loopback-only and are
+  metered as the `local` tenant; keyless remote is refused.
+- `suspend`/`remove`/`rotate` bite on the next request without a restart
+  (the daemon keeps a live key registry; disk and memory update together).
+  The last active admin credential can never be suspended or revoked —
+  recovery from a lost admin key is editing the config on the server host.
+- HTTP surface (admin): `GET /llmux/keys`, `POST /llmux/keys/new`,
+  `POST /llmux/keys/suspend` `{id, suspended}`, `POST /llmux/keys/remove`
+  `{id}`, `POST /llmux/keys/rotate` `{id}`.
+- The dashboard's `keys` tab (`K`) is the admin view: every issued key with
+  its name/email, kind, state, requests, tokens, API-equivalent cost, the
+  used-from → used-to span, and a per-model breakdown — the builtin
+  `local`/`legacy` buckets included, so every request is accounted for.
+  The dashboard document carries the same data as `tenant_usage` and
+  `client_keys` (metadata; never secrets). History persisted before this
+  feature shows as the `unknown` tenant — it is never folded into a live
+  bucket.
 
 ## Daemon and dashboard
 

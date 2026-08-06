@@ -109,6 +109,13 @@ fn classify_probe(status: http::StatusCode, body: &str) -> ServerProbe {
         // wants the api key. Off-loopback that means `remote.api_key`.
         return ServerProbe::Unauthorized;
     }
+    if status == http::StatusCode::FORBIDDEN {
+        // The two-axis gate (multi-tenant #22): the endpoint IS llmux, the
+        // presented credential just isn't admin-scoped (e.g. a default client
+        // key probing /llmux/status). Same recovery as 401: present an admin
+        // credential.
+        return ServerProbe::Unauthorized;
+    }
     if !status.is_success() {
         return ServerProbe::Foreign {
             detail: format!("status endpoint returned {status}"),

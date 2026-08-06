@@ -159,8 +159,63 @@ pub struct Config {
     /// written before this field loads with remote OFF (all-local behavior).
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// Downstream client keys the proxy ISSUES to its own callers
+    /// (multi-tenant metering + access control; issue #22). A distinct
+    /// namespace from upstream `accounts` credentials: each entry carries a
+    /// stable attribution id, tenant metadata (name/email), an authz kind, and
+    /// the SHA-256 digest of the secret — the plaintext is shown exactly once
+    /// at issuance and never stored (the human-mediated config-excerpt channel
+    /// cannot be closed by tests, so nothing secret lives here). Entries are
+    /// soft-revoked (`revoked_at_ms`), never hard-deleted, so historical usage
+    /// keeps resolving to name/email forever. Additive (`#[serde(default)]`):
+    /// older configs load with no client keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_keys: Vec<ClientKey>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// Authorization kind of an issued client key: `default` unlocks the data
+/// plane only (`/v1/*` forwarding); `admin` additionally unlocks the control
+/// plane (`/llmux/*` management + dashboard).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKeyKind {
+    #[default]
+    Default,
+    Admin,
+}
+
+/// One issued downstream client key (config `client_keys`). The secret itself
+/// is NOT stored — only its SHA-256 digest (hex, `sha256:` prefixed) plus a
+/// short display prefix. `id` is the immutable attribution identity: usage
+/// records reference it, rotation replaces the digest under the same `id`,
+/// and soft-revocation preserves the row so old usage keeps its name/email.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientKey {
+    /// Immutable attribution id (`k-` + 8 hex chars). Mutations target this.
+    pub id: String,
+    /// Human label for the tenant (PC/user), required at issuance.
+    pub name: String,
+    /// Optional tenant email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub kind: ClientKeyKind,
+    /// First characters of the issued secret (`lmk-xxxx`), display only.
+    pub key_prefix: String,
+    /// `sha256:<hex>` of the full issued secret; the auth gate compares
+    /// digests, never plaintext.
+    pub key_digest: String,
+    /// Operator pause: a suspended key authenticates to 401 until resumed.
+    #[serde(default)]
+    pub suspended: bool,
+    /// Issuance timestamp (epoch ms).
+    pub created_at_ms: u64,
+    /// Soft-revocation timestamp (epoch ms). A revoked key no longer
+    /// authenticates but the row is preserved for attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_ms: Option<u64>,
 }
 
 /// One dashboard event banner (an element of config `events`). Display-only:
@@ -267,6 +322,7 @@ impl Default for Config {
             account_limits: BTreeMap::new(),
             events: Vec::new(),
             remote: RemoteConfig::default(),
+            client_keys: Vec::new(),
             accounts: Vec::new(),
         }
     }

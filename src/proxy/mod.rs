@@ -5,6 +5,7 @@ pub mod classify;
 pub mod codex_trace;
 pub mod forward;
 pub mod idle_probe;
+pub mod keys;
 pub mod logging;
 pub mod login;
 pub mod raw_io;
