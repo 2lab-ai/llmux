@@ -209,10 +209,12 @@ fn env_prints_base_url_export() {
         "stdout: {}",
         out.stdout
     );
-    // No proxy.api_key configured → no ANTHROPIC_API_KEY export.
+    // Admin-0 self-heal (multi-tenant #22): a config with no proxy.api_key
+    // gets one minted on load_or_init — the control plane must always keep an
+    // admin credential — so `env` now exports the healed key like any other.
     assert!(
-        !out.stdout.contains("ANTHROPIC_API_KEY"),
-        "stdout leaked api key export: {}",
+        out.stdout.contains("export ANTHROPIC_API_KEY=lm-"),
+        "healed admin key exported: {}",
         out.stdout
     );
 }

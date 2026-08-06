@@ -2,7 +2,7 @@
 //! buffer of completed entries (newest first), and per-account totals.
 //! Pure state — rendering lives in `ui`, timestamps are passed in.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -898,6 +898,12 @@ pub(crate) struct PersistedRequest {
     pub kind: Option<String>,
     #[serde(default)]
     pub excerpt: Option<String>,
+    /// KEYED tenant attribution id (multi-tenant #22): client-key id /
+    /// `legacy` / `local`. Additive: pre-field lines default to `None` and
+    /// display as `unknown` — deliberately NOT coerced into `local`, so
+    /// pre-tenant history can never inflate a live bucket.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl PersistedRequest {
@@ -924,6 +930,7 @@ impl PersistedRequest {
             user_id,
             kind,
             excerpt,
+            tenant,
         } = event
         else {
             return None;
@@ -953,6 +960,7 @@ impl PersistedRequest {
             user_id: user_id.clone(),
             kind: kind.clone(),
             excerpt: excerpt.clone(),
+            tenant: tenant.clone(),
         })
     }
 
@@ -979,6 +987,7 @@ impl PersistedRequest {
             user_id: self.user_id,
             kind: self.kind,
             excerpt: self.excerpt,
+            tenant: self.tenant,
         };
         (event, ts)
     }
@@ -1066,6 +1075,13 @@ pub(crate) struct ActivityLog {
     /// by [`MAX_CLIENTS`] distinct ids (the `unknown` bucket excluded). This is
     /// pure metering: counting requests/tokens per client, never gating.
     clients: HashMap<String, Totals>,
+    /// Per-TENANT request attribution (multi-tenant #22), keyed by the auth
+    /// gate's attribution id (`k-…` / `legacy` / `local`; `unknown` holds
+    /// pre-tenant replayed history). Rebuilt from the persisted request log on
+    /// startup through the same fold, so restarts keep tenant history.
+    /// Carries the counts plus the per-model breakdown and first/last-seen
+    /// stamps the admin keys panel renders ("언제부터 언제까지").
+    tenants: BTreeMap<String, TenantStats>,
     /// Rolling hourly bucket ring for the windowed (24h/72h) per-account
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
@@ -1114,6 +1130,31 @@ impl HealthCounts {
         self.s401 += other.s401;
         self.s5xx += other.s5xx;
     }
+}
+
+/// Per-tenant aggregate (multi-tenant #22): lifetime counts, the summed
+/// token classes per served `(group, model)` (so API-equivalent cost can be
+/// priced at render time), and the first/last request timestamps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TenantStats {
+    pub totals: Totals,
+    /// First/last finished-request timestamps (epoch ms; replay passes each
+    /// record's persisted stamp, so history keeps its real span).
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// (group, model) → summed tokens + request count for priced breakdown.
+    /// Only requests attributed to a served model land here (pre-routing
+    /// failures keep group/model `None` and count in `totals` only).
+    pub models: BTreeMap<(String, String), TenantModelStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TenantModelStats {
+    pub requests: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1718,6 +1759,71 @@ impl ActivityLog {
         }
     }
 
+    /// Per-tenant attribution (multi-tenant #22): every finished request is
+    /// counted against the tenant id the auth gate resolved. `None` — only
+    /// pre-tenant replayed history — lands in `unknown`, NEVER in `local`
+    /// (coercing would silently inflate a live bucket). Model-attributed
+    /// requests additionally fold into the per-(group, model) breakdown the
+    /// keys panel prices; `now` stamps the first/last-seen span (replay
+    /// passes persisted timestamps, so restarts keep the real range).
+    #[allow(clippy::too_many_arguments)]
+    fn record_tenant(
+        &mut self,
+        tenant: Option<&str>,
+        status: u16,
+        tokens: Option<TokenCounts>,
+        group: Option<&str>,
+        model: Option<&str>,
+        now: SystemTime,
+    ) {
+        let key = match tenant {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => UNKNOWN_CLIENT.to_string(),
+        };
+        let bucket = self.tenants.entry(key).or_default();
+        bucket.totals.requests += 1;
+        if status < 400 {
+            bucket.totals.ok += 1;
+        } else {
+            bucket.totals.errors += 1;
+        }
+        if let Some(t) = tokens {
+            bucket.totals.tokens_in = bucket.totals.tokens_in.saturating_add(t.input);
+            bucket.totals.tokens_out = bucket.totals.tokens_out.saturating_add(t.output);
+        }
+        let at_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if bucket.first_ms == 0 || at_ms < bucket.first_ms {
+            bucket.first_ms = at_ms;
+        }
+        if at_ms > bucket.last_ms {
+            bucket.last_ms = at_ms;
+        }
+        if let (Some(group), Some(model)) = (group, model) {
+            let cell = bucket
+                .models
+                .entry((group.to_string(), normalize_model(model)))
+                .or_default();
+            cell.requests += 1;
+            if let Some(t) = tokens {
+                cell.input = cell.input.saturating_add(t.input);
+                cell.output = cell.output.saturating_add(t.output);
+                cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+                cell.cache_creation = cell
+                    .cache_creation
+                    .saturating_add(t.cache_creation.unwrap_or(0));
+            }
+        }
+    }
+
+    /// Full per-tenant aggregates (counts + model breakdown + span), for the
+    /// dashboard document build.
+    pub(crate) fn tenant_stats(&self) -> &BTreeMap<String, TenantStats> {
+        &self.tenants
+    }
+
     /// Per-client attribution lookup (issue #32), exercised by the tests.
     #[cfg(test)]
     pub(crate) fn client_totals(&self, client: &str) -> Totals {
@@ -1903,6 +2009,7 @@ impl ActivityLog {
                 user_id,
                 kind,
                 excerpt,
+                tenant,
             } => {
                 let routed = self
                     .in_flight
@@ -1916,6 +2023,15 @@ impl ActivityLog {
                 // `unknown` bucket when absent), independent of routing — so
                 // pre-routing failures are attributed too, never dropped.
                 self.record_client(user_id.as_deref(), status, tokens);
+                // Per-tenant attribution (multi-tenant #22), same independence.
+                self.record_tenant(
+                    tenant.as_deref(),
+                    status,
+                    tokens,
+                    group.as_deref(),
+                    model.as_deref(),
+                    now,
+                );
                 // Session label (TUI UI-3 U2): the FIRST plain user-input
                 // excerpt seen for a client id becomes that session's derived
                 // title (nothing on the wire carries a real one). Bounded by
@@ -2135,6 +2251,7 @@ mod tests {
         let day = |d: u64| UNIX_EPOCH + Duration::from_secs(d * 86_400 + 3600);
         let finished =
             |_ts: u64, tok_in: u64, uid: &str, excerpt: &str| ActivityEvent::RequestFinished {
+                tenant: None,
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
@@ -2238,6 +2355,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
@@ -2273,6 +2391,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
@@ -2307,6 +2426,7 @@ mod tests {
             user_id: user_id.map(str::to_string),
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
@@ -2906,6 +3026,104 @@ mod tests {
         assert_eq!(rows[0].requests, 3);
     }
 
+    /// A `finished_client` variant carrying a tenant attribution id
+    /// (multi-tenant #22).
+    fn finished_tenant(
+        id: u64,
+        tenant: Option<&str>,
+        tokens: Option<(u64, u64)>,
+        status: u16,
+    ) -> ActivityEvent {
+        match finished_client(id, None, tokens, status) {
+            ActivityEvent::RequestFinished {
+                id,
+                method,
+                path,
+                account,
+                status,
+                duration,
+                tokens,
+                group,
+                model,
+                effort,
+                fast,
+                ttfb_ms,
+                ttft_ms,
+                gen_ms,
+                aborted,
+                user_id,
+                kind,
+                excerpt,
+                tenant: _,
+            } => ActivityEvent::RequestFinished {
+                id,
+                method,
+                path,
+                account,
+                status,
+                duration,
+                tokens,
+                group,
+                model,
+                effort,
+                fast,
+                ttfb_ms,
+                ttft_ms,
+                gen_ms,
+                aborted,
+                user_id,
+                kind,
+                excerpt,
+                tenant: tenant.map(str::to_string),
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn tenant_attribution_separates_buckets_and_survives_replay() {
+        let dir = TempDir::new();
+        let path = dir.file();
+        let mut log = ActivityLog::new(50);
+        // Two keyed tenants (distinct PCs), one keyless-loopback request, and
+        // one pre-tenant event (None — as replayed old history would carry).
+        for (id, tenant, tokens, status) in [
+            (1, Some("k-aaaa"), Some((100, 40)), 200),
+            (2, Some("k-aaaa"), Some((50, 10)), 502),
+            (3, Some("k-bbbb"), Some((10, 5)), 200),
+            (4, Some("local"), Some((7, 3)), 200),
+            (5, None, Some((1, 1)), 200),
+        ] {
+            let event = finished_tenant(id, tenant, tokens, status);
+            persist_request(Some(&path), &event, at(id));
+            log.apply(event, at(id));
+        }
+        let expect = |log: &ActivityLog, key: &str, requests: u64, tokens_in: u64| {
+            let t = log.tenant_stats().get(key).cloned().unwrap_or_default();
+            assert_eq!(t.totals.requests, requests, "requests for {key}");
+            assert_eq!(t.totals.tokens_in, tokens_in, "tokens_in for {key}");
+        };
+        expect(&log, "k-aaaa", 2, 150);
+        expect(&log, "k-bbbb", 1, 10);
+        expect(&log, "local", 1, 7);
+        // Pre-tenant history lands in `unknown` — NEVER coerced into `local`
+        // (that would silently inflate a live bucket).
+        expect(&log, UNKNOWN_CLIENT, 1, 1);
+        let ka = log.tenant_stats().get("k-aaaa").unwrap();
+        assert_eq!(ka.totals.errors, 1);
+        // First/last span reflects the fold timestamps (at(1)..at(2)).
+        assert!(ka.first_ms > 0 && ka.last_ms > ka.first_ms);
+
+        // Replay from the persisted JSONL rebuilds identical tenant buckets
+        // (the additive `tenant` field round-trips; None stays None).
+        let mut replayed = ActivityLog::new(50);
+        replayed.load_persisted(Some(&path));
+        assert_eq!(log.tenant_stats(), replayed.tenant_stats());
+        // Every finished request is tenant-attributed across the buckets.
+        let total: u64 = log.tenant_stats().values().map(|t| t.totals.requests).sum();
+        assert_eq!(total, 5, "every finished request tenant-attributed");
+    }
+
     #[test]
     fn client_attribution_is_bounded_overflow_folds_into_unknown() {
         let mut log = ActivityLog::new(50);
@@ -3258,6 +3476,7 @@ mod tests {
             user_id: Some(format!("client-{account}")),
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
@@ -3355,6 +3574,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
@@ -3684,6 +3904,7 @@ mod tests {
                 user_id: None,
                 kind: None,
                 excerpt: None,
+                tenant: None,
             }
         };
         let now = at(1_000);
@@ -3777,6 +3998,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
         };
         let now = SystemTime::now();
         let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);

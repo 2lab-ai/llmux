@@ -86,6 +86,9 @@ fn default_params() -> SelectParams {
 }
 
 /// One running proxy over a tempdir config, listening on an OS-assigned port.
+/// The admin credential every e2e proxy is seeded with (control plane).
+const E2E_ADMIN_KEY: &str = "lm-e2e-admin";
+
 struct Proxy {
     addr: SocketAddr,
     pool: AccountPool,
@@ -133,6 +136,12 @@ impl Proxy {
         mut config: Config,
         prepare: impl FnOnce(&std::path::Path),
     ) -> Self {
+        // Control-plane endpoints require an admin credential even on
+        // loopback (multi-tenant #22 two-axis gate), so every test proxy
+        // carries a known admin key the /llmux/* calls present.
+        if config.proxy.api_key.is_none() {
+            config.proxy.api_key = Some(E2E_ADMIN_KEY.into());
+        }
         let tmp = TempDir::new();
         prepare(tmp.path());
         let config_path = tmp.path().join("llmux.json");
@@ -919,6 +928,7 @@ async fn background_refresh_renews_expiring_token_without_traffic() {
     // dashboard can show "refreshed N ago" next to the countdown.
     let doc: serde_json::Value = reqwest::Client::new()
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status")
@@ -976,6 +986,7 @@ async fn startup_selects_and_logs_each_group_independently() {
     for _ in 0..40 {
         doc = client
             .get(proxy.url("/llmux/dashboard"))
+            .header("x-api-key", E2E_ADMIN_KEY)
             .send()
             .await
             .expect("dashboard")
@@ -1196,6 +1207,7 @@ async fn proxy_totals(proxy: &Proxy, account: &AccountId) -> llmux::proxy::serve
     let client = reqwest::Client::new();
     let doc: serde_json::Value = client
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status")
@@ -1440,6 +1452,7 @@ fn epoch_secs_in(secs: u64) -> u64 {
 async fn status_account(proxy: &Proxy, name: &str) -> serde_json::Value {
     let doc: serde_json::Value = reqwest::Client::new()
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status")
@@ -1657,7 +1670,7 @@ async fn raw_io_endpoint_serves_the_captured_exchange() {
     let mut id = 0u64;
     let mut at_ms = 0u64;
     for _ in 0..100 {
-        let doc: serde_json::Value = get_dashboard(&proxy, None)
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
             .await
             .json()
             .await
@@ -1679,6 +1692,7 @@ async fn raw_io_endpoint_serves_the_captured_exchange() {
     // The endpoint returns the captured exchange for that (id, at_ms) pair.
     let raw: serde_json::Value = client
         .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("raw-io reachable")
@@ -1728,6 +1742,7 @@ async fn raw_io_endpoint_serves_the_captured_exchange() {
     // An unknown id (or an id from another daemon run's window) is a 404.
     let miss = client
         .get(proxy.url(&format!("/llmux/raw-io?id=777777&at_ms={at_ms}")))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("raw-io reachable");
@@ -1760,7 +1775,7 @@ async fn raw_io_translated_exchange_captures_the_upstream_half() {
     let mut id = 0u64;
     let mut at_ms = 0u64;
     for _ in 0..100 {
-        let doc: serde_json::Value = get_dashboard(&proxy, None)
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
             .await
             .json()
             .await
@@ -1782,6 +1797,7 @@ async fn raw_io_translated_exchange_captures_the_upstream_half() {
     for _ in 0..100 {
         let response = client
             .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .header("x-api-key", E2E_ADMIN_KEY)
             .send()
             .await
             .expect("raw-io reachable");
@@ -1879,7 +1895,11 @@ async fn raw_io_translated_4xx_client_leg_is_the_synthesized_error() {
     let mut id = 0u64;
     let mut at_ms = 0u64;
     for _ in 0..100 {
-        let doc: serde_json::Value = get_dashboard(&proxy, None).await.json().await.unwrap();
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .unwrap();
         if let Some(entry) = doc["activity"]["completed"]
             .as_array()
             .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
@@ -1896,6 +1916,7 @@ async fn raw_io_translated_4xx_client_leg_is_the_synthesized_error() {
     for _ in 0..100 {
         let r = client
             .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .header("x-api-key", E2E_ADMIN_KEY)
             .send()
             .await
             .unwrap();
@@ -1981,7 +2002,7 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     // later).
     let mut doc = serde_json::Value::Null;
     for _ in 0..100 {
-        let response = get_dashboard(&proxy, None).await;
+        let response = get_dashboard(&proxy, Some(E2E_ADMIN_KEY)).await;
         assert_eq!(response.status(), 200);
         assert_eq!(
             response
@@ -2092,11 +2113,26 @@ async fn switch_endpoint_switches_current_account() {
     );
 
     let client = reqwest::Client::new();
-    // Loopback peer with a deliberately wrong key: still accepted (exempt),
-    // and the switch commits.
+    // Control plane (multi-tenant #22): a wrong key on loopback is NOT
+    // admin — network position is no longer privilege — so the switch is
+    // refused and nothing moves.
     let response = client
         .post(proxy.url("/llmux/switch"))
         .header("x-api-key", "definitely-not-the-key")
+        .json(&serde_json::json!({ "account": "b" }))
+        .send()
+        .await
+        .expect("switch reachable");
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        proxy.pool.snapshot().legacy_current().cloned(),
+        Some(AccountId("a".into())),
+        "a refused switch leaves the current account unchanged"
+    );
+    // With the admin credential the switch commits.
+    let response = client
+        .post(proxy.url("/llmux/switch"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .json(&serde_json::json!({ "account": "b" }))
         .send()
         .await
@@ -2114,6 +2150,7 @@ async fn switch_endpoint_switches_current_account() {
     // A switch to an unknown account is refused with a clear error (not 200).
     let response = client
         .post(proxy.url("/llmux/switch"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .json(&serde_json::json!({ "account": "ghost" }))
         .send()
         .await
@@ -2143,6 +2180,7 @@ async fn shutdown_endpoint_stops_the_server() {
     let client = reqwest::Client::new();
     let response = client
         .post(proxy.url("/llmux/shutdown"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("shutdown endpoint reachable");
@@ -2178,6 +2216,7 @@ async fn codex_settings_endpoint_changes_the_upstream_request() {
     // Change codex settings via the control endpoint (loopback-exempt).
     let resp = client
         .post(proxy.url("/llmux/codex"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .json(&serde_json::json!({
             "fast": true,
             "default_model": "gpt-5.5-codex",
@@ -2956,6 +2995,7 @@ async fn login_endpoints_validate_input_without_a_browser() {
     // Unknown provider → 400, no browser opened.
     let resp = client
         .post(proxy.url("/llmux/login/start"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .header("content-type", "application/json")
         .body(r#"{"provider":"nope"}"#)
         .send()
@@ -2966,6 +3006,7 @@ async fn login_endpoints_validate_input_without_a_browser() {
     // Unknown poll state → 404.
     let resp = client
         .get(proxy.url("/llmux/login/status?state=does-not-exist"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("login/status reachable");
@@ -2974,6 +3015,7 @@ async fn login_endpoints_validate_input_without_a_browser() {
     // Cancelling an unknown state is idempotent: 200 + cancelled:false.
     let resp = client
         .post(proxy.url("/llmux/login/cancel"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .header("content-type", "application/json")
         .body(r#"{"state":"does-not-exist"}"#)
         .send()
@@ -3005,6 +3047,7 @@ async fn settings_flip_email_anonymous_live_and_persisted() {
     // (a) Initially off.
     let status: serde_json::Value = client
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status reachable")
@@ -3016,6 +3059,7 @@ async fn settings_flip_email_anonymous_live_and_persisted() {
     // (b) Flip on remotely.
     let resp = client
         .post(proxy.url("/llmux/settings"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .header("content-type", "application/json")
         .body(r#"{"email_anonymous":true}"#)
         .send()
@@ -3029,6 +3073,7 @@ async fn settings_flip_email_anonymous_live_and_persisted() {
     // (c) Status reflects the flip with no restart — and names stay real.
     let status: serde_json::Value = client
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status reachable")
@@ -3094,6 +3139,7 @@ async fn readiness_precedes_history_hydration_and_live_requests_survive_it() {
     let client = reqwest::Client::new();
     let status = client
         .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
         .send()
         .await
         .expect("status reachable immediately after ready");
@@ -3108,7 +3154,7 @@ async fn readiness_precedes_history_hydration_and_live_requests_survive_it() {
     let expected = HISTORY + 1;
     let mut last = 0;
     for _ in 0..200 {
-        let doc: serde_json::Value = get_dashboard(&proxy, None)
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
             .await
             .json()
             .await
