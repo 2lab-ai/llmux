@@ -49,7 +49,8 @@ The config file is written with mode `0600`. Updates use atomic read-merge-write
 | Key | Default | Meaning |
 |---|---:|---|
 | `proxy.port` | `3456` | Local daemon port. Claude Code reaches llmux through `ANTHROPIC_BASE_URL=http://localhost:3456`. |
-| `proxy.api_key` | generated | Required for non-loopback clients. Localhost is exempt. |
+| `proxy.api_key` | generated | The shared ADMIN credential (`lm-…`): non-loopback clients must present it (or an issued client key) as `x-api-key`, and `/llmux/*` control endpoints require it (or an admin-kind client key) even from localhost. Keyless data-plane requests are loopback-only. |
+| `client_keys` | `[]` | Issued downstream client keys (multi-tenant). Managed via `llmux key …` / `POST /llmux/keys/*` — each entry stores id, name, email, kind (`default`\|`admin`), key prefix, SHA-256 digest, suspended flag, and timestamps. The secret itself is never stored; edit this section by hand only for disaster recovery. |
 | `upstream` | `https://api.anthropic.com` | Anthropic-compatible upstream base URL for Claude accounts. |
 
 ## Scheduler knobs

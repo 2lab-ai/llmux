@@ -9,6 +9,7 @@ pub mod channel;
 pub mod daemon;
 pub mod env;
 pub mod import;
+pub mod keys;
 pub mod login;
 pub mod run;
 pub mod status;
@@ -104,6 +105,9 @@ pub enum Command {
     Status(StatusArgs),
     /// List configured accounts.
     Accounts(AccountsArgs),
+    /// Manage downstream client keys the proxy issues to its callers
+    /// (multi-tenant): issue, list, suspend/resume, revoke, rotate.
+    Key(KeyArgs),
     /// Force every account's usage windows and cooldowns back to cold on the
     /// target daemon (POST /llmux/reset-usage) — for when the provider reset
     /// quota server-side and the local gauges overstate usage.
@@ -210,6 +214,48 @@ pub struct AccountsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct KeyArgs {
+    #[command(subcommand)]
+    pub command: KeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Issue a new client key (the secret is shown once, never stored).
+    New(KeyNewArgs),
+    /// List issued keys (metadata only).
+    List,
+    /// Suspend a key: it 401s from the very next request (no restart).
+    Suspend(KeySelectArgs),
+    /// Resume a suspended key.
+    Resume(KeySelectArgs),
+    /// Revoke a key permanently (soft-delete: usage history keeps its
+    /// name/email attribution forever).
+    Remove(KeySelectArgs),
+    /// Replace the secret under the SAME attribution id (usage continuity).
+    Rotate(KeySelectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct KeyNewArgs {
+    /// Tenant label (PC/user name). Must be unique among active keys.
+    #[arg(long)]
+    pub name: String,
+    /// Optional tenant email.
+    #[arg(long)]
+    pub email: Option<String>,
+    /// Issue an ADMIN key (unlocks key management + dashboard remotely).
+    #[arg(long)]
+    pub admin: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct KeySelectArgs {
+    /// Key id (`k-…`) or its unique name.
+    pub key: String,
+}
+
+#[derive(Debug, Args)]
 pub struct RemoveArgs {
     /// Account name as shown by `llmux accounts`.
     pub name: String,
@@ -281,6 +327,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::list(args, remote).await,
+        Command::Key(args) => keys::run(args, remote).await,
         Command::ResetUsage(args) => daemon::reset_usage(args, remote).await,
         Command::Remove(args) => accounts::remove(args).await,
         Command::Api(args) => api::run(args).await,

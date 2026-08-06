@@ -235,6 +235,15 @@ pub struct AppState {
     /// atomic) because the value is a `Vec`; the lock is only ever held for a
     /// short clone/store, never across an await.
     pub event_banners: Arc<RwLock<Vec<crate::config::EventBanner>>>,
+    /// LIVE downstream client-key registry (multi-tenant keys, #22): the auth
+    /// gate resolves every request against THIS, not the boot-time `config`
+    /// snapshot, so issue/suspend/resume/rotate/revoke bite without a restart.
+    /// Mutations persist to disk first, then [`crate::proxy::keys::KeyRegistry::reload`]
+    /// swaps the snapshot (persist-then-swap).
+    pub keys: Arc<crate::proxy::keys::KeyRegistry>,
+    /// Serializes client-key mutations end-to-end (read-merge-write on disk +
+    /// registry swap) so concurrent admin calls can't lose updates.
+    key_mutation: Arc<Mutex<()>>,
     /// Graceful-shutdown trigger fired by `POST /llmux/shutdown`.
     pub shutdown: Arc<tokio::sync::Notify>,
     /// GUI-initiated OAuth login registry (FR4, `.prd/11-llmux-islands-spec.md`):
@@ -335,6 +344,8 @@ impl AppState {
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
             event_banners: Arc::new(RwLock::new(config.events.clone())),
+            keys: Arc::new(crate::proxy::keys::KeyRegistry::from_config(&config)),
+            key_mutation: Arc::new(Mutex::new(())),
             config,
             events: Some(events_tx),
             hub: Arc::new(DashboardHub::default()),
@@ -512,6 +523,178 @@ impl AppState {
             tracing::info!(account = %name, paused, "account pause updated");
         }
         Ok(known)
+    }
+
+    /// Serialize one client-key mutation: read-merge-write the config on disk
+    /// FIRST, and only on success swap the live registry snapshot from the
+    /// merged config (persist-then-swap; multi-tenant #22 MUST-FIX 1).
+    /// `mutate` returns `Ok(())` to commit or a domain error to abort with the
+    /// file untouched. The whole sequence runs under the key-mutation lock so
+    /// concurrent admin calls can't lose updates.
+    fn mutate_client_keys<F>(&self, mutate: F) -> Result<(), KeyAdminError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), KeyAdminError>,
+    {
+        let Some(path) = &self.config_path else {
+            return Err(KeyAdminError::Config(
+                crate::config::ConfigError::NoConfigDir,
+            ));
+        };
+        let _guard = self.key_mutation.lock().unwrap_or_else(|e| e.into_inner());
+        let mut domain: Result<(), KeyAdminError> = Ok(());
+        let merged = crate::config::update_path(path, |c| {
+            domain = mutate(c);
+        })
+        .map_err(KeyAdminError::Config)?;
+        domain?;
+        self.keys.reload(&merged);
+        Ok(())
+    }
+
+    /// Count of ACTIVE admin credentials in `config`: the legacy shared
+    /// `proxy.api_key` (full capability, counts as one) plus non-suspended,
+    /// non-revoked admin client keys.
+    fn active_admin_credentials(config: &Config) -> usize {
+        let legacy = usize::from(config.proxy.api_key.is_some());
+        legacy
+            + config
+                .client_keys
+                .iter()
+                .filter(|k| {
+                    matches!(k.kind, crate::config::ClientKeyKind::Admin)
+                        && !k.suspended
+                        && k.revoked_at_ms.is_none()
+                })
+                .count()
+    }
+
+    /// Issue a new downstream client key. Returns the stored row plus the
+    /// plaintext secret — the ONLY surface that ever returns it.
+    pub fn issue_client_key(
+        &self,
+        name: &str,
+        email: Option<String>,
+        kind: crate::config::ClientKeyKind,
+    ) -> Result<(crate::config::ClientKey, String), KeyAdminError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(KeyAdminError::NameRequired);
+        }
+        let issued = crate::config::generate_client_key();
+        let row = crate::config::ClientKey {
+            id: crate::config::generate_client_key_id(),
+            name: name.to_string(),
+            email: email.filter(|e| !e.trim().is_empty()),
+            kind,
+            key_prefix: issued.prefix.clone(),
+            key_digest: issued.digest.clone(),
+            suspended: false,
+            created_at_ms: now_epoch_ms(),
+            revoked_at_ms: None,
+        };
+        let stored = row.clone();
+        self.mutate_client_keys(move |c| {
+            // Names must stay unique among non-revoked keys so the CLI can
+            // resolve them unambiguously (mutations themselves are id-only).
+            if c.client_keys
+                .iter()
+                .any(|k| k.revoked_at_ms.is_none() && k.name == row.name)
+            {
+                return Err(KeyAdminError::NameTaken(row.name.clone()));
+            }
+            c.client_keys.push(row);
+            Ok(())
+        })?;
+        tracing::info!(id = %stored.id, name = %stored.name, "client key issued");
+        Ok((stored, issued.secret))
+    }
+
+    /// Suspend / resume an issued key. Refuses to suspend the last active
+    /// admin credential (self-lockout / fail-open guard).
+    pub fn set_client_key_suspended(
+        &self,
+        id: &str,
+        suspended: bool,
+    ) -> Result<crate::config::ClientKey, KeyAdminError> {
+        let id = id.to_string();
+        let mut updated: Option<crate::config::ClientKey> = None;
+        let out = &mut updated;
+        self.mutate_client_keys(move |c| {
+            let i = c
+                .client_keys
+                .iter()
+                .position(|k| k.id == id && k.revoked_at_ms.is_none())
+                .ok_or(KeyAdminError::NotFound)?;
+            let is_active_admin =
+                matches!(c.client_keys[i].kind, crate::config::ClientKeyKind::Admin)
+                    && !c.client_keys[i].suspended;
+            if suspended && is_active_admin && Self::active_admin_credentials(c) <= 1 {
+                return Err(KeyAdminError::LastAdmin);
+            }
+            c.client_keys[i].suspended = suspended;
+            *out = Some(c.client_keys[i].clone());
+            Ok(())
+        })?;
+        let key = updated.expect("mutation committed");
+        tracing::info!(id = %key.id, name = %key.name, suspended, "client key suspend updated");
+        Ok(key)
+    }
+
+    /// Soft-revoke an issued key: authentication stops immediately, but the
+    /// row (id/name/email) is preserved forever so historical usage keeps its
+    /// attribution. Refuses to revoke the last active admin credential.
+    pub fn revoke_client_key(&self, id: &str) -> Result<crate::config::ClientKey, KeyAdminError> {
+        let id = id.to_string();
+        let mut updated: Option<crate::config::ClientKey> = None;
+        let out = &mut updated;
+        self.mutate_client_keys(move |c| {
+            let i = c
+                .client_keys
+                .iter()
+                .position(|k| k.id == id && k.revoked_at_ms.is_none())
+                .ok_or(KeyAdminError::NotFound)?;
+            let is_active_admin =
+                matches!(c.client_keys[i].kind, crate::config::ClientKeyKind::Admin)
+                    && !c.client_keys[i].suspended;
+            if is_active_admin && Self::active_admin_credentials(c) <= 1 {
+                return Err(KeyAdminError::LastAdmin);
+            }
+            c.client_keys[i].revoked_at_ms = Some(now_epoch_ms());
+            *out = Some(c.client_keys[i].clone());
+            Ok(())
+        })?;
+        let key = updated.expect("mutation committed");
+        tracing::info!(id = %key.id, name = %key.name, "client key revoked");
+        Ok(key)
+    }
+
+    /// Rotate an issued key: a NEW secret under the SAME attribution id, so
+    /// usage continuity is a property of the API, not a promise. Returns the
+    /// updated row plus the new plaintext (shown once).
+    pub fn rotate_client_key(
+        &self,
+        id: &str,
+    ) -> Result<(crate::config::ClientKey, String), KeyAdminError> {
+        let id = id.to_string();
+        let issued = crate::config::generate_client_key();
+        let prefix = issued.prefix.clone();
+        let digest = issued.digest.clone();
+        let mut updated: Option<crate::config::ClientKey> = None;
+        let out = &mut updated;
+        self.mutate_client_keys(move |c| {
+            let i = c
+                .client_keys
+                .iter()
+                .position(|k| k.id == id && k.revoked_at_ms.is_none())
+                .ok_or(KeyAdminError::NotFound)?;
+            c.client_keys[i].key_prefix = prefix;
+            c.client_keys[i].key_digest = digest;
+            *out = Some(c.client_keys[i].clone());
+            Ok(())
+        })?;
+        let key = updated.expect("mutation committed");
+        tracing::info!(id = %key.id, name = %key.name, "client key rotated");
+        Ok((key, issued.secret))
     }
 
     /// Set / clear the per-account ceiling overrides (config `account_limits`)
@@ -1036,6 +1219,11 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/inject-account", post(inject_account_endpoint))
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/pause-account", post(pause_account_endpoint))
+        .route("/llmux/keys", get(keys_list_endpoint))
+        .route("/llmux/keys/new", post(keys_new_endpoint))
+        .route("/llmux/keys/suspend", post(keys_suspend_endpoint))
+        .route("/llmux/keys/remove", post(keys_remove_endpoint))
+        .route("/llmux/keys/rotate", post(keys_rotate_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
         .route("/llmux/reset-usage", post(reset_usage_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
@@ -1075,40 +1263,258 @@ async fn root_ping() -> &'static str {
 /// Pure client-auth decision (FR1): when a proxy api key is configured,
 /// non-loopback peers must present it as `x-api-key`; loopback peers are
 /// exempt. An unknown peer address (no ConnectInfo) is NOT exempt.
-pub fn client_auth_ok(
-    required: Option<&str>,
-    peer: Option<std::net::IpAddr>,
-    presented: Option<&str>,
-) -> bool {
-    match required {
-        None => true,
-        Some(key) => presented == Some(key) || peer.is_some_and(|ip| ip.is_loopback()),
-    }
+/// Scope classification (multi-tenant #22): the control plane is every
+/// `/llmux/*` surface except the model catalog alias — key management,
+/// account mutation, shutdown, AND the dashboard/status reads (the dashboard
+/// document contains every tenant's data). Everything else — the `/v1/*`
+/// forwarding fallback, `/models`, the root ping — is the data plane.
+pub fn is_control_plane(path: &str) -> bool {
+    path == "/llmux" || (path.starts_with("/llmux/") && path != "/llmux/models")
 }
 
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": { "type": "authentication_error", "message": message },
+    });
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Two-axis client auth (multi-tenant #22): the LIVE key registry resolves
+/// the presented credential to a *tenant identity* (attribution axis), then
+/// the route's scope decides whether that identity may pass (privilege axis).
+///
+/// - Identity: issued `lmk-` key → its tenant; legacy `proxy.api_key` →
+///   `legacy` (admin); keyless loopback → `local` (data plane only). Keyless
+///   remote is always denied — keyless is loopback-only.
+/// - Privilege: control-plane routes (see [`is_control_plane`]) require an
+///   ADMIN credential even from loopback — network position is not privilege
+///   (an `ssh -L` peer looks loopback). Local CLI/TUI clients present the
+///   config's own key automatically, so operator friction is zero.
+///
+/// The resolved [`Tenant`] rides the request as an extension; the forward
+/// path records its `id` on the activity event, which is what makes
+/// per-tenant metering land (P1 minimal attribution).
 async fn client_auth(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    use crate::proxy::keys::Resolution;
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
+    let loopback = peer.is_some_and(|ip| ip.is_loopback());
     let presented = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-    if client_auth_ok(state.config.proxy.api_key.as_deref(), peer, presented) {
-        next.run(req).await
-    } else {
-        let body = serde_json::json!({
-            "type": "error",
-            "error": { "type": "authentication_error", "message": "Invalid proxy API key" },
-        });
-        (
-            StatusCode::UNAUTHORIZED,
+    match state.keys.resolve(presented, loopback) {
+        Resolution::Allowed(tenant) => {
+            if is_control_plane(req.uri().path()) && !tenant.admin {
+                return auth_error(
+                    StatusCode::FORBIDDEN,
+                    "admin credential required for llmux control endpoints",
+                );
+            }
+            req.extensions_mut().insert(tenant);
+            next.run(req).await
+        }
+        Resolution::Suspended => auth_error(StatusCode::UNAUTHORIZED, "client key suspended"),
+        Resolution::Revoked => auth_error(StatusCode::UNAUTHORIZED, "client key revoked"),
+        Resolution::Denied => auth_error(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
+    }
+}
+
+/// Domain errors of the client-key admin surface (multi-tenant #22), mapped
+/// to HTTP statuses in the `/llmux/keys/*` handlers.
+#[derive(Debug)]
+pub enum KeyAdminError {
+    Config(crate::config::ConfigError),
+    /// No non-revoked key with the given id.
+    NotFound,
+    /// A non-revoked key already carries this name (names must resolve
+    /// unambiguously in the CLI).
+    NameTaken(String),
+    NameRequired,
+    /// The mutation would leave ZERO active admin credentials — refused so a
+    /// remote admin can't lock everyone out (recovery would then require the
+    /// server-local CLI config path).
+    LastAdmin,
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn key_admin_error_response(err: KeyAdminError) -> Response {
+    match err {
+        KeyAdminError::NotFound => relay_error(StatusCode::NOT_FOUND, "client key not found"),
+        KeyAdminError::NameTaken(name) => relay_error(
+            StatusCode::CONFLICT,
+            &format!("a client key named {name:?} already exists"),
+        ),
+        KeyAdminError::NameRequired => relay_error(StatusCode::BAD_REQUEST, "name is required"),
+        KeyAdminError::LastAdmin => relay_error(
+            StatusCode::CONFLICT,
+            "refusing to disable the last active admin credential",
+        ),
+        KeyAdminError::Config(crate::config::ConfigError::NoConfigDir) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config persistence disabled; cannot mutate client keys",
+        ),
+        KeyAdminError::Config(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to persist client keys: {err}"),
+        ),
+    }
+}
+
+/// Serializable metadata view of one client key — NEVER includes the secret
+/// or its digest (the digest is not secret-reversible but has no client use;
+/// the response surface stays secret-free by construction).
+fn client_key_json(key: &crate::config::ClientKey) -> serde_json::Value {
+    serde_json::json!({
+        "id": key.id,
+        "name": key.name,
+        "email": key.email,
+        "kind": match key.kind {
+            crate::config::ClientKeyKind::Admin => "admin",
+            crate::config::ClientKeyKind::Default => "default",
+        },
+        "key_prefix": key.key_prefix,
+        "suspended": key.suspended,
+        "created_at_ms": key.created_at_ms,
+        "revoked_at_ms": key.revoked_at_ms,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct KeyNewRequest {
+    name: String,
+    #[serde(default)]
+    email: Option<String>,
+    /// `"default"` (the default) or `"admin"`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// `POST /llmux/keys/new` — issue a downstream client key (admin only, like
+/// every `/llmux/*` route). The plaintext secret appears in THIS response and
+/// nowhere else, ever.
+async fn keys_new_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<KeyNewRequest>,
+) -> Response {
+    let kind = match body.kind.as_deref() {
+        None | Some("default") => crate::config::ClientKeyKind::Default,
+        Some("admin") => crate::config::ClientKeyKind::Admin,
+        Some(other) => {
+            return relay_error(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown key kind {other:?} (expected \"default\" or \"admin\")"),
+            )
+        }
+    };
+    match state.issue_client_key(&body.name, body.email.clone(), kind) {
+        Ok((row, secret)) => {
+            let mut json = client_key_json(&row);
+            // Shown once: the caller must store it now (only the digest is kept).
+            json["key"] = serde_json::Value::String(secret);
+            json["ok"] = serde_json::Value::Bool(true);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json.to_string(),
+            )
+                .into_response()
+        }
+        Err(err) => key_admin_error_response(err),
+    }
+}
+
+/// `GET /llmux/keys` — list issued keys (metadata only; secrets are neither
+/// stored nor returned). Usage summaries join in P2 via the dashboard doc.
+async fn keys_list_endpoint(State(state): State<AppState>) -> Response {
+    let keys: Vec<serde_json::Value> = state.keys.list().iter().map(client_key_json).collect();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "keys": keys }).to_string(),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct KeySuspendRequest {
+    id: String,
+    /// `true` to suspend, `false` to resume.
+    suspended: bool,
+}
+
+/// `POST /llmux/keys/suspend` — suspend/resume by id, effective on the very
+/// next request (live registry, no restart).
+async fn keys_suspend_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<KeySuspendRequest>,
+) -> Response {
+    match state.set_client_key_suspended(&body.id, body.suspended) {
+        Ok(row) => (
+            StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
-            body.to_string(),
+            serde_json::json!({ "ok": true, "key": client_key_json(&row) }).to_string(),
         )
-            .into_response()
+            .into_response(),
+        Err(err) => key_admin_error_response(err),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct KeyIdRequest {
+    id: String,
+}
+
+/// `POST /llmux/keys/remove` — soft-revoke by id: authentication stops now,
+/// attribution metadata is preserved forever.
+async fn keys_remove_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<KeyIdRequest>,
+) -> Response {
+    match state.revoke_client_key(&body.id) {
+        Ok(row) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": true, "key": client_key_json(&row) }).to_string(),
+        )
+            .into_response(),
+        Err(err) => key_admin_error_response(err),
+    }
+}
+
+/// `POST /llmux/keys/rotate` — new secret, same attribution id. The new
+/// plaintext appears in this response only.
+async fn keys_rotate_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<KeyIdRequest>,
+) -> Response {
+    match state.rotate_client_key(&body.id) {
+        Ok((row, secret)) => {
+            let mut json = serde_json::json!({ "ok": true, "key": client_key_json(&row) });
+            json["key"]["key"] = serde_json::Value::String(secret);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json.to_string(),
+            )
+                .into_response()
+        }
+        Err(err) => key_admin_error_response(err),
     }
 }
 
@@ -2679,7 +3085,6 @@ mod tests {
     use super::*;
     use crate::config::{AccountConfig, AccountCredential};
     use crate::scheduler::headers::{ParsedRateLimitHeaders, WindowReading};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn oauth_account(name: &str) -> AccountConfig {
         AccountConfig {
@@ -2705,41 +3110,44 @@ mod tests {
     }
 
     #[test]
-    fn client_auth_no_key_configured_allows_everyone() {
-        assert!(client_auth_ok(None, None, None));
-        assert!(client_auth_ok(
-            None,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))),
-            None
-        ));
+    fn scope_split_control_vs_data() {
+        // Control plane = /llmux/* management + dashboard/status reads.
+        assert!(is_control_plane("/llmux/keys"));
+        assert!(is_control_plane("/llmux/keys/new"));
+        assert!(is_control_plane("/llmux/dashboard"));
+        assert!(is_control_plane("/llmux/status"));
+        assert!(is_control_plane("/llmux/shutdown"));
+        assert!(is_control_plane("/llmux/remove-account"));
+        // Data plane = forwarding + the model catalog + the root ping.
+        assert!(!is_control_plane("/v1/messages"));
+        assert!(!is_control_plane("/models"));
+        assert!(!is_control_plane("/llmux/models"));
+        assert!(!is_control_plane("/"));
     }
 
     #[test]
-    fn client_auth_loopback_is_exempt() {
-        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        assert!(client_auth_ok(Some("lm-secret"), Some(v4), None));
-        assert!(client_auth_ok(Some("lm-secret"), Some(v6), None));
-    }
-
-    #[test]
-    fn client_auth_remote_requires_matching_key() {
-        let remote = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
-        assert!(client_auth_ok(
-            Some("lm-secret"),
-            Some(remote),
-            Some("lm-secret")
-        ));
-        assert!(!client_auth_ok(Some("lm-secret"), Some(remote), None));
-        assert!(!client_auth_ok(
-            Some("lm-secret"),
-            Some(remote),
-            Some("wrong")
-        ));
-        assert!(
-            !client_auth_ok(Some("lm-secret"), None, None),
-            "unknown peer is not exempt"
+    fn tenant_resolution_matrix() {
+        use crate::proxy::keys::{KeyRegistry, Resolution, Tenant};
+        // Legacy shared key + no issued keys: loopback keyless = local (data
+        // only), remote keyless = denied, legacy key = admin from anywhere.
+        let mut config = Config::default();
+        config.proxy.api_key = Some("lm-secret".into());
+        let reg = KeyRegistry::from_config(&config);
+        assert_eq!(
+            reg.resolve(None, true),
+            Resolution::Allowed(Tenant::local())
         );
+        assert_eq!(reg.resolve(None, false), Resolution::Denied);
+        assert_eq!(reg.resolve(Some("wrong"), false), Resolution::Denied);
+        match reg.resolve(Some("lm-secret"), false) {
+            Resolution::Allowed(t) => assert!(t.admin && t.id == "legacy"),
+            other => panic!("expected legacy admin, got {other:?}"),
+        }
+        // Keyless remote stays denied even with NO key configured at all —
+        // keyless is loopback-only (issue #22 P0-B fix; old `None => true`
+        // behavior is gone deliberately).
+        let reg = KeyRegistry::from_config(&Config::default());
+        assert_eq!(reg.resolve(None, false), Resolution::Denied);
     }
 
     fn params() -> SelectParams {
@@ -3300,6 +3708,239 @@ mod tests {
             !bv.contains("gpt-5.6-sol"),
             "/v1/models must reach the fallback, not return the catalog"
         );
+    }
+
+    // ---- multi-tenant client keys (#22) ----
+
+    /// The P1 receipt gate: issue → suspend → 401 → resume → 200 → revoke →
+    /// 401, all against ONE running server process with NO restart — proving
+    /// mutations reach the live auth gate through the registry, not just the
+    /// config file. Also pins the two-axis scope split end-to-end and that the
+    /// disk config mirrors every mutation (persist-then-swap).
+    #[tokio::test]
+    async fn client_key_lifecycle_bites_live_without_restart() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let mut state = endpoint_state(&path, Vec::new());
+        // Give the config a legacy admin key (the local CLI's credential).
+        state.config.proxy.api_key = Some("lm-admin".into());
+        crate::config::save_path(&path, &state.config).expect("seed key");
+        state.keys.reload(&state.config);
+        let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // Scope split: keyless loopback reaches the DATA plane…
+        let r = client
+            .get(format!("{base}/llmux/models"))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200, "keyless loopback data plane");
+        // …but NOT the control plane (network position is not privilege).
+        let r = client
+            .get(format!("{base}/llmux/keys"))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 403, "keyless loopback control plane");
+
+        // Admin (legacy key) issues a default-kind key.
+        let r = client
+            .post(format!("{base}/llmux/keys/new"))
+            .header("x-api-key", "lm-admin")
+            .json(&serde_json::json!({ "name": "pc-b", "email": "b@x.com" }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200);
+        let issued: serde_json::Value = r.json().await.expect("json");
+        let secret = issued["key"].as_str().expect("plaintext once").to_string();
+        let id = issued["id"].as_str().expect("id").to_string();
+        assert!(secret.starts_with("lmk-"), "issued namespace is lmk-");
+
+        // The issued key unlocks the data plane… (200 on the catalog route)
+        let data = |key: &str| {
+            client
+                .get(format!("{base}/llmux/models"))
+                .header("x-api-key", key.to_string())
+                .send()
+        };
+        assert_eq!(data(&secret).await.expect("send").status().as_u16(), 200);
+        // …but its default kind is refused on the control plane.
+        let r = client
+            .get(format!("{base}/llmux/keys"))
+            .header("x-api-key", &secret)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 403, "default kind is data-plane only");
+
+        // Suspend — SAME process, no restart — next request must 401.
+        let r = client
+            .post(format!("{base}/llmux/keys/suspend"))
+            .header("x-api-key", "lm-admin")
+            .json(&serde_json::json!({ "id": id, "suspended": true }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200);
+        let r = data(&secret).await.expect("send");
+        assert_eq!(r.status().as_u16(), 401, "suspend bites live");
+        let body = r.text().await.expect("body");
+        assert!(
+            body.contains("suspended"),
+            "explicit suspended message: {body}"
+        );
+
+        // Resume — next request passes again.
+        let r = client
+            .post(format!("{base}/llmux/keys/suspend"))
+            .header("x-api-key", "lm-admin")
+            .json(&serde_json::json!({ "id": id, "suspended": false }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(
+            data(&secret).await.expect("send").status().as_u16(),
+            200,
+            "resume bites live"
+        );
+
+        // Revoke — 401 forever, but the row (attribution metadata) survives
+        // on disk with its name/email (soft-delete).
+        let r = client
+            .post(format!("{base}/llmux/keys/remove"))
+            .header("x-api-key", "lm-admin")
+            .json(&serde_json::json!({ "id": id }))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(
+            data(&secret).await.expect("send").status().as_u16(),
+            401,
+            "revoke bites live"
+        );
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let row = on_disk
+            .client_keys
+            .iter()
+            .find(|k| k.id == id)
+            .expect("soft-deleted row preserved");
+        assert!(row.revoked_at_ms.is_some());
+        assert_eq!(row.name, "pc-b");
+        assert_eq!(row.email.as_deref(), Some("b@x.com"));
+    }
+
+    /// Secret-never-returned sweep (D1): after issuance, the plaintext must
+    /// not appear on ANY response surface — the keys list, the dashboard
+    /// document, or the persisted config (which stores only the digest).
+    #[tokio::test]
+    async fn client_key_secret_never_returned_after_issuance() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        let (row, secret) = state
+            .issue_client_key("pc-c", None, crate::config::ClientKeyKind::Default)
+            .expect("issue");
+        // List endpoint: no secret, no digest.
+        let response = keys_list_endpoint(State(state.clone())).await;
+        let body = response_json(response).await.to_string();
+        assert!(!body.contains(&secret), "list must not return the secret");
+        assert!(!body.contains("digest"), "list must not return digests");
+        // Dashboard document (the fan-out surface: TUI/attach/islands).
+        let doc = crate::dashboard::build_doc(&state, SystemTime::now());
+        let doc_json = serde_json::to_string(&doc).expect("doc json");
+        assert!(
+            !doc_json.contains(&secret),
+            "dashboard must not carry the secret"
+        );
+        assert!(
+            doc_json.contains(&row.id),
+            "dashboard lists the key metadata"
+        );
+        // On disk: digest only.
+        let on_disk = std::fs::read_to_string(&path).expect("config");
+        assert!(!on_disk.contains(&secret), "config stores no plaintext");
+        assert!(on_disk.contains("sha256:"), "config stores the digest");
+        // Rotation returns a NEW secret exactly once and the old stops resolving.
+        let (_, rotated) = state.rotate_client_key(&row.id).expect("rotate");
+        use crate::proxy::keys::Resolution;
+        assert!(matches!(
+            state.keys.resolve(Some(&rotated), false),
+            Resolution::Allowed(_)
+        ));
+        assert_eq!(state.keys.resolve(Some(&secret), false), Resolution::Denied);
+    }
+
+    /// Last-active-admin guard: with no legacy key configured, the final
+    /// admin client key can be neither suspended nor revoked (fail-open /
+    /// self-lockout guard); a second admin unblocks the first.
+    #[tokio::test]
+    async fn last_admin_credential_cannot_be_disabled() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        assert!(
+            state.config.proxy.api_key.is_none(),
+            "no legacy admin in this fixture"
+        );
+        let (a, _) = state
+            .issue_client_key("admin-a", None, crate::config::ClientKeyKind::Admin)
+            .expect("issue a");
+        assert!(matches!(
+            state.set_client_key_suspended(&a.id, true),
+            Err(KeyAdminError::LastAdmin)
+        ));
+        assert!(matches!(
+            state.revoke_client_key(&a.id),
+            Err(KeyAdminError::LastAdmin)
+        ));
+        let (b, _) = state
+            .issue_client_key("admin-b", None, crate::config::ClientKeyKind::Admin)
+            .expect("issue b");
+        state
+            .set_client_key_suspended(&a.id, true)
+            .expect("now suspendable");
+        // …and the guard moves to the remaining admin.
+        assert!(matches!(
+            state.revoke_client_key(&b.id),
+            Err(KeyAdminError::LastAdmin)
+        ));
+    }
+
+    /// Duplicate names among ACTIVE keys are refused (CLI resolves names to
+    /// ids, so names must be unambiguous); a revoked key frees its name.
+    #[tokio::test]
+    async fn client_key_names_unique_among_active() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        // A legacy admin exists so the guard doesn't interfere.
+        crate::config::update_path(&path, |c| {
+            c.proxy.api_key = Some("lm-admin".into());
+        })
+        .expect("seed");
+        let (first, _) = state
+            .issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default)
+            .expect("issue");
+        assert!(matches!(
+            state.issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default),
+            Err(KeyAdminError::NameTaken(_))
+        ));
+        state.revoke_client_key(&first.id).expect("revoke");
+        state
+            .issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default)
+            .expect("revoked name is reusable");
     }
 
     // ---- C11: login status carries device-flow verification fields ----
@@ -3921,24 +4562,30 @@ mod tests {
     }
 
     /// The settings route sits on the shared `.route(...)` chain behind the
-    /// `client_auth` middleware, so the auth semantics are exactly
-    /// [`client_auth_ok`] (unit-covered above): non-loopback peers must
-    /// present the proxy api key, loopback is exempt. This test pins the
-    /// decision for the settings mutation specifically.
+    /// `client_auth` middleware. Since the two-axis gate (multi-tenant #22)
+    /// it is CONTROL plane: an admin credential is required even from
+    /// loopback — keyless loopback resolves to the `local` tenant, which is
+    /// data-plane only.
     #[test]
     fn settings_mutation_auth_follows_shared_gate() {
-        let remote = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
-        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert!(
-            !client_auth_ok(Some("lm-secret"), Some(remote), None),
-            "non-loopback without key is rejected before the handler runs"
-        );
-        assert!(client_auth_ok(
-            Some("lm-secret"),
-            Some(remote),
-            Some("lm-secret")
-        ));
-        assert!(client_auth_ok(Some("lm-secret"), Some(loopback), None));
+        use crate::proxy::keys::{KeyRegistry, Resolution};
+        assert!(is_control_plane("/llmux/settings"));
+        let mut config = Config::default();
+        config.proxy.api_key = Some("lm-secret".into());
+        let reg = KeyRegistry::from_config(&config);
+        // Remote without key: denied outright.
+        assert_eq!(reg.resolve(None, false), Resolution::Denied);
+        // Remote with the legacy key: admin → control plane passes.
+        match reg.resolve(Some("lm-secret"), false) {
+            Resolution::Allowed(t) => assert!(t.admin),
+            other => panic!("expected admin, got {other:?}"),
+        }
+        // Keyless loopback: allowed as `local` but NOT admin → the gate
+        // 403s it on control routes.
+        match reg.resolve(None, true) {
+            Resolution::Allowed(t) => assert!(!t.admin),
+            other => panic!("expected local tenant, got {other:?}"),
+        }
     }
 
     /// An `EventsRequest` upsert body (all four fields present).

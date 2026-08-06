@@ -248,6 +248,10 @@ struct ForwardContext {
     /// from the request body once at entry (issue #32). `None` → the request is
     /// attributed to the `unknown` bucket. Counting only; never gates routing.
     user_id: Option<String>,
+    /// KEYED tenant attribution id resolved by the auth gate (multi-tenant
+    /// #22): client-key id / `legacy` / `local`. Counting only; the gate
+    /// already enforced access before forward ran.
+    tenant: Option<String>,
     /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
     /// at entry from the buffered body by [`crate::proxy::classify`]. Display
     /// only; never gates routing.
@@ -433,6 +437,7 @@ impl ForwardContext {
             user_id: self.user_id.clone(),
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
+            tenant: self.tenant.clone(),
         });
     }
 }
@@ -691,6 +696,13 @@ fn transient_response(detail: &str) -> Response {
 pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response {
     let started = std::time::Instant::now();
     let activity_id = state.next_request_id();
+    // Tenant attribution id resolved by the auth gate (multi-tenant #22),
+    // riding the request as an extension. Always present on gated requests;
+    // `None` only in unit tests that bypass the middleware.
+    let tenant = req
+        .extensions()
+        .get::<crate::proxy::keys::Tenant>()
+        .map(|t| t.id.clone());
     let (parts, body) = req.into_parts();
     let path_query = parts
         .uri
@@ -745,6 +757,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 user_id: None,
                 kind: None,
                 excerpt: None,
+                tenant,
             });
             return error_response(status, error_type, &message);
         }
@@ -794,6 +807,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         dispatched: None,
         model,
         user_id,
+        tenant,
         kind: Some(classified.kind.to_string()),
         excerpt: classified.excerpt,
         group,
@@ -1958,6 +1972,7 @@ async fn relay(
             fast,
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let tenant = ctx.tenant.clone();
         let kind = ctx.kind.clone();
         let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
@@ -2052,6 +2067,7 @@ async fn relay(
                         user_id,
                         kind,
                         excerpt,
+                        tenant,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -2267,6 +2283,7 @@ async fn relay_translate(
             fast,
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
+        let tenant = ctx.tenant.clone();
         let kind = ctx.kind.clone();
         let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
@@ -2413,6 +2430,7 @@ async fn relay_translate(
                         user_id,
                         kind,
                         excerpt,
+                        tenant,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -2710,6 +2728,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
             group: Some(group),
             served_by: None,
         }

@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, CodexConfig, Config, EventBanner, GrokConfig, IdleProbeConfig, ProxyConfig,
-    QuotaDisplay, RawIoConfig, RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode,
-    TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT,
-    DEFAULT_UPSTREAM,
+    AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner, GrokConfig,
+    IdleProbeConfig, ProxyConfig, QuotaDisplay, RawIoConfig, RemoteConfig, RoutingConfig,
+    SchedulerConfig, SchedulerMode, TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL,
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
@@ -306,6 +306,60 @@ pub fn generate_api_key() -> String {
     format!(
         "{API_KEY_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes_32())
+    )
+}
+
+/// Prefix of ISSUED downstream client keys (multi-tenant; issue #22).
+/// Distinct from the legacy shared proxy key (`lm-`) so the two namespaces
+/// never collide; still matched by the `lm-` masking rule in
+/// `proxy::logging::mask_credentials`.
+pub const CLIENT_KEY_PREFIX: &str = "lmk-";
+
+/// A freshly issued client-key secret plus the derived fields that get
+/// stored. The `secret` is shown to the caller exactly once and never
+/// persisted — only `prefix` + `digest` reach the config.
+pub struct IssuedClientKey {
+    pub secret: String,
+    pub prefix: String,
+    pub digest: String,
+}
+
+/// Generate a downstream client key: `lmk-` + 32 random bytes base64url,
+/// with its display prefix (first 8 chars) and `sha256:<hex>` digest.
+pub fn generate_client_key() -> IssuedClientKey {
+    use base64::Engine as _;
+    let secret = format!(
+        "{CLIENT_KEY_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes_32())
+    );
+    IssuedClientKey {
+        prefix: secret.chars().take(8).collect(),
+        digest: client_key_digest(&secret),
+        secret,
+    }
+}
+
+/// `sha256:<hex>` digest of a client-key secret — the stored/compared form.
+pub fn client_key_digest(secret: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(7 + out.len() * 2);
+    hex.push_str("sha256:");
+    for b in out {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// Generate a stable client-key attribution id: `k-` + 8 hex chars.
+pub fn generate_client_key_id() -> String {
+    let bytes = random_bytes_32();
+    format!(
+        "k-{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
     )
 }
 

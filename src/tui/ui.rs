@@ -10031,6 +10031,17 @@ mod tests {
             to: "2026-01-02".into(),
             content: "banner".into(),
         });
+        config.client_keys.push(crate::config::ClientKey {
+            id: "k-00000001".into(),
+            name: "pc-a".into(),
+            email: Some("a@x.com".into()),
+            kind: crate::config::ClientKeyKind::Default,
+            key_prefix: "lmk-test".into(),
+            key_digest: "sha256:00".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: Some(2),
+        });
         // Compile-time exhaustiveness: destructure every schema struct with
         // NO `..` rest pattern, so adding a field anywhere in the config
         // schema fails to COMPILE here — forcing this fixture (fill new
@@ -10059,6 +10070,7 @@ mod tests {
                 account_limits: _,
                 events: _,
                 remote,
+                client_keys: _,
                 accounts: _,
             } = &config;
             let crate::config::ProxyConfig {
@@ -10188,6 +10200,7 @@ mod tests {
             "remote.host",
             "remote.port",
             "remote.api_key",
+            "client_keys",
             "accounts",
         ];
         // Collections whose leaf paths embed RUNTIME keys (`pricing.<model>.

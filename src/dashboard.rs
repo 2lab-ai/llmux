@@ -235,6 +235,7 @@ impl DashboardHub {
             rpm_5m: state.log.requests_per_minute(now, RPM_WINDOW),
             model_usage: state.log.model_usage(),
             client_usage: state.log.client_usage(),
+            tenant_usage: state.log.tenant_usage(),
             // Windowed heatmap rows per window (issue #23). Computed under the
             // same lock as the rest of the view so one read is consistent.
             windowed: StatsWindow::ALL
@@ -268,6 +269,9 @@ pub(crate) struct HubView {
     pub model_usage: Vec<ModelUsage>,
     /// Per-client request attribution rows (issue #32), sorted by requests desc.
     pub client_usage: Vec<ClientUsage>,
+    /// Per-TENANT attribution rows (multi-tenant #22): `client` carries the
+    /// tenant attribution id (`k-…` / `legacy` / `local` / `unknown`).
+    pub tenant_usage: Vec<ClientUsage>,
     /// Windowed heatmap rows per window (issue #23): one `(window, rows)` pair
     /// per [`StatsWindow`], each already sorted by total tokens desc.
     pub windowed: Vec<(StatsWindow, Vec<WindowedRow>)>,
@@ -381,6 +385,7 @@ fn trace_event(event: &ActivityEvent) {
             ttft_ms: _,
             gen_ms: _,
             aborted: _,
+            tenant,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -404,6 +409,7 @@ fn trace_event(event: &ActivityEvent) {
                 effort = effort.as_deref().unwrap_or("-"),
                 fast = fast.unwrap_or(false),
                 client = user_id.as_deref().unwrap_or("unknown"),
+                tenant = tenant.as_deref().unwrap_or("unknown"),
                 kind = kind.as_deref().unwrap_or("-"),
                 "request finished"
             );
@@ -490,6 +496,15 @@ pub struct DashboardDoc {
     /// renders no client panel.
     #[serde(default)]
     pub client_usage: Vec<ClientUsageDoc>,
+    /// Per-TENANT attribution rows (multi-tenant #22): keyed usage buckets
+    /// resolved by the auth gate (`k-…` ids, `legacy`, `local`; `unknown` =
+    /// pre-tenant history). Additive: absent in older docs → parses empty.
+    #[serde(default)]
+    pub tenant_usage: Vec<TenantUsageDoc>,
+    /// Issued client keys (metadata ONLY — secrets are never stored, let
+    /// alone serialized). Additive: absent in older docs → parses empty.
+    #[serde(default)]
+    pub client_keys: Vec<KeyRowDoc>,
     /// Windowed (24h/72h) per-account/per-model token heatmap rows (issue #23).
     /// Additive: absent in pre-#23 docs → an older client parses it empty and an
     /// upgraded client attaching to an older daemon shows no heatmap. These are
@@ -1125,6 +1140,41 @@ pub struct ClientUsageDoc {
     pub last_seen_ms: u64,
 }
 
+/// One per-tenant attribution row (multi-tenant #22): the stable tenant id,
+/// its display name resolved at build time (key name; the id itself for the
+/// builtin `local`/`legacy`/`unknown` buckets), and its lifetime counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantUsageDoc {
+    /// Stable attribution id: `k-…` / `legacy` / `local` / `unknown`.
+    pub tenant: String,
+    /// Display name (key name, or the bucket id itself).
+    pub name: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// One issued client key's metadata for the dashboard (multi-tenant #22).
+/// NEVER carries the secret or digest — display fields only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRowDoc {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `"default"` or `"admin"`.
+    pub kind: String,
+    pub key_prefix: String,
+    pub suspended: bool,
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub revoked_at_ms: Option<u64>,
+}
+
 /// One trailing-window slice of the per-account/per-model heatmap (issue #23):
 /// a window label ("24h"/"72h") + every `(group, model, account)` cell with
 /// activity in that window, sorted by total tokens desc. Additive document
@@ -1332,6 +1382,8 @@ pub struct DocMeta {
     pub events: Vec<crate::config::EventBanner>,
     /// Config-editor facts (see [`ConfigFactsDoc`]).
     pub config_facts: ConfigFactsDoc,
+    /// Issued client keys (metadata only), from the LIVE registry.
+    pub client_keys: Vec<KeyRowDoc>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1796,6 +1848,29 @@ pub(crate) fn dashboard_doc(
         })
         .collect();
 
+    // Per-tenant rows (multi-tenant #22): join the hub's counts with the key
+    // metadata so display layers get names without another lookup. Builtin
+    // buckets (`local`/`legacy`/`unknown`) name themselves.
+    let tenant_usage: Vec<TenantUsageDoc> = hub
+        .tenant_usage
+        .iter()
+        .map(|t| {
+            let key = meta.client_keys.iter().find(|k| k.id == t.client);
+            TenantUsageDoc {
+                tenant: t.client.clone(),
+                name: key
+                    .map(|k| k.name.clone())
+                    .unwrap_or_else(|| t.client.clone()),
+                email: key.and_then(|k| k.email.clone()),
+                requests: t.requests,
+                ok: t.ok,
+                errors: t.errors,
+                tokens_in: t.tokens_in,
+                tokens_out: t.tokens_out,
+            }
+        })
+        .collect();
+
     DashboardDoc {
         version: crate::build_info::version_string(),
         pid: meta.pid,
@@ -1828,6 +1903,8 @@ pub(crate) fn dashboard_doc(
         },
         model_usage,
         client_usage,
+        tenant_usage,
+        client_keys: meta.client_keys.clone(),
         windowed: windowed_docs(hub),
         activity,
         health: Some(HealthDoc {
@@ -1880,6 +1957,24 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let grok_shape = state.grok.shape();
     let meta = DocMeta {
         pid: std::process::id(),
+        client_keys: state
+            .keys
+            .list()
+            .iter()
+            .map(|k| KeyRowDoc {
+                id: k.id.clone(),
+                name: k.name.clone(),
+                email: k.email.clone(),
+                kind: match k.kind {
+                    crate::config::ClientKeyKind::Admin => "admin".to_string(),
+                    crate::config::ClientKeyKind::Default => "default".to_string(),
+                },
+                key_prefix: k.key_prefix.clone(),
+                suspended: k.suspended,
+                created_at_ms: k.created_at_ms,
+                revoked_at_ms: k.revoked_at_ms,
+            })
+            .collect(),
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(std::sync::atomic::Ordering::Relaxed),
         upstream: state.config.upstream.clone(),
@@ -2046,6 +2141,7 @@ mod tests {
 
     fn meta() -> DocMeta {
         DocMeta {
+            client_keys: Vec::new(),
             grok: GrokSettingsDoc::default(),
             pid: 4321,
             uptime_secs: 130,
@@ -2145,6 +2241,7 @@ mod tests {
                 user_id: Some("acct_seed".into()),
                 kind: None,
                 excerpt: None,
+                tenant: None,
             },
             now() - Duration::from_secs(58),
         );
@@ -2968,6 +3065,7 @@ mod tests {
                     user_id: None,
                     kind: None,
                     excerpt: None,
+                    tenant: None,
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -3018,6 +3116,7 @@ mod tests {
             user_id: None,
             kind: None,
             excerpt: None,
+            tenant: None,
         }
     }
 
