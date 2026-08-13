@@ -8,6 +8,11 @@ features: [rules/documents.md](../rules/documents.md).
 
 ## Guides
 
+- [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
+- [What ships today](features.md) — the complete feature list, with dates on behavior changes.
+- [The accidental AI debugger](ai-debugger.md) — per-request receipts, DevTools-style raw viewer, copy-as-curl, email masking.
+- [Remote daemon](remote.md) — one central daemon topology, remote-mode command matrix, transport security.
+- [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
 - [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex backend, install variants.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, Codex shaping, account types, email-anonymous mode.

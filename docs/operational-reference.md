@@ -74,6 +74,24 @@ brew install 2lab-ai/tap/llmux-preview
 
 Use `llmux-preview` for the rolling preview channel. Use the stable `llmux` formula for normal daily work.
 
+### Channels and updating
+
+llmux is distributed through the [Homebrew tap](https://github.com/2lab-ai/homebrew-tap) on two channels: `stable` (formula `llmux`) and `preview` (formula `llmux-preview`). The active channel is derived from what brew has installed — there is no config field.
+
+```bash
+# Print the current channel
+llmux channel
+
+# Update in place on the current channel (brew upgrade), restarting the
+# daemon only if the binary actually changed
+llmux update
+
+# Switch channels now (brew uninstall old + install new, mirrored onto the
+# llmux-islands cask; restarts a running daemon)
+llmux channel preview
+llmux channel stable
+```
+
 ### Source build
 
 ```bash
