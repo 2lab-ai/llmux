@@ -52,9 +52,9 @@ Add accounts:
 
 ```bash
 llmux login           # Claude subscription OAuth; repeat once per account
-llmux login --api     # Anthropic API key
-llmux login --codex   # Codex / ChatGPT subscription
-llmux login --grok    # Grok / xAI (device-code flow)
+llmux login --api     # optional: Anthropic API key
+llmux login --codex   # optional: Codex / ChatGPT subscription
+llmux login --grok    # optional: Grok / xAI (device-code flow)
 llmux import          # or import supported local credential stores
 ```
 
@@ -119,7 +119,14 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 
 ## compliance & caveats
 
-llmux is for **one human using their own accounts** — no credential pooling, no resale. The durable path is Claude Code as the harness with your own subscriptions or API keys; routing third-party flat-rate subscription tokens through Claude Code depends on that vendor's current policy and can change without notice — use it opt-in and keep an API-key fallback configured. Anthropic quota headers and vendor subscription-token behavior may change. llmux is not affiliated with Anthropic, OpenAI, or xAI. Product intent is fixed in [`.prd/`](.prd/).
+llmux is for **one human using their own accounts** — no credential pooling, no resale.
+
+- **Durable path:** Claude Code as the harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
+- **Convenience path:** routing third-party flat-rate subscription tokens through Claude Code depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
+- Anthropic quota headers and vendor subscription-token behavior may change.
+- llmux is not affiliated with Anthropic, OpenAI, or xAI.
+
+Product intent — what llmux is, what it bets on, and what it refuses — is fixed in [`.prd/`](.prd/).
 
 ## agent instructions
 

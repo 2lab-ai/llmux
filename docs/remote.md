@@ -3,8 +3,8 @@
 The intended topology is **one** central llmux daemon (say `llmux-host:3456`)
 with every other machine running the CLI as a **pure client** of it — the CLI
 analogue of what llmux Islands already does. A client never starts a local
-daemon; it points `claude` at the remote proxy and presents the remote's proxy
-`x-api-key`.
+daemon; it points `claude` at the remote proxy and presents a credential as
+`x-api-key` — normally that machine's own issued client key.
 
 Remote mode is turned on, in this precedence, by:
 
@@ -19,19 +19,27 @@ llmux --remote llmux-host:3456 run     # claude → remote proxy
 llmux --remote llmux-host:3456 status  # probe the remote daemon
 ```
 
-Persistently, in `~/.config/llmux.json`. The `api_key` here is the **remote
-daemon's** `proxy.api_key` (read from the remote host's own config), presented
-as `x-api-key`:
+Persistently, in `~/.config/llmux.json`. The `api_key` is what the client
+presents as `x-api-key`. **The standard client credential is a per-machine
+issued key**: on the server run `llmux key new --name <pc> [--email …]` and
+paste the `lmk-…` secret here, so usage is metered per tenant and each machine
+can be suspended/rotated independently (see
+[multi-tenant client keys](operational-reference.md#multi-tenant-client-keys)):
 
 ```jsonc
 {
   "remote": {
     "host": "llmux-host",
     "port": 3456,
-    "api_key": "lm-…"      // the REMOTE daemon's proxy.api_key
+    "api_key": "lmk-…"     // this machine's issued client key
   }
 }
 ```
+
+Alternatively, the **remote daemon's own `proxy.api_key`** (read from the
+server host's config) also works — it is the admin credential, so reserve it
+for a single-owner setup where per-tenant metering and independent revocation
+don't matter.
 
 ## What each command does in remote mode
 
@@ -54,6 +62,6 @@ now.
 
 ## Multi-tenant client keys
 
-For several machines sharing one daemon with per-tenant metering, issue
-per-machine `lmk-` keys instead of sharing the proxy key:
+Full key lifecycle — issue, suspend/resume, revoke, rotate, scopes
+(`default` vs `admin`), and the dashboard keys tab:
 [operational-reference.md](operational-reference.md#multi-tenant-client-keys).
