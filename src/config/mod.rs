@@ -488,7 +488,7 @@ mod tests {
   ]
 }"#;
         let config: Config = serde_json::from_str(raw).expect("pre-grok config parses");
-        assert_eq!(config.grok.default_model, "grok-4.5", "defaults fill in");
+        assert_eq!(config.grok.default_model, "grok-4.6", "defaults fill in");
         assert!(config.routing.grok_models.is_empty());
         // Round-trip: serialize → parse → identical value (additive-only).
         let round: Config =

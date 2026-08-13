@@ -16,7 +16,7 @@ use crate::config::AccountCredential;
 
 /// Fallback model slug when none is configured; the configurable default
 /// lives in `config.grok.default_model`.
-pub const GROK_MODEL: &str = "grok-4.5";
+pub const GROK_MODEL: &str = "grok-4.6";
 
 /// Official Grok-CLI chat-proxy base URL (the subscription chat path,
 /// CLIProxyAPI `internal/auth/xai/types.go:13`). The identity trio below is
@@ -31,11 +31,15 @@ const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
 const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
 
-/// Per-model thinking levels (docs/grok/spec.md §R1; source: CLIProxyAPI
-/// registry models.json:2411-2520). Models NOT listed here get no
+/// Per-model thinking levels (docs/grok/spec.md §R1; source for
+/// grok-4.5/4.3/3-mini: CLIProxyAPI registry models.json:2411-2520; source
+/// for `grok-4.6`: the live cli-chat-proxy `GET /v1/models` response
+/// (2026-08-13), which lists reasoning_efforts xhigh/high/medium/low and
+/// context_window 500000 — note NO `none`). Models NOT listed here get no
 /// `reasoning` field at all — omission is the only universally-accepted
 /// wire form (e.g. `grok-build-0.1` has no thinking support).
 const GROK_THINKING_LEVELS: &[(&str, &[&str])] = &[
+    ("grok-4.6", &["low", "medium", "high", "xhigh"]),
     ("grok-4.5", &["low", "medium", "high"]),
     ("grok-4.3", &["none", "low", "medium", "high"]),
     ("grok-3-mini", &["low", "medium", "high"]),
@@ -97,7 +101,7 @@ pub struct GrokProvider {
 }
 
 impl GrokProvider {
-    /// Construct with the default request shape (pinned `grok-4.5`).
+    /// Construct with the default request shape (pinned `grok-4.6`).
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_shape(base_url, GrokShape::default())
     }
@@ -261,9 +265,11 @@ fn thinking_levels(model: &str) -> Option<&'static [&'static str]> {
 /// winner clamps INTO the effective model's level set. Models outside
 /// [`GROK_THINKING_LEVELS`] always yield `None` (omit `reasoning`). A
 /// clamped result of `none` also yields `None` — omission is the only
-/// universally-accepted zero form. Precedence flipped 2026-07-15 (was
-/// request-wins — codex parity): Claude Code always sends an effort, so a
-/// configured override could never apply.
+/// universally-accepted zero form. Above-`high` inputs (`xhigh|max|ultra`)
+/// stay at `xhigh` when the effective model's level set has it (grok-4.6,
+/// live `/v1/models` 2026-08-13) and otherwise degrade to `high`.
+/// Precedence flipped 2026-07-15 (was request-wins — codex parity): Claude
+/// Code always sends an effort, so a configured override could never apply.
 fn resolve_reasoning_effort(
     body: &Value,
     shape_effort: Option<&str>,
@@ -288,7 +294,13 @@ fn resolve_reasoning_effort(
             }
             "low"
         }
-        "xhigh" | "max" | "ultra" => "high",
+        "xhigh" | "max" | "ultra" => {
+            if levels.contains(&"xhigh") {
+                "xhigh"
+            } else {
+                "high"
+            }
+        }
         other => other,
     };
     if levels.contains(&clamped) {
@@ -348,7 +360,7 @@ pub fn translate_request_with(
 /// per-model clamping happens at request time, spec §R1). Empty / `unset`
 /// clears and is handled by the endpoint before this check.
 pub fn is_valid_config_effort(effort: &str) -> bool {
-    matches!(effort, "none" | "low" | "medium" | "high")
+    matches!(effort, "none" | "low" | "medium" | "high" | "xhigh")
 }
 
 #[cfg(test)]
@@ -685,11 +697,50 @@ mod tests {
 
     #[test]
     fn config_effort_validation_superset() {
-        for ok in ["none", "low", "medium", "high"] {
+        for ok in ["none", "low", "medium", "high", "xhigh"] {
             assert!(is_valid_config_effort(ok));
         }
-        for bad in ["turbo", "xhigh", "max", "ultra", "minimal"] {
+        for bad in ["turbo", "max", "ultra", "minimal"] {
             assert!(!is_valid_config_effort(bad), "{bad} rejected at config");
         }
+    }
+
+    // ---- grok-4.6 (live /v1/models 2026-08-13: low|medium|high|xhigh) ----
+    #[test]
+    fn grok_46_keeps_xhigh_on_the_wire() {
+        let mut b = body("grok-4.6");
+        b["output_config"] = json!({"effort": "xhigh"});
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(upstream["model"], "grok-4.6");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "grok-4.6 level set has xhigh — no downgrade"
+        );
+    }
+
+    #[test]
+    fn grok_45_still_clamps_xhigh_to_high() {
+        let mut b = body("grok-4.5");
+        b["output_config"] = json!({"effort": "xhigh"});
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(upstream["model"], "grok-4.5");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "high",
+            "grok-4.5 has no xhigh"
+        );
+    }
+
+    #[test]
+    fn grok_46_none_clamps_to_low() {
+        let mut b = body("grok-4.6");
+        b["output_config"] = json!({"effort": "none"});
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "low",
+            "grok-4.6 level set lacks none"
+        );
     }
 }

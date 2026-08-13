@@ -80,6 +80,10 @@ const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
 /// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
 const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; cached-input not listed
+/// on the page — carried from grok-4.5's $0.50/M rate. API-list-price
+/// equivalent for subscription traffic, like the other grok rows.
+const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -98,6 +102,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "grok-4.5" => Some(GROK_4_5),
+        "grok-4.6" => Some(GROK_4_6),
         _ => None,
     };
     if exact.is_some() {
@@ -259,6 +264,11 @@ mod tests {
         let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
         assert_eq!(
             (p.input, p.output, p.cache_read, p.cache_creation),
+            (2.0, 6.0, 0.5, 0.0)
+        );
+        let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
+        assert_eq!(
+            (p6.input, p6.output, p6.cache_read, p6.cache_creation),
             (2.0, 6.0, 0.5, 0.0)
         );
         let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
