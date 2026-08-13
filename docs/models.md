@@ -66,7 +66,7 @@ not that it is zero.
   are rewritten: a real catalog id is not an alias and passes through untouched
   — the `[1m]` suffix strip is a separate, subsequent step, which is why
   `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` — and foreign
-  slugs (`grok-4.5`, `gpt-5.6-sol`) are never rewritten. The mapping has a
+  slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The mapping has a
   single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
   `resolve_claude_alias`; adding a curated row carries its aliases
   automatically. llmux still does not otherwise *shape* claude requests, and the
@@ -82,7 +82,8 @@ not that it is zero.
 
 ### Out-of-catalog grok pin
 
-The curated grok set is just `grok-4.5`. `config.grok.default_model` may pin ANY
+The curated grok set is `grok-4.6` (the default pin) and `grok-4.5`.
+`config.grok.default_model` may pin ANY
 `grok-*` slug — including ids not in the curated table below (e.g.
 `grok-4.3`, `grok-code-fast-1`). Because the provider forwards such ids
 verbatim, the pin is real and routable, so the `"grok"` family alias must have
@@ -109,7 +110,8 @@ context/name for an id it does not curate.
 | gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
-| grok-4.5            | grok (pinned)| Grok 4.5            | low, medium, high                    | 500000      | grok   |
+| grok-4.6            | grok (pinned)| Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
 
 "grok (pinned)" means the `grok` alias appears on that row only while it is the
 live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
@@ -131,7 +133,9 @@ Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
   support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh (context
   272000). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer curated.
 - **Grok context window / name** — the live `cli-chat-proxy` `/v1/models` probe
-  2026-07-14 (`grok-4.5` ctx 500000). Grok effort menus come from the provider's
-  per-model thinking-level table. The curated grok set is just `grok-4.5`; other
-  known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
-  synthesize a null-metadata row when pinned.
+  2026-07-14 (`grok-4.5` ctx 500000). The `grok-4.6` row was verified the same
+  way against the live `cli-chat-proxy` `/v1/models` on 2026-08-13 (ctx 500000,
+  efforts `low, medium, high, xhigh`). Grok effort menus come from the provider's
+  per-model thinking-level table. The curated grok set is `grok-4.6` (the default
+  pin) and `grok-4.5`; other known grok ids (`grok-4.3`, `grok-3-mini`, …) pass
+  through at request time and synthesize a null-metadata row when pinned.
