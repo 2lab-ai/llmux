@@ -1,0 +1,26 @@
+# What ships today
+
+The complete feature list, with dates on behavior changes. Start at the root
+[README](../README.md) for the short version.
+
+![llmux live session — TUI dashboard with email-anonymous masking + Islands notch label](../screenshots/llmux-live-session.gif)
+
+[Original live-session recording](../screenshots/llmux-live-session.mp4)
+
+- **Local Anthropic-compatible proxy** for Claude Code: `ANTHROPIC_BASE_URL=http://localhost:3456` is the integration contract.
+- **One Rust binary, `llmux`**, with daemon, login/import, dashboard, status, account management, channel/update, and Claude Code launch (`run`).
+- **Three backend groups** in one pool: **Claude** (subscription + API key), **Codex** (`gpt-*` / ChatGPT subscription), **Grok** (xAI device-code login + `grok-*` models).
+- **Multi-account scheduling** with perishable-quota scoring (`default`) or sticky exhaust (`round-robin`), Fable weekly ceilings, and 429 cooldown parking — not manual account juggling. See [schedulers](schedulers.md).
+- **Model-to-backend routing**: Claude-like names → Claude group; `gpt-*` / `codex` → Codex; `grok` / `grok-*` → Grok. Override via config routing tables.
+- **Codex + Grok adapters** that accept Claude Code Messages requests and stream Anthropic-style SSE back (Responses-family upstreams under the hood).
+- **Reasoning-effort override with bypass** (2026-07-15, behavior change): a configured `codex.reasoning_effort` / `grok.reasoning_effort` now **OVERRIDES** the client's `output_config.effort`; leave it unset (or cycle the dashboard's group-settings bar to `bypass`) to let the client's value ride through. Previously a configured effort was only a fallback the client always outranked — if you relied on that, clear the setting to restore it. The codex cycle now includes `max` (native on gpt-5.6, clamps to `xhigh` below).
+- **Remote-first CLI**: `--remote host[:port]` or `remote.host` in config drives one central daemon from many machines (Tailscale/WireGuard). See [the remote daemon guide](remote.md).
+- **Multi-tenant client keys** (2026-08-06): `llmux key new --name <pc> [--email …] [--admin]` issues per-machine `lmk-` keys (shown once, stored hashed), so several PCs share one daemon while usage is metered per tenant; suspend/resume/revoke/rotate bite on the next request without a restart, and the `/llmux/*` control plane now requires an admin credential even from localhost. See [operational-reference.md](operational-reference.md#multi-tenant-client-keys).
+- **Model catalog API**: `GET /models` and `GET /llmux/models` — curated ids, aliases, efforts, `max_context`, group. See [models.md](models.md).
+- **Detached daemon + live TUI dashboard** for quota windows (incl. Fable weekly / Grok rate-limit gauges), account health, routing, and manual switch.
+- **Calendar usage & cost tab** (2026-07-15): hourly / daily / monthly buckets × model with all four token classes and API-equivalent USD cost, ledger-aligned amounts, replayed from the persisted request history — `U` in the dashboard. See [operational-reference.md](operational-reference.md#usage-tab-calendar-usage--cost).
+- **Perf tab: observed provider/model performance** (2026-07-17): passive per-request timing (TTFB, first streamed delta, estimated post-delta throughput) folded into daily tokens/sec stats per `(provider, model, codex-fast)` — braille chart, date×provider health matrix (requests / error% / latency / e2e / est), single-day drill-down, and a `t/s` column on every activity row and session. Quiet days render as gaps, low samples dim, client disconnects never poison a provider's error rate — `p` in the dashboard. See [operational-reference.md](operational-reference.md#perf-tab-observed-performance) and [`.prd/15`](../.prd/15-perf-telemetry-config-editor.md).
+- **Mouse-editable config tab** (2026-07-17): every config leaf classified live-editable / restart-required / read-only-with-reason (machine-enforced against the schema — a new setting fails the build until classified), click-to-edit value cells, blast-radius confirm gates, and persist-first apply with a typed ack so "saved but needs restart" can never masquerade as applied. Works identically attached to a remote daemon. See [configuration.md](configuration.md) and [`.prd/15`](../.prd/15-perf-telemetry-config-editor.md).
+- **DevTools-style raw request viewer** (2026-07-15): the activity feed's `🔍 request` line opens every captured leg of an exchange — client request, rewritten upstream request, verbatim upstream response, delivered response — with scrolling, `copy` / `copy as curl` / `save` actions. See [the accidental AI debugger](ai-debugger.md) and [operational-reference.md](operational-reference.md#raw-requestresponse-viewer).
+- **llmux Islands**, a native macOS menu-bar/notch companion plus an Arch Linux/KDE Qt/Kirigami port for glanceable usage, request receipts, and screen-share-safe email masking. See [llmux-islands.md](llmux-islands.md), [the Linux build guide](../llmux-islands-linux/README.md), and [the cross-platform design/evidence dossier](../.prd/docs/llmux-islands-linux-port/README.md).
+- **Stable + preview channels** via Homebrew (`llmux` / `llmux-preview`), with `llmux channel` and `llmux update`. See [operational-reference.md](operational-reference.md#channels-and-updating).

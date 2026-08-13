@@ -4,6 +4,10 @@
 
 The app does not read `~/.config/llmux.json`, does not touch provider credentials, and does not run separate usage scripts. It talks to the running llmux daemon over HTTP.
 
+![llmux Islands demo](../screenshots/llmux-islands-demo.gif)
+
+[Original llmux Islands screen recording](../screenshots/llmux-islands-demo.mov)
+
 ## What it shows
 
 - Per-account Claude / Codex / API-key usage from the llmux daemon.
