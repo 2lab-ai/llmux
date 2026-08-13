@@ -43,11 +43,13 @@ core with thin per-provider adapters.
 | Identity headers (cli-chat-proxy only) | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: 0.2.93`, `User-Agent: xai-grok-workspace/0.2.93` | xai_executor.go:66-69,1104-1111 |
 | Conversation header | `x-grok-conv-id: <session id>` | xai_executor.go:1085 |
 | Effort | `reasoning: {effort}` only for models with thinking levels; stripped otherwise | xai_executor.go:1206-1211 |
+| grok-4.6 | ctx 500K, max_out (not stated by /v1/models), thinking `low/medium/high/xhigh`, zero **not** allowed | live cli-chat-proxy /v1/models 2026-08-13 |
 | grok-4.5 | ctx 500K, max_out 65536, thinking `low/medium/high`, zero **not** allowed | registry models.json:2425-2443 |
 | grok-build-0.1 | fast coding model, ctx 256K, no thinking levels | models.json:2413-2423 |
 | Quota exhaustion | HTTP 429 body `code`/`error` contains `free-usage-exhausted` → 24h rolling window | xai_executor.go:2521-2545 |
 | No usage endpoint; passive headers DO exist | no `/api/oauth/usage` equivalent (probed live: /v1/{usage,rate_limits,quota,me} 404; grok.com/rest/rate-limits 403 for OAuth2 tokens; absent from CLIProxyAPI and official grok CLI 0.2.101 binary). **Correction 2026-07-14**: 200 responses DO carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` headers (live capture: 900 req / 15M tok, no reset header) — the original "no passive quota headers" claim was wrong | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
+| Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in carried from grok-4.5 ($0.50/M; not listed) | docs.x.ai grok-4.6 (web, 2026-08-13) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
 
 ## Requirements → design
@@ -77,7 +79,7 @@ core with thin per-provider adapters.
   validation: https + hostname exactly `x.ai` or `*.x.ai` label-boundary suffix
   (mirror ValidateOAuthEndpoint, xai.go:47-64).
 - `GrokProvider` (new `src/provider/grok.rs`): thin adapter over the shared Responses
-  core (R5). `GrokShape { model: "grok-4.5" (default), client_model: Option, effort:
+  core (R5). `GrokShape { model: "grok-4.6" (default), client_model: Option, effort:
   Option }` — **no `fast`** (xAI has no service tier). Live-mutable behind `RwLock`
   exactly like `CodexShape` (codex.rs:96-125).
 - Request shape differences vs codex (adapter knobs, not forks):
@@ -95,7 +97,8 @@ core with thin per-provider adapters.
     (OpenAI-specific; CLIProxyAPI does not send it for xAI);
   - effort is **per-model capability, not provider-global**: a static thinking-levels
     table (source: CLIProxyAPI registry models.json:2411-2520) —
-    `grok-4.5 → {low,medium,high}`, `grok-4.3 → {none,low,medium,high}`,
+    `grok-4.6 → {low,medium,high,xhigh}`, `grok-4.5 → {low,medium,high}`,
+    `grok-4.3 → {none,low,medium,high}`,
     `grok-3-mini → {low,medium,high}`; models NOT in the table (e.g. `grok-build-0.1`,
     unknown slugs) get **no `reasoning` field at all** (omission, mirroring CLIProxyAPI's
     strip at xai_executor.go:1206-1211, debug-logged). For models in the table, the
@@ -175,7 +178,7 @@ core with thin per-provider adapters.
   is delivered by the routing path above (verified in the live receipt), independent
   of these interactive control surfaces.
 - Config: new `config.grok` section `{upstream, default_model, reasoning_effort,
-  client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.5`, null, null, false).
+  client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.6`, null, null, false).
 
 ### R5. Refactor: one Responses core, thin codex/grok adapters
 

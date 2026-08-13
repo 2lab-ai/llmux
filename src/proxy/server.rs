@@ -3600,16 +3600,42 @@ mod tests {
             State(state.clone()),
             axum::extract::Json(GrokConfigRequest {
                 default_model: None,
-                reasoning_effort: Some("xhigh".into()),
+                reasoning_effort: Some("turbo".into()),
             }),
         )
         .await;
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "xhigh not in grok superset"
+            "turbo not in grok superset"
         );
         assert_eq!(state.grok.model(), "grok-4.3");
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.grok.default_model, "grok-4.3");
+        assert_eq!(
+            on_disk.grok.reasoning_effort, None,
+            "rejected effort leaves state unchanged"
+        );
+
+        // "xhigh" IS in the grok superset → accepted and persisted.
+        let response = grok_config_endpoint(
+            State(state.clone()),
+            axum::extract::Json(GrokConfigRequest {
+                default_model: None,
+                reasoning_effort: Some("xhigh".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["default_model"], "grok-4.3", "omitted model kept");
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["persisted"], true, "config write reported (C10)");
+        assert_eq!(state.grok.model(), "grok-4.3");
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.grok.default_model, "grok-4.3");
+        assert_eq!(on_disk.grok.reasoning_effort.as_deref(), Some("xhigh"));
     }
 
     // ---- GET /models and /llmux/models ----
@@ -3628,8 +3654,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 13 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 14);
+        // 14 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 15);
 
         let by_id = |id: &str| {
             models
@@ -3638,8 +3664,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} present"))
         };
         // The live pin (grok-4.3) carries the "grok" alias via a synthesized
-        // row; the curated grok-4.5 does not.
+        // row; the curated grok-4.6 / grok-4.5 do not.
         assert_eq!(by_id("grok-4.3")["aliases"], serde_json::json!(["grok"]));
+        assert_eq!(by_id("grok-4.6")["aliases"], serde_json::json!([]));
         assert_eq!(by_id("grok-4.5")["aliases"], serde_json::json!([]));
         // Static codex alias and context survive serialization.
         assert_eq!(

@@ -1057,7 +1057,7 @@ fn default_grok_upstream() -> String {
 /// Default grok model slug. Must stay in sync with
 /// `provider::grok::GROK_MODEL`.
 fn default_grok_model() -> String {
-    "grok-4.5".to_string()
+    "grok-4.6".to_string()
 }
 
 fn default_port() -> u16 {
