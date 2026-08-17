@@ -364,6 +364,16 @@ pub struct RawIoConfig {
     /// request/response yet bounding the memory a pathological body can pin.
     #[serde(default = "default_raw_io_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Total-size cap for the raw-io log, in bytes. When the file exceeds this,
+    /// the prune pass drops the OLDEST records (append order = capture order)
+    /// until the kept set fits — a size-based rotation complementing the
+    /// age-based `retention_days` (issue #127: a 90-day window alone let one
+    /// file grow to 19.5 GB). `0` = no size cap. Default 4 GiB. Approximate
+    /// under concurrent appends: records landing while a prune runs are always
+    /// kept, so the file can transiently sit slightly above the cap until the
+    /// next pass.
+    #[serde(default = "default_raw_io_max_total_bytes")]
+    pub max_total_bytes: u64,
 }
 
 impl Default for RawIoConfig {
@@ -372,6 +382,7 @@ impl Default for RawIoConfig {
             enabled: true,
             retention_days: default_raw_io_retention_days(),
             max_body_bytes: default_raw_io_max_body_bytes(),
+            max_total_bytes: default_raw_io_max_total_bytes(),
         }
     }
 }
@@ -1139,6 +1150,13 @@ fn default_raw_io_retention_days() -> u64 {
 /// backstop does.
 fn default_raw_io_max_body_bytes() -> usize {
     crate::proxy::raw_io::RESPONSE_CAP_BYTES
+}
+
+/// Default raw-io total-size cap: 4 GiB. Roughly weeks of typical proxy
+/// traffic at the 8 MiB per-body cap, while keeping the worst-case scan/replay
+/// cost of the file bounded (issue #127).
+fn default_raw_io_max_total_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024
 }
 
 fn default_routing_group() -> String {

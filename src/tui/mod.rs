@@ -387,6 +387,10 @@ pub(crate) struct Chrome {
     /// Percent of the raw-io file consumed by the in-flight streaming load
     /// (`bytes_read*100/file_len`), shown in the overlay title. 100 at rest.
     pub sessions_pct: u8,
+    /// True when the load scanned only the newest tail window of an oversized
+    /// raw-io file ([`SESSIONS_SCAN_MAX_BYTES`], issue #127) — the overlay
+    /// title says so instead of implying the timeline is complete.
+    pub sessions_truncated: bool,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles).
@@ -727,6 +731,7 @@ struct App {
     /// final (`done`) partial arrives over `sessions_tx`. Drives the overlay
     /// loading spinner (while empty) and the `loading… N%` title (once filling).
     sessions_loading: bool,
+    sessions_truncated: bool,
     /// Percent of the raw-io file the in-flight streaming load has consumed,
     /// carried on each partial and shown in the overlay title. 100 at rest.
     sessions_pct: u8,
@@ -843,6 +848,7 @@ impl App {
             stats_window: activity::StatsWindow::default(),
             sessions: Vec::new(),
             sessions_loading: false,
+            sessions_truncated: false,
             sessions_pct: 100,
             sessions_tx: None,
             session_cursor: 0,
@@ -1056,6 +1062,7 @@ impl App {
             sessions: self.sessions.clone(),
             sessions_loading: self.sessions_loading,
             sessions_pct: self.sessions_pct,
+            sessions_truncated: self.sessions_truncated,
             session_cursor: self.session_cursor,
             session_sort: self.session_sort,
             config_cursor: self.config_cursor,
@@ -2191,6 +2198,7 @@ impl App {
                         A::RoutingOnEmptyGroup => f.routing_on_empty_group.clone(),
                         A::RawIoRetention => f.raw_io_retention_days.to_string(),
                         A::RawIoMaxBody => f.raw_io_max_body_bytes.to_string(),
+                        A::RawIoMaxTotal => f.raw_io_max_total_bytes.to_string(),
                         A::Upstream => v.upstream.clone().unwrap_or_default(),
                         A::CodexUpstream => f.codex_upstream.clone(),
                         A::ProxyPort => v.port.to_string(),
@@ -2301,6 +2309,24 @@ impl App {
                                     .or_else(|| view.map(|v| v.config_facts.raw_io_retention_days));
                                 baseline.is_some_and(|base| {
                                     req.raw_io_retention_days.is_some_and(|days| days < base)
+                                })
+                            }
+                            || action == ui::ConfigAction::RawIoMaxTotal && {
+                                // A size-cap decrease prunes history on the
+                                // next sweep — same blast radius as a
+                                // retention decrease (0 = no cap, never a
+                                // decrease).
+                                let baseline = self
+                                    .config_saved
+                                    .get(&ui::ConfigAction::RawIoMaxTotal)
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .or_else(|| {
+                                        view.map(|v| v.config_facts.raw_io_max_total_bytes)
+                                    });
+                                baseline.is_some_and(|base| {
+                                    req.raw_io_max_total_bytes.is_some_and(|bytes| {
+                                        bytes != 0 && (base == 0 || bytes < base)
+                                    })
                                 })
                             };
                         if needs {
@@ -2577,6 +2603,7 @@ impl App {
         }
         self.sessions_loading = true;
         self.sessions_pct = 0;
+        self.sessions_truncated = false;
         if let Some(tx) = self.sessions_tx.clone() {
             // read + parse + fold is blocking IO/CPU → off the runtime onto the
             // blocking pool so the event loop keeps rendering and taking input.
@@ -3843,6 +3870,7 @@ async fn event_loop(
                 // so a mid-load `o` press survives the next partial.
                 app.session_sort.apply(&mut app.sessions);
                 app.sessions_pct = load.pct;
+                app.sessions_truncated = load.truncated;
                 app.sessions_loading = !load.done;
                 true
             }
@@ -4138,13 +4166,23 @@ struct SessionsLoad {
     sessions: Vec<crate::session::Session>,
     done: bool,
     pct: u8,
+    /// True when only the newest [`SESSIONS_SCAN_MAX_BYTES`] tail of an
+    /// oversized file was scanned (issue #127).
+    truncated: bool,
 }
 
-/// Records accumulated between folds. Large enough that the per-chunk re-fold
-/// of the whole accumulator stays negligible (fold is a single linear pass)
-/// while partials still arrive often enough to feel progressive on a multi-MB
-/// log.
+/// Records folded between progress deliveries. Each chunk boundary costs one
+/// O(groups) snapshot of the incremental fold, so this only tunes how often
+/// partials arrive on a multi-MB log.
 const SESSIONS_CHUNK_RECORDS: usize = 4096;
+
+/// Hard cap on how many bytes of the raw-io log one session load will scan
+/// (issue #127): the newest-first tail window. The lifetime prune bounds the
+/// file to `raw_io.max_total_bytes` (default 4 GiB), but a pre-existing or
+/// cap-disabled file can be tens of GB — scanning it all again each overlay
+/// open costs minutes of parse for history nobody scrolls to. 1 GiB of tail
+/// is ~weeks of typical traffic; the title flags the truncation honestly.
+const SESSIONS_SCAN_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// `bytes_read*100/file_len`, clamped to `0..=100`; 100 for an empty/unknown
 /// file so the title never shows a bogus overshoot.
@@ -4155,10 +4193,13 @@ fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
     (bytes_read.saturating_mul(100) / file_len).min(100) as u8
 }
 
-/// Streaming, progressive variant of the session load: reads the persisted
-/// raw-io log line by line, accumulating parsed records, and every
-/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
-/// and delivers a partial over `tx`. The final partial carries `done = true`.
+/// Streaming, progressive session load: reads the persisted raw-io log line
+/// by line (newest-tail window only when the file exceeds
+/// [`SESSIONS_SCAN_MAX_BYTES`]), projects each record to a body-free
+/// [`crate::session::RecordMeta`] and folds it ONCE into an incremental
+/// [`crate::session::SessionFolder`]; every `SESSIONS_CHUNK_RECORDS` (and
+/// always at EOF) an O(groups) snapshot is delivered over `tx`. The final
+/// partial carries `done = true`.
 /// A missing/unreadable file delivers a single empty, done partial so the
 /// overlay's loading state always clears. Runs on the blocking pool.
 fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
@@ -4167,22 +4208,49 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
             sessions: Vec::new(),
             done: true,
             pct: 100,
+            truncated: false,
         });
     };
     let Some(path) = crate::cli::daemon::raw_io_path() else {
         send_empty_done();
         return;
     };
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(mut file) = std::fs::File::open(&path) else {
         send_empty_done();
         return;
     };
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // Oversized file: scan only the newest tail window (issue #127). Seek,
+    // then discard the first (almost certainly partial) line — under-reading
+    // one record is honest, mis-parsing a torn line is not.
+    let truncated = file_len > SESSIONS_SCAN_MAX_BYTES;
+    if truncated {
+        use std::io::Seek as _;
+        if file
+            .seek(std::io::SeekFrom::Start(file_len - SESSIONS_SCAN_MAX_BYTES))
+            .is_err()
+        {
+            send_empty_done();
+            return;
+        }
+    }
+    let scan_len = if truncated {
+        SESSIONS_SCAN_MAX_BYTES
+    } else {
+        file_len
+    };
     let mut reader = std::io::BufReader::new(file);
-    let mut records: Vec<crate::proxy::raw_io::RawIoRecord> = Vec::new();
+    // Incremental fold over metadata-only projections: each parsed record is
+    // reduced to ~100 bytes of `RecordMeta` and DROPPED — the full bodies
+    // (up to `max_body_bytes` each) never accumulate, and each record is
+    // folded exactly once (the old accumulate-and-refold pattern was O(n²)
+    // over the whole file and retained every body: 18.6 GB RSS + 50–110% CPU
+    // on a 19.5 GB log).
+    let mut folder = crate::session::SessionFolder::new();
     let mut line = String::new();
     let mut bytes_read: u64 = 0;
     let mut since_fold: usize = 0;
+    let mut skip_first = truncated;
     loop {
         line.clear();
         // `read_line` keeps the newline so `bytes_read` tracks real file offset
@@ -4192,20 +4260,24 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
             Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
             Err(_) => break, // truncated/unreadable tail → fold what we have
         }
+        if std::mem::take(&mut skip_first) {
+            continue; // partial line at the seek point
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
-            records.push(rec);
+            folder.push(&crate::session::RecordMeta::from_record(&rec));
             since_fold += 1;
         }
         if since_fold >= SESSIONS_CHUNK_RECORDS {
             since_fold = 0;
             let partial = SessionsLoad {
-                sessions: crate::session::fold_sessions(&records),
+                sessions: folder.snapshot(),
                 done: false,
-                pct: sessions_load_pct(bytes_read, file_len),
+                pct: sessions_load_pct(bytes_read, scan_len),
+                truncated,
             };
             // Receiver gone (overlay closed / app exiting) → stop early.
             if tx.blocking_send(partial).is_err() {
@@ -4216,9 +4288,10 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
     // Final fold at EOF — always delivered (even for an empty file) so the
     // loading state clears.
     let _ = tx.blocking_send(SessionsLoad {
-        sessions: crate::session::fold_sessions(&records),
+        sessions: folder.snapshot(),
         done: true,
         pct: 100,
+        truncated,
     });
 }
 
@@ -4272,6 +4345,10 @@ fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::Settings
             "reduce raw-io retention to {}d (older history will be pruned)?",
             req.raw_io_retention_days.unwrap_or_default()
         ),
+        A::RawIoMaxTotal => format!(
+            "reduce raw-io size cap to {} bytes (oldest history will be pruned)?",
+            req.raw_io_max_total_bytes.unwrap_or_default()
+        ),
         _ => "apply this change?".into(),
     }
 }
@@ -4311,6 +4388,10 @@ fn parse_config_input(
         }
         A::RawIoMaxBody => {
             req.raw_io_max_body_bytes =
+                Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
+        }
+        A::RawIoMaxTotal => {
+            req.raw_io_max_total_bytes =
                 Some(raw.parse().map_err(|_| format!("not bytes: {raw:?}"))?)
         }
         A::Upstream => req.upstream = Some(raw.to_string()),

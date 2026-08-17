@@ -5,11 +5,19 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use super::event::{ActivityEvent, TokenCounts};
+
+/// Serializes [`persist_request`] appends against the commit step of a
+/// concurrent [`prune`] — the activity-log twin of
+/// [`crate::proxy::raw_io`]'s `IO_LOCK`, with the same contract: an append
+/// lands either before the commit's tail copy (and is carried over) or after
+/// the rename (and lands in the pruned file), never in between.
+static IO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Completed-entry ring capacity (matches teamclaude's 200-line log).
 pub(crate) const LOG_CAPACITY: usize = 200;
@@ -1011,6 +1019,10 @@ pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: S
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // Serialized against a background prune's commit (see [`IO_LOCK`]).
+    let _guard = IO_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1019,6 +1031,28 @@ pub(crate) fn persist_request(path: Option<&Path>, event: &ActivityEvent, now: S
         return;
     };
     let _ = writeln!(file, "{line}");
+}
+
+/// Prune `activity.jsonl` to the persisted-file lifetime contract (issue
+/// #127): the same age (`retention_days`) and total-size (`max_total_bytes`)
+/// bounds as the raw-io log, via the shared driver
+/// ([`crate::proxy::raw_io::prune_lifetime`]). Activity lines are small
+/// metadata, but the file grows forever and startup replays every line — an
+/// unbounded file makes hydration cost (and its transient allocations) grow
+/// without limit. Best-effort, streaming, safe against concurrent
+/// [`persist_request`] appends (shared [`IO_LOCK`]).
+pub(crate) fn prune(path: Option<&Path>, retention_days: u64, max_total_bytes: u64, now_ms: u64) {
+    crate::proxy::raw_io::prune_lifetime(
+        path,
+        retention_days,
+        max_total_bytes,
+        now_ms,
+        &|line, cutoff| {
+            matches!(serde_json::from_str::<PersistedRequest>(line),
+                Ok(record) if record.v == PERSIST_VERSION && record.ts_ms >= cutoff)
+        },
+        &IO_LOCK,
+    );
 }
 
 #[derive(Debug, Default)]
@@ -1219,20 +1253,30 @@ impl ActivityLog {
         path: &Path,
         up_to: u64,
     ) -> Result<(), std::io::Error> {
+        use std::io::BufRead as _;
         use std::io::Read as _;
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err),
         };
-        let mut contents = String::new();
-        file.take(up_to).read_to_string(&mut contents)?;
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        // STREAMING, line by line — never the whole prefix in one `String`
+        // (issue #127: a multi-GB activity log made hydration's transient
+        // allocation file-sized). Memory is bounded by the longest line.
+        let mut reader = std::io::BufReader::new(file.take(up_to));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF / cut reached
+                Ok(_) => {}
+                Err(err) => return Err(err),
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let Ok(record) = serde_json::from_str::<PersistedRequest>(line) else {
+            let Ok(record) = serde_json::from_str::<PersistedRequest>(trimmed) else {
                 continue; // corrupt / not a PersistedRequest line
             };
             if record.v != PERSIST_VERSION {
@@ -4272,6 +4316,148 @@ mod tests {
         assert!(
             !log.model_usage().iter().any(|m| m.requests == 0),
             "no phantom row from the skipped v99 line"
+        );
+    }
+
+    /// Issue #127: `activity.jsonl` shares the raw-io lifetime contract — a
+    /// size cap drops the oldest lines, an age bound drops out-of-window
+    /// lines, and a pruned file still hydrates cleanly.
+    #[test]
+    fn prune_bounds_activity_log_and_pruned_file_still_loads() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        for id in 0..30 {
+            persist_request(
+                Some(&path),
+                &finished_full(
+                    id,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    10,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(10 + id),
+            );
+        }
+        let len = std::fs::metadata(&path).expect("meta").len();
+
+        // Size cap at ~half: the oldest lines go, the newest survive.
+        prune(Some(&path), 0, len / 2, u64::MAX);
+        let after = std::fs::metadata(&path).expect("meta").len();
+        assert!(after < len, "size cap rewrote the file smaller");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<PersistedRequest>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(*ids.last().expect("kept"), 29, "newest line kept");
+        assert!(ids[0] > 0, "oldest lines dropped");
+
+        // The pruned file hydrates without error and folds the kept set.
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted(Some(&path));
+        assert_eq!(
+            log.totals_global().requests,
+            ids.len() as u64,
+            "hydration folds exactly the kept lines"
+        );
+
+        // Age bound: cutoff beyond every record empties the file.
+        let now_ms = u64::try_from(
+            at(1_000_000)
+                .duration_since(UNIX_EPOCH)
+                .expect("epoch")
+                .as_millis(),
+        )
+        .expect("ms");
+        prune(Some(&path), 1, 0, now_ms + 2 * 86_400_000);
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents.lines().count(), 0, "aged-out lines all dropped");
+    }
+
+    /// Issue #127 review MUST-FIX 1 (hydrate/prune ordering): the daemon
+    /// hydrates BEFORE the first prune because the hydration cut is a byte
+    /// offset captured at arm time — a prune that shrinks the file first
+    /// would pull live-appended lines inside the cut and double-count them.
+    /// This pins the SAFE order end-to-end: arm-time cut → live appends →
+    /// hydrate(cut) merges history behind live → prune afterwards; every
+    /// request is counted exactly once and the pruned file still holds the
+    /// newest lines.
+    #[test]
+    fn hydrate_before_prune_counts_each_request_exactly_once() {
+        let tmp = TempDir::new();
+        let path = tmp.file();
+        // Pre-boot history: 10 persisted requests.
+        for id in 0..10 {
+            persist_request(
+                Some(&path),
+                &finished_full(
+                    id,
+                    "a",
+                    "claude",
+                    "sonnet",
+                    None,
+                    200,
+                    10,
+                    5,
+                    None,
+                    "/v1/messages",
+                ),
+                at(10 + id),
+            );
+        }
+        // Arm time: capture the cut (pre-boot byte length).
+        let cut = std::fs::metadata(&path).expect("meta").len();
+        // Live traffic starts folding AND appending past the cut.
+        let mut live = ActivityLog::new(LOG_CAPACITY);
+        for id in 10..15 {
+            let event = finished_full(
+                id,
+                "b",
+                "claude",
+                "sonnet",
+                None,
+                200,
+                20,
+                8,
+                None,
+                "/v1/messages",
+            );
+            live.apply(event.clone(), at(100 + id));
+            persist_request(Some(&path), &event, at(100 + id));
+        }
+        // Hydrate the pre-boot prefix only, merge behind live.
+        let mut history = ActivityLog::new(LOG_CAPACITY);
+        history
+            .load_persisted_prefix(&path, cut)
+            .expect("prefix load");
+        live.merge_history_behind(history);
+        assert_eq!(
+            live.totals_global().requests,
+            15,
+            "10 history + 5 live, each exactly once"
+        );
+        // Prune AFTER hydration: the cut is dead, so a size-cap rewrite can
+        // no longer interact with it — and the newest lines survive.
+        let len = std::fs::metadata(&path).expect("meta").len();
+        prune(Some(&path), 0, len / 2, u64::MAX);
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let ids: Vec<u64> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<PersistedRequest>(l).ok())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(*ids.last().expect("kept"), 14, "newest live line kept");
+        assert_eq!(
+            live.totals_global().requests,
+            15,
+            "in-memory totals untouched by the on-disk prune"
         );
     }
 

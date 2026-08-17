@@ -1049,32 +1049,65 @@ pub async fn serve(
     // startup, and both are crash-safe mid-flight (hydration only reads;
     // prune renames atomically at the very end).
     //
+    // One background task, STRICTLY ordered (issue #127 review MUST-FIX 1):
+    //
     // 1. Activity history (req-persist A/C): replay `activity.jsonl` up to the
     //    pre-bind cut into a fresh log, then merge it BEHIND live traffic
     //    (`DashboardHub::hydrate_persisted` — live rows stay in front, sums
     //    commute, no double-count past the cut). Dashboards fill in as it
     //    lands; a "history loaded" note marks completion.
+    // 2. ONLY THEN the persisted-file lifetime prune (Feature B + issue #127),
+    //    re-run every [`PRUNE_SWEEP_SECS`]. The order is load-bearing: the
+    //    hydration cut is a byte offset captured at arm time, so a prune that
+    //    rewrote `activity.jsonl` smaller BEFORE hydration read it would put
+    //    live-appended records inside the cut window and double-count them
+    //    into the merged totals. After hydration the cut is dead and the
+    //    prune races only the append lock, which its commit already holds.
+    //
+    //    raw-io is pruned when capture is enabled; the ACTIVITY log is pruned
+    //    regardless of `raw_io.enabled` (review MUST-FIX 2 — activity keeps
+    //    appending with capture off, so its lifetime bound must not die with
+    //    the raw-io switch). `retention_days = 0` and `max_total_bytes = 0`
+    //    each disable their bound. Scans are streaming; commits preserve
+    //    records appended mid-pass (see `proxy::raw_io::prune_lifetime`).
     let hydrate_task = {
         let hub = state.hub.clone();
         let path = state.activity_log_path.clone();
-        tokio::task::spawn_blocking(move || hub.hydrate_persisted(path.as_deref(), hydrate_cut))
-    };
-    // 2. Raw-io retention prune (Feature B): guarded by config (`enabled =
-    //    false` skips it; `retention_days = 0` keeps everything). The scan is
-    //    streaming and the commit preserves records appended while it ran (see
-    //    `proxy::raw_io::prune`), so it is safe next to live traffic — and the
-    //    multi-GB payload log no longer stands between restart and readiness.
-    let prune_task = state.config.raw_io.enabled.then(|| {
-        let path = state.raw_io_path.clone();
+        let raw_io_enabled = state.config.raw_io.enabled;
+        let raw_io_path = state.raw_io_path.clone();
         let retention_days = state.config.raw_io.retention_days;
-        tokio::task::spawn_blocking(move || {
-            crate::proxy::raw_io::prune(
-                path.as_deref(),
-                retention_days,
-                crate::proxy::raw_io::now_ms(),
-            )
+        let max_total_bytes = state.config.raw_io.max_total_bytes;
+        tokio::spawn(async move {
+            let hydrate_path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                hub.hydrate_persisted(hydrate_path.as_deref(), hydrate_cut)
+            })
+            .await;
+            loop {
+                let raw_io_path = raw_io_path.clone();
+                let activity_path = path.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let now = crate::proxy::raw_io::now_ms();
+                    if raw_io_enabled {
+                        crate::proxy::raw_io::prune(
+                            raw_io_path.as_deref(),
+                            retention_days,
+                            max_total_bytes,
+                            now,
+                        );
+                    }
+                    crate::tui::activity::prune(
+                        activity_path.as_deref(),
+                        retention_days,
+                        max_total_bytes,
+                        now,
+                    );
+                })
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(PRUNE_SWEEP_SECS)).await;
+            }
         })
-    });
+    };
 
     let shutdown = state.shutdown.clone();
     let result = axum::serve(
@@ -1092,14 +1125,11 @@ pub async fn serve(
     if let Some(fold_task) = fold_task {
         fold_task.abort();
     }
-    // Blocking-pool tasks cannot be interrupted once running; `abort` here only
-    // cancels them if they have not started. Both are safe to leave finishing
-    // (read-only hydration; atomic-rename prune) — the runtime waits for them
-    // on shutdown.
+    // The hydrate-then-prune task's inner blocking work cannot be interrupted
+    // once running; `abort` only stops it between phases. Both phases are safe
+    // to leave finishing (read-only hydration; atomic-rename prune) — the
+    // runtime waits for them on shutdown.
     hydrate_task.abort();
-    if let Some(prune_task) = prune_task {
-        prune_task.abort();
-    }
     result.map_err(ProxyError::Io)
 }
 
@@ -1973,6 +2003,13 @@ async fn models_endpoint(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// How often the background lifetime prune re-runs after the startup pass
+/// (issue #127): startup-only pruning let a long-lived daemon regrow the
+/// raw-io/activity logs without bound between restarts. 6h keeps the excess
+/// over `max_total_bytes` small at typical traffic without measurable IO cost
+/// (the no-drop pre-pass is a single sequential read).
+const PRUNE_SWEEP_SECS: u64 = 6 * 3600;
+
 /// Partial update for `POST /llmux/settings` — daemon-wide display settings.
 /// Every field is optional; an omitted field keeps its current value (same
 /// contract as `POST /llmux/codex`), so the endpoint stays additive as more
@@ -2002,6 +2039,8 @@ pub struct SettingsRequest {
     // ---- persisted-only (effective on next daemon start) ----
     pub raw_io_retention_days: Option<u64>,
     pub raw_io_max_body_bytes: Option<u64>,
+    /// Total-size cap for raw-io.jsonl / activity.jsonl, bytes. `0` = no cap.
+    pub raw_io_max_total_bytes: Option<u64>,
     /// `"claude"` | `"codex"` | `"grok"`.
     pub routing_default_group: Option<String>,
     /// `"error"` | `"fallback"`.
@@ -2076,6 +2115,11 @@ pub fn apply_settings(
             return Err("raw_io_max_body_bytes: must be in [1 KiB, 1 GiB]".into());
         }
     }
+    if let Some(bytes) = req.raw_io_max_total_bytes {
+        if bytes != 0 && bytes < 1_048_576 {
+            return Err("raw_io_max_total_bytes: must be 0 (no cap) or >= 1 MiB".into());
+        }
+    }
     if let Some(group) = req.routing_default_group.as_deref() {
         if !["claude", "codex", "grok"].contains(&group) {
             return Err(format!("routing_default_group: unknown group {group:?}"));
@@ -2139,6 +2183,7 @@ pub fn apply_settings(
             usage_max_age_secs: req.usage_max_age_secs,
             raw_io_retention_days: req.raw_io_retention_days,
             raw_io_max_body_bytes: req.raw_io_max_body_bytes,
+            raw_io_max_total_bytes: req.raw_io_max_total_bytes,
             routing_default_group: req.routing_default_group.clone(),
             routing_on_empty_group: req.routing_on_empty_group.clone(),
             tui_gradient_speed: req.tui_gradient_speed,
@@ -2185,6 +2230,9 @@ pub fn apply_settings(
             }
             if let Some(v) = r.raw_io_max_body_bytes {
                 c.raw_io.max_body_bytes = usize::try_from(v).unwrap_or(usize::MAX);
+            }
+            if let Some(v) = r.raw_io_max_total_bytes {
+                c.raw_io.max_total_bytes = v;
             }
             if let Some(v) = &r.routing_default_group {
                 c.routing.default_group = v.clone();
@@ -2262,6 +2310,10 @@ pub fn apply_settings(
     for (name, present) in [
         ("raw_io_retention_days", req.raw_io_retention_days.is_some()),
         ("raw_io_max_body_bytes", req.raw_io_max_body_bytes.is_some()),
+        (
+            "raw_io_max_total_bytes",
+            req.raw_io_max_total_bytes.is_some(),
+        ),
         ("routing_default_group", req.routing_default_group.is_some()),
         (
             "routing_on_empty_group",
@@ -4440,6 +4492,10 @@ mod tests {
             },
             SettingsRequest {
                 upstream: Some("ftp://nope".into()),
+                ..Default::default()
+            },
+            SettingsRequest {
+                raw_io_max_total_bytes: Some(1024), // < 1 MiB and not 0
                 ..Default::default()
             },
         ] {
