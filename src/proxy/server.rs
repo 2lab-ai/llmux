@@ -3654,8 +3654,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 14 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 15);
+        // 16 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 17);
 
         let by_id = |id: &str| {
             models
@@ -3674,6 +3674,12 @@ mod tests {
             serde_json::json!(["sol", "gpt-5.6"])
         );
         assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
+        // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
+        // no aliases (those stay on the base rows), base sol unchanged.
+        for id in ["gpt-5.6-sol[1m]", "gpt-5.6-terra[1m]"] {
+            assert_eq!(by_id(id)["max_context"], 1_000_000, "{id}");
+            assert_eq!(by_id(id)["aliases"], serde_json::json!([]), "{id}");
+        }
     }
 
     #[tokio::test]

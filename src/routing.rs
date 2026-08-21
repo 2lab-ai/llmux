@@ -223,6 +223,13 @@ impl Classifier {
     /// default it would route to the wrong backend. Leading/trailing
     /// whitespace is never meaningful in a model slug for any group.
     ///
+    /// One trailing `[1m]` context-window suffix is also stripped: it is
+    /// client-side display metadata (Claude Code derives its context readout
+    /// from the model string), so `sol[1m]` must classify exactly like `sol`.
+    /// Prefix rules such as `gpt-` survive the suffix on their own, but EXACT
+    /// rules — the bare variant aliases — do not, and would land on
+    /// `default_group` (the wrong backend).
+    ///
     /// `None` (no model in the body) routes to the configured default group.
     /// Codex rules are checked first, then claude, then grok; an unrecognized
     /// model falls back to `default_group`. (The rule families are disjoint by
@@ -234,6 +241,10 @@ impl Classifier {
             return self.default_group;
         };
         let lower = model.trim().to_ascii_lowercase();
+        let lower = lower
+            .strip_suffix("[1m]")
+            .map(str::to_string)
+            .unwrap_or(lower);
         if self.codex_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Codex;
         }
@@ -373,6 +384,34 @@ mod tests {
             builtin().classify(Some("gpt-5.5-codex")),
             BackendGroup::Codex
         );
+    }
+
+    #[test]
+    fn bare_alias_with_context_suffix_still_routes_to_codex() {
+        // The bare aliases are EXACT rules, so without the suffix strip
+        // `sol[1m]` would match nothing and fall to the default group.
+        assert_eq!(builtin().classify(Some("sol[1m]")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("terra[1m]")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("SOL[1M]")), BackendGroup::Codex);
+        // Prefix-matched ids are unaffected.
+        assert_eq!(
+            builtin().classify(Some("gpt-5.6-sol[1m]")),
+            BackendGroup::Codex
+        );
+    }
+
+    #[test]
+    fn context_suffix_strip_is_global_across_groups() {
+        // The strip is deliberately group-agnostic: `[1m]` is client display
+        // metadata that can ride ANY backend's model string, so classification
+        // must be identical with and without it.
+        assert_eq!(
+            builtin().classify(Some("claude-sonnet-5[1m]")),
+            BackendGroup::Claude
+        );
+        assert_eq!(builtin().classify(Some("sonnet[1m]")), BackendGroup::Claude);
+        assert_eq!(builtin().classify(Some("grok-4.6[1m]")), BackendGroup::Grok);
+        assert_eq!(builtin().classify(Some("grok[1m]")), BackendGroup::Grok);
     }
 
     #[test]

@@ -1264,6 +1264,44 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["usage"]["output_tokens"], 11);
 }
 
+/// The codex twin of `client_context_window_suffix_is_stripped_before_upstream`:
+/// a raw client (curl / an SDK) sends the `[1m]` context-window annotation
+/// VERBATIM — Claude Code strips it client-side, nothing else does. Without the
+/// provider-side strip, `gpt-5.6-terra[1m]` matches no resolution rule and
+/// silently degrades to the configured pin (`gpt-5.6-sol`), i.e. the user gets
+/// a different model than they asked for. This drives the full process-level
+/// path, so it proves the strip is wired into the request translation, not just
+/// the unit.
+#[tokio::test]
+async fn codex_client_context_suffix_is_stripped_and_keeps_the_requested_model() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gpt-5.6-terra[1m]","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+
+    let sent = mock
+        .seen()
+        .into_iter()
+        .find(|r| r.path.contains("responses"))
+        .expect("a codex /responses request was sent");
+    let upstream: serde_json::Value = serde_json::from_slice(&sent.body).expect("upstream json");
+    assert_eq!(
+        upstream["model"], "gpt-5.6-terra",
+        "the [1m] suffix is stripped and the REQUESTED model is honored \
+         (not the pin, not the suffixed form)"
+    );
+}
+
 /// C3: a codex 401 forces one token refresh (form-encoded grant against the
 /// codex token endpoint) and the request retries with the fresh token.
 #[tokio::test]

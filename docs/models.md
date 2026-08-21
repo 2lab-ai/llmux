@@ -106,7 +106,9 @@ context/name for an id it does not curate.
 | claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
@@ -117,10 +119,35 @@ context/name for an id it does not curate.
 live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
 (see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)).
 
+### The codex `[1m]` rows
+
+`gpt-5.6-sol[1m]` / `gpt-5.6-terra[1m]` are the codex side of the same `[1m]`
+convention the claude rows use: the suffix is a **client-side context-denominator
+opt-in**, not a different upstream model. Claude Code parses it out of the
+configured model string to size its context readout; llmux strips one trailing
+`[1m]` before resolving the model, so upstream never sees it and
+`gpt-5.6-sol[1m]` reaches the backend as `gpt-5.6-sol`. The strip happens ahead
+of every resolution rule, so a suffixed alias works too (`sol[1m]` →
+`gpt-5.6-sol`), and it applies to routing as well (`sol[1m]` classifies to the
+codex group exactly like `sol`). A client that sends the id verbatim — curl, an
+SDK — gets the model it asked for instead of falling back to the configured pin.
+
+The advertised 1000000 is the opt-in denominator; the measured upstream input
+ceiling is close to it. Probes 2026-08-21 against the ChatGPT-account codex
+backend accepted 555,029 / ~801k / ~869k / 910,229 input tokens on
+`gpt-5.6-sol` and were rejected at ~936k with `Your input exceeds the context
+window of this model` (`gpt-5.6-terra` accepted 555,029). OpenAI publishes
+1,050,000 total for the gpt-5.6 family. The base rows keep the openai/codex
+catalog's 372000 — the window a client gets without opting in — exactly as the
+claude base rows keep 200000 next to their `[1m]` twins. There is deliberately
+no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
+`gpt-5.5[1m]` row (272k family).
+
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
-2026-07-27. The codex and grok evidence below is unchanged from 2026-07-14.
+2026-07-27, and the codex context windows were re-probed 2026-08-21 (the codex
+effort menus and the grok evidence below are unchanged from 2026-07-14).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -128,10 +155,16 @@ Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
   the user contract; llmux does not itself shape claude requests. The claude
   rows now live as the `CLAUDE_MODELS` const in `src/catalog.rs`, which is also
   the source for alias→id resolution in `src/provider/anthropic.rs`.
-- **Codex context windows and effort menus** — the openai/codex model catalog
-  (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` / `-terra`
-  support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh (context
-  272000). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer curated.
+- **Codex effort menus and base context windows** — the openai/codex model
+  catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
+  `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
+  (context 272000). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer
+  curated.
+- **Codex `[1m]` context window** — live probes through the daemon against the
+  ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
+  input tokens and was rejected at ~936k (`Your input exceeds the context window
+  of this model`); `gpt-5.6-terra` accepted 555,029. This supersedes the earlier
+  "369,755 pass / ~380k rejected" note that made 372000 look probe-confirmed.
 - **Grok context window / name** — the live `cli-chat-proxy` `/v1/models` probe
   2026-07-14 (`grok-4.5` ctx 500000). The `grok-4.6` row was verified the same
   way against the live `cli-chat-proxy` `/v1/models` on 2026-08-13 (ctx 500000,
