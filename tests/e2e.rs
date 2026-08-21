@@ -3446,3 +3446,106 @@ async fn openrouter_account_refuses_non_messages_endpoints() {
     assert_eq!(response.status(), 501);
     assert!(mock.seen().is_empty(), "not proxied");
 }
+
+/// Raw-io wire truth for OpenRouter. README.md:18 promises a raw viewer "over
+/// all four wire legs" and docs/ai-debugger.md promises "the raw bytes of both
+/// halves of every exchange" — a documented contract, not polish. OpenRouter is
+/// deliberately NOT a translator, but it still rewrites the `model`, drops the
+/// anthropic-only beta headers and targets another host with another
+/// credential, so gating the upstream leg on `is_translate` would silently
+/// record the CLIENT request as if it were the upstream one. This asserts the
+/// captured upstream half is the real thing, with the bearer redacted.
+#[tokio::test]
+async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer() {
+    const UPSTREAM_BODY: &str =
+        r#"{"id":"msg_or_raw","type":"message","usage":{"input_tokens":4,"output_tokens":2}}"#;
+
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-supersecretkeyvalue")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"or-ox-alpha","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().expect("id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "completed entry landed on the dashboard");
+
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let response = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .header("x-api-key", E2E_ADMIN_KEY)
+            .send()
+            .await
+            .expect("raw-io reachable");
+        if response.status().is_success() {
+            raw = response.json().await.expect("raw-io json");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let upstream = &raw["upstream"];
+    assert!(
+        upstream.is_object(),
+        "an openrouter exchange must carry the upstream half — it is not a \
+         byte-identity passthrough: {raw}"
+    );
+    assert!(
+        upstream["url"]
+            .as_str()
+            .expect("upstream url")
+            .ends_with("/v1/messages"),
+        "the openrouter target URL: {upstream}"
+    );
+
+    let sent = upstream["request_body"]
+        .as_str()
+        .expect("upstream request body");
+    assert!(
+        sent.contains("stealth/ox-alpha"),
+        "the upstream leg shows the REWRITTEN wire model, not `or-ox-alpha`: {sent}"
+    );
+    assert!(
+        !sent.contains("or-ox-alpha"),
+        "the client's id must not survive into the upstream leg: {sent}"
+    );
+
+    // Credential hygiene: the header is visible, its value never is.
+    let headers = serde_json::to_string(&upstream["request_headers"]).expect("headers json");
+    assert!(
+        !headers.contains("supersecretkeyvalue"),
+        "the openrouter key must never reach the raw-io log: {headers}"
+    );
+    assert!(
+        headers.to_lowercase().contains("authorization"),
+        "the header itself stays visible so the viewer shows it was sent: {headers}"
+    );
+}

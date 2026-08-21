@@ -1296,7 +1296,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         )
                         .await
                     }
-                    None => relay(state, ctx, lease, account, response).await,
+                    None => relay(state, ctx, lease, account, response, upstream_meta).await,
                 };
             }
             UpstreamSignal::RateLimited { retry_after } => {
@@ -2024,12 +2024,25 @@ fn sanitize_response_headers(headers: &HeaderMap) -> HeaderMap {
 /// buffered (Node parity — enables body logging + usage extraction from
 /// non-streaming JSON). The lease rides along until the body is fully
 /// delivered.
+/// Byte-identity relay of an upstream response.
+///
+/// `upstream_meta` is `Some` only when the proxy REWROTE the request on the way
+/// up while still speaking the client's wire format — i.e. openrouter (swapped
+/// `model`, dropped anthropic-only betas, another host and credential). The
+/// anthropic passthrough passes `None`: there the client bytes ARE the upstream
+/// bytes, which is the 2-payload case. Keeping the rewritten half is a
+/// documented contract, not a nicety — README.md advertises the raw viewer
+/// "over all four wire legs" and docs/ai-debugger.md promises the raw bytes of
+/// both halves of every exchange; recording the CLIENT request as though it
+/// were the upstream one would make the viewer lie exactly where a
+/// model-routing incident is diagnosed.
 async fn relay(
     state: &AppState,
     ctx: &mut ForwardContext,
     lease: crate::scheduler::AccountLease,
     account: AccountId,
     response: reqwest::Response,
+    upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
     let status = response.status();
     let headers = sanitize_response_headers(response.headers());
@@ -2087,6 +2100,11 @@ async fn relay(
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        // The upstream RESPONSE half is byte-identical to the client's here (no
+        // transform), so it is filled from the same tee; only the REQUEST half
+        // differs, and that is the half worth keeping.
+        let raw_io_upstream_meta = upstream_meta;
+        let raw_io_upstream_res_headers = raw_io_res_headers.clone();
         sse::passthrough_body(
             response,
             BODY_LOG_LIMIT,
@@ -2120,7 +2138,16 @@ async fn relay(
                     raw_io_max_body,
                     raw_io_req_headers,
                     raw_io_res_headers,
-                    None, // byte-identity passthrough — client IS the upstream exchange
+                    raw_io_upstream_meta.map(|m| {
+                        m.into_raw(
+                            raw_io_max_body,
+                            Some(crate::proxy::raw_io::bounded_body_streamed(
+                                raw_captured.bytes(),
+                                raw_captured.total(),
+                            )),
+                            raw_io_upstream_res_headers,
+                        )
+                    }),
                 );
                 if log_enabled {
                     sections.push(format!(
@@ -2188,10 +2215,26 @@ async fn relay(
         ));
         ctx.flush_log(state);
         // Raw-io capture (Feature B): the full non-streaming body, already
-        // materialized to relay it — no extra read, no hot-path effect.
-        // Byte-identity passthrough: client and upstream exchange are the same
-        // bytes → no separate upstream half (2-payload case).
-        ctx.capture_raw_io(state, Some(&account), status, &bytes, Some(&headers), None);
+        // materialized to relay it — no extra read, no hot-path effect. The
+        // upstream half is present only when the request was rewritten on the
+        // way up (openrouter); its RESPONSE bytes are the same ones the client
+        // gets, since this relay performs no transform.
+        let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        let upstream_raw = upstream_meta.map(|m| {
+            m.into_raw(
+                raw_io_max_body,
+                Some(crate::proxy::raw_io::bounded_body(&bytes, raw_io_max_body)),
+                Some(redacted_header_pairs(&headers)),
+            )
+        });
+        ctx.capture_raw_io(
+            state,
+            Some(&account),
+            status,
+            &bytes,
+            Some(&headers),
+            upstream_raw,
+        );
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)

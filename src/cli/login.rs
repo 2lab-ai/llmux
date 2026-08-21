@@ -240,6 +240,21 @@ async fn login_grok() -> Result<(), CliError> {
 /// cut of the daemon arm hardcoded a label-less `or:key`, which would have made
 /// every unlabeled dashboard login overwrite the previous one.
 pub(crate) fn openrouter_account_name(config: &Config, label: &str, api_key: &str) -> String {
+    // The KEY is the durable identity; the label is cosmetic and can change
+    // between logins (introspection is best-effort and degrades to empty). So
+    // look for this key FIRST, under whatever name it already has: without
+    // this, a key stored as `or:key` because the label lookup failed comes
+    // back as `or:work` once the label resolves, and one upstream credential
+    // becomes two scheduler accounts — double-counting its quota.
+    if let Some(existing) = config.accounts.iter().find(|a| {
+        matches!(
+            &a.credential,
+            AccountCredential::OpenRouter { api_key: k, .. } if k == api_key
+        )
+    }) {
+        return existing.name.clone();
+    }
+
     let taken_by_another_key = |name: &str| {
         config.accounts.iter().any(|a| {
             a.name == name
@@ -389,6 +404,33 @@ mod tests {
             "or:work-2",
             "a different key with the SAME label must not overwrite it \
              (openrouter labels are explicitly not unique)"
+        );
+    }
+
+    /// The key, not the label, is the identity. A label that appears (or
+    /// changes) between logins must NOT mint a second account for the same
+    /// credential — that would show one upstream quota as two scheduler
+    /// accounts.
+    #[test]
+    fn openrouter_name_follows_the_key_when_the_label_changes() {
+        let mut config = Config::default();
+        // Stored unlabeled first (introspection failed).
+        config.accounts.push(or_account("or:key", "sk-or-v1-aaa"));
+
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-aaa"),
+            "or:key",
+            "same key keeps its existing name even once a label resolves"
+        );
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-aaa"),
+            "or:key",
+            "and when the label disappears again"
+        );
+        // A genuinely new key is unaffected.
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-bbb"),
+            "or:work"
         );
     }
 
