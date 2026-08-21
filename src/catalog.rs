@@ -23,7 +23,12 @@
 //!   [`CLAUDE_MODELS`] as the mapping source.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol/terra`
-//!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh.
+//!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh. The
+//!   `gpt-5.6-*[1m]` rows are the codex side of the `[1m]` opt-in and carry
+//!   OpenAI's published 1,050,000-token family window rather than the
+//!   catalog's 372,000; live probes 2026-08-21 against the ChatGPT-account
+//!   backend corroborate it on SOL specifically (910,229 accepted, ~936k
+//!   rejected) and reach only 555,029 accepted on terra.
 //! - Grok context windows / names: the live `cli-chat-proxy` `/v1/models`
 //!   probe — `grok-4.5` ctx 500000 (2026-07-14), `grok-4.6` ctx 500000, name
 //!   "Grok 4.6" (2026-08-13). Grok effort menus come from
@@ -156,12 +161,41 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
     }
 
     // ---- codex ----
+    // The `[1m]` rows mirror the claude convention: a client-side
+    // context-denominator opt-in that the provider strips before the request
+    // leaves llmux. 1_000_000 is advertised on the strength of OpenAI's
+    // PUBLISHED 1,050,000 total window for the gpt-5.6 family; the 2026-08-21
+    // probes against the ChatGPT-account backend corroborate it but do not by
+    // themselves establish it per model. Those probes are sol-specific where
+    // they are strong — `gpt-5.6-sol` accepted 910,229 input tokens and was
+    // rejected at ~936k ("Your input exceeds the context window of this
+    // model") — while `gpt-5.6-terra` was only probed to 555,029 accepted,
+    // with no upper bound found; terra rides the family figure. The base rows
+    // keep the openai/codex catalog's 372,000 — the window a client gets
+    // without opting in — exactly as the claude base rows keep 200,000 next to
+    // their `[1m]` twins. No `gpt-5.6-luna[1m]` (luna still 404s upstream) and
+    // no `gpt-5.5[1m]` (272k family). Aliases stay on the base rows — a suffix
+    // is an explicit opt-in, never something an alias silently picks.
+    entries.push(codex_entry(
+        "gpt-5.6-sol[1m]",
+        "GPT-5.6-Sol [1M]",
+        CODEX_EFFORTS_SOL_TERRA,
+        Some(1_000_000),
+        Vec::new(),
+    ));
     entries.push(codex_entry(
         "gpt-5.6-sol",
         "GPT-5.6-Sol",
         CODEX_EFFORTS_SOL_TERRA,
         Some(372_000),
         vec!["sol".into(), "gpt-5.6".into()],
+    ));
+    entries.push(codex_entry(
+        "gpt-5.6-terra[1m]",
+        "GPT-5.6-Terra [1M]",
+        CODEX_EFFORTS_SOL_TERRA,
+        Some(1_000_000),
+        Vec::new(),
     ));
     entries.push(codex_entry(
         "gpt-5.6-terra",
@@ -264,10 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_14_entries() {
-        // The pinned (curated) case: exactly 14 rows, claude ids in order.
+    fn catalog_matches_user_contract_16_entries() {
+        // The pinned (curated) case: exactly 16 rows, claude ids in order.
+        // 14 before the codex `[1m]` pair landed (2026-08-21).
         let entries = catalog("grok-4.6", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 14);
+        assert_eq!(entries.len(), 16);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -454,10 +489,10 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 14.
+        // A curated pin: no synthesized row, alias on the static row, count 16.
         for (pin, owner) in [("grok-4.6", "grok-4.6"), ("grok-4.5", "grok-4.5")] {
             let entries = catalog(pin, "gpt-5.6-sol");
-            assert_eq!(entries.len(), 14, "pin {pin}");
+            assert_eq!(entries.len(), 16, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -472,7 +507,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 15);
+        assert_eq!(entries.len(), 17);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -493,7 +528,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 15);
+        assert_eq!(entries.len(), 17);
         // Both curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.6").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.5").max_context, Some(500_000));
@@ -510,6 +545,38 @@ mod tests {
         assert_eq!(sol.aliases, vec!["sol".to_string(), "gpt-5.6".to_string()]);
         assert_eq!(sol.max_context, Some(372_000));
         assert_eq!(sol.efforts.len(), 6);
+    }
+
+    #[test]
+    fn codex_1m_rows_advertise_the_probed_window_without_aliases() {
+        // The `[1m]` opt-in advertises the same 1_000_000 the claude `[1m]`
+        // rows do, on OpenAI's published 1,050,000 family window; the
+        // 2026-08-21 probes corroborate it (sol: 910,229 accepted / ~936k
+        // rejected; terra: 555,029 accepted, no ceiling found). The base rows
+        // keep the openai/codex catalog's 372,000 (the non-opt-in
+        // denominator).
+        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        for (id, name) in [
+            ("gpt-5.6-sol[1m]", "GPT-5.6-Sol [1M]"),
+            ("gpt-5.6-terra[1m]", "GPT-5.6-Terra [1M]"),
+        ] {
+            let e = find(&entries, id);
+            assert_eq!(e.name, name);
+            assert_eq!(e.max_context, Some(1_000_000), "{id}");
+            assert_eq!(e.group, "codex", "{id}");
+            assert_eq!(e.efforts, CODEX_EFFORTS_SOL_TERRA, "{id}");
+            // Aliases stay on the base row — a suffix is an explicit opt-in.
+            assert!(e.aliases.is_empty(), "{id} carries no alias");
+        }
+        assert_eq!(find(&entries, "gpt-5.6-sol").max_context, Some(372_000));
+        assert_eq!(find(&entries, "gpt-5.6-terra").max_context, Some(372_000));
+        // Not curated: luna still 404s upstream, gpt-5.5 is a 272k family.
+        for absent in ["gpt-5.6-luna[1m]", "gpt-5.5[1m]"] {
+            assert!(
+                !entries.iter().any(|e| e.id == absent),
+                "{absent} must not be curated"
+            );
+        }
     }
 
     #[test]

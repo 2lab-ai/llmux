@@ -361,9 +361,9 @@ or set the model in Claude Code's own model setting:
 /model gpt-5.5[1m]
 ```
 
-For account *selection*, the model string's only job is to choose the group. Any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the Codex group is routed there. The actual upstream model sent to Codex is `codex.default_model` (default `gpt-5.5`), set in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` and keeps a representative scalar `current` for back-compat.
+For account *selection*, the model string's only job is to choose the group. Any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the Codex group is routed there. The model actually sent upstream is the one you asked for whenever llmux recognizes it: the known codex ids (`gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`, …) pass through verbatim, the bare aliases resolve (`sol` → `gpt-5.6-sol`, bare `gpt-5.6` → the sol flagship), and a trailing `[1m]` is stripped before the request leaves llmux, so `gpt-5.6-terra[1m]` reaches the backend as `gpt-5.6-terra`. Only an unrecognized id or a model-less request falls back to `codex.default_model` (default `gpt-5.6-sol`), set in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` and keeps a representative scalar `current` for back-compat.
 
-### Context-window display for `gpt-5.5`
+### Context-window display for Codex models
 
 When you route to the Codex group with a bare `gpt-5.5`, Claude Code's **remaining context** indicator is wrong because the client computes the window from the **model-name string**. llmux can route and stream the request, but it cannot set Claude Code's local context-window table:
 
@@ -378,7 +378,9 @@ Use the `[1m]` suffix when you want Claude Code to display a 1M window:
 /model gpt-5.5[1m]
 ```
 
-`gpt-5.5[1m]` still routes to the Codex group: the `gpt-` prefix still matches, and the suffix is stripped for routing/usage attribution. The tradeoff is that the 1M display can **over-report** the real usable Codex window; it is a client-side display workaround, not a promise that every long transcript will be accepted unchanged.
+`gpt-5.5[1m]` still routes to the Codex group: the `gpt-` prefix still matches, and the suffix is stripped for routing/usage attribution — and, since 2026-08-21, on the codex request path too, so the suffix works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`) without degrading to the pin.
+
+How much a 1M display over-reports depends on the model. For the gpt-5.6 family it is modest: probes 2026-08-21 against the ChatGPT-account backend accepted **910,229** input tokens on `gpt-5.6-sol` and were rejected at ~936k, and OpenAI publishes 1,050,000 total for the family — which is why `gpt-5.6-sol[1m]` / `gpt-5.6-terra[1m]` are catalog rows (see [models.md](models.md#the-codex-1m-rows)). For `gpt-5.5` (a 272k model) the 1M display remains a pure client-side workaround, not a promise that every long transcript will be accepted unchanged.
 
 If a long session still blocks near the mid-200k range, use the empirical compaction workaround in [FAQ: gpt-5.5 context stops around 265k](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
 

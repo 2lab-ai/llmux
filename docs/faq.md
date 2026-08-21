@@ -27,7 +27,9 @@ This does not change your llmux account configuration. It is a Claude Code sessi
 
 Claude Code derives its displayed context window from the model-name string. Bare `gpt-5.5` can be treated as an unknown or smaller-window model by the client. The `[1m]` suffix tells Claude Code to use a 1M context display while llmux still routes the request by the `gpt-` prefix.
 
-See [operational-reference.md](operational-reference.md#context-window-display-for-gpt-55) for the routing details.
+llmux strips one trailing `[1m]` before resolving the codex model, so the suffix never reaches upstream and works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`). `gpt-5.6-sol[1m]` and `gpt-5.6-terra[1m]` are also catalog rows advertising a 1000000 window — probed 2026-08-21 at 910,229 input tokens accepted / ~936k rejected against the ChatGPT-account backend (OpenAI publishes 1,050,000 total for the gpt-5.6 family). `gpt-5.5` is a 272k model, so `gpt-5.5[1m]` remains a display-only workaround.
+
+See [operational-reference.md](operational-reference.md#context-window-display-for-codex-models) for the routing details, and [models.md](models.md#the-codex-1m-rows) for the catalog rows.
 
 ## Does `gpt-5.5[1m]` still route to Codex?
 
