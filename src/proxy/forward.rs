@@ -2045,6 +2045,15 @@ async fn relay(
     upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
     let status = response.status();
+    // Two header sets, deliberately: `headers` is what the CLIENT receives
+    // (hop-by-hop stripped, content-length recomputed by hyper), while
+    // `upstream_response_headers` is what the UPSTREAM actually sent. The raw
+    // viewer's upstream leg must show the latter — recording the sanitized set
+    // there would quietly turn "wire truth" into "wire truth, edited by us".
+    // Only materialized when there IS an upstream leg to attach it to.
+    let upstream_response_headers = upstream_meta
+        .as_ref()
+        .map(|_| redacted_header_pairs(response.headers()));
     let headers = sanitize_response_headers(response.headers());
     ctx.log(format!(
         "=== RESPONSE {status} ===\n{}",
@@ -2104,7 +2113,7 @@ async fn relay(
         // transform), so it is filled from the same tee; only the REQUEST half
         // differs, and that is the half worth keeping.
         let raw_io_upstream_meta = upstream_meta;
-        let raw_io_upstream_res_headers = raw_io_res_headers.clone();
+        let raw_io_upstream_res_headers = upstream_response_headers.clone();
         sse::passthrough_body(
             response,
             BODY_LOG_LIMIT,
@@ -2224,7 +2233,7 @@ async fn relay(
             m.into_raw(
                 raw_io_max_body,
                 Some(crate::proxy::raw_io::bounded_body(&bytes, raw_io_max_body)),
-                Some(redacted_header_pairs(&headers)),
+                upstream_response_headers,
             )
         });
         ctx.capture_raw_io(

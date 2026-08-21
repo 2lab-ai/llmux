@@ -3548,4 +3548,24 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
         headers.to_lowercase().contains("authorization"),
         "the header itself stays visible so the viewer shows it was sent: {headers}"
     );
+
+    // The upstream leg's RESPONSE headers must be what the upstream actually
+    // sent, not the set llmux hands the client. `sanitize_response_headers`
+    // strips `content-length` on the way out, so its presence here is the
+    // discriminator between "wire truth" and "wire truth, edited by us".
+    let up_res: Vec<(String, String)> =
+        serde_json::from_value(upstream["response_headers"].clone()).expect("upstream res headers");
+    let client_res: Vec<(String, String)> =
+        serde_json::from_value(raw["response_headers"].clone()).expect("client res headers");
+    let has = |set: &[(String, String)], name: &str| {
+        set.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    };
+    assert!(
+        has(&up_res, "content-length"),
+        "the upstream leg carries the upstream's own headers: {up_res:?}"
+    );
+    assert!(
+        !has(&client_res, "content-length"),
+        "…while the client leg carries the sanitized set: {client_res:?}"
+    );
 }
