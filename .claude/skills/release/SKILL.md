@@ -25,7 +25,11 @@ procedure B = publish+verify brew).
    without asking. Only deviate — a minor/major bump or a specific number — when the user
    gave a **special instruction** for this release (then use exactly what they said).
 2. **Bump.** Set `version = "<new>"` in `Cargo.toml`; run `just check` so `Cargo.lock`
-   updates and the gate passes. The release workflow **fails if tag `v<new>` ≠ Cargo.toml
+   updates and the gate passes. **Also sync the sub-crate lockfiles** — `just check` only
+   updates the workspace lock, but the `islands` release job builds with `cargo --locked`
+   against each crate's own lock (v0.2.20 first-tag failure, 2026-08-21):
+   `for d in llmux-islands-core llmux-islands-linux llmux-islands-macos-bridge; do (cd $d && cargo update -p llmux --precise <new>); done`
+   The release workflow **fails if tag `v<new>` ≠ Cargo.toml
    version** — they must match exactly.
 3. **Commit + push main.** `git commit -am "chore: release v<new>"`; `git push origin
    main` (token fallback if needed). Confirm with the user if a PR (not direct main) is
