@@ -1086,9 +1086,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 3. Translate-path accounts (codex, grok) serve the Messages API
-        // only: count_tokens is answered locally with a naive estimate (no
-        // upstream equivalent); any other endpoint is a clear 501.
+        // 3. Non-anthropic accounts (codex, grok, openrouter) serve the
+        // Messages API only: count_tokens is answered locally with a naive
+        // estimate (no upstream equivalent); any other endpoint is a clear
+        // 501.
         //
         // With routing ON the translate path is driven by the request's GROUP
         // — which, by the invariant asserted above, always matches the leased
@@ -1105,10 +1106,20 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // degradation, which is why it is a `matches!` over the two real
         // translators rather than `!= Claude`.
         let is_translate = matches!(served, BackendGroup::Codex | BackendGroup::Grok);
+        // The Messages-only endpoint guard is a WIDER set than `is_translate`:
+        // it covers every non-anthropic group, openrouter included. OpenRouter
+        // has no `count_tokens` — `POST /api/v1/messages/count_tokens` live-
+        // probes 404 (2026-08-21) — and Claude Code calls that endpoint
+        // routinely, so passing it through would surface a hard error on every
+        // context measurement. Answer it locally, exactly as codex/grok do.
+        let messages_only = matches!(
+            served,
+            BackendGroup::Codex | BackendGroup::Grok | BackendGroup::OpenRouter
+        );
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
-        if is_translate {
+        if messages_only {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
                 drop(lease);
@@ -2185,9 +2196,11 @@ async fn relay(
     out
 }
 
-/// `/v1/messages/count_tokens` on a codex account: no upstream equivalent —
-/// answer locally with a naive chars/4 estimate (good enough for Claude
-/// Code's context-window bookkeeping, and strictly better than an error).
+/// `/v1/messages/count_tokens` on a codex, grok or openrouter account: no
+/// upstream equivalent — answer locally with a naive chars/4 estimate (good
+/// enough for Claude Code's context-window bookkeeping, and strictly better
+/// than an error). OpenRouter genuinely 404s that path (live probe
+/// 2026-08-21), so this is not a convenience for it but a correctness fix.
 ///
 /// Deliberately NOT codex-traced: it makes no upstream call, so there is no
 /// "hung vs completed" question and no real upstream usage to record — the

@@ -3384,3 +3384,65 @@ async fn openrouter_verbatim_slug_escape_hatch_reaches_upstream() {
     let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json body");
     assert_eq!(sent["model"], "openai/gpt-oss-20b:free");
 }
+
+/// `/v1/messages/count_tokens` on an openrouter account must be answered
+/// LOCALLY, never proxied: OpenRouter has no such endpoint —
+/// `POST https://openrouter.ai/api/v1/messages/count_tokens` live-probes
+/// `{"error":{"message":"Not Found","code":404}}` (2026-08-21) — and Claude
+/// Code calls it on every context measurement. The mock is left with an EMPTY
+/// script and asserted untouched, so a regression that proxies the call fails
+/// here rather than in the user's editor.
+#[tokio::test]
+async fn openrouter_count_tokens_is_answered_locally_not_proxied() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(r#"{"model":"or-ox-alpha","messages":[{"role":"user","content":"hello there"}]}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert!(
+        body["input_tokens"].as_u64().is_some_and(|n| n > 0),
+        "a local estimate is returned, got {body}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "count_tokens must never reach the openrouter upstream (it 404s there)"
+    );
+}
+
+/// An openrouter account must refuse endpoints outside the Messages API with a
+/// clean 501 rather than blindly proxying them to openrouter.ai.
+#[tokio::test]
+async fn openrouter_account_refuses_non_messages_endpoints() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/complete"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"or-ox-alpha","prompt":"hi"}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+
+    assert_eq!(response.status(), 501);
+    assert!(mock.seen().is_empty(), "not proxied");
+}
