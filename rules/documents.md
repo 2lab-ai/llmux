@@ -22,6 +22,7 @@ feature is incomplete.
 | Captured Claude Code / multi-model **system prompt** wire text | [`docs/system-prompts/`](../docs/system-prompts/) — especially [`samples/`](../docs/system-prompts/samples/); never replace real samples with meta-only prose |
 | Product/architecture *decisions* (not how-to) | [`.prd/`](../.prd/) |
 | Grok provider STV design notes | [`docs/grok/`](../docs/grok/) (design artifact; not a user how-to) |
+| OpenRouter provider STV design notes | [`docs/openrouter/`](../docs/openrouter/) (design artifact; not a user how-to) |
 | Agent architecture rules / conventions / runbooks | [`AGENTS.md`](../AGENTS.md) |
 
 When unsure, update the narrowest row that a new user would open to understand

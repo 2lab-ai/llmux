@@ -13,7 +13,7 @@
 **One agent harness, every model.** llmux is a local Anthropic-compatible proxy for [Claude Code](https://www.anthropic.com/claude-code): `claude` talks to `http://localhost:3456`, llmux decides which account/backend serves the request. Your subagents, slash commands, MCP servers, hooks, and `CLAUDE.md` conventions stay put while frontier models and subscription limits keep moving — `/model fable`, `/model gpt-5.6-sol`, `/model grok-4.6` are routing signals, not migrations.
 
 - **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and a Claude Code launcher (`llmux run`)
-- **three backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), routed by model name ([models →](docs/models.md))
+- **four backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), OpenRouter (`or-*` / free models on an OpenRouter key), routed by model name ([models →](docs/models.md))
 - **multi-account scheduling** — quota-aware perishability scoring or sticky round-robin, 429 cooldown parking, Fable weekly ceilings ([schedulers →](docs/schedulers.md))
 - **DevTools for your agent's model traffic** — live per-request receipts, a raw request/response viewer over all four wire legs, copy-as-curl ([the accidental AI debugger →](docs/ai-debugger.md))
 - **remote-first** — one central daemon, every other machine a pure client, with per-machine multi-tenant keys ([remote daemon →](docs/remote.md))
@@ -55,6 +55,7 @@ llmux login           # Claude subscription OAuth; repeat once per account
 llmux login --api     # optional: Anthropic API key
 llmux login --codex   # optional: Codex / ChatGPT subscription
 llmux login --grok    # optional: Grok / xAI (device-code flow)
+llmux login --openrouter  # optional: OpenRouter (browser PKCE; --paste for an existing key)
 llmux import          # or import supported local credential stores
 ```
 
@@ -82,6 +83,7 @@ Claude Code's model name becomes the routing signal:
 /model opus[1m]
 /model gpt-5.6-sol[1m]
 /model grok-4.6
+/model or-ox-alpha
 ```
 
 | Name pattern | Backend group |
@@ -89,6 +91,7 @@ Claude Code's model name becomes the routing signal:
 | Claude-like (`fable`, `opus`, `sonnet`, `haiku`, `claude-*`) | Claude accounts |
 | `gpt-*` / `codex` / aliases (`sol`, `terra`, `luna`) | Codex accounts |
 | `grok` / `grok-*` | Grok accounts |
+| `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
@@ -124,7 +127,7 @@ llmux is for **one human using their own accounts** — no credential pooling, n
 - **Durable path:** Claude Code as the harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
 - **Convenience path:** routing third-party flat-rate subscription tokens through Claude Code depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
 - Anthropic quota headers and vendor subscription-token behavior may change.
-- llmux is not affiliated with Anthropic, OpenAI, or xAI.
+- llmux is not affiliated with Anthropic, OpenAI, xAI, or OpenRouter.
 
 Product intent — what llmux is, what it bets on, and what it refuses — is fixed in [`.prd/`](.prd/).
 
