@@ -2614,25 +2614,18 @@ async fn run_login(
             )
             .await
             .unwrap_or_default();
-            let trimmed = label.trim();
-            // Same naming rule as `llmux login --openrouter` — one shared
-            // helper so an unlabeled dashboard login gets `or:key-N` rather
-            // than repeatedly overwriting a single `or:key`.
-            let name = match crate::config::load_or_init() {
-                Ok(cfg) => crate::cli::login::openrouter_account_name(&cfg, trimmed, &api_key),
-                // No readable config yet: fall back to the label-or-first-slot
-                // name; `inject_account`'s read-merge-write still upserts.
-                Err(_) => crate::cli::login::openrouter_account_name(
-                    &crate::config::Config::default(),
-                    trimmed,
-                    &api_key,
-                ),
-            };
+            // The NAME is deliberately left as a placeholder:
+            // `inject_account` derives the real one from the key inside its
+            // read-merge-write closure (against the merged state, via the same
+            // allocator the CLI uses). Computing it here from a separate
+            // snapshot would reintroduce both a TOCTOU window and a path
+            // divergence — `load_or_init()` resolves the global config path
+            // while persistence uses `state.config_path`.
             crate::config::AccountConfig {
-                name,
+                name: String::new(),
                 credential: crate::config::AccountCredential::OpenRouter {
                     api_key,
-                    label: trimmed.to_string(),
+                    label: label.trim().to_string(),
                 },
             }
         }
