@@ -85,20 +85,21 @@ pub fn resolve_model(requested: Option<&str>, pin: &str) -> String {
     // `remainder` is what goes upstream when no curated alias matches; it is
     // the input minus the `or-` selector prefix (or the input itself when the
     // client already spelled a bare OpenRouter slug).
+    // Not `or-`-prefixed → forward VERBATIM. That covers a vendor-shaped slug
+    // named directly (`openrouter/free`, `z-ai/glm-5.2:free`) and, just as
+    // importantly, any slug a `routing.openrouter_models` override assigned
+    // here: a config that says `openrouter_models = ["free-"]` means
+    // `free-model-1` IS an OpenRouter model, and answering it with the pin
+    // instead would silently serve a different model than the one asked for.
+    //
+    // This deliberately does NOT special-case a foreign id arriving through
+    // `routing.on_empty_group = "fallback"` (a `claude-opus-5` served by the
+    // openrouter pool). Substituting the pin there was tried and reverted: it
+    // cannot be distinguished from the configured-override case at this layer,
+    // and a wrong-model answer is worse than OpenRouter's own honest 404 —
+    // the same rule the `or-`-prefixed unknown path already follows.
     let Some(remainder) = lowered.strip_prefix("or-") else {
-        // Not `or-`-prefixed. A vendor-shaped slug (`openrouter/free`,
-        // `z-ai/glm-5.2:free`) is a real OpenRouter model named directly —
-        // forward it. Anything else is a FOREIGN model that only reached this
-        // provider through `routing.on_empty_group = "fallback"` (a claude or
-        // codex id served by the openrouter pool because its own group has no
-        // accounts). Forwarding `claude-opus-5` to OpenRouter would just 400;
-        // substitute the pin, matching how the grok provider treats a
-        // non-grok-shaped model under the same fallback contract.
-        return if lowered.contains('/') {
-            lowered
-        } else {
-            pin.to_string()
-        };
+        return lowered;
     };
     if remainder.is_empty() {
         return pin.to_string();
@@ -407,6 +408,19 @@ mod tests {
         let blocks = v["messages"][0]["content"].as_array().expect("blocks");
         assert_eq!(blocks.len(), 1, "signed thinking survives: {blocks:?}");
         assert_eq!(blocks[0]["signature"], "sig-abc");
+    }
+
+    /// A `routing.openrouter_models` override means "these ARE OpenRouter
+    /// models". Answering one with the default pin would serve a different
+    /// model than the caller asked for — the exact silent substitution the
+    /// `or-`-prefixed unknown path already refuses.
+    #[test]
+    fn a_configured_slashless_model_is_forwarded_verbatim_not_pinned() {
+        assert_eq!(resolve_model(Some("free-model-1"), PIN), "free-model-1");
+        assert_ne!(resolve_model(Some("free-model-1"), PIN), PIN);
+        // Same for a foreign id arriving via on_empty_group=fallback: an
+        // honest upstream 404 beats a wrong-model answer.
+        assert_eq!(resolve_model(Some("claude-opus-5"), PIN), "claude-opus-5");
     }
 
     #[test]

@@ -321,6 +321,16 @@ impl Classifier {
             .strip_suffix("[1m]")
             .map(str::to_string)
             .unwrap_or(lower);
+        // OpenRouter FIRST. Its builtin selectors are explicit and anchored
+        // (`or-` / `openrouter/` prefixes, exact `or`), while codex owns the
+        // greedy `Substring("codex")` — so a perfectly valid escape-hatch slug
+        // like `or-openai/gpt-5-codex` would otherwise be stolen by codex and
+        // sent to the ChatGPT backend, which has never heard of it. Most
+        // specific selector wins; this is the only pair where the builtin
+        // families are not disjoint.
+        if self.openrouter_rules.iter().any(|r| r.matches(&lower)) {
+            return BackendGroup::OpenRouter;
+        }
         if self.codex_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Codex;
         }
@@ -329,9 +339,6 @@ impl Classifier {
         }
         if self.grok_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Grok;
-        }
-        if self.openrouter_rules.iter().any(|r| r.matches(&lower)) {
-            return BackendGroup::OpenRouter;
         }
         self.default_group
     }
@@ -696,6 +703,36 @@ mod tests {
             c.classify(Some("or-ox-alpha[1m]")),
             BackendGroup::OpenRouter
         );
+    }
+
+    /// The escape hatch names REAL upstream slugs, and some of them contain
+    /// another family's marker. `or-openai/gpt-5-codex` is a valid OpenRouter
+    /// model whose slug contains "codex" — codex's builtin rule is a greedy
+    /// `Substring("codex")`, so without openrouter being checked FIRST it is
+    /// routed to the ChatGPT backend, which has never heard of it.
+    #[test]
+    fn explicit_or_prefix_beats_codex_greedy_substring() {
+        let c = Classifier::default();
+        for model in [
+            "or-openai/gpt-5-codex",
+            "or-codex-something",
+            // …and the other families' markers, for the same reason.
+            "or-anthropic/claude-sonnet-4",
+            "or-x-ai/grok-3",
+            "or-openai/gpt-oss-20b:free",
+        ] {
+            assert_eq!(
+                c.classify(Some(model)),
+                BackendGroup::OpenRouter,
+                "{model} is an OpenRouter slug, not another family's"
+            );
+        }
+        // The other families keep their own ids — the `or-` anchor is what
+        // decides, not the presence of a vendor name.
+        assert_eq!(c.classify(Some("gpt-5-codex")), BackendGroup::Codex);
+        assert_eq!(c.classify(Some("codex-mini")), BackendGroup::Codex);
+        assert_eq!(c.classify(Some("claude-sonnet-4")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("grok-4.6")), BackendGroup::Grok);
     }
 
     #[test]
