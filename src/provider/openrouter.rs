@@ -123,10 +123,27 @@ pub fn resolve_model(requested: Option<&str>, pin: &str) -> String {
 /// A body with no `model` at all gets the pin inserted, because that is what
 /// [`resolve_model`] answers for `None` and OpenRouter (like Anthropic)
 /// requires the field.
-fn rewrite_model(body: bytes::Bytes, pin: &str) -> bytes::Bytes {
+/// Normalize an OpenRouter-bound body in ONE parse: rewrite `model` to the
+/// upstream slug, and strip foreign (unsigned) thinking blocks.
+///
+/// The thinking strip is the same guard `provider::anthropic` carries for
+/// issue #116, and it is needed here for the same reason: the codex and grok
+/// translators SYNTHESIZE `thinking` blocks with no `signature`
+/// (`provider/responses.rs`), Claude Code replays the assistant turn verbatim
+/// on the next request, and llmux is a multi-group proxy whose whole point is
+/// that you can switch `/model` mid-session. So a codex or grok answer
+/// followed by `/model or-ox-alpha` sends an unsigned thinking block to
+/// OpenRouter, whose Messages schema requires `signature` on such a block.
+/// Being a native passthrough is exactly why this does NOT come for free —
+/// nothing between the client and OpenRouter would otherwise touch it.
+///
+/// Returns the original bytes (refcounted, byte-identity) when nothing
+/// changed; a non-JSON body passes through untouched.
+fn normalize_body(body: bytes::Bytes, pin: &str) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
+    let thinking = crate::provider::anthropic::strip_foreign_thinking(&mut value);
     let Some(object) = value.as_object_mut() else {
         return body;
     };
@@ -135,10 +152,13 @@ fn rewrite_model(body: bytes::Bytes, pin: &str) -> bytes::Bytes {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let resolved = resolve_model(requested.as_deref(), pin);
-    if requested.as_deref() == Some(resolved.as_str()) {
+    let model_changed = requested.as_deref() != Some(resolved.as_str());
+    if model_changed {
+        object.insert("model".to_string(), serde_json::Value::String(resolved));
+    }
+    if !(model_changed || thinking) {
         return body;
     }
-    object.insert("model".to_string(), serde_json::Value::String(resolved));
     match serde_json::to_vec(&value) {
         Ok(bytes) => bytes::Bytes::from(bytes),
         Err(_) => body,
@@ -288,7 +308,7 @@ impl Provider for OpenRouterProvider {
             method: wire.method,
             path: wire.path,
             headers,
-            body: rewrite_model(wire.body, &self.default_model),
+            body: normalize_body(wire.body, &self.default_model),
         })
     }
 
@@ -345,6 +365,48 @@ mod tests {
             OpenRouterProvider::new("https://example.invalid", "some/future-model").model(),
             "some/future-model"
         );
+    }
+
+    /// Cross-group replay: codex and grok SYNTHESIZE unsigned `thinking`
+    /// blocks, Claude Code replays the assistant turn on the next request, and
+    /// switching `/model` mid-session is llmux's entire purpose. OpenRouter's
+    /// Messages schema requires a `signature` on a thinking block, so the
+    /// unsigned one must be stripped before it leaves — the same guard
+    /// `provider::anthropic` carries for issue #116, which a native
+    /// passthrough does NOT inherit for free.
+    #[test]
+    fn unsigned_thinking_from_a_translated_turn_is_stripped() {
+        const BODY: &str = r#"{"model":"or-ox-alpha","messages":[
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"synthesized by the codex translator"},
+                {"type":"text","text":"the answer"}]},
+            {"role":"user","content":"follow-up"}]}"#;
+        let out = normalize_body(bytes::Bytes::from_static(BODY.as_bytes()), PIN);
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(v["model"], "stealth/ox-alpha", "model still rewritten");
+        let blocks = v["messages"][0]["content"].as_array().expect("blocks");
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "thinking"),
+            "the unsigned thinking block must not reach OpenRouter: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|b| b["type"] == "text"),
+            "the real answer survives: {blocks:?}"
+        );
+        assert_eq!(v["messages"][1]["content"], "follow-up");
+    }
+
+    /// A SIGNED thinking block is genuine upstream content and must survive.
+    #[test]
+    fn signed_thinking_is_preserved() {
+        const BODY: &str = r#"{"model":"or-ox-alpha","messages":[
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"real","signature":"sig-abc"}]}]}"#;
+        let out = normalize_body(bytes::Bytes::from_static(BODY.as_bytes()), PIN);
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        let blocks = v["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1, "signed thinking survives: {blocks:?}");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
     }
 
     #[test]
@@ -539,7 +601,7 @@ mod tests {
     #[test]
     fn request_in_is_byte_identical_when_the_model_is_already_resolved() {
         let body = r#"{"model":"stealth/ox-alpha","messages":[]}"#;
-        let out = rewrite_model(bytes::Bytes::from_static(body.as_bytes()), PIN);
+        let out = normalize_body(bytes::Bytes::from_static(body.as_bytes()), PIN);
         assert_eq!(out.as_ref(), body.as_bytes());
     }
 
@@ -555,7 +617,7 @@ mod tests {
     /// must not panic on indexed assignment.
     #[test]
     fn request_in_passes_a_non_object_json_body_through_untouched() {
-        let out = rewrite_model(bytes::Bytes::from_static(b"[1,2,3]"), PIN);
+        let out = normalize_body(bytes::Bytes::from_static(b"[1,2,3]"), PIN);
         assert_eq!(out.as_ref(), b"[1,2,3]");
     }
 
@@ -563,7 +625,7 @@ mod tests {
     /// — OpenRouter requires the field.
     #[test]
     fn request_in_inserts_the_pin_when_the_body_has_no_model() {
-        let out = rewrite_model(bytes::Bytes::from_static(br#"{"messages":[]}"#), PIN);
+        let out = normalize_body(bytes::Bytes::from_static(br#"{"messages":[]}"#), PIN);
         let upstream: serde_json::Value = serde_json::from_slice(&out).expect("json");
         assert_eq!(upstream["model"], "stealth/ox-alpha");
     }
