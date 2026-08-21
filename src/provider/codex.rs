@@ -33,9 +33,16 @@ pub use super::responses::{
 /// `gpt-5.6-sol` (2026-07-09 launch, flagship tier): probed against the
 /// ChatGPT-account codex backend — bare `gpt-5.6` and `gpt-5.6-codex` are
 /// rejected ("model is not supported when using Codex with a ChatGPT
-/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. Context window
-/// 372,000 per the openai/codex model catalog (probe-consistent: 369,755
-/// tokens pass, ~380k rejected; gpt-5.5 is 272k).
+/// account"); `gpt-5.6-sol` / `gpt-5.6-terra` are accepted. This model's real
+/// input ceiling is ~1M, NOT the 372,000 the openai/codex model catalog lists
+/// (that figure — and the earlier "369,755 pass / ~380k rejected" note — is
+/// superseded): probes 2026-08-21 through the live daemon accepted 555,029,
+/// ~801k, ~869k and 910,229 input tokens on `gpt-5.6-sol` and were rejected
+/// at ~936k with the upstream error "Your input exceeds the context window
+/// of this model". That matches OpenAI's published 1,050,000 total window for
+/// the gpt-5.6 family, which is what the other family members are credited
+/// with: `gpt-5.6-terra` was only probed to 555,029 accepted (no ceiling
+/// found). gpt-5.5 is 272k.
 pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 
 /// Request-shaping knobs for the Responses request, sourced from
@@ -256,10 +263,20 @@ const LATEST_GPT_GENERATION: &str = "gpt-5.6";
 /// generation of that variant (`sol` → `gpt-5.6-sol`, …).
 const VARIANT_ALIASES: &[&str] = &["sol", "terra", "luna"];
 
-/// Resolve the model slug requested upstream: the bare variant aliases
-/// (`sol`/`terra`/`luna`) and bare `gpt-5.6` map to the latest gpt generation
-/// of that variant ([`LATEST_GPT_GENERATION`]); known-valid slugs pass through
-/// (the client's choice is honored — soma-work exposes sol/terra as distinct
+/// The client-side context-window suffix (`gpt-5.6-sol[1m]`), mirroring the
+/// claude convention (`crate::provider::anthropic`'s
+/// `strip_client_context_suffix`). It is display metadata Claude Code parses
+/// out of the model string; upstream never sees it. Clients that send the id
+/// VERBATIM (curl, SDKs) would otherwise defeat every match below and get the
+/// pin instead of the model they asked for.
+const CLIENT_CONTEXT_SUFFIX: &str = "[1m]";
+
+/// Resolve the model slug requested upstream: one trailing
+/// [`CLIENT_CONTEXT_SUFFIX`] is stripped first, so every rule below sees the
+/// base slug; the bare variant aliases (`sol`/`terra`/`luna`) and bare
+/// `gpt-5.6` map to the latest gpt generation of that variant
+/// ([`LATEST_GPT_GENERATION`]); known-valid slugs pass through (the client's
+/// choice is honored — soma-work exposes sol/terra as distinct
 /// user-selectable models); everything else (unknown ids, model-less requests)
 /// keeps the configured pin.
 fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
@@ -267,6 +284,10 @@ fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
         return pinned.to_string();
     };
     let req = req.trim().to_ascii_lowercase();
+    let req = req
+        .strip_suffix(CLIENT_CONTEXT_SUFFIX)
+        .map(str::to_string)
+        .unwrap_or(req);
     // Bare variant alias → latest gpt generation of that variant.
     if VARIANT_ALIASES.contains(&req.as_str()) {
         return format!("{LATEST_GPT_GENERATION}-{req}");
@@ -523,6 +544,54 @@ mod tests {
                 translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
             assert_eq!(upstream["model"], expected, "alias {alias} → {expected}");
         }
+    }
+
+    #[test]
+    fn client_context_suffix_is_stripped_before_resolution() {
+        // Claude Code parses `[1m]` out of the model string client-side, but a
+        // raw client (curl/SDK) sends it verbatim. Stripping it first keeps
+        // every resolution path — passthrough, bare generation, variant alias
+        // — working, instead of silently degrading to the pin.
+        for (requested, expected) in [
+            ("gpt-5.6-sol[1m]", "gpt-5.6-sol"),
+            ("gpt-5.6-terra[1m]", "gpt-5.6-terra"),
+            ("sol[1m]", "gpt-5.6-sol"),
+            ("gpt-5.6[1m]", "gpt-5.6-sol"),
+            ("gpt-5.5[1m]", "gpt-5.5"),
+            ("  GPT-5.6-Sol[1M]  ", "gpt-5.6-sol"),
+        ] {
+            assert_eq!(
+                resolve_upstream_model(Some(requested), CODEX_MODEL),
+                expected,
+                "{requested} → {expected}"
+            );
+        }
+        // Unknown-with-suffix keeps the pin, exactly like unknown without it.
+        assert_eq!(
+            resolve_upstream_model(Some("foo[1m]"), CODEX_MODEL),
+            CODEX_MODEL
+        );
+        // The suffix never reaches upstream.
+        let body =
+            json!({ "model": "gpt-5.6-sol[1m]", "messages": [{"role":"user","content":"hi"}] });
+        let (upstream, _) =
+            translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+        assert_eq!(upstream["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn suffixed_model_keeps_the_extended_effort_menu() {
+        // Effort clamping resolves against the STRIPPED model, so `max` stays
+        // `max` on `gpt-5.6-sol[1m]` (it would clamp to xhigh if the suffixed
+        // id fell back to an unknown/older model).
+        let body = json!({
+            "model": "gpt-5.6-sol[1m]",
+            "output_config": { "effort": "max" },
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let (upstream, _) =
+            translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+        assert_eq!(upstream["reasoning"]["effort"], "max");
     }
 
     #[test]
