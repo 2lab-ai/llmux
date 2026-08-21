@@ -118,6 +118,13 @@ pub trait Host {
     /// post-update/switch daemon restart must spawn — `current_exe()` may be
     /// the keg brew just deleted.
     fn formula_bin_path(&self, formula: &str) -> Option<std::path::PathBuf>;
+    /// Full version line of a binary on disk (`<exe> --version`, trimmed) —
+    /// byte-identical to what that build reports as `version` in
+    /// `/llmux/status`, so the two are directly comparable. `None` when the
+    /// binary cannot be run or prints nothing usable. Asking the ARTIFACT is
+    /// the point: this process's own `build_info` describes whichever keg the
+    /// user happened to invoke, which may be stale or the other channel's.
+    fn binary_version(&self, exe: &std::path::Path) -> Option<String>;
     /// Is the Islands menu-bar app currently running?
     fn islands_running(&self) -> bool;
     /// Best-effort relaunch of the Islands app (quit + reopen).
@@ -284,6 +291,27 @@ pub fn update_plan(channel: Channel, islands_installed: bool) -> Vec<BrewCmd> {
 /// actually changed (an `already up to date` upgrade must not churn it).
 pub fn should_restart_daemon(daemon_running: bool, version_changed: bool) -> bool {
     daemon_running && version_changed
+}
+
+/// PURE: restart a running daemon that serves a DIFFERENT build than the
+/// binary brew has INSTALLED, even when brew had nothing to upgrade — an
+/// out-of-band `brew upgrade` (or a restart skipped on an earlier run) leaves
+/// exactly that state, and `update` must converge it instead of reporting
+/// "already up to date" over a stale server.
+///
+/// The comparand is deliberately the installed artifact, never the invoking
+/// process's `build_info`: a stale CLI equal to a stale server would hide a
+/// real mismatch, and a stale CLI against an already-current server would
+/// invent one. Either version unknown = missing data, so no restart.
+pub fn should_restart_for_version_mismatch(
+    daemon_running: bool,
+    server_version: Option<&str>,
+    installed_version: Option<&str>,
+) -> bool {
+    match (server_version, installed_version) {
+        (Some(server), Some(installed)) => daemon_running && server != installed,
+        _ => false,
+    }
 }
 
 /// PURE: relaunch the Islands app only when it was running AND its cask
@@ -492,6 +520,19 @@ impl Host for RealHost {
         bin.exists().then_some(bin)
     }
 
+    fn binary_version(&self, exe: &std::path::Path) -> Option<String> {
+        // clap prints "<bin> <version> (<channel> <id>)" on stdout.
+        let output = std::process::Command::new(exe)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!line.is_empty()).then_some(line)
+    }
+
     fn islands_running(&self) -> bool {
         // `pgrep -x` matches the exact process name (the app's PRODUCT_NAME,
         // `LlmuxIslands`, from llmux-islands/project.yml).
@@ -542,6 +583,8 @@ pub(crate) mod testing {
         pub islands_running: bool,
         /// `formula` → binary path answered by `formula_bin_path`.
         pub bin_paths: Vec<(String, std::path::PathBuf)>,
+        /// `path` → version answered by `binary_version` (no subprocess).
+        pub binary_versions: Vec<(std::path::PathBuf, String)>,
         /// Ordered log: `"brew <args>"` and `"relaunch-islands"`.
         pub calls: RefCell<Vec<String>>,
         /// Optional hook: given the brew args just run, mutate `versions`
@@ -558,6 +601,7 @@ pub(crate) mod testing {
                 versions: RefCell::new(Vec::new()),
                 islands_running: false,
                 bin_paths: Vec::new(),
+                binary_versions: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 on_run: None,
             }
@@ -605,6 +649,12 @@ pub(crate) mod testing {
                 .iter()
                 .find(|(name, _)| name == formula)
                 .map(|(_, path)| path.clone())
+        }
+        fn binary_version(&self, exe: &std::path::Path) -> Option<String> {
+            self.binary_versions
+                .iter()
+                .find(|(path, _)| path == exe)
+                .map(|(_, version)| version.clone())
         }
         fn islands_running(&self) -> bool {
             self.islands_running
@@ -828,6 +878,56 @@ mod tests {
         assert!(should_relaunch_islands(true, true));
         assert!(!should_relaunch_islands(false, true));
         assert!(!should_relaunch_islands(true, false));
+    }
+
+    // Three INDEPENDENT builds, so no case can pass by accident: what the
+    // user invoked (A), what the daemon serves, and what brew installed (B).
+    const STALE_A: &str = "llmux 0.2.19 (preview 2026-08-13-0413-aaaaaaa)";
+    const FRESH_B: &str = "llmux 0.2.19 (preview 2026-08-21-0458-bbbbbbb)";
+    const OTHER_C: &str = "llmux 0.2.18 (stable 2026-07-30-1200-ccccccc)";
+
+    #[test]
+    fn version_mismatch_restart_conditions() {
+        // Shape (a): the invoking CLI is itself stale A and so is the server;
+        // brew has B installed. Comparing against the INSTALLED binary is what
+        // makes this fire — a client-process comparand would see A == A.
+        assert!(
+            should_restart_for_version_mismatch(true, Some(STALE_A), Some(FRESH_B)),
+            "a daemon left on another build must converge on the installed one"
+        );
+        // Shape (b): the CLI is stale A but the server already runs the
+        // installed B — nothing to apply, restarting would be pointless churn.
+        assert!(
+            !should_restart_for_version_mismatch(true, Some(FRESH_B), Some(FRESH_B)),
+            "server already on the installed build must not churn"
+        );
+        // A third build in play changes nothing: server ≠ installed ⇒ restart.
+        assert!(should_restart_for_version_mismatch(
+            true,
+            Some(OTHER_C),
+            Some(FRESH_B)
+        ));
+        assert!(
+            !should_restart_for_version_mismatch(true, None, Some(FRESH_B)),
+            "unknown server version is missing data, not a mismatch"
+        );
+        assert!(
+            !should_restart_for_version_mismatch(true, Some(STALE_A), None),
+            "unresolvable installed version is missing data, not a mismatch"
+        );
+        assert!(
+            !should_restart_for_version_mismatch(false, Some(STALE_A), Some(FRESH_B)),
+            "not running"
+        );
+    }
+
+    #[test]
+    fn binary_version_comes_from_the_artifact_on_disk() {
+        let exe = std::path::PathBuf::from("/opt/homebrew/opt/llmux-preview/bin/llmux");
+        let mut host = FakeHost::new();
+        host.binary_versions = vec![(exe.clone(), FRESH_B.to_string())];
+        assert_eq!(host.binary_version(&exe).as_deref(), Some(FRESH_B));
+        assert_eq!(host.binary_version(std::path::Path::new("/nope")), None);
     }
 
     #[test]

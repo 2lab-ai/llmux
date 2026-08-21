@@ -83,7 +83,7 @@ llmux is distributed through the [Homebrew tap](https://github.com/2lab-ai/homeb
 llmux channel
 
 # Update in place on the current channel (brew upgrade), restarting the
-# daemon only if the binary actually changed
+# daemon if the binary changed or the running one is a different build
 llmux update
 
 # Switch channels now (brew uninstall old + install new, mirrored onto the
@@ -91,6 +91,8 @@ llmux update
 llmux channel preview
 llmux channel stable
 ```
+
+`llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
 ### Source build
 
