@@ -239,19 +239,40 @@ async fn login_grok() -> Result<(), CliError> {
 /// and the dashboard switcher cannot drift into two naming schemes — the first
 /// cut of the daemon arm hardcoded a label-less `or:key`, which would have made
 /// every unlabeled dashboard login overwrite the previous one.
-pub(crate) fn openrouter_account_name(config: &Config, label: &str) -> String {
-    let label = label.trim();
-    if label.is_empty() {
-        let n = config
-            .accounts
-            .iter()
-            .filter(|a| a.name.starts_with("or:key-"))
-            .count()
-            + 1;
-        format!("or:key-{n}")
-    } else {
-        format!("or:{label}")
+pub(crate) fn openrouter_account_name(config: &Config, label: &str, api_key: &str) -> String {
+    let taken_by_another_key = |name: &str| {
+        config.accounts.iter().any(|a| {
+            a.name == name
+                && !matches!(
+                    &a.credential,
+                    AccountCredential::OpenRouter { api_key: existing, .. } if existing == api_key
+                )
+        })
+    };
+
+    let base = {
+        let label = label.trim();
+        if label.is_empty() {
+            "or:key".to_string()
+        } else {
+            format!("or:{label}")
+        }
+    };
+    // Re-logging in with the SAME key keeps the same name (an in-place
+    // update); a DIFFERENT key never lands on an occupied name.
+    if !taken_by_another_key(&base) {
+        return base;
     }
+    // First UNUSED suffix, not `count + 1`: with `or:key-1` and `or:key-3`
+    // present, counting yields `or:key-3` and the name-keyed upsert would
+    // REPLACE that account — silently destroying a working credential instead
+    // of growing the pool. OpenRouter key labels are explicitly not unique
+    // (see `AccountCredential::OpenRouter`), so this collision is reachable
+    // with labels too, not just unlabeled logins.
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|name| !taken_by_another_key(name))
+        .unwrap_or(base)
 }
 
 async fn login_openrouter(paste: bool) -> Result<(), CliError> {
@@ -286,7 +307,7 @@ async fn login_openrouter(paste: bool) -> Result<(), CliError> {
     crate::config::update(|config: &mut Config| {
         // Numbering is resolved against the fresh on-disk state so unlabeled
         // logins don't overwrite each other (same rule as `api-N`).
-        let name = openrouter_account_name(config, &label);
+        let name = openrouter_account_name(config, &label, &api_key);
         final_name = name.clone();
         outcome = config.upsert_account(AccountConfig {
             name,
@@ -335,4 +356,72 @@ fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
     let email = (account.name != "codex").then_some(account.name.as_str());
     account.name = codex::codex_account_name(email, &account_id);
     Ok(Some(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn or_account(name: &str, key: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::OpenRouter {
+                api_key: key.to_string(),
+                label: String::new(),
+            },
+        }
+    }
+
+    /// Re-logging in with the SAME key must reuse the name (in-place update),
+    /// while a DIFFERENT key must never land on an occupied one.
+    #[test]
+    fn openrouter_name_reuses_for_the_same_key_and_avoids_another() {
+        let mut config = Config::default();
+        config.accounts.push(or_account("or:work", "sk-or-v1-aaa"));
+
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-aaa"),
+            "or:work",
+            "same key re-login updates in place"
+        );
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-bbb"),
+            "or:work-2",
+            "a different key with the SAME label must not overwrite it \
+             (openrouter labels are explicitly not unique)"
+        );
+    }
+
+    /// The unlabeled fallback must pick the first UNUSED suffix. Counting
+    /// existing accounts instead would return an occupied name after a gap,
+    /// and the name-keyed upsert would destroy that credential.
+    #[test]
+    fn openrouter_unlabeled_name_skips_gaps_instead_of_overwriting() {
+        let mut config = Config::default();
+        config.accounts.push(or_account("or:key", "sk-or-v1-1"));
+        config.accounts.push(or_account("or:key-3", "sk-or-v1-3"));
+
+        // `or:key` and `or:key-3` are taken; `or:key-2` is the first free slot.
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-new"),
+            "or:key-2"
+        );
+        // Filling the gap pushes the next one past the highest existing.
+        config.accounts.push(or_account("or:key-2", "sk-or-v1-2"));
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-new"),
+            "or:key-4"
+        );
+    }
+
+    #[test]
+    fn openrouter_name_is_the_bare_label_on_an_empty_config() {
+        let config = Config::default();
+        assert_eq!(
+            openrouter_account_name(&config, "  my-key  ", "sk-or-v1-x"),
+            "or:my-key",
+            "label is trimmed"
+        );
+        assert_eq!(openrouter_account_name(&config, "", "sk-or-v1-x"), "or:key");
+    }
 }

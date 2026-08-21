@@ -75,6 +75,41 @@ impl BackendGroup {
             _ => Self::Claude,
         }
     }
+
+    /// Whether this group's provider must TRANSLATE the Anthropic Messages
+    /// body into a foreign wire format (and its stream back) — codex and grok
+    /// (Messages↔Responses + an SSE converter). Claude is the native upstream;
+    /// OpenRouter serves the Anthropic Messages format natively too
+    /// (docs/openrouter/spec.md), so both are byte-level passthroughs.
+    ///
+    /// Exhaustive on purpose: a fifth group is a COMPILE ERROR here rather
+    /// than a silent default. Getting this wrong is body corruption, not
+    /// degradation — a native-Messages backend wrongly marked as translating
+    /// would have its payload run through the Responses converter.
+    pub fn needs_body_translation(self) -> bool {
+        match self {
+            Self::Codex | Self::Grok => true,
+            Self::Claude | Self::OpenRouter => false,
+        }
+    }
+
+    /// Whether this group's upstream implements ONLY `POST /v1/messages` —
+    /// i.e. it has no `/v1/messages/count_tokens` sibling and no other
+    /// Anthropic endpoint. True for every non-Anthropic group.
+    ///
+    /// This is a DIFFERENT question from [`Self::needs_body_translation`], and
+    /// conflating them has already cost one defect: `count_tokens`'s local
+    /// estimate used to hang off the translate flag, so when OpenRouter joined
+    /// as a non-translating group its `count_tokens` calls were proxied to an
+    /// endpoint that live-probes 404 (2026-08-21) — on a path Claude Code hits
+    /// for every context measurement. Two questions, two predicates, both
+    /// exhaustive.
+    pub fn serves_messages_only(self) -> bool {
+        match self {
+            Self::Codex | Self::Grok | Self::OpenRouter => true,
+            Self::Claude => false,
+        }
+    }
 }
 
 impl std::fmt::Display for BackendGroup {
@@ -243,12 +278,14 @@ impl Classifier {
             claude_rules,
             grok_rules,
             openrouter_rules,
-            default_group: match default_group.trim().to_ascii_lowercase().as_str() {
-                "codex" => BackendGroup::Codex,
-                "grok" => BackendGroup::Grok,
-                "openrouter" => BackendGroup::OpenRouter,
-                _ => BackendGroup::Claude,
-            },
+            // One label→group parser for the whole crate
+            // ([`BackendGroup::from_label`]): a second hand-rolled map here
+            // means every new group must be added twice, and missing THIS one
+            // degrades a valid `routing.default_group` to Claude silently
+            // while status/API parsing still recognizes it.
+            default_group: BackendGroup::from_label(
+                default_group.trim().to_ascii_lowercase().as_str(),
+            ),
         }
     }
 

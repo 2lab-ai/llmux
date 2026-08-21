@@ -25,7 +25,7 @@ use crate::config::AccountCredential;
 /// Must stay in sync with `config::schema::default_openrouter_model` (that
 /// function's doc comment points back here); it is duplicated rather than
 /// imported because the schema default is a private serde helper.
-pub const OPENROUTER_DEFAULT_MODEL: &str = "stealth/ox-alpha";
+pub const OPENROUTER_DEFAULT_MODEL: &str = crate::catalog::OPENROUTER_DEFAULT_PIN;
 
 /// Client auth header stripped on the way upstream (OpenRouter accepts BOTH
 /// `x-api-key` and `Authorization: Bearer`, so a client-supplied `x-api-key`
@@ -85,10 +85,27 @@ pub fn resolve_model(requested: Option<&str>, pin: &str) -> String {
     // `remainder` is what goes upstream when no curated alias matches; it is
     // the input minus the `or-` selector prefix (or the input itself when the
     // client already spelled a bare OpenRouter slug).
-    let remainder = lowered.strip_prefix("or-").unwrap_or(&lowered);
+    let Some(remainder) = lowered.strip_prefix("or-") else {
+        // Not `or-`-prefixed. A vendor-shaped slug (`openrouter/free`,
+        // `z-ai/glm-5.2:free`) is a real OpenRouter model named directly —
+        // forward it. Anything else is a FOREIGN model that only reached this
+        // provider through `routing.on_empty_group = "fallback"` (a claude or
+        // codex id served by the openrouter pool because its own group has no
+        // accounts). Forwarding `claude-opus-5` to OpenRouter would just 400;
+        // substitute the pin, matching how the grok provider treats a
+        // non-grok-shaped model under the same fallback contract.
+        return if lowered.contains('/') {
+            lowered
+        } else {
+            pin.to_string()
+        };
+    };
     if remainder.is_empty() {
         return pin.to_string();
     }
+    // Explicitly `or-`-prefixed from here on: the user named an OpenRouter
+    // model, so an unknown one is forwarded VERBATIM and OpenRouter's own 404
+    // reaches them — never a silent substitution.
     if remainder.contains('/') {
         return remainder.to_string();
     }
@@ -185,10 +202,24 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    /// The `default_model` pin is NORMALIZED through the curated alias table
+    /// on the way in, so a config that pins the ADVERTISED id
+    /// (`openrouter.default_model = "or-ox-alpha"` — the string the user sees
+    /// everywhere in `/models` and types into Claude Code) resolves to the
+    /// wire slug `stealth/ox-alpha` instead of being sent upstream verbatim
+    /// and 400ing. Normalizing here rather than at each use keeps the two
+    /// consumers — `resolve_model`'s pin path and `catalog()`'s
+    /// `slug == openrouter_pin` alias-owner comparison — reading the same
+    /// value; otherwise an advertised-id pin also orphans the bare `or` alias
+    /// onto a synthesized `or-or-ox-alpha` row. A real slug is left untouched.
     pub fn new(base_url: impl Into<String>, default_model: impl Into<String>) -> Self {
+        let default_model = default_model.into();
+        let default_model = crate::catalog::resolve_openrouter_alias(&default_model)
+            .map(str::to_string)
+            .unwrap_or(default_model);
         Self {
             base_url: base_url.into(),
-            default_model: default_model.into(),
+            default_model,
         }
     }
 
@@ -290,6 +321,32 @@ mod tests {
     /// so an `endpoint` of `…/api/v1` composes `…/api/v1/v1/messages`. Live
     /// probes 2026-08-21: the wrong URL → 404, the right one → 401 (auth, i.e.
     /// the route exists). Every openrouter request would have 404'd.
+    /// A config that pins the ADVERTISED id must still reach the right model.
+    /// Without normalization in `new`, `openrouter.default_model =
+    /// "or-ox-alpha"` would be sent upstream verbatim (400) AND would make
+    /// `catalog()` synthesize an `or-or-ox-alpha` row that steals the bare
+    /// `or` alias from the real one.
+    #[test]
+    fn advertised_id_as_the_pin_is_normalized_to_the_wire_slug() {
+        let provider = OpenRouterProvider::new("https://example.invalid", "or-ox-alpha");
+        assert_eq!(provider.model(), "stealth/ox-alpha");
+        // The bare `or` alias and a model-less request both follow the pin.
+        assert_eq!(
+            resolve_model(Some("or"), provider.model()),
+            "stealth/ox-alpha"
+        );
+        assert_eq!(resolve_model(None, provider.model()), "stealth/ox-alpha");
+        // A real slug is untouched, and an uncurated pin stays verbatim.
+        assert_eq!(
+            OpenRouterProvider::new("https://example.invalid", "z-ai/glm-5.2:free").model(),
+            "z-ai/glm-5.2:free"
+        );
+        assert_eq!(
+            OpenRouterProvider::new("https://example.invalid", "some/future-model").model(),
+            "some/future-model"
+        );
+    }
+
     #[test]
     fn openrouter_upstream_composes_the_real_endpoint() {
         let endpoint = crate::config::OpenRouterConfig::default().upstream;

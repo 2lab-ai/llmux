@@ -34,7 +34,7 @@ The config file is written with mode `0600`. Updates use atomic read-merge-write
     "fast": false
   },
   "openrouter": {
-    "upstream": "https://openrouter.ai/api/v1",
+    "upstream": "https://openrouter.ai/api",
     "default_model": "stealth/ox-alpha"
   },
   "accounts": [
@@ -153,7 +153,7 @@ OpenRouter serves the **Anthropic Messages** format natively, so llmux forwards 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `openrouter.upstream` | `https://openrouter.ai/api/v1` | Base URL the Messages request is POSTed to (`{upstream}/messages`). |
+| `openrouter.upstream` | `https://openrouter.ai/api` | Base URL the client's verbatim path is appended to, so the request goes to `{upstream}/v1/messages`. Host root, **not** `…/api/v1` — that would compose `…/api/v1/v1/messages`, which 404s. |
 | `openrouter.default_model` | `stealth/ox-alpha` | The slug a bare `or` — or a request that names no model — resolves to. |
 
 Model selection is the `or-` prefix: `or-ox-alpha` and the other curated ids resolve to their OpenRouter slug, `or-<vendor>/<slug>` reaches any of the ~400 uncurated models verbatim, and an unknown bare name is passed through so OpenRouter's own 404 answers it. See [models.md](models.md#alias-semantics).

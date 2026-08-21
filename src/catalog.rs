@@ -210,6 +210,14 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
     ),
 ];
 
+/// The default OpenRouter pin — the wire slug the bare `or` alias resolves to.
+/// SSOT for BOTH `config::schema::default_openrouter_model` (what a fresh
+/// config writes) and `provider::openrouter::OPENROUTER_DEFAULT_MODEL` (what
+/// the provider exports); it lives here because [`OPENROUTER_MODELS`] is
+/// already the model SSOT and two literal copies would drift silently — a
+/// config advertising one pin while the provider resolved another.
+pub(crate) const OPENROUTER_DEFAULT_PIN: &str = "stealth/ox-alpha";
+
 /// Resolve a curated OpenRouter advertised id (`or-ox-alpha`) to its upstream
 /// slug (`stealth/ox-alpha`), or `None` when it is not curated — the provider
 /// then applies the verbatim-passthrough rules of spec §R3.

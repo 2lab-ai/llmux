@@ -2619,12 +2619,13 @@ async fn run_login(
             // helper so an unlabeled dashboard login gets `or:key-N` rather
             // than repeatedly overwriting a single `or:key`.
             let name = match crate::config::load_or_init() {
-                Ok(cfg) => crate::cli::login::openrouter_account_name(&cfg, trimmed),
+                Ok(cfg) => crate::cli::login::openrouter_account_name(&cfg, trimmed, &api_key),
                 // No readable config yet: fall back to the label-or-first-slot
                 // name; `inject_account`'s read-merge-write still upserts.
                 Err(_) => crate::cli::login::openrouter_account_name(
                     &crate::config::Config::default(),
                     trimmed,
+                    &api_key,
                 ),
             };
             crate::config::AccountConfig {

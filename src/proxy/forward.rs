@@ -320,9 +320,15 @@ impl ForwardContext {
             // is client metadata here exactly as on the claude passthrough.
             Some(BackendGroup::OpenRouter) => FinishedMeta {
                 group: Some("openrouter".to_string()),
+                // The pin MUST come from the provider, not from raw config:
+                // `OpenRouterProvider::new` normalizes an advertised-id pin
+                // (`or-ox-alpha`) to its wire slug, and this metadata is what
+                // usage and pricing are booked against. Reading the raw config
+                // here would book a pinned request as `or-ox-alpha` while the
+                // wire carried `stealth/ox-alpha` — unpriced and misattributed.
                 model: Some(crate::provider::openrouter::resolve_model(
                     self.model.as_deref(),
-                    &state.config.openrouter.default_model,
+                    state.openrouter.model(),
                 )),
                 effort: claude_effort(&self.body),
                 fast: false,
@@ -1031,9 +1037,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
                 BackendGroup::OpenRouter => (
                     Some("openrouter".to_string()),
+                    // Provider-normalized pin — same reason as `finished_meta`:
+                    // the in-flight row must name what actually goes on the wire.
                     Some(crate::provider::openrouter::resolve_model(
                         ctx.model.as_deref(),
-                        &state.config.openrouter.default_model,
+                        state.openrouter.model(),
                     )),
                     claude_effort(&ctx.body),
                     false,
@@ -1097,25 +1105,18 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // back to the legacy credential check (translate accounts stay the
         // cross-group overflow pool).
         let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
-        // TRANSLATE = codex/grok only (Messages↔Responses + an SSE converter).
-        // OpenRouter serves the Anthropic Messages format NATIVELY
-        // (docs/openrouter/spec.md §"Why this is NOT a translator"), so it
-        // rides the passthrough branch below with a different endpoint,
-        // credential and a `model`-field rewrite — no converter, no SSE
-        // transform. Getting this wrong is a whole-body corruption, not a
-        // degradation, which is why it is a `matches!` over the two real
-        // translators rather than `!= Claude`.
-        let is_translate = matches!(served, BackendGroup::Codex | BackendGroup::Grok);
-        // The Messages-only endpoint guard is a WIDER set than `is_translate`:
-        // it covers every non-anthropic group, openrouter included. OpenRouter
-        // has no `count_tokens` — `POST /api/v1/messages/count_tokens` live-
-        // probes 404 (2026-08-21) — and Claude Code calls that endpoint
-        // routinely, so passing it through would surface a hard error on every
-        // context measurement. Answer it locally, exactly as codex/grok do.
-        let messages_only = matches!(
-            served,
-            BackendGroup::Codex | BackendGroup::Grok | BackendGroup::OpenRouter
-        );
+        // Two INDEPENDENT questions, each owned by an exhaustive predicate on
+        // `BackendGroup` so a fifth group cannot answer one and silently
+        // inherit the other (see routing.rs — that conflation already cost one
+        // defect in this very feature).
+        //   - needs_body_translation: codex/grok only. OpenRouter serves the
+        //     Anthropic Messages format natively, so it rides the passthrough
+        //     branch below with a different endpoint, credential and a
+        //     `model`-field rewrite — no converter, no SSE transform.
+        //   - serves_messages_only: every non-anthropic group, openrouter
+        //     included — no count_tokens sibling upstream.
+        let is_translate = served.needs_body_translation();
+        let messages_only = served.serves_messages_only();
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
@@ -1195,13 +1196,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
             }
         };
-        // Raw-io 4-payload capture (UI-8): on the translate path the proxy
-        // REWRITES the payload, so the upstream request differs from the
-        // client's — keep the rewritten half for the raw viewer. The
-        // passthrough forwards the client's bytes verbatim → `None` (the
-        // 2-payload case). Built only when capture is on (`Bytes` clone is
-        // refcounted — cheap either way).
-        let upstream_meta = if is_translate && ctx.raw_io_path(state).is_some() {
+        // Raw-io 4-payload capture (UI-8): whenever the proxy REWRITES the
+        // payload the upstream request differs from the client's, so the
+        // rewritten half must be kept for the raw viewer. That is true of the
+        // translate path AND of openrouter — which is not a translator but
+        // still swaps the `model` field, drops the anthropic-only betas, and
+        // targets a different host with a different credential. Gating this on
+        // `is_translate` alone would render an openrouter exchange as the
+        // 2-payload byte-identity view and hide what actually went on the
+        // wire, which is exactly the evidence a model-routing incident needs.
+        // The anthropic passthrough stays 2-payload (its `normalize_body` is a
+        // client-annotation strip, not a routing decision).
+        let rewrites_payload = is_translate || served == BackendGroup::OpenRouter;
+        let upstream_meta = if rewrites_payload && ctx.raw_io_path(state).is_some() {
             Some(UpstreamMeta {
                 url: format!("{}{}", endpoint.trim_end_matches('/'), upstream_req.path),
                 headers: redacted_header_pairs(&upstream_req.headers),

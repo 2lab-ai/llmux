@@ -1149,7 +1149,7 @@ fn default_openrouter_upstream() -> String {
 /// Default free-model pin the bare `or` alias resolves to. Must stay in sync
 /// with `provider::openrouter::OPENROUTER_DEFAULT_MODEL`.
 fn default_openrouter_model() -> String {
-    "stealth/ox-alpha".to_string()
+    crate::catalog::OPENROUTER_DEFAULT_PIN.to_string()
 }
 
 fn default_port() -> u16 {
