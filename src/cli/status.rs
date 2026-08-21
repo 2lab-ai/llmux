@@ -110,8 +110,10 @@ fn render(
 }
 
 /// `version_string` is "llmux X (channel id)" — drop the binary name
-/// for display (the section labels already say whose version it is).
-fn display_version(version: &str) -> &str {
+/// for display (the surrounding text already says whose version it is).
+/// Shared with `update` so every version line strips the same way: `status`
+/// prints the client/server pair, `update` the installed/server pair.
+pub(super) fn display_version(version: &str) -> &str {
     version.strip_prefix("llmux ").unwrap_or(version)
 }
 
