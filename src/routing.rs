@@ -2,11 +2,15 @@
 //!
 //! An inbound Anthropic Messages request names a `model`; this module maps
 //! that name to a [`BackendGroup`] — the pool of accounts that can serve it.
-//! Three groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
+//! Four groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
 //! served by the Anthropic provider), [`BackendGroup::Codex`] (chatgpt
-//! oauth accounts, served by the codex provider), and [`BackendGroup::Grok`]
-//! (xAI grok oauth accounts, served by the grok provider). The scheduler then
-//! picks the best eligible account *within* that group, sticky per group.
+//! oauth accounts, served by the codex provider), [`BackendGroup::Grok`]
+//! (xAI grok oauth accounts, served by the grok provider), and
+//! [`BackendGroup::OpenRouter`] (OpenRouter API-key accounts, served by the
+//! openrouter provider — a passthrough, NOT a translator, because OpenRouter
+//! exposes a native Anthropic Messages endpoint; docs/openrouter/spec.md).
+//! The scheduler then picks the best eligible account *within* that group,
+//! sticky per group.
 //!
 //! Everything here is a deterministic function of its inputs — no IO, no
 //! clock, no shared state — so it is unit-test heavy by design. The
@@ -16,34 +20,39 @@
 /// Which backend pool an account belongs to / a model routes to.
 ///
 /// `Ord` is derived so the group can key a `BTreeMap` (per-group stickiness)
-/// with a stable, total order: `Claude < Codex < Grok`. That order also makes
-/// `Claude` the representative group when a scalar must be chosen (status
-/// output picks the claude slot first) and fixes the `on_empty_group`
-/// fallback scan order (docs/grok/spec.md §R5).
+/// with a stable, total order: `Claude < Codex < Grok < OpenRouter`. That
+/// order also makes `Claude` the representative group when a scalar must be
+/// chosen (status output picks the claude slot first) and fixes the
+/// `on_empty_group` fallback scan order (docs/grok/spec.md §R5). OpenRouter is
+/// appended LAST precisely so neither of those established behaviors moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackendGroup {
     Claude,
     Codex,
     Grok,
+    OpenRouter,
 }
 
 impl BackendGroup {
     /// Group an account belongs to, derived from its credential `kind`
-    /// (`"oauth" | "apikey" | "codex" | "grok"` — see
+    /// (`"oauth" | "apikey" | "codex" | "grok" | "openrouter"` — see
     /// [`crate::config::AccountCredential::kind`]). Codex credentials are the
-    /// Codex group, grok credentials the Grok group; everything else is Claude.
+    /// Codex group, grok credentials the Grok group, openrouter credentials
+    /// the OpenRouter group; everything else is Claude.
     pub fn from_kind(kind: &str) -> Self {
         match kind {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "openrouter" => Self::OpenRouter,
             _ => Self::Claude,
         }
     }
 
-    /// Every group, in the canonical `Ord` order (`Claude < Codex < Grok`).
-    /// Single source for "scan all groups" loops (fallback resolution,
-    /// status rendering).
-    pub const ALL: &'static [BackendGroup] = &[Self::Claude, Self::Codex, Self::Grok];
+    /// Every group, in the canonical `Ord` order
+    /// (`Claude < Codex < Grok < OpenRouter`). Single source for "scan all
+    /// groups" loops (fallback resolution, status rendering).
+    pub const ALL: &'static [BackendGroup] =
+        &[Self::Claude, Self::Codex, Self::Grok, Self::OpenRouter];
 
     /// Lowercase label for logs / status output.
     pub fn as_str(self) -> &'static str {
@@ -51,6 +60,7 @@ impl BackendGroup {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::OpenRouter => "openrouter",
         }
     }
 
@@ -61,6 +71,7 @@ impl BackendGroup {
         match label {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "openrouter" => Self::OpenRouter,
             _ => Self::Claude,
         }
     }
@@ -149,6 +160,24 @@ fn builtin_grok_rules() -> Vec<Rule> {
     vec![Rule::Prefix("grok".to_string())]
 }
 
+/// Builtin openrouter rules (docs/openrouter/spec.md §R2): the user-facing
+/// `or-` model prefix (`or-ox-alpha`, `or-glm-5.2`, `or-openai/gpt-oss-20b:free`),
+/// the bare `or` family alias (resolves to the live free-model pin, mirroring
+/// bare `grok`), and the raw `openrouter/` vendor prefix so OpenRouter's own
+/// router slugs (`openrouter/free`) route here when named verbatim.
+///
+/// Disjointness from the other builtin families is checked in the unit tests
+/// below: codex owns `gpt-`/`o1`/`o3`/`o4`/`~codex`, claude owns
+/// `claude|opus|sonnet|haiku|fable`, grok owns `grok` — none of which is a
+/// prefix of `or-` or of the bare `or`.
+fn builtin_openrouter_rules() -> Vec<Rule> {
+    vec![
+        Rule::Prefix("or-".to_string()),
+        Rule::Exact("or".to_string()),
+        Rule::Prefix("openrouter/".to_string()),
+    ]
+}
+
 /// Compiled model→group classifier. First-match-wins over the codex rules
 /// then the claude rules; an unmatched (or absent) model falls back to
 /// `default_group`. Built from config overrides when present, else builtins.
@@ -157,6 +186,7 @@ pub struct Classifier {
     codex_rules: Vec<Rule>,
     claude_rules: Vec<Rule>,
     grok_rules: Vec<Rule>,
+    openrouter_rules: Vec<Rule>,
     default_group: BackendGroup,
 }
 
@@ -169,6 +199,7 @@ impl Default for Classifier {
             codex_rules: builtin_codex_rules(),
             claude_rules: builtin_claude_rules(),
             grok_rules: builtin_grok_rules(),
+            openrouter_rules: builtin_openrouter_rules(),
             default_group: BackendGroup::Claude,
         }
     }
@@ -184,6 +215,7 @@ impl Classifier {
         claude_models: &[String],
         codex_models: &[String],
         grok_models: &[String],
+        openrouter_models: &[String],
         default_group: &str,
     ) -> Self {
         let claude_rules = if claude_models.is_empty() {
@@ -201,13 +233,20 @@ impl Classifier {
         } else {
             grok_models.iter().map(|m| Rule::parse(m)).collect()
         };
+        let openrouter_rules = if openrouter_models.is_empty() {
+            builtin_openrouter_rules()
+        } else {
+            openrouter_models.iter().map(|m| Rule::parse(m)).collect()
+        };
         Self {
             codex_rules,
             claude_rules,
             grok_rules,
+            openrouter_rules,
             default_group: match default_group.trim().to_ascii_lowercase().as_str() {
                 "codex" => BackendGroup::Codex,
                 "grok" => BackendGroup::Grok,
+                "openrouter" => BackendGroup::OpenRouter,
                 _ => BackendGroup::Claude,
             },
         }
@@ -253,6 +292,9 @@ impl Classifier {
         }
         if self.grok_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Grok;
+        }
+        if self.openrouter_rules.iter().any(|r| r.matches(&lower)) {
+            return BackendGroup::OpenRouter;
         }
         self.default_group
     }
@@ -497,7 +539,7 @@ mod tests {
         // The claude assertions above would also pass by luck of the default
         // group being claude. Re-run them with a non-claude default so the
         // padded alias must match the CLAUDE RULE, not the fallback.
-        let grok_default = Classifier::from_config(&[], &[], &[], "grok");
+        let grok_default = Classifier::from_config(&[], &[], &[], &[], "grok");
         assert_eq!(
             grok_default.classify(Some("  opus  ")),
             BackendGroup::Claude,
@@ -565,14 +607,116 @@ mod tests {
             &[
                 BackendGroup::Claude,
                 BackendGroup::Codex,
-                BackendGroup::Grok
+                BackendGroup::Grok,
+                BackendGroup::OpenRouter
             ]
         );
     }
 
     #[test]
+    fn openrouter_kind_and_label_round_trip() {
+        assert_eq!(
+            BackendGroup::from_kind("openrouter"),
+            BackendGroup::OpenRouter
+        );
+        assert_eq!(BackendGroup::OpenRouter.as_str(), "openrouter");
+        assert_eq!(
+            BackendGroup::from_label("openrouter"),
+            BackendGroup::OpenRouter
+        );
+        // OpenRouter is ordered LAST so the representative group stays Claude
+        // and the `on_empty_group` fallback scan order is unchanged.
+        assert!(BackendGroup::Grok < BackendGroup::OpenRouter);
+        assert_eq!(
+            BackendGroup::ALL.iter().min(),
+            Some(&BackendGroup::Claude),
+            "claude must remain the representative group"
+        );
+    }
+
+    #[test]
+    fn openrouter_builtin_rules_classify_the_or_family() {
+        let c = Classifier::default();
+        for model in [
+            "or-ox-alpha",
+            "or-glm-5.2",
+            "or-gpt-oss-20b",
+            // The verbatim escape hatch: a full vendor slug behind `or-`.
+            "or-openai/gpt-oss-20b:free",
+            // OpenRouter's own router slug, named without the `or-` prefix.
+            "openrouter/free",
+        ] {
+            assert_eq!(
+                c.classify(Some(model)),
+                BackendGroup::OpenRouter,
+                "{model} must route to the openrouter group"
+            );
+        }
+        // Bare family alias + the classifier's whitespace/case/[1m] handling.
+        assert_eq!(c.classify(Some("or")), BackendGroup::OpenRouter);
+        assert_eq!(c.classify(Some("  OR  ")), BackendGroup::OpenRouter);
+        assert_eq!(
+            c.classify(Some("or-ox-alpha[1m]")),
+            BackendGroup::OpenRouter
+        );
+    }
+
+    #[test]
+    fn openrouter_rules_are_disjoint_from_the_other_builtin_families() {
+        // The claim made in `builtin_openrouter_rules`'s doc comment, made
+        // mechanical: no existing family's model may be captured by the `or-`
+        // rules, and no `or-` model may be captured by an existing family.
+        // The `o1`/`o3`/`o4` codex prefixes are the near-miss worth pinning —
+        // they are PREFIXES, not an `o*` wildcard, so `or-…` never matches.
+        let c = Classifier::default();
+        for (model, expected) in [
+            ("claude-opus-5", BackendGroup::Claude),
+            ("opus", BackendGroup::Claude),
+            ("fable", BackendGroup::Claude),
+            ("gpt-5.6-sol", BackendGroup::Codex),
+            ("o3-mini", BackendGroup::Codex),
+            ("o1", BackendGroup::Codex),
+            ("sol", BackendGroup::Codex),
+            ("grok-4.6", BackendGroup::Grok),
+            ("grok", BackendGroup::Grok),
+        ] {
+            assert_eq!(
+                c.classify(Some(model)),
+                expected,
+                "{model} must NOT be captured by the openrouter rules"
+            );
+        }
+        // And the reverse direction: an `or-` id is claimed by nobody else,
+        // which is what makes the check order in `classify` irrelevant here.
+        assert_eq!(c.classify(Some("or-ox-alpha")), BackendGroup::OpenRouter);
+    }
+
+    #[test]
+    fn config_openrouter_list_replaces_builtin() {
+        let c = Classifier::from_config(&[], &[], &[], &["free-".to_string()], "claude");
+        assert_eq!(c.classify(Some("free-model-1")), BackendGroup::OpenRouter);
+        assert_eq!(
+            c.classify(Some("or-ox-alpha")),
+            BackendGroup::Claude,
+            "builtin or- prefix dropped when config provides its own openrouter list"
+        );
+    }
+
+    #[test]
+    fn openrouter_can_be_the_default_group() {
+        let c = Classifier::from_config(&[], &[], &[], &[], "openrouter");
+        assert_eq!(c.classify(None), BackendGroup::OpenRouter);
+        assert_eq!(
+            c.classify(Some("totally-unknown")),
+            BackendGroup::OpenRouter
+        );
+        // A recognized family still wins over the default.
+        assert_eq!(c.classify(Some("claude-opus-5")), BackendGroup::Claude);
+    }
+
+    #[test]
     fn c2_config_grok_list_replaces_builtin() {
-        let c = Classifier::from_config(&[], &[], &["mega-".to_string()], "claude");
+        let c = Classifier::from_config(&[], &[], &["mega-".to_string()], &[], "claude");
         assert_eq!(c.classify(Some("mega-1")), BackendGroup::Grok);
         assert_eq!(
             c.classify(Some("grok-4.5")),
@@ -583,14 +727,14 @@ mod tests {
 
     #[test]
     fn c2_default_group_grok_parses() {
-        let c = Classifier::from_config(&[], &[], &[], "grok");
+        let c = Classifier::from_config(&[], &[], &[], &[], "grok");
         assert_eq!(c.classify(None), BackendGroup::Grok);
     }
 
     #[test]
     fn config_codex_list_replaces_builtin() {
         // Config says ONLY "wizard-" is codex; gpt-5.5 is no longer codex.
-        let c = Classifier::from_config(&[], &["wizard-".to_string()], &[], "claude");
+        let c = Classifier::from_config(&[], &["wizard-".to_string()], &[], &[], "claude");
         assert_eq!(c.classify(Some("wizard-7b")), BackendGroup::Codex);
         assert_eq!(
             c.classify(Some("gpt-5.5")),
@@ -601,7 +745,7 @@ mod tests {
 
     #[test]
     fn config_claude_list_replaces_builtin() {
-        let c = Classifier::from_config(&["acme-".to_string()], &[], &[], "claude");
+        let c = Classifier::from_config(&["acme-".to_string()], &[], &[], &[], "claude");
         assert_eq!(c.classify(Some("acme-1")), BackendGroup::Claude);
         // opus is no longer a claude model under the override; with no codex
         // match it falls back to the default group (claude).
@@ -615,7 +759,7 @@ mod tests {
     fn config_can_move_a_model_across_groups() {
         // Make "opus" a CODEX model via config — config override wins over
         // the builtin claude prefix.
-        let c = Classifier::from_config(&[], &["=opus".to_string()], &[], "claude");
+        let c = Classifier::from_config(&[], &["=opus".to_string()], &[], &[], "claude");
         assert_eq!(c.classify(Some("opus")), BackendGroup::Codex);
     }
 
@@ -624,6 +768,7 @@ mod tests {
         let c = Classifier::from_config(
             &[],
             &["~special".to_string(), "=exact-model".to_string()],
+            &[],
             &[],
             "claude",
         );
@@ -638,7 +783,7 @@ mod tests {
 
     #[test]
     fn config_default_group_codex_changes_fallback() {
-        let c = Classifier::from_config(&[], &[], &[], "codex");
+        let c = Classifier::from_config(&[], &[], &[], &[], "codex");
         assert_eq!(
             c.classify(None),
             BackendGroup::Codex,

@@ -36,6 +36,17 @@ pub async fn list(args: AccountsArgs, remote: Option<String>) -> Result<(), CliE
             AccountCredential::Apikey { api_key } => {
                 println!("  [{}] {} (apikey)  {}", i + 1, account.name, mask(api_key));
             }
+            AccountCredential::OpenRouter { api_key, label } => {
+                println!(
+                    "  [{}] {} (openrouter)  {}",
+                    i + 1,
+                    account.name,
+                    mask(api_key)
+                );
+                if args.verbose && !label.is_empty() {
+                    println!("       Key label: {label}");
+                }
+            }
             AccountCredential::Oauth {
                 account_uuid,
                 expires_at_ms,

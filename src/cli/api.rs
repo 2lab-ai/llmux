@@ -46,6 +46,11 @@ pub async fn run(args: ApiArgs) -> Result<(), CliError> {
         AccountCredential::Grok { access_token, .. } => client
             .get(&url)
             .header("authorization", format!("Bearer {access_token}")),
+        // Debug GETs with an OpenRouter credential: the key IS the bearer
+        // token; the caller passes a full openrouter.ai URL (e.g. /api/v1/key).
+        AccountCredential::OpenRouter { api_key, .. } => client
+            .get(&url)
+            .header("authorization", format!("Bearer {api_key}")),
     };
 
     let response = request

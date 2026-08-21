@@ -313,6 +313,20 @@ impl ForwardContext {
                     fast: false,
                 }
             }
+            // OpenRouter is a PASSTHROUGH, so there is no per-request
+            // `request_meta` to consult — but the wire model still differs
+            // from the inbound one (`or-ox-alpha` → `stealth/ox-alpha`), and
+            // the activity log must name what actually went upstream. Effort
+            // is client metadata here exactly as on the claude passthrough.
+            Some(BackendGroup::OpenRouter) => FinishedMeta {
+                group: Some("openrouter".to_string()),
+                model: Some(crate::provider::openrouter::resolve_model(
+                    self.model.as_deref(),
+                    &state.config.openrouter.default_model,
+                )),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
             Some(BackendGroup::Claude) => FinishedMeta {
                 group: Some("claude".to_string()),
                 model: self.model.clone(),
@@ -1015,6 +1029,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     let (model, effort) = state.grok.request_meta(&ctx.body);
                     (Some("grok".to_string()), Some(model), effort, false)
                 }
+                BackendGroup::OpenRouter => (
+                    Some("openrouter".to_string()),
+                    Some(crate::provider::openrouter::resolve_model(
+                        ctx.model.as_deref(),
+                        &state.config.openrouter.default_model,
+                    )),
+                    claude_effort(&ctx.body),
+                    false,
+                ),
                 BackendGroup::Claude => (
                     Some("claude".to_string()),
                     ctx.model.clone(),
@@ -1073,7 +1096,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // back to the legacy credential check (translate accounts stay the
         // cross-group overflow pool).
         let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
-        let is_translate = served != BackendGroup::Claude;
+        // TRANSLATE = codex/grok only (Messages↔Responses + an SSE converter).
+        // OpenRouter serves the Anthropic Messages format NATIVELY
+        // (docs/openrouter/spec.md §"Why this is NOT a translator"), so it
+        // rides the passthrough branch below with a different endpoint,
+        // credential and a `model`-field rewrite — no converter, no SSE
+        // transform. Getting this wrong is a whole-body corruption, not a
+        // degradation, which is why it is a `matches!` over the two real
+        // translators rather than `!= Claude`.
+        let is_translate = matches!(served, BackendGroup::Codex | BackendGroup::Grok);
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
@@ -1122,13 +1153,23 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     .grok
                     .build_request(&ctx.body, &credential)
                     .map(|out| (out, state.grok.endpoint().to_string())),
-                BackendGroup::Claude => unreachable!("is_translate excludes claude"),
+                BackendGroup::Claude | BackendGroup::OpenRouter => {
+                    unreachable!("is_translate excludes claude and openrouter")
+                }
             };
             match built {
                 Ok(((req, client_stream), endpoint)) => {
                     translate_stream = Some(client_stream);
                     (req, endpoint)
                 }
+                Err(err) => {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return rewrite_error(state, ctx, err.to_string());
+                }
+            }
+        } else if served == BackendGroup::OpenRouter {
+            match build_openrouter_request(state, ctx, &credential).await {
+                Ok(req) => (req, state.openrouter.endpoint().to_string()),
                 Err(err) => {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                     return rewrite_error(state, ctx, err.to_string());
@@ -1676,13 +1717,15 @@ fn resolve_group(
 }
 
 /// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth`,
-/// `Codex`, and `Grok` all rotate access tokens; `Apikey` never expires.
+/// `Codex`, and `Grok` all rotate access tokens. `Apikey` never expires, and
+/// neither does `OpenRouter` — its PKCE exchange yields a long-lived API key
+/// rather than an access/refresh pair (docs/openrouter/spec.md §R1).
 fn refreshable_expiry(credential: &AccountCredential) -> Option<u64> {
     match credential {
         AccountCredential::Oauth { expires_at_ms, .. }
         | AccountCredential::Codex { expires_at_ms, .. }
         | AccountCredential::Grok { expires_at_ms, .. } => Some(*expires_at_ms),
-        AccountCredential::Apikey { .. } => None,
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
     }
 }
 
@@ -1747,7 +1790,11 @@ pub(crate) async fn refresh_credential(
             // no-coalescer rationale as codex (C8).
             crate::auth::grok::refresh_grok_at(&state.client, token_endpoint, refresh_token).await
         }
-        AccountCredential::Apikey { .. } => return RefreshOutcome::Failed,
+        // Nothing to refresh: an anthropic API key and an OpenRouter key are
+        // both long-lived secrets, not rotating tokens.
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
+            return RefreshOutcome::Failed
+        }
     };
     match outcome {
         Ok(tokens) => {
@@ -1810,7 +1857,9 @@ pub(crate) async fn refresh_credential(
                     },
                     non_empty_or(subject, &account.0),
                 ),
-                AccountCredential::Apikey { .. } => unreachable!("filtered above"),
+                AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
+                    unreachable!("filtered above")
+                }
             };
             state.pool.update_credential(account, fresh.clone());
             state.emit(ActivityEvent::TokenRefreshed {
@@ -1890,6 +1939,29 @@ async fn build_upstream_request(
     let mut upstream_req = state.provider.request_in(unified)?;
     strip_hop_by_hop(&mut upstream_req.headers);
     state.provider.auth(&mut upstream_req, credential).await?;
+    Ok(upstream_req)
+}
+
+/// The openrouter twin of [`build_upstream_request`]: the same four provider
+/// hooks, but through [`AppState::openrouter`] so the request gets the
+/// OpenRouter base URL, a `Bearer sk-or-…` credential, and the `or-…` →
+/// upstream-slug `model` rewrite. Still a PASSTHROUGH — the Messages body
+/// leaves in the Anthropic wire format it arrived in.
+async fn build_openrouter_request(
+    state: &AppState,
+    ctx: &ForwardContext,
+    credential: &AccountCredential,
+) -> Result<ProviderRequest, crate::provider::ProviderError> {
+    let wire = AnthropicRequest {
+        method: ctx.method.clone(),
+        path: ctx.path_query.clone(),
+        headers: ctx.headers.clone(),
+        body: ctx.body.clone(),
+    };
+    let unified = state.openrouter.request_out(wire)?;
+    let mut upstream_req = state.openrouter.request_in(unified)?;
+    strip_hop_by_hop(&mut upstream_req.headers);
+    state.openrouter.auth(&mut upstream_req, credential).await?;
     Ok(upstream_req)
 }
 

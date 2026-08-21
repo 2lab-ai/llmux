@@ -29,6 +29,9 @@ pub enum LoginProvider {
     /// localhost callback; the daemon polls while the user approves in the
     /// browser).
     Grok,
+    /// OpenRouter OAuth PKCE (browser), yielding a long-lived API key
+    /// (docs/openrouter/spec.md §R5).
+    OpenRouter,
 }
 
 impl LoginProvider {
@@ -39,6 +42,7 @@ impl LoginProvider {
             "claude" | "oauth" | "anthropic" => Some(Self::Claude),
             "codex" | "chatgpt" | "openai" => Some(Self::Codex),
             "grok" | "xai" | "x-ai" => Some(Self::Grok),
+            "openrouter" | "open-router" | "or" => Some(Self::OpenRouter),
             _ => None,
         }
     }
@@ -49,6 +53,7 @@ impl LoginProvider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::OpenRouter => "openrouter",
         }
     }
 }

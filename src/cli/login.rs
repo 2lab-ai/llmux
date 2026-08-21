@@ -1,6 +1,6 @@
-//! `llmux login [--api | --codex | --grok]` — add an account.
+//! `llmux login [--api | --codex | --grok | --openrouter]` — add an account.
 
-use crate::auth::{codex, oauth, profile};
+use crate::auth::{codex, oauth, openrouter, profile, AuthError};
 use crate::config::{AccountConfig, AccountCredential, Config, Upsert};
 
 use super::{prompt_line, CliError, LoginArgs};
@@ -10,8 +10,12 @@ use super::{prompt_line, CliError, LoginArgs};
 /// `--api` path: prompt for an API key, store as an apikey account.
 /// `--codex` path: ChatGPT OAuth browser flow → upsert a Codex account.
 /// `--grok` path: xAI device-code flow → upsert a Grok account.
+/// `--openrouter` path: OpenRouter PKCE browser flow (or `--paste`) →
+/// upsert an `or:<label>` account.
 pub async fn run(args: LoginArgs) -> Result<(), CliError> {
-    if args.grok {
+    if args.openrouter {
+        login_openrouter(args.paste).await
+    } else if args.grok {
         login_grok().await
     } else if args.codex {
         login_codex().await
@@ -218,6 +222,97 @@ async fn login_grok() -> Result<(), CliError> {
     }
     println!("Saved to {}", crate::config::config_path()?.display());
     Ok(())
+}
+
+/// `--openrouter`: mint (or accept) an OpenRouter API key and upsert an
+/// `or:<label>` account (docs/openrouter/spec.md §R5).
+///
+/// `paste = true` skips the browser and prompts for an existing key; the
+/// browser flow also degrades to that prompt when it cannot run at all
+/// (no browser / callback timeout), so a headless box is never a dead end.
+/// The key itself is never printed — only the derived account name is.
+/// Account name for an OpenRouter login: `or:<key label>` when introspection
+/// returned one, else `or:key-N` numbered against `config`'s existing
+/// `or:key-*` accounts (same rule as `api-N` / `claude:account-N`).
+///
+/// SHARED with the daemon-side login (`proxy::server::run_login`) so the CLI
+/// and the dashboard switcher cannot drift into two naming schemes — the first
+/// cut of the daemon arm hardcoded a label-less `or:key`, which would have made
+/// every unlabeled dashboard login overwrite the previous one.
+pub(crate) fn openrouter_account_name(config: &Config, label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() {
+        let n = config
+            .accounts
+            .iter()
+            .filter(|a| a.name.starts_with("or:key-"))
+            .count()
+            + 1;
+        format!("or:key-{n}")
+    } else {
+        format!("or:{label}")
+    }
+}
+
+async fn login_openrouter(paste: bool) -> Result<(), CliError> {
+    crate::config::load_or_init()?;
+    let client = reqwest::Client::new();
+
+    let api_key = if paste {
+        prompt_openrouter_key()?
+    } else {
+        println!("Starting OpenRouter OAuth login...");
+        match openrouter::login_interactive(&client).await {
+            Ok(key) => key,
+            // Aborted/Io = the flow could not complete locally (no browser,
+            // timeout, port bind). A token-endpoint or transport failure is a
+            // real error and propagates instead of silently asking for a key.
+            Err(err @ (AuthError::Aborted(_) | AuthError::Io(_))) => {
+                eprintln!("warning: interactive OpenRouter login failed ({err})");
+                eprintln!("falling back to manual key entry");
+                prompt_openrouter_key()?
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+
+    // Cosmetic only: a failed introspection degrades to the `or:key-N` name.
+    let label = openrouter::fetch_key_label(&client, openrouter::KEY_INFO_URL, &api_key)
+        .await
+        .unwrap_or_default();
+
+    let mut final_name = String::new();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        // Numbering is resolved against the fresh on-disk state so unlabeled
+        // logins don't overwrite each other (same rule as `api-N`).
+        let name = openrouter_account_name(config, &label);
+        final_name = name.clone();
+        outcome = config.upsert_account(AccountConfig {
+            name,
+            credential: AccountCredential::OpenRouter {
+                api_key: api_key.clone(),
+                label: label.clone(),
+            },
+        });
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added account {final_name:?}"),
+        Upsert::Updated => println!("Updated account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// Prompt for an `sk-or-v1-…` key (stderr prompt, stdin read) — the shape
+/// `login_api` uses. Echoing the key back is deliberately not done.
+fn prompt_openrouter_key() -> Result<String, CliError> {
+    let api_key = prompt_line("OpenRouter API key (sk-or-v1-…): ")?;
+    if api_key.is_empty() {
+        return Err(CliError::Message("no API key provided".into()));
+    }
+    Ok(api_key)
 }
 
 /// Import `~/.codex/auth.json` (when present) and rename it to the

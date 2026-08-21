@@ -44,6 +44,11 @@ pub struct Config {
     /// Additive (`#[serde(default)]`): pre-grok configs load with defaults.
     #[serde(default)]
     pub grok: GrokConfig,
+    /// OpenRouter backend endpoint + free-model pin (used only by
+    /// `type: "openrouter"` accounts). Additive: pre-openrouter configs load
+    /// with defaults (docs/openrouter/spec.md §R4).
+    #[serde(default)]
+    pub openrouter: OpenRouterConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Model→backend-group routing (default: disabled — exactly today's
@@ -308,6 +313,7 @@ impl Default for Config {
             upstream: default_upstream(),
             codex: CodexConfig::default(),
             grok: GrokConfig::default(),
+            openrouter: OpenRouterConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),
@@ -463,13 +469,19 @@ pub struct RoutingConfig {
     /// Additive: pre-grok configs load with the builtin `grok` prefix rule.
     #[serde(default)]
     pub grok_models: Vec<String>,
+    /// Models routed to the openrouter group (empty → builtin `or-` / bare
+    /// `or` / `openrouter/` rules). Additive: pre-openrouter configs load
+    /// with those builtins (docs/openrouter/spec.md §R2).
+    #[serde(default)]
+    pub openrouter_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.
     #[serde(default = "default_routing_group")]
     pub default_group: String,
     /// What to do when the matched group has ZERO CONFIGURED accounts
     /// (parked/limited accounts still count as configured): `"error"`
     /// (default) returns a clean 404 not_found_error; `"fallback"` tries the
-    /// remaining groups in the fixed `Claude → Codex → Grok` order and the
+    /// remaining groups in the fixed `Claude → Codex → Grok → OpenRouter`
+    /// order and the
     /// first group with ≥1 configured account serves the request under its
     /// own provider semantics (docs/grok/spec.md §R5).
     #[serde(default = "default_on_empty_group")]
@@ -483,6 +495,7 @@ impl Default for RoutingConfig {
             claude_models: Vec::new(),
             codex_models: Vec::new(),
             grok_models: Vec::new(),
+            openrouter_models: Vec::new(),
             default_group: default_routing_group(),
             on_empty_group: default_on_empty_group(),
         }
@@ -591,6 +604,40 @@ impl Default for GrokConfig {
             client_model: None,
             reasoning_effort: None,
             trace: false,
+        }
+    }
+}
+
+/// OpenRouter backend endpoint + free-model pin (docs/openrouter/spec.md §R4).
+///
+/// Deliberately much thinner than [`GrokConfig`]/[`CodexConfig`]: OpenRouter
+/// speaks the **Anthropic Messages** wire format natively
+/// (`POST {upstream}/messages`, live-probed 2026-08-21), so llmux does not
+/// shape the request at all beyond rewriting the `model` field. There is
+/// therefore no `reasoning_effort` / `fast` / `trace` knob here — effort rides
+/// through as client metadata exactly as it does on the claude passthrough.
+///
+/// There is also no token endpoint: the OAuth PKCE exchange yields a
+/// long-lived API key (`sk-or-v1-…`), not an expiring access token, so the
+/// credential never needs refreshing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRouterConfig {
+    /// Base URL the client's verbatim path is appended to — i.e. the request
+    /// goes to `{upstream}/v1/messages`. Host root, NOT `…/api/v1`; see
+    /// [`default_openrouter_upstream`].
+    #[serde(default = "default_openrouter_upstream")]
+    pub upstream: String,
+    /// Slug the bare `or` family alias resolves to — the free-model pin.
+    /// Mirrors bare `grok` resolving to the live grok pin.
+    #[serde(default = "default_openrouter_model")]
+    pub default_model: String,
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_openrouter_upstream(),
+            default_model: default_openrouter_model(),
         }
     }
 }
@@ -875,6 +922,26 @@ pub enum AccountCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_refresh_ms: Option<u64>,
     },
+    /// OpenRouter API key (`sk-or-v1-…`), minted by the OAuth PKCE flow
+    /// (`llmux login --openrouter`) or pasted by hand. Served by the
+    /// openrouter provider (docs/openrouter/spec.md §R1).
+    ///
+    /// NO refresh fields: OpenRouter's PKCE exchange returns a long-lived key
+    /// rather than an expiring access token, so this credential is closer to
+    /// [`Self::Apikey`] than to the oauth-style variants.
+    ///
+    /// NOTE downgrade contract: a config containing this variant does not
+    /// parse under pre-openrouter binaries (internally-tagged enum) — remove
+    /// `or:*` accounts before downgrading.
+    OpenRouter {
+        /// The `sk-or-v1-…` key.
+        api_key: String,
+        /// Key label from `GET /api/v1/key` (empty when unavailable). Used
+        /// only for the account NAME; it is not a dedup key — OpenRouter
+        /// labels are not unique per key.
+        #[serde(default)]
+        label: String,
+    },
 }
 
 impl AccountCredential {
@@ -885,6 +952,7 @@ impl AccountCredential {
             Self::Apikey { .. } => "apikey",
             Self::Codex { .. } => "codex",
             Self::Grok { .. } => "grok",
+            Self::OpenRouter { .. } => "openrouter",
         }
     }
 
@@ -902,7 +970,7 @@ impl AccountCredential {
             | Self::Grok {
                 last_refresh_ms, ..
             } => *last_refresh_ms,
-            Self::Apikey { .. } => None,
+            Self::Apikey { .. } | Self::OpenRouter { .. } => None,
         }
     }
 
@@ -1020,7 +1088,9 @@ impl Config {
                 *lr = Some(refreshed_at_ms);
                 true
             }
-            AccountCredential::Apikey { .. } => false,
+            // Nothing to rotate: an anthropic API key and an OpenRouter key
+            // are long-lived secrets, not access/refresh pairs.
+            AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => false,
         }
     }
 }
@@ -1058,6 +1128,28 @@ fn default_grok_upstream() -> String {
 /// `provider::grok::GROK_MODEL`.
 fn default_grok_model() -> String {
     "grok-4.6".to_string()
+}
+
+/// Default OpenRouter base URL.
+///
+/// It is the host root **before** `/v1`, exactly like `upstream`
+/// (`https://api.anthropic.com`) — because the proxy appends the CLIENT's
+/// verbatim path (`/v1/messages`) to it, so the wire URL composes to
+/// `https://openrouter.ai/api/v1/messages`, the real Anthropic-compatible
+/// endpoint.
+///
+/// Getting this wrong is silent and total: with `…/api/v1` here the request
+/// goes to `…/api/v1/v1/messages`, which live-probes **404** while the correct
+/// URL probes 401 (2026-08-21). `openrouter_upstream_composes_the_real_endpoint`
+/// in `provider::openrouter` pins the composition.
+fn default_openrouter_upstream() -> String {
+    "https://openrouter.ai/api".to_string()
+}
+
+/// Default free-model pin the bare `or` alias resolves to. Must stay in sync
+/// with `provider::openrouter::OPENROUTER_DEFAULT_MODEL`.
+fn default_openrouter_model() -> String {
+    "stealth/ox-alpha".to_string()
 }
 
 fn default_port() -> u16 {

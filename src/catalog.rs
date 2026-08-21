@@ -58,7 +58,7 @@ pub struct ModelEntry {
     pub efforts: &'static [&'static str],
     /// Context window in tokens, or `None` when unpublished.
     pub max_context: Option<u64>,
-    /// Backend group: `claude`, `codex`, or `grok`.
+    /// Backend group: `claude`, `codex`, `grok`, or `openrouter`.
     pub group: &'static str,
 }
 
@@ -114,6 +114,116 @@ const GROK_MODELS: &[(&str, &str, u64)] = &[
     ("grok-4.5", "Grok 4.5", 500_000),
 ];
 
+// ---- openrouter effort menus (live `GET /api/v1/models`
+//      `reasoning.supported_efforts`, 2026-08-21, re-sorted low→high) ----
+const OR_EFFORTS_OX: &[&str] = &["low", "high", "max"];
+const OR_EFFORTS_GLM: &[&str] = &["high", "xhigh"];
+const OR_EFFORTS_NEMOTRON_ULTRA: &[&str] = &["medium", "high"];
+const OR_EFFORTS_GPT_OSS: &[&str] = &["low", "medium", "high"];
+const OR_EFFORTS_NONE: &[&str] = &[];
+
+/// The curated OpenRouter catalog — SSOT for BOTH the `/models` rows and the
+/// `or-…` → upstream-slug resolution in [`crate::provider::openrouter`].
+///
+/// Column 0 is the id llmux ADVERTISES and the client SENDS (`or-ox-alpha`);
+/// column 1 is the OpenRouter slug it is rewritten to on the wire
+/// (`stealth/ox-alpha`). They differ on purpose: the advertised id must match
+/// the `or-` routing rule (docs/openrouter/spec.md §R2) so Claude Code's model
+/// picker produces something that actually routes to this group, while the
+/// wire slug is whatever OpenRouter calls the model.
+///
+/// This table is a CONVENIENCE layer, not a gate — `or-<vendor>/<slug>` passes
+/// through verbatim for the ~400 models not listed here (spec §R3 step 3).
+///
+/// Tuple = (advertised id, upstream slug, display name, max_context, efforts).
+/// Every value is from the live `GET /api/v1/models` probe on 2026-08-21.
+pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
+    (
+        "or-ox-alpha",
+        "stealth/ox-alpha",
+        "Ox Alpha (free)",
+        1_048_576,
+        OR_EFFORTS_OX,
+    ),
+    (
+        "or-free",
+        "openrouter/free",
+        "OpenRouter Free Models Router",
+        200_000,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-glm-5.2",
+        "z-ai/glm-5.2:free",
+        "Z.ai GLM 5.2 (free)",
+        256_000,
+        OR_EFFORTS_GLM,
+    ),
+    (
+        "or-nemotron-3-ultra",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "NVIDIA Nemotron 3 Ultra (free)",
+        1_000_000,
+        OR_EFFORTS_NEMOTRON_ULTRA,
+    ),
+    (
+        "or-nemotron-3.5-lightning",
+        "nvidia/nemotron-3.5-lightning:free",
+        "NVIDIA Nemotron 3.5 Lightning (free)",
+        1_000_000,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-dots-3-note",
+        "dots-studio/dots-3-note-preview:free",
+        "Dots3-Note Preview (free)",
+        512_000,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-laguna-s-2.1",
+        "poolside/laguna-s-2.1:free",
+        "Poolside Laguna S 2.1 (free)",
+        262_144,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-north-mini-code",
+        "cohere/north-mini-code:free",
+        "Cohere North Mini Code (free)",
+        256_000,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-gemma-4-31b",
+        "google/gemma-4-31b-it:free",
+        "Google Gemma 4 31B (free)",
+        262_144,
+        OR_EFFORTS_NONE,
+    ),
+    (
+        "or-gpt-oss-20b",
+        "openai/gpt-oss-20b:free",
+        "OpenAI gpt-oss-20b (free)",
+        131_072,
+        OR_EFFORTS_GPT_OSS,
+    ),
+];
+
+/// Resolve a curated OpenRouter advertised id (`or-ox-alpha`) to its upstream
+/// slug (`stealth/ox-alpha`), or `None` when it is not curated — the provider
+/// then applies the verbatim-passthrough rules of spec §R3.
+///
+/// Trimmed and ASCII-lowercased before matching, matching the classifier's
+/// normalization so an id that ROUTES here also RESOLVES here.
+pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
+    let needle = model.trim().to_ascii_lowercase();
+    OPENROUTER_MODELS
+        .iter()
+        .find(|(id, ..)| *id == needle.as_str())
+        .map(|&(_, slug, ..)| slug)
+}
+
 /// Resolve a curated claude ALIAS (`opus`, `opus-5`, `sonnet`, `haiku`, …) to
 /// its catalog id, or `None` when `model` is not an alias (a real id, or any
 /// foreign slug — those must pass through untouched). Trimmed and
@@ -145,7 +255,7 @@ pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
 /// context null. `codex_pin` is unused for aliasing (a model-less codex request
 /// uses the pin directly, which is not an alias) — accepted for symmetry /
 /// future use.
-pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
+pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<ModelEntry> {
     let mut entries = Vec::new();
 
     // ---- claude (user-curated 2026-07-27) ----
@@ -256,6 +366,41 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str) -> Vec<ModelEntry> {
         });
     }
 
+    // ---- openrouter (curated free set, live probe 2026-08-21) ----
+    // The bare `"or"` family alias rides the pin exactly like `"grok"` does:
+    // the curated row whose UPSTREAM SLUG equals `openrouter_pin` carries it,
+    // so at most one row owns it. When the pin is outside the curated set a
+    // synthesized row is appended so the alias is never orphaned.
+    let mut or_pin_owned = false;
+    for &(id, slug, name, ctx, efforts) in OPENROUTER_MODELS {
+        let owns_alias = slug == openrouter_pin;
+        or_pin_owned |= owns_alias;
+        entries.push(ModelEntry {
+            id: Cow::Borrowed(id),
+            aliases: if owns_alias {
+                vec!["or".to_string()]
+            } else {
+                Vec::new()
+            },
+            name: Cow::Borrowed(name),
+            efforts,
+            max_context: Some(ctx),
+            group: "openrouter",
+        });
+    }
+    if !or_pin_owned {
+        // A config can pin ANY OpenRouter slug; advertise it under the id a
+        // client can actually type (`or-<slug>`), metadata unknown.
+        entries.push(ModelEntry {
+            id: Cow::Owned(format!("or-{openrouter_pin}")),
+            aliases: vec!["or".to_string()],
+            name: Cow::Owned(openrouter_pin.to_string()),
+            efforts: OR_EFFORTS_NONE,
+            max_context: None,
+            group: "openrouter",
+        });
+    }
+
     entries
 }
 
@@ -298,11 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_16_entries() {
-        // The pinned (curated) case: exactly 16 rows, claude ids in order.
-        // 14 before the codex `[1m]` pair landed (2026-08-21).
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 16);
+    fn catalog_matches_user_contract_26_entries() {
+        // The pinned (curated) case: exactly 26 rows, claude ids in order.
+        // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
+        // 10 curated openrouter free rows landed (2026-08-21).
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(entries.len(), 26);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -325,20 +471,22 @@ mod tests {
 
     #[test]
     fn catalog_groups_in_canonical_order() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let groups: Vec<&str> = entries.iter().map(|e| e.group).collect();
         let first_codex = groups.iter().position(|g| *g == "codex").unwrap();
         let first_grok = groups.iter().position(|g| *g == "grok").unwrap();
+        let first_or = groups.iter().position(|g| *g == "openrouter").unwrap();
         assert!(groups[..first_codex].iter().all(|g| *g == "claude"));
         assert!(groups[first_codex..first_grok]
             .iter()
             .all(|g| *g == "codex"));
-        assert!(groups[first_grok..].iter().all(|g| *g == "grok"));
+        assert!(groups[first_grok..first_or].iter().all(|g| *g == "grok"));
+        assert!(groups[first_or..].iter().all(|g| *g == "openrouter"));
     }
 
     #[test]
     fn claude_entries_carry_curated_efforts_and_context() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         for e in entries.iter().filter(|e| e.group == "claude") {
             assert_eq!(
                 e.efforts,
@@ -454,7 +602,7 @@ mod tests {
 
     #[test]
     fn curated_grok_rows_carry_context_and_efforts() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         // grok-4.6: live /v1/models probe 2026-08-13 (ctx 500000).
         let g46 = find(&entries, "grok-4.6");
         assert_eq!(g46.name, "Grok 4.6");
@@ -470,18 +618,18 @@ mod tests {
     #[test]
     fn grok_family_alias_follows_the_pin() {
         // Default pin: the newest curated row owns the alias.
-        let pinned = catalog("grok-4.6", "gpt-5.6-sol");
+        let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(find(&pinned, "grok-4.6").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
 
         // The older curated row can be pinned too — the alias moves to it.
-        let pinned = catalog("grok-4.5", "gpt-5.6-sol");
+        let pinned = catalog("grok-4.5", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(find(&pinned, "grok-4.5").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
 
         // Out-of-catalog pin: alias moves to the synthesized row, and NEITHER
         // curated row keeps it.
-        let pinned = catalog("grok-4.3", "gpt-5.6-sol");
+        let pinned = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
         assert_eq!(find(&pinned, "grok-4.3").aliases, vec!["grok".to_string()]);
@@ -489,10 +637,10 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 16.
+        // A curated pin: no synthesized row, alias on the static row, count 26.
         for (pin, owner) in [("grok-4.6", "grok-4.6"), ("grok-4.5", "grok-4.5")] {
-            let entries = catalog(pin, "gpt-5.6-sol");
-            assert_eq!(entries.len(), 16, "pin {pin}");
+            let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
+            assert_eq!(entries.len(), 26, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -506,8 +654,8 @@ mod tests {
     fn out_of_catalog_pin_synthesizes_a_null_metadata_row() {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
-        let entries = catalog("grok-code-fast-1", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 17);
+        let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(entries.len(), 27);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -519,16 +667,22 @@ mod tests {
         assert_eq!(synth.max_context, None);
         assert_eq!(synth.efforts, &[] as &[&str], "unknown id → no efforts");
         assert_eq!(synth.group, "grok");
-        // Appended after the curated grok rows (last entry).
-        assert_eq!(entries.last().unwrap().id, "grok-code-fast-1");
+        // Appended after the curated grok rows — i.e. the LAST grok row (the
+        // openrouter block follows the whole grok block, so this is no longer
+        // the last entry of the catalog).
+        let last_grok = entries
+            .iter()
+            .rfind(|e| e.group == "grok")
+            .expect("at least one grok row");
+        assert_eq!(last_grok.id, "grok-code-fast-1");
     }
 
     #[test]
     fn synthesized_pin_keeps_known_thinking_levels() {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
-        let entries = catalog("grok-4.3", "gpt-5.6-sol");
-        assert_eq!(entries.len(), 17);
+        let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(entries.len(), 27);
         // Both curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.6").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.5").max_context, Some(500_000));
@@ -540,7 +694,7 @@ mod tests {
 
     #[test]
     fn gpt_5_6_sol_aliases_context_and_effort_count() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let sol = find(&entries, "gpt-5.6-sol");
         assert_eq!(sol.aliases, vec!["sol".to_string(), "gpt-5.6".to_string()]);
         assert_eq!(sol.max_context, Some(372_000));
@@ -555,7 +709,7 @@ mod tests {
         // rejected; terra: 555,029 accepted, no ceiling found). The base rows
         // keep the openai/codex catalog's 372,000 (the non-opt-in
         // denominator).
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         for (id, name) in [
             ("gpt-5.6-sol[1m]", "GPT-5.6-Sol [1M]"),
             ("gpt-5.6-terra[1m]", "GPT-5.6-Terra [1M]"),
@@ -581,7 +735,7 @@ mod tests {
 
     #[test]
     fn dropped_ids_are_absent() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         for gone in [
             "gpt-5.5-codex",
             "gpt-5-codex",
@@ -599,7 +753,7 @@ mod tests {
 
     #[test]
     fn entry_serializes_with_all_required_fields() {
-        let entries = catalog("grok-4.5", "gpt-5.6-sol");
+        let entries = catalog("grok-4.5", "gpt-5.6-sol", "stealth/ox-alpha");
         let value = serde_json::to_value(find(&entries, "grok-4.5")).unwrap();
         let obj = value.as_object().unwrap();
         // Required keys present (additive evolution may add more).
@@ -616,7 +770,7 @@ mod tests {
         );
 
         // Same contract for the newer curated row, pinned so it owns the alias.
-        let entries = catalog("grok-4.6", "gpt-5.6-sol");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let json = serde_json::to_string(find(&entries, "grok-4.6")).unwrap();
         assert_eq!(
             json,

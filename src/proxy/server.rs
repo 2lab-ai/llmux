@@ -152,6 +152,10 @@ pub struct AppState {
     /// xAI grok provider (docs/grok/spec.md): live-mutable shape behind
     /// `POST /llmux/grok`, same contract as `codex`.
     pub grok: Arc<crate::provider::grok::GrokProvider>,
+    /// OpenRouter provider (docs/openrouter/spec.md). A PASSTHROUGH like
+    /// [`Self::provider`] — not a translator — differing only in base URL,
+    /// credential shape, and the `or-…` → upstream-slug `model` rewrite.
+    pub openrouter: Arc<crate::provider::openrouter::OpenRouterProvider>,
     /// On-demand idle-account usage probe (issue #21). Fires at most one
     /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
     /// ranking/display has real 5h/7d data. Enabled by default (#45;
@@ -291,6 +295,10 @@ impl AppState {
             config.grok.upstream.clone(),
             crate::provider::grok::GrokShape::from_config(&config.grok),
         ));
+        let openrouter = Arc::new(crate::provider::openrouter::OpenRouterProvider::new(
+            config.openrouter.upstream.clone(),
+            config.openrouter.default_model.clone(),
+        ));
         // On-demand idle probe (issue #21): reuses the same client + provider
         // hooks the forward path uses to send one gated `max_tokens = 1` ping.
         let idle_prober = Arc::new(IdleProber::new(
@@ -310,6 +318,7 @@ impl AppState {
             &config.routing.claude_models,
             &config.routing.codex_models,
             &config.routing.grok_models,
+            &config.routing.openrouter_models,
             &config.routing.default_group,
         ));
         // A non-default upstream (staging, e2e mock) must also receive the
@@ -330,6 +339,7 @@ impl AppState {
             provider,
             codex,
             grok,
+            openrouter,
             idle_prober,
             classifier,
             refresher: Arc::new(refresher),
@@ -1159,7 +1169,8 @@ pub async fn background_refresh_pass(state: &AppState) {
             AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. }
             | AccountCredential::Grok { expires_at_ms, .. } => *expires_at_ms,
-            AccountCredential::Apikey { .. } => continue,
+            // Neither an anthropic API key nor an OpenRouter key expires.
+            AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => continue,
         };
         if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
             continue;
@@ -1964,7 +1975,11 @@ async fn grok_config_endpoint(
 /// the upstream proxy fallback; Anthropic exposes no root `/models`, and
 /// `/v1/models` is untouched (still proxied), so nothing regresses.
 async fn models_endpoint(State(state): State<AppState>) -> Response {
-    let models = crate::catalog::catalog(&state.grok.model(), &state.codex.model());
+    let models = crate::catalog::catalog(
+        &state.grok.model(),
+        &state.codex.model(),
+        state.openrouter.model(),
+    );
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -2077,7 +2092,7 @@ pub fn apply_settings(
         }
     }
     if let Some(group) = req.routing_default_group.as_deref() {
-        if !["claude", "codex", "grok"].contains(&group) {
+        if !["claude", "codex", "grok", "openrouter"].contains(&group) {
             return Err(format!("routing_default_group: unknown group {group:?}"));
         }
     }
@@ -2427,7 +2442,7 @@ async fn inject_account_endpoint(
         | AccountCredential::Grok { access_token, .. } => {
             Some(crate::proxy::logging::mask_credentials(access_token))
         }
-        AccountCredential::Apikey { .. } => None,
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
     };
     let kind = account.credential.kind();
 
@@ -2584,6 +2599,41 @@ async fn run_login(
                     .map_err(|e| e.to_string())?;
             crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint)
                 .map_err(|e| e.to_string())?
+        }
+        LoginProvider::OpenRouter => {
+            // OAuth PKCE with a localhost callback (docs/openrouter/spec.md
+            // §R5). The exchange yields a long-lived API key, so there is no
+            // token/expiry to publish — just the account.
+            let api_key = crate::auth::openrouter::login_interactive(&state.client)
+                .await
+                .map_err(|e| e.to_string())?;
+            let label = crate::auth::openrouter::fetch_key_label(
+                &state.client,
+                crate::auth::openrouter::KEY_INFO_URL,
+                &api_key,
+            )
+            .await
+            .unwrap_or_default();
+            let trimmed = label.trim();
+            // Same naming rule as `llmux login --openrouter` — one shared
+            // helper so an unlabeled dashboard login gets `or:key-N` rather
+            // than repeatedly overwriting a single `or:key`.
+            let name = match crate::config::load_or_init() {
+                Ok(cfg) => crate::cli::login::openrouter_account_name(&cfg, trimmed),
+                // No readable config yet: fall back to the label-or-first-slot
+                // name; `inject_account`'s read-merge-write still upserts.
+                Err(_) => crate::cli::login::openrouter_account_name(
+                    &crate::config::Config::default(),
+                    trimmed,
+                ),
+            };
+            crate::config::AccountConfig {
+                name,
+                credential: crate::config::AccountCredential::OpenRouter {
+                    api_key,
+                    label: trimmed.to_string(),
+                },
+            }
         }
     };
     state
@@ -3654,8 +3704,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 16 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 17);
+        // 26 curated (8 claude + 6 codex + 2 grok + 10 openrouter) + 1
+        // synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 27);
 
         let by_id = |id: &str| {
             models

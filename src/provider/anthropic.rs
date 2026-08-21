@@ -163,6 +163,11 @@ pub fn inject_credential(
                 "codex credential cannot authenticate against the anthropic provider".into(),
             ));
         }
+        AccountCredential::OpenRouter { .. } => {
+            return Err(ProviderError::Auth(
+                "openrouter credential cannot authenticate against the anthropic provider".into(),
+            ));
+        }
     }
     Ok(())
 }
