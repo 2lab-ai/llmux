@@ -2634,12 +2634,15 @@ async fn run_login(
             let api_key = crate::auth::openrouter::login_interactive(&state.client)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Key-shaped "labels" are discarded, not persisted — OpenRouter
+            // returns the masked KEY as the label for a PKCE-minted key.
             let label = crate::auth::openrouter::fetch_key_label(
                 &state.client,
                 crate::auth::openrouter::KEY_INFO_URL,
                 &api_key,
             )
             .await
+            .filter(|l| !crate::cli::login::label_is_key_shaped(l))
             .unwrap_or_default();
             // The NAME is deliberately left as a placeholder:
             // `inject_account` derives the real one from the key inside its

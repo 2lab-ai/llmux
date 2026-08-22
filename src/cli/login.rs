@@ -239,6 +239,14 @@ async fn login_grok() -> Result<(), CliError> {
 /// and the dashboard switcher cannot drift into two naming schemes — the first
 /// cut of the daemon arm hardcoded a label-less `or:key`, which would have made
 /// every unlabeled dashboard login overwrite the previous one.
+/// Whether an OpenRouter key label is really just the key (masked or not).
+/// Their `/api/v1/key` returns the key itself as the "label" for a
+/// PKCE-minted key, so this is the common case, not an edge case.
+pub(crate) fn label_is_key_shaped(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    lower.starts_with("sk-or-") || lower.starts_with("sk-")
+}
+
 pub(crate) fn openrouter_account_name(config: &Config, label: &str, api_key: &str) -> String {
     // The KEY is the durable identity; the label is cosmetic and can change
     // between logins (introspection is best-effort and degrades to empty). So
@@ -267,7 +275,14 @@ pub(crate) fn openrouter_account_name(config: &Config, label: &str, api_key: &st
 
     let base = {
         let label = label.trim();
-        if label.is_empty() {
+        // OpenRouter's key introspection does NOT return a human label for a
+        // PKCE-minted key — it returns the KEY, masked: a real login produced
+        // `sk-or-v1-010...e42` (live 2026-08-22), which would have made the
+        // account `or:sk-or-v1-010...e42`. That is key material in a name that
+        // then appears in status output, logs and the TUI, and it identifies
+        // nothing a human would recognize. Treat a key-shaped label as absent
+        // and fall back to the numbered form.
+        if label.is_empty() || label_is_key_shaped(label) {
             "or:key".to_string()
         } else {
             format!("or:{label}")
@@ -313,8 +328,11 @@ async fn login_openrouter(paste: bool) -> Result<(), CliError> {
     };
 
     // Cosmetic only: a failed introspection degrades to the `or:key-N` name.
+    // A key-shaped "label" is discarded outright rather than persisted — it is
+    // the key again, not a name, and storing it just duplicates the secret.
     let label = openrouter::fetch_key_label(&client, openrouter::KEY_INFO_URL, &api_key)
         .await
+        .filter(|l| !label_is_key_shaped(l))
         .unwrap_or_default();
 
     let mut final_name = String::new();
@@ -431,6 +449,25 @@ mod tests {
         assert_eq!(
             openrouter_account_name(&config, "work", "sk-or-v1-bbb"),
             "or:work"
+        );
+    }
+
+    /// OpenRouter returns the KEY (masked) as the label for a PKCE-minted
+    /// key — a real login produced `sk-or-v1-010...e42`. Naming the account
+    /// after that puts key material into status output, logs and the TUI and
+    /// identifies nothing. Found by the live smoke, not by any mock.
+    #[test]
+    fn a_key_shaped_label_is_not_used_as_the_account_name() {
+        let config = Config::default();
+        for label in ["sk-or-v1-010...e42", "sk-or-v1-abcdef", "sk-ant-whatever"] {
+            let name = openrouter_account_name(&config, label, "sk-or-v1-AAA");
+            assert_eq!(name, "or:key", "{label} must not become the name");
+            assert!(!name.contains("sk-"), "no key material in the name: {name}");
+        }
+        // A genuine human label is still used.
+        assert_eq!(
+            openrouter_account_name(&config, "work laptop", "sk-or-v1-AAA"),
+            "or:work laptop"
         );
     }
 
