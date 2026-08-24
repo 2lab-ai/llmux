@@ -612,7 +612,7 @@ struct UsageActivityList: View {
             row(
                 time: DashFormat.ago(ms: entry.atMs, now: now),
                 status: statusText(entry.status),
-                label: entry.model ?? entry.path ?? entry.method ?? "request",
+                label: completedLabel(entry),
                 trailing: [
                     entry.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
                     entry.costUsd.map { DashFormat.cost($0) },
@@ -622,6 +622,16 @@ struct UsageActivityList: View {
                 .joined(separator: "  ")
             )
         }
+    }
+
+    /// Row label: the 4-char short client name (activity client-name,
+    /// `ClientNameLabel`) leads when the daemon resolved one — "Z opus-4-8",
+    /// "loca gpt-5.5" — and rows without one (older daemons, pre-tenant
+    /// history) keep the bare model/path label, never a coerced "local".
+    private func completedLabel(_ entry: LlmuxDashboardCompleted) -> String {
+        let base = entry.model ?? entry.path ?? entry.method ?? "request"
+        guard let name = entry.clientName, !name.isEmpty else { return base }
+        return "\(ClientNameLabel.short(name)) \(base)"
     }
 
     private func row(time: String, status: Text, label: String, trailing: String) -> some View {

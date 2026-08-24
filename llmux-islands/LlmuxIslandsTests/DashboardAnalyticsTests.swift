@@ -66,6 +66,24 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(ClientIDLabel.display(#"["device_id"]"#), #"["device_id"]"#)
     }
 
+    // MARK: - Client name shortening (activity client-name)
+
+    func testClientNameLabelFirstTokenFirstFourChars() {
+        // The user-spec examples, verbatim (mirrors Rust `client_short_name`).
+        XCTAssertEqual(ClientNameLabel.short("Z (U09F1M5MML1)"), "Z")
+        XCTAssertEqual(ClientNameLabel.short("luka (U0AAAAAAAAA)"), "luka")
+        XCTAssertEqual(ClientNameLabel.short("angelo (U0BBBBBBBBB)"), "ange")
+        XCTAssertEqual(ClientNameLabel.short("local"), "loca")
+    }
+
+    func testClientNameLabelUnicodeAndEmpty() {
+        // Character-based clipping: multi-byte names never split a scalar.
+        XCTAssertEqual(ClientNameLabel.short("위대한이름 (U1)"), "위대한이")
+        XCTAssertEqual(ClientNameLabel.short("한글"), "한글")
+        XCTAssertEqual(ClientNameLabel.short(""), "")
+        XCTAssertEqual(ClientNameLabel.short("   "), "")
+    }
+
     func testCountAndCostFormatting() {
         XCTAssertEqual(DashFormat.count(UInt64(999)), "999")
         XCTAssertEqual(DashFormat.count(UInt64(12_345)), "12.3k")

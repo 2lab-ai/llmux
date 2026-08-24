@@ -252,6 +252,18 @@ enum ClientIDLabel {
     }
 }
 
+/// Short display form of a completed row's client display name (activity
+/// client-name) — mirrors Rust's `format::client_short_name`: the FIRST
+/// whitespace-separated token, clipped to its first 4 characters
+/// (Character-based, so multi-byte names never split). "Z (U09…)" → "Z",
+/// "luka (U0…)" → "luka", "angelo (U0…)" → "ange", "local" → "loca".
+enum ClientNameLabel {
+    static func short(_ name: String) -> String {
+        guard let first = name.split(whereSeparator: \.isWhitespace).first else { return "" }
+        return String(first.prefix(4))
+    }
+}
+
 /// Row identity = `(group, model)` — the U13 hard rule. Claude and Codex rows
 /// with the same model text stay separate; every ForEach over model rows MUST
 /// key off this id, never `model` alone.
