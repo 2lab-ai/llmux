@@ -294,6 +294,59 @@ enum ClientNameLabel {
     }
 }
 
+/// The ONE composed row model for both recent-activity lists (activity
+/// client-name). The views (`UsageActivityList` / the canonical receipt
+/// list in UsageAnalyticsViews.swift) render these fields VERBATIM — there
+/// is no per-view label/trailing expression left at the call sites, so the
+/// factory tests cover exactly what renders.
+struct ActivityRowModel: Equatable {
+    /// Relative age ("5m").
+    let time: String
+    /// Raw HTTP status for the view's color mapping; `nil` renders blank.
+    let status: Int?
+    /// Non-request marker text ("···" in-flight / "note"), overriding the
+    /// status cell when present.
+    let marker: String?
+    /// Short client name + model/path base (`ClientNameLabel` composition).
+    let label: String
+    /// tokens · cost · duration (or elapsed time while in flight).
+    let trailing: String
+
+    static func completed(_ entry: LlmuxDashboardCompleted, now: Date) -> ActivityRowModel {
+        ActivityRowModel(
+            time: DashFormat.ago(ms: entry.atMs, now: now),
+            status: entry.status,
+            marker: nil,
+            label: ClientNameLabel.completedLabel(entry),
+            trailing: [
+                entry.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
+                entry.costUsd.map { DashFormat.cost($0) },
+                entry.durationMs.map { DashFormat.duration(ms: $0) },
+            ]
+            .compactMap { $0 }
+            .joined(separator: "  ")
+        )
+    }
+
+    static func receipt(_ receipt: SharedActivityReceipt, now: Date) -> ActivityRowModel {
+        ActivityRowModel(
+            time: DashFormat.ago(ms: receipt.occurredAtMs, now: now),
+            status: receipt.status,
+            marker: receipt.kind == "in_flight" ? "···" : receipt.kind == "note" ? "note" : nil,
+            label: ClientNameLabel.receiptLabel(receipt),
+            trailing: receipt.kind == "in_flight"
+                ? (receipt.elapsedMs.map { DashFormat.duration(ms: $0) } ?? "in flight")
+                : [
+                    receipt.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
+                    receipt.costUsd.map { DashFormat.cost($0) },
+                    receipt.durationMs.map { DashFormat.duration(ms: $0) },
+                ]
+                .compactMap { $0 }
+                .joined(separator: "  ")
+        )
+    }
+}
+
 /// Row identity = `(group, model)` — the U13 hard rule. Claude and Codex rows
 /// with the same model text stay separate; every ForEach over model rows MUST
 /// key off this id, never `model` alone.

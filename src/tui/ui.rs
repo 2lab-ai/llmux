@@ -5728,9 +5728,10 @@ fn pad_cells_left(text: &str, width: usize) -> String {
 }
 
 /// One folded activity row (glance-triage atom 3, narrowed to `count` runs):
-/// `▸ HH:MM:SS count 33× [meta] email → (all 2xx)` — the START time only
-/// (Z 2026-07-15), the run size riding the type column. The marker toggles
-/// the fold; the body expands it.
+/// `▸ HH:MM:SS count 33×  [meta] email → (all 2xx)` — the START time only
+/// (Z 2026-07-15), the run size riding the NAME column slot (padded to the
+/// same cells as a regular row's name cell, so the meta column stays
+/// aligned). The marker toggles the fold; the body expands it.
 #[allow(clippy::too_many_arguments)]
 fn folded_run_line(
     run: &[Completed],
@@ -5766,11 +5767,18 @@ fn folded_run_line(
         .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
     let kind = kind.as_deref().unwrap_or("count");
+    // The run count rides the NAME column slot (activity client-name):
+    // padded to the same ACTIVITY_NAME_W + 1 cells as a regular row's name
+    // cell so the [meta] column starts at the same cell on the header and
+    // its member rows. A count too wide for the slot (10000+ runs) widens
+    // the cell rather than truncating a number.
+    let count = format!("{}×", run.len());
+    let count_pad = ACTIVITY_NAME_W.saturating_sub(cell_width(&count));
     let mut spans = vec![
         stamp,
         Span::styled(format!("{kind:<8} "), kind_style(kind)),
         Span::styled(
-            format!("{}× ", run.len()),
+            format!("{count}{} ", " ".repeat(count_pad)),
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
@@ -9736,19 +9744,29 @@ mod tests {
     }
 
     #[test]
-    fn folded_run_header_shares_the_stamp_and_kind_columns(/* activity client-name */) {
-        // Aggregate fold headers (count runs) carry no name cell — a run can
-        // mix tenants — but must keep the shared stamp+kind prefix so the
-        // columns up to `kind` still align with regular rows.
+    fn folded_run_header_aligns_meta_with_regular_rows(/* activity client-name */) {
+        // The run count rides the NAME column slot: header = stamp + kind +
+        // count-cell, regular row = stamp + kind + name-cell, both padded to
+        // the same width — so the [meta] column starts at the SAME cell on
+        // the header and its member rows. Boundaries are computed from the
+        // ACTUAL rendered span widths, not hand-written constants.
         let mut probe =
             completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
-        if let CompletedBody::Request { kind, .. } = &mut probe.body {
+        if let CompletedBody::Request {
+            kind,
+            tenant,
+            client_name,
+            ..
+        } = &mut probe.body
+        {
             *kind = Some("count".into());
+            *tenant = Some("k-1".into());
+            *client_name = Some("Z (U09F1M5MML1)".into());
         }
         let run = [probe.clone(), probe.clone()];
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
-        let m = RowMetrics::measure(80, &[], &[&probe]);
+        let m = RowMetrics::measure(120, &[], &[&probe]);
         let header = folded_run_line(
             &run,
             false,
@@ -9770,11 +9788,20 @@ mod tests {
             true,
             GradientCfg::default(),
         );
-        for i in 0..2 {
+        let boundary = |line: &Line<'static>, spans: usize| {
+            line.spans[..spans]
+                .iter()
+                .map(|s| cell_width(&s.content))
+                .sum::<usize>()
+        };
+        // Span-by-span: stamp end, kind end, and the post-kind column start
+        // (count-cell == name-cell width) — the meta group begins at the
+        // same cell on both lines.
+        for i in 1..=3 {
             assert_eq!(
-                cell_width(&header.spans[i].content),
-                cell_width(&row.spans[i].content),
-                "stamp/kind column {i} stays aligned"
+                boundary(&header, i),
+                boundary(&row, i),
+                "column boundary after span {i} stays aligned"
             );
         }
     }
