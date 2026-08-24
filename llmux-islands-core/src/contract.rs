@@ -402,6 +402,14 @@ pub struct ActivityReceipt {
     pub elapsed_ms: Option<u64>,
     pub message: Option<String>,
     pub error: bool,
+    /// Tenant attribution id + resolved client display name (activity
+    /// client-name) from the dashboard doc's completed rows. Additive:
+    /// `Option` fields decode as `None` when absent, so older serialized
+    /// states and strict native decoders keep parsing without a schema bump.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub client_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

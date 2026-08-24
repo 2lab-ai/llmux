@@ -9614,6 +9614,172 @@ mod tests {
     }
 
     #[test]
+    fn activity_name_cell_final_render_stays_four_cells(/* activity client-name */) {
+        // FINAL RENDERED output, not just the helper: the name cell is the
+        // 3rd span (stamp, kind, name) and always occupies exactly
+        // ACTIVITY_NAME_W + 1 cells — grapheme shortening first (the
+        // cross-client semantic shared with Swift), cell clipping second
+        // (this terminal's fixed column).
+        let named = |name: &str| {
+            let mut entry =
+                completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+            if let CompletedBody::Request {
+                tenant,
+                client_name,
+                kind,
+                ..
+            } = &mut entry.body
+            {
+                *tenant = Some("k-1".into());
+                *client_name = Some(name.to_string());
+                *kind = Some("user".into());
+            }
+            entry
+        };
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let name_cell = |entry: &Completed| {
+            let m = RowMetrics::measure(200, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans[2]
+                .content
+                .to_string()
+        };
+        // The 4 user examples, at the rendered-cell level.
+        for (name, cell) in [
+            ("Z (U09F1M5MML1)", "Z    "),
+            ("luka (U0AAAAAAAAA)", "luka "),
+            ("angelo (U0BBBBBBBBB)", "ange "),
+            ("local", "loca "),
+        ] {
+            assert_eq!(name_cell(&named(name)), cell, "cell for {name:?}");
+        }
+        // 4-Hangul name: 4 graphemes = 8 display cells → cell-clipped with
+        // an ellipsis inside the SAME fixed column.
+        let cell = name_cell(&named("위대한이름 (U1)"));
+        assert!(cell.starts_with("위…"), "wide name cell-clips: {cell:?}");
+        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        // Family-emoji name: ONE grapheme survives shortening whole (the
+        // helper test proves no tear), then cell-clips to the column.
+        let cell = name_cell(&named("👨‍👩‍👧‍👦 (U1)"));
+        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        assert!(cell.starts_with('👨'), "clip starts at the emoji: {cell:?}");
+    }
+
+    #[test]
+    fn activity_excerpt_budget_accounts_for_name_cell(/* activity client-name */) {
+        // The excerpt budget is derived from the ACTUAL spans at draw time,
+        // so the new fixed name cell must shrink it: with a monster excerpt
+        // the rendered line never exceeds the frame width. A stale budget
+        // that ignored the 5-cell name span would overflow by exactly 5.
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            kind,
+            excerpt,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("k-1".into());
+            *client_name = Some("angelo (U0BBBBBBBBB)".into());
+            *kind = Some("user".into());
+            *excerpt = Some("x".repeat(400));
+        }
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let rendered_width = |entry: &Completed, w: u16| {
+            let m = RowMetrics::measure(w, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans
+            .iter()
+            .map(|s| cell_width(&s.content))
+            .sum::<usize>()
+        };
+        assert!(
+            rendered_width(&entry, 200) <= 200,
+            "wide frame: the excerpt fills the rest but never overflows"
+        );
+        // NARROW frame: the fixed columns alone exceed 60 cells, the budget
+        // hits zero, and the excerpt is DROPPED — it must contribute
+        // nothing (the line equals its excerpt-less width).
+        let mut no_excerpt = entry.clone();
+        if let CompletedBody::Request { excerpt, .. } = &mut no_excerpt.body {
+            *excerpt = None;
+        }
+        assert_eq!(
+            rendered_width(&entry, 60),
+            rendered_width(&no_excerpt, 60),
+            "at width 60 the excerpt contributes zero cells"
+        );
+    }
+
+    #[test]
+    fn folded_run_header_shares_the_stamp_and_kind_columns(/* activity client-name */) {
+        // Aggregate fold headers (count runs) carry no name cell — a run can
+        // mix tenants — but must keep the shared stamp+kind prefix so the
+        // columns up to `kind` still align with regular rows.
+        let mut probe =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request { kind, .. } = &mut probe.body {
+            *kind = Some("count".into());
+        }
+        let run = [probe.clone(), probe.clone()];
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let m = RowMetrics::measure(80, &[], &[&probe]);
+        let header = folded_run_line(
+            &run,
+            false,
+            false,
+            &abbrev,
+            &m,
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        let row = completed_line(
+            &probe,
+            false,
+            false,
+            &labels,
+            &abbrev,
+            &m,
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        for i in 0..2 {
+            assert_eq!(
+                cell_width(&header.spans[i].content),
+                cell_width(&row.spans[i].content),
+                "stamp/kind column {i} stays aligned"
+            );
+        }
+    }
+
+    #[test]
     fn completed_row_layout_puts_excerpt_last_at_full_width(/* Z 2026-07-15 */) {
         // Row contract: time · kind · [model effort] · email(10) → status
         // dur tok $ … "excerpt", with the excerpt LAST and spending the rest

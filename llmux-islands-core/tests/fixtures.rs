@@ -205,3 +205,60 @@ fn identical_completed_requests_receive_distinct_stable_receipt_ids() {
 
     assert_eq!(unique.len(), ids.len());
 }
+
+#[test]
+fn activity_receipts_carry_tenant_and_client_name() {
+    // Activity client-name: the canonical receipt path (the list native
+    // shells prefer) must transport the per-row attribution, or names would
+    // silently blank there while the dashboard DTO shows them.
+    let mut doc = read_fixture("current");
+    if let Some(llmux::dashboard::CompletedDoc::Request {
+        tenant,
+        client_name,
+        ..
+    }) = doc
+        .activity
+        .completed
+        .iter_mut()
+        .find(|row| matches!(row, llmux::dashboard::CompletedDoc::Request { .. }))
+    {
+        *tenant = Some("k-t1".into());
+        *client_name = Some("Z (U09F1M5MML1)".into());
+    }
+
+    let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
+    let request = state
+        .statistics
+        .activity_receipts
+        .iter()
+        .find(|receipt| receipt.status == Some(200))
+        .expect("request receipt");
+    assert_eq!(request.tenant.as_deref(), Some("k-t1"));
+    assert_eq!(request.client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+    // Rows without attribution (in-flight here) stay None — never coerced.
+    let in_flight = &state.statistics.activity_receipts[0];
+    assert_eq!(in_flight.receipt_id, "in_flight:99");
+    assert_eq!(in_flight.tenant, None);
+    assert_eq!(in_flight.client_name, None);
+}
+
+#[test]
+fn anonymous_masks_email_bearing_client_names() {
+    // Key names are user-chosen text and may embed an account email; under
+    // the anonymity policy the receipt must not leak it (same guard as
+    // account displays and notes).
+    let mut doc = read_fixture("current");
+    if let Some(llmux::dashboard::CompletedDoc::Request { client_name, .. }) = doc
+        .activity
+        .completed
+        .iter_mut()
+        .find(|row| matches!(row, llmux::dashboard::CompletedDoc::Request { .. }))
+    {
+        *client_name = Some("alice@example.com desk".into());
+    }
+
+    let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
+    let serialized =
+        serde_json::to_string(&state.statistics.activity_receipts).expect("receipts JSON");
+    assert!(!serialized.contains("alice@example.com"));
+}

@@ -262,6 +262,36 @@ enum ClientNameLabel {
         guard let first = name.split(whereSeparator: \.isWhitespace).first else { return "" }
         return String(first.prefix(4))
     }
+
+    /// Recent-activity row label for a dashboard-DTO completed entry: the
+    /// short client name leads when the daemon resolved one — "Z opus-4-8" —
+    /// and rows without one (older daemons, pre-tenant history) keep the
+    /// bare model/path label, never a coerced "local".
+    static func completedLabel(_ entry: LlmuxDashboardCompleted) -> String {
+        composedLabel(
+            name: entry.clientName,
+            base: entry.model ?? entry.path ?? entry.method ?? "request"
+        )
+    }
+
+    /// Same composition for the canonical shared-core receipt path — the
+    /// list the app prefers whenever `activityReceipts` is non-empty
+    /// (StatsSectionContent.overview).
+    static func receiptLabel(_ receipt: SharedActivityReceipt) -> String {
+        composedLabel(
+            name: receipt.clientName,
+            base: receipt.message ?? receipt.model ?? receipt.path ?? receipt.method ?? receipt.kind
+        )
+    }
+
+    /// Guard on the SHORTENED value: a whitespace-only name shortens to
+    /// empty and must yield the bare base label, not a leading space.
+    private static func composedLabel(name: String?, base: String) -> String {
+        guard let name else { return base }
+        let shortName = short(name)
+        guard !shortName.isEmpty else { return base }
+        return "\(shortName) \(base)"
+    }
 }
 
 /// Row identity = `(group, model)` — the U13 hard rule. Claude and Codex rows

@@ -233,7 +233,9 @@ struct UsageCanonicalActivityReceiptList: View {
                         .font(.system(size: 9, weight: .semibold, design: .monospaced))
                         .foregroundColor(statusColor(receipt))
                         .frame(width: 28, alignment: .leading)
-                    Text(receipt.message ?? receipt.model ?? receipt.path ?? receipt.method ?? receipt.kind)
+                    // Short client name leads (activity client-name), same
+                    // tested composition as the dashboard-DTO list.
+                    Text(ClientNameLabel.receiptLabel(receipt))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.white.opacity(0.7))
                         .lineLimit(1)
@@ -612,7 +614,9 @@ struct UsageActivityList: View {
             row(
                 time: DashFormat.ago(ms: entry.atMs, now: now),
                 status: statusText(entry.status),
-                label: completedLabel(entry),
+                // Short client name leads (activity client-name) — the
+                // composition lives in ClientNameLabel so it is unit-tested.
+                label: ClientNameLabel.completedLabel(entry),
                 trailing: [
                     entry.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
                     entry.costUsd.map { DashFormat.cost($0) },
@@ -622,16 +626,6 @@ struct UsageActivityList: View {
                 .joined(separator: "  ")
             )
         }
-    }
-
-    /// Row label: the 4-char short client name (activity client-name,
-    /// `ClientNameLabel`) leads when the daemon resolved one — "Z opus-4-8",
-    /// "loca gpt-5.5" — and rows without one (older daemons, pre-tenant
-    /// history) keep the bare model/path label, never a coerced "local".
-    private func completedLabel(_ entry: LlmuxDashboardCompleted) -> String {
-        let base = entry.model ?? entry.path ?? entry.method ?? "request"
-        guard let name = entry.clientName, !name.isEmpty else { return base }
-        return "\(ClientNameLabel.short(name)) \(base)"
     }
 
     private func row(time: String, status: Text, label: String, trailing: String) -> some View {

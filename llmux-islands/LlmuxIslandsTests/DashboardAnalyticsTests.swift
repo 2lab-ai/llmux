@@ -77,11 +77,50 @@ final class DashboardAnalyticsTests: XCTestCase {
     }
 
     func testClientNameLabelUnicodeAndEmpty() {
-        // Character-based clipping: multi-byte names never split a scalar.
+        // Character (grapheme) clipping — the SAME unit as Rust's
+        // `client_short_name` (unicode-segmentation): a ZWJ family emoji is
+        // one Character and survives whole; Hangul keeps whole syllables.
         XCTAssertEqual(ClientNameLabel.short("위대한이름 (U1)"), "위대한이")
         XCTAssertEqual(ClientNameLabel.short("한글"), "한글")
+        XCTAssertEqual(ClientNameLabel.short("👨‍👩‍👧‍👦 (U1)"), "👨‍👩‍👧‍👦")
+        XCTAssertEqual(ClientNameLabel.short("👨‍👩‍👧‍👦x둘셋넷 (U1)"), "👨‍👩‍👧‍👦x둘셋")
         XCTAssertEqual(ClientNameLabel.short(""), "")
         XCTAssertEqual(ClientNameLabel.short("   "), "")
+    }
+
+    // MARK: - Row label composition (activity client-name)
+
+    private func completedRow(_ json: String) throws -> LlmuxDashboardCompleted {
+        try JSONDecoder().decode(LlmuxDashboardCompleted.self, from: Data(json.utf8))
+    }
+
+    func testCompletedLabelLeadsWithShortClientName() throws {
+        // The PRODUCTION composition — dropping the name from the label
+        // makes this fail, not just the shortening helper.
+        let named = try completedRow(
+            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"Z (U09F1M5MML1)"}"#
+        )
+        XCTAssertEqual(ClientNameLabel.completedLabel(named), "Z claude-opus-4-8")
+        let bare = try completedRow(#"{"kind":"request","at_ms":1,"model":"claude-opus-4-8"}"#)
+        XCTAssertEqual(ClientNameLabel.completedLabel(bare), "claude-opus-4-8")
+        // Whitespace-only name shortens to empty → bare label, never a
+        // leading space (guard sits on the SHORTENED value).
+        let blank = try completedRow(
+            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"   "}"#
+        )
+        XCTAssertEqual(ClientNameLabel.completedLabel(blank), "claude-opus-4-8")
+    }
+
+    func testReceiptLabelLeadsWithShortClientName() throws {
+        // Canonical shared-core receipt path (the list the app prefers when
+        // receipts exist) uses the same tested composition.
+        let json = #"{"receipt_id":"request:1:POST:/v1/messages:200","kind":"request","occurred_at_ms":1,"status":200,"method":"POST","path":"/v1/messages","fast":false,"error":false,"model":"claude-opus-4-8","client_name":"angelo (U0B)"}"#
+        let receipt = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(json.utf8))
+        XCTAssertEqual(ClientNameLabel.receiptLabel(receipt), "ange claude-opus-4-8")
+        // Notes keep their message verbatim (no name on note receipts).
+        let noteJSON = #"{"receipt_id":"note:1:0","kind":"note","occurred_at_ms":1,"fast":false,"error":false,"message":"token refreshed: anonymous"}"#
+        let note = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(noteJSON.utf8))
+        XCTAssertEqual(ClientNameLabel.receiptLabel(note), "token refreshed: anonymous")
     }
 
     func testCountAndCostFormatting() {

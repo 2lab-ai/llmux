@@ -389,17 +389,22 @@ struct SharedActivityReceipt: Decodable, Equatable, Identifiable {
     let durationMs, elapsedMs: UInt64?
     let message: String?
     let error: Bool
+    // Activity client-name (additive — absent in older core states → nil).
+    let tenant: String?
+    let clientName: String?
 
     var id: String { receiptId }
 
     enum CodingKeys: String, CodingKey {
-        case kind, status, method, path, provider, model, effort, fast, tokens, cache, message, error
+        case kind, status, method, path, provider, model, effort, fast, tokens, cache, message, error,
+             tenant
         case receiptId = "receipt_id"
         case occurredAtMs = "occurred_at_ms"
         case accountDisplay = "account_display"
         case costUsd = "cost_usd"
         case durationMs = "duration_ms"
         case elapsedMs = "elapsed_ms"
+        case clientName = "client_name"
     }
 
 }
