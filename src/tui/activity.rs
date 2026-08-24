@@ -109,6 +109,17 @@ pub(crate) enum CompletedBody {
         /// Cleaned input excerpt (bounded), shown truncated on the row and
         /// in full on the click-expanded detail line.
         excerpt: Option<String>,
+        /// KEYED tenant attribution id (multi-tenant #22): client-key id
+        /// (`k-…`) / `legacy` / `local`. `None` only for pre-field replayed
+        /// history — rendered blank, never coerced into `local`.
+        tenant: Option<String>,
+        /// Resolved client display name for `tenant` (key name for `k-…`,
+        /// the bucket id itself for builtins). The FOLD leaves this `None` —
+        /// key metadata lives in config, not here — and the doc builder
+        /// resolves it; both render paths consume the doc via `from_doc`
+        /// (src/tui/mod.rs Backend::Local/Remote), so the renderer never
+        /// sees a fold-time name.
+        client_name: Option<String>,
     },
     Note {
         text: String,
@@ -2147,6 +2158,9 @@ impl ActivityLog {
                         user_id,
                         kind,
                         excerpt,
+                        tenant,
+                        // Resolved at doc-build time (needs key metadata).
+                        client_name: None,
                     },
                 });
             }
@@ -3122,6 +3136,40 @@ mod tests {
         // Every finished request is tenant-attributed across the buckets.
         let total: u64 = log.tenant_stats().values().map(|t| t.totals.requests).sum();
         assert_eq!(total, 5, "every finished request tenant-attributed");
+    }
+
+    /// Activity client-name: the fold carries the tenant id into the
+    /// completed entry (the doc builder resolves the display name — key
+    /// metadata is not available here, so `client_name` stays `None`).
+    #[test]
+    fn fold_carries_tenant_into_the_completed_entry() {
+        let mut log = ActivityLog::new(8);
+        log.apply(finished_tenant(1, Some("k-aaaa"), None, 200), at(1));
+        log.apply(finished_tenant(2, None, None, 200), at(2));
+        let entries: Vec<&Completed> = log.completed().collect();
+        // Newest first: entry 0 is the pre-tenant (None) request.
+        match &entries[0].body {
+            CompletedBody::Request {
+                tenant,
+                client_name,
+                ..
+            } => {
+                assert_eq!(*tenant, None, "pre-tenant history stays None");
+                assert_eq!(*client_name, None);
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+        match &entries[1].body {
+            CompletedBody::Request {
+                tenant,
+                client_name,
+                ..
+            } => {
+                assert_eq!(tenant.as_deref(), Some("k-aaaa"));
+                assert_eq!(*client_name, None, "no key metadata at the fold");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
     }
 
     #[test]

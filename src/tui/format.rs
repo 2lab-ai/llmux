@@ -275,6 +275,20 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month, day)
 }
 
+/// Short display form of a client display name for the activity Name column
+/// (activity client-name): the FIRST whitespace-separated token, clipped to
+/// its first 4 CHARS (chars, not bytes — multi-byte names never split a
+/// scalar). "Z (U09F1M5MML1)" → "Z", "luka (U0…)" → "luka",
+/// "angelo (U0…)" → "ange", "local" → "loca". Empty input stays empty.
+pub(crate) fn client_short_name(name: &str) -> String {
+    name.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(4)
+        .collect()
+}
+
 /// Countdown to a deadline as `Nd Nh Nm Ns` — leading zero units are omitted,
 /// but once a unit appears every smaller one follows, and seconds are ALWAYS
 /// shown (a zero/expired remaining renders `0s`). Distinct from [`countdown`],
@@ -536,5 +550,28 @@ mod tests {
     #[test]
     fn remaining_hms_zero_is_zero_seconds() {
         assert_eq!(remaining_hms(Duration::from_secs(0)), "0s");
+    }
+
+    // ---- activity Name column shortening (user spec, verbatim examples) ----
+
+    #[test]
+    fn client_short_name_first_token_first_four_chars() {
+        assert_eq!(client_short_name("Z (U09F1M5MML1)"), "Z");
+        assert_eq!(client_short_name("luka (U0AAAAAAAAA)"), "luka");
+        assert_eq!(client_short_name("angelo (U0BBBBBBBBB)"), "ange");
+        assert_eq!(client_short_name("local"), "loca");
+    }
+
+    #[test]
+    fn client_short_name_multibyte_never_splits_a_char() {
+        // 4 CHARS, not bytes: a Hangul name keeps whole scalars.
+        assert_eq!(client_short_name("위대한이름 (U1)"), "위대한이");
+        assert_eq!(client_short_name("한글"), "한글");
+    }
+
+    #[test]
+    fn client_short_name_empty_and_whitespace_are_empty() {
+        assert_eq!(client_short_name(""), "");
+        assert_eq!(client_short_name("   "), "");
     }
 }

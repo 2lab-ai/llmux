@@ -5707,6 +5707,11 @@ fn draw_activity(
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
 const ACTIVITY_EMAIL_W: usize = 10;
 
+/// The client Name column width on activity rows (activity client-name,
+/// Z 2026-08-24: "첫 4자만 출력") — matches the 4-char shortening rule of
+/// [`format::client_short_name`]; wide glyphs `…`-clip to the same 4 cells.
+const ACTIVITY_NAME_W: usize = 4;
+
 /// Pad `text` with trailing spaces to exactly `width` display cells,
 /// `…`-clipping first when it is too wide.
 fn pad_cells(text: &str, width: usize) -> String {
@@ -5821,11 +5826,13 @@ fn completed_line(
             user_id,
             kind,
             excerpt,
+            tenant: _,
+            client_name,
         } => {
             // Row layout (Z 2026-07-15): every column padded to the frame's
             // max width so rows line up, and the input excerpt LAST, spending
-            // whatever terminal width remains:
-            //   ▸ HH:MM:SS kind [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
+            // whatever terminal width remains (Name added 2026-08-24):
+            //   ▸ HH:MM:SS kind name [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
@@ -5875,6 +5882,19 @@ fn completed_line(
             spans.push(Span::styled(
                 format!("{:<8} ", kind.as_deref().unwrap_or("")),
                 kind_style(kind.as_deref().unwrap_or("")),
+            ));
+            // Client Name column (activity client-name): the tenant display
+            // name resolved by the doc builder, shortened to the first
+            // token's first 4 chars ("Z (U09…)"→"Z", "local"→"loca").
+            // Blank when the row predates tenant attribution — never
+            // coerced to "local". Fixed width so the columns stay aligned.
+            let short = client_name
+                .as_deref()
+                .map(|n| format::client_short_name(&masked_text(n, mask)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
+                Style::new().fg(Color::Cyan),
             ));
             spans.extend(pad_spans(
                 activity_meta_spans(
@@ -5977,6 +5997,8 @@ fn completed_detail_lines(
         user_id,
         kind,
         excerpt,
+        tenant,
+        client_name,
     } = &entry.body
     else {
         return Vec::new();
@@ -6020,6 +6042,16 @@ fn completed_detail_lines(
             .map(|l| format!(" \u{ab}{}\u{bb}", masked_text(l, mask)))
             .unwrap_or_default();
         lines.push(indent("client", format!("{uid}{label}")));
+    }
+    // Tenant identity (activity client-name): the FULL raw display name —
+    // the detail row is the fidelity surface, the collapsed row clips to 4
+    // chars — plus the attribution id. Absent for pre-tenant history.
+    if let Some(id) = tenant.as_deref() {
+        let value = match client_name.as_deref() {
+            Some(name) if name != id => format!("{} · {id}", masked_text(name, mask)),
+            _ => id.to_string(),
+        };
+        lines.push(indent("name", value));
     }
     lines.push(indent(
         "account",
@@ -9431,6 +9463,8 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         };
         let labels = BTreeMap::new();
@@ -9466,6 +9500,120 @@ mod tests {
     }
 
     #[test]
+    fn activity_name_column_shows_short_client_name(/* activity client-name */) {
+        // A row with a resolved client name renders the 4-char short form
+        // right after the kind column; a pre-tenant row (no tenant) renders
+        // a BLANK cell — never coerced to "local"/"loca".
+        let named = |name: &str| {
+            let mut entry =
+                completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+            if let CompletedBody::Request {
+                tenant,
+                client_name,
+                kind,
+                ..
+            } = &mut entry.body
+            {
+                *tenant = Some("k-1".into());
+                *client_name = Some(name.to_string());
+                *kind = Some("user".into());
+            }
+            entry
+        };
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let render = |entry: &Completed| -> String {
+            let m = RowMetrics::measure(200, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+        };
+        // "angelo (U0…)" → first token, first 4 chars, right after kind.
+        let row = render(&named("angelo (U0BBBBBBBBB)"));
+        assert!(
+            row.contains("user     ange "),
+            "4-char short name after the kind column: {row}"
+        );
+        // "Z (U09…)" → "Z", padded to the fixed 4-cell column.
+        let row = render(&named("Z (U09F1M5MML1)"));
+        assert!(row.contains("user     Z    "), "padded short name: {row}");
+        // No tenant → blank cell, and nothing invents a name.
+        let blank = completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        let row = render(&blank);
+        assert!(!row.contains("loca"), "never coerced to local: {row}");
+        assert!(
+            row.contains("         [") || row.contains("user          "),
+            "blank name cell keeps the column: {row}"
+        );
+    }
+
+    #[test]
+    fn expanded_detail_keeps_full_client_name(/* activity client-name */) {
+        // The collapsed row clips to 4 chars; the expanded detail is the
+        // fidelity surface and keeps the FULL name + tenant id.
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("k-1".into());
+            *client_name = Some("angelo (U0BBBBBBBBB)".into());
+        }
+        let text: String = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("angelo (U0BBBBBBBBB) · k-1"),
+            "full raw name + tenant id: {text}"
+        );
+        // Builtin bucket: name == id → the id renders once, not "local · local".
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("local".into());
+            *client_name = Some("local".into());
+        }
+        let text: String = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(text.contains("local"));
+        assert!(!text.contains("local · local"));
+        // No tenant → no name detail line at all.
+        let blank = completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        let text: String = completed_detail_lines(&blank, false, &Default::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(!text.contains("       name"), "no name line: {text}");
+    }
+
+    #[test]
     fn completed_row_layout_puts_excerpt_last_at_full_width(/* Z 2026-07-15 */) {
         // Row contract: time · kind · [model effort] · email(10) → status
         // dur tok $ … "excerpt", with the excerpt LAST and spending the rest
@@ -9497,6 +9645,8 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
+                tenant: None,
+                client_name: None,
             },
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
@@ -9622,6 +9772,8 @@ mod tests {
                 user_id: None,
                 kind: None,
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         }
     }
@@ -11155,6 +11307,8 @@ mod tests {
                     user_id: None,
                     kind: None,
                     excerpt: None,
+                    tenant: None,
+                    client_name: None,
                 },
             },
             Completed {

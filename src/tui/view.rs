@@ -329,6 +329,8 @@ impl DashboardView {
                     user_id,
                     msg_kind,
                     excerpt,
+                    tenant,
+                    client_name,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -363,6 +365,11 @@ impl DashboardView {
                         user_id: user_id.clone(),
                         kind: msg_kind.clone(),
                         excerpt: excerpt.clone(),
+                        // Tenant id + server-resolved display name (activity
+                        // Name column). Older daemons omit both → None →
+                        // the cell renders blank, never coerced.
+                        tenant: tenant.clone(),
+                        client_name: client_name.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -763,6 +770,44 @@ mod tests {
         let switch = view.last_switch.expect("last switch");
         assert_eq!(switch.to, "a");
         assert_eq!(switch.from, None);
+    }
+
+    /// Activity client-name: the per-row tenant id + resolved display name
+    /// survive doc→view (both render paths consume the doc), and docs from
+    /// older daemons (no fields) stay `None` — the Name cell renders blank,
+    /// never coerced into `local`.
+    #[test]
+    fn completed_tenant_and_client_name_survive_doc_to_view() {
+        let mut json = doc_json();
+        json["activity"]["completed"][0]["tenant"] = serde_json::json!("k-1");
+        json["activity"]["completed"][0]["client_name"] = serde_json::json!("Z (U09F1M5MML1)");
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        match &view.completed[0].body {
+            CompletedBody::Request {
+                tenant,
+                client_name,
+                ..
+            } => {
+                assert_eq!(tenant.as_deref(), Some("k-1"));
+                assert_eq!(client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+
+        let legacy: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        let view = DashboardView::from_doc(&legacy);
+        match &view.completed[0].body {
+            CompletedBody::Request {
+                tenant,
+                client_name,
+                ..
+            } => {
+                assert_eq!(*tenant, None);
+                assert_eq!(*client_name, None);
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
     }
 
     #[test]
