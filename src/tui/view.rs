@@ -146,6 +146,7 @@ fn kind_static(kind: &str) -> &'static str {
         "apikey" => "apikey",
         "codex" => "codex",
         "grok" => "grok",
+        "openrouter" => "openrouter",
         _ => "unknown",
     }
 }

@@ -10,7 +10,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `run [--force] [-- args]` | Ensure the daemon is running, then spawn `claude` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
 | `stop` | Stop a running server gracefully via `POST /llmux/shutdown`. |
 | `restart` | Cooperatively drain a running daemon, then respawn it from this binary after an upgrade. |
-| `login [--api \| --codex]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account. |
+| `login [--api \| --codex \| --grok \| --openrouter [--paste]]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account; `--grok` runs the xAI device-code flow; `--openrouter` runs the OpenRouter OAuth PKCE flow in the browser and mints a long-lived `sk-or-v1-…` key. `--paste` (only with `--openrouter`) prompts for an existing key instead of opening a browser — and is also the automatic fallback when the browser flow cannot complete locally. |
 | `import [--from PATH \| --json JSON]` | Import credentials from a teamclaude config, `~/.claude/.credentials.json`, a Codex `~/.codex/auth.json`, or inline JSON. |
 | `dashboard` | Attach to a running daemon and render its dashboard over HTTP. Read-only except manual account switch. |
 | `env` | Print shell exports for pointing Claude Code at the proxy. |
@@ -229,7 +229,7 @@ Scheduler knobs:
 
 Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.5`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`; omitted by default).
 
-Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), or `codex` (ChatGPT/Codex subscription token). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
+Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
 
 `email_anonymous` (default `false`) masks account emails on every display surface. The TUI render layer uses the same stable fake-email mapping as demo mode, and llmux Islands pixelizes emails in its Usage panel. The value is served in `GET /llmux/status` and can be flipped live via `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ toggle.
 
@@ -322,6 +322,8 @@ By default (`routing.enabled = true`) the request's `model` selects the backend 
 
 - **claude group** — `oauth` + `apikey` accounts; models `claude-*`, `opus`, `sonnet`, `haiku`, `fable-5`.
 - **codex group** — `codex` accounts; models `gpt-*`, `gpt-5.5`, `codex`, `o1`/`o3`/`o4`.
+- **grok group** — `grok` accounts; models `grok`, `grok-*`.
+- **openrouter group** — `openrouter` accounts; models `or-*`, a bare `or`, and `openrouter/*`.
 
 Within the matched group the scheduler picks the best eligible account, sticky **per group**. The Claude pick and the Codex pick advance independently. An unrecognized or absent model falls back to `default_group`.
 
@@ -332,6 +334,8 @@ Turn routing **off** (`routing.enabled = false`) for the older behavior: the `mo
   "enabled": true,
   "claude_models": [],
   "codex_models": [],
+  "grok_models": [],
+  "openrouter_models": [],
   "default_group": "claude",
   "on_empty_group": "error"
 }
@@ -342,10 +346,12 @@ Turn routing **off** (`routing.enabled = false`) for the older behavior: the `mo
 | `enabled` | `true` | On = model→group routing; off = Codex-as-overflow behavior. |
 | `claude_models` | `[]` | Models routed to the Claude group. Empty keeps the builtin rules; a non-empty list replaces them. |
 | `codex_models` | `[]` | Models routed to the Codex group with the same semantics. |
-| `default_group` | `"claude"` | Group for an unmatched or model-less request. |
-| `on_empty_group` | `"error"` | When the matched group has no configured account: `"error"` returns a 404 `not_found_error`; `"fallback"` falls back to the other group. |
+| `grok_models` | `[]` | Models routed to the Grok group with the same semantics. |
+| `openrouter_models` | `[]` | Models routed to the OpenRouter group with the same semantics. Empty keeps the builtin `or-` prefix, exact `or`, and `openrouter/` prefix rules. |
+| `default_group` | `"claude"` | Group for an unmatched or model-less request: `"claude"`, `"codex"`, `"grok"`, or `"openrouter"`. |
+| `on_empty_group` | `"error"` | When the matched group has no configured account: `"error"` returns a 404 `not_found_error`; `"fallback"` tries the remaining groups in the fixed `claude → codex → grok → openrouter` order and the first group with an account serves the request. |
 
-Override tokens in `claude_models` / `codex_models` are matched in order, first-match-wins, case-insensitively. A bare token is a **prefix** (`"gpt-"`); prefix it with `~` for a **substring** (`"~codex"`) or `=` for an **exact** match (`"=gpt-5.5"`).
+Override tokens in the per-group model lists are matched in order, first-match-wins, case-insensitively. A bare token is a **prefix** (`"gpt-"`); prefix it with `~` for a **substring** (`"~codex"`) or `=` for an **exact** match (`"=gpt-5.5"`).
 
 ### Selecting the Codex model from Claude Code
 
@@ -395,6 +401,30 @@ llmux import --from ~/.codex/auth.json
 ```
 
 The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE. The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, thinking summaries, and tool calls are supported. Images are dropped with a warning for now. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+
+## OpenRouter backend
+
+Add an OpenRouter account with the browser OAuth PKCE flow:
+
+```bash
+llmux login --openrouter
+```
+
+llmux opens `https://openrouter.ai/auth`, takes the callback on a localhost port, and exchanges the code for a long-lived `sk-or-v1-…` API key. There is **no token refresh**: the exchange yields an API key rather than an expiring access token, so the credential is never rotated. The account is named `or:<key label>` (the label comes from `GET /api/v1/key`), or `or:key-N` when no label is available.
+
+If a browser cannot be opened, the callback times out (2 minutes), or the local port cannot be bound, the flow degrades to a key prompt on its own. You can also ask for that prompt up front — it is the way to reuse a key you already have:
+
+```bash
+llmux login --openrouter --paste
+```
+
+`--paste` requires `--openrouter`. The key is read from stdin, never printed back, and is masked in logs like every other credential.
+
+Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, not a translator**: OpenRouter exposes a native Anthropic Messages endpoint (`POST {openrouter.upstream}/messages`), so llmux forwards the Messages body unchanged apart from its `model` field, plus dropping the Claude-Code-local `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers OpenRouter does not know. There is no SSE conversion on this path. `/v1/messages/count_tokens` is answered locally (OpenRouter has no equivalent endpoint).
+
+Model selection is the `or-` prefix — `/model or-ox-alpha` routes to the openrouter group and reaches OpenRouter as `stealth/ox-alpha`. A bare `or` (or a model-less request) uses `openrouter.default_model`, `or-<vendor>/<slug>` passes through verbatim for the models llmux does not curate, and an unrecognized bare name is forwarded as typed so OpenRouter's own 404 reaches you. The curated rows, their wire slugs, and their context windows are in [models.md](models.md#alias-semantics).
+
+Cost: the ten curated models are free (`$0` in and out). An uncurated openrouter model has **no known rate** — the usage tab shows `—` and marks the bucket `+?` rather than pricing it as free, because the same group also fronts OpenRouter's paid catalog.
 
 ## Development
 

@@ -192,7 +192,18 @@ impl<P: Prober> IdleProber<P> {
         // Grok accounts NEVER produce window data (no quota headers, no
         // usage endpoint — docs/grok/spec.md §R3), so `probe_eligible`'s
         // "no window" test would re-probe them forever. Spend nothing.
-        if matches!(credential, AccountCredential::Grok { .. }) {
+        //
+        // OpenRouter is the same shape and for the same reason: its quota
+        // model is per-key credits and rate limits, not the 5h/7d rolling
+        // windows this prober samples, so `ReqwestProber::build` rejects it
+        // deterministically. Without this gate the account stays permanently
+        // windowless, burns its cooldown every sweep, and logs one
+        // `idle probe failed` warning forever (observed live 2026-08-21:
+        // default sweep and cooldown are both 900s, so ~4/hour, indefinitely).
+        if matches!(
+            credential,
+            AccountCredential::Grok { .. } | AccountCredential::OpenRouter { .. }
+        ) {
             return false;
         }
         if !self.try_acquire(account, now) {
@@ -565,6 +576,56 @@ mod tests {
             now(),
             Duration::ZERO
         ));
+    }
+
+    fn credential_account(name: &str, credential: AccountCredential) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential,
+        }
+    }
+
+    /// Neither grok nor openrouter can EVER produce 5h/7d window data, and the
+    /// prober rejects both deterministically. Without this gate the account is
+    /// permanently windowless, so `probe_eligible` keeps electing it: the
+    /// cooldown is burned every sweep and an `idle probe failed` warning is
+    /// logged forever (observed live: default sweep and cooldown are both
+    /// 900s, so roughly four an hour, indefinitely).
+    ///
+    /// This test exists because the openrouter half of the gate was once lost
+    /// in an edit and nothing caught it — a fix with no failing test can
+    /// vanish silently.
+    #[tokio::test]
+    async fn grok_and_openrouter_accounts_are_never_probed() {
+        for (name, credential) in [
+            (
+                "grok",
+                AccountCredential::Grok {
+                    subject: "s".into(),
+                    access_token: "at".into(),
+                    refresh_token: "rt".into(),
+                    expires_at_ms: 0,
+                    token_endpoint: String::new(),
+                    last_refresh_ms: None,
+                },
+            ),
+            (
+                "or",
+                AccountCredential::OpenRouter {
+                    api_key: "sk-or-v1-x".into(),
+                    label: "l".into(),
+                },
+            ),
+        ] {
+            let pool = AccountPool::new(&[credential_account(name, credential)]);
+            let prober = CountingProber::new(0.42);
+            let orch = IdleProber::new(pool, &prober, cfg(true, 3600));
+            assert!(
+                !orch.probe_if_idle(&id(name), now()).await,
+                "{name} must not be probed"
+            );
+            assert_eq!(prober.call_count(), 0, "{name} must not reach the prober");
+        }
     }
 
     #[tokio::test]

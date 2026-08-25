@@ -115,6 +115,14 @@ fn default_name(config: &Config, credential: &AccountCredential) -> String {
         AccountCredential::Apikey { .. } => "api-",
         AccountCredential::Codex { .. } => "codex-",
         AccountCredential::Grok { .. } => "grok-",
+        // Currently UNREACHABLE: `config::migrate`'s parser accepts only
+        // `oauth` and `apikey` and hard-errors on any other `type`, so an
+        // openrouter credential cannot arrive through import. Kept in the
+        // `or:` namespace anyway — `docs/configuration.md`'s downgrade
+        // procedure tells users to remove `or:*` accounts before running a
+        // pre-openrouter binary, and an off-convention `or-key-N` would slip
+        // through that cleanup and then fail the older binary's config load.
+        AccountCredential::OpenRouter { .. } => "or:key-",
     };
     let mut n = config
         .accounts

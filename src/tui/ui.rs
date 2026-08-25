@@ -2422,6 +2422,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             action: None,
         },
         CfgRow {
+            section: "openrouter",
+            label: "upstream / model",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "openrouter.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
             section: "display",
             label: "quota fill",
             value: match quota {
@@ -5503,6 +5511,7 @@ fn draw_activity(
                 Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
                 Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
                 Some(BackendGroup::Grok) => (anim::block_spin(anim_frame), Color::Yellow),
+                Some(BackendGroup::OpenRouter) => (anim::block_spin(anim_frame), Color::Green),
                 None => (anim::braille_spin(anim_frame), Color::DarkGray),
             };
             let mut spans = vec![
@@ -10292,6 +10301,7 @@ mod tests {
                 upstream: _,
                 codex,
                 grok,
+                openrouter,
                 scheduler,
                 routing,
                 pricing: _,
@@ -10338,6 +10348,10 @@ mod tests {
                 reasoning_effort: _,
                 trace: _,
             } = grok;
+            let crate::config::OpenRouterConfig {
+                upstream: _,
+                default_model: _,
+            } = openrouter;
             let crate::config::SchedulerConfig {
                 five_hour_max: _,
                 seven_day_max: _,
@@ -10352,6 +10366,7 @@ mod tests {
                 claude_models: _,
                 codex_models: _,
                 grok_models: _,
+                openrouter_models: _,
                 default_group: _,
                 on_empty_group: _,
             } = routing;
@@ -10407,6 +10422,8 @@ mod tests {
             "grok.client_model",
             "grok.reasoning_effort",
             "grok.trace",
+            "openrouter.upstream",
+            "openrouter.default_model",
             "scheduler.mode",
             "scheduler.five_hour_max",
             "scheduler.seven_day_max",
@@ -10418,6 +10435,7 @@ mod tests {
             "routing.claude_models",
             "routing.codex_models",
             "routing.grok_models",
+            "routing.openrouter_models",
             "routing.default_group",
             "routing.on_empty_group",
             "raw_io.enabled",

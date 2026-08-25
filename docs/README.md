@@ -24,6 +24,7 @@ features: [rules/documents.md](../rules/documents.md).
 ## Design notes (not how-to)
 
 - [Grok provider STV notes](grok/) — `spec.md` / `trace.md` design artifacts for the grok backend; not a user guide.
+- [OpenRouter provider STV notes](openrouter/) — `spec.md` design artifact for the openrouter backend (why it is a passthrough, the live upstream probes); not a user guide.
 - Product/architecture decisions live in [`.prd/`](../.prd/):
 
   - [Product spec](../.prd/01-spec.md)

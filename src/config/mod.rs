@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
     AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner, GrokConfig,
-    IdleProbeConfig, ProxyConfig, QuotaDisplay, RawIoConfig, RemoteConfig, RoutingConfig,
-    SchedulerConfig, SchedulerMode, TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL,
+    IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig, RemoteConfig,
+    RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL,
     DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
 };
 

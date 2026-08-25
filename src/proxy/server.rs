@@ -152,6 +152,10 @@ pub struct AppState {
     /// xAI grok provider (docs/grok/spec.md): live-mutable shape behind
     /// `POST /llmux/grok`, same contract as `codex`.
     pub grok: Arc<crate::provider::grok::GrokProvider>,
+    /// OpenRouter provider (docs/openrouter/spec.md). A PASSTHROUGH like
+    /// [`Self::provider`] — not a translator — differing only in base URL,
+    /// credential shape, and the `or-…` → upstream-slug `model` rewrite.
+    pub openrouter: Arc<crate::provider::openrouter::OpenRouterProvider>,
     /// On-demand idle-account usage probe (issue #21). Fires at most one
     /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
     /// ranking/display has real 5h/7d data. Enabled by default (#45;
@@ -291,6 +295,10 @@ impl AppState {
             config.grok.upstream.clone(),
             crate::provider::grok::GrokShape::from_config(&config.grok),
         ));
+        let openrouter = Arc::new(crate::provider::openrouter::OpenRouterProvider::new(
+            config.openrouter.upstream.clone(),
+            config.openrouter.default_model.clone(),
+        ));
         // On-demand idle probe (issue #21): reuses the same client + provider
         // hooks the forward path uses to send one gated `max_tokens = 1` ping.
         let idle_prober = Arc::new(IdleProber::new(
@@ -310,6 +318,7 @@ impl AppState {
             &config.routing.claude_models,
             &config.routing.codex_models,
             &config.routing.grok_models,
+            &config.routing.openrouter_models,
             &config.routing.default_group,
         ));
         // A non-default upstream (staging, e2e mock) must also receive the
@@ -330,6 +339,7 @@ impl AppState {
             provider,
             codex,
             grok,
+            openrouter,
             idle_prober,
             classifier,
             refresher: Arc::new(refresher),
@@ -814,11 +824,31 @@ impl AppState {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::NoConfigDir);
         };
-        let name = account.name.clone();
+        // Oauth/codex/grok credentials carry a stable `account_uuid`, so
+        // `upsert_account` dedupes them however the caller named them. An
+        // openrouter credential has NO such identity — its KEY is the identity
+        // — so a caller-supplied name is the only thing standing between one
+        // key and two scheduler accounts (double-counted quota), or between
+        // two keys and one overwritten account. Derive it from the key here,
+        // which also lets `run_login` hand over an empty name rather than
+        // computing one from a snapshot it would then race.
+        //
+        // Derived INSIDE the read-merge-write closure, against the MERGED
+        // state, exactly as the CLI does inside `config::update`. Deriving it
+        // from a separate `load_path` first leaves a TOCTOU window in which
+        // another writer claims the chosen name and this upsert replaces that
+        // credential.
         let kind = account.credential.kind();
         let mut outcome = crate::config::Upsert::Added;
+        let mut name = account.name.clone();
         let merged = crate::config::update_path(path, |c| {
-            outcome = c.upsert_account(account.clone());
+            let mut account = account.clone();
+            if let AccountCredential::OpenRouter { api_key, label } = &account.credential {
+                let (api_key, label) = (api_key.clone(), label.clone());
+                account.name = crate::cli::login::openrouter_account_name(c, &label, &api_key);
+            }
+            name = account.name.clone();
+            outcome = c.upsert_account(account);
         })?;
         self.apply_roster(&merged);
         // Names/kinds are not credentials; no token reaches a log line.
@@ -1159,7 +1189,8 @@ pub async fn background_refresh_pass(state: &AppState) {
             AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. }
             | AccountCredential::Grok { expires_at_ms, .. } => *expires_at_ms,
-            AccountCredential::Apikey { .. } => continue,
+            // Neither an anthropic API key nor an OpenRouter key expires.
+            AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => continue,
         };
         if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
             continue;
@@ -1964,7 +1995,11 @@ async fn grok_config_endpoint(
 /// the upstream proxy fallback; Anthropic exposes no root `/models`, and
 /// `/v1/models` is untouched (still proxied), so nothing regresses.
 async fn models_endpoint(State(state): State<AppState>) -> Response {
-    let models = crate::catalog::catalog(&state.grok.model(), &state.codex.model());
+    let models = crate::catalog::catalog(
+        &state.grok.model(),
+        &state.codex.model(),
+        state.openrouter.model(),
+    );
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -2077,7 +2112,7 @@ pub fn apply_settings(
         }
     }
     if let Some(group) = req.routing_default_group.as_deref() {
-        if !["claude", "codex", "grok"].contains(&group) {
+        if !["claude", "codex", "grok", "openrouter"].contains(&group) {
             return Err(format!("routing_default_group: unknown group {group:?}"));
         }
     }
@@ -2416,7 +2451,14 @@ async fn inject_account_endpoint(
     body: axum::extract::Json<InjectAccountRequest>,
 ) -> Response {
     let account = body.0.account;
-    if account.name.trim().is_empty() {
+    // An openrouter credential is the one kind whose name is DERIVED, not
+    // supplied: `inject_account` computes it from the key inside the
+    // read-merge-write closure (the key is the identity; a caller-chosen name
+    // could duplicate or overwrite a credential). `run_login` therefore hands
+    // one over empty on purpose — rejecting that here breaks the daemon login
+    // outright with a 400.
+    let name_derived = matches!(account.credential, AccountCredential::OpenRouter { .. });
+    if !name_derived && account.name.trim().is_empty() {
         return relay_error(StatusCode::BAD_REQUEST, "account name is required");
     }
     // Capture a masked echo of the access token BEFORE moving the account into
@@ -2427,7 +2469,7 @@ async fn inject_account_endpoint(
         | AccountCredential::Grok { access_token, .. } => {
             Some(crate::proxy::logging::mask_credentials(access_token))
         }
-        AccountCredential::Apikey { .. } => None,
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
     };
     let kind = account.credential.kind();
 
@@ -2584,6 +2626,38 @@ async fn run_login(
                     .map_err(|e| e.to_string())?;
             crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint)
                 .map_err(|e| e.to_string())?
+        }
+        LoginProvider::OpenRouter => {
+            // OAuth PKCE with a localhost callback (docs/openrouter/spec.md
+            // §R5). The exchange yields a long-lived API key, so there is no
+            // token/expiry to publish — just the account.
+            let api_key = crate::auth::openrouter::login_interactive(&state.client)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Key-shaped "labels" are discarded, not persisted — OpenRouter
+            // returns the masked KEY as the label for a PKCE-minted key.
+            let label = crate::auth::openrouter::fetch_key_label(
+                &state.client,
+                crate::auth::openrouter::KEY_INFO_URL,
+                &api_key,
+            )
+            .await
+            .filter(|l| !crate::cli::login::label_is_key_shaped(l))
+            .unwrap_or_default();
+            // The NAME is deliberately left as a placeholder:
+            // `inject_account` derives the real one from the key inside its
+            // read-merge-write closure (against the merged state, via the same
+            // allocator the CLI uses). Computing it here from a separate
+            // snapshot would reintroduce both a TOCTOU window and a path
+            // divergence — `load_or_init()` resolves the global config path
+            // while persistence uses `state.config_path`.
+            crate::config::AccountConfig {
+                name: String::new(),
+                credential: crate::config::AccountCredential::OpenRouter {
+                    api_key,
+                    label: label.trim().to_string(),
+                },
+            }
         }
     };
     state
@@ -3654,8 +3728,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 16 curated + 1 synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 17);
+        // 26 curated (8 claude + 6 codex + 2 grok + 10 openrouter) + 1
+        // synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 27);
 
         let by_id = |id: &str| {
             models
@@ -4198,6 +4273,91 @@ mod tests {
                 last_refresh_ms: Some(1_699_990_000_000),
             },
         }
+    }
+
+    fn openrouter_account_named(name: &str, key: &str, label: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::OpenRouter {
+                api_key: key.to_string(),
+                label: label.to_string(),
+            },
+        }
+    }
+
+    /// `/llmux/inject-account` must not let a caller-supplied name decide
+    /// openrouter identity, and must cope with `run_login` handing over an
+    /// EMPTY name (it defers naming here on purpose, so it never computes one
+    /// from a snapshot it would then race).
+    ///
+    /// Oauth/codex/grok credentials carry an `account_uuid`, so
+    /// `upsert_account` dedupes them whatever they are called. An openrouter
+    /// credential has none — its KEY is the identity — so without derivation
+    /// the cases below produce a duplicated credential (one key, two accounts,
+    /// double-counted quota), an overwritten one (two keys, one account), or
+    /// an account literally named "".
+    #[tokio::test]
+    async fn inject_openrouter_account_derives_the_name_from_the_key() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+
+        async fn inject(state: AppState, account: AccountConfig) -> serde_json::Value {
+            let r = inject_account_endpoint(
+                State(state),
+                axum::extract::Json(InjectAccountRequest { account }),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            response_json(r).await
+        }
+
+        // 1. `run_login`'s shape: an EMPTY name, labelled "work".
+        let body = inject(
+            state.clone(),
+            openrouter_account_named("", "sk-or-v1-AAA", "work"),
+        )
+        .await;
+        assert_eq!(body["name"], "or:work", "empty name must never persist");
+
+        // 2. The SAME key under a caller-chosen name lands on the same account.
+        let body = inject(
+            state.clone(),
+            openrouter_account_named("or:something-else", "sk-or-v1-AAA", ""),
+        )
+        .await;
+        assert_eq!(body["name"], "or:work", "same key keeps its account");
+        assert_eq!(body["added"], false, "updated, not added");
+
+        // 3. A DIFFERENT key sharing the label must NOT overwrite it.
+        let body = inject(
+            state.clone(),
+            openrouter_account_named("or:work", "sk-or-v1-BBB", "work"),
+        )
+        .await;
+        assert_eq!(body["name"], "or:work-2");
+        assert_eq!(body["added"], true);
+
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        let names: Vec<&str> = on_disk.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["or:work", "or:work-2"],
+            "two keys, two accounts"
+        );
+        let keys: Vec<&str> = on_disk
+            .accounts
+            .iter()
+            .filter_map(|a| match &a.credential {
+                AccountCredential::OpenRouter { api_key, .. } => Some(api_key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["sk-or-v1-AAA", "sk-or-v1-BBB"],
+            "no key silently replaced"
+        );
     }
 
     #[tokio::test]

@@ -84,6 +84,14 @@ const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 /// on the page — carried from grok-4.5's $0.50/M rate. API-list-price
 /// equivalent for subscription traffic, like the other grok rows.
 const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
+/// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
+/// on the live `GET /api/v1/models` probe of 2026-08-21
+/// (docs/openrouter/spec.md). Deliberately NOT the `group == "openrouter"`
+/// fallback: OpenRouter also serves ~400 PAID models reachable through the
+/// `or-<vendor>/<slug>` escape hatch, and asserting $0 for those would be an
+/// invented number.
+const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -107,6 +115,17 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     };
     if exact.is_some() {
         return exact;
+    }
+    // Curated OpenRouter free models, keyed by the UPSTREAM slug — which is
+    // what the activity log records (the proxy rewrites `or-ox-alpha` to
+    // `stealth/ox-alpha` before the request leaves, and `finished_meta`
+    // reports the wire model). `crate::catalog::OPENROUTER_MODELS` is the SSOT
+    // for the set, so adding a row there prices it automatically.
+    if crate::catalog::OPENROUTER_MODELS
+        .iter()
+        .any(|(_, slug, ..)| *slug == model_norm_lower)
+    {
+        return Some(OPENROUTER_FREE);
     }
     // Prefix fallback for versioned / suffixed slugs.
     if model_norm_lower.starts_with("claude-opus-") {
@@ -172,7 +191,11 @@ pub fn price_for(
         return Some(p);
     }
 
-    // 3. Group fallback.
+    // 3. Group fallback. `openrouter` deliberately has NONE: the group spans
+    // free and paid models from ~60 vendors, so there is no defensible
+    // representative rate — an uncurated openrouter model is priced `None`
+    // (unknown), which `cost_usd` renders as 0.0 exactly as it does for any
+    // other unknown group.
     match group.to_ascii_lowercase().as_str() {
         "claude" => Some(OPUS_TIER),
         "codex" => Some(GPT_5_5),
@@ -256,6 +279,44 @@ pub fn priced_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- openrouter pricing (docs/openrouter/spec.md §R6) ----
+    #[test]
+    fn openrouter_curated_free_models_price_at_zero() {
+        let overrides = std::collections::HashMap::new();
+        // Priced by the UPSTREAM slug — the activity log records what went on
+        // the wire, not the `or-…` id the client typed.
+        for (_, slug, ..) in crate::catalog::OPENROUTER_MODELS {
+            let p = price_for("openrouter", slug, &overrides)
+                .unwrap_or_else(|| panic!("{slug} priced"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_creation),
+                (0.0, 0.0, 0.0, 0.0),
+                "{slug} is a free model"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_group_has_no_fallback_price() {
+        let overrides = std::collections::HashMap::new();
+        // The group fronts ~400 PAID models through the `or-<vendor>/<slug>`
+        // escape hatch, so an uncurated slug must be UNKNOWN rather than
+        // silently claimed free (which would understate real spend).
+        assert!(
+            price_for("openrouter", "anthropic/claude-sonnet-4", &overrides).is_none(),
+            "an uncurated openrouter model must not inherit a group price"
+        );
+        // …and a config override still wins, so a user CAN price one.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "anthropic/claude-sonnet-4".to_string(),
+            ModelPrice::new(3.0, 15.0, 0.3, 3.75),
+        );
+        let p = price_for("openrouter", "anthropic/claude-sonnet-4", &overrides)
+            .expect("override applies");
+        assert_eq!((p.input, p.output), (3.0, 15.0));
+    }
 
     // ---- C14: grok pricing ----
     #[test]
