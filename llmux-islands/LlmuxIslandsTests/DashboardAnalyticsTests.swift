@@ -66,6 +66,104 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(ClientIDLabel.display(#"["device_id"]"#), #"["device_id"]"#)
     }
 
+    // MARK: - Client name shortening (activity client-name)
+
+    func testClientNameLabelFirstTokenFirstFourChars() {
+        // The user-spec examples, verbatim (mirrors Rust `client_short_name`).
+        XCTAssertEqual(ClientNameLabel.short("Z (U09F1M5MML1)"), "Z")
+        XCTAssertEqual(ClientNameLabel.short("luka (U0AAAAAAAAA)"), "luka")
+        XCTAssertEqual(ClientNameLabel.short("angelo (U0BBBBBBBBB)"), "ange")
+        XCTAssertEqual(ClientNameLabel.short("local"), "loca")
+    }
+
+    func testClientNameLabelUnicodeAndEmpty() {
+        // Character (grapheme) clipping — the SAME unit as Rust's
+        // `client_short_name` (unicode-segmentation): a ZWJ family emoji is
+        // one Character and survives whole; Hangul keeps whole syllables.
+        XCTAssertEqual(ClientNameLabel.short("위대한이름 (U1)"), "위대한이")
+        XCTAssertEqual(ClientNameLabel.short("한글"), "한글")
+        XCTAssertEqual(ClientNameLabel.short("👨‍👩‍👧‍👦 (U1)"), "👨‍👩‍👧‍👦")
+        XCTAssertEqual(ClientNameLabel.short("👨‍👩‍👧‍👦x둘셋넷 (U1)"), "👨‍👩‍👧‍👦x둘셋")
+        XCTAssertEqual(ClientNameLabel.short(""), "")
+        XCTAssertEqual(ClientNameLabel.short("   "), "")
+    }
+
+    // MARK: - Row label composition (activity client-name)
+
+    private func completedRow(_ json: String) throws -> LlmuxDashboardCompleted {
+        try JSONDecoder().decode(LlmuxDashboardCompleted.self, from: Data(json.utf8))
+    }
+
+    func testCompletedLabelLeadsWithShortClientName() throws {
+        // The PRODUCTION composition — dropping the name from the label
+        // makes this fail, not just the shortening helper.
+        let named = try completedRow(
+            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"Z (U09F1M5MML1)"}"#
+        )
+        XCTAssertEqual(ClientNameLabel.completedLabel(named), "Z claude-opus-4-8")
+        let bare = try completedRow(#"{"kind":"request","at_ms":1,"model":"claude-opus-4-8"}"#)
+        XCTAssertEqual(ClientNameLabel.completedLabel(bare), "claude-opus-4-8")
+        // Whitespace-only name shortens to empty → bare label, never a
+        // leading space (guard sits on the SHORTENED value).
+        let blank = try completedRow(
+            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"   "}"#
+        )
+        XCTAssertEqual(ClientNameLabel.completedLabel(blank), "claude-opus-4-8")
+    }
+
+    func testActivityRowModelComposesTheDashboardRowVerbatim() throws {
+        // The factory output IS what UsageActivityList renders (the view has
+        // no label/trailing expression of its own) — dropping the short name
+        // from the composed row fails HERE, at the production surface.
+        let entry = try completedRow(
+            #"{"kind":"request","at_ms":0,"model":"claude-opus-4-8","client_name":"Z (U09F1M5MML1)","status":200,"duration_ms":1000,"tokens":{"input":10,"output":5}}"#
+        )
+        let now = Date(timeIntervalSince1970: 300)
+        let model = ActivityRowModel.completed(entry, now: now)
+        XCTAssertEqual(model.label, "Z claude-opus-4-8")
+        XCTAssertEqual(model.status, 200)
+        XCTAssertNil(model.marker)
+        XCTAssertEqual(model.time, "5m")
+        XCTAssertEqual(model.trailing, "10→5  1.0s")
+    }
+
+    func testActivityRowModelComposesReceiptRowsForAllKinds() throws {
+        let now = Date(timeIntervalSince1970: 300)
+        // Request receipt: short name leads the label (the canonical list
+        // renders this model verbatim).
+        let requestJSON = #"{"receipt_id":"request:1:POST:/v1/messages:200","kind":"request","occurred_at_ms":0,"status":200,"method":"POST","path":"/v1/messages","fast":false,"error":false,"model":"claude-opus-4-8","client_name":"angelo (U0B)","duration_ms":1000}"#
+        let request = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(requestJSON.utf8))
+        let requestModel = ActivityRowModel.receipt(request, now: now)
+        XCTAssertEqual(requestModel.label, "ange claude-opus-4-8")
+        XCTAssertNil(requestModel.marker)
+        XCTAssertEqual(requestModel.trailing, "1.0s")
+        // In-flight receipt: marker + elapsed trailing, no name invented.
+        let inFlightJSON = #"{"receipt_id":"in_flight:9","kind":"in_flight","occurred_at_ms":0,"method":"POST","path":"/v1/messages","fast":false,"error":false,"elapsed_ms":2000}"#
+        let inFlight = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(inFlightJSON.utf8))
+        let inFlightModel = ActivityRowModel.receipt(inFlight, now: now)
+        XCTAssertEqual(inFlightModel.marker, "···")
+        XCTAssertEqual(inFlightModel.label, "/v1/messages")
+        XCTAssertEqual(inFlightModel.trailing, "2.0s")
+        // Note receipt: marker "note", message verbatim as the label.
+        let noteJSON = #"{"receipt_id":"note:1:0","kind":"note","occurred_at_ms":0,"fast":false,"error":false,"message":"token refreshed: anonymous"}"#
+        let note = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(noteJSON.utf8))
+        let noteModel = ActivityRowModel.receipt(note, now: now)
+        XCTAssertEqual(noteModel.marker, "note")
+        XCTAssertEqual(noteModel.label, "token refreshed: anonymous")
+    }
+
+    func testReceiptLabelLeadsWithShortClientName() throws {
+        // Canonical shared-core receipt path (the list the app prefers when
+        // receipts exist) uses the same tested composition.
+        let json = #"{"receipt_id":"request:1:POST:/v1/messages:200","kind":"request","occurred_at_ms":1,"status":200,"method":"POST","path":"/v1/messages","fast":false,"error":false,"model":"claude-opus-4-8","client_name":"angelo (U0B)"}"#
+        let receipt = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(json.utf8))
+        XCTAssertEqual(ClientNameLabel.receiptLabel(receipt), "ange claude-opus-4-8")
+        // Notes keep their message verbatim (no name on note receipts).
+        let noteJSON = #"{"receipt_id":"note:1:0","kind":"note","occurred_at_ms":1,"fast":false,"error":false,"message":"token refreshed: anonymous"}"#
+        let note = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(noteJSON.utf8))
+        XCTAssertEqual(ClientNameLabel.receiptLabel(note), "token refreshed: anonymous")
+    }
+
     func testCountAndCostFormatting() {
         XCTAssertEqual(DashFormat.count(UInt64(999)), "999")
         XCTAssertEqual(DashFormat.count(UInt64(12_345)), "12.3k")

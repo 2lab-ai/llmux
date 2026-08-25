@@ -39,6 +39,8 @@ final class SharedUiStateTests: XCTestCase {
         XCTAssertEqual(state.statistics.overview.requests, 12)
         XCTAssertEqual(state.statistics.activityReceipts.first?.receiptId, "request:1:POST:/v1/messages:200")
         XCTAssertEqual(state.statistics.activityReceipts.first?.path, "/v1/messages")
+        XCTAssertEqual(state.statistics.activityReceipts.first?.tenant, "k-t1")
+        XCTAssertEqual(state.statistics.activityReceipts.first?.clientName, "Z (U09F1M5MML1)")
         XCTAssertEqual(state.verificationReceipts.first?.operation, "pause_account")
         XCTAssertEqual(state.verificationReceipts.first?.outcome, "succeeded")
         XCTAssertTrue(state.settings.emailAnonymous)
@@ -47,6 +49,15 @@ final class SharedUiStateTests: XCTestCase {
         XCTAssertEqual(state.settings.screens.first?.id, "screen-1")
         XCTAssertFalse(state.settings.capabilities.tray.available)
         XCTAssertEqual(state.settings.events.first?.id, "launch")
+    }
+
+    func testActivityReceiptWithoutTenantFieldsDecodesNil() throws {
+        // Older core states never wrote tenant/client_name (activity
+        // client-name) — absent keys decode nil, never a parse error.
+        let json = #"{"receipt_id":"request:1:POST:/p:200","kind":"request","occurred_at_ms":1,"status":200,"method":"POST","path":"/p","account_display":null,"provider":null,"model":null,"effort":null,"fast":false,"tokens":null,"cache":null,"cost_usd":null,"duration_ms":10,"elapsed_ms":null,"message":null,"error":false}"#
+        let receipt = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(json.utf8))
+        XCTAssertNil(receipt.tenant)
+        XCTAssertNil(receipt.clientName)
     }
 
     func testUnknownSchemaVersionIsRejected() {
@@ -136,7 +147,9 @@ final class SharedUiStateTests: XCTestCase {
           "duration_ms": 10,
           "elapsed_ms": null,
           "message": null,
-          "error": false
+          "error": false,
+          "tenant": "k-t1",
+          "client_name": "Z (U09F1M5MML1)"
         }],
         "data_quality": {
           "model_usage": "canonical",

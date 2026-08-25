@@ -252,6 +252,101 @@ enum ClientIDLabel {
     }
 }
 
+/// Short display form of a completed row's client display name (activity
+/// client-name) — mirrors Rust's `format::client_short_name`: the FIRST
+/// whitespace-separated token, clipped to its first 4 characters
+/// (Character-based, so multi-byte names never split). "Z (U09…)" → "Z",
+/// "luka (U0…)" → "luka", "angelo (U0…)" → "ange", "local" → "loca".
+enum ClientNameLabel {
+    static func short(_ name: String) -> String {
+        guard let first = name.split(whereSeparator: \.isWhitespace).first else { return "" }
+        return String(first.prefix(4))
+    }
+
+    /// Recent-activity row label for a dashboard-DTO completed entry: the
+    /// short client name leads when the daemon resolved one — "Z opus-4-8" —
+    /// and rows without one (older daemons, pre-tenant history) keep the
+    /// bare model/path label, never a coerced "local".
+    static func completedLabel(_ entry: LlmuxDashboardCompleted) -> String {
+        composedLabel(
+            name: entry.clientName,
+            base: entry.model ?? entry.path ?? entry.method ?? "request"
+        )
+    }
+
+    /// Same composition for the canonical shared-core receipt path — the
+    /// list the app prefers whenever `activityReceipts` is non-empty
+    /// (StatsSectionContent.overview).
+    static func receiptLabel(_ receipt: SharedActivityReceipt) -> String {
+        composedLabel(
+            name: receipt.clientName,
+            base: receipt.message ?? receipt.model ?? receipt.path ?? receipt.method ?? receipt.kind
+        )
+    }
+
+    /// Guard on the SHORTENED value: a whitespace-only name shortens to
+    /// empty and must yield the bare base label, not a leading space.
+    private static func composedLabel(name: String?, base: String) -> String {
+        guard let name else { return base }
+        let shortName = short(name)
+        guard !shortName.isEmpty else { return base }
+        return "\(shortName) \(base)"
+    }
+}
+
+/// The ONE composed row model for both recent-activity lists (activity
+/// client-name). The views (`UsageActivityList` / the canonical receipt
+/// list in UsageAnalyticsViews.swift) render these fields VERBATIM — there
+/// is no per-view label/trailing expression left at the call sites, so the
+/// factory tests cover exactly what renders.
+struct ActivityRowModel: Equatable {
+    /// Relative age ("5m").
+    let time: String
+    /// Raw HTTP status for the view's color mapping; `nil` renders blank.
+    let status: Int?
+    /// Non-request marker text ("···" in-flight / "note"), overriding the
+    /// status cell when present.
+    let marker: String?
+    /// Short client name + model/path base (`ClientNameLabel` composition).
+    let label: String
+    /// tokens · cost · duration (or elapsed time while in flight).
+    let trailing: String
+
+    static func completed(_ entry: LlmuxDashboardCompleted, now: Date) -> ActivityRowModel {
+        ActivityRowModel(
+            time: DashFormat.ago(ms: entry.atMs, now: now),
+            status: entry.status,
+            marker: nil,
+            label: ClientNameLabel.completedLabel(entry),
+            trailing: [
+                entry.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
+                entry.costUsd.map { DashFormat.cost($0) },
+                entry.durationMs.map { DashFormat.duration(ms: $0) },
+            ]
+            .compactMap { $0 }
+            .joined(separator: "  ")
+        )
+    }
+
+    static func receipt(_ receipt: SharedActivityReceipt, now: Date) -> ActivityRowModel {
+        ActivityRowModel(
+            time: DashFormat.ago(ms: receipt.occurredAtMs, now: now),
+            status: receipt.status,
+            marker: receipt.kind == "in_flight" ? "···" : receipt.kind == "note" ? "note" : nil,
+            label: ClientNameLabel.receiptLabel(receipt),
+            trailing: receipt.kind == "in_flight"
+                ? (receipt.elapsedMs.map { DashFormat.duration(ms: $0) } ?? "in flight")
+                : [
+                    receipt.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
+                    receipt.costUsd.map { DashFormat.cost($0) },
+                    receipt.durationMs.map { DashFormat.duration(ms: $0) },
+                ]
+                .compactMap { $0 }
+                .joined(separator: "  ")
+        )
+    }
+}
+
 /// Row identity = `(group, model)` — the U13 hard rule. Claude and Codex rows
 /// with the same model text stay separate; every ForEach over model rows MUST
 /// key off this id, never `model` alone.

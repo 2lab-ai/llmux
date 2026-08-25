@@ -5624,6 +5624,8 @@ mod tests {
             at: SystemTime::UNIX_EPOCH + Duration::from_millis(42),
             body: activity::CompletedBody::Request {
                 id,
+                tenant: None,
+                client_name: None,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 account: Some("claude:a@x".into()),
@@ -5862,6 +5864,8 @@ mod tests {
                 user_id: None,
                 kind: Some("count".into()),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         };
         let note = |secs: u64| activity::Completed {
@@ -5973,6 +5977,8 @@ mod tests {
                 // render row k maps to `completed[k]`.
                 kind: Some("user".into()),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         };
         let mut app = remote_app();
@@ -6073,6 +6079,8 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         };
         let top_key =

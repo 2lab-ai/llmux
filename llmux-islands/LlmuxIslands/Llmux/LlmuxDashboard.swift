@@ -412,6 +412,8 @@ struct LlmuxDashboardCompleted: Decodable {
     let group: String?           // additive
     let model: String?           // additive
     let effort: String?          // additive
+    let tenant: String?          // additive (activity client-name)
+    let clientName: String?      // additive (activity client-name)
 
     // "note" fields
     let text: String?
@@ -426,10 +428,11 @@ struct LlmuxDashboardCompleted: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case kind, method, path, account, status, tokens, group, model, effort, text, error
+        case kind, method, path, account, status, tokens, group, model, effort, tenant, text, error
         case atMs = "at_ms"
         case durationMs = "duration_ms"
         case costUsd = "cost_usd"
+        case clientName = "client_name"
     }
 }
 

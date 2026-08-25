@@ -4,7 +4,8 @@ use llmux::dashboard::{ActivityDoc, CompletedDoc};
 
 use crate::contract::{ActivityReceipt, Provider, ReceiptCache, ReceiptKind, ReceiptTokens};
 use crate::privacy::{
-    display_account, display_receipt_target, sanitize_activity_note, sanitize_path, sanitize_text,
+    display_account, display_receipt_target, sanitize_account_text, sanitize_activity_note,
+    sanitize_path, sanitize_text,
 };
 
 /// Project the daemon's bounded activity sample into privacy-safe semantic
@@ -46,6 +47,10 @@ pub(crate) fn from_activity_with_account_privacy(
             elapsed_ms: Some(now_ms.saturating_sub(row.started_at_ms)),
             message: None,
             error: false,
+            // In-flight rows carry no tenant attribution on the wire
+            // (`InFlightDoc` has no tenant field) — never coerced.
+            tenant: None,
+            client_name: None,
         });
     }
 
@@ -64,6 +69,8 @@ pub(crate) fn from_activity_with_account_privacy(
                 model,
                 effort,
                 fast,
+                tenant,
+                client_name,
                 ..
             } => {
                 let safe_path = sanitize_path(path);
@@ -115,6 +122,14 @@ pub(crate) fn from_activity_with_account_privacy(
                     elapsed_ms: None,
                     message: None,
                     error: *status >= 400,
+                    // Activity client-name: the tenant id is machine-shaped
+                    // (`k-…`/`local`/`legacy`), plain sanitize; the display
+                    // name is USER-CHOSEN text that may embed an account
+                    // email, so it passes the account/email masking filter.
+                    tenant: tenant.as_deref().map(sanitize_text),
+                    client_name: client_name
+                        .as_deref()
+                        .map(|name| sanitize_account_text(name, anonymous, &account_handles)),
                 });
             }
             CompletedDoc::Note { at_ms, text, error } => receipts.push(ActivityReceipt {
@@ -136,6 +151,8 @@ pub(crate) fn from_activity_with_account_privacy(
                 elapsed_ms: None,
                 message: Some(sanitize_activity_note(text, anonymous, &account_handles)),
                 error: *error,
+                tenant: None,
+                client_name: None,
             }),
         }
     }

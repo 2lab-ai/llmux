@@ -114,6 +114,25 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertEqual(note.error, false)
         XCTAssertNotNil(note.text)
         XCTAssertNil(note.status)
+
+        // The fixture predates the tenant/client-name fields (activity
+        // client-name) — absent keys decode nil, never a parse error.
+        XCTAssertNil(requests[0].tenant)
+        XCTAssertNil(requests[0].clientName)
+    }
+
+    func testCompletedRowTenantAndClientNameDecode() throws {
+        // A row as a current daemon writes it: tenant id + resolved name.
+        let json = """
+        {"kind": "request", "at_ms": 1783146111455, "method": "POST",
+         "path": "/v1/messages", "account": "claude:user1@example.com",
+         "status": 200, "duration_ms": 1463,
+         "tenant": "k-abc123", "client_name": "Z (U09F1M5MML1)"}
+        """
+        let row = try JSONDecoder().decode(LlmuxDashboardCompleted.self, from: Data(json.utf8))
+        XCTAssertEqual(row.tenant, "k-abc123")
+        XCTAssertEqual(row.clientName, "Z (U09F1M5MML1)")
+        XCTAssertEqual(ClientNameLabel.short(try XCTUnwrap(row.clientName)), "Z")
     }
 
     // MARK: - (b) old-daemon-shaped document

@@ -5716,6 +5716,11 @@ fn draw_activity(
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
 const ACTIVITY_EMAIL_W: usize = 10;
 
+/// The client Name column width on activity rows (activity client-name,
+/// Z 2026-08-24: "첫 4자만 출력") — matches the 4-char shortening rule of
+/// [`format::client_short_name`]; wide glyphs `…`-clip to the same 4 cells.
+const ACTIVITY_NAME_W: usize = 4;
+
 /// Pad `text` with trailing spaces to exactly `width` display cells,
 /// `…`-clipping first when it is too wide.
 fn pad_cells(text: &str, width: usize) -> String {
@@ -5732,9 +5737,10 @@ fn pad_cells_left(text: &str, width: usize) -> String {
 }
 
 /// One folded activity row (glance-triage atom 3, narrowed to `count` runs):
-/// `▸ HH:MM:SS count 33× [meta] email → (all 2xx)` — the START time only
-/// (Z 2026-07-15), the run size riding the type column. The marker toggles
-/// the fold; the body expands it.
+/// `▸ HH:MM:SS count 33×  [meta] email → (all 2xx)` — the START time only
+/// (Z 2026-07-15), the run size riding the NAME column slot (padded to the
+/// same cells as a regular row's name cell, so the meta column stays
+/// aligned). The marker toggles the fold; the body expands it.
 #[allow(clippy::too_many_arguments)]
 fn folded_run_line(
     run: &[Completed],
@@ -5770,11 +5776,18 @@ fn folded_run_line(
         .map(|a| row_account_name(a, mask, abbrev))
         .unwrap_or_else(|| "?".to_string());
     let kind = kind.as_deref().unwrap_or("count");
+    // The run count rides the NAME column slot (activity client-name):
+    // padded to the same ACTIVITY_NAME_W + 1 cells as a regular row's name
+    // cell so the [meta] column starts at the same cell on the header and
+    // its member rows. A count too wide for the slot (10000+ runs) widens
+    // the cell rather than truncating a number.
+    let count = format!("{}×", run.len());
+    let count_pad = ACTIVITY_NAME_W.saturating_sub(cell_width(&count));
     let mut spans = vec![
         stamp,
         Span::styled(format!("{kind:<8} "), kind_style(kind)),
         Span::styled(
-            format!("{}× ", run.len()),
+            format!("{count}{} ", " ".repeat(count_pad)),
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
@@ -5830,11 +5843,13 @@ fn completed_line(
             user_id,
             kind,
             excerpt,
+            tenant: _,
+            client_name,
         } => {
             // Row layout (Z 2026-07-15): every column padded to the frame's
             // max width so rows line up, and the input excerpt LAST, spending
-            // whatever terminal width remains:
-            //   ▸ HH:MM:SS kind [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
+            // whatever terminal width remains (Name added 2026-08-24):
+            //   ▸ HH:MM:SS kind name [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
                 format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
@@ -5884,6 +5899,19 @@ fn completed_line(
             spans.push(Span::styled(
                 format!("{:<8} ", kind.as_deref().unwrap_or("")),
                 kind_style(kind.as_deref().unwrap_or("")),
+            ));
+            // Client Name column (activity client-name): the tenant display
+            // name resolved by the doc builder, shortened to the first
+            // token's first 4 chars ("Z (U09…)"→"Z", "local"→"loca").
+            // Blank when the row predates tenant attribution — never
+            // coerced to "local". Fixed width so the columns stay aligned.
+            let short = client_name
+                .as_deref()
+                .map(|n| format::client_short_name(&masked_text(n, mask)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
+                Style::new().fg(Color::Cyan),
             ));
             spans.extend(pad_spans(
                 activity_meta_spans(
@@ -5986,6 +6014,8 @@ fn completed_detail_lines(
         user_id,
         kind,
         excerpt,
+        tenant,
+        client_name,
     } = &entry.body
     else {
         return Vec::new();
@@ -6029,6 +6059,16 @@ fn completed_detail_lines(
             .map(|l| format!(" \u{ab}{}\u{bb}", masked_text(l, mask)))
             .unwrap_or_default();
         lines.push(indent("client", format!("{uid}{label}")));
+    }
+    // Tenant identity (activity client-name): the FULL raw display name —
+    // the detail row is the fidelity surface, the collapsed row clips to 4
+    // chars — plus the attribution id. Absent for pre-tenant history.
+    if let Some(id) = tenant.as_deref() {
+        let value = match client_name.as_deref() {
+            Some(name) if name != id => format!("{} · {id}", masked_text(name, mask)),
+            _ => id.to_string(),
+        };
+        lines.push(indent("name", value));
     }
     lines.push(indent(
         "account",
@@ -9440,6 +9480,8 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         };
         let labels = BTreeMap::new();
@@ -9475,6 +9517,305 @@ mod tests {
     }
 
     #[test]
+    fn activity_name_column_shows_short_client_name(/* activity client-name */) {
+        // A row with a resolved client name renders the 4-char short form
+        // right after the kind column; a pre-tenant row (no tenant) renders
+        // a BLANK cell — never coerced to "local"/"loca".
+        let named = |name: &str| {
+            let mut entry =
+                completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+            if let CompletedBody::Request {
+                tenant,
+                client_name,
+                kind,
+                ..
+            } = &mut entry.body
+            {
+                *tenant = Some("k-1".into());
+                *client_name = Some(name.to_string());
+                *kind = Some("user".into());
+            }
+            entry
+        };
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let render = |entry: &Completed| -> String {
+            let m = RowMetrics::measure(200, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+        };
+        // "angelo (U0…)" → first token, first 4 chars, right after kind.
+        let row = render(&named("angelo (U0BBBBBBBBB)"));
+        assert!(
+            row.contains("user     ange "),
+            "4-char short name after the kind column: {row}"
+        );
+        // "Z (U09…)" → "Z", padded to the fixed 4-cell column.
+        let row = render(&named("Z (U09F1M5MML1)"));
+        assert!(row.contains("user     Z    "), "padded short name: {row}");
+        // No tenant → blank cell, and nothing invents a name.
+        let blank = completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        let row = render(&blank);
+        assert!(!row.contains("loca"), "never coerced to local: {row}");
+        assert!(
+            row.contains("         [") || row.contains("user          "),
+            "blank name cell keeps the column: {row}"
+        );
+    }
+
+    #[test]
+    fn expanded_detail_keeps_full_client_name(/* activity client-name */) {
+        // The collapsed row clips to 4 chars; the expanded detail is the
+        // fidelity surface and keeps the FULL name + tenant id.
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("k-1".into());
+            *client_name = Some("angelo (U0BBBBBBBBB)".into());
+        }
+        let text: String = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("angelo (U0BBBBBBBBB) · k-1"),
+            "full raw name + tenant id: {text}"
+        );
+        // Builtin bucket: name == id → the id renders once, not "local · local".
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("local".into());
+            *client_name = Some("local".into());
+        }
+        let text: String = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(text.contains("local"));
+        assert!(!text.contains("local · local"));
+        // No tenant → no name detail line at all.
+        let blank = completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        let text: String = completed_detail_lines(&blank, false, &Default::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(!text.contains("       name"), "no name line: {text}");
+    }
+
+    #[test]
+    fn activity_name_cell_final_render_stays_four_cells(/* activity client-name */) {
+        // FINAL RENDERED output, not just the helper: the name cell is the
+        // 3rd span (stamp, kind, name) and always occupies exactly
+        // ACTIVITY_NAME_W + 1 cells — grapheme shortening first (the
+        // cross-client semantic shared with Swift), cell clipping second
+        // (this terminal's fixed column).
+        let named = |name: &str| {
+            let mut entry =
+                completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+            if let CompletedBody::Request {
+                tenant,
+                client_name,
+                kind,
+                ..
+            } = &mut entry.body
+            {
+                *tenant = Some("k-1".into());
+                *client_name = Some(name.to_string());
+                *kind = Some("user".into());
+            }
+            entry
+        };
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let name_cell = |entry: &Completed| {
+            let m = RowMetrics::measure(200, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans[2]
+                .content
+                .to_string()
+        };
+        // The 4 user examples, at the rendered-cell level.
+        for (name, cell) in [
+            ("Z (U09F1M5MML1)", "Z    "),
+            ("luka (U0AAAAAAAAA)", "luka "),
+            ("angelo (U0BBBBBBBBB)", "ange "),
+            ("local", "loca "),
+        ] {
+            assert_eq!(name_cell(&named(name)), cell, "cell for {name:?}");
+        }
+        // 4-Hangul name: 4 graphemes = 8 display cells → cell-clipped with
+        // an ellipsis inside the SAME fixed column.
+        let cell = name_cell(&named("위대한이름 (U1)"));
+        assert!(cell.starts_with("위…"), "wide name cell-clips: {cell:?}");
+        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        // Family-emoji name: ONE grapheme survives shortening whole (the
+        // helper test proves no tear), then cell-clips to the column.
+        let cell = name_cell(&named("👨‍👩‍👧‍👦 (U1)"));
+        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        assert!(cell.starts_with('👨'), "clip starts at the emoji: {cell:?}");
+    }
+
+    #[test]
+    fn activity_excerpt_budget_accounts_for_name_cell(/* activity client-name */) {
+        // The excerpt budget is derived from the ACTUAL spans at draw time,
+        // so the new fixed name cell must shrink it: with a monster excerpt
+        // the rendered line never exceeds the frame width. A stale budget
+        // that ignored the 5-cell name span would overflow by exactly 5.
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            tenant,
+            client_name,
+            kind,
+            excerpt,
+            ..
+        } = &mut entry.body
+        {
+            *tenant = Some("k-1".into());
+            *client_name = Some("angelo (U0BBBBBBBBB)".into());
+            *kind = Some("user".into());
+            *excerpt = Some("x".repeat(400));
+        }
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let rendered_width = |entry: &Completed, w: u16| {
+            let m = RowMetrics::measure(w, &[], &[entry]);
+            completed_line(
+                entry,
+                false,
+                false,
+                &labels,
+                &abbrev,
+                &m,
+                0,
+                true,
+                GradientCfg::default(),
+            )
+            .spans
+            .iter()
+            .map(|s| cell_width(&s.content))
+            .sum::<usize>()
+        };
+        assert!(
+            rendered_width(&entry, 200) <= 200,
+            "wide frame: the excerpt fills the rest but never overflows"
+        );
+        // NARROW frame: the fixed columns alone exceed 60 cells, the budget
+        // hits zero, and the excerpt is DROPPED — it must contribute
+        // nothing (the line equals its excerpt-less width).
+        let mut no_excerpt = entry.clone();
+        if let CompletedBody::Request { excerpt, .. } = &mut no_excerpt.body {
+            *excerpt = None;
+        }
+        assert_eq!(
+            rendered_width(&entry, 60),
+            rendered_width(&no_excerpt, 60),
+            "at width 60 the excerpt contributes zero cells"
+        );
+    }
+
+    #[test]
+    fn folded_run_header_aligns_meta_with_regular_rows(/* activity client-name */) {
+        // The run count rides the NAME column slot: header = stamp + kind +
+        // count-cell, regular row = stamp + kind + name-cell, both padded to
+        // the same width — so the [meta] column starts at the SAME cell on
+        // the header and its member rows. Boundaries are computed from the
+        // ACTUAL rendered span widths, not hand-written constants.
+        let mut probe =
+            completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
+        if let CompletedBody::Request {
+            kind,
+            tenant,
+            client_name,
+            ..
+        } = &mut probe.body
+        {
+            *kind = Some("count".into());
+            *tenant = Some("k-1".into());
+            *client_name = Some("Z (U09F1M5MML1)".into());
+        }
+        let run = [probe.clone(), probe.clone()];
+        let labels = BTreeMap::new();
+        let abbrev = BTreeMap::new();
+        let m = RowMetrics::measure(120, &[], &[&probe]);
+        let header = folded_run_line(
+            &run,
+            false,
+            false,
+            &abbrev,
+            &m,
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        let row = completed_line(
+            &probe,
+            false,
+            false,
+            &labels,
+            &abbrev,
+            &m,
+            0,
+            true,
+            GradientCfg::default(),
+        );
+        let boundary = |line: &Line<'static>, spans: usize| {
+            line.spans[..spans]
+                .iter()
+                .map(|s| cell_width(&s.content))
+                .sum::<usize>()
+        };
+        // Span-by-span: stamp end, kind end, and the post-kind column start
+        // (count-cell == name-cell width) — the meta group begins at the
+        // same cell on both lines.
+        for i in 1..=3 {
+            assert_eq!(
+                boundary(&header, i),
+                boundary(&row, i),
+                "column boundary after span {i} stays aligned"
+            );
+        }
+    }
+
+    #[test]
     fn completed_row_layout_puts_excerpt_last_at_full_width(/* Z 2026-07-15 */) {
         // Row contract: time · kind · [model effort] · email(10) → status
         // dur tok $ … "excerpt", with the excerpt LAST and spending the rest
@@ -9506,6 +9847,8 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
+                tenant: None,
+                client_name: None,
             },
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
@@ -9631,6 +9974,8 @@ mod tests {
                 user_id: None,
                 kind: None,
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         }
     }
@@ -11173,6 +11518,8 @@ mod tests {
                     user_id: None,
                     kind: None,
                     excerpt: None,
+                    tenant: None,
+                    client_name: None,
                 },
             },
             Completed {

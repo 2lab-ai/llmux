@@ -1339,6 +1339,15 @@ pub enum CompletedDoc {
         msg_kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         excerpt: Option<String>,
+        /// KEYED tenant attribution id (`k-…` / `legacy` / `local`) and its
+        /// resolved display name (key name for `k-…`, the bucket id itself
+        /// for builtins — same join as `tenant_usage`). Additive: absent in
+        /// docs written before these fields existed, and `None` (pre-tenant
+        /// replayed history) is skipped on the wire — never coerced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
     },
     Note {
         at_ms: u64,
@@ -1782,6 +1791,10 @@ pub(crate) fn dashboard_doc(
                     user_id,
                     kind,
                     excerpt,
+                    tenant,
+                    // Fold-time name is always None (no key metadata at the
+                    // fold) — the doc resolves it below from `meta`.
+                    client_name: _,
                 } => CompletedDoc::Request {
                     id: *id,
                     at_ms: epoch_ms(entry.at),
@@ -1815,6 +1828,19 @@ pub(crate) fn dashboard_doc(
                     user_id: user_id.clone(),
                     msg_kind: kind.clone(),
                     excerpt: excerpt.clone(),
+                    tenant: tenant.clone(),
+                    // Per-row client name (activity Name column): key name
+                    // for `k-…` ids, the id itself for builtin buckets
+                    // (`local`/`legacy`) — the same join as `tenant_usage`
+                    // below. `None` tenant (pre-field history) stays `None`,
+                    // never coerced into `local`.
+                    client_name: tenant.as_ref().map(|id| {
+                        meta.client_keys
+                            .iter()
+                            .find(|k| &k.id == id)
+                            .map(|k| k.name.clone())
+                            .unwrap_or_else(|| id.clone())
+                    }),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -2477,6 +2503,93 @@ mod tests {
         assert_eq!(doc.client_keys.len(), 1);
         let serialized = serde_json::to_string(&doc.client_keys).expect("json");
         assert!(!serialized.contains("digest"));
+    }
+
+    /// Activity client-name: every completed request row carries its tenant
+    /// id plus the resolved display name — key name for `k-…` ids, the
+    /// bucket id itself for builtins (`local`), and `None` (skipped on the
+    /// wire) for pre-tenant history — never coerced into `local`.
+    #[test]
+    fn doc_completed_rows_carry_tenant_and_resolved_client_name() {
+        let hub = DashboardHub::default();
+        let finished = |id: u64, tenant: Option<&str>, at: SystemTime| {
+            (
+                ActivityEvent::RequestFinished {
+                    id,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    account: Some("a".into()),
+                    status: 200,
+                    duration: Duration::from_millis(900),
+                    tokens: None,
+                    group: Some("claude".into()),
+                    model: Some("claude-opus-4-8".into()),
+                    effort: None,
+                    fast: Some(false),
+                    ttfb_ms: None,
+                    ttft_ms: None,
+                    gen_ms: None,
+                    aborted: false,
+                    user_id: None,
+                    kind: None,
+                    excerpt: None,
+                    tenant: tenant.map(str::to_string),
+                },
+                at,
+            )
+        };
+        let (e, at) = finished(1, Some("k-t1"), now() - Duration::from_secs(30));
+        hub.apply_event(e, at);
+        let (e, at) = finished(2, Some("local"), now() - Duration::from_secs(20));
+        hub.apply_event(e, at);
+        let (e, at) = finished(3, None, now() - Duration::from_secs(10));
+        hub.apply_event(e, at);
+
+        let mut meta = meta();
+        meta.client_keys.push(KeyRowDoc {
+            id: "k-t1".into(),
+            name: "Z (U09F1M5MML1)".into(),
+            email: None,
+            kind: "default".into(),
+            key_prefix: "lmk-aaaa".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        });
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta,
+        );
+
+        let row = |i: usize| match &doc.activity.completed[i] {
+            CompletedDoc::Request {
+                tenant,
+                client_name,
+                ..
+            } => (tenant.clone(), client_name.clone()),
+            other => panic!("expected request, got {other:?}"),
+        };
+        // Newest first: [0] = pre-tenant, [1] = local, [2] = keyed.
+        assert_eq!(row(0), (None, None), "None stays None, never `local`");
+        assert_eq!(
+            row(1),
+            (Some("local".into()), Some("local".into())),
+            "builtin buckets name themselves"
+        );
+        assert_eq!(
+            row(2),
+            (Some("k-t1".into()), Some("Z (U09F1M5MML1)".into()),),
+            "key name joined from key metadata"
+        );
+        // Additive wire shape: the pre-tenant row omits both keys entirely.
+        let json = serde_json::to_value(&doc.activity.completed[0]).expect("json");
+        assert!(json.get("tenant").is_none());
+        assert!(json.get("client_name").is_none());
     }
 
     #[test]
