@@ -682,6 +682,8 @@ mod tests {
                 user_id: None,
                 kind: kind.map(str::to_string),
                 excerpt: None,
+                tenant: None,
+                client_name: None,
             },
         }
     }

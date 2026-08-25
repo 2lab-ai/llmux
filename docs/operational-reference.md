@@ -239,9 +239,15 @@ The dashboard's activity panel shows one row per completed request
 (2026-07-15 layout):
 
 ```text
-▸ HH:MM:SS  kind  [model effort]  email…(10) → 200 3.1s 269tok $0.0079 «session» "input text to the screen edge"
+▸ HH:MM:SS  kind  name  [model effort]  email…(10) → 200 3.1s 269tok $0.0079 «session» "input text to the screen edge"
 ```
 
+- **name** — who sent it: the client-key name for keyed requests, the
+  builtin bucket id for keyless traffic, shortened to the first
+  whitespace-separated token's first 4 chars (`Z (U09…)` → `Z`,
+  `angelo (U0…)` → `ange`, `local` → `loca`). Blank for history persisted
+  before tenant attribution existed — never coerced to `local`. The
+  expanded detail's `name` line keeps the full name plus the tenant id.
 - **kind** — what the request was, classified once at forward entry from the
   buffered body: `user`, `count` (count_tokens), `security`, `compact`,
   `summary`, `title`, `suggest`, `audit`, `subagent`, `sdk`, plus two

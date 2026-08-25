@@ -246,15 +246,20 @@ extension SharedActivityReceipt {
                 kind: "note", atMs: occurredAtMs,
                 method: nil, path: nil, account: nil, status: nil, durationMs: nil,
                 tokens: nil, costUsd: nil, group: nil, model: nil, effort: nil,
+                tenant: tenant, clientName: clientName,
                 text: message, error: error
             )
         }
+        // Tenant attribution rides the receipt from the core producer
+        // (llmux-islands-core/src/receipts.rs) — pass it through so the
+        // canonical activity path shows the same name as the dashboard DTO.
         return LlmuxDashboardCompleted(
             kind: "request", atMs: occurredAtMs,
             method: method, path: path, account: accountDisplay, status: status,
             durationMs: durationMs,
             tokens: tokens.map { .init(input: $0.input, output: $0.output) },
             costUsd: costUsd, group: provider?.rawValue, model: model, effort: effort,
+            tenant: tenant, clientName: clientName,
             text: nil, error: error
         )
     }

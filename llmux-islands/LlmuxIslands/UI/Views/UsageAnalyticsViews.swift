@@ -224,22 +224,27 @@ struct UsageCanonicalActivityReceiptList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(receipts.prefix(11)) { receipt in
+                // The whole row is composed by the ONE tested factory
+                // (ActivityRowModel, DashboardAnalytics.swift) — the view
+                // renders its fields verbatim; only the color mapping
+                // (needs kind/error) stays here.
+                let model = ActivityRowModel.receipt(receipt, now: now)
                 HStack(spacing: 6) {
-                    Text(DashFormat.ago(ms: receipt.occurredAtMs, now: now))
+                    Text(model.time)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.white.opacity(0.35))
                         .frame(width: 30, alignment: .trailing)
-                    Text(status(receipt))
+                    Text(model.marker ?? model.status.map(String.init) ?? "")
                         .font(.system(size: 9, weight: .semibold, design: .monospaced))
                         .foregroundColor(statusColor(receipt))
                         .frame(width: 28, alignment: .leading)
-                    Text(receipt.message ?? receipt.model ?? receipt.path ?? receipt.method ?? receipt.kind)
+                    Text(model.label)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.white.opacity(0.7))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 6)
-                    Text(trailing(receipt))
+                    Text(model.trailing)
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.white.opacity(0.45))
                         .lineLimit(1)
@@ -250,29 +255,12 @@ struct UsageCanonicalActivityReceiptList: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
     }
 
-    private func status(_ receipt: SharedActivityReceipt) -> String {
-        if receipt.kind == "in_flight" { return "···" }
-        if receipt.kind == "note" { return "note" }
-        return receipt.status.map(String.init) ?? ""
-    }
-
     private func statusColor(_ receipt: SharedActivityReceipt) -> Color {
         if receipt.kind == "in_flight" { return TerminalColors.amber }
         guard let status = receipt.status else {
             return receipt.error ? TerminalColors.red : .white.opacity(0.45)
         }
         return status < 400 ? TerminalColors.green : status < 500 ? TerminalColors.amber : TerminalColors.red
-    }
-
-    private func trailing(_ receipt: SharedActivityReceipt) -> String {
-        if receipt.kind == "in_flight" {
-            return receipt.elapsedMs.map { DashFormat.duration(ms: $0) } ?? "in flight"
-        }
-        return [
-            receipt.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
-            receipt.costUsd.map { DashFormat.cost($0) },
-            receipt.durationMs.map { DashFormat.duration(ms: $0) },
-        ].compactMap { $0 }.joined(separator: "  ")
     }
 }
 
@@ -609,19 +597,22 @@ struct UsageActivityList: View {
                 Spacer(minLength: 0)
             }
         } else {
-            row(
-                time: DashFormat.ago(ms: entry.atMs, now: now),
-                status: statusText(entry.status),
-                label: entry.model ?? entry.path ?? entry.method ?? "request",
-                trailing: [
-                    entry.tokens.map { "\(DashFormat.count($0.input))→\(DashFormat.count($0.output))" },
-                    entry.costUsd.map { DashFormat.cost($0) },
-                    entry.durationMs.map { DashFormat.duration(ms: $0) },
-                ]
-                .compactMap { $0 }
-                .joined(separator: "  ")
-            )
+            // The whole row is composed by the ONE tested factory
+            // (ActivityRowModel, DashboardAnalytics.swift) — this view
+            // renders its fields verbatim, so there is no per-view
+            // label/trailing expression to drift from the tests.
+            row(ActivityRowModel.completed(entry, now: now))
         }
+    }
+
+    private func row(_ model: ActivityRowModel) -> some View {
+        row(
+            time: model.time,
+            status: model.marker.map { Text($0).foregroundColor(TerminalColors.amber) }
+                ?? statusText(model.status),
+            label: model.label,
+            trailing: model.trailing
+        )
     }
 
     private func row(time: String, status: Text, label: String, trailing: String) -> some View {
