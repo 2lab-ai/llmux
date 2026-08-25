@@ -92,6 +92,13 @@ impl ReqwestProber {
             AccountCredential::Grok { .. } => Err(ProbeError::Build(
                 "grok accounts expose no quota headers; idle probe skipped".into(),
             )),
+            // OpenRouter's quota model is per-key credit/rate limits, not the
+            // 5h/7d rolling windows the prober exists to sample, and the free
+            // models cost nothing — a probe would burn a request to learn
+            // nothing the scheduler ranks on. Gated out alongside grok.
+            AccountCredential::OpenRouter { .. } => Err(ProbeError::Build(
+                "openrouter accounts expose no 5h/7d quota windows; idle probe skipped".into(),
+            )),
             AccountCredential::Oauth { .. } | AccountCredential::Apikey { .. } => {
                 let mut headers = HeaderMap::new();
                 headers.insert(

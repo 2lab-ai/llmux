@@ -166,7 +166,7 @@ pub async fn login_interactive(client: &reqwest::Client) -> Result<OAuthTokens, 
     eprintln!("If it doesn't open, visit:\n  {url}\n");
     open_browser(&url);
 
-    let code = run_callback_server(listener, "/callback", &state).await?;
+    let code = run_callback_server(listener, "/callback", Some(&state)).await?;
 
     exchange_code_with_state(client, TOKEN_URL, &code, Some(&state), &pkce, &redirect_uri).await
 }
@@ -195,20 +195,25 @@ pub(crate) async fn bind_callback_listener(
     })))
 }
 
-/// Serve the OAuth callback on `listener` until a valid `code` arrives (state
-/// verified), racing against a manual-paste fallback on stdin under the
-/// 2-minute login timeout. Shared by the Claude and Codex flows — the only
-/// per-flow differences (bind port, callback path) are parameters.
+/// Serve the OAuth callback on `listener` until a valid `code` arrives,
+/// racing against a manual-paste fallback on stdin under the 2-minute login
+/// timeout. Shared by the Claude, Codex and OpenRouter flows — the per-flow
+/// differences (bind port, callback path, CSRF state) are parameters.
+///
+/// `state`: `Some(s)` verifies the `state` echo and rejects a mismatch
+/// ([`AuthError::StateMismatch`]); `None` skips the check entirely, for
+/// providers whose callback carries only `code` (OpenRouter — its callback
+/// has no `state` parameter at all, docs/openrouter/spec.md §R5).
 pub(crate) async fn run_callback_server(
     listener: tokio::net::TcpListener,
     callback_path: &str,
-    state: &str,
+    state: Option<&str>,
 ) -> Result<String, AuthError> {
     let (code_tx, code_rx) = oneshot::channel::<Result<String, AuthError>>();
     let app = Router::new()
         .route(callback_path, get(callback_handler))
         .with_state(CallbackState {
-            expected_state: state.to_string(),
+            expected_state: state.map(str::to_string),
             code_tx: Arc::new(StdMutex::new(Some(code_tx))),
         });
     let server = tokio::spawn(async move {
@@ -226,7 +231,7 @@ pub(crate) async fn run_callback_server(
 /// mirroring teamclaude) under the 2-minute login timeout.
 async fn wait_for_code(
     code_rx: oneshot::Receiver<Result<String, AuthError>>,
-    expected_state: &str,
+    expected_state: Option<&str>,
 ) -> Result<String, AuthError> {
     let timeout = tokio::time::sleep(LOGIN_TIMEOUT);
     tokio::pin!(timeout);
@@ -266,16 +271,19 @@ async fn wait_for_code(
 }
 
 /// Interpret a manually pasted value: a full callback URL (extract `code`,
-/// verify `state` when present) or the bare authorization code.
+/// verify `state` when present AND expected) or the bare authorization code.
 /// Query values are not percent-decoded — codes and state are base64url.
-fn parse_pasted_code(input: &str, expected_state: &str) -> Result<String, AuthError> {
+///
+/// `expected_state = None` (state-less providers) means there is nothing to
+/// verify: a pasted code — bare or inside a URL — is accepted as is.
+fn parse_pasted_code(input: &str, expected_state: Option<&str>) -> Result<String, AuthError> {
     if input.starts_with("http://") || input.starts_with("https://") {
         if let Some((_, query)) = input.split_once('?') {
             let query = query.split('#').next().unwrap_or(query);
             let params = parse_query(query);
             if let Some(code) = params.get("code") {
-                if let Some(state) = params.get("state") {
-                    if state != expected_state {
+                if let (Some(expected), Some(state)) = (expected_state, params.get("state")) {
+                    if state != expected {
                         return Err(AuthError::StateMismatch);
                     }
                 }
@@ -302,7 +310,8 @@ type CodeSender = Arc<StdMutex<Option<oneshot::Sender<Result<String, AuthError>>
 
 #[derive(Clone)]
 struct CallbackState {
-    expected_state: String,
+    /// `None` = the provider sends no `state`; skip the CSRF echo check.
+    expected_state: Option<String>,
     code_tx: CodeSender,
 }
 
@@ -320,7 +329,10 @@ enum CallbackOutcome {
     Ignore,
 }
 
-fn eval_callback(params: &HashMap<String, String>, expected_state: &str) -> CallbackOutcome {
+fn eval_callback(
+    params: &HashMap<String, String>,
+    expected_state: Option<&str>,
+) -> CallbackOutcome {
     if let Some(error) = params.get("error") {
         let description = params
             .get("error_description")
@@ -328,9 +340,11 @@ fn eval_callback(params: &HashMap<String, String>, expected_state: &str) -> Call
             .unwrap_or("");
         return CallbackOutcome::ProviderError(format!("{error} - {description}"));
     }
-    match params.get("state") {
-        Some(state) if state == expected_state => {}
-        _ => return CallbackOutcome::StateMismatch,
+    if let Some(expected) = expected_state {
+        match params.get("state") {
+            Some(state) if state == expected => {}
+            _ => return CallbackOutcome::StateMismatch,
+        }
     }
     match params.get("code") {
         Some(code) if !code.is_empty() => CallbackOutcome::Code(code.clone()),
@@ -342,7 +356,7 @@ async fn callback_handler(
     State(state): State<CallbackState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let outcome = eval_callback(&params, &state.expected_state);
+    let outcome = eval_callback(&params, state.expected_state.as_deref());
 
     let settle = |result: Result<String, AuthError>| {
         let mut slot = state
@@ -740,14 +754,14 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            eval_callback(&params, "good"),
+            eval_callback(&params, Some("good")),
             CallbackOutcome::StateMismatch
         );
 
         // Missing state is also a mismatch.
         let params: HashMap<String, String> = [("code".to_string(), "abc".to_string())].into();
         assert_eq!(
-            eval_callback(&params, "good"),
+            eval_callback(&params, Some("good")),
             CallbackOutcome::StateMismatch
         );
     }
@@ -760,7 +774,7 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            eval_callback(&params, "good"),
+            eval_callback(&params, Some("good")),
             CallbackOutcome::Code("abc".to_string())
         );
 
@@ -770,37 +784,87 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            eval_callback(&params, "good"),
+            eval_callback(&params, Some("good")),
             CallbackOutcome::ProviderError("access_denied - nope".to_string())
         );
 
         // No code, no error, valid state → stray hit, keep waiting.
         let params: HashMap<String, String> = [("state".to_string(), "good".to_string())].into();
-        assert_eq!(eval_callback(&params, "good"), CallbackOutcome::Ignore);
+        assert_eq!(
+            eval_callback(&params, Some("good")),
+            CallbackOutcome::Ignore
+        );
+    }
+
+    /// OpenRouter's callback carries ONLY `code` — no `state` to echo — so
+    /// the state-less mode must accept it instead of crying CSRF
+    /// (docs/openrouter/spec.md §R5).
+    #[test]
+    fn callback_without_expected_state_accepts_bare_code() {
+        let params: HashMap<String, String> = [("code".to_string(), "abc".to_string())].into();
+        assert_eq!(
+            eval_callback(&params, None),
+            CallbackOutcome::Code("abc".to_string())
+        );
+
+        // A stray `state` is simply ignored when none is expected.
+        let params: HashMap<String, String> = [
+            ("code".to_string(), "abc".to_string()),
+            ("state".to_string(), "whatever".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            eval_callback(&params, None),
+            CallbackOutcome::Code("abc".to_string())
+        );
+
+        // Provider errors and stray hits keep their meaning.
+        let params: HashMap<String, String> = [("error".to_string(), "denied".to_string())].into();
+        assert_eq!(
+            eval_callback(&params, None),
+            CallbackOutcome::ProviderError("denied - ".to_string())
+        );
+        assert_eq!(
+            eval_callback(&HashMap::new(), None),
+            CallbackOutcome::Ignore
+        );
+
+        // Pasting is state-less too: URL or bare code, both accepted.
+        assert_eq!(
+            parse_pasted_code("http://localhost:1/callback?code=c9", None).ok(),
+            Some("c9".into())
+        );
+        assert_eq!(
+            parse_pasted_code("bare-code", None).ok(),
+            Some("bare-code".into())
+        );
     }
 
     #[test]
     fn pasted_code_accepts_url_and_raw_forms() {
         // Full callback URL with matching state.
         let url = "http://localhost:1234/callback?code=the-code&state=st";
-        assert_eq!(parse_pasted_code(url, "st").ok(), Some("the-code".into()));
+        assert_eq!(
+            parse_pasted_code(url, Some("st")).ok(),
+            Some("the-code".into())
+        );
 
         // URL with wrong state is rejected.
         let url = "http://localhost:1234/callback?code=the-code&state=evil";
         assert!(matches!(
-            parse_pasted_code(url, "st"),
+            parse_pasted_code(url, Some("st")),
             Err(AuthError::StateMismatch)
         ));
 
         // Raw code passes through.
         assert_eq!(
-            parse_pasted_code("raw-code-123", "st").ok(),
+            parse_pasted_code("raw-code-123", Some("st")).ok(),
             Some("raw-code-123".into())
         );
 
         // Fragment after the query is ignored.
         let url = "https://x/callback?code=c1&state=st#frag";
-        assert_eq!(parse_pasted_code(url, "st").ok(), Some("c1".into()));
+        assert_eq!(parse_pasted_code(url, Some("st")).ok(), Some("c1".into()));
     }
 
     /// Mock token endpoint: serves `responses` in order (last one repeats),

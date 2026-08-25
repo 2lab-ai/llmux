@@ -313,6 +313,26 @@ impl ForwardContext {
                     fast: false,
                 }
             }
+            // OpenRouter is a PASSTHROUGH, so there is no per-request
+            // `request_meta` to consult — but the wire model still differs
+            // from the inbound one (`or-ox-alpha` → `stealth/ox-alpha`), and
+            // the activity log must name what actually went upstream. Effort
+            // is client metadata here exactly as on the claude passthrough.
+            Some(BackendGroup::OpenRouter) => FinishedMeta {
+                group: Some("openrouter".to_string()),
+                // The pin MUST come from the provider, not from raw config:
+                // `OpenRouterProvider::new` normalizes an advertised-id pin
+                // (`or-ox-alpha`) to its wire slug, and this metadata is what
+                // usage and pricing are booked against. Reading the raw config
+                // here would book a pinned request as `or-ox-alpha` while the
+                // wire carried `stealth/ox-alpha` — unpriced and misattributed.
+                model: Some(crate::provider::openrouter::resolve_model(
+                    self.model.as_deref(),
+                    state.openrouter.model(),
+                )),
+                effort: claude_effort(&self.body),
+                fast: false,
+            },
             Some(BackendGroup::Claude) => FinishedMeta {
                 group: Some("claude".to_string()),
                 model: self.model.clone(),
@@ -1015,6 +1035,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     let (model, effort) = state.grok.request_meta(&ctx.body);
                     (Some("grok".to_string()), Some(model), effort, false)
                 }
+                BackendGroup::OpenRouter => (
+                    Some("openrouter".to_string()),
+                    // Provider-normalized pin — same reason as `finished_meta`:
+                    // the in-flight row must name what actually goes on the wire.
+                    Some(crate::provider::openrouter::resolve_model(
+                        ctx.model.as_deref(),
+                        state.openrouter.model(),
+                    )),
+                    claude_effort(&ctx.body),
+                    false,
+                ),
                 BackendGroup::Claude => (
                     Some("claude".to_string()),
                     ctx.model.clone(),
@@ -1063,9 +1094,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 3. Translate-path accounts (codex, grok) serve the Messages API
-        // only: count_tokens is answered locally with a naive estimate (no
-        // upstream equivalent); any other endpoint is a clear 501.
+        // 3. Non-anthropic accounts (codex, grok, openrouter) serve the
+        // Messages API only: count_tokens is answered locally with a naive
+        // estimate (no upstream equivalent); any other endpoint is a clear
+        // 501.
         //
         // With routing ON the translate path is driven by the request's GROUP
         // — which, by the invariant asserted above, always matches the leased
@@ -1073,11 +1105,22 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // back to the legacy credential check (translate accounts stay the
         // cross-group overflow pool).
         let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
-        let is_translate = served != BackendGroup::Claude;
+        // Two INDEPENDENT questions, each owned by an exhaustive predicate on
+        // `BackendGroup` so a fifth group cannot answer one and silently
+        // inherit the other (see routing.rs — that conflation already cost one
+        // defect in this very feature).
+        //   - needs_body_translation: codex/grok only. OpenRouter serves the
+        //     Anthropic Messages format natively, so it rides the passthrough
+        //     branch below with a different endpoint, credential and a
+        //     `model`-field rewrite — no converter, no SSE transform.
+        //   - serves_messages_only: every non-anthropic group, openrouter
+        //     included — no count_tokens sibling upstream.
+        let is_translate = served.needs_body_translation();
+        let messages_only = served.serves_messages_only();
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
-        if is_translate {
+        if messages_only {
             let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
             if path == "/v1/messages/count_tokens" {
                 drop(lease);
@@ -1122,13 +1165,23 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     .grok
                     .build_request(&ctx.body, &credential)
                     .map(|out| (out, state.grok.endpoint().to_string())),
-                BackendGroup::Claude => unreachable!("is_translate excludes claude"),
+                BackendGroup::Claude | BackendGroup::OpenRouter => {
+                    unreachable!("is_translate excludes claude and openrouter")
+                }
             };
             match built {
                 Ok(((req, client_stream), endpoint)) => {
                     translate_stream = Some(client_stream);
                     (req, endpoint)
                 }
+                Err(err) => {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return rewrite_error(state, ctx, err.to_string());
+                }
+            }
+        } else if served == BackendGroup::OpenRouter {
+            match build_openrouter_request(state, ctx, &credential).await {
+                Ok(req) => (req, state.openrouter.endpoint().to_string()),
                 Err(err) => {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                     return rewrite_error(state, ctx, err.to_string());
@@ -1143,13 +1196,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
             }
         };
-        // Raw-io 4-payload capture (UI-8): on the translate path the proxy
-        // REWRITES the payload, so the upstream request differs from the
-        // client's — keep the rewritten half for the raw viewer. The
-        // passthrough forwards the client's bytes verbatim → `None` (the
-        // 2-payload case). Built only when capture is on (`Bytes` clone is
-        // refcounted — cheap either way).
-        let upstream_meta = if is_translate && ctx.raw_io_path(state).is_some() {
+        // Raw-io 4-payload capture (UI-8): whenever the proxy REWRITES the
+        // payload the upstream request differs from the client's, so the
+        // rewritten half must be kept for the raw viewer. That is true of the
+        // translate path AND of openrouter — which is not a translator but
+        // still swaps the `model` field, drops the anthropic-only betas, and
+        // targets a different host with a different credential. Gating this on
+        // `is_translate` alone would render an openrouter exchange as the
+        // 2-payload byte-identity view and hide what actually went on the
+        // wire, which is exactly the evidence a model-routing incident needs.
+        // The anthropic passthrough stays 2-payload (its `normalize_body` is a
+        // client-annotation strip, not a routing decision).
+        let rewrites_payload = is_translate || served == BackendGroup::OpenRouter;
+        let upstream_meta = if rewrites_payload && ctx.raw_io_path(state).is_some() {
             Some(UpstreamMeta {
                 url: format!("{}{}", endpoint.trim_end_matches('/'), upstream_req.path),
                 headers: redacted_header_pairs(&upstream_req.headers),
@@ -1237,7 +1296,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         )
                         .await
                     }
-                    None => relay(state, ctx, lease, account, response).await,
+                    None => relay(state, ctx, lease, account, response, upstream_meta).await,
                 };
             }
             UpstreamSignal::RateLimited { retry_after } => {
@@ -1676,13 +1735,15 @@ fn resolve_group(
 }
 
 /// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth`,
-/// `Codex`, and `Grok` all rotate access tokens; `Apikey` never expires.
+/// `Codex`, and `Grok` all rotate access tokens. `Apikey` never expires, and
+/// neither does `OpenRouter` — its PKCE exchange yields a long-lived API key
+/// rather than an access/refresh pair (docs/openrouter/spec.md §R1).
 fn refreshable_expiry(credential: &AccountCredential) -> Option<u64> {
     match credential {
         AccountCredential::Oauth { expires_at_ms, .. }
         | AccountCredential::Codex { expires_at_ms, .. }
         | AccountCredential::Grok { expires_at_ms, .. } => Some(*expires_at_ms),
-        AccountCredential::Apikey { .. } => None,
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
     }
 }
 
@@ -1747,7 +1808,11 @@ pub(crate) async fn refresh_credential(
             // no-coalescer rationale as codex (C8).
             crate::auth::grok::refresh_grok_at(&state.client, token_endpoint, refresh_token).await
         }
-        AccountCredential::Apikey { .. } => return RefreshOutcome::Failed,
+        // Nothing to refresh: an anthropic API key and an OpenRouter key are
+        // both long-lived secrets, not rotating tokens.
+        AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
+            return RefreshOutcome::Failed
+        }
     };
     match outcome {
         Ok(tokens) => {
@@ -1810,7 +1875,9 @@ pub(crate) async fn refresh_credential(
                     },
                     non_empty_or(subject, &account.0),
                 ),
-                AccountCredential::Apikey { .. } => unreachable!("filtered above"),
+                AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
+                    unreachable!("filtered above")
+                }
             };
             state.pool.update_credential(account, fresh.clone());
             state.emit(ActivityEvent::TokenRefreshed {
@@ -1893,6 +1960,29 @@ async fn build_upstream_request(
     Ok(upstream_req)
 }
 
+/// The openrouter twin of [`build_upstream_request`]: the same four provider
+/// hooks, but through [`AppState::openrouter`] so the request gets the
+/// OpenRouter base URL, a `Bearer sk-or-…` credential, and the `or-…` →
+/// upstream-slug `model` rewrite. Still a PASSTHROUGH — the Messages body
+/// leaves in the Anthropic wire format it arrived in.
+async fn build_openrouter_request(
+    state: &AppState,
+    ctx: &ForwardContext,
+    credential: &AccountCredential,
+) -> Result<ProviderRequest, crate::provider::ProviderError> {
+    let wire = AnthropicRequest {
+        method: ctx.method.clone(),
+        path: ctx.path_query.clone(),
+        headers: ctx.headers.clone(),
+        body: ctx.body.clone(),
+    };
+    let unified = state.openrouter.request_out(wire)?;
+    let mut upstream_req = state.openrouter.request_in(unified)?;
+    strip_hop_by_hop(&mut upstream_req.headers);
+    state.openrouter.auth(&mut upstream_req, credential).await?;
+    Ok(upstream_req)
+}
+
 async fn send_upstream(
     state: &AppState,
     endpoint: &str,
@@ -1934,14 +2024,36 @@ fn sanitize_response_headers(headers: &HeaderMap) -> HeaderMap {
 /// buffered (Node parity — enables body logging + usage extraction from
 /// non-streaming JSON). The lease rides along until the body is fully
 /// delivered.
+/// Byte-identity relay of an upstream response.
+///
+/// `upstream_meta` is `Some` only when the proxy REWROTE the request on the way
+/// up while still speaking the client's wire format — i.e. openrouter (swapped
+/// `model`, dropped anthropic-only betas, another host and credential). The
+/// anthropic passthrough passes `None`: there the client bytes ARE the upstream
+/// bytes, which is the 2-payload case. Keeping the rewritten half is a
+/// documented contract, not a nicety — README.md advertises the raw viewer
+/// "over all four wire legs" and docs/ai-debugger.md promises the raw bytes of
+/// both halves of every exchange; recording the CLIENT request as though it
+/// were the upstream one would make the viewer lie exactly where a
+/// model-routing incident is diagnosed.
 async fn relay(
     state: &AppState,
     ctx: &mut ForwardContext,
     lease: crate::scheduler::AccountLease,
     account: AccountId,
     response: reqwest::Response,
+    upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
     let status = response.status();
+    // Two header sets, deliberately: `headers` is what the CLIENT receives
+    // (hop-by-hop stripped, content-length recomputed by hyper), while
+    // `upstream_response_headers` is what the UPSTREAM actually sent. The raw
+    // viewer's upstream leg must show the latter — recording the sanitized set
+    // there would quietly turn "wire truth" into "wire truth, edited by us".
+    // Only materialized when there IS an upstream leg to attach it to.
+    let upstream_response_headers = upstream_meta
+        .as_ref()
+        .map(|_| redacted_header_pairs(response.headers()));
     let headers = sanitize_response_headers(response.headers());
     ctx.log(format!(
         "=== RESPONSE {status} ===\n{}",
@@ -1997,6 +2109,11 @@ async fn relay(
         let raw_io_group = group.clone();
         let raw_io_model = model.clone();
         let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        // The upstream RESPONSE half is byte-identical to the client's here (no
+        // transform), so it is filled from the same tee; only the REQUEST half
+        // differs, and that is the half worth keeping.
+        let raw_io_upstream_meta = upstream_meta;
+        let raw_io_upstream_res_headers = upstream_response_headers.clone();
         sse::passthrough_body(
             response,
             BODY_LOG_LIMIT,
@@ -2030,7 +2147,16 @@ async fn relay(
                     raw_io_max_body,
                     raw_io_req_headers,
                     raw_io_res_headers,
-                    None, // byte-identity passthrough — client IS the upstream exchange
+                    raw_io_upstream_meta.map(|m| {
+                        m.into_raw(
+                            raw_io_max_body,
+                            Some(crate::proxy::raw_io::bounded_body_streamed(
+                                raw_captured.bytes(),
+                                raw_captured.total(),
+                            )),
+                            raw_io_upstream_res_headers,
+                        )
+                    }),
                 );
                 if log_enabled {
                     sections.push(format!(
@@ -2098,10 +2224,26 @@ async fn relay(
         ));
         ctx.flush_log(state);
         // Raw-io capture (Feature B): the full non-streaming body, already
-        // materialized to relay it — no extra read, no hot-path effect.
-        // Byte-identity passthrough: client and upstream exchange are the same
-        // bytes → no separate upstream half (2-payload case).
-        ctx.capture_raw_io(state, Some(&account), status, &bytes, Some(&headers), None);
+        // materialized to relay it — no extra read, no hot-path effect. The
+        // upstream half is present only when the request was rewritten on the
+        // way up (openrouter); its RESPONSE bytes are the same ones the client
+        // gets, since this relay performs no transform.
+        let raw_io_max_body = state.config.raw_io.max_body_bytes;
+        let upstream_raw = upstream_meta.map(|m| {
+            m.into_raw(
+                raw_io_max_body,
+                Some(crate::proxy::raw_io::bounded_body(&bytes, raw_io_max_body)),
+                upstream_response_headers,
+            )
+        });
+        ctx.capture_raw_io(
+            state,
+            Some(&account),
+            status,
+            &bytes,
+            Some(&headers),
+            upstream_raw,
+        );
         ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
         drop(lease);
         axum::body::Body::from(bytes)
@@ -2113,9 +2255,11 @@ async fn relay(
     out
 }
 
-/// `/v1/messages/count_tokens` on a codex account: no upstream equivalent —
-/// answer locally with a naive chars/4 estimate (good enough for Claude
-/// Code's context-window bookkeeping, and strictly better than an error).
+/// `/v1/messages/count_tokens` on a codex, grok or openrouter account: no
+/// upstream equivalent — answer locally with a naive chars/4 estimate (good
+/// enough for Claude Code's context-window bookkeeping, and strictly better
+/// than an error). OpenRouter genuinely 404s that path (live probe
+/// 2026-08-21), so this is not a convenience for it but a correctness fix.
 ///
 /// Deliberately NOT codex-traced: it makes no upstream call, so there is no
 /// "hung vs completed" question and no real upstream usage to record — the

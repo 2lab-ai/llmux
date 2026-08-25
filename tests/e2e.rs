@@ -3273,3 +3273,299 @@ async fn oauth_token_endpoint_is_relayed_raw_without_credential_injection_or_lea
         "token relay must bypass the forward/lease path"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. OpenRouter provider: passthrough with a model rewrite
+// ---------------------------------------------------------------------------
+
+fn openrouter_account(name: &str, key: &str) -> AccountConfig {
+    AccountConfig {
+        name: name.to_string(),
+        credential: AccountCredential::OpenRouter {
+            api_key: key.to_string(),
+            label: format!("label-{name}"),
+        },
+    }
+}
+
+/// Config whose only account is openrouter, with the openrouter upstream
+/// pointed at the mock. `upstream` (the anthropic one) is pointed at a dead
+/// port ON PURPOSE: if the forward path ever picks the anthropic passthrough
+/// for an openrouter account the test fails loudly instead of silently
+/// passing because both happen to point at the same mock.
+fn openrouter_config(mock: &MockUpstream, accounts: Vec<AccountConfig>) -> Config {
+    let mut config = Config {
+        upstream: "http://127.0.0.1:1".to_string(),
+        accounts,
+        ..Default::default()
+    };
+    config.openrouter.upstream = mock.base_url();
+    config
+}
+
+/// An `or-…` model served by an openrouter account must reach the upstream as
+/// a PASSTHROUGH: the Anthropic Messages path and body survive verbatim except
+/// for the `model` field, which is rewritten to the OpenRouter slug. This is
+/// the whole design claim of docs/openrouter/spec.md — that OpenRouter needs
+/// no Messages↔Responses translation — driven end-to-end through the real
+/// forward path rather than the provider unit.
+#[tokio::test]
+async fn openrouter_account_passthrough_rewrites_only_the_model() {
+    const UPSTREAM_BODY: &str =
+        r#"{"id":"msg_or","type":"message","usage":{"input_tokens":11,"output_tokens":5}}"#;
+    const CLIENT_BODY: &str = r#"{"model":"or-ox-alpha","max_tokens":16,"system":"Be brief.","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, CLIENT_BODY).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        UPSTREAM_BODY.as_bytes(),
+        "relayed body must be byte-identical (no translation)"
+    );
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(
+        seen[0].path, "/v1/messages",
+        "the client's Messages path is appended verbatim to openrouter.upstream \
+         — this is what composes https://openrouter.ai/api + /v1/messages"
+    );
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer sk-or-v1-test"),
+        "the openrouter key is the bearer token"
+    );
+    assert_eq!(seen[0].x_api_key, None, "client x-api-key stripped");
+
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "stealth/ox-alpha",
+        "or-ox-alpha resolved to its OpenRouter slug"
+    );
+    // Everything else survived untouched — still an Anthropic Messages body,
+    // NOT a Responses-API one (no `input`/`instructions` keys).
+    assert_eq!(sent["max_tokens"], 16);
+    assert_eq!(sent["system"], "Be brief.");
+    assert_eq!(sent["messages"][0]["content"], "hi");
+    assert!(sent.get("input").is_none(), "not translated to Responses");
+}
+
+/// The `or-<vendor>/<slug>` escape hatch reaches OpenRouter verbatim, so the
+/// ~400 uncurated models are usable without a catalog entry.
+#[tokio::test]
+async fn openrouter_verbatim_slug_escape_hatch_reaches_upstream() {
+    const UPSTREAM_BODY: &str = r#"{"id":"msg_or2","type":"message"}"#;
+    const CLIENT_BODY: &str = r#"{"model":"or-openai/gpt-oss-20b:free","max_tokens":8,"messages":[{"role":"user","content":"yo"}]}"#;
+
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, CLIENT_BODY).await;
+    assert_eq!(response.status(), 200);
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json body");
+    assert_eq!(sent["model"], "openai/gpt-oss-20b:free");
+}
+
+/// `/v1/messages/count_tokens` on an openrouter account must be answered
+/// LOCALLY, never proxied: OpenRouter has no such endpoint —
+/// `POST https://openrouter.ai/api/v1/messages/count_tokens` live-probes
+/// `{"error":{"message":"Not Found","code":404}}` (2026-08-21) — and Claude
+/// Code calls it on every context measurement. The mock is left with an EMPTY
+/// script and asserted untouched, so a regression that proxies the call fails
+/// here rather than in the user's editor.
+#[tokio::test]
+async fn openrouter_count_tokens_is_answered_locally_not_proxied() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(r#"{"model":"or-ox-alpha","messages":[{"role":"user","content":"hello there"}]}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert!(
+        body["input_tokens"].as_u64().is_some_and(|n| n > 0),
+        "a local estimate is returned, got {body}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "count_tokens must never reach the openrouter upstream (it 404s there)"
+    );
+}
+
+/// An openrouter account must refuse endpoints outside the Messages API with a
+/// clean 501 rather than blindly proxying them to openrouter.ai.
+#[tokio::test]
+async fn openrouter_account_refuses_non_messages_endpoints() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/complete"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"or-ox-alpha","prompt":"hi"}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+
+    assert_eq!(response.status(), 501);
+    assert!(mock.seen().is_empty(), "not proxied");
+}
+
+/// Raw-io wire truth for OpenRouter. README.md:18 promises a raw viewer "over
+/// all four wire legs" and docs/ai-debugger.md promises "the raw bytes of both
+/// halves of every exchange" — a documented contract, not polish. OpenRouter is
+/// deliberately NOT a translator, but it still rewrites the `model`, drops the
+/// anthropic-only beta headers and targets another host with another
+/// credential, so gating the upstream leg on `is_translate` would silently
+/// record the CLIENT request as if it were the upstream one. This asserts the
+/// captured upstream half is the real thing, with the bearer redacted.
+#[tokio::test]
+async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer() {
+    const UPSTREAM_BODY: &str =
+        r#"{"id":"msg_or_raw","type":"message","usage":{"input_tokens":4,"output_tokens":2}}"#;
+
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-supersecretkeyvalue")],
+    ))
+    .await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"or-ox-alpha","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+
+    let mut id = 0u64;
+    let mut at_ms = 0u64;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(entry) = doc["activity"]["completed"]
+            .as_array()
+            .and_then(|c| c.iter().find(|e| e["kind"] == "request"))
+        {
+            id = entry["id"].as_u64().expect("id");
+            at_ms = entry["at_ms"].as_u64().expect("at_ms");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(id > 0, "completed entry landed on the dashboard");
+
+    let mut raw = serde_json::Value::Null;
+    for _ in 0..100 {
+        let response = client
+            .get(proxy.url(&format!("/llmux/raw-io?id={id}&at_ms={at_ms}")))
+            .header("x-api-key", E2E_ADMIN_KEY)
+            .send()
+            .await
+            .expect("raw-io reachable");
+        if response.status().is_success() {
+            raw = response.json().await.expect("raw-io json");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let upstream = &raw["upstream"];
+    assert!(
+        upstream.is_object(),
+        "an openrouter exchange must carry the upstream half — it is not a \
+         byte-identity passthrough: {raw}"
+    );
+    assert!(
+        upstream["url"]
+            .as_str()
+            .expect("upstream url")
+            .ends_with("/v1/messages"),
+        "the openrouter target URL: {upstream}"
+    );
+
+    let sent = upstream["request_body"]
+        .as_str()
+        .expect("upstream request body");
+    assert!(
+        sent.contains("stealth/ox-alpha"),
+        "the upstream leg shows the REWRITTEN wire model, not `or-ox-alpha`: {sent}"
+    );
+    assert!(
+        !sent.contains("or-ox-alpha"),
+        "the client's id must not survive into the upstream leg: {sent}"
+    );
+
+    // Credential hygiene: the header is visible, its value never is.
+    let headers = serde_json::to_string(&upstream["request_headers"]).expect("headers json");
+    assert!(
+        !headers.contains("supersecretkeyvalue"),
+        "the openrouter key must never reach the raw-io log: {headers}"
+    );
+    assert!(
+        headers.to_lowercase().contains("authorization"),
+        "the header itself stays visible so the viewer shows it was sent: {headers}"
+    );
+
+    // The upstream leg's RESPONSE headers must be what the upstream actually
+    // sent, not the set llmux hands the client. `sanitize_response_headers`
+    // strips `content-length` on the way out, so its presence here is the
+    // discriminator between "wire truth" and "wire truth, edited by us".
+    let up_res: Vec<(String, String)> =
+        serde_json::from_value(upstream["response_headers"].clone()).expect("upstream res headers");
+    let client_res: Vec<(String, String)> =
+        serde_json::from_value(raw["response_headers"].clone()).expect("client res headers");
+    let has = |set: &[(String, String)], name: &str| {
+        set.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    };
+    assert!(
+        has(&up_res, "content-length"),
+        "the upstream leg carries the upstream's own headers: {up_res:?}"
+    );
+    assert!(
+        !has(&client_res, "content-length"),
+        "…while the client leg carries the sanitized set: {client_res:?}"
+    );
+}

@@ -12,6 +12,7 @@
 pub mod anthropic;
 pub mod codex;
 pub mod grok;
+pub mod openrouter;
 pub mod responses;
 pub mod stubs;
 

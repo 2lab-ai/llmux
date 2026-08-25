@@ -349,7 +349,7 @@ pub async fn login_codex_interactive(
     eprintln!("If it doesn't open, visit:\n  {url}\n");
     oauth::open_browser(&url);
 
-    let code = oauth::run_callback_server(listener, CODEX_CALLBACK_PATH, &state).await?;
+    let code = oauth::run_callback_server(listener, CODEX_CALLBACK_PATH, Some(&state)).await?;
     let exchange = exchange_codex_code(client, token_url, &code, &redirect_uri, &pkce).await?;
 
     account_from_exchange(exchange)

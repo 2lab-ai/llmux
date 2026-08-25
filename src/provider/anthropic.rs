@@ -87,7 +87,7 @@ fn strip_client_context_suffix(value: &mut serde_json::Value) -> bool {
 /// touched. A message whose content array is left EMPTY by the strip is
 /// dropped whole — a foreign thinking-only turn has nothing valid to replay,
 /// and an empty content array is itself an upstream 400.
-fn strip_foreign_thinking(value: &mut serde_json::Value) -> bool {
+pub(crate) fn strip_foreign_thinking(value: &mut serde_json::Value) -> bool {
     let Some(messages) = value
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
@@ -161,6 +161,11 @@ pub fn inject_credential(
         AccountCredential::Codex { .. } => {
             return Err(ProviderError::Auth(
                 "codex credential cannot authenticate against the anthropic provider".into(),
+            ));
+        }
+        AccountCredential::OpenRouter { .. } => {
+            return Err(ProviderError::Auth(
+                "openrouter credential cannot authenticate against the anthropic provider".into(),
             ));
         }
     }

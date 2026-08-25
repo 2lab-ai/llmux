@@ -1,12 +1,14 @@
 # Model catalog
 
-llmux exposes the **known** models — a curated set plus the live grok pin — as
-a machine-readable catalog. This is deliberately not an exhaustive list of
-everything routable: at request time the grok provider forwards ANY `grok-*` id
-verbatim (see [alias semantics](#alias-semantics)), so a request or config pin
-naming an id outside the curated set still works. Such an out-of-catalog pin
-appears here as a **synthesized row** with null metadata (see
-[out-of-catalog pin](#out-of-catalog-grok-pin)).
+llmux exposes the **known** models — a curated set plus the live grok and
+openrouter pins — as a machine-readable catalog. This is deliberately not an
+exhaustive list of everything routable: at request time the grok provider
+forwards ANY `grok-*` id verbatim and the openrouter provider forwards any
+`or-<vendor>/<slug>` verbatim (see [alias semantics](#alias-semantics)), so a
+request or config pin naming an id outside the curated set still works. Such an
+out-of-catalog pin appears here as a **synthesized row** with null metadata (see
+[out-of-catalog grok pin](#out-of-catalog-grok-pin) and
+[out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)).
 
 ## Endpoints
 
@@ -35,7 +37,7 @@ Each element of `models` is a `ModelEntry`:
 | `name`        | string              | Human-facing display name.                                    |
 | `efforts`     | array of strings    | Accepted `reasoning.effort` values, low→high (may be empty).  |
 | `max_context` | integer or `null`   | Context window in tokens; `null` when unpublished.            |
-| `group`       | string              | Backend group: `claude`, `codex`, or `grok`.                  |
+| `group`       | string              | Backend group: `claude`, `codex`, `grok`, or `openrouter`.    |
 
 `max_context: null` means the context window is not published for that id —
 not that it is zero.
@@ -72,6 +74,42 @@ not that it is zero.
   automatically. llmux still does not otherwise *shape* claude requests, and the
   `efforts` menu on claude rows is the Claude Code `/effort` level list, per the
   user contract.
+- **openrouter `or-` aliases** — the openrouter rows advertise the id a client
+  SENDS (`or-ox-alpha`); the OpenRouter slug it is rewritten to on the wire
+  (`stealth/ox-alpha`) is a different string, because the advertised id has to
+  carry the `or-` prefix that routes the request to the openrouter group in the
+  first place. The curated mapping:
+
+  | request slug                | model on the wire                        |
+  | --------------------------- | ---------------------------------------- |
+  | `or-ox-alpha`               | `stealth/ox-alpha`                       |
+  | `or-free`                   | `openrouter/free`                        |
+  | `or-glm-5.2`                | `z-ai/glm-5.2:free`                      |
+  | `or-nemotron-3-ultra`       | `nvidia/nemotron-3-ultra-550b-a55b:free` |
+  | `or-nemotron-3.5-lightning` | `nvidia/nemotron-3.5-lightning:free`     |
+  | `or-dots-3-note`            | `dots-studio/dots-3-note-preview:free`   |
+  | `or-laguna-s-2.1`           | `poolside/laguna-s-2.1:free`             |
+  | `or-north-mini-code`        | `cohere/north-mini-code:free`            |
+  | `or-gemma-4-31b`            | `google/gemma-4-31b-it:free`             |
+  | `or-gpt-oss-20b`            | `openai/gpt-oss-20b:free`                |
+
+  Three rules sit around that table, and the table is a convenience layer, not
+  a gate:
+
+  - **bare `or`** — like bare `grok`, it resolves to the live pin
+    (`config.openrouter.default_model`, default `stealth/ox-alpha`), and so
+    does a request that names no model at all.
+  - **`or-<vendor>/<slug>` escape hatch** — anything containing a `/` is used
+    VERBATIM minus the `or-` selector, so the ~400 OpenRouter models outside
+    the curated set are reachable: `or-openai/gpt-oss-20b:free` →
+    `openai/gpt-oss-20b:free`. A bare `openrouter/…` slug also routes here and
+    rides through unchanged.
+  - **no silent substitution** — an uncurated bare name passes through as it
+    was typed, so OpenRouter's own 404 reaches the user instead of llmux
+    answering from a model nobody asked for.
+
+  Matching is trimmed and case-insensitive, and one trailing `[1m]` is stripped
+  first, exactly as on the claude and codex paths.
 - **alias stability** — aliases float to the current generation, ids do not.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
@@ -94,6 +132,17 @@ known reasoner — e.g. pinning `grok-4.3` yields `none, low, medium, high`), an
 `max_context` = `null`. The null metadata reflects that llmux has no published
 context/name for an id it does not curate.
 
+### Out-of-catalog openrouter pin
+
+`config.openrouter.default_model` may pin ANY OpenRouter slug, including one
+outside the curated table below — the provider forwards it verbatim, so the pin
+is real and routable and the bare `or` alias must have an owner. When the pin
+matches no curated row's wire slug, the catalog appends a **synthesized**
+openrouter row: `id` = `or-<pin>` (the string a client can actually type),
+`name` = the pin verbatim, `aliases` = `["or"]`, `efforts` = empty, and
+`max_context` = `null` — llmux has no published context or effort menu for a
+model it does not curate.
+
 ## Current catalog
 
 | id                  | aliases      | name                | efforts                              | max_context | group  |
@@ -114,10 +163,27 @@ context/name for an id it does not curate.
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.6            | grok (pinned)| Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
+| or-ox-alpha         | or (pinned)  | Ox Alpha (free)     | low, high, max                       | 1048576     | openrouter |
+| or-free             | —            | OpenRouter Free Models Router | —                          | 200000      | openrouter |
+| or-glm-5.2          | —            | Z.ai GLM 5.2 (free) | high, xhigh                          | 256000      | openrouter |
+| or-nemotron-3-ultra | —            | NVIDIA Nemotron 3 Ultra (free) | medium, high              | 1000000     | openrouter |
+| or-nemotron-3.5-lightning | —      | NVIDIA Nemotron 3.5 Lightning (free) | —                   | 1000000     | openrouter |
+| or-dots-3-note      | —            | Dots3-Note Preview (free) | —                              | 512000      | openrouter |
+| or-laguna-s-2.1     | —            | Poolside Laguna S 2.1 (free) | —                           | 262144      | openrouter |
+| or-north-mini-code  | —            | Cohere North Mini Code (free) | —                          | 256000      | openrouter |
+| or-gemma-4-31b      | —            | Google Gemma 4 31B (free) | —                              | 262144      | openrouter |
+| or-gpt-oss-20b      | —            | OpenAI gpt-oss-20b (free) | low, medium, high              | 131072      | openrouter |
 
 "grok (pinned)" means the `grok` alias appears on that row only while it is the
 live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
-(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)).
+(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). "or (pinned)" reads
+the same way for the openrouter pin (see
+[Out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)); with the
+default pin it sits on `or-ox-alpha`. The openrouter ids are what a client
+sends — the slug that reaches OpenRouter is the one in the
+[alias table](#alias-semantics), and every curated openrouter row is a free
+model (priced `$0` in and out; an UNCURATED openrouter model has no known
+rate and is reported unpriced, never as a free `$0`).
 
 ### The codex `[1m]` rows
 
@@ -165,6 +231,15 @@ effort menus and the grok evidence below are unchanged from 2026-07-14).
   input tokens and was rejected at ~936k (`Your input exceeds the context window
   of this model`); `gpt-5.6-terra` accepted 555,029. This supersedes the earlier
   "369,755 pass / ~380k rejected" note that made 372000 look probe-confirmed.
+- **OpenRouter rows** — the live `GET https://openrouter.ai/api/v1/models`
+  probe on 2026-08-21: 420 models, 21 of them with `pricing.prompt == "0"`; the
+  ten curated rows take their wire slug, display name, `max_context`, and
+  effort menu (`reasoning.supported_efforts`, re-sorted low→high) from that
+  response. They are the `OPENROUTER_MODELS` const in `src/catalog.rs`, which
+  is also the source for `or-…` → slug resolution in
+  `src/provider/openrouter.rs`. The design record, including the probe evidence
+  that OpenRouter serves a NATIVE Anthropic Messages endpoint, is
+  [`openrouter/spec.md`](openrouter/spec.md).
 - **Grok context window / name** — the live `cli-chat-proxy` `/v1/models` probe
   2026-07-14 (`grok-4.5` ctx 500000). The `grok-4.6` row was verified the same
   way against the live `cli-chat-proxy` `/v1/models` on 2026-08-13 (ctx 500000,

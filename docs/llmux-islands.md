@@ -24,6 +24,14 @@ are active, the indicator animates with a rainbow loop; the mascot makes a
 small jump whose speed scales with activity up to the capped high-activity
 state.
 
+**OpenRouter accounts are not modeled yet** (2026-08-21). The shared UI
+contract has no openrouter provider case, so an `or:*` account surfaces here
+with an `unknown` provider, and Islands cannot start an OpenRouter login — the
+shared core rejects that provider. Add the account from a terminal instead
+(`llmux login --openrouter`); the daemon, CLI, and TUI serve it normally. The
+Swift shell needs tolerant provider decoding plus an icon before Islands can
+carry the fourth backend group.
+
 ## Native presentation boundaries
 
 The shells share semantic state and behavior, not a cross-platform widget tree.

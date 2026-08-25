@@ -1,6 +1,6 @@
-//! `llmux login [--api | --codex | --grok]` — add an account.
+//! `llmux login [--api | --codex | --grok | --openrouter]` — add an account.
 
-use crate::auth::{codex, oauth, profile};
+use crate::auth::{codex, oauth, openrouter, profile, AuthError};
 use crate::config::{AccountConfig, AccountCredential, Config, Upsert};
 
 use super::{prompt_line, CliError, LoginArgs};
@@ -10,8 +10,12 @@ use super::{prompt_line, CliError, LoginArgs};
 /// `--api` path: prompt for an API key, store as an apikey account.
 /// `--codex` path: ChatGPT OAuth browser flow → upsert a Codex account.
 /// `--grok` path: xAI device-code flow → upsert a Grok account.
+/// `--openrouter` path: OpenRouter PKCE browser flow (or `--paste`) →
+/// upsert an `or:<label>` account.
 pub async fn run(args: LoginArgs) -> Result<(), CliError> {
-    if args.grok {
+    if args.openrouter {
+        login_openrouter(args.paste).await
+    } else if args.grok {
         login_grok().await
     } else if args.codex {
         login_codex().await
@@ -220,6 +224,151 @@ async fn login_grok() -> Result<(), CliError> {
     Ok(())
 }
 
+/// `--openrouter`: mint (or accept) an OpenRouter API key and upsert an
+/// `or:<label>` account (docs/openrouter/spec.md §R5).
+///
+/// `paste = true` skips the browser and prompts for an existing key; the
+/// browser flow also degrades to that prompt when it cannot run at all
+/// (no browser / callback timeout), so a headless box is never a dead end.
+/// The key itself is never printed — only the derived account name is.
+/// Account name for an OpenRouter login: `or:<key label>` when introspection
+/// returned one, else `or:key-N` numbered against `config`'s existing
+/// `or:key-*` accounts (same rule as `api-N` / `claude:account-N`).
+///
+/// SHARED with the daemon-side login (`proxy::server::run_login`) so the CLI
+/// and the dashboard switcher cannot drift into two naming schemes — the first
+/// cut of the daemon arm hardcoded a label-less `or:key`, which would have made
+/// every unlabeled dashboard login overwrite the previous one.
+/// Whether an OpenRouter key label is really just the key (masked or not).
+/// Their `/api/v1/key` returns the key itself as the "label" for a
+/// PKCE-minted key, so this is the common case, not an edge case.
+pub(crate) fn label_is_key_shaped(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    lower.starts_with("sk-or-") || lower.starts_with("sk-")
+}
+
+pub(crate) fn openrouter_account_name(config: &Config, label: &str, api_key: &str) -> String {
+    // The KEY is the durable identity; the label is cosmetic and can change
+    // between logins (introspection is best-effort and degrades to empty). So
+    // look for this key FIRST, under whatever name it already has: without
+    // this, a key stored as `or:key` because the label lookup failed comes
+    // back as `or:work` once the label resolves, and one upstream credential
+    // becomes two scheduler accounts — double-counting its quota.
+    if let Some(existing) = config.accounts.iter().find(|a| {
+        matches!(
+            &a.credential,
+            AccountCredential::OpenRouter { api_key: k, .. } if k == api_key
+        )
+    }) {
+        return existing.name.clone();
+    }
+
+    let taken_by_another_key = |name: &str| {
+        config.accounts.iter().any(|a| {
+            a.name == name
+                && !matches!(
+                    &a.credential,
+                    AccountCredential::OpenRouter { api_key: existing, .. } if existing == api_key
+                )
+        })
+    };
+
+    let base = {
+        let label = label.trim();
+        // OpenRouter's key introspection does NOT return a human label for a
+        // PKCE-minted key — it returns the KEY, masked: a real login produced
+        // `sk-or-v1-010...e42` (live 2026-08-22), which would have made the
+        // account `or:sk-or-v1-010...e42`. That is key material in a name that
+        // then appears in status output, logs and the TUI, and it identifies
+        // nothing a human would recognize. Treat a key-shaped label as absent
+        // and fall back to the numbered form.
+        if label.is_empty() || label_is_key_shaped(label) {
+            "or:key".to_string()
+        } else {
+            format!("or:{label}")
+        }
+    };
+    // Re-logging in with the SAME key keeps the same name (an in-place
+    // update); a DIFFERENT key never lands on an occupied name.
+    if !taken_by_another_key(&base) {
+        return base;
+    }
+    // First UNUSED suffix, not `count + 1`: with `or:key-1` and `or:key-3`
+    // present, counting yields `or:key-3` and the name-keyed upsert would
+    // REPLACE that account — silently destroying a working credential instead
+    // of growing the pool. OpenRouter key labels are explicitly not unique
+    // (see `AccountCredential::OpenRouter`), so this collision is reachable
+    // with labels too, not just unlabeled logins.
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|name| !taken_by_another_key(name))
+        .unwrap_or(base)
+}
+
+async fn login_openrouter(paste: bool) -> Result<(), CliError> {
+    crate::config::load_or_init()?;
+    let client = reqwest::Client::new();
+
+    let api_key = if paste {
+        prompt_openrouter_key()?
+    } else {
+        println!("Starting OpenRouter OAuth login...");
+        match openrouter::login_interactive(&client).await {
+            Ok(key) => key,
+            // Aborted/Io = the flow could not complete locally (no browser,
+            // timeout, port bind). A token-endpoint or transport failure is a
+            // real error and propagates instead of silently asking for a key.
+            Err(err @ (AuthError::Aborted(_) | AuthError::Io(_))) => {
+                eprintln!("warning: interactive OpenRouter login failed ({err})");
+                eprintln!("falling back to manual key entry");
+                prompt_openrouter_key()?
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+
+    // Cosmetic only: a failed introspection degrades to the `or:key-N` name.
+    // A key-shaped "label" is discarded outright rather than persisted — it is
+    // the key again, not a name, and storing it just duplicates the secret.
+    let label = openrouter::fetch_key_label(&client, openrouter::KEY_INFO_URL, &api_key)
+        .await
+        .filter(|l| !label_is_key_shaped(l))
+        .unwrap_or_default();
+
+    let mut final_name = String::new();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        // Numbering is resolved against the fresh on-disk state so unlabeled
+        // logins don't overwrite each other (same rule as `api-N`).
+        let name = openrouter_account_name(config, &label, &api_key);
+        final_name = name.clone();
+        outcome = config.upsert_account(AccountConfig {
+            name,
+            credential: AccountCredential::OpenRouter {
+                api_key: api_key.clone(),
+                label: label.clone(),
+            },
+        });
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added account {final_name:?}"),
+        Upsert::Updated => println!("Updated account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// Prompt for an `sk-or-v1-…` key (stderr prompt, stdin read) — the shape
+/// `login_api` uses. Echoing the key back is deliberately not done.
+fn prompt_openrouter_key() -> Result<String, CliError> {
+    let api_key = prompt_line("OpenRouter API key (sk-or-v1-…): ")?;
+    if api_key.is_empty() {
+        return Err(CliError::Message("no API key provided".into()));
+    }
+    Ok(api_key)
+}
+
 /// Import `~/.codex/auth.json` (when present) and rename it to the
 /// `codex:{email}` convention. `Ok(None)` when no auth.json exists.
 fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
@@ -240,4 +389,118 @@ fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
     let email = (account.name != "codex").then_some(account.name.as_str());
     account.name = codex::codex_account_name(email, &account_id);
     Ok(Some(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn or_account(name: &str, key: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::OpenRouter {
+                api_key: key.to_string(),
+                label: String::new(),
+            },
+        }
+    }
+
+    /// Re-logging in with the SAME key must reuse the name (in-place update),
+    /// while a DIFFERENT key must never land on an occupied one.
+    #[test]
+    fn openrouter_name_reuses_for_the_same_key_and_avoids_another() {
+        let mut config = Config::default();
+        config.accounts.push(or_account("or:work", "sk-or-v1-aaa"));
+
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-aaa"),
+            "or:work",
+            "same key re-login updates in place"
+        );
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-bbb"),
+            "or:work-2",
+            "a different key with the SAME label must not overwrite it \
+             (openrouter labels are explicitly not unique)"
+        );
+    }
+
+    /// The key, not the label, is the identity. A label that appears (or
+    /// changes) between logins must NOT mint a second account for the same
+    /// credential — that would show one upstream quota as two scheduler
+    /// accounts.
+    #[test]
+    fn openrouter_name_follows_the_key_when_the_label_changes() {
+        let mut config = Config::default();
+        // Stored unlabeled first (introspection failed).
+        config.accounts.push(or_account("or:key", "sk-or-v1-aaa"));
+
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-aaa"),
+            "or:key",
+            "same key keeps its existing name even once a label resolves"
+        );
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-aaa"),
+            "or:key",
+            "and when the label disappears again"
+        );
+        // A genuinely new key is unaffected.
+        assert_eq!(
+            openrouter_account_name(&config, "work", "sk-or-v1-bbb"),
+            "or:work"
+        );
+    }
+
+    /// OpenRouter returns the KEY (masked) as the label for a PKCE-minted
+    /// key — a real login produced `sk-or-v1-010...e42`. Naming the account
+    /// after that puts key material into status output, logs and the TUI and
+    /// identifies nothing. Found by the live smoke, not by any mock.
+    #[test]
+    fn a_key_shaped_label_is_not_used_as_the_account_name() {
+        let config = Config::default();
+        for label in ["sk-or-v1-010...e42", "sk-or-v1-abcdef", "sk-ant-whatever"] {
+            let name = openrouter_account_name(&config, label, "sk-or-v1-AAA");
+            assert_eq!(name, "or:key", "{label} must not become the name");
+            assert!(!name.contains("sk-"), "no key material in the name: {name}");
+        }
+        // A genuine human label is still used.
+        assert_eq!(
+            openrouter_account_name(&config, "work laptop", "sk-or-v1-AAA"),
+            "or:work laptop"
+        );
+    }
+
+    /// The unlabeled fallback must pick the first UNUSED suffix. Counting
+    /// existing accounts instead would return an occupied name after a gap,
+    /// and the name-keyed upsert would destroy that credential.
+    #[test]
+    fn openrouter_unlabeled_name_skips_gaps_instead_of_overwriting() {
+        let mut config = Config::default();
+        config.accounts.push(or_account("or:key", "sk-or-v1-1"));
+        config.accounts.push(or_account("or:key-3", "sk-or-v1-3"));
+
+        // `or:key` and `or:key-3` are taken; `or:key-2` is the first free slot.
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-new"),
+            "or:key-2"
+        );
+        // Filling the gap pushes the next one past the highest existing.
+        config.accounts.push(or_account("or:key-2", "sk-or-v1-2"));
+        assert_eq!(
+            openrouter_account_name(&config, "", "sk-or-v1-new"),
+            "or:key-4"
+        );
+    }
+
+    #[test]
+    fn openrouter_name_is_the_bare_label_on_an_empty_config() {
+        let config = Config::default();
+        assert_eq!(
+            openrouter_account_name(&config, "  my-key  ", "sk-or-v1-x"),
+            "or:my-key",
+            "label is trimmed"
+        );
+        assert_eq!(openrouter_account_name(&config, "", "sk-or-v1-x"), "or:key");
+    }
 }

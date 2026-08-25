@@ -174,6 +174,14 @@ pub struct LoginArgs {
     /// (opens a verification page; no localhost callback).
     #[arg(long, conflicts_with_all = ["api", "codex"])]
     pub grok: bool,
+    /// Add an OpenRouter account via its OAuth PKCE browser flow. The
+    /// exchange yields a long-lived `sk-or-v1-…` key (no refresh).
+    #[arg(long, conflicts_with_all = ["api", "codex", "grok"])]
+    pub openrouter: bool,
+    /// With `--openrouter`: paste an existing API key instead of opening a
+    /// browser (also the automatic fallback when no browser is available).
+    #[arg(long, requires = "openrouter")]
+    pub paste: bool,
 }
 
 #[derive(Debug, Args)]
@@ -804,6 +812,8 @@ mod tests {
                 api: false,
                 codex: false,
                 grok: false,
+                openrouter: false,
+                paste: false,
             })),
             Some("login")
         );

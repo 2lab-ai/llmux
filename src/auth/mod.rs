@@ -5,6 +5,7 @@ pub mod codex;
 pub mod credentials;
 pub mod grok;
 pub mod oauth;
+pub mod openrouter;
 pub mod profile;
 
 #[derive(Debug, thiserror::Error)]
