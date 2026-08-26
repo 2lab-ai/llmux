@@ -49,7 +49,7 @@ loudly** — it never silently acts on a local daemon.
 | Commands | Behavior |
 |---|---|
 | `run`, `server`, `dashboard`, `status`, `env`, `accounts` | Target the REMOTE daemon (read/attach only). `run` exports `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` (the remote key) so the off-loopback client-auth gate passes; no local daemon is started, and the proxy still swaps in the real upstream account so subscription mode is preserved at the account layer. `accounts` shows the remote's shared account pool. |
-| `stop`, `restart`, `remove`, `login`, `import` | **Refused** with an error naming the remote — lifecycle and account mutation belong to the daemon's own host. Run them there, or drop `--remote` / unset `remote.host`. |
+| `stop`, `restart`, `remove`, `login`, `import` | **Refused** with an error naming the remote — lifecycle and account mutation belong to the daemon's own host. Run them there, or drop `--remote` / unset `remote.host`. The one browser-login path that does work from here is the attached dashboard's `n` picker: the OAuth flow runs in THIS client and the minted credential is relayed to the remote daemon over `POST /llmux/inject-account`, which needs an admin credential. |
 | `channel`, `update` | LOCAL and allowed — they manage THIS machine's binary install, not the daemon. |
 
 ## Transport security

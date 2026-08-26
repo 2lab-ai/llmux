@@ -8,7 +8,7 @@ llmux makes a different bet:
 
 - **Keep Claude Code as the canonical harness.** Do not port your workflow to every vendor CLI.
 - **Move the model boundary behind a local proxy.** Claude Code talks to `http://localhost:3456`; llmux decides which account/backend serves the request.
-- **Use every account deliberately.** Multiple Claude subscription/API-key accounts, plus optional Codex and Grok accounts, live in one cockpit with quota-aware routing instead of manual juggling.
+- **Use every account deliberately.** Multiple Claude subscription/API-key accounts, plus optional Codex, Grok, and OpenRouter accounts, live in one cockpit with quota-aware routing instead of manual juggling.
 - **Treat model choice as a setting, not a migration.** `fable`, `opus`, `gpt-5.6-sol`, `grok-4.6`, and future model names become routing signals, not reasons to rebuild your agent stack.
 
 The result: your workflow stays still while the model market moves.

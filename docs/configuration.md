@@ -143,9 +143,18 @@ Codex settings are configurable in the config file and adjustable live from the 
 |---|---|
 | `codex.default_model` | Upstream Codex model slug; default `gpt-5.6-sol`. |
 | `codex.fast` | Sends `service_tier: "priority"` when true. |
-| `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
+| `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (`ultra` on `gpt-5.6-sol`/`-terra`). `max`/`ultra` clamp to `xhigh` on models below the gpt-5.6 family. |
 
 For Claude Code model-selection details, including `gpt-5.5[1m]` and the long-context compaction workaround, see [operational-reference.md](operational-reference.md#selecting-the-codex-model-from-claude-code) and [faq.md](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
+
+## Grok request shaping
+
+Grok settings are configurable in the config file and adjustable live from the dashboard — click the Grok group's `effort:` value on the settings bar, or edit the rows in the config tab (`c`). There is no `fast` knob — xAI has no service tier.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `grok.default_model` | `grok-4.6` | Upstream slug used when the client's model is not grok-shaped. Any `grok-*` slug is accepted, curated or not. |
+| `grok.reasoning_effort` | unset | Optional: `none`, `low`, `medium`, `high`, or `xhigh`; unset = bypass (the client's own effort rides through). The value is clamped against the effective model's level set at request time, so `xhigh` reaches the wire on `grok-4.6` and lands as `high` on `grok-4.5`. |
 
 ## OpenRouter backend
 
@@ -196,6 +205,8 @@ Like `tui_effects`, the resolved settings ride the dashboard document, so `llmux
 | `codex` | `llmux login --codex` or `llmux import --from ~/.codex/auth.json` | ChatGPT/Codex subscription token. |
 | `grok` | `llmux login --grok` | xAI Grok subscription token. |
 | `openrouter` | `llmux login --openrouter` | OpenRouter API key (`sk-or-v1-…`), stored with the key label it was minted under. Named `or:<label>` (or `or:key-N` when the label is unavailable). No refresh: the key does not expire. |
+
+Every browser-login type in that table — `oauth`, `codex`, `grok`, `openrouter` — can also be added without leaving the dashboard: `n` opens the provider picker, the flow runs in the client, and the credential is injected into the running daemon (see [operational-reference.md](operational-reference.md#commands)). `apikey` accounts still come from `a` (paste) or `llmux login --api`.
 
 Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name (an OpenRouter label is not unique per key, so it is used for the name only).
 

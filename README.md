@@ -59,6 +59,8 @@ llmux login --openrouter  # optional: OpenRouter (browser PKCE; --paste for an e
 llmux import          # or import supported local credential stores
 ```
 
+Already looking at the dashboard? `n` opens a provider picker for the same four browser logins (Claude / Codex / Grok / OpenRouter) — the flow runs in the client and the credential is injected into the daemon, so it works attached to a remote one too.
+
 Run Claude Code through llmux:
 
 ```bash

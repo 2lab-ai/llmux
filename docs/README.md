@@ -15,7 +15,7 @@ features: [rules/documents.md](../rules/documents.md).
 - [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
 - [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex backend, install variants.
-- [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, Codex shaping, account types, email-anonymous mode.
+- [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, Codex/Grok shaping, account types, email-anonymous mode.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
 - [FAQ](faq.md) — context-window workarounds (including `gpt-*` → Claude 1M `/compact` → back).
 - [llmux Islands](llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, recording.

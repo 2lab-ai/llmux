@@ -212,8 +212,9 @@ no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
-2026-07-27, and the codex context windows were re-probed 2026-08-21 (the codex
-effort menus and the grok evidence below are unchanged from 2026-07-14).
+2026-07-27, the codex context windows were re-probed 2026-08-21 (the codex
+effort menus are unchanged from 2026-07-14), and the grok rows were re-probed
+2026-08-26 (unchanged — see below).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -243,7 +244,12 @@ effort menus and the grok evidence below are unchanged from 2026-07-14).
 - **Grok context window / name** — the live `cli-chat-proxy` `/v1/models` probe
   2026-07-14 (`grok-4.5` ctx 500000). The `grok-4.6` row was verified the same
   way against the live `cli-chat-proxy` `/v1/models` on 2026-08-13 (ctx 500000,
-  efforts `low, medium, high, xhigh`). Grok effort menus come from the provider's
-  per-model thinking-level table. The curated grok set is `grok-4.6` (the default
-  pin) and `grok-4.5`; other known grok ids (`grok-4.3`, `grok-3-mini`, …) pass
-  through at request time and synthesize a null-metadata row when pinned.
+  efforts `low, medium, high, xhigh`) and re-probed unchanged on 2026-08-26 with
+  a real subscription token: `grok-4.6` `reasoning_efforts` `xhigh, high,
+  medium, low` (upstream default `high`, ctx 500000), `grok-4.5` `high, medium,
+  low` — no `xhigh` — ctx 500000. That asymmetry is why an above-`high` request
+  keeps `xhigh` on `grok-4.6` and clamps to `high` on `grok-4.5`. Grok effort
+  menus come from the provider's per-model thinking-level table. The curated
+  grok set is `grok-4.6` (the default pin) and `grok-4.5`; other known grok ids
+  (`grok-4.3`, `grok-3-mini`, …) pass through at request time and synthesize a
+  null-metadata row when pinned.
