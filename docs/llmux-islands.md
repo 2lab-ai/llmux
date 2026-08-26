@@ -10,13 +10,13 @@ The app does not read `~/.config/llmux.json`, does not touch provider credential
 
 ## What it shows
 
-- Per-account Claude / Codex / API-key usage from the llmux daemon.
+- Per-account Claude / Codex / Grok / API-key usage from the llmux daemon.
 - 5-hour and 7-day quota windows with reset timing.
 - Token/auth health and degraded accounts.
 - A closed floating island label:
 
 ```text
-Llmux Islands [mascot] [Claude activity] [Codex activity]
+Llmux Islands [mascot] [Claude activity] [Codex activity] [Grok activity]
 ```
 
 Activity counters are hidden when the count is zero. When one or more sessions
@@ -27,8 +27,9 @@ state.
 **OpenRouter accounts are not modeled yet** (2026-08-21). The shared UI
 contract has no openrouter provider case, so an `or:*` account surfaces here
 with an `unknown` provider, and Islands cannot start an OpenRouter login — the
-shared core rejects that provider. Add the account from a terminal instead
-(`llmux login --openrouter`); the daemon, CLI, and TUI serve it normally. The
+shared core rejects that provider. Add the account elsewhere instead
+(`llmux login --openrouter`, or the TUI dashboard's `n` provider picker, which
+does carry OpenRouter); the daemon, CLI, and TUI serve it normally. The
 Swift shell needs tolerant provider decoding plus an icon before Islands can
 carry the fourth backend group.
 

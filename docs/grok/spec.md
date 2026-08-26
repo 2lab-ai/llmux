@@ -103,13 +103,17 @@ core with thin per-provider adapters.
     unknown slugs) get **no `reasoning` field at all** (omission, mirroring CLIProxyAPI's
     strip at xai_executor.go:1206-1211, debug-logged). For models in the table, the
     requested/configured effort clamps INTO the model's level set: `none|minimal` → `low`
-    when zero not allowed (else `none`), `xhigh|max|ultra` → `high`. When the clamped
+    when zero not allowed (else `none`), `xhigh|max|ultra` → `high` (amended
+    2026-08-26: conditional since #138 — `xhigh` when the model's level set has it
+    (grok-4.6), `high` otherwise (grok-4.5); src/provider/grok.rs:297-300). When the clamped
     result is `none` (only reachable on models whose level set contains it, e.g.
     grok-4.3), the `reasoning` field is OMITTED rather than sent as `"none"` —
     omission is the only universally-accepted wire form; explicit `"none"` is an
     untested upstream shape. **The per-model table is the single source of effort
     truth**: the `POST /llmux/grok` config endpoint accepts the SUPERSET
-    `none|low|medium|high` (plus empty/`unset` to clear) and the per-request clamp
+    `none|low|medium|high` (amended 2026-08-26: `xhigh` accepted since #138 —
+    `is_valid_config_effort`, src/provider/grok.rs:362-364) (plus empty/`unset` to
+    clear) and the per-request clamp
     against the effective model happens at request time — a configured `none` on a
     model without `none` degrades to `low` at request time, by the same clamp.
 - Error handling (429): `Retry-After` header, when present, wins (existing generic

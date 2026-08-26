@@ -81,9 +81,10 @@ const CODEX_MODELS: &[&str] = &[
 /// gpt-5.6 family and clamps to `xhigh` on older models.
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
-/// Values are the config superset (`none|low|medium|high`) — per-model
-/// clamping happens at request time in the provider.
-const GROK_EFFORTS: &[&str] = &["", "none", "low", "medium", "high"];
+/// Values are the config superset (`none|low|medium|high|xhigh`) — per-model
+/// clamping happens at request time in the provider (`grok-4.6` keeps
+/// `xhigh`, `grok-4.5` clamps it to `high`).
+const GROK_EFFORTS: &[&str] = &["", "none", "low", "medium", "high", "xhigh"];
 
 /// One-line summary of codex settings for the status bar.
 fn codex_status_line(c: &CodexSettingsDoc) -> String {
@@ -186,7 +187,8 @@ pub(crate) struct PollHealth {
 
 /// Which browser login flow the "new login" picker (`n`) kicks off. The flow
 /// runs in the CLIENT (this process) — `login_interactive` for Anthropic,
-/// `login_codex_interactive` for ChatGPT/Codex — then the minted credential is
+/// `login_codex_interactive` for ChatGPT/Codex, the xAI device-code flow for
+/// Grok, PKCE-to-API-key for OpenRouter — then the minted credential is
 /// injected into the daemon (in-process locally, `POST /llmux/inject-account`
 /// when attached). One code path for local and attach (issue #4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,17 +197,30 @@ pub(crate) enum LoginKind {
     Anthropic,
     /// ChatGPT / Codex OAuth (`login_codex_interactive`).
     Codex,
+    /// xAI Grok device-code flow — no localhost callback, so the picker prints
+    /// the verification URL + user code and polls the token endpoint.
+    Grok,
+    /// OpenRouter PKCE login whose exchange yields a long-lived API key
+    /// (no token refresh to schedule).
+    OpenRouter,
 }
 
 impl LoginKind {
     /// Quick-pick rows for `Mode::NewLogin`, in display order.
-    pub(crate) const ALL: [LoginKind; 2] = [LoginKind::Anthropic, LoginKind::Codex];
+    pub(crate) const ALL: [LoginKind; 4] = [
+        LoginKind::Anthropic,
+        LoginKind::Codex,
+        LoginKind::Grok,
+        LoginKind::OpenRouter,
+    ];
 
     /// One-line label for the picker + status line.
     pub(crate) fn label(self) -> &'static str {
         match self {
             LoginKind::Anthropic => "Claude (Anthropic OAuth)",
             LoginKind::Codex => "Codex (ChatGPT OAuth)",
+            LoginKind::Grok => "Grok (xAI OAuth)",
+            LoginKind::OpenRouter => "OpenRouter (OAuth key)",
         }
     }
 }
@@ -2834,7 +2849,7 @@ impl App {
     }
 
     /// Cycle the grok effort override (UI-3 U12): bypass → none → low →
-    /// medium → high → bypass. Local mode applies + persists in-process;
+    /// medium → high → xhigh → bypass. Local mode applies + persists in-process;
     /// attach mode queues `POST /llmux/grok`.
     fn cycle_grok_effort(&mut self, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
@@ -3451,11 +3466,11 @@ impl App {
     }
 
     /// Run a new browser login in THIS client and inject the resulting account
-    /// into the daemon (issue #4). The OAuth flow (`login_interactive` /
-    /// `login_codex_interactive`) opens the browser + binds a localhost
-    /// callback HERE; the minted credential is then injected — in-process when
-    /// local, via `POST /llmux/inject-account` when attached. ONE code path:
-    /// the only fork is where the credential lands.
+    /// into the daemon (issue #4). The OAuth flow runs HERE — a localhost
+    /// callback for Anthropic/Codex/OpenRouter, a printed device code for Grok
+    /// (which has no callback) — and the minted credential is then injected:
+    /// in-process when local, via `POST /llmux/inject-account` when attached.
+    /// ONE code path: the only fork is where the credential lands.
     ///
     /// MUST run with the raw terminal SUSPENDED (the flow prints prompts and
     /// may read a pasted code from stdin) — the event loop handles
@@ -3492,6 +3507,93 @@ impl App {
                         self.set_status(format!("codex login failed: {err}"));
                         return;
                     }
+                }
+            }
+            LoginKind::Grok => {
+                // Device-code flow (docs/grok/spec.md T1): there is NO
+                // localhost callback, so the operator has to carry the code to
+                // the browser themselves — print it exactly like
+                // `llmux login --grok` does (the terminal is suspended here).
+                //
+                // Deliberately NOT the shared `client`: the poll POST returns
+                // the refresh token, so it must run on the no-redirect client
+                // (a redirect to an off-boundary host would resend it).
+                let grok_client = crate::auth::grok::oauth_http_client();
+                let discovery = match crate::auth::grok::discover(&grok_client).await {
+                    Ok(discovery) => discovery,
+                    Err(err) => {
+                        self.set_status(format!("grok login failed: {err}"));
+                        return;
+                    }
+                };
+                let device =
+                    match crate::auth::grok::request_device_code(&grok_client, &discovery).await {
+                        Ok(device) => device,
+                        Err(err) => {
+                            self.set_status(format!("grok login failed: {err}"));
+                            return;
+                        }
+                    };
+                println!("Open:  {}", device.open_url());
+                println!("Code:  {}", device.user_code);
+                crate::auth::oauth::open_browser(device.open_url());
+                println!("Waiting for authorization (Ctrl-C to abort)...");
+                let bundle = match crate::auth::grok::poll_token(
+                    &grok_client,
+                    &discovery.token_endpoint,
+                    &device,
+                )
+                .await
+                {
+                    Ok(bundle) => bundle,
+                    Err(err) => {
+                        self.set_status(format!("grok login failed: {err}"));
+                        return;
+                    }
+                };
+                match crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint) {
+                    Ok(account) => account,
+                    Err(err) => {
+                        self.set_status(format!("grok login failed: {err}"));
+                        return;
+                    }
+                }
+            }
+            LoginKind::OpenRouter => {
+                // PKCE with a localhost callback (docs/openrouter/spec.md §R5).
+                // The exchange yields a long-lived API key, so nothing here
+                // expires. No stdin paste fallback in the TUI arm — a headless
+                // box should use the CLI, which the error message names.
+                let api_key = match crate::auth::openrouter::login_interactive(&client).await {
+                    Ok(api_key) => api_key,
+                    Err(err) => {
+                        self.set_status(format!(
+                            "openrouter login failed: {err} — try `llmux login --openrouter --paste`"
+                        ));
+                        return;
+                    }
+                };
+                // Key-shaped "labels" are discarded, not persisted — OpenRouter
+                // returns the masked KEY as the label for a PKCE-minted key.
+                let label = crate::auth::openrouter::fetch_key_label(
+                    &client,
+                    crate::auth::openrouter::KEY_INFO_URL,
+                    &api_key,
+                )
+                .await
+                .filter(|l| !crate::cli::login::label_is_key_shaped(l))
+                .unwrap_or_default();
+                // The NAME is left empty on purpose: `inject_account` (and the
+                // inject endpoint, which allows an empty name for openrouter)
+                // derives `or:<label>` / `or:key-N` inside its read-merge-write
+                // closure. Deriving it here from a separate snapshot would
+                // reintroduce a TOCTOU window and a second naming scheme.
+                AccountConfig {
+                    name: String::new(),
+                    credential: crate::config::AccountCredential::OpenRouter {
+                        api_key,
+                        label: label.trim().to_string(),
+                    },
                 }
             }
         };
@@ -4449,6 +4551,32 @@ mod tests {
         assert_eq!(app.mode, Mode::NewLogin { idx: 0 });
     }
 
+    /// Down stops on the LAST provider row, so the picker can never queue an
+    /// out-of-range `LoginKind::ALL` index (which would panic on Enter).
+    #[test]
+    fn new_login_picker_down_clamps_at_last_row() {
+        let mut app = remote_app();
+        let last = LoginKind::ALL.len() - 1;
+        app.mode = Mode::NewLogin { idx: last };
+        app.on_key_new_login(KeyCode::Down, last);
+        assert_eq!(app.mode, Mode::NewLogin { idx: last });
+        assert_eq!(last, 3, "picker rows: anthropic, codex, grok, openrouter");
+    }
+
+    /// Rows 2 and 3 are the providers added alongside Claude/Codex: Enter on
+    /// each queues THAT provider, so the picker order and `ALL` cannot drift.
+    #[test]
+    fn new_login_picker_enter_queues_grok_and_openrouter_rows() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 2 };
+        app.on_key_new_login(KeyCode::Enter, 2);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::Grok));
+
+        app.mode = Mode::NewLogin { idx: 3 };
+        app.on_key_new_login(KeyCode::Enter, 3);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::OpenRouter));
+    }
+
     #[test]
     fn headless_fallback_names_llmux_login_per_mode() {
         // Attached: point the operator at the daemon host.
@@ -4461,11 +4589,19 @@ mod tests {
         assert!(local.contains("this host"), "{local}");
     }
 
+    /// Every picker row names its provider distinctly — the label is the only
+    /// thing the operator reads before Enter starts an irreversible browser
+    /// flow, so no two rows may look alike.
     #[test]
     fn login_kind_labels_distinguish_providers() {
         assert!(LoginKind::Anthropic.label().contains("Anthropic"));
         assert!(LoginKind::Codex.label().contains("Codex"));
-        assert_eq!(LoginKind::ALL.len(), 2);
+        assert!(LoginKind::Grok.label().contains("Grok"));
+        assert!(LoginKind::OpenRouter.label().contains("OpenRouter"));
+        assert_eq!(LoginKind::ALL.len(), 4);
+        let labels: std::collections::BTreeSet<&str> =
+            LoginKind::ALL.iter().map(|k| k.label()).collect();
+        assert_eq!(labels.len(), LoginKind::ALL.len(), "labels are unique");
     }
 
     // --- issue #5: overlay key routing -------------------------------------
@@ -4754,10 +4890,19 @@ mod tests {
         // grok endpoint.
         assert!(app.on_mouse(click(22), Some(&view)));
         assert_eq!(app.take_pending_grok(), Some(Some("none".to_string())));
-        // Cycling from the top of the grok list wraps back to bypass.
+        // grok effort: high is no longer the top — `xhigh` sits above it
+        // (grok-4.6 takes it on the wire; grok-4.5 clamps at request time).
         view.grok.effort = Some("high".into());
         assert!(app.on_mouse(click(22), Some(&view)));
-        assert_eq!(app.take_pending_grok(), Some(None), "high wraps to bypass");
+        assert_eq!(
+            app.take_pending_grok(),
+            Some(Some("xhigh".to_string())),
+            "high cycles to xhigh"
+        );
+        // Cycling from the top of the grok list wraps back to bypass.
+        view.grok.effort = Some("xhigh".into());
+        assert!(app.on_mouse(click(22), Some(&view)));
+        assert_eq!(app.take_pending_grok(), Some(None), "xhigh wraps to bypass");
     }
 
     /// Review R2 regression: rows reorder between menu-open and click — the

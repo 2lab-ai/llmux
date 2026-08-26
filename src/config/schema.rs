@@ -585,7 +585,7 @@ pub struct GrokConfig {
     /// real grok model (same contract as `codex.client_model`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_model: Option<String>,
-    /// Reasoning effort default: superset `none|low|medium|high`; the
+    /// Reasoning effort default: superset `none|low|medium|high|xhigh`; the
     /// per-model clamp happens at request time (docs/grok/spec.md §R1).
     /// `None` → omit `reasoning` and let the backend default (high) apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
