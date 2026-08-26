@@ -1917,7 +1917,7 @@ async fn codex_config_endpoint(
 /// Partial update for `POST /llmux/grok` (docs/grok/spec.md §R4, C10 —
 /// dashboard/islands grok settings). Same partial-update contract as
 /// `POST /llmux/codex`; differences (intentional, spec §R1/T4): effort is
-/// VALIDATED against the closed superset `none|low|medium|high` (per-model
+/// VALIDATED against the closed superset `none|low|medium|high|xhigh` (per-model
 /// clamping happens at request time), there is no `fast` (xAI has no service
 /// tier), and the response reports whether the config write succeeded
 /// (`persisted`) instead of hiding a failed persist.
@@ -1946,7 +1946,7 @@ async fn grok_config_endpoint(
         } else {
             return relay_error(
                 StatusCode::BAD_REQUEST,
-                "reasoning_effort must be one of none|low|medium|high (or empty/'unset' to clear)",
+                "reasoning_effort must be one of none|low|medium|high|xhigh (or empty/'unset' to clear)",
             );
         }
     }

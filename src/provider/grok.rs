@@ -63,8 +63,9 @@ pub struct GrokShape {
     /// the synthesized Anthropic response (same contract as
     /// `codex.client_model`).
     pub client_model: Option<String>,
-    /// Configured `reasoning.effort` default (superset `none|low|medium|high`;
-    /// clamped per-model at request time), or `None` for the backend default.
+    /// Configured `reasoning.effort` default (superset
+    /// `none|low|medium|high|xhigh`; clamped per-model at request time), or
+    /// `None` for the backend default.
     pub effort: Option<String>,
 }
 
