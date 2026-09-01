@@ -903,6 +903,9 @@ mod tests {
         assert!(is_fable_model(Some("FABLE-5-20251001")));
         // Vendor-prefixed variant is still recognized (contains, not prefix).
         assert!(is_fable_model(Some("claude-fable-5")));
+        // The 5.1 generation and its `[1m]` catalog id (2026-09-02 roll).
+        assert!(is_fable_model(Some("claude-fable-5-1")));
+        assert!(is_fable_model(Some("claude-fable-5-1[1m]")));
     }
 
     #[test]

@@ -59,17 +59,21 @@ not that it is zero.
 
   | request slug     | catalog id            | model on the wire  |
   | ---------------- | --------------------- | ------------------ |
-  | `fable`          | `claude-fable-5[1m]`  | `claude-fable-5`   |
+  | `fable`, `fable-5-1` | `claude-fable-5-1[1m]` | `claude-fable-5-1` |
   | `opus`, `opus-5` | `claude-opus-5[1m]`   | `claude-opus-5`    |
   | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
   | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
 
-  Matching is trimmed and case-insensitive (`"  OPUS  "` resolves). Only aliases
-  are rewritten: a real catalog id is not an alias and passes through untouched
-  — the `[1m]` suffix strip is a separate, subsequent step, which is why
-  `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` — and foreign
-  slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The mapping has a
-  single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
+  Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
+  alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
+  exactly like `fable`, because alias resolution runs before the suffix strip.
+  That strip is syntactic only — it does not promise a 1M-capable target
+  (`haiku[1m]` resolves to the ordinary `claude-haiku-4-5` row).
+  Only aliases are rewritten: a real catalog id is not an alias and passes
+  through untouched — the `[1m]` suffix strip is a separate, subsequent step,
+  which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
+  and foreign slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The
+  mapping has a single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
   `resolve_claude_alias`; adding a curated row carries its aliases
   automatically. llmux still does not otherwise *shape* claude requests, and the
   `efforts` menu on claude rows is the Claude Code `/effort` level list, per the
@@ -147,7 +151,8 @@ model it does not curate.
 
 | id                  | aliases      | name                | efforts                              | max_context | group  |
 | ------------------- | ------------ | ------------------- | ------------------------------------ | ----------- | ------ |
-| claude-fable-5[1m]  | fable        | Claude Fable 5      | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-fable-5-1[1m] | fable, fable-5-1 | Claude Fable 5.1 | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-fable-5[1m]  | —            | Claude Fable 5      | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-5[1m]   | opus, opus-5 | Claude Opus 5 [1M]  | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
