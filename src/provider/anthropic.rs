@@ -25,6 +25,9 @@ use crate::config::AccountCredential;
 /// `[1m]` context-window suffix from `model`, and strip foreign (unsigned)
 /// thinking blocks from `messages` (issue #116). The two model steps run in
 /// that order and compose (`opus` → `claude-opus-5[1m]` → `claude-opus-5`).
+/// Because the alias step runs FIRST, an alias that already carries the client
+/// suffix (`opus[1m]`, `fable[1m]`) must resolve too — that is handled on the
+/// needle side in [`crate::catalog::resolve_claude_alias`].
 /// Returns the original bytes (refcounted, byte-identity) when nothing
 /// changed; a non-JSON body passes through untouched — passthrough never
 /// fails on body shape.
@@ -342,7 +345,18 @@ mod tests {
         assert_eq!(normalized_model("opus-5"), "claude-opus-5");
         assert_eq!(normalized_model("sonnet"), "claude-sonnet-5");
         assert_eq!(normalized_model("sonnet-5"), "claude-sonnet-5");
-        assert_eq!(normalized_model("fable"), "claude-fable-5");
+        assert_eq!(normalized_model("fable"), "claude-fable-5-1");
+        assert_eq!(normalized_model("fable-5-1"), "claude-fable-5-1");
+    }
+
+    /// An alias may arrive with the Claude-Code-local `[1m]` suffix attached.
+    /// Alias resolution runs BEFORE the suffix strip, so before the fix
+    /// `opus[1m]` matched no alias, was then reduced to a bare `opus`, and
+    /// 404'd at api.anthropic.com.
+    #[test]
+    fn normalize_body_resolves_an_alias_carrying_the_client_context_suffix() {
+        assert_eq!(normalized_model("fable[1m]"), "claude-fable-5-1");
+        assert_eq!(normalized_model("opus[1m]"), "claude-opus-5");
     }
 
     /// `haiku`'s catalog row carries NO `[1m]` suffix — proof the two steps

@@ -61,7 +61,7 @@ const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25);
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
 /// Haiku-tier rates {1.0, 5.0, 0.1, 1.25}.
 const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
-/// Fable-5 rates {10.0, 50.0, 1.0, 12.5}.
+/// Fable-family rates (Fable 5 and 5.1 share the tier) {10.0, 50.0, 1.0, 12.5}.
 const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
@@ -104,7 +104,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         | "claude-opus-4-5" => Some(OPUS_TIER),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
         "claude-haiku-4-5" => Some(HAIKU_TIER),
-        "claude-fable-5" => Some(FABLE_TIER),
+        "claude-fable-5" | "claude-fable-5-1" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
@@ -531,6 +531,15 @@ mod tests {
             cost_usd(
                 "claude",
                 "claude-fable-5",
+                &tc(1_000_000, 0, None, None),
+                &empty(),
+            ),
+            10.0,
+        );
+        approx(
+            cost_usd(
+                "claude",
+                "claude-fable-5-1",
                 &tc(1_000_000, 0, None, None),
                 &empty(),
             ),
