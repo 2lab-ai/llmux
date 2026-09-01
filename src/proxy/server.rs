@@ -3728,9 +3728,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 26 curated (8 claude + 6 codex + 2 grok + 10 openrouter) + 1
+        // 27 curated (9 claude + 6 codex + 2 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 27);
+        assert_eq!(models.len(), 28);
 
         let by_id = |id: &str| {
             models

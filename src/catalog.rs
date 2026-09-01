@@ -10,7 +10,8 @@
 //! bit: the grok family alias `"grok"` attaches to whichever grok id is the
 //! live pin, mirroring [`crate::provider::grok`]'s bare-`grok` routing.
 //!
-//! Sources (evidence gathered 2026-07-14; claude rows re-curated 2026-07-27):
+//! Sources (evidence gathered 2026-07-14; claude rows re-curated 2026-07-27;
+//! fable alias rolled to 5.1 on 2026-09-02):
 //! - Claude rows: user-curated 2026-07-27, and they live in [`CLAUDE_MODELS`]
 //!   — that const is the SSOT for both these rows and the alias→id resolution
 //!   in [`crate::provider::anthropic`] (Claude Code model picker; `[1m]`
@@ -80,11 +81,12 @@ const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
 /// Tuple = (id, aliases, display name, max_context).
 pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
     (
-        "claude-fable-5[1m]",
-        &["fable"],
-        "Claude Fable 5",
+        "claude-fable-5-1[1m]",
+        &["fable", "fable-5-1"],
+        "Claude Fable 5.1",
         1_000_000,
     ),
+    ("claude-fable-5[1m]", &[], "Claude Fable 5", 1_000_000),
     (
         "claude-opus-5[1m]",
         &["opus", "opus-5"],
@@ -238,6 +240,16 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 /// ASCII-lowercased before matching. [`CLAUDE_MODELS`] is the only mapping
 /// source, so a new curated row carries its aliases automatically.
 ///
+/// A trailing `[1m]` is stripped from the NEEDLE before the lookup, because
+/// the client may attach the context suffix to an alias (`fable[1m]`,
+/// `opus[1m]`) exactly as it does to an id. Alias resolution runs before the
+/// suffix strip in [`crate::provider::anthropic`]'s `normalize_body`, so
+/// without this a suffixed alias missed the table, then lost its suffix, and a
+/// bare `fable`/`opus` reached api.anthropic.com and 404'd.
+/// The strip is purely syntactic: it does NOT promise a 1M-capable target —
+/// `haiku[1m]` resolves to the ordinary `claude-haiku-4-5` row (previously a
+/// loud upstream 404); the upstream context limit still applies.
+///
 /// Two consumers must agree on this, which is why it lives here rather than in
 /// either of them: `provider::anthropic` rewrites the outbound `model` so the
 /// alias `/models` advertises is honored upstream, and `tui::activity`'s
@@ -245,9 +257,10 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 /// against the id that actually served the request.
 pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
     let needle = model.trim().to_ascii_lowercase();
+    let needle = needle.strip_suffix("[1m]").unwrap_or(&needle);
     CLAUDE_MODELS
         .iter()
-        .find(|(_, aliases, _, _)| aliases.contains(&needle.as_str()))
+        .find(|(_, aliases, _, _)| aliases.contains(&needle))
         .map(|&(id, _, _, _)| id)
 }
 
@@ -451,12 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_26_entries() {
-        // The pinned (curated) case: exactly 26 rows, claude ids in order.
+    fn catalog_matches_user_contract_27_entries() {
+        // The pinned (curated) case: exactly 27 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
-        // 10 curated openrouter free rows landed (2026-08-21).
+        // 10 curated openrouter free rows landed (2026-08-21); 26 before the
+        // fable-5.1 row landed (2026-09-02).
         let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 26);
+        assert_eq!(entries.len(), 27);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -465,6 +479,7 @@ mod tests {
         assert_eq!(
             claude_ids,
             vec![
+                "claude-fable-5-1[1m]",
                 "claude-fable-5[1m]",
                 "claude-opus-5[1m]",
                 "claude-opus-5",
@@ -504,7 +519,14 @@ mod tests {
             );
         }
         // Curated aliases and 1M-vs-standard context windows.
-        assert_eq!(find(&entries, "claude-fable-5[1m]").aliases, vec!["fable"]);
+        assert_eq!(
+            find(&entries, "claude-fable-5-1[1m]").aliases,
+            vec!["fable", "fable-5-1"]
+        );
+        // The `fable` alias MOVED off Fable 5 onto Fable 5.1 (2026-09-02, Fable
+        // 5 is legacy upstream) — same regression this guards for opus-4-8: a
+        // stale alias would keep bare `fable` resolving to the old model.
+        assert!(find(&entries, "claude-fable-5[1m]").aliases.is_empty());
         assert_eq!(
             find(&entries, "claude-opus-5[1m]").aliases,
             vec!["opus", "opus-5"]
@@ -521,6 +543,14 @@ mod tests {
         );
         assert!(find(&entries, "claude-sonnet-5").aliases.is_empty());
         assert_eq!(find(&entries, "claude-haiku-4-5").aliases, vec!["haiku"]);
+        assert_eq!(
+            find(&entries, "claude-fable-5-1[1m]").max_context,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            find(&entries, "claude-fable-5[1m]").max_context,
+            Some(1_000_000)
+        );
         assert_eq!(
             find(&entries, "claude-opus-5[1m]").max_context,
             Some(1_000_000)
@@ -590,6 +620,26 @@ mod tests {
         assert_eq!(resolve_claude_alias("  OPUS  "), Some("claude-opus-5[1m]"));
     }
 
+    /// The client may hang the `[1m]` context suffix on an ALIAS, not just on
+    /// an id. Alias resolution runs before the suffix strip in
+    /// `provider::anthropic::normalize_body`, so before the needle-side strip
+    /// `fable[1m]` matched no row, then lost its suffix, and a bare `fable`
+    /// reached api.anthropic.com and 404'd.
+    #[test]
+    fn resolve_claude_alias_accepts_client_context_suffix_on_alias() {
+        assert_eq!(
+            resolve_claude_alias("fable[1m]"),
+            Some("claude-fable-5-1[1m]")
+        );
+        assert_eq!(resolve_claude_alias("opus[1m]"), Some("claude-opus-5[1m]"));
+        assert_eq!(
+            resolve_claude_alias("  FABLE[1m] "),
+            Some("claude-fable-5-1[1m]")
+        );
+        // The row's own id carries no suffix — the alias still resolves.
+        assert_eq!(resolve_claude_alias("haiku[1m]"), Some("claude-haiku-4-5"));
+    }
+
     /// Deliberate asymmetry: a real id is NOT an alias (the `[1m]` strip is a
     /// separate downstream step), and foreign slugs must pass through
     /// untouched so non-claude routing is never rewritten.
@@ -645,10 +695,10 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 26.
+        // A curated pin: no synthesized row, alias on the static row, count 27.
         for (pin, owner) in [("grok-4.6", "grok-4.6"), ("grok-4.5", "grok-4.5")] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 26, "pin {pin}");
+            assert_eq!(entries.len(), 27, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -663,7 +713,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 27);
+        assert_eq!(entries.len(), 28);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -690,7 +740,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 27);
+        assert_eq!(entries.len(), 28);
         // Both curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.6").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.5").max_context, Some(500_000));
