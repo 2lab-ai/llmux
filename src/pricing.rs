@@ -75,6 +75,11 @@ const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
 /// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
 const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
+/// gpt-6-astra (generation-6 flagship, 2026-09 launch, standard tier): $10 in
+/// / $50 out / $1 cached input, per third-party pricing trackers — OpenAI's
+/// own page was not read for this row. Codex: no cache-creation charge, same
+/// convention as the other codex rows.
+const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
 /// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
 /// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
@@ -109,6 +114,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
+        "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.6" => Some(GROK_4_6),
         _ => None,
@@ -150,6 +156,15 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6-astra-") {
+        Some(GPT_6_ASTRA)
+    } else if model_norm_lower.starts_with("gpt-6-") {
+        // Astra is generation 6's flagship (and its only tier), so it is the
+        // `gpt-6-` default exactly as sol is for `gpt-5.6-`. The required `-`
+        // is the generation boundary: `gpt-60-*` and `gpt-6.5-*` are DIFFERENT
+        // generations and must miss this branch (mirrors codex.rs
+        // `supports_extended_efforts`).
+        Some(GPT_6_ASTRA)
     } else {
         None
     }
@@ -423,6 +438,57 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_matches_exact_and_bare_and_prefix() {
+        // Exact `gpt-6-astra`, the bare `gpt-6` alias, and a dated snapshot
+        // all resolve to astra rates ($10 in / $50 out / $1 cached input).
+        for model in ["gpt-6-astra", "gpt-6", "gpt-6-astra-20260903"] {
+            let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
+            approx(cost, 10.00);
+            let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
+            approx(out, 50.00);
+            let cached = cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty());
+            approx(cached, 1.00);
+        }
+        // Codex convention: no cache-creation charge.
+        let creation = cost_usd(
+            "codex",
+            "gpt-6-astra",
+            &tc(0, 0, None, Some(1_000_000)),
+            &empty(),
+        );
+        approx(creation, 0.0);
+        // The bare ALIAS is deliberately absent from the price table: the
+        // codex provider resolves `astra` to `gpt-6-astra` BEFORE the request
+        // (and the recorded model) leaves llmux, so pricing only ever sees the
+        // resolved slug. Pricing the alias too would be a second source of
+        // truth that could silently disagree with the wire model.
+        assert_eq!(builtin_price("astra"), None);
+        assert_eq!(
+            price_for("codex", "astra", &empty()),
+            Some(GPT_5_5),
+            "an unresolved alias would fall back to the codex group rate"
+        );
+    }
+
+    #[test]
+    fn gpt_60_and_gpt_6_5_do_not_resolve_to_astra_pricing() {
+        // Generation boundary, same shape as the 5.60 test: a wider `gpt-60-`
+        // or a newer `gpt-6.5-` generation is NOT gpt-6, so both miss the
+        // built-in table and land on the codex group fallback (gpt-5.5 rates).
+        assert_eq!(builtin_price("gpt-60-astra"), None);
+        assert_eq!(builtin_price("gpt-6.5-astra"), None);
+        assert_eq!(
+            price_for("codex", "gpt-60-astra", &empty()),
+            Some(GPT_5_5),
+            "unknown codex model takes the group fallback"
+        );
+        // The boundary must not break the real family ids.
+        assert_eq!(builtin_price("gpt-6"), Some(GPT_6_ASTRA));
+        assert_eq!(builtin_price("gpt-6-astra"), Some(GPT_6_ASTRA));
+        assert_eq!(builtin_price("gpt-6-astra-20260903"), Some(GPT_6_ASTRA));
+    }
+
+    #[test]
     fn gpt_5_6_terra_and_luna_have_tier_rates() {
         let terra = cost_usd(
             "codex",
@@ -601,9 +667,12 @@ mod tests {
 
     #[test]
     fn unknown_codex_model_falls_back_to_gpt_5_5() {
+        // A slug from no known generation. (`gpt-6-mini` was the old sample;
+        // since 2026-09-07 `gpt-6-` is a REAL generation prefix defaulting to
+        // the astra flagship, exactly like `gpt-5.6-` defaults to sol.)
         let cost = cost_usd(
             "codex",
-            "gpt-6-mini",
+            "gpt-7-mini",
             &tc(0, 1_000_000, None, None),
             &empty(),
         );
