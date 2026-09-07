@@ -158,11 +158,14 @@ impl Rule {
 }
 
 /// Builtin codex rules: `gpt-` / `o1`-`o4` prefixes, `codex` substring, the
-/// exact `gpt-5.5` / `gpt-5.6` family ids (covered by `gpt-` already, but kept
-/// explicit so the intent survives a future prefix change), and the bare
-/// variant aliases `sol` / `terra` / `luna` (which the codex provider resolves
-/// to the latest gpt generation of that variant — see
-/// [`crate::provider::codex`]).
+/// exact `gpt-5.5` / `gpt-5.6` / `gpt-6` family ids (all already covered by the
+/// `gpt-` prefix, but kept explicit so the intent survives a future prefix
+/// change — the same rationale as the pre-existing `gpt-5.5` / `gpt-5.6`
+/// rules), and the bare variant aliases `sol` / `terra` / `luna` / `astra`,
+/// which carry NO `gpt-` prefix and therefore NEED their exact rules. The
+/// codex provider resolves each alias to a concrete slug: sol/terra/luna to
+/// the latest gpt generation of that variant, astra to the single-tier
+/// `gpt-6-astra` — see [`crate::provider::codex`].
 fn builtin_codex_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gpt-".to_string()),
@@ -173,9 +176,12 @@ fn builtin_codex_rules() -> Vec<Rule> {
         Rule::Exact("gpt-5.5".to_string()),
         Rule::Exact("gpt-5.6".to_string()),
         Rule::Exact("gpt-5.6-sol".to_string()),
+        Rule::Exact("gpt-6".to_string()),
+        Rule::Exact("gpt-6-astra".to_string()),
         Rule::Exact("sol".to_string()),
         Rule::Exact("terra".to_string()),
         Rule::Exact("luna".to_string()),
+        Rule::Exact("astra".to_string()),
     ]
 }
 
@@ -478,6 +484,7 @@ mod tests {
         // `sol[1m]` would match nothing and fall to the default group.
         assert_eq!(builtin().classify(Some("sol[1m]")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("terra[1m]")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("astra[1m]")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("SOL[1M]")), BackendGroup::Codex);
         // Prefix-matched ids are unaffected.
         assert_eq!(
@@ -516,11 +523,21 @@ mod tests {
         assert_eq!(builtin().classify(Some("sol")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("terra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("luna")), BackendGroup::Codex);
+        // `astra` is the generation-6 flagship alias (single tier).
+        assert_eq!(builtin().classify(Some("astra")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("gpt-6-astra")), BackendGroup::Codex);
+        assert_eq!(builtin().classify(Some("gpt-6")), BackendGroup::Codex);
         // Exact, case-insensitive like the rest.
         assert_eq!(builtin().classify(Some("SOL")), BackendGroup::Codex);
-        // Not a substring rule: a name merely containing "sol" is unaffected.
+        assert_eq!(builtin().classify(Some("ASTRA")), BackendGroup::Codex);
+        // Not a substring rule: a name merely containing "sol"/"astra" is
+        // unaffected.
         assert_eq!(
             builtin().classify(Some("solar-flare")),
+            BackendGroup::Claude
+        );
+        assert_eq!(
+            builtin().classify(Some("claude-astral")),
             BackendGroup::Claude
         );
     }
@@ -748,9 +765,11 @@ mod tests {
             ("opus", BackendGroup::Claude),
             ("fable", BackendGroup::Claude),
             ("gpt-5.6-sol", BackendGroup::Codex),
+            ("gpt-6-astra", BackendGroup::Codex),
             ("o3-mini", BackendGroup::Codex),
             ("o1", BackendGroup::Codex),
             ("sol", BackendGroup::Codex),
+            ("astra", BackendGroup::Codex),
             ("grok-4.6", BackendGroup::Grok),
             ("grok", BackendGroup::Grok),
         ] {

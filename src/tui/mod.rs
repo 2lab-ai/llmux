@@ -66,9 +66,13 @@ use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
 use crate::scheduler::select;
 use view::DashboardView;
 
-/// Codex models the dashboard cycles through with `m` (req8.1). Any model can
-/// still be set via config / the control endpoint; this is the quick-pick set.
+/// Codex models the dashboard cycles through with `m` (req8.1), newest
+/// generation first. Any model can still be set via config / the control
+/// endpoint; this is the quick-pick set. `gpt-6-astra` added 2026-09-07: it is
+/// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
+/// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 const CODEX_MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.5",
@@ -78,7 +82,7 @@ const CODEX_MODELS: &[&str] = &[
 /// Reasoning-effort levels cycled with `e` (and the group-settings bar);
 /// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
 /// U12). A concrete value OVERRIDES every request. `max` is native on the
-/// gpt-5.6 family and clamps to `xhigh` on older models.
+/// gpt-5.6 family and on `gpt-6-astra`, and clamps to `xhigh` on older models.
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
 /// Values are the config superset (`none|low|medium|high|xhigh`) — per-model
@@ -4838,6 +4842,55 @@ mod tests {
         };
         assert!(app.on_mouse(lclick_outside, Some(&view)));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// req8.1: `m` rotates the codex quick-pick set, and `gpt-6-astra` is
+    /// reachable from the shipped pin — the dashboard IS the model switch, so
+    /// a model llmux can route but cannot be cycled to is not switchable.
+    #[test]
+    fn codex_model_cycle_reaches_gpt_6_astra_from_the_sol_pin() {
+        // Newest generation first, and every entry is distinct (a duplicate
+        // would make the modulo cycle skip a model forever).
+        assert_eq!(CODEX_MODELS[0], "gpt-6-astra");
+        assert_eq!(CODEX_MODELS.len(), 6);
+        let mut sorted = CODEX_MODELS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), CODEX_MODELS.len(), "no duplicate quick-pick");
+
+        let mut view = stats_view_with_account();
+        view.codex.available = true;
+        view.codex.model = "gpt-5.6-sol".into();
+        let mut app = remote_app();
+        // Walk the whole loop from the current pin; astra must appear within
+        // one full rotation, and the walk must return to where it started.
+        let mut seen = Vec::new();
+        for _ in 0..CODEX_MODELS.len() {
+            app.cycle_codex_model(Some(&view));
+            let next = app
+                .take_pending_codex()
+                .expect("model change queued for the control endpoint")
+                .model;
+            view.codex.model = next.clone();
+            seen.push(next);
+        }
+        assert!(
+            seen.contains(&"gpt-6-astra".to_string()),
+            "astra reachable by cycling: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("gpt-5.6-sol"),
+            "one full rotation returns to the starting pin: {seen:?}"
+        );
+        // An out-of-set pin (config / control endpoint) lands on the first
+        // entry, i.e. the newest generation.
+        view.codex.model = "gpt-5-codex-preview".into();
+        app.cycle_codex_model(Some(&view));
+        assert_eq!(
+            app.take_pending_codex().map(|c| c.model),
+            Some("gpt-6-astra".to_string())
+        );
     }
 
     /// UI-3 U9/U10/U12: clicking a group-settings segment rotates that

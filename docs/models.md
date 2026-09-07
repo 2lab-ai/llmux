@@ -50,8 +50,11 @@ not that it is zero.
   exactly the pinned entry. Any `grok-*` id also passes through verbatim.
 - **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
-  `gpt-5.6` id resolves to the `sol` flagship. These are advertised statically
-  on the corresponding entries.
+  `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
+  resolve to `gpt-6-astra`: generation 6 shipped a SINGLE tier, so
+  `sol` / `terra` / `luna` stay on 5.6 (there is no `gpt-6-sol` and a request
+  for one would 404 upstream). These are advertised statically on the
+  corresponding entries.
 - **claude aliases** — the claude rows carry short user-curated aliases that
   both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
   rewritten to its catalog id before the request leaves llmux, so the alias
@@ -160,6 +163,8 @@ model it does not curate.
 | claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| gpt-6-astra[1m]     | —            | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-astra         | astra, gpt-6 | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -192,7 +197,7 @@ rate and is reported unpriced, never as a free `$0`).
 
 ### The codex `[1m]` rows
 
-`gpt-5.6-sol[1m]` / `gpt-5.6-terra[1m]` are the codex side of the same `[1m]`
+`gpt-6-astra[1m]` / `gpt-5.6-sol[1m]` / `gpt-5.6-terra[1m]` are the codex side of the same `[1m]`
 convention the claude rows use: the suffix is a **client-side context-denominator
 opt-in**, not a different upstream model. Claude Code parses it out of the
 configured model string to size its context readout; llmux strips one trailing
@@ -214,6 +219,14 @@ claude base rows keep 200000 next to their `[1m]` twins. There is deliberately
 no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 `gpt-5.5[1m]` row (272k family).
 
+`gpt-6-astra[1m]` advertises the same 1000000 on the strength of OpenAI's
+published 1,050,000-token window for Astra — it has **not** been probed through
+the daemon, unlike the 5.6 rows above (the only astra probe so far is the
+2026-09-07 acceptance check, which confirms the backend takes the slug, not its
+ceiling). The base `gpt-6-astra` row keeps the openai/codex catalog's 272000,
+the window a client gets without opting in; the catalog also lists an 872,000
+`max_context_window` for astra, which llmux does not advertise.
+
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
@@ -232,6 +245,17 @@ effort menus are unchanged from 2026-07-14), and the grok rows were re-probed
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
   (context 272000). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer
   curated.
+- **gpt-6-astra** — same catalog re-fetched 2026-09-07: slug `gpt-6-astra`,
+  display name "GPT-6-Astra", context_window 272000, max_context_window 872000,
+  six reasoning levels (low, medium, high, xhigh, max, ultra), default effort
+  low, minimal client version 0.153.0. The catalog lists NO `gpt-6-sol` /
+  `-terra` / `-luna`. A live probe on 2026-09-07 confirmed the ChatGPT-account
+  codex backend ACCEPTS `gpt-6-astra` with llmux's existing header set
+  (`originator: codex_cli_rs`, no client-version header), so no header change
+  was needed — only adding the slug to the provider passthrough list. Pricing
+  ($10/M input, $50/M output, $1/M cached input, no cache-creation charge)
+  comes from third-party pricing trackers for the 2026-09 launch standard tier,
+  not from an OpenAI page read directly.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window
