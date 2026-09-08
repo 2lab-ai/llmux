@@ -301,8 +301,16 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // Newest generation first. `gpt-6-astra` (openai/codex models.json,
     // fetched 2026-09-07) shipped as a single tier — there is no
     // gpt-6-sol/terra/luna — so it owns the bare `astra` and `gpt-6` aliases
-    // the way sol owns `sol` / `gpt-5.6`. Its base row carries the catalog's
-    // 272,000 window.
+    // the way sol owns `sol` / `gpt-5.6`. Deliberate asymmetry with the 5.6
+    // rows: on astra those bare aliases sit on the `[1m]` TWIN rather than the
+    // base row, so a client typing `astra` / `gpt-6` gets the 1M window
+    // (OpenAI's published ~1,050,000 for astra) — the ergonomic name selects
+    // the 1M denominator, and the explicit base id `gpt-6-astra` (no aliases)
+    // is the way to pick the openai/codex catalog's 272,000 window. The
+    // provider still strips one trailing `[1m]` before the request leaves
+    // llmux, so bare and suffixed aliases reach the codex backend as the same
+    // upstream slug `gpt-6-astra` — the split is a client-side context
+    // denominator, not two upstream models.
     //
     // The `[1m]` rows mirror the claude convention: a client-side
     // context-denominator opt-in that the provider strips before the request
@@ -317,8 +325,9 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // keep the openai/codex catalog's 372,000 — the window a client gets
     // without opting in — exactly as the claude base rows keep 200,000 next to
     // their `[1m]` twins. No `gpt-5.6-luna[1m]` (luna still 404s upstream) and
-    // no `gpt-5.5[1m]` (272k family). Aliases stay on the base rows — a suffix
-    // is an explicit opt-in, never something an alias silently picks.
+    // no `gpt-5.5[1m]` (272k family). For the 5.6 rows aliases stay on the
+    // base row — a suffix is an explicit opt-in, never something an alias
+    // silently picks; astra is the exception noted above.
     // `gpt-6-astra[1m]` rides OpenAI's published 1,050,000 window for astra;
     // unlike the 5.6 rows it has NOT been probed through the daemon.
     entries.push(codex_entry(
@@ -326,14 +335,14 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "GPT-6-Astra [1M]",
         CODEX_EFFORTS_FULL,
         Some(1_000_000),
-        Vec::new(),
+        vec!["astra".into(), "gpt-6".into()],
     ));
     entries.push(codex_entry(
         "gpt-6-astra",
         "GPT-6-Astra",
         CODEX_EFFORTS_FULL,
         Some(272_000),
-        vec!["astra".into(), "gpt-6".into()],
+        Vec::new(),
     ));
     entries.push(codex_entry(
         "gpt-5.6-sol[1m]",
@@ -790,27 +799,52 @@ mod tests {
 
     #[test]
     fn gpt_6_astra_aliases_context_and_effort_count() {
-        // Generation 6 shipped ONE tier, so the base astra row owns both the
-        // bare variant alias and the bare generation id (mirroring sol, which
-        // owns `sol` + `gpt-5.6`). Context 272_000 = the openai/codex catalog
-        // figure fetched 2026-09-07; six efforts (low..ultra).
+        // Astra alias ownership contract (fix-astra-alias-1m): unlike the
+        // 5.6 sol/terra pattern where the base row owns the bare variant
+        // alias, the astra bare aliases (`astra`, `gpt-6`) belong to the
+        // `[1m]` twin — so a client typing `astra` or `gpt-6` gets the 1M
+        // context window advertised on the ONLY row a client can practically
+        // reach it through. The base row keeps its openai/codex catalog
+        // window (272_000) and advertises NO aliases; six efforts on both.
         let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let astra = find(&entries, "gpt-6-astra");
-        assert_eq!(
-            astra.aliases,
-            vec!["astra".to_string(), "gpt-6".to_string()]
+        assert!(
+            astra.aliases.is_empty(),
+            "base gpt-6-astra must carry no aliases (they belong to the [1m] twin), \
+             got {:?}",
+            astra.aliases
         );
         assert_eq!(astra.name, "GPT-6-Astra");
         assert_eq!(astra.max_context, Some(272_000));
         assert_eq!(astra.efforts.len(), 6);
         assert_eq!(astra.group, "codex");
-        // The `[1m]` twin: OpenAI's published window, no aliases (the suffix
-        // is an explicit opt-in).
+        // The `[1m]` twin owns both bare aliases and advertises OpenAI's
+        // published 1M window.
         let twin = find(&entries, "gpt-6-astra[1m]");
         assert_eq!(twin.name, "GPT-6-Astra [1M]");
         assert_eq!(twin.max_context, Some(1_000_000));
         assert_eq!(twin.efforts, astra.efforts);
-        assert!(twin.aliases.is_empty(), "the [1m] twin carries no alias");
+        assert_eq!(
+            twin.aliases,
+            vec!["astra".to_string(), "gpt-6".to_string()],
+            "gpt-6-astra[1m] must own the astra/gpt-6 aliases"
+        );
+        // Catalog-wide uniqueness: the ONLY row that advertises `astra` or
+        // `gpt-6` must be `gpt-6-astra[1m]`. Without this scan, the base-row
+        // emptiness above would still pass if some unrelated row silently
+        // grabbed the same alias.
+        for alias in ["astra", "gpt-6"] {
+            let owners: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.aliases.iter().any(|a| a == alias))
+                .map(|e| e.id.as_ref())
+                .collect();
+            assert_eq!(
+                owners,
+                vec!["gpt-6-astra[1m]"],
+                "alias {alias:?} must be owned solely by gpt-6-astra[1m], got {owners:?}"
+            );
+        }
     }
 
     #[test]
