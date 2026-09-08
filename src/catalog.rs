@@ -829,6 +829,22 @@ mod tests {
             vec!["astra".to_string(), "gpt-6".to_string()],
             "gpt-6-astra[1m] must own the astra/gpt-6 aliases"
         );
+        // Catalog-wide uniqueness: the ONLY row that advertises `astra` or
+        // `gpt-6` must be `gpt-6-astra[1m]`. Without this scan, the base-row
+        // emptiness above would still pass if some unrelated row silently
+        // grabbed the same alias.
+        for alias in ["astra", "gpt-6"] {
+            let owners: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.aliases.iter().any(|a| a == alias))
+                .map(|e| e.id.as_ref())
+                .collect();
+            assert_eq!(
+                owners,
+                vec!["gpt-6-astra[1m]"],
+                "alias {alias:?} must be owned solely by gpt-6-astra[1m], got {owners:?}"
+            );
+        }
     }
 
     #[test]
