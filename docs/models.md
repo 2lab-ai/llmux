@@ -51,10 +51,15 @@ not that it is zero.
 - **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
-  resolve to `gpt-6-astra`: generation 6 shipped a SINGLE tier, so
-  `sol` / `terra` / `luna` stay on 5.6 (there is no `gpt-6-sol` and a request
-  for one would 404 upstream). These are advertised statically on the
-  corresponding entries.
+  resolve to `gpt-6-astra[1m]` — deliberate asymmetry with the 5.6 rows: on
+  astra the bare aliases advertise the 1M row so a client typing `astra` or
+  `gpt-6` gets OpenAI's published ~1,050,000-token window, and the explicit
+  base id `gpt-6-astra` is the way to pick the openai/codex catalog's 272000.
+  Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
+  (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
+  advertised statically on the corresponding entries. The provider always
+  strips a trailing `[1m]` before the request leaves llmux, so bare and
+  suffixed aliases reach the backend as the same upstream slug.
 - **claude aliases** — the claude rows carry short user-curated aliases that
   both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
   rewritten to its catalog id before the request leaves llmux, so the alias
@@ -163,8 +168,8 @@ model it does not curate.
 | claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
-| gpt-6-astra[1m]     | —            | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-6-astra         | astra, gpt-6 | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -223,9 +228,12 @@ no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 published 1,050,000-token window for Astra — it has **not** been probed through
 the daemon, unlike the 5.6 rows above (the only astra probe so far is the
 2026-09-07 acceptance check, which confirms the backend takes the slug, not its
-ceiling). The base `gpt-6-astra` row keeps the openai/codex catalog's 272000,
-the window a client gets without opting in; the catalog also lists an 872,000
-`max_context_window` for astra, which llmux does not advertise.
+ceiling). On astra the bare aliases `astra` / `gpt-6` sit on the `[1m]` row —
+opposite the 5.6 convention — so the ergonomic name selects the 1M window; the
+explicit base id `gpt-6-astra` keeps the openai/codex catalog's 272000, the
+window a client gets without opting in, and advertises no aliases. The catalog
+also lists an 872,000 `max_context_window` for astra, which llmux does not
+advertise.
 
 ## Sources
 
