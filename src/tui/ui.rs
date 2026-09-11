@@ -60,6 +60,10 @@ const WIDE_TABLE_AT: u16 = 150;
 /// leftover-space allocation made it too wide). Longer names are clipped by the
 /// cell.
 const NAME_COL_MAX: u16 = 20;
+/// Width of the reset-inventory column (.prd/16): 3 columns hold the header
+/// (`rst`) and every realistic cell — `?`, `—`, `3`, `3*`, `12` — so the
+/// column survives the narrow layout, where the width budget is tight.
+const RESET_COL_WIDTH: u16 = 3;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
 /// Default rows shown in the always-visible compact model strip (req12; Z
@@ -3925,7 +3929,18 @@ fn draw_accounts(
         frame.render_widget(empty, area);
         return Vec::new();
     }
-    let show_fable = view.show_fable_weekly;
+    let mut show_fable = view.show_fable_weekly;
+    // Reset-inventory column (.prd/16): shown only when the daemon reports
+    // usage-control metadata at all, so an older daemon's table is
+    // byte-identical to before. Compact by design — `3`, `3*`, `?`, `—` all fit
+    // in 3 cells, so the column survives the narrow layout where a gauge
+    // would not.
+    let show_resets = !view.usage_controls.is_empty();
+    let reset_extra = if show_resets {
+        RESET_COL_WIDTH as usize + 1
+    } else {
+        0
+    };
     // The account column is a fixed `Length(name_width)` that fits the widest
     // display name up to NAME_COL_MAX (floor = the header word "account").
     // Because it is Length, not Min, leftover width after the fixed data
@@ -3952,9 +3967,36 @@ fn draw_accounts(
     // models table.
     let wide = {
         let n_gauges = 2 + show_fable as usize;
-        let min_wide = 47 + name_width as usize + n_gauges * QUOTA_CELL_WIDTH + (8 + n_gauges - 1);
+        let min_wide = 47
+            + name_width as usize
+            + n_gauges * QUOTA_CELL_WIDTH
+            + (8 + n_gauges - 1)
+            + reset_extra;
         area.width as usize >= min_wide
     };
+    // Narrow + reset column: if the row STILL does not fit, the compact Fbl
+    // marker is the one column that gives way. Without this the table overflows
+    // and ratatui shaves every column instead — the 100-col frame rendered
+    // `gr`/`CO` for group and squeezed the status/gauges (runtime QA). Priority
+    // at a tight width is identity first (group + account), then the quota
+    // gauges, then `rst`; the Fable percent is one keystroke away in the detail
+    // pane and returns as soon as the terminal is wide enough.
+    if !wide && show_fable {
+        // The same sum the narrow branch of `bar_width` builds below, with the
+        // Fbl column included: 34 fixed + name + the two gauge cells + Fbl 7 +
+        // `rst`, plus one space between each pair of columns.
+        let ncols = 9 + show_resets as usize;
+        let fixed = 34
+            + name_width as usize
+            + 2 * QUOTA_CELL_WIDTH
+            + 7
+            + if show_resets {
+                RESET_COL_WIDTH as usize
+            } else {
+                0
+            };
+        show_fable = fixed + (ncols - 1) <= area.width as usize;
+    }
     // Leftover terminal width — everything past the FIXED columns and the 1-col
     // inter-column spacing — is poured into the quota gauge BARS instead of
     // dying as dead space on the right (Z 2026-07-13, follow-up to the
@@ -3970,16 +4012,31 @@ fn draw_accounts(
         // `n_gauges` stretchy gauge columns share whatever width is left.
         let n_gauges = if wide { 2 + show_fable as usize } else { 2 };
         let (fixed_total, ncols) = if wide {
-            // marker 2 + group 7 + # 2 + status 20 + if 3 + req 6 + tok 7 = 47.
-            let ncols = 8 + n_gauges;
-            let fixed = 47 + name_width as usize + n_gauges * QUOTA_CELL_WIDTH;
+            // marker 2 + group 7 + # 2 + status 20 + if 3 + req 6 + tok 7 = 47,
+            // plus the compact reset column when shown (it does NOT stretch).
+            let ncols = 8 + n_gauges + show_resets as usize;
+            let fixed = 47
+                + name_width as usize
+                + n_gauges * QUOTA_CELL_WIDTH
+                + if show_resets {
+                    RESET_COL_WIDTH as usize
+                } else {
+                    0
+                };
             (fixed, ncols)
         } else {
             // marker 2 + group 7 + # 2 + status 20 + if 3 = 34, + the compact
-            // 7-wide Fbl marker when shown (it does NOT stretch).
-            let ncols = 8 + show_fable as usize;
-            let fixed =
-                34 + name_width as usize + 2 * QUOTA_CELL_WIDTH + if show_fable { 7 } else { 0 };
+            // 7-wide Fbl marker when shown (it does NOT stretch), + `rst`.
+            let ncols = 8 + show_fable as usize + show_resets as usize;
+            let fixed = 34
+                + name_width as usize
+                + 2 * QUOTA_CELL_WIDTH
+                + if show_fable { 7 } else { 0 }
+                + if show_resets {
+                    RESET_COL_WIDTH as usize
+                } else {
+                    0
+                };
             (fixed, ncols)
         };
         let leftover = (area.width as usize).saturating_sub(fixed_total + (ncols - 1));
@@ -3990,6 +4047,7 @@ fn draw_accounts(
     let selected = match chrome.mode {
         Mode::Select { idx }
         | Mode::ConfirmRemove { idx }
+        | Mode::ConfirmReset { idx }
         | Mode::EditLimits { idx }
         | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
         // NewLogin is a provider picker, not an account-row cursor; the
@@ -4003,7 +4061,7 @@ fn draw_accounts(
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
         let cursor = selected == Some(pos);
-        let row = account_row(account, view, ctx, pos, wide, cursor, bar_width);
+        let row = account_row(account, view, ctx, pos, wide, cursor, bar_width, show_fable);
         if cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
         } else {
@@ -4038,6 +4096,10 @@ fn draw_accounts(
             header.push("7d Fbl");
             constraints.push(Constraint::Length(gauge_cell));
         }
+        if show_resets {
+            header.push("rst");
+            constraints.push(Constraint::Length(RESET_COL_WIDTH));
+        }
         header.extend(["if", "req", "tok"]);
         constraints.extend([
             Constraint::Length(3),
@@ -4060,6 +4122,10 @@ fn draw_accounts(
             header.push("7d Fbl");
             // Compact marker column ("F 100%!" fits in 7): no bar, no stretch.
             constraints.push(Constraint::Length(7));
+        }
+        if show_resets {
+            header.push("rst");
+            constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
         header.extend(["if"]);
         constraints.extend([Constraint::Length(3)]);
@@ -4098,6 +4164,10 @@ fn account_row<'a>(
     wide: bool,
     cursor: bool,
     bar_width: usize,
+    // The EFFECTIVE Fable-column flag from `draw_accounts` (the config toggle,
+    // minus the narrow-width drop) — reading `view.show_fable_weekly` here
+    // would push a cell into a column the header/constraints did not reserve.
+    show_fable: bool,
 ) -> Row<'a> {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -4198,7 +4268,7 @@ fn account_row<'a>(
     // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
     // same slot (after 7d) as the header/constraints reserve above, so the
     // cells stay column-aligned. Absent-window → the same cold state 5h/7d use.
-    if view.show_fable_weekly {
+    if show_fable {
         cells.push(fable_gauge_cell(
             account.fable_weekly(),
             now,
@@ -4210,6 +4280,22 @@ fn account_row<'a>(
             select::effective_limits(account, params).2,
             bar_width,
         ));
+    }
+    // Reset inventory (.prd/16), in the same slot the header/constraints
+    // reserve: `?` unknown, `N` owned, `N*` owned-but-none-applicable, `—` for
+    // a provider with no resets at all. Rendered only when the daemon reports
+    // control metadata, so an older daemon's table is unchanged.
+    if !view.usage_controls.is_empty() {
+        let label =
+            super::view::reset_cell(view.usage_control(&account.id.0), account.credential_kind);
+        // Unknown and "owned but not applicable now" are dimmed rather than
+        // colored: they are caveats on a count, not alarm states.
+        let style = if label == "?" || label.ends_with('*') {
+            dim()
+        } else {
+            Style::new()
+        };
+        cells.push(Cell::from(Span::styled(label, style)));
     }
     cells.push(Cell::from(in_flight_span(account.in_flight)));
     if wide {
@@ -4869,6 +4955,7 @@ fn draw_detail(
     let pos = match chrome.mode {
         Mode::Select { idx }
         | Mode::ConfirmRemove { idx }
+        | Mode::ConfirmReset { idx }
         | Mode::EditLimits { idx }
         | Mode::ContextMenu { idx, .. } => idx.min(ctx.order.len().saturating_sub(1)),
         // NewLogin keeps the detail pane on the current account.
@@ -4972,6 +5059,18 @@ fn draw_detail(
         Span::styled(" poll  ", dim()),
         Span::raw(poll),
     ]));
+    // Reset inventory (.prd/16) — only once the daemon reports usage-control
+    // metadata at all, so an older daemon's detail pane is unchanged.
+    if !view.usage_controls.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" reset ", dim()),
+            Span::raw(super::view::reset_detail(
+                view.usage_control(&account.id.0),
+                account.credential_kind,
+                now,
+            )),
+        ]));
+    }
 
     let block = Block::new().borders(Borders::TOP).title(" detail ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -7361,10 +7460,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // Accounts overlay: the issue #3/#4 affordances. a (add) and r
             // (remove) act on the DAEMON via the control endpoints, so they are
             // live in attach mode too.
+            // `f` (refresh usage) and `R` (redeem ONE reset) are the .prd/16
+            // controls. `R` is deliberately the SHIFTED key next to `r`
+            // remove: a redemption spends something upstream, so it must not
+            // share a keystroke with anything else.
             Overlay::Accounts => Line::from(vec![
                 Span::raw(" accounts — "),
                 key("s"),
                 Span::raw(" switch  "),
+                key("f"),
+                Span::raw(" refresh  "),
+                key("R"),
+                Span::raw(" reset  "),
                 key("a"),
                 Span::raw(" add  "),
                 key("n"),
@@ -7524,6 +7631,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             key("Esc/n"),
             Span::raw(" cancel"),
         ]),
+        // Redemption confirm (.prd/16): the SUBJECT (which account, one
+        // reset) is on the status line above; this bar is just the gate.
+        Mode::ConfirmReset { .. } => Line::from(vec![
+            Span::raw(" "),
+            key("↑/k ↓/j"),
+            Span::raw(" pick codex account  "),
+            Span::styled("redeem ONE reset? ", Style::new().fg(Color::Yellow)),
+            key("y"),
+            Span::raw(" confirm  "),
+            key("Esc/n"),
+            Span::raw(" cancel"),
+        ]),
         Mode::NewLogin { idx } => {
             // Provider picker: the cursor row is shown highlighted; Enter
             // opens the browser for that provider.
@@ -7590,6 +7709,7 @@ mod tests {
             daily_perf: Vec::new(),
             config_facts: Default::default(),
             usage_stats: Vec::new(),
+            usage_controls: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -7854,6 +7974,177 @@ mod tests {
             "one accounts separator, directly under the tabs:\n{}",
             rows[..6].join("\n")
         );
+    }
+
+    // --- codex usage controls (.prd/16) ------------------------------------
+
+    /// A codex account carrying control metadata, plus a claude account that
+    /// carries none — so every assertion below has a negative control in the
+    /// SAME frame.
+    fn usage_control_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let account = |name: &str, kind: &'static str, group| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: kind,
+            group,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![
+            account("codex:me@example.com", "codex", BackendGroup::Codex),
+            account("claude:me@example.com", "oauth", BackendGroup::Claude),
+        ];
+        view.usage_controls.insert(
+            "codex:me@example.com".into(),
+            crate::proxy::usage_controls::UsageControlDoc {
+                available_resets: Some(3),
+                applicable_resets: Some(0),
+                ..Default::default()
+            },
+        );
+        view
+    }
+
+    /// The accounts overlay shows the per-account reset count at BOTH a narrow
+    /// and a wide terminal, and the `*` marks "owned but upstream reports none
+    /// applicable now". The claude row, which has no resets at all, shows `—`
+    /// — never `0`.
+    #[test]
+    fn accounts_overlay_shows_reset_counts_at_narrow_and_wide_widths() {
+        let view = usage_control_view();
+        for (w, h) in [(110u16, 24u16), (200, 40)] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), w, h);
+            let frame = rows.join("\n");
+            assert!(
+                rows.iter().any(|r| r.contains("rst")),
+                "reset column header at {w}x{h}:\n{frame}"
+            );
+            let codex_row = rows
+                .iter()
+                .find(|r| r.contains("me@example.com") && r.contains("CODEX"))
+                .unwrap_or_else(|| panic!("codex row at {w}x{h}:\n{frame}"));
+            assert!(
+                codex_row.contains("3*"),
+                "owned-but-not-applicable marker at {w}x{h}: {codex_row:?}"
+            );
+            let claude_row = rows
+                .iter()
+                .find(|r| r.contains("me@example.com") && r.contains("CLAUDE"))
+                .unwrap_or_else(|| panic!("claude row at {w}x{h}:\n{frame}"));
+            assert!(
+                claude_row.contains('—'),
+                "a provider without resets renders n/a, not 0: {claude_row:?}"
+            );
+        }
+    }
+
+    /// Runtime QA (100 cols, `show_fable_weekly` ON): the row used to overflow,
+    /// and ratatui shaved EVERY column to fit — the group header read `gr` and
+    /// the cell `CO`. At a width that cannot hold everything, identity
+    /// (group + account) and the reset count must survive; the compact Fbl
+    /// marker is what gives way, and it returns at a wider terminal.
+    #[test]
+    fn narrow_100_keeps_group_and_reset_readable_by_dropping_the_fable_marker() {
+        let mut view = usage_control_view();
+        view.show_fable_weekly = true;
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 100, 24);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        assert!(
+            header.contains("group"),
+            "the group header is not truncated: {header:?}\n{frame}"
+        );
+        assert!(header.contains("rst"), "{header:?}\n{frame}");
+        assert!(
+            !header.contains("Fbl"),
+            "the Fbl marker gives way at 100 cols: {header:?}\n{frame}"
+        );
+        let codex_row = rows
+            .iter()
+            .find(|r| r.contains("CODEX"))
+            .unwrap_or_else(|| panic!("full CODEX group cell:\n{frame}"));
+        assert!(codex_row.contains("3*"), "{codex_row:?}\n{frame}");
+        assert!(
+            rows.iter().any(|r| r.contains("CLAUDE")),
+            "the other group cell is intact too:\n{frame}"
+        );
+
+        // Wide enough → the Fable marker is back, with `rst` still present.
+        let wide = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24).join("\n");
+        assert!(wide.contains("Fbl"), "{wide}");
+        assert!(wide.contains("rst"), "{wide}");
+        assert!(wide.contains("CODEX"), "{wide}");
+    }
+
+    /// The detail pane spells the counts out for the SELECTED row — and the
+    /// selection follows the display order, so the detail belongs to the row
+    /// the cursor is on.
+    #[test]
+    fn accounts_detail_pane_spells_out_the_reset_inventory() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        let codex_pos = view
+            .display_order(SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        chrome.mode = Mode::Select { idx: codex_pos };
+        let frame = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(frame.contains("3 owned"), "{frame}");
+        assert!(frame.contains("0 applicable now"), "{frame}");
+    }
+
+    /// The accounts keybar advertises the two new affordances — and keeps
+    /// `r remove` distinct from `R reset`, which is the whole reason the
+    /// redemption key is capitalized.
+    #[test]
+    fn accounts_keybar_advertises_refresh_and_reset() {
+        let view = usage_control_view();
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 160, 30);
+        let footer = rows[rows.len() - 1].clone();
+        assert!(footer.contains("f refresh"), "{footer}");
+        assert!(footer.contains("R reset"), "{footer}");
+        assert!(footer.contains("r remove"), "{footer}");
+    }
+
+    /// The redemption confirmation names the account and the ONE reset it
+    /// spends — a bare y/N with no subject is exactly what this forbids.
+    #[test]
+    fn reset_confirmation_names_the_account_and_one_reset() {
+        let view = usage_control_view();
+        let codex_pos = view
+            .display_order(SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::ConfirmReset { idx: codex_pos };
+        chrome.status_line = Some(super::super::reset_confirm_status(
+            "codex:me@example.com",
+            Some(3),
+            Some(0),
+        ));
+        let rows = render_rows(&view, &chrome, 160, 30);
+        let frame = rows.join("\n");
+        assert!(frame.contains("codex:me@example.com"), "{frame}");
+        assert!(frame.contains("ONE"), "{frame}");
+        let keybar = rows[rows.len() - 1].clone();
+        assert!(keybar.contains('y'), "confirm key advertised: {keybar}");
     }
 
     #[test]

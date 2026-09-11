@@ -374,6 +374,82 @@ fn accounts_verbose_shows_oauth_token_detail() {
 }
 
 // ---------------------------------------------------------------------------
+// .prd/16 — `accounts refresh|resets|reset` (codex usage controls).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accounts_subcommands_are_additive_to_the_bare_listing() {
+    // The usage controls are subcommands OF `accounts`: the bare listing (and
+    // its flags) keep working, and `--help` advertises all three.
+    let h = Harness::new();
+    h.seed_config(&config_json(39121, "[]"));
+    let help = Output::run({
+        let mut c = h.cmd();
+        c.args(["accounts", "--help"]);
+        c
+    });
+    assert_eq!(help.code, Some(0), "stderr: {}", help.stderr);
+    for sub in ["refresh", "resets", "reset"] {
+        assert!(help.stdout.contains(sub), "{sub} missing:\n{}", help.stdout);
+    }
+    // The bare listing is unchanged (offline, exit 0, no daemon needed).
+    let list = Output::run({
+        let mut c = h.cmd();
+        c.arg("accounts");
+        c
+    });
+    assert_eq!(list.code, Some(0), "stderr: {}", list.stderr);
+    assert!(
+        list.stdout.contains("No accounts configured."),
+        "{}",
+        list.stdout
+    );
+}
+
+#[test]
+fn accounts_reset_without_yes_refuses_on_a_non_tty_before_any_network_call() {
+    // A redemption is irreversible, so a non-TTY invocation without `--yes`
+    // is refused BEFORE the daemon is contacted. The seeded port has no
+    // daemon: if the refusal happened after the request, the error would be a
+    // connection failure instead.
+    let h = Harness::new();
+    h.seed_config(&config_json(39122, "[]"));
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["accounts", "reset", "codex:me@x.com"]);
+        c
+    });
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("--yes"), "{}", out.stderr);
+    assert!(out.stderr.contains("codex:me@x.com"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("request failed"),
+        "the refusal must precede any network call: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("request id"),
+        "no idempotency key is minted for a refused redemption: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn accounts_refresh_without_a_daemon_fails_cleanly() {
+    // The controls act on the DAEMON; with nothing on the port the command
+    // fails with a transport error and a nonzero exit — never a fake green.
+    let h = Harness::new();
+    h.seed_config(&config_json(39123, "[]"));
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["accounts", "refresh"]);
+        c
+    });
+    assert_eq!(out.code, Some(1), "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("refresh"), "{}", out.stderr);
+}
+
+// ---------------------------------------------------------------------------
 // CLI-07 — `login --api`.
 // ---------------------------------------------------------------------------
 

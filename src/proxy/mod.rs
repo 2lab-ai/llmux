@@ -11,6 +11,7 @@ pub mod login;
 pub mod raw_io;
 pub mod server;
 pub mod sse;
+pub mod usage_controls;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
