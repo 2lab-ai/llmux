@@ -23,6 +23,8 @@ features: [rules/documents.md](../rules/documents.md).
 
 ## Design notes (not how-to)
 
+- Responses compatibility: [spec](responses-compatibility/spec.md) and [trace](responses-compatibility/trace.md) — Codex/Grok image and tool translation, explicit semantic losses, strict policy, and count/termination validation. User-facing limits are in the [operational reference](operational-reference.md#codex--grok-compatibility-contract).
+
 - [Grok provider STV notes](grok/) — `spec.md` / `trace.md` design artifacts for the grok backend; not a user guide.
 - [OpenRouter provider STV notes](openrouter/) — `spec.md` design artifact for the openrouter backend (why it is a passthrough, the live upstream probes); not a user guide.
 - Product/architecture decisions live in [`.prd/`](../.prd/):

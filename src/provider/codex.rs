@@ -14,6 +14,7 @@ use http::{HeaderMap, HeaderValue, Method};
 use serde_json::Value;
 
 use super::responses::{self, RequestPlan};
+use super::responses_request::{self, ResponsesFlavor};
 use super::{ProviderError, ProviderRequest};
 use crate::config::AccountCredential;
 
@@ -179,8 +180,12 @@ impl CodexProvider {
                 "codex provider requires a codex credential".into(),
             ));
         };
-        let body: Value = serde_json::from_slice(anthropic_body)
-            .map_err(|err| ProviderError::Convert(format!("request body is not JSON: {err}")))?;
+        // A body that is not JSON is the CLIENT's fault, not the provider's:
+        // typed as `InvalidRequest` so the proxy answers 400 locally instead of
+        // blaming the upstream with a 502.
+        let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
+            ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
+        })?;
         let (upstream_body, client_stream) =
             translate_request_with(&body, &self.session_id, &self.shape())?;
 
@@ -232,8 +237,10 @@ impl CodexProvider {
 
 /// Translate an Anthropic Messages request body into a Responses API body.
 /// Returns `(upstream_body, client_requested_stream)`. The model is ALWAYS
-/// rewritten to [`CODEX_MODEL`]; `max_tokens` and `tool_choice` are ignored
-/// (logged at debug); images and thinking blocks are dropped (warn/debug).
+/// rewritten to [`CODEX_MODEL`]. Content translation and the compatibility
+/// contract (images kept, `tool_choice` mapped, `max_tokens` omitted + reported,
+/// unsupported content rejected) live in
+/// [`super::responses_request`] — see `docs/responses-compatibility/spec.md`.
 pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool), ProviderError> {
     translate_request_with(body, session_id, &CodexShape::default())
 }
@@ -409,9 +416,9 @@ pub fn effective_request_meta(body: &Value, shape: &CodexShape) -> (String, Opti
 /// Like [`translate_request`] but with an explicit request [`CodexShape`]
 /// (configurable model / fast tier / reasoning effort). Known-valid slugs in
 /// the request pass through verbatim (`resolve_upstream_model`); everything
-/// else is rewritten to `shape.model`. `max_tokens` and `tool_choice` are
-/// ignored (logged at debug); images and thinking blocks are dropped
-/// (warn/debug). When `shape.fast`, `service_tier: "priority"` is added (the
+/// else is rewritten to `shape.model`. Content translation + compatibility
+/// policy are [`super::responses_request`]'s under
+/// [`ResponsesFlavor::Codex`]. When `shape.fast`, `service_tier: "priority"` is added (the
 /// wire value the codex CLI sends for fast mode); reasoning effort comes from
 /// the request's `output_config.effort` when valid, else `shape.effort`
 /// (`resolve_reasoning_effort`).
@@ -432,7 +439,7 @@ pub fn translate_request_with(
         }
     }
     let effort = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model);
-    responses::build_responses_body(
+    responses_request::build_responses_body(
         body,
         &RequestPlan {
             upstream_model: &upstream_model,
@@ -441,6 +448,7 @@ pub fn translate_request_with(
             include_encrypted_reasoning: true,
             session_id,
         },
+        ResponsesFlavor::Codex,
     )
 }
 
@@ -483,7 +491,12 @@ mod tests {
         assert_eq!(upstream["instructions"], "You are helpful.");
         assert_eq!(upstream["stream"], true);
         assert_eq!(upstream["store"], false);
-        assert_eq!(upstream["parallel_tool_calls"], true);
+        // A tool-LESS request now omits the `tools`/`tool_choice`/
+        // `parallel_tool_calls` trio (there is nothing to choose or
+        // parallelize, and xAI rejects a choice without tools) — previously
+        // this body shipped `tools: []` + `parallel_tool_calls: true`.
+        assert!(upstream.get("parallel_tool_calls").is_none());
+        assert!(upstream.get("tools").is_none());
         assert_eq!(upstream["prompt_cache_key"], "sess-1");
         assert_eq!(upstream["include"][0], "reasoning.encrypted_content");
         let input = upstream["input"].as_array().expect("input");
@@ -512,6 +525,11 @@ mod tests {
         assert!(
             upstream.get("max_tokens").is_none(),
             "max_tokens must not be forwarded to the codex responses API, got {upstream:?}"
+        );
+        assert!(
+            upstream.get("max_output_tokens").is_none(),
+            "nor under the Responses name — the codex OAuth backend answers \
+             `400 Unsupported parameter: max_output_tokens` (live receipt)"
         );
     }
 
@@ -1011,17 +1029,21 @@ mod tests {
         assert_eq!(input[1]["role"], "user");
     }
 
-    /// Any unrecognized role degrades to `user` — never to `system` (the one
-    /// role codex forbids).
+    /// An unrecognized role is now REFUSED instead of degrading to `user`.
+    /// The old coercion silently rewrote who said something — a semantic
+    /// change the client could not see — and the Anthropic API it emulates
+    /// does not accept these roles either. (The original point of this test
+    /// stands: the role never becomes `system`, the one role codex forbids.)
     #[test]
-    fn translate_unknown_role_degrades_to_user_not_system() {
+    fn translate_unknown_role_is_refused_not_rewritten() {
         let body = json!({
             "messages": [{"role": "tool", "content": "result text"}]
         });
-        let (upstream, _) = translate_request(&body, "s").expect("translate");
-        let input = upstream["input"].as_array().expect("input");
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user", "unknown role → user");
+        let err = translate_request(&body, "s").expect_err("unknown role");
+        let ProviderError::InvalidRequest(message) = err else {
+            panic!("expected InvalidRequest, got {err:?}");
+        };
+        assert!(message.starts_with("messages[0].role:"), "{message:?}");
     }
 
     /// A system-role message expressed as a content-block array (Anthropic's
@@ -1088,15 +1110,23 @@ mod tests {
         assert_eq!(tools[0]["description"], "Get weather");
         assert_eq!(tools[0]["strict"], false);
         assert_eq!(tools[0]["parameters"]["type"], "object");
-        assert!(upstream.get("tool_choice").is_none(), "tool_choice ignored");
+        // `tool_choice` is no longer ignored: `auto` is forwarded as the
+        // Responses string of the same name (compatibility spec R2).
+        assert_eq!(upstream["tool_choice"], "auto");
     }
 
+    /// The compatibility flip for the codex flavor: a VALID user image is
+    /// converted (it was dropped), prior thinking is still omitted (neither
+    /// endpoint can replay a foreign provider's reasoning), and an image the
+    /// endpoint cannot take is an `InvalidRequest`, never a silent drop.
+    /// Exhaustive cases live in `provider::responses_request::tests`.
     #[test]
-    fn translate_drops_images_and_thinking() {
+    fn translate_keeps_images_omits_thinking_and_rejects_bad_images() {
         let body = json!({
             "messages": [
                 {"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "data": "..."}},
+                    {"type": "image", "source": {"type": "base64",
+                        "media_type": "image/png", "data": "aGVsbG8="}},
                     {"type": "text", "text": "what is this"}
                 ]},
                 {"role": "assistant", "content": [
@@ -1107,14 +1137,32 @@ mod tests {
         });
         let (upstream, _) = translate_request(&body, "s").expect("translate");
         let input = upstream["input"].as_array().expect("input");
-        assert_eq!(input.len(), 2, "image and thinking dropped");
-        assert_eq!(input[0]["content"][0]["text"], "what is this");
-        assert_eq!(input[1]["content"][0]["text"], "a cat");
+        assert_eq!(input.len(), 2, "one user item, one assistant item");
+        assert_eq!(input[0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            input[0]["content"][0]["image_url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(input[0]["content"][1]["text"], "what is this");
+        assert_eq!(input[1]["content"][0]["text"], "a cat", "thinking omitted");
+
+        // The pre-change fixture (no media_type, non-base64 data) is now a
+        // typed client error instead of a vanished image.
+        let broken = json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "data": "..."}},
+        ]}]});
+        assert!(matches!(
+            translate_request(&broken, "s"),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]
     fn translate_rejects_missing_messages() {
-        assert!(translate_request(&json!({"model": "m"}), "s").is_err());
+        assert!(matches!(
+            translate_request(&json!({"model": "m"}), "s"),
+            Err(ProviderError::InvalidRequest(_))
+        ));
     }
 
     #[test]

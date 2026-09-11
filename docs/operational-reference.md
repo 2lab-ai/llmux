@@ -109,6 +109,15 @@ llmux channel stable
 
 `llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
+### How a preview reaches brew
+
+A preview is published when the tap points at it, not when the prerelease exists. The `Preview` workflow's `publish` job creates `preview-<YYYY-MM-DD-HHMM>-<sha12>` and then, in the same job, renders `Formula/llmux-preview.rb` + `Casks/llmux-islands-preview.rb` from the exact assets it just uploaded and pushes them to [`2lab-ai/homebrew-tap`](https://github.com/2lab-ai/homebrew-tap) ([`.github/scripts/bump-tap-preview.sh`](../.github/scripts/bump-tap-preview.sh)). `brew upgrade llmux-preview` therefore sees a merge to `main` within one workflow run — no waiting.
+
+- **Credential:** repository secret **`TAP_DISPATCH_TOKEN`** (a token with push access to the tap), consumed as `GH_TOKEN` through `gh auth setup-git`, so it lives only in the runner's ephemeral git credential helper and never in a remote URL or the log. This is the only tap credential this repo has; an earlier `TAP_PUSH_KEY` deploy key was referenced by the workflow but never registered, which made every bump silently skip.
+- **Fail-closed:** a missing credential, a missing asset, or a failed push fails the `publish` job. Re-run the job — the release upload and the bump are both idempotent (a tap already at this tag is a no-op). The tap's own 6h `bump.yml` cron remains only as a backstop for builds published before this step existed.
+- **Never rolls back:** if the tap already points at a *newer* preview minute the bump skips; if it points at a *different* build from the *same minute* the ordering is unknowable from the tag, so the job fails instead of guessing.
+- **Regression test:** `.github/scripts/tests/bump-tap-preview.test.sh` (run by the `tap-bump-test` job, which gates `publish`) exercises clone → render → commit → push against a local git remote with a mocked `gh`, and pins every failure mode above to a non-zero exit.
+
 ### Source build
 
 ```bash
@@ -421,7 +430,54 @@ A ChatGPT/Codex subscription credential can be added with `llmux login --codex` 
 llmux import --from ~/.codex/auth.json
 ```
 
-The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE. The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, thinking summaries, and tool calls are supported. Images are dropped with a warning for now. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE (or an aggregated Messages JSON response for `stream: false`). The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, reasoning summaries, ordinary client-defined tools, and the bounded image subset below are supported. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+
+### Codex / Grok compatibility contract
+
+These are **subscription gateways**, not the public OpenAI or xAI API: Codex uses `https://chatgpt.com/backend-api/codex/responses`; Grok uses `https://cli-chat-proxy.grok.com/v1/responses`. Shared Responses syntax does not imply identical capabilities or budgets. Anthropic and OpenRouter passthrough behavior is unchanged by this contract; unsupported translated input is not a reason to silently fall back to another provider.
+
+| Messages input / behavior | Codex | Grok |
+| --- | --- | --- |
+| User PNG/JPEG base64 images | Supported as `input_image.image_url` data URIs | Same |
+| Images nested in user `tool_result.content` | Supported in `function_call_output.output` content arrays, preserving text/image order | Same |
+| URL images, other media, unknown content blocks | Local HTTP 400; never fetched or silently dropped | Same |
+| `tool_choice` | `auto` → `"auto"`; `any` → `"required"`; `none` → `"none"`; `tool{name}` → `{"type":"function","name":name}` | Same |
+| Absent/empty tools | Omit `tools`, `tool_choice`, and `parallel_tool_calls` together (`auto`/`none` are vacuous) | Same |
+| Positive-integer `max_tokens` | Omitted upstream; omission/warning `max_tokens`; strict mode returns 400 | Forwarded unchanged as `max_output_tokens`; warning `max_tokens_semantics`; strict mode returns 400 |
+| Prior assistant `thinking` / `redacted_thinking` | Omitted with matching omission/warning names; strict mode returns 400 | Same |
+| Top-level `thinking` configuration | Validate shape, then omit with `thinking_config` omission/warning; strict mode returns 400 | Same |
+| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; subscription support is unverified | Same |
+| Text/tool-only `count_tokens` | Local heuristic, including serialized tool schemas/property names; `X-Llmux-Token-Count: estimate` | Same |
+| Image `count_tokens` (top-level or nested) | Local HTTP 400: no reliable image-token estimate | Same |
+| Process-wide `prompt_cache_key` | Retained | Omitted; routing scope of a shared key is unproven |
+
+Image validation requires `source.type: "base64"`, `media_type: "image/png"` or `"image/jpeg"`, nonempty valid base64, and decoded size at most **20 MiB per image**. This is a bounded llmux contract, not support for every upstream image format. Images on assistant/system/developer roles, documents, audio/video, malformed structures, and nameless or server-side tools return a typed local 400 with a field path, not raw payload data. `tool_use` requires valid id/name/input; `tool_result` requires a nonempty `tool_use_id`, and `is_error: true` is preserved by an explicit error-text prefix. Named choices must refer to a declared tool; `any`/`tool` require nonempty tools. `disable_parallel_tool_use` must be boolean and maps to the inverse `parallel_tool_calls`; there is no fallback from an invalid choice to `auto`.
+
+**Compatibility policy and headers.** Omit `X-Llmux-Compatibility` or send `X-Llmux-Compatibility: compat` for the default policy. It permits only the enumerated semantic losses above; it does not make unsupported content acceptable. Successful translated responses advertise sorted, deduplicated field-name lists when relevant:
+
+- `X-Llmux-Omitted-Fields`: fields actually omitted (`max_tokens` on Codex, `thinking`, `redacted_thinking`, and `thinking_config` for top-level thinking configuration).
+- `X-Llmux-Compatibility-Warnings`: omission names plus `max_tokens_semantics` on Grok. Grok's forwarded limit is **not** listed as omitted.
+- A structured WARN records provider, field list, and request id. These headers/logs are machine-readable diagnostics, **not a promise that Claude Code displays a warning**.
+
+Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **before upstream traffic or credential refresh**. Other header values and invalid/nonpositive/noninteger limits also return 400. Since normal Messages clients send `max_tokens`, strict mode will reject those Codex/Grok requests rather than pretend to enforce an equivalent budget.
+
+**Other generation controls.** Non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
+
+**Limits are not billing caps.** Codex's subscription endpoint rejected `max_output_tokens: 16` in the dated probe below; llmux does not send it, clamp it, or fake truncation. Grok accepted that field and stopped at an observed 16 non-reasoning output tokens, but reported **302 output tokens including 286 reasoning tokens**. That is evidence of a visible-output cap for that fixture, not an Anthropic-equivalent total-generation budget or a billing guarantee. Reasoning usage can be additional to the requested visible output. A `response.incomplete` (or a `response.completed` envelope with `status: "incomplete"`) whose reason is `max_output_tokens` maps to Messages `stop_reason: "max_tokens"`, retaining partial text and usage. Other incomplete reasons become an Anthropic error event for SSE or HTTP 502 for aggregate JSON. Truncated tool arguments must never be repaired to an executable `{}` call; clients must not execute incomplete tool calls.
+
+**No private reasoning continuity.** Remaining text/tool history is preserved when prior assistant thinking is omitted. Neither provider's foreign thinking signatures are converted into upstream ciphertext. There is no ciphertext cache or private-reasoning replay in this version; returned reasoning summaries are not a continuity mechanism. Thinking blocks in other roles are rejected. Grok's process-wide cache key is removed because the public reference describes routing through `x-grok-conv-id`, not because a cross-session data leak was established. Upstream text is relayed verbatim, including literal XML or artifact-looking text; there is no heuristic output scrub. Reported output usage retains the upstream total including reasoning, without subtracting reasoning or clamping it to the requested limit.
+
+**Counting is an estimate, not upstream usage.** For validated text/tool-only input, the heuristic sums string characters under system/messages and compact serialized tool JSON (including keys), divides by four, and floors the result at one. It is not a model tokenizer. Malformed JSON/structures and image requests return 400 instead of a plausible-looking count; Codex/Grok counting uses no upstream call or credential refresh. The estimate marker does not apply a new contract to OpenRouter's existing local count path.
+
+### Compatibility evidence and scope
+
+The following official sources were inspected on **2026-09-11**. OpenAI source links are pinned to Codex `rust-v0.154.0`, commit `6b9826e3aa83b1a5947db50f4332cb9c65f1b340`; xAI URLs are live documents, so the fetched OpenAPI snapshot is identified by SHA-256 `492ae8625849e4f8bffdc576cead51856a41c874a3ccaab59a3aa0b704e1653f`.
+
+- [Codex request struct](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/codex-api/src/common.rs#L281-L307) has no `max_output_tokens`. Its string-typed tool choice alone is not proof of named-choice support.
+- [Codex image content](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/models.rs#L856-L874) and [tool-result image content](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/models.rs#L2055-L2070) define the wire shapes.
+- [xAI Responses reference](https://docs.x.ai/developers/rest-api-reference/inference/responses.md), [OpenAPI schema](https://docs.x.ai/openapi.json) (`ModelToolChoice`, `FunctionToolCallOutput`, `ModelRequest`), and [image guide](https://docs.x.ai/developers/model-capabilities/images/understanding.md) document flat named choices, multimodal tool outputs, PNG/JPEG, and the 20 MiB limit. These describe **api.x.ai**, not a guaranteed subscription-gateway contract. In particular, the public reference says the output limit includes reasoning; the gateway fixture below does not demonstrate that equivalence.
+
+Synthetic gateway probes on **2026-09-11**, models **`gpt-5.6-sol`** and **`grok-4.6`**, observed: user PNG + flat named choice returned `report_color(red)`; `required` returned a function call; nested tool-result PNG returned blue; `none` returned `OK` without calls. Codex rejected the cap field with 400; Grok produced the incomplete/usage result above. These are single observed fixtures per case, not universal model/version guarantees, JPEG-specific live proof, or proof that named choice excludes additional prose. Raw account identifiers, transcripts, and credentials are deliberately not reproduced.
 
 ## OpenRouter backend
 

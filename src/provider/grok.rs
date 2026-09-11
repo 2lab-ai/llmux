@@ -11,6 +11,7 @@ use http::{HeaderMap, HeaderValue, Method};
 use serde_json::Value;
 
 use super::responses::{self, RequestPlan, ResponsesSseConverter, RESPONSES_PATH};
+use super::responses_request::{self, ResponsesFlavor};
 use super::{ProviderError, ProviderRequest};
 use crate::config::AccountCredential;
 
@@ -169,8 +170,11 @@ impl GrokProvider {
                 "grok provider requires a grok credential".into(),
             ));
         };
-        let body: Value = serde_json::from_slice(anthropic_body)
-            .map_err(|err| ProviderError::Convert(format!("request body is not JSON: {err}")))?;
+        // Client-side fault → `InvalidRequest` (HTTP 400 locally), not a 502
+        // that blames the upstream for a body it never saw.
+        let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
+            ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
+        })?;
         let (upstream_body, client_stream) =
             translate_request_with(&body, &self.session_id, &self.shape())?;
 
@@ -327,7 +331,12 @@ pub fn effective_request_meta(body: &Value, shape: &GrokShape) -> (String, Optio
 /// `shape`: grok-shaped requested slugs pass through verbatim, effort
 /// resolves per-model, and the shared core does the rest. NO
 /// `include: [reasoning.encrypted_content]` (OpenAI-specific) and NO
-/// `service_tier` (xAI has no tier) — C1.
+/// `service_tier` (xAI has no tier) — C1. Content translation and the
+/// compatibility contract are [`super::responses_request`]'s under
+/// [`ResponsesFlavor::Grok`]: images and `tool_choice` are forwarded,
+/// `max_tokens` becomes `max_output_tokens` (with a semantics warning), and
+/// `prompt_cache_key` is NOT sent (the key's routing scope on cli-chat-proxy
+/// is undocumented). See `docs/responses-compatibility/spec.md`.
 pub fn translate_request_with(
     body: &Value,
     session_id: &str,
@@ -345,7 +354,7 @@ pub fn translate_request_with(
         }
     }
     let effort = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model);
-    responses::build_responses_body(
+    responses_request::build_responses_body(
         body,
         &RequestPlan {
             upstream_model: &upstream_model,
@@ -354,6 +363,7 @@ pub fn translate_request_with(
             include_encrypted_reasoning: false,
             session_id,
         },
+        ResponsesFlavor::Grok,
     )
 }
 
@@ -462,7 +472,27 @@ mod tests {
         );
         assert!(upstream.get("service_tier").is_none(), "no service tier");
         assert_eq!(upstream["store"], false);
-        assert_eq!(upstream["prompt_cache_key"], "sess");
+        // `prompt_cache_key` is a PROCESS-wide id; cli-chat-proxy documents no
+        // routing scope for it, so grok no longer asserts a session grouping
+        // llmux cannot back with evidence (codex keeps sending it).
+        assert!(upstream.get("prompt_cache_key").is_none());
+    }
+
+    /// The grok side of the compatibility contract: the cap IS forwarded
+    /// (live receipt: cap 16 → `incomplete`/`max_output_tokens`) where codex
+    /// must omit it, and a tool-less body sends none of the tool trio (xAI
+    /// rejects a `tool_choice` without tools). Exhaustive cases live in
+    /// `provider::responses_request::tests`.
+    #[test]
+    fn c16_grok_forwards_max_tokens_and_omits_the_tool_trio_when_tool_less() {
+        let mut b = body("grok-4.6");
+        b["max_tokens"] = json!(1024);
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(upstream["max_output_tokens"], 1024);
+        for field in ["tools", "tool_choice", "parallel_tool_calls"] {
+            assert!(upstream.get(field).is_none(), "{field}: {upstream}");
+        }
     }
 
     #[test]

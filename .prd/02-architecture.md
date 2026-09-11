@@ -130,10 +130,16 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
    Routing is **on by default**, so the `model` normally selects the group. With routing disabled
    no group filter is applied: a single legacy current slot is used and codex becomes the
    cross-group overflow pool — the older behavior.
-3. Refresh credential if near expiry; on one 401, force refresh and retry once.
-4. Build provider request:
+3. For the served Codex/Grok group, validate Messages input and compatibility policy before
+   credential refresh or upstream traffic. `validate_request` returns typed `InvalidRequest`
+   (local HTTP 400) or a sorted/deduplicated compatibility report. Strict policy rejects any
+   report issue. Valid text/tool counts return the local labeled estimate here; image counts
+   fail locally. Anthropic/OpenRouter request paths retain their existing behavior.
+4. Refresh credential if near expiry; on one 401, force refresh and retry once. Build request:
    - Anthropic: identity body, inject Bearer or x-api-key.
-   - Codex: translate Anthropic Messages to OpenAI Responses JSON, inject Codex OAuth headers.
+   - Codex/Grok: shared Messages→Responses translation with an explicit `ResponsesFlavor`
+     argument alongside `RequestPlan`, plus adapter-owned auth/model/effort. Builder validation also protects
+     direct callers; only the HTTP layer applies client strict policy and diagnostic headers.
 5. Send upstream, classify response, and retry/switch according to taxonomy.
 6. Relay response:
    - Anthropic: byte-identity SSE/body relay; usage observed from emitted Anthropic SSE.
@@ -194,25 +200,71 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
 `migrate.rs` reads teamclaude's `~/.config/teamclaude.json`; `credentials.rs` reads
 `~/.claude/.credentials.json`; `auth/codex.rs` reads Codex CLI `~/.codex/auth.json`.
 
-## Codex translation details
+## Shared Codex / Grok translation details
 
-The Codex endpoint is OpenAI Responses-shaped but rejects `role:"system"` input items. The
-translator therefore:
-- folds top-level Anthropic `system` and any message-level system messages into `instructions`;
-- maps legal input roles to `assistant`, `developer`, or `user` (never `system`);
-- maps Anthropic text blocks to `input_text`/`output_text`;
-- maps `tool_use` to `function_call` and `tool_result` to `function_call_output`;
-- drops request-side images/thinking in v0.1 with warnings;
-- sends `codex.default_model` (default `gpt-5.5`), optional `service_tier`/`reasoning.effort`,
-  `stream: true`, `store: false`, and a stable `prompt_cache_key`.
+`provider::responses` owns Messages→Responses validation/conversion and the reverse SSE state
+machine; adapters own endpoint, credentials, model and effort resolution. `ResponsesFlavor`
+(`Codex` / `Grok`) captures the actual subscription-gateway differences, not public-API parity.
+The translator:
+- folds top-level `system` and message-level system text into `instructions` (preserving the
+  existing Codex-compatible policy; this is not a claim that xAI forbids system-role inputs);
+- maps legal input roles to `assistant`, `developer`, or `user` and text to
+  `input_text`/`output_text`;
+- maps valid `tool_use` to `function_call`, and `tool_result` to `function_call_output` with an
+  explicit error-text prefix for `is_error: true`;
+- preserves valid user PNG/JPEG base64 images, including nested tool-result images, as
+  `input_image` with a data-URI `image_url`; ordered multimodal tool outputs use content arrays;
+- rejects URL images, invalid base64/MIME/size (>20 MiB decoded), forbidden-role images,
+  unknown/unsupported blocks, malformed tool structures and nameless/server tools with field
+  paths (no payload contents) in `InvalidRequest`, rather than dropping them;
+- translates choices `auto`→`auto`, `any`→`required`, `none`→`none`, `tool{name}`→flat named
+  function selector and inverts boolean `disable_parallel_tool_use`. Named tools must exist;
+  `any`/`tool` need tools. Both providers' no-tools requests omit `tools`/`tool_choice`/`parallel_tool_calls`;
+- omits Codex `max_tokens` with omission/warning `max_tokens`; forwards Grok `max_tokens` exactly
+  as `max_output_tokens` with warning `max_tokens_semantics` (not an omission). Positive integer
+  validation is not clamping, a total-budget guarantee, or a billing cap;
+- rejects non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` with local 400
+  rather than infer subscription support from public schemas. Empty stop sequences are
+  vacuous; malformed values fail. Top-level `thinking` is shape-validated, then omitted with
+  `thinking_config` in omissions/warnings (strict: 400), without enforcing `budget_tokens` or
+  disabled reasoning. Count validation emits no inference-only omission warnings. This is
+  an enumerated-controls contract, not an all-fields compatibility guarantee;
+- omits prior assistant `thinking`/`redacted_thinking` with corresponding issues. Remaining
+  transcript order survives; private reasoning does not. No ciphertext cache/replay or foreign
+  signature conversion; those block types on other roles are invalid;
+- sends `stream: true`, `store: false`, adapter-resolved model/effort, Codex-only priority tier
+  and encrypted-reasoning include. Codex retains its stable `prompt_cache_key`; Grok omits the
+  process-wide key because its routing scope is unproven (not an established leak).
+
+The HTTP boundary consumes `CompatibilityReport { omitted_fields, warnings }`: absent or
+`X-Llmux-Compatibility: compat` permits the enumerated losses; `strict` rejects any issue with
+400 before refresh/network. Other policy values also fail. Successful responses carry relevant
+`X-Llmux-Omitted-Fields` / `X-Llmux-Compatibility-Warnings` lists and structured WARN diagnostics
+(provider/field list/request id). Headers are machine-readable; client UI display is not promised.
+Local validated text/tool counts include serialized tools/property keys, retain a chars/4
+heuristic (floor one), and set `X-Llmux-Token-Count: estimate`; image or malformed counts return
+400 without refresh/network. The internal Codex idle probe explicitly builds a **no-cap** body,
+not a one-token-budget promise or a client strict-policy request.
 
 The response converter is a state machine over Responses SSE events:
 - `response.created` → Anthropic `message_start`;
-- text deltas → `content_block_start` + `content_block_delta` + `content_block_stop`;
-- reasoning summary deltas → thinking blocks;
-- function call items/argument deltas → `tool_use` + `input_json_delta`;
-- `response.completed` → `message_delta` + `message_stop`;
-- `response.failed`/malformed stream → Anthropic `error`.
+- text deltas → text blocks; reasoning summary deltas → thinking blocks (summaries, not replay);
+- function call items/argument deltas → `tool_use` + `input_json_delta`; stable block identity
+  uses upstream `output_index`/`item_id` plus `content_index`, preserving overlapping streams
+  and out-of-order item completion rather than assigning every delta to the last block;
+- completed output → `message_delta` + `message_stop`; malformed executable arguments on
+  normal completion are protocol errors, and incomplete empty arguments are not repaired to `{}`;
+- `response.incomplete`, or a completed envelope whose response status is incomplete, maps
+  `max_output_tokens` to `stop_reason: max_tokens`, preserving partial text and reported usage;
+- other incomplete reasons, `response.failed`, or malformed streams → Anthropic SSE `error`
+  (aggregate JSON returns HTTP 502). Truncated tool JSON must not become executable `{}`;
+- legitimate provider text/thinking/tool output is preserved, not heuristically scrubbed.
+  Reported output usage is not clamped to the request limit or reduced by reasoning tokens to
+  make the cap appear satisfied. The existing fresh/cache-read input split is independent.
+
+See [the compatibility reference](../docs/operational-reference.md#codex--grok-compatibility-contract)
+for the provider matrix, pinned official sources and 2026-09-11 synthetic endpoint receipts.
+A single accepted fixture proves neither all-model support nor reasoning-budget equivalence.
 
 ## Control-plane auth
 

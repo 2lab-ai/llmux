@@ -87,14 +87,15 @@ core with thin per-provider adapters.
     `/responses`;
   - identity headers `X-XAI-Token-Auth` / `x-grok-client-version` / `User-Agent`
     attached only when upstream is the official cli-chat-proxy host;
-  - **NO `x-grok-conv-id` header** (consensus round 3): CLIProxyAPI sends it only when
-    an execution-session id exists or the model is a `grok-composer-*` requiring
-    isolated conversations (xai_executor.go:1116-1148); for standard grok-4.5 chat it
-    is absent. Omitting it removes any cross-session state-mixing risk from a shared
-    per-process id. Body `prompt_cache_key` = per-process uuid stays (pure cache hint,
-    codex parity — not conversation state);
-  - `service_tier` never sent; `include: ["reasoning.encrypted_content"]` **not** sent
-    (OpenAI-specific; CLIProxyAPI does not send it for xAI);
+  - **No process-wide conversation routing key**: omit both `x-grok-conv-id` and body
+    `prompt_cache_key`. Correction 2026-09-11: the [official public Responses reference](https://docs.x.ai/developers/rest-api-reference/inference/responses.md)
+    describes `prompt_cache_key` as plumbed to `x-grok-conv-id` and used for routing; the
+    old claim that it is a pure cache hint was not justified. Removing it avoids an unproven
+    shared routing scope; neither a known data leak nor its absence has been established;
+  - `service_tier` never sent; `include: ["reasoning.encrypted_content"]` is not requested
+    because this adapter has no ciphertext-replay contract/cache. xAI's public API does
+    document this include option; it is **not** OpenAI-exclusive. Foreign Anthropic thinking
+    signatures are never converted into xAI encrypted content;
   - effort is **per-model capability, not provider-global**: a static thinking-levels
     table (source: CLIProxyAPI registry models.json:2411-2520) —
     `grok-4.6 → {low,medium,high,xhigh}`, `grok-4.5 → {low,medium,high}`,
@@ -108,8 +109,8 @@ core with thin per-provider adapters.
     (grok-4.6), `high` otherwise (grok-4.5); src/provider/grok.rs:297-300). When the clamped
     result is `none` (only reachable on models whose level set contains it, e.g.
     grok-4.3), the `reasoning` field is OMITTED rather than sent as `"none"` —
-    omission is the only universally-accepted wire form; explicit `"none"` is an
-    untested upstream shape. **The per-model table is the single source of effort
+    omission is this adapter's conservative wire policy; explicit `"none"` remains an
+    untested subscription-gateway shape. **The per-model table is the single source of effort
     truth**: the `POST /llmux/grok` config endpoint accepts the SUPERSET
     `none|low|medium|high` (amended 2026-08-26: `xhigh` accepted since #138 —
     `is_valid_config_effort`, src/provider/grok.rs:362-364) (plus empty/`unset` to
@@ -186,24 +187,13 @@ core with thin per-provider adapters.
 
 ### R5. Refactor: one Responses core, thin codex/grok adapters
 
-- New `src/provider/responses.rs`: the provider-agnostic Messages↔Responses machinery
-  moved **verbatim where possible** from codex.rs — `messages_to_input`,
-  `build_instructions`, `tools_to_functions`, response/SSE conversion
-  (Responses SSE → Anthropic SSE), usage extraction, and the request builder
-  parameterized by a `ResponsesFlavor`:
-  ```rust
-  pub struct ResponsesFlavor {
-      pub provider: &'static str,          // "codex" | "grok" (logs, errors)
-      pub valid_efforts: &'static [&'static str],
-      pub clamp_effort: fn(&str, &str) -> String,   // (effort, model) -> effort
-      pub model_passthrough: fn(&str) -> bool,      // requested slug accepted?
-      pub send_encrypted_reasoning_include: bool,   // codex true, grok false
-      pub supports_service_tier: bool,              // codex true, grok false
-  }
-  ```
-  (Exact shape may be simplified during implementation — a struct of data +
-  fn pointers keeps it dyn-free and testable; the trace, not this sketch, is
-  normative for behavior.)
+- `src/provider/responses.rs` is the shared façade: request validation/conversion lives in
+  `src/provider/responses_request.rs`; the façade re-exports it and owns token estimation,
+  `RequestPlan`, and response/SSE conversion. `ResponsesFlavor` is `Codex | Grok`, passed
+  explicitly alongside `RequestPlan` to the builder, not stored in it. Model and effort
+  resolution stay in the thin adapters. `validate_request(body, flavor, count_tokens)` returns
+  a `CompatibilityReport` (omitted fields and warnings) or typed `InvalidRequest`; the HTTP
+  layer applies strict policy before refresh/network and the builder validates direct calls.
 - `codex.rs` shrinks to: `CodexShape`, OAuth/refresh glue, header assembly, flavor
   definition, `effective_request_meta`. `grok.rs` is the same ~small file for grok.
 - `forward.rs` binary `is_codex` dispatch (forward.rs:726-770) becomes a three-way
@@ -218,21 +208,75 @@ core with thin per-provider adapters.
   A group whose accounts are all parked/limited is NOT empty: the request stays
   in-group and gets the existing all-limited behavior (identical to the claude group
   today). Contract-tested (C2b).
-- Existing codex unit tests move with the code they test; codex behavior is
-  **bit-identical** (gate: full existing test suite green untouched except imports).
+- The original extraction kept Codex behavior bit-identical (existing tests moved only with
+  their code). R6 is a subsequent, intentional compatibility change, not that extraction gate.
 - **Commit discipline**: the behavior-preserving core extraction lands as its own
   commit (C12 green at that commit), grok lands on top — refactor failures isolate
   from provider failures.
+
+### R6. Explicit Responses compatibility (2026-09-11)
+
+The [shared compatibility spec](../responses-compatibility/spec.md) and
+[operational matrix](../operational-reference.md#codex--grok-compatibility-contract) supersede
+v1's image-drop and ignored-choice behavior. Anthropic/OpenRouter paths are unchanged.
+
+- Preserve ordered PNG/JPEG base64 user images, including nested `tool_result.content`, as
+  data-URI `input_image` items. Multimodal `function_call_output.output` uses an array.
+  Require nonempty valid base64, supported MIME, decoded size ≤20 MiB, valid role/tool
+  structure; reject URL images (no fetch), other media, unknown blocks and nameless/server
+  tools locally with 400/field path. Tool-result errors retain an explicit error-text marker.
+- Map `auto`→`auto`, `any`→`required`, `none`→`none`, `tool{name}`→flat named function selector;
+  invert boolean `disable_parallel_tool_use`. Validate declared tool names/nonempty tools for
+  `any`/`tool`. No tools means omit `tools`, `tool_choice`, `parallel_tool_calls` together.
+- Forward positive-integer `max_tokens` unchanged as `max_output_tokens` but report
+  `max_tokens_semantics`. The subscription probe below showed a visible-output cap with
+  additional reasoning usage, not proven Anthropic total-budget equivalence or a billing cap.
+  Do not clamp the request, fabricate output truncation, or subtract reasoning from reported
+  output usage to make the limit appear satisfied.
+- Non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` return local 400;
+  subscription-gateway support is unverified. Empty stop sequences are vacuous; malformed
+  stop sequences fail. Top-level `thinking` configuration is distinct from prior-history
+  blocks: validate its shape, omit with `thinking_config` in omissions/warnings, strict 400.
+  Neither `budget_tokens` nor disabled reasoning is enforced. Counts carry no inference-only
+  omission warnings. This closes known controls, not every present or future Messages field.
+- Prior assistant `thinking`/`redacted_thinking` are omitted with matching issues; retain other
+  transcript content/order. No private-reasoning continuity, encrypted replay, or ciphertext
+  cache. Those block types on other roles are invalid. Returned summaries remain output,
+  not a replay mechanism; legitimate text/thinking/tool output is not heuristically scrubbed.
+- Absent / `X-Llmux-Compatibility: compat` permits only these enumerated losses. Emit relevant
+  `X-Llmux-Omitted-Fields` and `X-Llmux-Compatibility-Warnings` plus structured WARN
+  provider/fields/request id. `max_tokens_semantics` is a warning, **not** an omitted field.
+  Headers are machine-readable diagnostics, not guaranteed UI visibility. `strict` rejects
+  any issue with 400 before refresh/network; other policy values also fail.
+- Valid text/tool-only counts include serialized schemas/property names in a local chars/4
+  heuristic, floor one, with `X-Llmux-Token-Count: estimate`. Image or malformed counts return
+  400; counting performs no network/refresh. No image/base64 token estimate is invented.
+- `response.incomplete` or a completed envelope with incomplete status and reason
+  `max_output_tokens` yields `stop_reason: max_tokens`, partial text and usage. Other reasons
+  yield SSE error / aggregate HTTP 502. Truncated arguments must not become executable `{}`.
+
+**Evidence scope.** The official [image guide](https://docs.x.ai/developers/model-capabilities/images/understanding.md),
+[Responses reference](https://docs.x.ai/developers/rest-api-reference/inference/responses.md),
+and [OpenAPI schema](https://docs.x.ai/openapi.json) were inspected 2026-09-11; the fetched
+OpenAPI SHA-256 is `492ae8625849e4f8bffdc576cead51856a41c874a3ccaab59a3aa0b704e1653f`.
+These describe `api.x.ai`, not a version-stable contract for `cli-chat-proxy.grok.com`.
+Synthetic **2026-09-11 / `grok-4.6`** gateway fixtures accepted user PNG + flat named choice
+(`report_color(red)`), required choice, nested tool-result PNG (blue), and none (OK, no calls).
+A limit of 16 produced `response.incomplete` / `max_output_tokens`, output usage 302 and
+reasoning usage 286. The public reference says the limit includes reasoning; this gateway
+fixture instead supports only the narrower visible-output observation. One fixture per case
+is not universal model support, JPEG-specific live proof, or proof of prose-free named choice.
+Only synthetic outcomes are summarized here; no raw account/user payloads are published.
 
 ## Non-goals (v1)
 
 - API-key grok accounts (`api.x.ai` `using_api` path) — subscription OAuth only.
 - x_search auto-injection (CLIProxyAPI injects `{"type":"x_search"}` always,
   xai_executor.go:77-78) — llmux does not inject tools the client didn't send.
-- Grok media (image/video), websockets executor, `/responses/compact`, composer models.
-- xAI reasoning replay cache (CLIProxyAPI `internal/cache/xai_reasoning_replay_cache.go`)
-  — Claude Code resends full conversation; llmux's codex path already works multi-turn
-  without a replay cache. Revisit only if live receipt shows reasoning-continuity loss.
+- Media outside R6's PNG/JPEG base64 subset (URL images, video/audio/documents), websockets
+  executor, `/responses/compact`, composer models.
+- xAI reasoning replay/ciphertext cache. Resending text/tool history is not private-reasoning
+  continuity; R6 explicitly reports prior-thinking omission instead of claiming replay.
 - Importing grok-cli's own credential store.
 - Active quota polling for grok (no known endpoint).
 
@@ -263,7 +307,8 @@ core with thin per-provider adapters.
 3. **Live wire receipt** before merge: at least one captured real
    `POST …/responses` request + SSE stream against a real grok account through the
    local daemon (raw_io trace on), INCLUDING a ≥2-turn tool-call round trip
-   (reasoning-continuity check) — this closes spec Risks #2 (wire-shape unknowns).
+   (text/tool transcript-continuity check, **not** private-reasoning replay proof). R6's
+   subscription/public differences remain bounded by its separate dated fixtures.
 4. External reviewer agent pass (zbrain DEV.md §2).
 
 ## Risks / open items
@@ -271,10 +316,10 @@ core with thin per-provider adapters.
 1. **cli-chat-proxy client-version pinning**: header value `0.2.93` may age; kept in one
    const with a comment, config-overridable via `grok.upstream` remaining functional
    even if identity headers change requirements. (CLIProxyAPI pins the same way.)
-2. **Wire-shape unknowns** (does cli-chat-proxy accept `store:false`,
-   `parallel_tool_calls`, `prompt_cache_key`?): CLIProxyAPI sends translator-normalized
-   Responses bodies without stripping these; live receipt (first real request) is the
-   gate. If rejected, adapter strips per flavor flag.
+2. **Subscription/public wire drift**: R6's dated fixtures establish only those observed
+   requests. Larger limits, future models, and broader multimodal forms need new evidence;
+   public API documentation alone is insufficient. `prompt_cache_key` is deliberately omitted,
+   not a field to re-enable merely because one request accepts it.
 3. **429 body shape drift**: matching is substring-based on `code`/`error` fields,
    mirroring CLIProxyAPI exactly.
 
