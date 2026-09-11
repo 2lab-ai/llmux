@@ -109,6 +109,15 @@ llmux channel stable
 
 `llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
+### How a preview reaches brew
+
+A preview is published when the tap points at it, not when the prerelease exists. The `Preview` workflow's `publish` job creates `preview-<YYYY-MM-DD-HHMM>-<sha12>` and then, in the same job, renders `Formula/llmux-preview.rb` + `Casks/llmux-islands-preview.rb` from the exact assets it just uploaded and pushes them to [`2lab-ai/homebrew-tap`](https://github.com/2lab-ai/homebrew-tap) ([`.github/scripts/bump-tap-preview.sh`](../.github/scripts/bump-tap-preview.sh)). `brew upgrade llmux-preview` therefore sees a merge to `main` within one workflow run — no waiting.
+
+- **Credential:** repository secret **`TAP_DISPATCH_TOKEN`** (a token with push access to the tap), consumed as `GH_TOKEN` through `gh auth setup-git`, so it lives only in the runner's ephemeral git credential helper and never in a remote URL or the log. This is the only tap credential this repo has; an earlier `TAP_PUSH_KEY` deploy key was referenced by the workflow but never registered, which made every bump silently skip.
+- **Fail-closed:** a missing credential, a missing asset, or a failed push fails the `publish` job. Re-run the job — the release upload and the bump are both idempotent (a tap already at this tag is a no-op). The tap's own 6h `bump.yml` cron remains only as a backstop for builds published before this step existed.
+- **Never rolls back:** if the tap already points at a *newer* preview minute the bump skips; if it points at a *different* build from the *same minute* the ordering is unknowable from the tag, so the job fails instead of guessing.
+- **Regression test:** `.github/scripts/tests/bump-tap-preview.test.sh` (run by the `tap-bump-test` job, which gates `publish`) exercises clone → render → commit → push against a local git remote with a mocked `gh`, and pins every failure mode above to a non-zero exit.
+
 ### Source build
 
 ```bash
