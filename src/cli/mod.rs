@@ -219,6 +219,60 @@ pub struct AccountsArgs {
     /// running server. Exits 1 (with a JSON error object) if no server is up.
     #[arg(long)]
     pub json: bool,
+    /// Usage-control subcommand. Omitted = the account roster listing (the
+    /// offline table, or `--json` / remote mode's live dashboard).
+    #[command(subcommand)]
+    pub command: Option<AccountsCommand>,
+}
+
+/// Usage controls that act on the TARGET DAEMON's accounts (.prd/16): an
+/// explicit upstream usage read, the reset-entitlement listing, and the one
+/// deliberate redemption. All three go through the resolved endpoint
+/// (`--remote` included) with the admin `x-api-key`.
+#[derive(Debug, Subcommand)]
+pub enum AccountsCommand {
+    /// Re-read usage from the provider NOW for one account (or every supported
+    /// subscription account) — the recovery path when an external reset left
+    /// llmux's cached window overstating usage.
+    Refresh(AccountsRefreshArgs),
+    /// List an account's upstream rate-limit reset entitlements (read-only —
+    /// never redeems).
+    Resets(AccountsResetsArgs),
+    /// Redeem exactly ONE rate-limit reset for an account. Deliberate: a TTY
+    /// confirmation names the account and the single reset; a non-TTY refuses
+    /// without `--yes`.
+    Reset(AccountsResetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsRefreshArgs {
+    /// Account name as shown by `llmux accounts`. Omit to refresh every
+    /// supported subscription account.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsResetsArgs {
+    /// Account name as shown by `llmux accounts`.
+    pub account: String,
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsResetArgs {
+    /// Account name as shown by `llmux accounts`.
+    pub account: String,
+    /// Redeem a SPECIFIC credit (from `llmux accounts resets`) instead of
+    /// letting the daemon pick the account's next redeemable one.
+    #[arg(long, value_name = "ID")]
+    pub credit_id: Option<String>,
+    /// Retry an EARLIER redemption with its exact request id (printed before
+    /// every send). Reusing the id is what makes a retry safe after an
+    /// uncertain failure — a new id could spend a second reset.
+    #[arg(long, value_name = "ID")]
+    pub request_id: Option<String>,
+    /// Skip the confirmation prompt (required when stdin is not a TTY).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -334,7 +388,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Env(args) => env::run(args, remote).await,
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
-        Command::Accounts(args) => accounts::list(args, remote).await,
+        Command::Accounts(args) => accounts::run(args, remote).await,
         Command::Key(args) => keys::run(args, remote).await,
         Command::ResetUsage(args) => daemon::reset_usage(args, remote).await,
         Command::Remove(args) => accounts::remove(args).await,
@@ -838,6 +892,19 @@ mod tests {
             remote_refused_command(&Command::Accounts(AccountsArgs {
                 verbose: false,
                 json: false,
+                command: None,
+            })),
+            None
+        );
+        // The usage-control subcommands act on the DAEMON's accounts, so they
+        // target the remote like the listing does — never refused.
+        assert_eq!(
+            remote_refused_command(&Command::Accounts(AccountsArgs {
+                verbose: false,
+                json: false,
+                command: Some(AccountsCommand::Refresh(AccountsRefreshArgs {
+                    account: None
+                })),
             })),
             None
         );
@@ -855,6 +922,71 @@ mod tests {
             remote_refused_command(&Command::Update(UpdateArgs {})),
             None
         );
+    }
+
+    /// The usage-control subcommands are ADDITIVE: `llmux accounts` with no
+    /// subcommand still parses (and keeps `-v` / `--json`), while each
+    /// subcommand parses with its own arguments.
+    #[test]
+    fn accounts_subcommands_parse_without_breaking_the_bare_listing() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| Cli::try_parse_from(args).expect("parse");
+
+        let Command::Accounts(args) = parse(&["llmux", "accounts", "-v"]).command else {
+            panic!("expected accounts");
+        };
+        assert!(args.verbose && !args.json && args.command.is_none());
+
+        let Command::Accounts(args) = parse(&["llmux", "accounts", "--json"]).command else {
+            panic!("expected accounts");
+        };
+        assert!(args.json && args.command.is_none());
+
+        // refresh: optional account (absent = every supported account).
+        let Command::Accounts(args) = parse(&["llmux", "accounts", "refresh"]).command else {
+            panic!("expected accounts");
+        };
+        assert!(matches!(
+            args.command,
+            Some(AccountsCommand::Refresh(AccountsRefreshArgs {
+                account: None
+            }))
+        ));
+        let Command::Accounts(args) = parse(&["llmux", "accounts", "refresh", "a@x"]).command
+        else {
+            panic!("expected accounts");
+        };
+        let Some(AccountsCommand::Refresh(refresh)) = args.command else {
+            panic!("expected refresh");
+        };
+        assert_eq!(refresh.account.as_deref(), Some("a@x"));
+
+        // resets: account required.
+        assert!(Cli::try_parse_from(["llmux", "accounts", "resets"]).is_err());
+
+        // reset: account + the idempotency/confirmation flags.
+        let Command::Accounts(args) = parse(&[
+            "llmux",
+            "accounts",
+            "reset",
+            "a@x",
+            "--credit-id",
+            "c-1",
+            "--request-id",
+            "01RID",
+            "--yes",
+        ])
+        .command
+        else {
+            panic!("expected accounts");
+        };
+        let Some(AccountsCommand::Reset(reset)) = args.command else {
+            panic!("expected reset");
+        };
+        assert_eq!(reset.account, "a@x");
+        assert_eq!(reset.credit_id.as_deref(), Some("c-1"));
+        assert_eq!(reset.request_id.as_deref(), Some("01RID"));
+        assert!(reset.yes);
     }
 
     #[test]

@@ -932,6 +932,14 @@ pub struct AccountDoc {
     pub totals: LifetimeTotalsDoc,
     /// Activity-log totals (ok/err + token split) for the table/detail panes.
     pub session: SessionTotalsDoc,
+    /// Daemon-owned usage-control metadata (`.prd/16-codex-usage-controls.md`):
+    /// reset counters, last successful refresh, sanitized last error, pending
+    /// redemption id. Additive — `None` from a daemon that never observed this
+    /// account (and from one predating the feature), which means UNKNOWN, not
+    /// "no resets". It lives here rather than on `AccountSnapshot` because it
+    /// is daemon state, not scheduler state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_control: Option<crate::proxy::usage_controls::UsageControlDoc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1420,6 +1428,11 @@ pub struct DocMeta {
     pub config_facts: ConfigFactsDoc,
     /// Issued client keys (metadata only), from the LIVE registry.
     pub client_keys: Vec<KeyRowDoc>,
+    /// Daemon-owned usage-control metadata by account name, from the live
+    /// [`crate::proxy::server::AppState::usage_controls`] store. Threaded
+    /// through `DocMeta` (like `pricing_overrides`) so `dashboard_doc` stays a
+    /// pure function of its inputs. See [`AccountDoc::usage_control`].
+    pub usage_controls: HashMap<String, crate::proxy::usage_controls::UsageControlDoc>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1714,6 +1727,7 @@ pub(crate) fn dashboard_doc(
                     tokens_in: session.tokens_in,
                     tokens_out: session.tokens_out,
                 },
+                usage_control: meta.usage_controls.get(&account.id.0).cloned(),
             }
         })
         .collect();
@@ -2151,6 +2165,9 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone(),
+        // Live store, not a config snapshot: a refresh/redemption must show up
+        // on the very next frame/poll.
+        usage_controls: state.usage_controls.all(),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -2236,6 +2253,7 @@ mod tests {
     fn meta() -> DocMeta {
         DocMeta {
             client_keys: Vec::new(),
+            usage_controls: HashMap::new(),
             grok: GrokSettingsDoc::default(),
             pid: 4321,
             uptime_secs: 130,

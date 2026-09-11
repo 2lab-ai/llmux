@@ -52,7 +52,7 @@ pub use event::{ActivityEvent, TokenCounts};
 /// guarantees a dropped finish can never leak.
 pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -63,7 +63,6 @@ use tokio_stream::StreamExt;
 
 use crate::config::AccountConfig;
 use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
-use crate::scheduler::select;
 use view::DashboardView;
 
 /// Codex models the dashboard cycles through with `m` (req8.1), newest
@@ -249,6 +248,12 @@ pub(crate) enum Mode {
     /// Confirming a destructive account removal (the `r` key). `idx` is the
     /// display row being removed; the name is resolved at confirm time.
     ConfirmRemove {
+        idx: usize,
+    },
+    /// Confirming ONE rate-limit reset redemption (the `R` key, .prd/16).
+    /// `idx` is the display row; the account is resolved at confirm time and
+    /// named in the status line, so the gate is never a subject-less y/N.
+    ConfirmReset {
         idx: usize,
     },
     /// Picking the provider for a new browser login (the `n` key). `idx` is the
@@ -558,6 +563,55 @@ struct ClipResult {
     message: String,
 }
 
+/// A usage-control operation queued by a key and executed OFF the event loop
+/// (.prd/16). Each one can wait on an upstream round-trip, so none of them may
+/// run inline: the loop keeps rendering and taking input while a background
+/// task performs the call and delivers a [`ControlResult`] on the control
+/// channel.
+///
+/// The same enum drives BOTH backends: local calls the daemon's in-process
+/// service, attach POSTs the same operation to the daemon. There is exactly
+/// one semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlOp {
+    /// Explicit usage refresh. `None` = every supported account.
+    Refresh { account: Option<String> },
+    /// Redeem ONE reset. The idempotency key is minted by the CLIENT before
+    /// the send and reused verbatim on every retry — a new key could spend a
+    /// second reset.
+    Reset {
+        account: String,
+        request_id: String,
+        credit_id: Option<String>,
+    },
+    /// Manual switch, which refreshes the target's usage first (including an
+    /// already-active target) and may come back with a refresh warning.
+    Switch { account: String },
+}
+
+/// A redemption whose outcome this client is still holding: the account, the
+/// key that must be reused, and the credit it named. Kept until a TERMINAL
+/// outcome arrives (or the daemon reports none pending) — closing the dialog
+/// does not clear it, and no new id may be minted for the account while it is
+/// set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRedemption {
+    pub account: String,
+    pub request_id: String,
+    pub credit_id: Option<String>,
+}
+
+/// Outcome of a background control operation.
+struct ControlResult {
+    /// Operator-facing status line.
+    message: String,
+    /// A redemption to hold (uncertain outcome / a conflicting pending id the
+    /// daemon reported), replacing whatever the client held.
+    hold: Option<PendingRedemption>,
+    /// A terminal redemption outcome: stop holding the key.
+    resolved: Option<String>,
+}
+
 /// Attach-mode banner state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Attach {
@@ -599,9 +653,6 @@ struct Remote {
     /// Last successfully fetched document (kept through reconnects).
     doc: Option<DashboardDoc>,
     connected: bool,
-    /// Switch target chosen in select mode, performed by the event loop
-    /// (key handling is sync; the POST is not).
-    pending_switch: Option<String>,
     /// Codex settings change (fast/model/effort) queued by a key, performed by
     /// the event loop via `POST /llmux/codex` (req8.1).
     pending_codex: Option<crate::dashboard::CodexSettingsDoc>,
@@ -820,6 +871,19 @@ struct App {
     clip_inflight: bool,
     /// Sender the background export delivers its [`ClipResult`] on.
     clip_tx: Option<mpsc::Sender<ClipResult>>,
+    /// A usage-control operation queued by a key, drained by the event loop
+    /// into a background task (.prd/16) — same pattern as `pending_raw`.
+    pending_control: Option<ControlOp>,
+    /// True while a control operation is running. SINGLE-FLIGHT: it is what
+    /// makes a second Enter/`f`/`y` a no-op instead of a second refresh — or,
+    /// far worse, a second redemption.
+    control_inflight: bool,
+    /// Sender the background control task delivers its outcome on.
+    control_tx: Option<mpsc::Sender<ControlResult>>,
+    /// A redemption this client is still holding (see [`PendingRedemption`]).
+    /// Closing the confirm dialog does NOT clear it; only a terminal outcome
+    /// does.
+    pending_redemption: Option<PendingRedemption>,
 }
 
 impl App {
@@ -885,6 +949,10 @@ impl App {
             clip_inflight: false,
             clip_tx: None,
             reset_absolute: false,
+            pending_control: None,
+            control_inflight: false,
+            control_tx: None,
+            pending_redemption: None,
         }
     }
 
@@ -1139,11 +1207,83 @@ impl App {
         }
     }
 
-    fn take_pending_switch(&mut self) -> Option<String> {
-        match &mut self.backend {
-            Backend::Remote(remote) => remote.pending_switch.take(),
-            Backend::Local(_) => None,
+    // --- usage controls (.prd/16) ------------------------------------------
+
+    /// Queue one control operation for the event loop, unless one is already
+    /// running. The single-flight refusal is the anti-duplicate gate: a second
+    /// Enter on the redemption confirm, or a leaned-on `f`, must never start a
+    /// second operation.
+    /// Returns whether the operation was ACCEPTED. Callers that mutate state
+    /// alongside the queue (the redemption, which starts holding an
+    /// idempotency key) must key that mutation off this — a refused queue that
+    /// still installed a hold would invent an unresolved redemption that was
+    /// never sent.
+    fn queue_control(&mut self, op: ControlOp, pending_status: String) -> bool {
+        if self.control_inflight || self.pending_control.is_some() {
+            self.set_status(
+                "a usage-control operation is already running — wait for it to finish".into(),
+            );
+            return false;
         }
+        self.pending_control = Some(op);
+        self.set_status(pending_status);
+        true
+    }
+
+    fn take_pending_control(&mut self) -> Option<ControlOp> {
+        self.pending_control.take()
+    }
+
+    /// Run one control operation OFF the event loop. Local calls the daemon's
+    /// in-process service; attach POSTs the same operation. Both deliver their
+    /// outcome on the control channel, so the TUI keeps rendering meanwhile.
+    fn spawn_control(&mut self, op: ControlOp) {
+        let Some(tx) = self.control_tx.clone() else {
+            // Only in unit tests that never run `event_loop`; they assert on
+            // the QUEUED operation, not on its delivery.
+            return;
+        };
+        self.control_inflight = true;
+        match &self.backend {
+            Backend::Local(state) => {
+                let state = (**state).clone();
+                tokio::spawn(async move {
+                    let result = run_control_local(&state, op).await;
+                    let _ = tx.send(result).await;
+                });
+            }
+            Backend::Remote(remote) => {
+                let client = remote.client.clone();
+                let base_url = remote.base_url.clone();
+                let api_key = remote.api_key.clone();
+                tokio::spawn(async move {
+                    let result =
+                        run_control_remote(&client, &base_url, api_key.as_deref(), op).await;
+                    let _ = tx.send(result).await;
+                });
+            }
+        }
+    }
+
+    /// Apply a delivered control outcome: free the single-flight slot, show
+    /// the message, and update the held redemption. `hold` replaces the held
+    /// key (uncertain outcome, or a pending id the daemon reported); `resolved`
+    /// clears it — and ONLY a terminal outcome resolves.
+    fn apply_control_result(&mut self, result: ControlResult) {
+        self.control_inflight = false;
+        if let Some(hold) = result.hold {
+            self.pending_redemption = Some(hold);
+        }
+        if let Some(account) = result.resolved {
+            if self
+                .pending_redemption
+                .as_ref()
+                .is_some_and(|p| p.account == account)
+            {
+                self.pending_redemption = None;
+            }
+        }
+        self.set_status(result.message);
     }
 
     fn on_key(&mut self, key: KeyEvent, view: Option<&DashboardView>) {
@@ -1175,6 +1315,7 @@ impl App {
             Mode::EditLimits { idx } => return self.on_key_edit_limits(key.code, idx, view),
             Mode::AddKey => return self.on_key_add(key.code),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
+            Mode::ConfirmReset { idx } => return self.on_key_confirm_reset(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
             Mode::ContextMenu { idx, item } => {
                 return self.on_key_context_menu(key.code, idx, item, view)
@@ -2488,6 +2629,9 @@ impl App {
             Overlay::None => self.overlay = Overlay::None,
             Overlay::Stats => self.open_stats(view),
             Overlay::Sessions => self.open_sessions(),
+            // Same entry behavior as the `a` key: one refresh, not one per
+            // frame (.prd/16).
+            Overlay::Accounts => self.open_accounts(view),
             Overlay::Usage => {
                 self.usage_scroll = 0;
                 self.overlay = Overlay::Usage;
@@ -2616,8 +2760,9 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('R') => self.reload(),
-            // Summon overlays (issue #5).
-            KeyCode::Char('a') => self.overlay = Overlay::Accounts,
+            // Summon overlays (issue #5). Accounts entry also requests ONE
+            // usage refresh when the reset counts are absent/stale (.prd/16).
+            KeyCode::Char('a') => self.open_accounts(view),
             KeyCode::Char('g') => self.open_stats(view),
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Observed performance (perf telemetry v1): daily tok/s + health.
@@ -2792,7 +2937,205 @@ impl App {
             // credential is injected into the daemon, so it works in both local
             // and attach mode with no restart.
             KeyCode::Char('n') => self.open_new_login(),
+            // Explicit usage refresh for every supported account (.prd/16).
+            // Unlike the entry refresh this has NO staleness floor: the
+            // operator asking is the reason.
+            KeyCode::Char('f') => {
+                self.queue_control(
+                    ControlOp::Refresh { account: None },
+                    "refreshing usage for all supported accounts…".into(),
+                );
+            }
+            // Redeem ONE reset (.prd/16): opens the confirm gate on the first
+            // codex row. Capitalized on purpose — `r` removes an account, and
+            // a redemption must not share a keystroke with anything.
+            KeyCode::Char('R') => self.open_reset_confirm(view),
             _ => {}
+        }
+    }
+
+    /// Open the redemption confirm on the first row whose provider actually
+    /// has resets. No codex account → a hint, never an empty gate.
+    fn open_reset_confirm(&mut self, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(pos) = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+        else {
+            self.set_status(
+                "reset: no codex account (rate-limit resets are a ChatGPT/Codex entitlement)"
+                    .into(),
+            );
+            return;
+        };
+        self.mode = Mode::ConfirmReset { idx: pos };
+        self.set_reset_confirm_status(pos, view);
+    }
+
+    /// Status line for the open confirm gate: names the account under the
+    /// cursor and its inventory, or the pending redemption this client is
+    /// still holding for it (which `y` retries with the SAME id).
+    fn set_reset_confirm_status(&mut self, idx: usize, view: &DashboardView) {
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let account = target.id.0.clone();
+        if let Some(pending) = self
+            .pending_redemption
+            .as_ref()
+            .filter(|p| p.account == account)
+        {
+            let request_id = pending.request_id.clone();
+            self.set_status(format!(
+                "{account} has an UNRESOLVED redemption (request id {request_id}) — y retries \
+                 THAT id, Esc closes this dialog (it does not abandon the redemption)"
+            ));
+            return;
+        }
+        let control = view.usage_control(&account);
+        self.set_status(reset_confirm_status(
+            &account,
+            control.and_then(|c| c.available_resets),
+            control.and_then(|c| c.applicable_resets),
+        ));
+    }
+
+    /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `y`
+    /// redeems ONE reset, anything else closes the dialog.
+    ///
+    /// Closing is NOT abandoning: a redemption this client is still holding
+    /// stays held (and the daemon keeps its own pending receipt), so reopening
+    /// the gate offers the same id again rather than minting a new one.
+    fn on_key_confirm_reset(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let len = view.snapshot.accounts.len();
+        if len == 0 {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let idx = idx.min(len - 1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let idx = idx.saturating_sub(1);
+                self.mode = Mode::ConfirmReset { idx };
+                self.set_reset_confirm_status(idx, view);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let idx = (idx + 1).min(len - 1);
+                self.mode = Mode::ConfirmReset { idx };
+                self.set_reset_confirm_status(idx, view);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.submit_reset(idx, view);
+                self.mode = Mode::Normal;
+            }
+            // Any other key (Esc/n/q/…) closes the dialog only.
+            _ => {
+                self.mode = Mode::Normal;
+                self.set_status(match self.pending_redemption.as_ref() {
+                    Some(pending) => format!(
+                        "closed — {} still has an unresolved redemption (request id {})",
+                        pending.account, pending.request_id
+                    ),
+                    None => "reset cancelled — nothing was spent".to_string(),
+                });
+            }
+        }
+    }
+
+    /// Queue the redemption for the row under the cursor. The account must be
+    /// a codex account; the idempotency key is minted HERE, once, and a held
+    /// (unresolved) key for this account is REUSED rather than replaced.
+    fn submit_reset(&mut self, idx: usize, view: &DashboardView) {
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        if target.credential_kind != "codex" {
+            self.set_status(format!(
+                "reset: {} is a {} account — rate-limit resets are a Codex entitlement",
+                target.id, target.credential_kind
+            ));
+            return;
+        }
+        let account = target.id.0.clone();
+        // Reuse an unresolved key for this account: the first attempt may
+        // already have spent the credit, so only THAT id may be retried. The
+        // daemon's own pending receipt is the second line of defense.
+        let held = self
+            .pending_redemption
+            .as_ref()
+            .filter(|p| p.account == account)
+            .cloned()
+            .or_else(|| {
+                view.usage_control(&account)
+                    .and_then(|c| c.pending_request_id.as_ref())
+                    .map(|request_id| PendingRedemption {
+                        account: account.clone(),
+                        request_id: request_id.clone(),
+                        credit_id: view
+                            .usage_control(&account)
+                            .and_then(|c| c.pending_credit_id.clone()),
+                    })
+            });
+        let (request_id, credit_id, pending_text) = match held {
+            Some(pending) => (
+                pending.request_id.clone(),
+                pending.credit_id.clone(),
+                format!(
+                    "retrying the pending redemption for {account} (request id {})…",
+                    pending.request_id
+                ),
+            ),
+            None => {
+                let request_id = ulid::Ulid::new().to_string();
+                let text = format!("redeeming one reset for {account} (request id {request_id})…");
+                (request_id, None, text)
+            }
+        };
+        // The hold is installed ONLY if the queue accepted the redemption, but
+        // still before the send: a refused queue (another control operation in
+        // flight) must leave any existing hold — and the absence of one —
+        // exactly as it was, while an accepted one is held from this moment so
+        // a lost outcome still has its retry key on the client.
+        let accepted = self.queue_control(
+            ControlOp::Reset {
+                account: account.clone(),
+                request_id: request_id.clone(),
+                credit_id: credit_id.clone(),
+            },
+            pending_text,
+        );
+        if accepted {
+            self.pending_redemption = Some(PendingRedemption {
+                account,
+                request_id,
+                credit_id,
+            });
+        }
+    }
+
+    /// Open the Accounts overlay and request ONE usage refresh if the reset
+    /// inventory is absent or older than [`ENTRY_REFRESH_FLOOR`] (.prd/16):
+    /// entering the surface populates the counts, but re-entering it (or
+    /// re-rendering it) does not hammer upstream. `f` has no such floor.
+    fn open_accounts(&mut self, view: Option<&DashboardView>) {
+        self.overlay = Overlay::Accounts;
+        if let Some(view) = view {
+            if accounts_entry_refresh_due(view, SystemTime::now()) {
+                self.queue_control(
+                    ControlOp::Refresh { account: None },
+                    "refreshing reset counts…".into(),
+                );
+            }
         }
     }
 
@@ -3234,9 +3577,33 @@ impl App {
             // `L` from the switcher: edit the highlighted account's ceiling
             // overrides (config `account_limits`).
             KeyCode::Char('L') => self.open_limits_editor(idx, view),
+            // `f` from the switcher: refresh THIS account's usage (.prd/16) —
+            // the targeted form of the overlay's all-accounts refresh.
+            KeyCode::Char('f') => {
+                self.refresh_selected(idx, view);
+                self.mode = Mode::Select { idx };
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.mode = Mode::Normal,
             _ => self.mode = Mode::Select { idx },
         }
+    }
+
+    /// Queue an explicit usage refresh for the switcher's highlighted row.
+    fn refresh_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
+        let Some(view) = view else { return };
+        let now = SystemTime::now();
+        let order = view.display_order(now);
+        let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
+            return;
+        };
+        let account = target.id.0.clone();
+        let pending = format!("refreshing usage for {account}…");
+        self.queue_control(
+            ControlOp::Refresh {
+                account: Some(account),
+            },
+            pending,
+        );
     }
 
     /// Open the new-login provider picker, OR — on a headless client that
@@ -3679,11 +4046,16 @@ impl App {
 
     /// Enter in select mode — switch the scheduler to the chosen account.
     ///
-    /// The eligibility precheck runs here on the view's snapshot (same pure
-    /// gate the scheduler uses), so the operator gets the real refusal
-    /// reason immediately; the commit re-validates anyway (local:
-    /// `AccountPool::switch_to` under the pool lock; remote: the server's
-    /// switch endpoint runs the identical call).
+    /// Queues the switch as a control operation in BOTH backends (.prd/16 S3):
+    /// the daemon service refreshes the target's usage FIRST — including an
+    /// already-active target, which is the whole point of re-selecting one —
+    /// and then commits through the pool.
+    ///
+    /// There is deliberately NO client-side eligibility precheck any more. It
+    /// judged CACHED windows, so an account whose quota was reset upstream
+    /// read as exhausted and the TUI refused the very switch that would have
+    /// refreshed it. The pool stays the authority on pause / auth / cooldown
+    /// and refuses with its own reason.
     fn try_manual_switch(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
@@ -3692,76 +4064,498 @@ impl App {
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
-        if view.snapshot.is_current(&target.id) {
-            self.set_status(format!("{} is already active", target.id));
-            return;
-        }
-        let headers_only =
-            select::headers_only_mode(&view.snapshot, &view.select_params, None, now);
-        if let Some(reason) = select::eligibility(target, &view.select_params, now, headers_only) {
-            if reason == select::IneligibleReason::Paused {
-                self.set_status(format!(
-                    "cannot switch to {}: paused — press p to resume",
-                    target.id
-                ));
-            } else {
-                self.set_status(format!("cannot switch to {}: {reason:?}", target.id));
-            }
-            return;
-        }
-        let target_id = target.id.clone();
-        let from = view.snapshot.representative_current().cloned();
-        match &mut self.backend {
-            Backend::Local(state) => {
-                match state.pool.switch_to(&target_id, &view.select_params, now) {
-                    Ok(()) => {
-                        state.emit(ActivityEvent::AccountSwitched {
-                            from: from.map(|id| id.0),
-                            to: target_id.0.clone(),
-                            reason: Some("manual".into()),
-                        });
-                        self.set_status(format!("switched to {target_id} (manual)"));
-                    }
-                    Err(err) => self.set_status(format!("switch to {target_id} failed: {err}")),
-                }
-            }
-            Backend::Remote(remote) => {
-                remote.pending_switch = Some(target_id.0.clone());
-                self.set_status(format!("switching to {target_id}…"));
-            }
-        }
-    }
-
-    /// Perform the queued remote switch (`POST /llmux/switch`).
-    async fn perform_remote_switch(&mut self, target: String) {
-        let Backend::Remote(remote) = &mut self.backend else {
-            return;
+        let account = target.id.0.clone();
+        let pending = if view.snapshot.is_current(&target.id) {
+            format!("refreshing {account} and re-selecting it…")
+        } else {
+            format!("switching to {account}…")
         };
-        let url = format!("{}/llmux/switch", remote.base_url);
-        let mut request = remote
-            .client
-            .post(&url)
-            .json(&serde_json::json!({ "account": target }));
-        if let Some(key) = &remote.api_key {
+        self.queue_control(ControlOp::Switch { account }, pending);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage-control execution (.prd/16) — one semantics, two transports
+// ---------------------------------------------------------------------------
+
+/// How stale a reset-inventory observation may be before ENTERING the accounts
+/// overlay asks for a fresh one. Entry refresh is a convenience (populate the
+/// counts); the explicit `f` refresh has no floor at all.
+const ENTRY_REFRESH_FLOOR: Duration = Duration::from_secs(60);
+
+/// Does entering the accounts overlay warrant one refresh? Only when an
+/// account that HAS reset entitlements (codex) carries no observation, or one
+/// older than [`ENTRY_REFRESH_FLOOR`]. No such account → no refresh at all, so
+/// a claude-only roster never pays for this.
+fn accounts_entry_refresh_due(view: &DashboardView, now: SystemTime) -> bool {
+    view.snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.credential_kind == "codex")
+        .any(|a| match view.usage_control(&a.id.0) {
+            None => true,
+            Some(control) => match control.last_refresh_ms {
+                None => true,
+                Some(ms) => {
+                    let observed = UNIX_EPOCH + Duration::from_millis(ms);
+                    now.duration_since(observed)
+                        .map(|age| age > ENTRY_REFRESH_FLOOR)
+                        // A clock that went backwards is not evidence of
+                        // freshness; treat it as due.
+                        .unwrap_or(false)
+                }
+            },
+        })
+}
+
+/// Status line for a completed refresh: how many accounts were refreshed, the
+/// reset inventory when it is known, and EVERY failure. A partial failure is
+/// never summarized into a green.
+fn refresh_message(response: &crate::proxy::usage_controls::RefreshResponse) -> String {
+    let failures: Vec<String> = response
+        .results
+        .iter()
+        .filter(|r| !r.ok)
+        .map(|r| {
+            format!(
+                "{}: {}",
+                r.account,
+                r.error.as_deref().unwrap_or("unspecified error")
+            )
+        })
+        .collect();
+    let ok = response.results.len() - failures.len();
+    if failures.is_empty() {
+        // One account: name its inventory; many: the count is the signal.
+        if let [only] = &response.results[..] {
+            let control = only.usage_control.as_ref();
+            return format!(
+                "refreshed {} · resets {}",
+                only.account,
+                match control.and_then(|c| c.available_resets) {
+                    None => "unknown".to_string(),
+                    Some(owned) => match control.and_then(|c| c.applicable_resets) {
+                        Some(applicable) => format!("{owned} owned · {applicable} applicable now"),
+                        None => format!("{owned} owned · applicable unknown"),
+                    },
+                }
+            );
+        }
+        return format!("refreshed {ok} account(s)");
+    }
+    format!(
+        "refresh: {ok} ok, {} FAILED — {}",
+        failures.len(),
+        failures.join(" · ")
+    )
+}
+
+/// Status line for a terminal redemption outcome. The four codes stay
+/// distinct, and a failed follow-up read is appended as a warning on a
+/// SUCCESS — never turned into a retryable failure.
+fn consume_message(
+    account: &str,
+    response: &crate::proxy::usage_controls::ConsumeResponse,
+) -> String {
+    use crate::auth::codex_usage::ResetOutcome;
+    let head = match response.outcome {
+        ResetOutcome::Reset => format!(
+            "reset redeemed for {account} ({} window(s))",
+            response.windows_reset
+        ),
+        ResetOutcome::AlreadyRedeemed => {
+            format!("{account}: already redeemed — this replay spent no second reset")
+        }
+        ResetOutcome::NothingToReset => {
+            format!("{account}: nothing to reset — no reset was spent")
+        }
+        ResetOutcome::NoCredit => {
+            format!("{account}: no reset credit available upstream — nothing was spent")
+        }
+    };
+    let mut text = format!("{head} · request id {}", response.request_id);
+    if let Some(warning) = &response.applicability_warning {
+        text.push_str(&format!(" · note: {warning}"));
+    }
+    if let Some(warning) = &response.refresh_warning {
+        text.push_str(&format!(
+            " · WARNING (stale read, redemption stands): {warning}"
+        ));
+    }
+    text
+}
+
+/// Turn a TERMINAL consume response into a client outcome.
+///
+/// R1 receipt-close failure: upstream can reach a terminal outcome while the
+/// daemon fails to release its durable pending receipt, and then it keeps
+/// reporting the redemption as pending. That combination is a SUCCESS whose
+/// receipt is still open — the client keeps the safe retry identity (the same
+/// id, never a new one) instead of declaring the redemption resolved, and it
+/// never re-offers the spend as a fresh redemption.
+fn consume_result(
+    account: &str,
+    response: crate::proxy::usage_controls::ConsumeResponse,
+) -> ControlResult {
+    let message = consume_message(account, &response);
+    let still_pending = response
+        .usage_control
+        .as_ref()
+        .and_then(|control| control.pending_request_id.clone());
+    match still_pending {
+        Some(request_id) => ControlResult {
+            message: format!(
+                "{message} · the daemon still reports this redemption as pending — it was NOT \
+                 re-spent; only request id {request_id} may be repeated"
+            ),
+            hold: Some(PendingRedemption {
+                account: account.to_string(),
+                request_id,
+                credit_id: response.credit_id,
+            }),
+            resolved: None,
+        },
+        None => ControlResult {
+            message,
+            hold: None,
+            resolved: Some(account.to_string()),
+        },
+    }
+}
+
+/// Status line for a manual switch. The pre-switch refresh warning is shown
+/// SEPARATELY from the switch result — a stale read never reads as a failed
+/// switch, and a successful switch never hides it.
+fn switch_message(response: &crate::proxy::usage_controls::SwitchResponse) -> String {
+    let head = format!("switched to {} (manual)", response.current);
+    match &response.refresh_warning {
+        Some(warning) => format!("{head} · WARNING: usage refresh failed — {warning}"),
+        None => head,
+    }
+}
+
+/// The redemption confirm prompt: names the ACCOUNT and the ONE reset, with
+/// the inventory (unknown stays unknown).
+pub(crate) fn reset_confirm_status(
+    account: &str,
+    owned: Option<u64>,
+    applicable: Option<u64>,
+) -> String {
+    let inventory = match owned {
+        None => "inventory unknown".to_string(),
+        Some(owned) => match applicable {
+            Some(applicable) => format!("{owned} owned · {applicable} applicable now"),
+            None => format!("{owned} owned · applicable unknown"),
+        },
+    };
+    format!(
+        "redeem ONE rate-limit reset for {account}? ({inventory}) — y confirms, Esc cancels; \
+         this spends a reset upstream and cannot be undone"
+    )
+}
+
+/// Map a daemon-side control error onto a client outcome. The two errors that
+/// carry an id are the load-bearing ones: an UNCERTAIN redemption keeps its
+/// own key, and a PENDING one hands back the key that must be retried instead.
+fn control_error_result(
+    account: &str,
+    err: &crate::proxy::usage_controls::UsageControlError,
+) -> ControlResult {
+    use crate::proxy::usage_controls::UsageControlError as E;
+    match err {
+        E::Uncertain { request_id, .. } => ControlResult {
+            message: format!(
+                "{account}: redemption outcome UNCERTAIN — {err}. Press R again to retry the \
+                 SAME id ({request_id}); a new one could spend a second reset"
+            ),
+            hold: Some(PendingRedemption {
+                account: account.to_string(),
+                request_id: request_id.clone(),
+                credit_id: None,
+            }),
+            resolved: None,
+        },
+        E::Pending {
+            request_id,
+            credit_id,
+            ..
+        } => ControlResult {
+            message: format!("{account}: {err}"),
+            hold: Some(PendingRedemption {
+                account: account.to_string(),
+                request_id: request_id.clone(),
+                credit_id: credit_id.clone(),
+            }),
+            resolved: None,
+        },
+        // Everything else refused before spending anything.
+        other => ControlResult {
+            message: format!("{account}: {other}"),
+            hold: None,
+            resolved: None,
+        },
+    }
+}
+
+/// Execute one control operation against the IN-PROCESS daemon (local mode).
+async fn run_control_local(state: &crate::proxy::server::AppState, op: ControlOp) -> ControlResult {
+    use crate::proxy::usage_controls::ConsumeRequest;
+    match op {
+        ControlOp::Refresh { account } => match state.refresh_usage(account.as_deref()).await {
+            Ok(response) => ControlResult {
+                message: refresh_message(&response),
+                hold: None,
+                resolved: None,
+            },
+            Err(err) => ControlResult {
+                message: format!("refresh failed: {err}"),
+                hold: None,
+                resolved: None,
+            },
+        },
+        ControlOp::Reset {
+            account,
+            request_id,
+            credit_id,
+        } => {
+            let request = ConsumeRequest {
+                account: account.clone(),
+                redeem_request_id: request_id,
+                credit_id,
+                confirm: true,
+            };
+            match state.consume_reset(&request).await {
+                Ok(response) => consume_result(&account, response),
+                Err(err) => control_error_result(&account, &err),
+            }
+        }
+        ControlOp::Switch { account } => match state.manual_switch(&account).await {
+            Ok(response) => ControlResult {
+                message: switch_message(&response),
+                hold: None,
+                resolved: None,
+            },
+            Err(err) => ControlResult {
+                message: format!("switch to {account} failed: {err}"),
+                hold: None,
+                resolved: None,
+            },
+        },
+    }
+}
+
+/// Execute one control operation against an ATTACHED daemon over HTTP — the
+/// same endpoints `llmux accounts refresh/reset` uses.
+async fn run_control_remote(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    op: ControlOp,
+) -> ControlResult {
+    let post = |path: &str, body: serde_json::Value| {
+        let mut request = client.post(format!("{base_url}{path}")).json(&body);
+        if let Some(key) = api_key {
             request = request.header("x-api-key", key);
         }
-        let message = match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                format!("switched to {target} (manual)")
+        request
+    };
+    match op {
+        ControlOp::Refresh { account } => {
+            let body = match &account {
+                Some(name) => serde_json::json!({ "account": name }),
+                None => serde_json::json!({}),
+            };
+            match post("/llmux/refresh-usage", body).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return ControlResult {
+                            message: format!("refresh failed: {}", http_error_text(status, &text)),
+                            hold: None,
+                            resolved: None,
+                        };
+                    }
+                    match serde_json::from_str(&text) {
+                        Ok(parsed) => ControlResult {
+                            message: refresh_message(&parsed),
+                            hold: None,
+                            resolved: None,
+                        },
+                        Err(err) => ControlResult {
+                            message: format!("refresh: unreadable response ({err})"),
+                            hold: None,
+                            resolved: None,
+                        },
+                    }
+                }
+                Err(err) => ControlResult {
+                    message: format!("refresh failed: {err}"),
+                    hold: None,
+                    resolved: None,
+                },
             }
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let detail = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                    .unwrap_or_else(|| status.to_string());
-                format!("switch to {target} failed: {detail}")
+        }
+        ControlOp::Reset {
+            account,
+            request_id,
+            credit_id,
+        } => {
+            let mut body = serde_json::json!({
+                "account": account,
+                "redeem_request_id": request_id,
+                "confirm": true,
+            });
+            // Omitted, never null, when no credit was named.
+            if let Some(id) = &credit_id {
+                body["credit_id"] = serde_json::Value::String(id.clone());
             }
-            Err(err) => format!("switch to {target} failed: {err}"),
-        };
-        self.set_status(message);
+            match post("/llmux/reset-credits/consume", body).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        return match serde_json::from_str(&text) {
+                            Ok(parsed) => consume_result(&account, parsed),
+                            // A 2xx we cannot read is UNCERTAIN: the
+                            // redemption may have happened. Keep the key.
+                            Err(err) => ControlResult {
+                                message: format!(
+                                    "{account}: redemption outcome UNCERTAIN — unreadable \
+                                     response ({err}). Press R again to retry the SAME id \
+                                     ({request_id})"
+                                ),
+                                hold: Some(PendingRedemption {
+                                    account,
+                                    request_id,
+                                    credit_id,
+                                }),
+                                resolved: None,
+                            },
+                        };
+                    }
+                    remote_consume_error(&account, &text, request_id, credit_id, status)
+                }
+                // A transport failure is uncertain by definition.
+                Err(err) => ControlResult {
+                    message: format!(
+                        "{account}: redemption outcome UNCERTAIN — {err}. Press R again to \
+                         retry the SAME id ({request_id})"
+                    ),
+                    hold: Some(PendingRedemption {
+                        account,
+                        request_id,
+                        credit_id,
+                    }),
+                    resolved: None,
+                },
+            }
+        }
+        ControlOp::Switch { account } => {
+            match post("/llmux/switch", serde_json::json!({ "account": account }))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return ControlResult {
+                            message: format!(
+                                "switch to {account} failed: {}",
+                                http_error_text(status, &text)
+                            ),
+                            hold: None,
+                            resolved: None,
+                        };
+                    }
+                    let message = match serde_json::from_str(&text) {
+                        Ok(parsed) => switch_message(&parsed),
+                        Err(_) => format!("switched to {account} (manual)"),
+                    };
+                    ControlResult {
+                        message,
+                        hold: None,
+                        resolved: None,
+                    }
+                }
+                Err(err) => ControlResult {
+                    message: format!("switch to {account} failed: {err}"),
+                    hold: None,
+                    resolved: None,
+                },
+            }
+        }
     }
+}
+
+/// Classify a FAILED consume response by the daemon's stable error code (the
+/// same codes the CLI branches on).
+fn remote_consume_error(
+    account: &str,
+    body: &str,
+    request_id: String,
+    credit_id: Option<String>,
+    status: reqwest::StatusCode,
+) -> ControlResult {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let code = value["error"]["type"].as_str().unwrap_or("");
+    let message = value["error"]["message"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| status.to_string());
+    match code {
+        "pending_redemption" => {
+            let pending = value["pending_request_id"]
+                .as_str()
+                .unwrap_or(&request_id)
+                .to_string();
+            let pending_credit = value["pending_credit_id"]
+                .as_str()
+                .map(str::to_string)
+                .or(credit_id);
+            ControlResult {
+                message: format!("{account}: {message} — press R again to retry THAT id"),
+                hold: Some(PendingRedemption {
+                    account: account.to_string(),
+                    request_id: pending,
+                    credit_id: pending_credit,
+                }),
+                resolved: None,
+            }
+        }
+        "uncertain" => {
+            let id = value["request_id"]
+                .as_str()
+                .unwrap_or(&request_id)
+                .to_string();
+            ControlResult {
+                message: format!(
+                    "{account}: redemption outcome UNCERTAIN — {message}. Press R again to \
+                     retry the SAME id ({id})"
+                ),
+                hold: Some(PendingRedemption {
+                    account: account.to_string(),
+                    request_id: id,
+                    credit_id,
+                }),
+                resolved: None,
+            }
+        }
+        _ => ControlResult {
+            message: format!("{account}: redemption refused — {message}"),
+            hold: None,
+            resolved: None,
+        },
+    }
+}
+
+/// The daemon's `error.message` for a non-2xx, falling back to the status.
+fn http_error_text(status: reqwest::StatusCode, body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| status.to_string())
 }
 
 /// Initialize the terminal for the dashboard: `ratatui::try_init` (raw mode +
@@ -3833,7 +4627,6 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pid: opts.pid,
         doc: None,
         connected: false,
-        pending_switch: None,
         pending_codex: None,
         pending_settings: None,
         pending_pause: None,
@@ -3906,6 +4699,12 @@ async fn event_loop(
     // this select.
     let (clip_tx, mut clip_rx) = mpsc::channel::<ClipResult>(4);
     app.clip_tx = Some(clip_tx);
+    // Usage controls (.prd/16): refresh / redeem / switch each wait on an
+    // upstream round-trip, so they run in a background task and deliver here.
+    // Running them inline would freeze input for the length of the call — and
+    // a frozen TUI is exactly how an operator ends up pressing Enter twice.
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlResult>(4);
+    app.control_tx = Some(control_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -3979,17 +4778,24 @@ async fn event_loop(
                 app.apply_clip_result(result);
                 true
             }
+            // A usage-control operation finished (.prd/16): free the
+            // single-flight slot, show the outcome, and update the held
+            // redemption key (only a TERMINAL outcome releases it).
+            Some(result) = control_rx.recv() => {
+                app.apply_control_result(result);
+                true
+            }
         };
+        if let Some(op) = app.take_pending_control() {
+            app.spawn_control(op);
+            redraw = true;
+        }
         if let Some(req) = app.take_pending_raw() {
             app.spawn_raw_fetch(req);
             redraw = true;
         }
         if let Some(req) = app.next_clip_if_idle() {
             app.spawn_clip(req);
-            redraw = true;
-        }
-        if let Some(target) = app.take_pending_switch() {
-            app.perform_remote_switch(target).await;
             redraw = true;
         }
         if let Some(codex) = app.take_pending_codex() {
@@ -4500,7 +5306,6 @@ mod tests {
             pid: None,
             doc: None,
             connected: false,
-            pending_switch: None,
             pending_codex: None,
             pending_settings: None,
             pending_pause: None,
@@ -6377,6 +7182,7 @@ mod tests {
             daily_perf: Vec::new(),
             config_facts: Default::default(),
             usage_stats: Vec::new(),
+            usage_controls: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -6384,7 +7190,7 @@ mod tests {
             port: 3456,
             upstream: None,
             config_path: None,
-            select_params: select::SelectParams {
+            select_params: crate::scheduler::select::SelectParams {
                 five_hour_max: 0.9,
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
@@ -6422,5 +7228,658 @@ mod tests {
             data_quality: crate::dashboard::DataQualityDoc::default(),
             events: Vec::new(),
         }
+    }
+
+    // --- codex usage controls (.prd/16) ------------------------------------
+
+    /// A roster with one codex account (which HAS resets) and one claude
+    /// account (which does not), plus the codex account selected — so every
+    /// assertion below has a negative control.
+    fn control_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let account = |name: &str, kind: &'static str, group| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: kind,
+            group,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = empty_view();
+        view.snapshot.accounts = vec![
+            account("claude:a@x.com", "oauth", BackendGroup::Claude),
+            account("codex:c@x.com", "codex", BackendGroup::Codex),
+        ];
+        view
+    }
+
+    fn control_doc(
+        available: Option<u64>,
+        last_refresh_ms: Option<u64>,
+    ) -> crate::proxy::usage_controls::UsageControlDoc {
+        crate::proxy::usage_controls::UsageControlDoc {
+            available_resets: available,
+            applicable_resets: Some(0),
+            last_refresh_ms,
+            ..Default::default()
+        }
+    }
+
+    /// `f` queues exactly ONE refresh, and a second press while it runs is
+    /// refused — the anti-duplicate gate that also protects the redemption.
+    #[test]
+    fn accounts_f_queues_one_refresh_and_refuses_a_second_while_it_runs() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('f'), Some(&view));
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Refresh { account: None })
+        );
+        // The loop drains it and marks it in flight.
+        let op = app.take_pending_control().expect("queued");
+        app.control_inflight = true;
+        assert_eq!(op, ControlOp::Refresh { account: None });
+
+        app.on_key_accounts(KeyCode::Char('f'), Some(&view));
+        assert_eq!(app.pending_control, None, "no second refresh while running");
+        assert!(
+            app.status_line().is_some_and(|s| s.contains("already")),
+            "{:?}",
+            app.status_line()
+        );
+    }
+
+    /// `f` in the switcher refreshes the HIGHLIGHTED account (display order),
+    /// not the whole roster.
+    #[test]
+    fn switcher_f_refreshes_the_highlighted_account() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        let codex_pos = view
+            .display_order(SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        app.mode = Mode::Select { idx: codex_pos };
+        app.on_key_select(KeyCode::Char('f'), codex_pos, Some(&view));
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Refresh {
+                account: Some("codex:c@x.com".into())
+            })
+        );
+        assert_eq!(
+            app.mode,
+            Mode::Select { idx: codex_pos },
+            "stays in the switcher"
+        );
+    }
+
+    /// Entering the accounts surface refreshes ONCE when the reset inventory
+    /// is absent or stale — and NOT when it was read seconds ago (the floor),
+    /// nor at all when no account has resets to count.
+    #[test]
+    fn accounts_entry_refresh_respects_the_staleness_floor() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ms = |secs: u64| secs * 1_000;
+
+        // No codex account → nothing to count → never refreshes on entry.
+        let mut claude_only = control_view();
+        claude_only
+            .snapshot
+            .accounts
+            .retain(|a| a.credential_kind != "codex");
+        assert!(!accounts_entry_refresh_due(&claude_only, now));
+
+        // Codex account with no observation at all → due.
+        let mut view = control_view();
+        assert!(accounts_entry_refresh_due(&view, now));
+
+        // Observed 10s ago → NOT due (entry must not hammer upstream).
+        view.usage_controls.insert(
+            "codex:c@x.com".into(),
+            control_doc(Some(3), Some(ms(999_990))),
+        );
+        assert!(!accounts_entry_refresh_due(&view, now));
+
+        // Observed 61s ago → due again.
+        view.usage_controls.insert(
+            "codex:c@x.com".into(),
+            control_doc(Some(3), Some(ms(999_939))),
+        );
+        assert!(accounts_entry_refresh_due(&view, now));
+
+        // A count with no timestamp is an unanchored observation → due.
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        assert!(accounts_entry_refresh_due(&view, now));
+    }
+
+    /// Both accounts entry points (the `a` key and a tab/mouse `open_tab`)
+    /// queue the entry refresh — and exactly one, not one per press while it
+    /// is still running.
+    #[test]
+    fn both_accounts_entry_points_queue_the_entry_refresh() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('a'), Some(&view));
+        assert_eq!(app.overlay, Overlay::Accounts);
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Refresh { account: None }),
+            "`a` entry requests the counts"
+        );
+
+        let mut app = remote_app();
+        app.open_tab(Overlay::Accounts, Some(&view));
+        assert_eq!(app.overlay, Overlay::Accounts);
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Refresh { account: None }),
+            "tab/mouse entry requests the same"
+        );
+    }
+
+    /// The manual switch no longer refuses on CACHED state: the account whose
+    /// quota reads 100% (exactly the stale-window case an upstream reset
+    /// fixes) still queues, and so does the ALREADY-ACTIVE account — which is
+    /// how the operator forces a fresh read of it.
+    #[test]
+    fn manual_switch_queues_for_exhausted_and_already_active_targets() {
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        let mut view = control_view();
+        let now = SystemTime::now();
+        // Cached 100% on the codex account — the pre-.prd/16 client refused
+        // this switch outright.
+        view.snapshot.accounts[1].five_hour = Some(QuotaWindow {
+            utilization: 1.0,
+            resets_at: now + Duration::from_secs(3_600),
+            fetched_at: now,
+            source: WindowSource::UsagePoll,
+        });
+        let order = view.display_order(now);
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+
+        let mut app = remote_app();
+        app.try_manual_switch(codex_pos, Some(&view));
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Switch {
+                account: "codex:c@x.com".into()
+            }),
+            "an exhausted cached window must not block the switch"
+        );
+
+        // Already active: still queued (refresh-then-reselect), with a status
+        // that says so rather than "already active".
+        view.snapshot.current.insert(
+            crate::routing::BackendGroup::Codex,
+            crate::scheduler::AccountId("codex:c@x.com".into()),
+        );
+        let order = view.display_order(now);
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let mut app = remote_app();
+        app.try_manual_switch(codex_pos, Some(&view));
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Switch {
+                account: "codex:c@x.com".into()
+            }),
+            "re-selecting the active account refreshes it"
+        );
+        assert!(
+            app.status_line().is_some_and(|s| s.contains("refreshing")),
+            "{:?}",
+            app.status_line()
+        );
+    }
+
+    /// `R` opens the gate on a CODEX row (never a claude one), the prompt
+    /// names that account and one reset, and cancelling queues nothing.
+    #[test]
+    fn reset_gate_targets_a_codex_account_and_cancel_queues_nothing() {
+        let mut view = control_view();
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        let Mode::ConfirmReset { idx } = app.mode else {
+            panic!("expected the reset gate, got {:?}", app.mode);
+        };
+        let order = view.display_order(SystemTime::now());
+        assert_eq!(
+            view.snapshot.accounts[order[idx]].credential_kind, "codex",
+            "the gate opens on an account that HAS resets"
+        );
+        let status = app.status_line().expect("prompt").to_string();
+        assert!(status.contains("codex:c@x.com"), "{status}");
+        assert!(status.contains("ONE"), "{status}");
+        assert!(status.contains("3 owned"), "{status}");
+
+        // Esc cancels: nothing queued, nothing held.
+        app.on_key_confirm_reset(KeyCode::Esc, idx, Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pending_control, None, "a cancelled gate spends nothing");
+        assert!(app.pending_redemption.is_none());
+    }
+
+    /// A roster with no codex account cannot open the gate at all.
+    #[test]
+    fn reset_gate_refuses_without_a_codex_account() {
+        let mut view = control_view();
+        view.snapshot
+            .accounts
+            .retain(|a| a.credential_kind != "codex");
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pending_control, None);
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("no codex account")));
+    }
+
+    /// The confirm resolves the cursor to an account at CONFIRM time through
+    /// the display order, so a roster that reordered between opening the gate
+    /// and pressing `y` cannot redirect the redemption to another account.
+    #[test]
+    fn reset_confirm_follows_the_row_under_the_cursor_after_a_reorder() {
+        let mut view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        let Mode::ConfirmReset { idx } = app.mode else {
+            panic!("expected the reset gate");
+        };
+        // The roster reorders (the codex account moves to the other row).
+        view.snapshot.accounts.swap(0, 1);
+        // Move the cursor onto the codex row and confirm.
+        let order = view.display_order(SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let _ = idx;
+        app.on_key_confirm_reset(KeyCode::Char('y'), codex_pos, Some(&view));
+        match app.pending_control.as_ref().expect("queued redemption") {
+            ControlOp::Reset { account, .. } => assert_eq!(account, "codex:c@x.com"),
+            other => panic!("expected a redemption, got {other:?}"),
+        }
+        // Confirming on the CLAUDE row instead redeems nothing.
+        let mut app = remote_app();
+        let claude_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "oauth")
+            .expect("claude row");
+        app.on_key_confirm_reset(KeyCode::Char('y'), claude_pos, Some(&view));
+        assert_eq!(app.pending_control, None);
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("Codex entitlement")));
+    }
+
+    /// The redemption id is minted ONCE by the client and held before the
+    /// send; a retry reuses THAT id (never a fresh one), and an id the daemon
+    /// reports as pending is adopted rather than replaced.
+    #[test]
+    fn redemption_reuses_the_held_request_id_on_retry() {
+        let view = control_view();
+        let order = view.display_order(SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+
+        let mut app = remote_app();
+        app.submit_reset(codex_pos, &view);
+        let ControlOp::Reset { request_id, .. } = app.pending_control.clone().expect("queued")
+        else {
+            panic!("expected a redemption");
+        };
+        assert!(!request_id.is_empty(), "the client mints the key");
+        assert_eq!(
+            app.pending_redemption
+                .as_ref()
+                .map(|p| p.request_id.clone()),
+            Some(request_id.clone()),
+            "held BEFORE the send"
+        );
+
+        // The outcome never arrived (uncertain): retry reuses the same key.
+        app.pending_control = None;
+        app.control_inflight = false;
+        app.submit_reset(codex_pos, &view);
+        let ControlOp::Reset {
+            request_id: retry_id,
+            ..
+        } = app.pending_control.clone().expect("queued retry")
+        else {
+            panic!("expected a redemption");
+        };
+        assert_eq!(retry_id, request_id, "a retry never mints a new key");
+
+        // A daemon-reported pending id (crash recovery / another client) is
+        // adopted by a client that holds nothing.
+        let mut view = control_view();
+        view.usage_controls.insert(
+            "codex:c@x.com".into(),
+            crate::proxy::usage_controls::UsageControlDoc {
+                pending_request_id: Some("01DAEMON".into()),
+                ..Default::default()
+            },
+        );
+        let mut app = remote_app();
+        app.submit_reset(codex_pos, &view);
+        match app.pending_control.as_ref().expect("queued") {
+            ControlOp::Reset { request_id, .. } => assert_eq!(request_id, "01DAEMON"),
+            other => panic!("expected a redemption, got {other:?}"),
+        }
+    }
+
+    /// A refused queue must not leave a phantom hold: with another control
+    /// operation in flight, `y` on the gate queues NOTHING, and the client
+    /// must not start holding a redemption id it never sent. An id it was
+    /// already holding stays exactly as it was.
+    #[test]
+    fn a_busy_queue_creates_no_phantom_pending_redemption() {
+        let view = control_view();
+        let order = view.display_order(SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+
+        // Busy flag 1: an operation is already running.
+        let mut app = remote_app();
+        app.control_inflight = true;
+        app.submit_reset(codex_pos, &view);
+        assert_eq!(app.pending_control, None, "nothing queued while in flight");
+        assert!(
+            app.pending_redemption.is_none(),
+            "no hold for a redemption that was never sent"
+        );
+
+        // Busy flag 2: an operation is queued but not yet drained.
+        let mut app = remote_app();
+        app.pending_control = Some(ControlOp::Refresh { account: None });
+        app.submit_reset(codex_pos, &view);
+        assert_eq!(
+            app.pending_control,
+            Some(ControlOp::Refresh { account: None }),
+            "the queued refresh is not displaced"
+        );
+        assert!(app.pending_redemption.is_none());
+
+        // An EXISTING hold survives a refused attempt untouched.
+        let mut app = remote_app();
+        app.control_inflight = true;
+        app.pending_redemption = Some(PendingRedemption {
+            account: "codex:c@x.com".into(),
+            request_id: "01HELD".into(),
+            credit_id: Some("c1".into()),
+        });
+        app.submit_reset(codex_pos, &view);
+        assert_eq!(
+            app.pending_redemption,
+            Some(PendingRedemption {
+                account: "codex:c@x.com".into(),
+                request_id: "01HELD".into(),
+                credit_id: Some("c1".into()),
+            }),
+            "a refused attempt rewrites nothing"
+        );
+    }
+
+    /// Receipt-close failure (R1): upstream reached a TERMINAL outcome but the
+    /// daemon could not release its durable pending receipt, so it reports the
+    /// redemption as still pending. That is a SUCCESS with a warning — the
+    /// client keeps the safe retry identity and never re-offers the spend as a
+    /// new one.
+    #[test]
+    fn terminal_outcome_that_is_still_pending_keeps_the_retry_identity() {
+        let response: crate::proxy::usage_controls::ConsumeResponse =
+            serde_json::from_value(serde_json::json!({
+                "outcome": "reset",
+                "request_id": "01RID",
+                "windows_reset": 1,
+                "usage_control": { "pending_request_id": "01RID" },
+            }))
+            .expect("consume response");
+        let result = consume_result("codex:c@x.com", response);
+        assert!(
+            result.resolved.is_none(),
+            "a receipt the daemon still reports as pending is not resolved"
+        );
+        assert_eq!(
+            result.hold.as_ref().map(|p| p.request_id.clone()),
+            Some("01RID".into()),
+            "the safe retry identity is kept"
+        );
+        assert!(result.message.contains("redeemed"), "{}", result.message);
+        assert!(result.message.contains("01RID"), "{}", result.message);
+
+        // The normal terminal case still resolves.
+        let clean: crate::proxy::usage_controls::ConsumeResponse =
+            serde_json::from_value(serde_json::json!({
+                "outcome": "reset", "request_id": "01RID", "windows_reset": 1,
+            }))
+            .expect("consume response");
+        let result = consume_result("codex:c@x.com", clean);
+        assert_eq!(result.resolved.as_deref(), Some("codex:c@x.com"));
+        assert!(result.hold.is_none());
+    }
+
+    /// Closing the dialog is NOT abandoning: the held key survives, and
+    /// reopening the gate offers that same id.
+    #[test]
+    fn closing_the_dialog_keeps_the_pending_redemption() {
+        let view = control_view();
+        let order = view.display_order(SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let mut app = remote_app();
+        app.pending_redemption = Some(PendingRedemption {
+            account: "codex:c@x.com".into(),
+            request_id: "01HELD".into(),
+            credit_id: None,
+        });
+        app.mode = Mode::ConfirmReset { idx: codex_pos };
+        app.on_key_confirm_reset(KeyCode::Esc, codex_pos, Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.pending_redemption
+                .as_ref()
+                .map(|p| p.request_id.clone()),
+            Some("01HELD".into()),
+            "closing the dialog cannot clear an unresolved redemption"
+        );
+        // Reopening names that id instead of a fresh prompt.
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("01HELD") && s.contains("UNRESOLVED")));
+    }
+
+    /// Only a TERMINAL outcome releases the held key; an uncertain one
+    /// replaces it (and the single-flight slot is freed either way).
+    #[test]
+    fn control_results_hold_uncertain_ids_and_release_terminal_ones() {
+        let mut app = remote_app();
+        app.control_inflight = true;
+        app.apply_control_result(ControlResult {
+            message: "uncertain".into(),
+            hold: Some(PendingRedemption {
+                account: "codex:c@x.com".into(),
+                request_id: "01RID".into(),
+                credit_id: None,
+            }),
+            resolved: None,
+        });
+        assert!(!app.control_inflight, "the slot is freed");
+        assert_eq!(
+            app.pending_redemption
+                .as_ref()
+                .map(|p| p.request_id.clone()),
+            Some("01RID".into())
+        );
+
+        // A terminal outcome for ANOTHER account leaves it held.
+        app.apply_control_result(ControlResult {
+            message: "done".into(),
+            hold: None,
+            resolved: Some("claude:a@x.com".into()),
+        });
+        assert!(app.pending_redemption.is_some());
+
+        // A terminal outcome for THIS account releases it.
+        app.apply_control_result(ControlResult {
+            message: "done".into(),
+            hold: None,
+            resolved: Some("codex:c@x.com".into()),
+        });
+        assert!(app.pending_redemption.is_none());
+    }
+
+    /// Status lines: a partial refresh failure is never summarized into a
+    /// green, the four redemption outcomes stay distinct, a post-success
+    /// stale read is a warning ON a success, and a switch shows its refresh
+    /// warning separately from the switch result.
+    #[test]
+    fn control_status_lines_never_flatten_failures_into_success() {
+        use crate::auth::codex_usage::ResetOutcome;
+        use crate::proxy::usage_controls::{ConsumeResponse, RefreshResponse, SwitchResponse};
+
+        // Built through serde, not struct literals: these are the daemon's
+        // wire types, and pinning their exact field SET here would break on
+        // every additive field the backend adds.
+        let response: RefreshResponse = serde_json::from_value(serde_json::json!({
+            "ok": false,
+            "results": [
+                { "account": "codex:c@x.com", "ok": true, "provider": "codex",
+                  "usage_control": { "available_resets": 3 } },
+                { "account": "claude:a@x.com", "ok": false, "provider": "oauth",
+                  "error": "upstream 502" },
+            ],
+        }))
+        .expect("refresh response");
+        let message = refresh_message(&response);
+        assert!(message.contains("FAILED"), "{message}");
+        assert!(message.contains("claude:a@x.com"), "{message}");
+        assert!(message.contains("upstream 502"), "{message}");
+
+        // Single-account success names the inventory it observed.
+        let one: RefreshResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "results": [
+                { "account": "codex:c@x.com", "ok": true, "provider": "codex",
+                  "usage_control": { "available_resets": 3, "applicable_resets": 0 } },
+            ],
+        }))
+        .expect("refresh response");
+        let message = refresh_message(&one);
+        assert!(message.contains("3 owned"), "{message}");
+        assert!(message.contains("0 applicable now"), "{message}");
+
+        let consume = |outcome: ResetOutcome, refresh_warning: Option<&str>| {
+            serde_json::from_value::<ConsumeResponse>(serde_json::json!({
+                "outcome": outcome, "request_id": "01RID", "windows_reset": 1,
+                "refresh_warning": refresh_warning,
+            }))
+            .expect("consume response")
+        };
+        assert!(consume_message("c", &consume(ResetOutcome::Reset, None)).contains("redeemed"));
+        assert!(
+            consume_message("c", &consume(ResetOutcome::AlreadyRedeemed, None))
+                .contains("no second reset")
+        );
+        assert!(
+            consume_message("c", &consume(ResetOutcome::NothingToReset, None))
+                .contains("nothing to reset")
+        );
+        assert!(consume_message("c", &consume(ResetOutcome::NoCredit, None))
+            .contains("no reset credit"));
+        // A failed follow-up read rides on the SUCCESS, not instead of it.
+        let stale = consume_message("c", &consume(ResetOutcome::Reset, Some("read failed")));
+        assert!(
+            stale.contains("redeemed") && stale.contains("WARNING"),
+            "{stale}"
+        );
+
+        let switched = switch_message(
+            &serde_json::from_value::<SwitchResponse>(serde_json::json!({
+                "ok": true, "current": "codex:c@x.com",
+                "refresh_warning": "usage read timed out",
+            }))
+            .expect("switch response"),
+        );
+        assert!(switched.contains("switched to"), "{switched}");
+        assert!(switched.contains("WARNING"), "{switched}");
+        assert!(switched.contains("usage read timed out"), "{switched}");
+    }
+
+    /// A daemon error that carries an id (uncertain / pending) is held for an
+    /// explicit same-key retry; every other refusal spent nothing and holds
+    /// nothing.
+    #[test]
+    fn control_errors_hold_only_the_ids_that_must_be_retried() {
+        use crate::proxy::usage_controls::UsageControlError as E;
+        let uncertain = control_error_result(
+            "codex:c@x.com",
+            &E::Uncertain {
+                message: "timeout".into(),
+                request_id: "01RID".into(),
+            },
+        );
+        assert_eq!(
+            uncertain.hold.as_ref().map(|p| p.request_id.clone()),
+            Some("01RID".into())
+        );
+        assert!(
+            uncertain.message.contains("UNCERTAIN"),
+            "{}",
+            uncertain.message
+        );
+
+        let pending = control_error_result(
+            "codex:c@x.com",
+            &E::Pending {
+                account: "codex:c@x.com".into(),
+                request_id: "01OLD".into(),
+                credit_id: Some("cred-1".into()),
+            },
+        );
+        assert_eq!(
+            pending.hold.as_ref().map(|p| p.request_id.clone()),
+            Some("01OLD".into())
+        );
+
+        // A plain refusal (busy / unsupported / no credit) holds nothing.
+        let busy = control_error_result("codex:c@x.com", &E::Busy("codex:c@x.com".into()));
+        assert!(busy.hold.is_none());
+        assert!(busy.resolved.is_none());
     }
 }

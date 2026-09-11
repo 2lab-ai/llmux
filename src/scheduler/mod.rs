@@ -192,6 +192,12 @@ pub struct AccountState {
     /// Per-account ceiling overrides (config `account_limits`); empty = the
     /// global scheduler ceilings apply.
     pub limits: crate::config::AccountLimits,
+    /// Roster generation of THIS entry: a fresh process-wide id taken when the
+    /// entry is created, and retaken when a reload swaps in a different
+    /// credential. In-flight usage-control operations compare it (inside the
+    /// write lock) so a removed-and-re-added account cannot receive its
+    /// predecessor's result. See [`AccountFingerprint`].
+    pub generation: u64,
 }
 
 impl AccountState {
@@ -199,6 +205,7 @@ impl AccountState {
         Self {
             id: AccountId(config.name.clone()),
             credential: config.credential.clone(),
+            generation: next_generation(),
             health: AccountHealth::Healthy,
             five_hour: None,
             seven_day: None,
@@ -407,6 +414,76 @@ pub enum SwitchError {
         account: AccountId,
         reason: select::IneligibleReason,
     },
+}
+
+/// STABLE non-secret identity of a credential: its kind plus the upstream
+/// account identity (`account_uuid` / `account_id` / `subject`). Survives token
+/// refreshes and daemon restarts, which is exactly what a PERSISTED pending
+/// redemption must be keyed by. It is deliberately NOT sufficient to accept an
+/// in-flight result — two accounts can both carry an empty upstream id, and a
+/// name can be removed and re-added — so live checks use
+/// [`AccountFingerprint`]. Never contains a token.
+pub fn credential_identity(credential: &AccountCredential) -> String {
+    format!(
+        "{}:{}",
+        credential.kind(),
+        credential.account_uuid().unwrap_or_default()
+    )
+}
+
+/// Process-wide source of account GENERATIONS. Every [`AccountState`] ever
+/// constructed takes the next value, so a name that is removed and re-added
+/// with a byte-identical credential still lands on a NEW generation — the one
+/// replacement a content digest cannot see.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// NON-SECRET content digest of a credential: truncated `sha256` over its
+/// serialized form. Secrets go INTO the hash and never come out — this is what
+/// makes "the token was swapped" observable without storing or logging either
+/// token. An unserializable credential (never, in practice) yields a sentinel
+/// that keeps the caller's comparison conservative.
+pub fn credential_digest(credential: &AccountCredential) -> String {
+    use sha2::{Digest as _, Sha256};
+    let Ok(bytes) = serde_json::to_vec(credential) else {
+        return "unserializable".to_string();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for b in out.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// What an in-flight operation captured about an account BEFORE its IO: the
+/// stable identity, the roster GENERATION of the live entry, and the credential
+/// content digest. All three must still match when the result is applied
+/// (`.prd/16-codex-usage-controls.md` §Account identity/generation safety) —
+/// generation catches remove/re-add, the digest catches a credential swap
+/// (including one that keeps the same upstream account id), and the identity
+/// keeps the comparison legible. Non-secret by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountFingerprint {
+    pub identity: String,
+    pub generation: u64,
+    pub digest: String,
+}
+
+impl AccountFingerprint {
+    fn of(account: &AccountState) -> Self {
+        Self {
+            identity: credential_identity(&account.credential),
+            generation: account.generation,
+            digest: credential_digest(&account.credential),
+        }
+    }
 }
 
 impl PoolState {
@@ -1224,7 +1301,35 @@ impl AccountPool {
         params: &select::SelectParams,
         now: SystemTime,
     ) -> Result<(), SwitchError> {
+        self.switch_to_checked(target, None, params, now)
+    }
+
+    /// [`Self::switch_to`] gated on the target's [`AccountFingerprint`]
+    /// (`.prd/16-codex-usage-controls.md` §Account identity/generation safety):
+    /// an operation that read a credential BEFORE some IO passes the
+    /// fingerprint it saw, and the commit is refused when the pool no longer
+    /// carries it — so a removed/replaced account cannot be switched to on the
+    /// strength of a predecessor's read. Reported as
+    /// [`SwitchError::UnknownAccount`]: the account the caller acted on is
+    /// genuinely gone. `None` keeps the unchecked behavior.
+    pub fn switch_to_checked(
+        &self,
+        target: &AccountId,
+        expected: Option<&AccountFingerprint>,
+        params: &select::SelectParams,
+        now: SystemTime,
+    ) -> Result<(), SwitchError> {
         let mut state = self.write();
+        if let Some(expected) = expected {
+            let live = state
+                .accounts
+                .iter()
+                .find(|a| &a.id == target)
+                .map(AccountFingerprint::of);
+            if live.as_ref() != Some(expected) {
+                return Err(SwitchError::UnknownAccount(target.clone()));
+            }
+        }
         // A manual switch lands the target into ITS OWN group's slot (derived
         // from the target's credential kind) — so switching a codex account
         // never displaces the claude slot and vice versa. An unknown target
@@ -1281,6 +1386,41 @@ impl AccountPool {
         self.write().record_usage(account, usage, now);
     }
 
+    /// The fingerprint an in-flight operation must capture BEFORE its IO (see
+    /// [`AccountFingerprint`]). `None` when no account carries that name.
+    pub fn fingerprint(&self, account: &AccountId) -> Option<AccountFingerprint> {
+        self.read()
+            .accounts
+            .iter()
+            .find(|a| &a.id == account)
+            .map(AccountFingerprint::of)
+    }
+
+    /// [`Self::record_usage`] gated on the fingerprint the caller read the
+    /// observation with (`.prd/16-codex-usage-controls.md`): the check and the
+    /// merge happen under ONE write lock, so an account removed, re-added or
+    /// re-credentialed during the fetch cannot receive its predecessor's
+    /// reading. Returns `false` when the observation was DISCARDED.
+    pub fn record_usage_if(
+        &self,
+        account: &AccountId,
+        expected: &AccountFingerprint,
+        usage: &UsageSnapshot,
+        now: SystemTime,
+    ) -> bool {
+        let mut state = self.write();
+        let live = state
+            .accounts
+            .iter()
+            .find(|a| &a.id == account)
+            .map(AccountFingerprint::of);
+        if live.as_ref() != Some(expected) {
+            return false;
+        }
+        state.record_usage(account, usage, now);
+        true
+    }
+
     /// See [`PoolState::reset_usage`] — the `POST /llmux/reset-usage`
     /// operator command (issue #115).
     pub fn reset_usage(&self) -> usize {
@@ -1334,6 +1474,13 @@ impl AccountPool {
                 match state.accounts.iter().find(|a| a.id == id) {
                     Some(existing) => {
                         let mut kept = existing.clone();
+                        // A swapped credential is a NEW generation, so results
+                        // read with the old one are refused when they land.
+                        if credential_digest(&existing.credential)
+                            != credential_digest(&config.credential)
+                        {
+                            kept.generation = next_generation();
+                        }
                         kept.credential = config.credential.clone();
                         kept
                     }
@@ -1506,6 +1653,69 @@ mod tests {
             seven_day: seven,
             scoped: Vec::new(),
         }
+    }
+
+    /// `.prd/16-codex-usage-controls.md` §Account identity/generation safety.
+    /// The three replacements an in-flight observation must NOT survive —
+    /// including the two a stable `kind:account_uuid` identity cannot see.
+    #[test]
+    fn fingerprint_changes_on_every_kind_of_replacement() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let before = pool.fingerprint(&id("a")).expect("fingerprint");
+
+        // 1. Same roster re-applied → unchanged, so a benign reload (e.g. a
+        //    pause toggle) never discards an in-flight reading.
+        pool.reload_accounts(&[oauth_account("a")]);
+        assert_eq!(pool.fingerprint(&id("a")).as_ref(), Some(&before));
+
+        // 2. Credential SWAPPED behind the same name and same upstream uuid
+        //    (a re-login): identity is unchanged, the digest is not.
+        let mut swapped = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut swapped.credential {
+            *access_token = "at-a-replacement".into();
+        }
+        pool.reload_accounts(&[swapped]);
+        let after_swap = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert_eq!(
+            after_swap.identity, before.identity,
+            "the upstream account is the same — identity alone cannot see this"
+        );
+        assert_ne!(after_swap, before, "the fingerprint must change");
+
+        // 3. REMOVED and re-added with a byte-identical credential: identity
+        //    AND digest match, only the generation moves.
+        pool.reload_accounts(&[]);
+        pool.reload_accounts(&[oauth_account("a")]);
+        let readded = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert_eq!(readded.digest, before.digest, "same credential bytes");
+        assert!(
+            readded.generation > before.generation,
+            "a re-added account is a NEW generation ({} → {})",
+            before.generation,
+            readded.generation
+        );
+        assert_ne!(readded, before);
+
+        // And the gate actually refuses the stale observation.
+        assert!(
+            !pool.record_usage_if(
+                &id("a"),
+                &before,
+                &usage(Some(reading(0.5, NOW_SECS + 60)), None),
+                now()
+            ),
+            "an observation read before the replacement is discarded"
+        );
+        assert!(pool.snapshot().accounts[0].five_hour.is_none());
+        assert!(
+            pool.record_usage_if(
+                &id("a"),
+                &readded,
+                &usage(Some(reading(0.5, NOW_SECS + 60)), None),
+                now()
+            ),
+            "the CURRENT fingerprint still applies"
+        );
     }
 
     #[test]
