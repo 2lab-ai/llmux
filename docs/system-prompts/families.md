@@ -218,16 +218,31 @@ session lifecycle. All carry the client's `metadata.user_id`
 | Ping | Wire shape | When | llmux handling |
 | --- | --- | --- | --- |
 | **quota probe** | `messages: [{role: user, content: "quota"}]`, `max_tokens: 1`, no real system | every session start + periodic retries; reads the `anthropic-ratelimit-*` response headers | classified kind `quota` (BOTH halves required); routed with exactly ONE upstream attempt, no failover sweep, no exhaustion park |
-| **warmup ping** | `content: [{text: "Hi", cache_control: ephemeral}]`, `max_tokens: 1`, system = billing header + one-liner | model change / warmup | plain classification; note grok ignores `max_tokens: 1` and answers at length (token waste is upstream behavior, not llmux) |
+| **warmup ping** | `content: [{text: "Hi", cache_control: ephemeral}]`, `max_tokens: 1`, system = billing header + one-liner | model change / warmup | plain classification; Codex omits the limit with `max_tokens` diagnostics; Grok forwards it with `max_tokens_semantics` diagnostics, not a total-generation budget guarantee; strict compatibility returns 400 |
 | **return recap** | user text starts `The user stepped away and is coming back.` | session resume | classified kind `recap` |
 
 Related non-body probe: Claude Code also sends `HEAD /` against its base URL
 as a reachability check; llmux answers it locally (200, GET/HEAD only) and
 never forwards it upstream.
 
-llmux's OWN idle probe (issue #21) is different from all of the above: it
-sends `content: "."` with `max_tokens: 1` outside the forward path and never
-appears in the activity feed.
+llmux's OWN idle probe (issue #21) is different from all of the above: it runs
+outside the forward path and never appears in the activity feed. The Anthropic
+probe sends `content: "."` with `max_tokens: 1`; the Codex probe explicitly constructs
+a **no-cap** Responses request, not a one-token-budget promise or a strict client request.
+
+**Compatibility drift note — 2026-09-11.** The 2026-07-15 captured wire shapes above
+remain historical samples, not newly captured prompts. The former claim that Grok
+itself ignores `max_tokens: 1` incorrectly skipped llmux's translator, which did not
+forward a limit. Current policy forwards Grok `max_output_tokens` with
+`X-Llmux-Compatibility-Warnings: max_tokens_semantics`; Codex omits the limit and
+advertises `max_tokens` in both `X-Llmux-Omitted-Fields` and
+`X-Llmux-Compatibility-Warnings`. `X-Llmux-Compatibility: strict` rejects either
+semantic loss before refresh/upstream traffic. The same policy applies to client quota
+pings; these headers are machine-readable, not a guarantee of a visible Claude Code warning.
+A synthetic `grok-4.6` cap-16 fixture on 2026-09-11 ended incomplete with output usage
+302 / reasoning 286 — evidence of 16 visible-output tokens in that fixture, not a
+one-token-ping result or a universal reasoning/billing cap. No new raw system text has
+been invented or substituted. See [compatibility evidence and limits](../operational-reference.md#codex--grok-compatibility-contract).
 
 ## What not to do
 

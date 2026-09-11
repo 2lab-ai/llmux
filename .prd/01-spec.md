@@ -46,8 +46,12 @@ only a foreground process.
 - No analytics database or browser dashboard. The dashboard is terminal-native ratatui.
 - No request-content routing (claude-code-router task-type routing). Manual switch + scheduler only.
 - No production Gemini/local backends. Stub providers only.
-- Codex provider v0.1 does not support images; `tool_choice` is ignored; non-`/v1/messages`
-  endpoints are limited (`count_tokens` is an estimate, others return clear 501).
+- Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary
+  multimodal Messages parity. URL images, unknown blocks, and unsupported media return local 400.
+- No private-reasoning replay/ciphertext cache, exact local image token counting, or guaranteed
+  Anthropic-equivalent generation/billing cap on subscription Responses gateways.
+- Non-`/v1/messages` endpoints remain limited: text/tool-only `count_tokens` is a labeled local
+  estimate; image counts return 400; other endpoints return clear 501.
 
 ## Functional requirements
 
@@ -130,6 +134,50 @@ observation happen.
     blocks, `message_delta`, `message_stop`).
 - Parses `x-codex-primary/secondary-*` quota headers into the same 5h/7d windows.
 - Refreshes tokens via `auth.openai.com/oauth/token` and persists them.
+
+#### Responses compatibility — Codex and Grok
+
+- Both adapters preserve PNG/JPEG base64 images in user content and nested user tool results,
+  with text/image order. Validate MIME, nonempty base64, decoded size ≤20 MiB, roles, and tool
+  structure. URL images are never downloaded; unsupported/unknown content returns local 400,
+  not silent loss or implicit provider fallback. Failed tool results retain an error marker.
+- Tool choices map `auto`/`any`/`none` to `auto`/`required`/`none`; `tool{name}` maps to a flat
+  function selector naming an existing tool. `disable_parallel_tool_use` is inverted. Both
+  providers without tools omit all three tool-control fields; malformed choices do not become `auto`.
+- Codex omits positive-integer `max_tokens` with issue `max_tokens`. Grok forwards it unchanged
+  as `max_output_tokens` with issue `max_tokens_semantics`: the 2026-09-11 `grok-4.6` fixture
+  capped visible output at 16 but reported output 302 / reasoning 286. This is not a proven
+  total-generation budget or billing cap. Invalid values return 400; no fabricated truncation,
+  limit clamping, or subtraction of reasoning usage to appear within the requested cap.
+- Non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` return local 400;
+  public-API support is not subscription-gateway proof. Empty stop sequences are vacuous;
+  malformed stop sequences return 400. Top-level `thinking` configuration is shape-validated
+  then omitted with omission/warning `thinking_config` (strict: 400). Neither its `budget_tokens`
+  nor disabled reasoning is enforced. Counts produce no inference-only omission warnings.
+  This covers known controls only, not every present or future Anthropic field.
+- Prior assistant `thinking`/`redacted_thinking` are omitted with matching issues, preserving
+  the remaining transcript. No reasoning continuity, signature-to-ciphertext conversion, or
+  replay cache is promised; those blocks on other roles return 400.
+- Default `X-Llmux-Compatibility: compat` (also absent header) permits only these enumerated
+  losses. `X-Llmux-Omitted-Fields` lists actual omissions;
+  `X-Llmux-Compatibility-Warnings` also includes Grok's `max_tokens_semantics`. A structured
+  WARN records provider/fields/request id. These are machine-readable diagnostics, not proof
+  of a client-visible warning. `X-Llmux-Compatibility: strict` rejects any issue before
+  upstream calls or credential refresh; invalid policy values return 400.
+- Text/tool-only `count_tokens` validates input and includes serialized tool schemas/keys in
+  a chars/4 heuristic, floor one, marked `X-Llmux-Token-Count: estimate`. Malformed or image
+  counts return 400. Codex/Grok count locally without network/refresh; OpenRouter is unchanged.
+- Upstream incomplete output-limit termination maps to `stop_reason: max_tokens` with partial
+  text and usage intact; other incomplete reasons become SSE error / aggregate HTTP 502.
+  Truncated tool arguments must never become an executable repaired `{}` call. Valid upstream
+  text, reasoning summaries, and tool calls are not heuristically scrubbed or reclassified.
+- Grok omits the process-wide `prompt_cache_key`: official public documentation describes
+  routing scope, which is unproven for a shared process key. This is not a confirmed data-leak
+  finding. Codex retains its existing key policy.
+
+Normative detail, official source pins, and bounded synthetic gateway receipts (`gpt-5.6-sol` /
+`grok-4.6`, 2026-09-11): [operational compatibility reference](../docs/operational-reference.md#codex--grok-compatibility-contract).
+Public Responses schemas alone are not evidence of subscription-endpoint equivalence.
 
 ### FR5 — CLI
 `llmux <cmd>`:
