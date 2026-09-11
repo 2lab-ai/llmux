@@ -3569,3 +3569,867 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
         "…while the client leg carries the sanitized set: {client_res:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 15. Responses compatibility policy (codex + grok)
+// ---------------------------------------------------------------------------
+//
+// One policy, two flavors: everything asserted here is required of BOTH
+// Responses-family backends, so each scenario is driven twice. The only
+// deliberate divergences are the ones the contract names (`max_tokens`:
+// omitted for codex, mapped-with-a-semantics-warning for grok), and those are
+// passed in as expectations rather than forked into separate scenarios.
+
+/// A 1×1 PNG (the smallest valid one) — a real decodable image, so the
+/// validator's base64/MIME/size checks see truth rather than a placeholder.
+const COMPAT_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// Minimal Responses SSE: one text delta, then completion with usage. Enough
+/// for a 200 on either leg (stream or aggregate) without dragging tool-call
+/// bookkeeping into scenarios that are about the REQUEST side.
+const COMPAT_RESPONSES_SSE: &str = concat!(
+    "event: response.created\n",
+    r#"data: {"type":"response.created","response":{"id":"resp_compat"}}"#,
+    "\n\n",
+    "event: response.output_item.added\n",
+    r#"data: {"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}"#,
+    "\n\n",
+    "event: response.output_text.delta\n",
+    r#"data: {"type":"response.output_text.delta","delta":"red"}"#,
+    "\n\n",
+    "event: response.output_item.done\n",
+    r#"data: {"type":"response.output_item.done","item":{"type":"message"}}"#,
+    "\n\n",
+    "event: response.completed\n",
+    r#"data: {"type":"response.completed","response":{"id":"resp_compat","usage":{"input_tokens":11,"output_tokens":2}}}"#,
+    "\n\n",
+);
+
+/// The Responses-family backends the compatibility policy covers.
+#[derive(Clone, Copy, Debug)]
+enum CompatFlavor {
+    Codex,
+    Grok,
+}
+
+impl CompatFlavor {
+    fn account_name(self) -> &'static str {
+        match self {
+            Self::Codex => "cx",
+            Self::Grok => "gk",
+        }
+    }
+
+    /// Account with a token that never enters any refresh window.
+    fn account(self, mock: &MockUpstream) -> AccountConfig {
+        self.account_expiring(mock, far_future_ms())
+    }
+
+    fn account_expiring(self, mock: &MockUpstream, expires_at_ms: u64) -> AccountConfig {
+        let name = self.account_name().to_string();
+        let credential = match self {
+            Self::Codex => AccountCredential::Codex {
+                account_id: "acct-compat".into(),
+                access_token: "at-compat".into(),
+                refresh_token: "rt-compat".into(),
+                expires_at_ms,
+                last_refresh_ms: None,
+            },
+            Self::Grok => AccountCredential::Grok {
+                subject: "sub-compat".into(),
+                access_token: "at-compat".into(),
+                refresh_token: "rt-compat".into(),
+                expires_at_ms,
+                token_endpoint: format!("{}/v1/oauth/token", mock.base_url()),
+                last_refresh_ms: None,
+            },
+        };
+        AccountConfig { name, credential }
+    }
+
+    /// Single-account config with this flavor's upstream pointed at the mock.
+    fn config(self, mock: &MockUpstream) -> Config {
+        self.config_with(mock, self.account(mock))
+    }
+
+    fn config_with(self, mock: &MockUpstream, account: AccountConfig) -> Config {
+        let mut config = Config {
+            upstream: mock.base_url(),
+            accounts: vec![account],
+            ..Default::default()
+        };
+        config.codex.upstream = mock.base_url();
+        config.codex.token_url = format!("{}/v1/oauth/token", mock.base_url());
+        config.grok.upstream = mock.base_url();
+        // Same reason as `codex_config`: these exercise the provider through
+        // the legacy overflow path with a single-flavor pool.
+        config.routing.enabled = false;
+        config
+    }
+
+    /// Config whose token is inside the request-time refresh window (5 min)
+    /// while the BACKGROUND refresher is switched off — so any token-endpoint
+    /// hit can only have come from the forward path. This is what makes
+    /// "rejected BEFORE the credential refresh" observable from outside.
+    fn config_expiring(self, mock: &MockUpstream) -> Config {
+        let account = self.account_expiring(mock, epoch_ms_now() + 60_000);
+        let mut config = self.config_with(mock, account);
+        config.scheduler.refresh_ahead_secs = 0;
+        config
+    }
+}
+
+/// POST `/v1/messages` with an optional `x-llmux-compatibility` mode header.
+async fn post_compat(
+    client: &reqwest::Client,
+    proxy: &Proxy,
+    body: &str,
+    mode: Option<&str>,
+) -> reqwest::Response {
+    let mut request = client
+        .post(proxy.url("/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(body.to_string());
+    if let Some(mode) = mode {
+        request = request.header("x-llmux-compatibility", mode);
+    }
+    request.send().await.expect("proxy reachable")
+}
+
+async fn post_count_tokens(
+    client: &reqwest::Client,
+    proxy: &Proxy,
+    body: &str,
+) -> reqwest::Response {
+    client
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("proxy reachable")
+}
+
+fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A comma-separated compatibility header as a list (`None` → empty).
+fn header_list(response: &reqwest::Response, name: &str) -> Vec<String> {
+    header_value(response, name)
+        .map(|v| {
+            v.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every `input[].content[]` part of an upstream Responses body, flattened in
+/// wire order — the shape-independent way to assert "text then image".
+fn upstream_content_parts(upstream: &serde_json::Value) -> Vec<serde_json::Value> {
+    upstream["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("content").and_then(|c| c.as_array()))
+                .flat_map(|parts| parts.iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The client request every "supported content" scenario sends: a user turn
+/// of text THEN an image, a named tool choice with parallel use disabled, and
+/// a `max_tokens` the two flavors must treat differently.
+fn compat_image_request(stream: bool) -> String {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "stream": stream,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what color?"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": COMPAT_PNG_B64
+                }},
+            ],
+        }],
+        "tools": [{
+            "name": "report_color",
+            "description": "Report the color",
+            "input_schema": {"type": "object", "properties": {"color": {"type": "string"}}},
+        }],
+        "tool_choice": {"type": "tool", "name": "report_color", "disable_parallel_tool_use": true},
+    })
+    .to_string()
+}
+
+/// Contract §1/§2/§3: a user image and a named tool choice reach the upstream
+/// intact (ordering preserved, image as a `data:` URL, flat function
+/// selector, parallel use inverted), and `max_tokens` lands per flavor —
+/// omitted for codex, mapped to `max_output_tokens` for grok.
+async fn compat_forwards_image_and_tool_choice(
+    flavor: CompatFlavor,
+    expected_max_output_tokens: Option<u64>,
+) {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 17));
+    let proxy = Proxy::spawn_config(flavor.config(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &compat_image_request(false), None).await;
+    assert_eq!(response.status(), 200, "{flavor:?} serves the image turn");
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1, "{flavor:?} made exactly one upstream call");
+    assert_eq!(seen[0].path, "/responses");
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("upstream json");
+
+    let parts = upstream_content_parts(&upstream);
+    let kinds: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| p["type"].as_str())
+        .filter(|t| *t == "input_text" || *t == "input_image")
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["input_text", "input_image"],
+        "text/image ORDER preserved: {upstream}"
+    );
+    let image = parts
+        .iter()
+        .find(|p| p["type"] == "input_image")
+        .expect("input_image part");
+    assert_eq!(
+        image["image_url"].as_str(),
+        Some(format!("data:image/png;base64,{COMPAT_PNG_B64}").as_str()),
+        "image rides as a data URL: {image}"
+    );
+
+    assert_eq!(
+        upstream["tool_choice"],
+        serde_json::json!({"type": "function", "name": "report_color"}),
+        "named tool choice becomes the flat function selector: {upstream}"
+    );
+    assert_eq!(
+        upstream["parallel_tool_calls"], false,
+        "disable_parallel_tool_use inverts: {upstream}"
+    );
+    match expected_max_output_tokens {
+        Some(cap) => assert_eq!(
+            upstream["max_output_tokens"].as_u64(),
+            Some(cap),
+            "{flavor:?} maps max_tokens exactly: {upstream}"
+        ),
+        None => assert!(
+            upstream.get("max_output_tokens").is_none(),
+            "{flavor:?} omits the unsupported output cap: {upstream}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn compatibility_codex_forwards_image_and_tool_choice_without_output_cap() {
+    compat_forwards_image_and_tool_choice(CompatFlavor::Codex, None).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_forwards_image_and_tool_choice_with_mapped_output_cap() {
+    compat_forwards_image_and_tool_choice(CompatFlavor::Grok, Some(256)).await;
+}
+
+/// Contract §1/§5: unsupported content is a LOCAL 400 in every mode — before
+/// the upstream call and before the credential refresh (the account's token is
+/// inside the 5-minute refresh window, so a single token-endpoint hit would
+/// prove the check ran too late). The error names the field without echoing
+/// the payload.
+async fn compat_unsupported_content_is_local_400(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "read this"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf",
+                    "data": "SECRETPAYLOADMARKER"
+                }},
+            ],
+        }],
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} refuses unsupported content locally"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["type"], "error");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    let message = doc["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(
+        message.contains("document"),
+        "the error names the offending block: {message}"
+    );
+    assert!(
+        message.contains("messages"),
+        "the error carries a field path: {message}"
+    );
+    assert!(
+        !message.contains("SECRETPAYLOADMARKER"),
+        "the error never echoes the payload: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} rejected content must not reach the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "{flavor:?} rejection happens BEFORE the credential refresh"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_unsupported_content_is_400_without_upstream_or_refresh() {
+    compat_unsupported_content_is_local_400(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_unsupported_content_is_400_without_upstream_or_refresh() {
+    compat_unsupported_content_is_local_400(CompatFlavor::Grok).await;
+}
+
+/// Contract §5: `x-llmux-compatibility: strict` turns every lossy difference
+/// — including the ones compat mode merely warns about — into a local 400,
+/// again before upstream and before refresh.
+async fn compat_strict_rejects_lossy_request(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &body, Some("strict")).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} strict mode refuses a lossy request"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    let message = doc["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("max_tokens"),
+        "strict rejection names the difference: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} strict rejection must not reach the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "{flavor:?} strict rejection happens BEFORE the credential refresh"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_strict_mode_rejects_omitted_max_tokens() {
+    compat_strict_rejects_lossy_request(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_strict_mode_rejects_max_tokens_semantics() {
+    compat_strict_rejects_lossy_request(CompatFlavor::Grok).await;
+}
+
+/// Contract §5: the mode header is a two-value vocabulary. An unknown value is
+/// a 400 rather than a silent downgrade to the permissive default.
+#[tokio::test]
+async fn compatibility_unknown_mode_header_is_rejected() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(CompatFlavor::Codex.config(&mock)).await;
+
+    let body = r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#;
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, body, Some("lenient")).await;
+    assert_eq!(response.status(), 400, "unknown mode is refused");
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    assert!(
+        mock.seen().is_empty(),
+        "an unknown mode must not reach the upstream"
+    );
+}
+
+/// The request both warning scenarios send: a `max_tokens` plus a previous
+/// assistant `thinking` block — the two narrowly-enumerated lossy inputs
+/// compat mode preserves-with-a-warning.
+fn compat_lossy_request(stream: bool) -> String {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "pondering", "signature": "sig-abc"},
+                {"type": "text", "text": "hello"},
+            ]},
+            {"role": "user", "content": "again"},
+        ],
+    })
+    .to_string()
+}
+
+/// Contract §5, both terminal legs: compat mode serves the request and
+/// reports what it lost in machine-readable headers. `thinking` is a true
+/// omission for both flavors; `max_tokens` is an omission for codex but only a
+/// SEMANTICS warning for grok (which really does send the cap upstream), so
+/// the omitted list must not claim otherwise.
+async fn compat_warning_headers(flavor: CompatFlavor, stream: bool) {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 23));
+    let proxy = Proxy::spawn_config(flavor.config(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &compat_lossy_request(stream), None).await;
+    assert_eq!(response.status(), 200, "compat mode serves the request");
+
+    let omitted = header_list(&response, "x-llmux-omitted-fields");
+    let warnings = header_list(&response, "x-llmux-compatibility-warnings");
+    assert!(
+        omitted.iter().any(|f| f == "thinking"),
+        "previous thinking is a true omission: {omitted:?}"
+    );
+    match flavor {
+        CompatFlavor::Codex => {
+            assert!(
+                omitted.iter().any(|f| f == "max_tokens"),
+                "codex drops the output cap: {omitted:?}"
+            );
+            assert!(
+                warnings.iter().any(|w| w == "max_tokens"),
+                "…and warns about it: {warnings:?}"
+            );
+        }
+        CompatFlavor::Grok => {
+            assert!(
+                !omitted.iter().any(|f| f == "max_tokens"),
+                "grok sends the cap, so it is not omitted: {omitted:?}"
+            );
+            assert!(
+                warnings.iter().any(|w| w == "max_tokens_semantics"),
+                "…but its budget semantics are unproven: {warnings:?}"
+            );
+        }
+    }
+    assert!(
+        warnings.iter().any(|w| w == "thinking"),
+        "warnings include the omitted names: {warnings:?}"
+    );
+
+    // The response is still a well-formed answer on whichever leg was asked.
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    if stream {
+        let events = parse_anthropic_sse(&body);
+        assert_eq!(events[0].0, "message_start", "streamed body intact: {body}");
+        assert_eq!(
+            events.last().expect("terminal event").0,
+            "message_stop",
+            "streamed body intact: {body}"
+        );
+    } else {
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("aggregate json");
+        assert_eq!(doc["type"], "message", "aggregate body intact: {body}");
+        assert_eq!(doc["content"][0]["text"], "red");
+    }
+}
+
+#[tokio::test]
+async fn compatibility_codex_stream_carries_warning_headers() {
+    compat_warning_headers(CompatFlavor::Codex, true).await;
+}
+
+#[tokio::test]
+async fn compatibility_codex_json_carries_warning_headers() {
+    compat_warning_headers(CompatFlavor::Codex, false).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_stream_carries_warning_headers() {
+    compat_warning_headers(CompatFlavor::Grok, true).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_json_carries_warning_headers() {
+    compat_warning_headers(CompatFlavor::Grok, false).await;
+}
+
+/// Contract §6: the local count includes the serialized tool schemas (an
+/// agentic client resends every schema each turn, so dropping them drops the
+/// dominant term) and the answer carries the estimate in a header that marks
+/// it as one. No upstream call, no credential refresh.
+async fn compat_count_tokens_counts_tools(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+    let client = reqwest::Client::new();
+
+    let without_tools = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "count me"}],
+    })
+    .to_string();
+    let with_tools = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "count me"}],
+        "tools": [{
+            "name": "report_color",
+            "description": "Report the color",
+            "input_schema": {"type": "object", "properties": {
+                "color": {"type": "string", "description": "the color name"}
+            }},
+        }],
+    })
+    .to_string();
+
+    let bare = post_count_tokens(&client, &proxy, &without_tools).await;
+    assert_eq!(bare.status(), 200);
+    // The header LABELS the answer, it does not repeat it: the number already
+    // has a home in `input_tokens`, and a second copy of it would say nothing
+    // about HOW the number was produced — the one thing a client reading a
+    // local chars/4 heuristic needs to know.
+    assert_eq!(
+        header_value(&bare, "x-llmux-token-count").as_deref(),
+        Some("estimate"),
+        "the count is marked an estimate, not a tokenizer's count"
+    );
+    let bare_doc: serde_json::Value = bare.json().await.expect("json");
+    let bare_count = bare_doc["input_tokens"].as_u64().expect("input_tokens");
+
+    let with = post_count_tokens(&client, &proxy, &with_tools).await;
+    assert_eq!(with.status(), 200);
+    let with_doc: serde_json::Value = with.json().await.expect("json");
+    let with_count = with_doc["input_tokens"].as_u64().expect("input_tokens");
+    assert!(
+        with_count > bare_count,
+        "{flavor:?} tool schemas raise the estimate: {with_count} vs {bare_count}"
+    );
+
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} count_tokens never calls the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "{flavor:?} count_tokens never refreshes the credential"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_count_tokens_includes_tool_schemas() {
+    compat_count_tokens_counts_tools(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_count_tokens_includes_tool_schemas() {
+    compat_count_tokens_counts_tools(CompatFlavor::Grok).await;
+}
+
+/// Contract §6: there is no honest image token estimate, so a multimodal
+/// count is refused rather than answered with base64 characters divided by 4.
+async fn compat_count_tokens_image_is_400(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color?"},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": COMPAT_PNG_B64
+            }},
+        ]}],
+    })
+    .to_string();
+    let response = post_count_tokens(&client, &proxy, &body).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} refuses to estimate image tokens"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    assert!(
+        doc["input_tokens"].is_null(),
+        "a refusal is not a count: {doc}"
+    );
+    assert!(mock.seen().is_empty());
+    assert_eq!(mock.token_hits(), 0);
+}
+
+#[tokio::test]
+async fn compatibility_codex_count_tokens_image_is_400() {
+    compat_count_tokens_image_is_400(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_count_tokens_image_is_400() {
+    compat_count_tokens_image_is_400(CompatFlavor::Grok).await;
+}
+
+/// Contract §6: a body that is not JSON at all is a 400 — the old
+/// `unwrap_or(1)` answered "1 token" for a request nobody could read, which is
+/// a fabricated number dressed as a count.
+async fn compat_count_tokens_malformed_is_400(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+    let client = reqwest::Client::new();
+
+    let response = post_count_tokens(&client, &proxy, "{not json at all").await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} refuses an unreadable count body"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    assert!(
+        doc["input_tokens"].is_null(),
+        "no fabricated fallback count: {doc}"
+    );
+    assert!(mock.seen().is_empty());
+    assert_eq!(mock.token_hits(), 0);
+}
+
+#[tokio::test]
+async fn compatibility_codex_count_tokens_malformed_body_is_400() {
+    compat_count_tokens_malformed_is_400(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_count_tokens_malformed_body_is_400() {
+    compat_count_tokens_malformed_is_400(CompatFlavor::Grok).await;
+}
+
+// --- Contract §11: generation controls (sampling, stop, thinking config) ----
+
+/// Contract §11: a sampling control the backend's acceptance was never verified
+/// for is refused locally rather than silently ignored. Quietly dropping it
+/// would run the request at the backend default while the client believes it
+/// set one — a lie no header can undo, so it is a 400 like any other
+/// unrepresentable input.
+async fn compat_sampling_control_is_local_400(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} refuses an unhonorable sampling control"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    let message = doc["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("temperature"),
+        "the error names the control: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} sampling refusal must not reach the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "{flavor:?} sampling refusal happens BEFORE the credential refresh"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_sampling_control_is_400_without_upstream() {
+    compat_sampling_control_is_local_400(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_sampling_control_is_400_without_upstream() {
+    compat_sampling_control_is_local_400(CompatFlavor::Grok).await;
+}
+
+/// Contract §11: `stop_sequences` the backend cannot enforce are refused
+/// locally — a client that asked the model to stop at a delimiter and got a
+/// full completion has been given wrong output, not a degraded one.
+async fn compat_stop_sequences_is_local_400(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "stop_sequences": ["\n\nHuman:"],
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} refuses unenforceable stop sequences"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    let message = doc["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("stop_sequences"),
+        "the error names the field: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} stop-sequence refusal must not reach the upstream"
+    );
+    assert_eq!(mock.token_hits(), 0, "{flavor:?} refusal precedes refresh");
+}
+
+#[tokio::test]
+async fn compatibility_codex_stop_sequences_is_400_without_upstream() {
+    compat_stop_sequences_is_local_400(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_stop_sequences_is_400_without_upstream() {
+    compat_stop_sequences_is_local_400(CompatFlavor::Grok).await;
+}
+
+/// The §11 thinking-config request, deliberately WITHOUT `max_tokens`: the
+/// only issue in this body is the top-level `thinking` object, so the header
+/// values below are exactly one name — an isolation the `max_tokens` scenarios
+/// cannot provide.
+fn compat_thinking_config_request() -> String {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "thinking": {"type": "enabled", "budget_tokens": 16000},
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    .to_string()
+}
+
+/// Contract §11: a top-level thinking config is REPORTED, not enforced and not
+/// silently swallowed — neither backend takes an Anthropic thinking budget, and
+/// inventing an effort mapping for it would be a fabricated equivalence.
+async fn compat_thinking_config_is_reported(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 19));
+    let proxy = Proxy::spawn_config(flavor.config(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &compat_thinking_config_request(), None).await;
+    assert_eq!(response.status(), 200, "compat mode still serves the turn");
+    assert_eq!(
+        header_list(&response, "x-llmux-omitted-fields"),
+        vec!["thinking_config".to_string()],
+        "the thinking config is the ONLY omission in this body"
+    );
+    assert_eq!(
+        header_list(&response, "x-llmux-compatibility-warnings"),
+        vec!["thinking_config".to_string()],
+        "…and the only warning"
+    );
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("upstream json");
+    assert!(
+        upstream.get("thinking").is_none(),
+        "the Anthropic thinking config is not forwarded verbatim: {upstream}"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_thinking_config_is_reported_not_enforced() {
+    compat_thinking_config_is_reported(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_thinking_config_is_reported_not_enforced() {
+    compat_thinking_config_is_reported(CompatFlavor::Grok).await;
+}
+
+/// Contract §11 under `strict`: the same thinking config that compat mode
+/// serves-and-reports becomes a local 400 — no upstream call, no refresh.
+async fn compat_strict_rejects_thinking_config(flavor: CompatFlavor) {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(flavor.config_expiring(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let response = post_compat(
+        &client,
+        &proxy,
+        &compat_thinking_config_request(),
+        Some("strict"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        400,
+        "{flavor:?} strict mode refuses an unenforceable thinking config"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(doc["error"]["type"], "invalid_request_error");
+    let message = doc["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("thinking_config"),
+        "strict rejection names the issue: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "{flavor:?} strict refusal must not reach the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "{flavor:?} strict refusal happens BEFORE the credential refresh"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_strict_mode_rejects_thinking_config() {
+    compat_strict_rejects_thinking_config(CompatFlavor::Codex).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_strict_mode_rejects_thinking_config() {
+    compat_strict_rejects_thinking_config(CompatFlavor::Grok).await;
+}

@@ -31,7 +31,10 @@ use super::logging::BODY_LOG_LIMIT;
 use super::server::AppState;
 use super::sse::{self, SseTransform as _};
 use crate::config::AccountCredential;
-use crate::provider::{anthropic, AnthropicRequest, Provider as _, ProviderRequest};
+use crate::provider::{
+    anthropic, responses, responses_request, AnthropicRequest, Provider as _, ProviderError,
+    ProviderRequest,
+};
 use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
 use crate::scheduler::{headers as rl_headers, AccountId, DEFAULT_HEURISTIC_COOLDOWN};
@@ -267,6 +270,12 @@ struct ForwardContext {
     /// then, e.g. a pre-routing failure). Drives the activity log's
     /// group/model/effort columns even when `group` is `None` (routing off).
     served_by: Option<BackendGroup>,
+    /// What the Responses compatibility gate found in this request, computed
+    /// ONCE (pre-refresh) and replayed onto whichever terminal leg answers —
+    /// the streamed SSE response and the aggregated JSON one must report the
+    /// same losses. `None` on every non-Responses path: anthropic/openrouter
+    /// requests go upstream verbatim and have nothing to report.
+    compatibility: Option<responses_request::CompatibilityReport>,
 }
 
 impl ForwardContext {
@@ -671,6 +680,205 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     response
 }
 
+// ---------------------------------------------------------------------------
+// Responses compatibility policy (codex/grok) — proxy side
+// ---------------------------------------------------------------------------
+//
+// The translation rules live in `provider::responses_request`; this section
+// owns the three things only the proxy can do: run the check BEFORE the
+// credential refresh (so a request the backend cannot carry never spends a
+// token grant or an upstream call), answer the refusals locally, and report
+// what was lost on the response the client actually receives.
+
+/// Request header choosing the compatibility MODE for a Responses backend.
+const COMPATIBILITY_HEADER: &str = "x-llmux-compatibility";
+
+/// Response header: the request fields that were NOT sent upstream.
+const OMITTED_FIELDS_HEADER: &str = "x-llmux-omitted-fields";
+
+/// Response header: every compatibility issue — the omissions above plus the
+/// semantic ones (e.g. `max_tokens_semantics`, where the field IS sent but
+/// its budget meaning is unproven).
+const COMPATIBILITY_WARNINGS_HEADER: &str = "x-llmux-compatibility-warnings";
+
+/// Response header marking a `count_tokens` answer as a local ESTIMATE rather
+/// than a tokenizer's count. Its value is the literal word `estimate`: the
+/// number itself is the body's `input_tokens`, and this header exists to say
+/// where that number came from.
+const TOKEN_COUNT_HEADER: &str = "x-llmux-token-count";
+
+/// How much loss the client tolerates on a Responses backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CompatibilityMode {
+    /// Default: serve the narrowly-enumerated lossy requests and report the
+    /// loss in headers.
+    Compat,
+    /// Refuse anything that cannot be carried faithfully.
+    Strict,
+}
+
+/// Parse [`COMPATIBILITY_HEADER`]. Absent → [`CompatibilityMode::Compat`]; any
+/// value outside the two-word vocabulary is an ERROR, never a silent downgrade
+/// to the permissive default — a client that asked for `strict` and got compat
+/// because it misspelled the mode would be told nothing.
+fn compatibility_mode(headers: &HeaderMap) -> Result<CompatibilityMode, String> {
+    match headers.get(COMPATIBILITY_HEADER) {
+        None => Ok(CompatibilityMode::Compat),
+        Some(value) => match value.to_str().unwrap_or_default().trim() {
+            "compat" => Ok(CompatibilityMode::Compat),
+            "strict" => Ok(CompatibilityMode::Strict),
+            _ => Err(format!(
+                "{COMPATIBILITY_HEADER} must be `compat` or `strict`"
+            )),
+        },
+    }
+}
+
+/// The Responses flavor a backend group speaks. `None` for the groups that
+/// serve the Anthropic wire format natively (claude, openrouter) — they are
+/// not translated, so this policy does not apply to them.
+fn responses_flavor(group: BackendGroup) -> Option<responses_request::ResponsesFlavor> {
+    match group {
+        BackendGroup::Codex => Some(responses_request::ResponsesFlavor::Codex),
+        BackendGroup::Grok => Some(responses_request::ResponsesFlavor::Grok),
+        BackendGroup::Claude | BackendGroup::OpenRouter => None,
+    }
+}
+
+/// A request the gate accepted: the body parsed ONCE (the count path answers
+/// straight out of it) plus what serving it will cost in fidelity.
+struct CompatibilityCheck {
+    body: serde_json::Value,
+    report: responses_request::CompatibilityReport,
+}
+
+/// Local `400 invalid_request_error` for a request llmux refuses on its own
+/// — logged, finished, and returned without touching the upstream.
+fn invalid_request_response(
+    state: &AppState,
+    ctx: &mut ForwardContext,
+    account: &AccountId,
+    message: &str,
+) -> Response {
+    ctx.log(format!("=== ERROR ===\n{message}"));
+    ctx.flush_log(state);
+    ctx.emit_finished(state, Some(account), StatusCode::BAD_REQUEST, None);
+    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+}
+
+/// The pre-refresh compatibility gate for one codex/grok request.
+///
+/// `Err` is the finished response to return as-is: an unreadable body, an
+/// unknown mode, content the flavor cannot represent, or — under `strict` —
+/// any issue at all. All of them are HTTP 400s produced BEFORE the credential
+/// refresh and before any upstream call, which is the whole point of running
+/// here rather than inside the provider's `build_request`. It is boxed because
+/// a whole `Response` in the error arm would make every `Ok` carry its size.
+fn compatibility_gate(
+    state: &AppState,
+    ctx: &mut ForwardContext,
+    account: &AccountId,
+    group: BackendGroup,
+    flavor: responses_request::ResponsesFlavor,
+    count_tokens: bool,
+) -> Result<CompatibilityCheck, Box<Response>> {
+    let mode = match compatibility_mode(&ctx.headers) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return Err(Box::new(invalid_request_response(
+                state, ctx, account, &message,
+            )))
+        }
+    };
+    // A body that will not parse has no honest answer on either path: the
+    // relay would 502 on it later, and the count path used to answer "1
+    // token" — a fabricated number dressed as a count.
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&ctx.body) else {
+        return Err(Box::new(invalid_request_response(
+            state,
+            ctx,
+            account,
+            "request body is not valid JSON",
+        )));
+    };
+    let report = match responses_request::validate_request(&body, flavor, count_tokens) {
+        Ok(report) => report,
+        Err(ProviderError::InvalidRequest(message)) => {
+            return Err(Box::new(invalid_request_response(
+                state, ctx, account, &message,
+            )));
+        }
+        // Anything else is OUR failure, not the client's — keep the 502
+        // taxonomy for it.
+        Err(err) => {
+            let message = format!("{group} request validation failed: {err}");
+            ctx.log(format!("=== ERROR ===\n{message}"));
+            ctx.flush_log(state);
+            ctx.emit_finished(state, Some(account), StatusCode::BAD_GATEWAY, None);
+            return Err(Box::new(error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_error",
+                &message,
+            )));
+        }
+    };
+    if mode == CompatibilityMode::Strict && !report.warnings.is_empty() {
+        let message = format!(
+            "{group} cannot serve this request without loss: {}",
+            report.warnings.join(", ")
+        );
+        return Err(Box::new(invalid_request_response(
+            state, ctx, account, &message,
+        )));
+    }
+    if !report.warnings.is_empty() {
+        // Structured, greppable, and fed by the SAME lists the response
+        // headers carry — the operator-side half of the machine-readable
+        // warning (never a user-visible error).
+        tracing::warn!(
+            provider = %group,
+            request_id = ctx.request_id,
+            omitted = %report.omitted_fields.join(","),
+            warnings = %report.warnings.join(","),
+            "compatibility: serving a lossy request"
+        );
+    }
+    Ok(CompatibilityCheck { body, report })
+}
+
+/// The compatibility headers for one report, as `(name, value)` pairs. Empty
+/// when nothing was lost — a faithful request carries no headers at all, so
+/// their PRESENCE is the signal.
+fn compatibility_header_pairs(
+    report: Option<&responses_request::CompatibilityReport>,
+) -> Vec<(&'static str, String)> {
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    if !report.omitted_fields.is_empty() {
+        pairs.push((OMITTED_FIELDS_HEADER, report.omitted_fields.join(",")));
+    }
+    if !report.warnings.is_empty() {
+        pairs.push((COMPATIBILITY_WARNINGS_HEADER, report.warnings.join(",")));
+    }
+    pairs
+}
+
+/// Stamp the report onto a response the client receives. Applied on BOTH
+/// terminal legs (streamed SSE and aggregated JSON) so the same request never
+/// reports different losses depending on how the client asked to read it.
+fn apply_compatibility_headers(
+    headers: &mut HeaderMap,
+    report: Option<&responses_request::CompatibilityReport>,
+) {
+    for (name, value) in compatibility_header_pairs(report) {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
+}
+
 /// Pool exhausted: 429 + `retry-after` = soonest reset (FR3.5). `eligible` is
 /// the in-scope account count — never the whole multi-group pool (issue #71).
 fn exhausted_response(retry_after: Option<Duration>, eligible: usize) -> Response {
@@ -832,6 +1040,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         excerpt: classified.excerpt,
         group,
         served_by: None,
+        compatibility: None,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -1062,7 +1271,51 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             fast: served_fast,
         });
 
-        // 2. Proactive refresh: oauth-style tokens (anthropic oauth AND
+        // The group that will serve this request. Computed HERE — before the
+        // refresh — because the compatibility gate below needs it; step 4
+        // reuses the same value (a token refresh never changes a credential's
+        // kind).
+        let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
+        let request_path = ctx.path_query.split('?').next().unwrap_or("").to_string();
+        let count_tokens = request_path == "/v1/messages/count_tokens";
+
+        // 2. Responses compatibility gate (codex/grok), BEFORE the refresh:
+        // a request the flavor cannot carry is answered locally, so a doomed
+        // request never spends a token grant or an upstream call. The count
+        // path is answered here too — it makes no upstream call, so it must
+        // not refresh either (a local estimate is not worth a token grant).
+        // Only the two endpoints these accounts actually serve are gated;
+        // anything else keeps falling through to the 501 in step 4.
+        let gated_flavor = responses_flavor(served).filter(|_| {
+            matches!(
+                request_path.as_str(),
+                "/v1/messages" | "/v1/messages/count_tokens"
+            )
+        });
+        if let Some(flavor) = gated_flavor {
+            match compatibility_gate(state, ctx, &account, served, flavor, count_tokens) {
+                Ok(check) => {
+                    if count_tokens {
+                        ctx.served_by = Some(served);
+                        drop(lease);
+                        return translate_count_tokens_response(
+                            state,
+                            ctx,
+                            &account,
+                            served,
+                            Some(&check.body),
+                        );
+                    }
+                    ctx.compatibility = Some(check.report);
+                }
+                Err(response) => {
+                    drop(lease);
+                    return *response;
+                }
+            }
+        }
+
+        // 3. Proactive refresh: oauth-style tokens (anthropic oauth AND
         // codex chatgpt tokens) expiring within 5 minutes.
         if let Some(expires_at_ms) = refreshable_expiry(&credential) {
             if expiring_soon(expires_at_ms) {
@@ -1094,7 +1347,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 3. Non-anthropic accounts (codex, grok, openrouter) serve the
+        // 4. Non-anthropic accounts (codex, grok, openrouter) serve the
         // Messages API only: count_tokens is answered locally with a naive
         // estimate (no upstream equivalent); any other endpoint is a clear
         // 501.
@@ -1103,8 +1356,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // — which, by the invariant asserted above, always matches the leased
         // credential's kind. With routing OFF (`group` is `None`) it falls
         // back to the legacy credential check (translate accounts stay the
-        // cross-group overflow pool).
-        let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
+        // cross-group overflow pool). `served` was resolved before the refresh
+        // (the compatibility gate needed it).
+        //
         // Two INDEPENDENT questions, each owned by an exhaustive predicate on
         // `BackendGroup` so a fifth group cannot answer one and silently
         // inherit the other (see routing.rs — that conflation already cost one
@@ -1121,10 +1375,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
         if messages_only {
-            let path = ctx.path_query.split('?').next().unwrap_or("").to_string();
+            let path = request_path.as_str();
             if path == "/v1/messages/count_tokens" {
+                // OpenRouter only: the Responses flavors already answered
+                // their count above (pre-refresh), so this arm is the
+                // unchanged legacy estimate for the one group the
+                // compatibility policy does not cover.
                 drop(lease);
-                return translate_count_tokens_response(state, ctx, &account, served);
+                return translate_count_tokens_response(state, ctx, &account, served, None);
             }
             if path != "/v1/messages" {
                 drop(lease);
@@ -1141,7 +1399,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 4. Rewrite + send via the provider hooks (codex: translate the
+        // 5. Rewrite + send via the provider hooks (codex: translate the
         // Anthropic body into a Responses API request).
         let rewrite_error = |state: &AppState, ctx: &mut ForwardContext, err: String| {
             ctx.log(format!("=== ERROR ===\nprovider rewrite failed: {err}"));
@@ -2261,6 +2519,12 @@ async fn relay(
 /// than an error). OpenRouter genuinely 404s that path (live probe
 /// 2026-08-21), so this is not a convenience for it but a correctness fix.
 ///
+/// For the Responses flavors the body arrives pre-validated (`validated`):
+/// the shapes with no honest estimate were already refused with a 400, so
+/// what reaches here is a number the caller may act on — and it is labeled as
+/// an estimate on the way out. "Better than an error" stops being true once
+/// the alternative is a fabricated count.
+///
 /// Deliberately NOT codex-traced: it makes no upstream call, so there is no
 /// "hung vs completed" question and no real upstream usage to record — the
 /// trace exists to diagnose the `/v1/messages` relay path. Tracing it would
@@ -2270,10 +2534,19 @@ fn translate_count_tokens_response(
     ctx: &mut ForwardContext,
     account: &AccountId,
     served: BackendGroup,
+    validated: Option<&serde_json::Value>,
 ) -> Response {
-    let estimate = serde_json::from_slice::<serde_json::Value>(&ctx.body)
-        .map(|v| crate::provider::responses::estimate_input_tokens(&v))
-        .unwrap_or(1);
+    // `Some` = the Responses compatibility gate already parsed AND validated
+    // this body (rejecting the shapes that have no honest estimate, e.g.
+    // images), so the number is answerable and rides in a header that names
+    // it an estimate. `None` = OpenRouter's untouched legacy path, including
+    // its historical `1` fallback for a body it cannot parse.
+    let estimate = match validated {
+        Some(body) => responses::estimate_input_tokens(body),
+        None => serde_json::from_slice::<serde_json::Value>(&ctx.body)
+            .map(|v| responses::estimate_input_tokens(&v))
+            .unwrap_or(1),
+    };
     ctx.log(format!(
         "=== RESPONSE ({served} count_tokens estimate: {estimate}) ==="
     ));
@@ -2285,6 +2558,15 @@ fn translate_count_tokens_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    if validated.is_some() {
+        // A LABEL, not a second copy of the number: `input_tokens` already
+        // carries the value, and repeating it would say nothing about how it
+        // was produced. This header is the provenance — a local chars/4
+        // heuristic, never a tokenizer's count.
+        response
+            .headers_mut()
+            .insert(TOKEN_COUNT_HEADER, HeaderValue::from_static("estimate"));
+    }
     response
 }
 
@@ -2449,11 +2731,20 @@ async fn relay_translate(
         // response, so the CLIENT response headers are the synthesized ones
         // (mirroring what `out` sets below); the upstream's real headers
         // (request ids, ratelimits) ride in the record's `upstream` half.
+        let compat_pairs = compatibility_header_pairs(ctx.compatibility.as_ref());
         let raw_io_res_headers = raw_io_path.as_ref().map(|_| {
-            vec![
+            let mut pairs = vec![
                 ("content-type".to_string(), "text/event-stream".to_string()),
                 ("cache-control".to_string(), "no-cache".to_string()),
-            ]
+            ];
+            // The compatibility headers are part of what the client received,
+            // so the captured client leg must show them too.
+            pairs.extend(
+                compat_pairs
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone())),
+            );
+            pairs
         });
         let raw_io_upstream_res_headers = raw_io_path
             .as_ref()
@@ -2589,6 +2880,8 @@ async fn relay_translate(
         );
         out.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        // What this request lost in translation, on the streamed leg.
+        apply_compatibility_headers(out.headers_mut(), ctx.compatibility.as_ref());
         return out;
     }
 
@@ -2674,6 +2967,9 @@ async fn relay_translate(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
+            // Same losses, same headers as the streamed leg — the aggregate
+            // client must not have to ask twice to learn what was dropped.
+            apply_compatibility_headers(&mut client_headers, ctx.compatibility.as_ref());
             let upstream_raw = upstream_meta.map(|m| {
                 m.into_raw(
                     raw_io_max_body,
@@ -2699,10 +2995,7 @@ async fn relay_translate(
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
-            out.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
+            *out.headers_mut() = client_headers;
             out
         }
         None => {
@@ -2875,6 +3168,7 @@ mod tests {
             tenant: None,
             group: Some(group),
             served_by: None,
+            compatibility: None,
         }
     }
 

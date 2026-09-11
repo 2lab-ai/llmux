@@ -7,10 +7,12 @@
 //! (`WindowSource::Headers`).
 //!
 //! Codex path (issue #21 §Codex): a Codex account's `count_tokens` is answered
-//! locally with no upstream call, so it emits no ratelimit headers — the real
-//! `max_tokens = 1` `/responses` ping is therefore used for Codex too (built
-//! via [`crate::provider::codex::CodexProvider::build_request`]). That is the
-//! only path that actually moves/returns Codex's 5h/7d windows.
+//! locally with no upstream call, so it emits no ratelimit headers — a real
+//! `/responses` ping is therefore used for Codex too (built via
+//! [`crate::provider::codex::CodexProvider::build_request`]). That is the only
+//! path that actually moves/returns Codex's 5h/7d windows. Its body is built
+//! separately from the Anthropic one because Codex accepts no output cap (see
+//! [`codex_probe_body`]).
 
 use std::sync::Arc;
 
@@ -30,6 +32,25 @@ fn anthropic_probe_body(model: &str) -> bytes::Bytes {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "." }],
+    });
+    bytes::Bytes::from(body.to_string())
+}
+
+/// The `POST /v1/messages` probe body for a Codex account: a one-character
+/// user turn and NO `max_tokens`.
+///
+/// Codex's Responses endpoint has no output cap to ask for
+/// (`max_output_tokens` is rejected outright), so the compatibility policy
+/// drops `max_tokens` and reports it as a loss. Reusing the Anthropic probe
+/// body here would therefore send a `max_tokens: 1` that nothing honors: the
+/// probe would claim a one-token budget it never gets, and every probe would
+/// generate a compatibility warning about llmux's own request. The probe asks
+/// for what it can actually have — a real request whose only job is to return
+/// the quota headers.
+fn codex_probe_body(model: &str) -> bytes::Bytes {
+    let body = serde_json::json!({
+        "model": model,
         "messages": [{ "role": "user", "content": "." }],
     });
     bytes::Bytes::from(body.to_string())
@@ -78,7 +99,7 @@ impl ReqwestProber {
     ) -> Result<(ProviderRequest, String), ProbeError> {
         match credential {
             AccountCredential::Codex { .. } => {
-                let body = anthropic_probe_body(&self.codex_model);
+                let body = codex_probe_body(&self.codex_model);
                 let (req, _client_stream) = self
                     .codex
                     .build_request(&body, credential)
@@ -163,6 +184,18 @@ mod tests {
             codex_provider(),
             "gpt-5.5".to_string(),
         )
+    }
+
+    #[test]
+    fn codex_probe_body_carries_no_output_cap() {
+        let bytes = codex_probe_body("gpt-5.5");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value.get("max_tokens").is_none(),
+            "codex has no output cap to ask for: {value}"
+        );
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["model"], "gpt-5.5");
     }
 
     #[test]

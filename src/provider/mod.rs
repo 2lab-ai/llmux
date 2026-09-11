@@ -14,6 +14,10 @@ pub mod codex;
 pub mod grok;
 pub mod openrouter;
 pub mod responses;
+// Private module behind `responses`: the Anthropic→Responses REQUEST
+// translation + its compatibility contract. Callers reach it through the
+// `responses` facade so there is one import path for the shared machinery.
+pub(crate) mod responses_request;
 pub mod stubs;
 
 use crate::config::AccountCredential;
@@ -28,6 +32,13 @@ pub enum ProviderError {
     Auth(String),
     #[error("format conversion failed: {0}")]
     Convert(String),
+    /// The CLIENT's request cannot be expressed for this backend (an image the
+    /// endpoint refuses, an unknown content block, a malformed field). The
+    /// message names the offending JSON path and NEVER the payload. Callers
+    /// answer 400 locally — no upstream call, no credential refresh — because
+    /// the fault is in the request, not in the provider.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }
 
 /// Anthropic-shaped request as received from the client (Claude Code).
