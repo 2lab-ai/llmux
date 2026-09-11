@@ -254,6 +254,18 @@ pub struct AppState {
     /// the single in-flight browser login the daemon runs on behalf of an HTTP
     /// client (`llmux-islands`), behind `/llmux/login/{start,status,cancel}`.
     pub logins: Arc<super::login::LoginRegistry>,
+    /// Daemon-owned usage-control state (`.prd/16-codex-usage-controls.md`):
+    /// per-account reset counters / last-refresh / sanitized error, the
+    /// pending-redemption registry, and the per-account control try-lock.
+    /// Serialized additively onto the dashboard document; NEVER persisted into
+    /// credentials.
+    pub usage_controls: Arc<super::usage_controls::UsageControlStore>,
+    /// Where pending-redemption receipts are written before the irreversible
+    /// consume POST (state dir `usage-resets.json`, atomic replace). `None`
+    /// disables redemption entirely — an unrecorded redemption could be
+    /// re-attempted with a fresh key after a crash. Tests point it at a
+    /// tempdir, same pattern as `activity_log_path`.
+    pub usage_control_state_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -365,6 +377,12 @@ impl AppState {
             started: Instant::now(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             logins: Arc::new(super::login::LoginRegistry::default()),
+            usage_controls: Arc::new(super::usage_controls::UsageControlStore::default()),
+            // `<state dir>/usage-resets.json`, derived from the activity log's
+            // own resolved path so the XDG rule lives in ONE place
+            // (`cli::daemon::state_dir`, which this crate does not re-implement).
+            usage_control_state_path: crate::cli::daemon::activity_log_path()
+                .map(|p| p.with_file_name("usage-resets.json")),
         })
     }
 
@@ -861,7 +879,23 @@ impl AppState {
     /// `reload_accounts`; the re-eval picks a replacement). Shared tail of
     /// [`Self::add_apikey_account`] / [`Self::remove_account`].
     fn apply_roster(&self, merged: &Config) {
+        // Identity snapshot BEFORE the swap: a name whose credential changed —
+        // or that disappears — must not leave its usage-control state behind
+        // for whatever takes that name next
+        // (`.prd/16-codex-usage-controls.md` §Account identity/generation safety).
+        let before: Vec<(String, String)> = self
+            .pool
+            .snapshot()
+            .accounts
+            .iter()
+            .filter_map(|a| {
+                self.pool
+                    .credential(&a.id)
+                    .map(|c| (a.id.0.clone(), crate::scheduler::credential_identity(&c)))
+            })
+            .collect();
         self.pool.reload_accounts(&merged.accounts);
+        self.invalidate_roster_changes(&before, merged);
         self.pool.apply_paused(&merged.paused_accounts);
         self.pool.apply_limits(&merged.account_limits);
         let params = self.select_params();
@@ -1054,6 +1088,23 @@ pub async fn serve(
             }
         }
     });
+
+    // Reload pending redemption receipts BEFORE the listener accepts
+    // (`.prd/16-codex-usage-controls.md` §Crash boundary): after a restart the
+    // operator must be able to SEE an unresolved redemption (and its request
+    // id) on the read surfaces — discovering it by attempting another consume
+    // is exactly the second spend the receipt exists to prevent. A corrupt or
+    // unreadable file is logged, never fatal; the consume path re-checks it.
+    //
+    // Placed HERE, after the background tasks are spawned, deliberately: this
+    // is file IO, and doing it earlier delayed the token-refresh task's
+    // immediate first pass into the window where a request-time 401 refresh had
+    // already installed a short-lived token (which made
+    // `codex_401_refreshes_once_and_retries` flaky without changing any
+    // production behavior).
+    if let Err(err) = state.hydrate_pending().await {
+        tracing::warn!(error = %err, "pending redemption receipts could not be reloaded");
+    }
 
     let port = state.config.proxy.port;
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
@@ -1251,6 +1302,9 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/keys/rotate", post(keys_rotate_endpoint))
         .route("/llmux/account-limits", post(account_limits_endpoint))
         .route("/llmux/reset-usage", post(reset_usage_endpoint))
+        .route("/llmux/refresh-usage", post(refresh_usage_endpoint))
+        .route("/llmux/reset-credits", get(reset_credits_endpoint))
+        .route("/llmux/reset-credits/consume", post(consume_reset_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
         .route("/llmux/events", post(events_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
@@ -1590,13 +1644,19 @@ fn scoped_window_json(
 }
 
 /// Server-process facts for `/llmux/status` that are not pool state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerMeta {
     pub pid: u32,
     pub uptime_secs: u64,
     pub port: u16,
     /// Live `email_anonymous` display setting (see [`AppState::email_anonymous`]).
     pub email_anonymous: bool,
+    /// Daemon-owned usage-control metadata by account name
+    /// (`.prd/16-codex-usage-controls.md`): reset counters, last successful
+    /// refresh, sanitized last error, pending redemption id. Additive and
+    /// per-account OPTIONAL — an absent entry means "never observed", never
+    /// zero. Not `Copy` because of this map; every caller passes `&ServerMeta`.
+    pub usage_controls: HashMap<String, crate::proxy::usage_controls::UsageControlDoc>,
 }
 
 /// Serializable `/llmux/status` document — pure function of a pool
@@ -1672,6 +1732,9 @@ pub fn status_json(
                         .iter()
                         .map(|s| scoped_window_json(s, now, true))
                         .collect::<Vec<_>>(),
+                    // Daemon-owned usage-control metadata (additive; null when
+                    // this account has never been refreshed / has no controls).
+                    "usage_control": meta.usage_controls.get(&account.id.0),
                     "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                     "in_flight": account.in_flight,
                     // Token health (additive): expiry + last refresh, epoch
@@ -1719,6 +1782,7 @@ async fn status(State(state): State<AppState>) -> Response {
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(Ordering::Relaxed),
         email_anonymous: state.email_anonymous.load(Ordering::Relaxed),
+        usage_controls: state.usage_controls.all(),
     };
     let body = status_json(
         &state.pool.snapshot(),
@@ -1813,36 +1877,109 @@ struct SwitchRequest {
 /// `POST /llmux/switch` `{"account":"<name>"}` — manual account switch,
 /// the server-side of the dashboard's `s`-key path. Same gate as every route
 /// (loopback exempt, otherwise the proxy api key). Runs the identical
-/// `AccountPool::switch_to` the in-process TUI calls, emits the
-/// `AccountSwitched` activity event on success, and answers `{"ok":true,
-/// "current":"<name>"}`. A refused switch (ineligible / unknown account)
-/// is a 409 with the scheduler's own refusal reason.
+/// [`AppState::manual_switch`] the in-process TUI calls: the target's usage is
+/// refreshed FIRST (including an already-active target,
+/// `.prd/16-codex-usage-controls.md` S3) and the pool stays the authority on
+/// pause / auth / cooldown. Answers `{"ok":true,"current":"<name>"}`, plus a
+/// `refresh_warning` when the pre-switch refresh failed — a failed refresh
+/// never blocks the switch. A refused switch (ineligible / paused / unknown
+/// account) keeps its pre-existing shape: 409 with the scheduler's own refusal
+/// reason in the generic `proxy_error` envelope.
 async fn switch_endpoint(
     State(state): State<AppState>,
     body: axum::extract::Json<SwitchRequest>,
 ) -> Response {
-    let target = AccountId(body.account.clone());
-    let now = SystemTime::now();
-    let from = state
-        .pool
-        .snapshot()
-        .representative_current()
-        .map(|c| c.0.clone());
-    match state.pool.switch_to(&target, &state.select_params(), now) {
-        Ok(()) => {
-            state.emit(ActivityEvent::AccountSwitched {
-                from,
-                to: target.0.clone(),
-                reason: Some("manual".into()),
-            });
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "ok": true, "current": target.0 }).to_string(),
-            )
-                .into_response()
+    match state.manual_switch(&body.account).await {
+        Ok(response) => json_ok(&response),
+        Err(err @ crate::proxy::usage_controls::UsageControlError::SwitchRefused(_)) => {
+            relay_error(StatusCode::CONFLICT, &err.to_string())
         }
-        Err(err) => relay_error(StatusCode::CONFLICT, &format!("switch refused: {err}")),
+        Err(err) => usage_control_error(err),
+    }
+}
+
+/// Serialize a usage-control response, or 500 if that somehow fails.
+fn json_ok<T: serde::Serialize>(value: &T) -> Response {
+    match serde_json::to_string(value) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("response serialize failed: {err}"),
+        ),
+    }
+}
+
+/// Typed usage-control failure → its HTTP status plus the machine-readable
+/// body (`code`, message, and the request ids a client needs to continue).
+fn usage_control_error(err: crate::proxy::usage_controls::UsageControlError) -> Response {
+    (
+        err.status(),
+        [(header::CONTENT_TYPE, "application/json")],
+        err.body().to_string(),
+    )
+        .into_response()
+}
+
+/// Body of `POST /llmux/refresh-usage`: an account name, or none for every
+/// account whose provider supports a usage read.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RefreshUsageRequest {
+    account: Option<String>,
+}
+
+/// `POST /llmux/refresh-usage` `{"account":"<name>"?}` — explicit usage
+/// refresh (`.prd/16-codex-usage-controls.md` S1). Admin-gated like every
+/// `/llmux/*` route. Per-account failures ride in `results[]` with `ok:false`
+/// (200 with a false envelope — a partial failure is never silently green);
+/// an unknown account is 404 and an unsupported provider 422, both before any
+/// upstream IO.
+async fn refresh_usage_endpoint(
+    State(state): State<AppState>,
+    body: Option<axum::extract::Json<RefreshUsageRequest>>,
+) -> Response {
+    let request = body.map(|b| b.0).unwrap_or_default();
+    match state.refresh_usage(request.account.as_deref()).await {
+        Ok(response) => json_ok(&response),
+        Err(err) => usage_control_error(err),
+    }
+}
+
+/// Query for [`reset_credits_endpoint`].
+#[derive(serde::Deserialize)]
+struct AccountQuery {
+    account: String,
+}
+
+/// `GET /llmux/reset-credits?account=NAME` — the account's reset entitlement
+/// list (S2). A pure read: it never redeems.
+async fn reset_credits_endpoint(
+    State(state): State<AppState>,
+    Query(query): Query<AccountQuery>,
+) -> Response {
+    match state.reset_credits(&query.account).await {
+        Ok(response) => json_ok(&response),
+        Err(err) => usage_control_error(err),
+    }
+}
+
+/// `POST /llmux/reset-credits/consume` — redeem exactly ONE reset credit (S2).
+/// The client owns `redeem_request_id`; `confirm:true` is mandatory. An
+/// uncertain outcome answers 502 with the SAME request id to retry with, and
+/// the daemon refuses a different id for that account until a terminal
+/// four-code outcome resolves it.
+async fn consume_reset_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<crate::proxy::usage_controls::ConsumeRequest>,
+) -> Response {
+    match state.consume_reset(&body.0).await {
+        Ok(response) => json_ok(&response),
+        Err(err) => usage_control_error(err),
     }
 }
 
@@ -3273,6 +3410,7 @@ mod tests {
             uptime_secs: 7980,
             port: 3456,
             email_anonymous: false,
+            usage_controls: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
 
@@ -3345,6 +3483,7 @@ mod tests {
             uptime_secs: 1,
             port: 3456,
             email_anonymous: false,
+            usage_controls: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
         let accounts = doc["accounts"].as_array().expect("accounts array");
@@ -3410,6 +3549,7 @@ mod tests {
             uptime_secs: 0,
             port: 3456,
             email_anonymous: false,
+            usage_controls: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -3444,6 +3584,7 @@ mod tests {
             uptime_secs: 0,
             port: 0,
             email_anonymous: false,
+            usage_controls: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -3475,6 +3616,7 @@ mod tests {
             uptime_secs: 0,
             port: 0,
             email_anonymous: false,
+            usage_controls: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -3540,6 +3682,7 @@ mod tests {
                 uptime_secs: 0,
                 port: 0,
                 email_anonymous: false,
+                usage_controls: Default::default(),
             },
         );
         let names: Vec<&str> = doc["accounts"]
@@ -4539,6 +4682,7 @@ mod tests {
                 uptime_secs: 0,
                 port: 0,
                 email_anonymous: true,
+                usage_controls: Default::default(),
             },
         );
         assert_eq!(doc["email_anonymous"], true);

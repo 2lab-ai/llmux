@@ -122,6 +122,16 @@ pub(crate) struct DashboardView {
     /// active banner (`from <= now < to`) with the earliest `to` as one line,
     /// and nothing when none is active.
     pub events: Vec<crate::config::EventBanner>,
+    /// Per-account usage-control metadata (.prd/16), keyed by account name:
+    /// how many upstream rate-limit resets the daemon last OBSERVED, when it
+    /// last refreshed, the last sanitized error and any pending redemption.
+    ///
+    /// An account with no entry is UNKNOWN, not "zero resets" — the daemon
+    /// only emits an entry once it has something observed to report, and the
+    /// renderer keeps the two apart ([`reset_cell`]). Carried on the document,
+    /// so local and attach render identically.
+    pub usage_controls:
+        std::collections::BTreeMap<String, crate::proxy::usage_controls::UsageControlDoc>,
     /// Rolling 5-minute status-class counts for the header health verdict
     /// (glance-triage), carried on the document. `None` from an older daemon
     /// = no telemetry: the verdict skips storm detection and renders the err
@@ -445,6 +455,17 @@ impl DashboardView {
             // a `POST /llmux/events` reflects on the next document. Absent →
             // empty (no banner).
             events: doc.events.clone(),
+            // Additive per-account control metadata: only accounts the daemon
+            // actually reported get an entry (absent = unknown, never zero).
+            usage_controls: doc
+                .accounts
+                .iter()
+                .filter_map(|a| {
+                    a.usage_control
+                        .as_ref()
+                        .map(|control| (a.name.clone(), control.clone()))
+                })
+                .collect(),
             health: doc.health.as_ref().map(|h| super::activity::HealthCounts {
                 requests: h.requests,
                 errors: h.errors,
@@ -481,6 +502,94 @@ impl DashboardView {
     pub(crate) fn display_version(&self) -> &str {
         self.version.strip_prefix("llmux ").unwrap_or(&self.version)
     }
+
+    /// This account's usage-control metadata, or `None` when the daemon has
+    /// reported none (UNKNOWN — see [`Self::usage_controls`]).
+    pub(crate) fn usage_control(
+        &self,
+        account: &str,
+    ) -> Option<&crate::proxy::usage_controls::UsageControlDoc> {
+        self.usage_controls.get(account)
+    }
+}
+
+/// Providers that can carry rate-limit reset entitlements. Anything else has
+/// no controls at all, which is a DIFFERENT display state from "we have not
+/// looked yet" — an apikey account must never read as an account with unknown
+/// resets.
+fn has_usage_controls(credential_kind: &str) -> bool {
+    matches!(credential_kind, "codex")
+}
+
+/// The compact accounts-table cell for an account's reset count:
+/// `—` this provider has no resets · `?` unknown (never observed) · `N` owned ·
+/// `N*` owned but upstream currently reports none applicable.
+///
+/// The `*` exists because upstream can report owned resets alongside
+/// `applicable_available_count: 0` (a live read recorded in the contract
+/// showed 3 owned / 0 applicable): llmux reports both and claims neither —
+/// owned is not the same as usable now.
+pub(crate) fn reset_cell(
+    control: Option<&crate::proxy::usage_controls::UsageControlDoc>,
+    credential_kind: &str,
+) -> String {
+    if !has_usage_controls(credential_kind) {
+        return "—".to_string();
+    }
+    match control.and_then(|c| c.available_resets) {
+        None => "?".to_string(),
+        Some(owned) => {
+            let non_applicable = owned > 0
+                && control
+                    .and_then(|c| c.applicable_resets)
+                    .is_some_and(|applicable| applicable == 0);
+            if non_applicable {
+                format!("{owned}*")
+            } else {
+                owned.to_string()
+            }
+        }
+    }
+}
+
+/// The detail-pane sentence for the same facts: counts, the applicability
+/// caveat, the age of the last successful observation, a retained error
+/// (which never erases the last good counts), and any pending redemption id.
+pub(crate) fn reset_detail(
+    control: Option<&crate::proxy::usage_controls::UsageControlDoc>,
+    credential_kind: &str,
+    now: SystemTime,
+) -> String {
+    if !has_usage_controls(credential_kind) {
+        return format!("n/a ({credential_kind} has no rate-limit resets)");
+    }
+    let Some(control) = control else {
+        return "unknown — press f to refresh".to_string();
+    };
+    let mut text = match control.available_resets {
+        None => "unknown — press f to refresh".to_string(),
+        Some(owned) => {
+            let applicable = match control.applicable_resets {
+                Some(applicable) => format!(" · {applicable} applicable now"),
+                None => " · applicable unknown".to_string(),
+            };
+            format!("{owned} owned{applicable}")
+        }
+    };
+    if let Some(ms) = control.last_refresh_ms {
+        let age = now.duration_since(ms_time(ms)).unwrap_or_default();
+        text.push_str(&format!(
+            " · read {} ago",
+            crate::scheduler::select::compact_duration(age)
+        ));
+    }
+    if let Some(pending) = &control.pending_request_id {
+        text.push_str(&format!(" · redemption pending (request id {pending})"));
+    }
+    if let Some(error) = &control.last_error {
+        text.push_str(&format!(" · last error: {error}"));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -974,6 +1083,111 @@ mod tests {
         );
         assert!(!view.domain_abbrev.contains_key("insightquest.io"));
         assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
+    }
+
+    /// Usage-control metadata (.prd/16) rides the SAME document into both
+    /// backends, so the accounts surface shows reset counts identically in
+    /// local and attach mode. An older daemon's doc (no field) yields an empty
+    /// map — which the renderer must show as UNKNOWN, never as zero.
+    #[test]
+    fn usage_control_metadata_survives_doc_to_view() {
+        let mut json = doc_json();
+        json["accounts"][0]["usage_control"] = serde_json::json!({
+            "available_resets": 3,
+            "applicable_resets": 0,
+            "last_refresh_ms": 1_000_000_000u64,
+        });
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+        let control = view.usage_control("a").expect("carried through from_doc");
+        assert_eq!(control.available_resets, Some(3));
+        assert_eq!(control.applicable_resets, Some(0));
+        // The account WITHOUT the field has no entry at all (unknown ≠ 0).
+        assert!(view.usage_control("b").is_none());
+
+        let legacy: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        assert!(DashboardView::from_doc(&legacy).usage_controls.is_empty());
+    }
+
+    /// The compact accounts-table cell keeps four states apart: unknown (`?`),
+    /// a plain count, a count whose resets upstream says are NOT applicable
+    /// right now (`3*`), and an account whose provider has no controls (`—`).
+    /// Unknown must never render as `0`.
+    #[test]
+    fn reset_cell_keeps_unknown_zero_and_non_applicable_apart() {
+        use crate::proxy::usage_controls::UsageControlDoc;
+        assert_eq!(reset_cell(None, "codex"), "?", "no metadata = unknown");
+        assert_eq!(
+            reset_cell(None, "apikey"),
+            "—",
+            "a provider with no controls is not 'unknown'"
+        );
+        let doc = |available, applicable| UsageControlDoc {
+            available_resets: available,
+            applicable_resets: applicable,
+            ..Default::default()
+        };
+        assert_eq!(reset_cell(Some(&doc(None, None)), "codex"), "?");
+        assert_eq!(reset_cell(Some(&doc(Some(0), Some(0))), "codex"), "0");
+        assert_eq!(reset_cell(Some(&doc(Some(3), None)), "codex"), "3");
+        assert_eq!(
+            reset_cell(Some(&doc(Some(3), Some(0))), "codex"),
+            "3*",
+            "owned but none applicable now is visibly distinct"
+        );
+        assert_eq!(reset_cell(Some(&doc(Some(3), Some(3))), "codex"), "3");
+    }
+
+    /// The detail line spells the same facts out in words, including the
+    /// applicability caveat, the last successful refresh and a retained error.
+    #[test]
+    fn reset_detail_spells_out_unknown_applicability_and_errors() {
+        use crate::proxy::usage_controls::UsageControlDoc;
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let none = reset_detail(None, "codex", now);
+        assert!(none.contains("unknown"), "{none}");
+        assert!(none.contains("f"), "names the refresh key: {none}");
+        assert!(reset_detail(None, "apikey", now).contains("n/a"));
+
+        let full = reset_detail(
+            Some(&UsageControlDoc {
+                available_resets: Some(3),
+                applicable_resets: Some(0),
+                last_refresh_ms: Some(999_940_000),
+                ..Default::default()
+            }),
+            "codex",
+            now,
+        );
+        assert!(full.contains("3 owned"), "{full}");
+        assert!(full.contains("0 applicable now"), "{full}");
+        assert!(full.contains("ago"), "carries the observation age: {full}");
+
+        let failed = reset_detail(
+            Some(&UsageControlDoc {
+                available_resets: Some(3),
+                last_error: Some("upstream 502".into()),
+                ..Default::default()
+            }),
+            "codex",
+            now,
+        );
+        assert!(
+            failed.contains("3 owned") && failed.contains("upstream 502"),
+            "a retained error never erases the last good observation: {failed}"
+        );
+
+        let pending = reset_detail(
+            Some(&UsageControlDoc {
+                available_resets: Some(3),
+                pending_request_id: Some("01PENDING".into()),
+                ..Default::default()
+            }),
+            "codex",
+            now,
+        );
+        assert!(pending.contains("01PENDING"), "{pending}");
+        assert!(pending.contains("pending"), "{pending}");
     }
 
     #[test]

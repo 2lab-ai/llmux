@@ -2,6 +2,7 @@
 //! profile lookup, and `~/.claude/.credentials.json` import.
 
 pub mod codex;
+pub mod codex_usage;
 pub mod credentials;
 pub mod grok;
 pub mod oauth;
