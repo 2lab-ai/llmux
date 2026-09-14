@@ -4794,22 +4794,24 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// One-line usage-poller health: oauth count, last-success age spread,
+/// One-line usage-poller health: polled-account count (oauth's
+/// `/api/oauth/usage` + grok's `/billing?format=credits` — same
+/// `UsagePoller`, see `scheduler/usage.rs`), last-success age spread,
 /// backing-off accounts, soonest next poll.
 fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
-    let oauth: Vec<&AccountSnapshot> = view
+    let polled: Vec<&AccountSnapshot> = view
         .snapshot
         .accounts
         .iter()
-        .filter(|a| a.credential_kind == "oauth")
+        .filter(|a| a.credential_kind == "oauth" || a.credential_kind == "grok")
         .collect();
-    if oauth.is_empty() {
-        return "no oauth accounts (header-driven only)".into();
+    if polled.is_empty() {
+        return "no polled accounts (header-driven only)".into();
     }
     let mut ok_ages: Vec<Duration> = Vec::new();
     let mut next_in: Option<Duration> = None;
     let mut backoff: Vec<String> = Vec::new();
-    for account in &oauth {
+    for account in &polled {
         let Some(health) = view.poll_health(&account.id.0) else {
             continue;
         };
@@ -4828,9 +4830,9 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
         }
     }
     if ok_ages.is_empty() && backoff.is_empty() {
-        return format!("{} oauth · warming up", oauth.len());
+        return format!("{} polled · warming up", polled.len());
     }
-    let mut out = format!("{} oauth", oauth.len());
+    let mut out = format!("{} polled", polled.len());
     if let (Some(min), Some(max)) = (ok_ages.iter().min(), ok_ages.iter().max()) {
         if min == max {
             out.push_str(&format!(
@@ -4964,8 +4966,10 @@ fn draw_detail(
             };
             format!("{last}{next}{backoff}")
         }
-        None if account.credential_kind == "oauth" => "not polled yet".into(),
-        // apikey/codex accounts have no Anthropic usage endpoint to poll.
+        None if account.credential_kind == "oauth" || account.credential_kind == "grok" => {
+            "not polled yet".into()
+        }
+        // apikey/codex/openrouter accounts have no polled usage endpoint.
         None => format!("n/a ({})", account.credential_kind),
     };
     lines.push(Line::from(vec![
@@ -10484,6 +10488,44 @@ mod tests {
         assert!(
             !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
             "no fallback to the row occupant"
+        );
+    }
+
+    /// `poller_summary` must count grok accounts as polled alongside oauth
+    /// (both ride `UsagePoller` since the `/billing?format=credits` fix) —
+    /// not just oauth, or the scheduler line undercounts and looks stuck at
+    /// "1 oauth" forever once a grok account is added.
+    #[test]
+    fn poller_summary_counts_grok_alongside_oauth() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, kind: &'static str, group: BackendGroup| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: kind,
+            group,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![
+            acct("claude:a@x.com", "oauth", BackendGroup::Claude),
+            acct("grok:g@x.com", "grok", BackendGroup::Grok),
+            acct("codex:c@x.com", "codex", BackendGroup::Codex),
+        ];
+        let summary = poller_summary(&view, SystemTime::now());
+        assert!(
+            summary.starts_with("2 polled"),
+            "oauth + grok counted, codex excluded (no polled endpoint): {summary}"
         );
     }
 
