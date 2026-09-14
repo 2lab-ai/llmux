@@ -866,11 +866,15 @@ mod tests {
         let mut config = Config::default();
         config.accounts.push(codex_account("codex-old", "acct-1"));
 
-        // Re-import with the same account_id replaces, never duplicates.
+        // Re-import with the same account_id replaces, never duplicates. The
+        // ESTABLISHED name survives the identity-matched replace
+        // (`docs/keys-history/relogin-trace.md` B6): paused_accounts,
+        // account_limits and the scheduler's per-account state are keyed by
+        // name, so a re-login must not rename the account out from under them.
         let outcome = config.upsert_account(codex_account("cx@x.com", "acct-1"));
         assert_eq!(outcome, Upsert::Updated);
         assert_eq!(config.accounts.len(), 1);
-        assert_eq!(config.accounts[0].name, "cx@x.com");
+        assert_eq!(config.accounts[0].name, "codex-old");
 
         // Refreshed codex tokens persist through the shared updater.
         assert!(config.update_oauth_tokens("acct-1", "at-new", Some("rt-new"), 99, 77));
@@ -969,11 +973,13 @@ mod tests {
         config.accounts.push(oauth_account("old-name", "uuid-a"));
         config.accounts.push(apikey_account("api-1"));
 
-        // Same uuid, new name -> replaces in place (re-login rename).
+        // Same uuid, new name -> replaces the CREDENTIAL in place and KEEPS
+        // the established name (relogin-trace B6; the old "a re-login renames
+        // the account to its profile email" contract is retired).
         let outcome = config.upsert_account(oauth_account("new@x.com", "uuid-a"));
         assert_eq!(outcome, Upsert::Updated);
         assert_eq!(config.accounts.len(), 2);
-        assert_eq!(config.accounts[0].name, "new@x.com");
+        assert_eq!(config.accounts[0].name, "old-name");
 
         // Unknown uuid, unknown name -> appended.
         let outcome = config.upsert_account(oauth_account("c@x.com", "uuid-c"));

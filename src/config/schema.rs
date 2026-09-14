@@ -999,25 +999,52 @@ impl Config {
     /// `account_uuid` wins, falling back to `name` (FR2 dedup order,
     /// mirroring teamclaude's `findConfigAccount`).
     pub fn find_account(&self, account: &AccountConfig) -> Option<usize> {
+        self.locate_account(account).map(|(idx, _)| idx)
+    }
+
+    /// [`Self::find_account`] plus HOW it matched: `true` = matched on the
+    /// stable upstream identity (`account_uuid`), `false` = matched on `name`.
+    /// The distinction decides whether the caller's name may replace the
+    /// stored one (see [`Self::upsert_account`]).
+    fn locate_account(&self, account: &AccountConfig) -> Option<(usize, bool)> {
         if let Some(uuid) = account.credential.account_uuid() {
             if let Some(idx) = self
                 .accounts
                 .iter()
                 .position(|a| a.credential.account_uuid() == Some(uuid))
             {
-                return Some(idx);
+                return Some((idx, true));
             }
         }
-        self.accounts.iter().position(|a| a.name == account.name)
+        self.accounts
+            .iter()
+            .position(|a| a.name == account.name)
+            .map(|idx| (idx, false))
     }
 
     /// Insert or replace an account, keyed by `account_uuid` then `name`.
-    /// On a match the whole entry is replaced in place (a re-login may
-    /// rename the account to its profile email).
+    ///
+    /// On an IDENTITY (uuid) match the CREDENTIAL is replaced but the stored
+    /// NAME is kept: `paused_accounts`, `account_limits` and every scheduler
+    /// per-account state (quota windows, cooldowns, in-flight leases, sticky
+    /// current) are keyed by name, so letting a re-login rename the account to
+    /// its latest profile email would silently resume a paused account and drop
+    /// its ceilings (`docs/keys-history/relogin-trace.md` B6). The account name
+    /// is therefore a stable LOCAL label, not a mirror of the profile email —
+    /// an intentional trade against a full identity migration.
+    ///
+    /// On a NAME match (no stable identity, e.g. an api key) the name IS the
+    /// identity, so the caller's entry replaces the row wholesale. Callers that
+    /// report the account back to a user must read the resolved name from the
+    /// merged config (`find_account`), not from what they passed in.
     pub fn upsert_account(&mut self, account: AccountConfig) -> Upsert {
-        match self.find_account(&account) {
-            Some(idx) => {
+        match self.locate_account(&account) {
+            Some((idx, matched_by_identity)) => {
+                let established = self.accounts[idx].name.clone();
                 self.accounts[idx] = account;
+                if matched_by_identity {
+                    self.accounts[idx].name = established;
+                }
                 Upsert::Updated
             }
             None => {
@@ -1050,6 +1077,34 @@ impl Config {
         expires_at_ms: u64,
         refreshed_at_ms: u64,
     ) -> bool {
+        self.update_oauth_tokens_if(
+            ident,
+            |_| true,
+            access_token,
+            refresh_token,
+            expires_at_ms,
+            refreshed_at_ms,
+        )
+    }
+
+    /// [`Self::update_oauth_tokens`] gated on the credential CURRENTLY stored
+    /// for `ident`: the tokens land only if `still_matches` accepts what is on
+    /// disk. Callers pass "is this still the credential my refresh started
+    /// from?" (a `credential_digest` comparison), and because the check runs
+    /// INSIDE the `config::update_path` read-merge-write closure, a re-login
+    /// that lands between the pool CAS and this write cannot be overwritten —
+    /// the disk half of `docs/keys-history/relogin-trace.md` B3. Returns
+    /// `false` when no account matched OR the guard refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_oauth_tokens_if(
+        &mut self,
+        ident: &str,
+        still_matches: impl Fn(&AccountCredential) -> bool,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at_ms: u64,
+        refreshed_at_ms: u64,
+    ) -> bool {
         let idx = self
             .accounts
             .iter()
@@ -1058,6 +1113,9 @@ impl Config {
         let Some(idx) = idx else {
             return false;
         };
+        if !still_matches(&self.accounts[idx].credential) {
+            return false;
+        }
         match &mut self.accounts[idx].credential {
             AccountCredential::Oauth {
                 access_token: at,

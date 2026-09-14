@@ -230,7 +230,7 @@ pub(crate) fn draw(
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
-        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view),
+        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view, chrome),
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -1999,21 +1999,180 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
 /// keybindings and build/daemon facts. Read-only.
-/// Client-key panel (multi-tenant #22, `K` / the "keys" tab): every issued
-/// key joined with its tenant usage — name, email, kind, state, requests,
-/// ok/err, tokens, API-equivalent cost, and the used-from → used-to span —
-/// followed by dim per-model breakdown rows. Builtin buckets (`local` /
-/// `legacy` / `unknown`) render when they carry usage, so the admin's view
-/// accounts for EVERY request, keyed or not. Read-only: mutations stay in
-/// the CLI/API (admin-gated), so the attach-mode panel is safe everywhere.
-fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
-    frame.render_widget(Clear, area);
-    let header = [
-        "key", "name", "kind", "state", "req", "ok/err", "in", "out", "cost", "used",
-    ];
-    let mut rows: Vec<Row> = Vec::new();
-    // Issued keys first (usage joined by id), then builtin buckets with usage.
-    let usage_of = |id: &str| view.tenant_usage.iter().find(|t| t.tenant == id);
+/// One flattened row of the keys panel (keys-history K-0): either an issued
+/// key / builtin bucket, or one of its per-model breakdown rows. Built ONCE
+/// per frame and shared by the renderer and the scroll handler, so "how many
+/// rows can I scroll through" and "what is drawn" can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeysRow {
+    /// Display cells, in header order.
+    pub cells: Vec<String>,
+    pub kind: KeysRowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeysRowKind {
+    /// An issued key, with the state its row is colored by.
+    Key(KeyState),
+    /// A builtin attribution bucket (`local`/`legacy`/`unknown`).
+    Builtin,
+    /// A per-model breakdown row under the row above it.
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyState {
+    Active,
+    Suspended,
+    Revoked,
+}
+
+impl KeyState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Active => Color::Green,
+            Self::Suspended => Color::Yellow,
+            Self::Revoked => Color::Red,
+        }
+    }
+}
+
+/// One column of the keys table. NAME is first (the operator identifies a
+/// tenant by person/machine, not by an opaque id) and is the only flexible
+/// column; the rest are fixed-width and are shed — widest-and-least-valuable
+/// first — when the frame cannot hold them all.
+pub(crate) struct KeysColumn {
+    pub header: &'static str,
+    /// Fixed width in display cells (ignored for the name column, which fills).
+    pub width: u16,
+    /// Shed order when the frame is too narrow: HIGHER goes first. `0` = never
+    /// dropped (the name column).
+    pub shed: u8,
+}
+
+/// The table's columns in render order. Shed ranks encode the user's own
+/// priorities: the name must survive (`docs/keys-history/spec.md` K-6), then
+/// the identifying key cell and the counts; the wide `used` span and the
+/// low-entropy `kind`/`state` words go first.
+pub(crate) const KEYS_COLUMNS: [KeysColumn; 10] = [
+    KeysColumn {
+        header: "name",
+        width: 0,
+        shed: 0,
+    },
+    KeysColumn {
+        header: "key",
+        width: KEY_CELL_WIDTH as u16,
+        shed: 2,
+    },
+    KeysColumn {
+        header: "kind",
+        width: 7,
+        shed: 8,
+    },
+    KeysColumn {
+        header: "state",
+        width: 9,
+        shed: 7,
+    },
+    KeysColumn {
+        header: "req",
+        width: 7,
+        shed: 1,
+    },
+    KeysColumn {
+        header: "ok/err",
+        width: 9,
+        shed: 6,
+    },
+    KeysColumn {
+        header: "in",
+        width: 8,
+        shed: 3,
+    },
+    KeysColumn {
+        header: "out",
+        width: 8,
+        shed: 4,
+    },
+    KeysColumn {
+        header: "cost",
+        width: 9,
+        shed: 5,
+    },
+    KeysColumn {
+        header: "used",
+        width: 23,
+        shed: 9,
+    },
+];
+
+/// Display cells the name column is never squeezed below. A 100-cell terminal
+/// used to starve `Fill(1)` to ZERO — the name header, every tenant name and
+/// every `└ group/model` label simply vanished (live capture, 2026-09-14).
+const NAME_MIN_WIDTH: u16 = 20;
+
+/// Display-cell budget of the `key` column — id + issued prefix, `…`-clipped.
+/// NEVER the secret: only the immutable attribution id and the display prefix
+/// the issuance already printed.
+const KEY_CELL_WIDTH: usize = 16;
+
+/// Which columns fit in `width` display cells, in render order. Always keeps
+/// the name column with at least [`NAME_MIN_WIDTH`] cells, shedding the rest
+/// by descending [`KeysColumn::shed`] until the budget fits. Derived, not a
+/// per-width lookup table, so any terminal size lands somewhere sensible.
+pub(crate) fn keys_visible_columns(width: u16) -> Vec<usize> {
+    let mut kept: Vec<usize> = (0..KEYS_COLUMNS.len()).collect();
+    // Fixed widths + one cell of spacing between columns (ratatui's default).
+    let budget = |kept: &Vec<usize>| -> u16 {
+        let fixed: u16 = kept.iter().skip(1).map(|&i| KEYS_COLUMNS[i].width).sum();
+        fixed + kept.len().saturating_sub(1) as u16
+    };
+    let shed_one = |kept: &mut Vec<usize>| {
+        if let Some(victim) = kept
+            .iter()
+            .copied()
+            .skip(1)
+            .max_by_key(|&i| KEYS_COLUMNS[i].shed)
+        {
+            kept.retain(|&i| i != victim);
+        }
+    };
+    while kept.len() > 1 && budget(&kept) + NAME_MIN_WIDTH > width {
+        shed_one(&mut kept);
+    }
+    // A frame too narrow even for the name minimum still renders the NAME: the
+    // other columns are gone and the name takes whatever is left.
+    while kept.len() > 1 && budget(&kept) > width {
+        shed_one(&mut kept);
+    }
+    kept
+}
+
+/// Flatten the keys panel into scrollable rows: every issued key (usage joined
+/// from the fetched document by attribution id) followed by its per-model
+/// rows, then every builtin bucket that carries usage in the current window.
+///
+/// The roster comes from the dashboard document (`client_keys` — metadata, no
+/// secrets); the NUMBERS come exclusively from the keys-usage answer, so a
+/// window/model filter applies to every figure on screen.
+pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
+    let empty = Vec::new();
+    let tenants = chrome
+        .keys
+        .doc
+        .as_ref()
+        .map(|d| &d.tenants)
+        .unwrap_or(&empty);
+    let mut rows: Vec<KeysRow> = Vec::new();
     let span_label = |first_ms: u64, last_ms: u64| {
         if first_ms == 0 {
             "never".to_string()
@@ -2025,118 +2184,271 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             format!("{} → {}", stamp(first_ms), stamp(last_ms))
         }
     };
-    let push_models = |rows: &mut Vec<Row>, tenant: Option<&crate::dashboard::TenantUsageDoc>| {
-        if let Some(t) = tenant {
-            for m in &t.models {
-                rows.push(
-                    Row::new(vec![
-                        Cell::from(""),
-                        Cell::from(format!("  └ {}/{}", m.group, m.model)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(format::human_count(m.requests)),
-                        Cell::from(""),
-                        Cell::from(format::human_count(m.tokens_in)),
-                        Cell::from(format::human_count(m.tokens_out)),
-                        Cell::from(format!("${:.2}", m.cost_usd)),
-                        Cell::from(""),
-                    ])
-                    .style(dim()),
-                );
-            }
+    let push_models = |rows: &mut Vec<KeysRow>,
+                       usage: Option<&crate::dashboard::TenantUsageDoc>| {
+        for m in usage.iter().flat_map(|t| t.models.iter()) {
+            rows.push(KeysRow {
+                cells: vec![
+                    format!("  └ {}/{}", m.group, m.model),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    format::human_count(m.requests),
+                    String::new(),
+                    format::human_count(m.tokens_in),
+                    format::human_count(m.tokens_out),
+                    format!("${:.2}", m.cost_usd),
+                    String::new(),
+                ],
+                kind: KeysRowKind::Model,
+            });
         }
     };
+
     for key in &view.client_keys {
-        let usage = usage_of(&key.id);
+        let usage = tenants.iter().find(|t| t.tenant == key.id);
         let state = if key.revoked_at_ms.is_some() {
-            Span::styled("revoked", Style::new().fg(Color::Red))
+            KeyState::Revoked
         } else if key.suspended {
-            Span::styled("suspended", Style::new().fg(Color::Yellow))
+            KeyState::Suspended
         } else {
-            Span::styled("active", Style::new().fg(Color::Green))
+            KeyState::Active
         };
         let name = match &key.email {
             Some(email) => format!("{} <{email}>", key.name),
             None => key.name.clone(),
         };
-        rows.push(Row::new(vec![
-            Cell::from(format!("{} ({}…)", key.id, key.key_prefix)),
-            Cell::from(name),
-            Cell::from(key.kind.clone()),
-            Cell::from(Line::from(state)),
-            Cell::from(format::human_count(usage.map(|t| t.requests).unwrap_or(0))),
-            Cell::from(match usage {
-                Some(t) => format!("{}/{}", t.ok, t.errors),
-                None => "—".into(),
-            }),
-            Cell::from(format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0))),
-            Cell::from(format::human_count(
-                usage.map(|t| t.tokens_out).unwrap_or(0),
-            )),
-            Cell::from(match usage {
-                Some(t) => format!("${:.2}", t.cost_usd),
-                None => "—".into(),
-            }),
-            Cell::from(match usage {
-                Some(t) => span_label(t.first_ms, t.last_ms),
-                None => "never".into(),
-            }),
-        ]));
+        rows.push(KeysRow {
+            cells: vec![
+                name,
+                truncate_cells(&format!("{}·{}", key.id, key.key_prefix), KEY_CELL_WIDTH),
+                key.kind.clone(),
+                state.label().to_string(),
+                format::human_count(usage.map(|t| t.requests).unwrap_or(0)),
+                match usage {
+                    Some(t) => format!("{}/{}", t.ok, t.errors),
+                    None => "—".into(),
+                },
+                format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0)),
+                format::human_count(usage.map(|t| t.tokens_out).unwrap_or(0)),
+                match usage {
+                    Some(t) => format!("${:.2}", t.cost_usd),
+                    None => "—".into(),
+                },
+                match usage {
+                    Some(t) => span_label(t.first_ms, t.last_ms),
+                    None => "never".into(),
+                },
+            ],
+            kind: KeysRowKind::Key(state),
+        });
         push_models(&mut rows, usage);
     }
-    for t in &view.tenant_usage {
+
+    for t in tenants {
         // Builtin buckets — anything not matching an issued key row above.
         if view.client_keys.iter().any(|k| k.id == t.tenant) {
             continue;
         }
-        rows.push(Row::new(vec![
-            Cell::from(t.tenant.clone()),
-            Cell::from(t.name.clone()),
-            Cell::from("builtin".to_string()),
-            Cell::from(""),
-            Cell::from(format::human_count(t.requests)),
-            Cell::from(format!("{}/{}", t.ok, t.errors)),
-            Cell::from(format::human_count(t.tokens_in)),
-            Cell::from(format::human_count(t.tokens_out)),
-            Cell::from(format!("${:.2}", t.cost_usd)),
-            Cell::from(span_label(t.first_ms, t.last_ms)),
-        ]));
+        rows.push(KeysRow {
+            cells: vec![
+                t.name.clone(),
+                truncate_cells(&t.tenant, KEY_CELL_WIDTH),
+                "builtin".to_string(),
+                String::new(),
+                format::human_count(t.requests),
+                format!("{}/{}", t.ok, t.errors),
+                format::human_count(t.tokens_in),
+                format::human_count(t.tokens_out),
+                format!("${:.2}", t.cost_usd),
+                span_label(t.first_ms, t.last_ms),
+            ],
+            kind: KeysRowKind::Builtin,
+        });
         push_models(&mut rows, Some(t));
     }
-    if rows.is_empty() {
-        let empty = Paragraph::new(vec![
+    rows
+}
+
+/// How many flattened rows the keys panel has this frame — the scroll
+/// handler's clamp (Up/Down/Page/Home/End must reach the LAST row).
+pub(crate) fn keys_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
+    keys_rows(view, chrome).len()
+}
+
+/// Client-key panel (multi-tenant #22 + keys-history K, `K` / the "keys"
+/// tab): every issued key joined with its DURABLE per-tenant usage for the
+/// selected window and model filter — name first, then capped key metadata,
+/// kind, state, requests, ok/err, tokens, API-equivalent cost, and the
+/// used-from → used-to span — followed by dim per-model breakdown rows.
+/// Builtin buckets (`local` / `legacy` / `unknown`) render when they carry
+/// usage, so the admin's view accounts for EVERY request, keyed or not.
+///
+/// The table is scrolled by the panel's own offset (rows are sliced here, not
+/// clipped by the widget), so the final rows are reachable on any terminal
+/// height. Read-only: mutations stay in the CLI/API (admin-gated).
+fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+    frame.render_widget(Clear, area);
+    let panel = &chrome.keys;
+    let rows = keys_rows(view, chrome);
+    let issued = view.client_keys.len();
+    let filter = if panel.models.is_empty() {
+        "all models".to_string()
+    } else {
+        format!("{} model(s)", panel.models.len())
+    };
+    let matched = panel.doc.as_ref().map(|d| d.rows).unwrap_or(0);
+    // While the legacy history is still migrating, every total on screen is a
+    // PARTIAL sum — say so in the title rather than let it read as final.
+    let importing = panel
+        .doc
+        .as_ref()
+        .filter(|d| d.health.importing)
+        .map(|d| format!(" · importing history {}%", d.health.import_pct))
+        .unwrap_or_default();
+    let title = format!(
+        " keys — {issued} issued · window {} · {filter} · {matched} requests{}{importing} ",
+        panel.window.as_str(),
+        if panel.loading { " · loading…" } else { "" }
+    );
+
+    // A failed or missing query NEVER renders as zeros: the panel says what it
+    // could not answer (keys-history K-5).
+    if let Some(err) = &panel.error {
+        let body = Paragraph::new(vec![
             Line::default(),
-            Line::from("  No client keys issued and no tenant usage yet."),
-            Line::from(
-                "  Issue one on the server:  llmux key new --name <pc> [--email addr] [--admin]",
-            ),
-            Line::from(
-                "  Then on the client PC set  remote.host + remote.api_key  and `llmux run`.",
-            ),
+            Line::from(Span::styled(
+                format!("  keys usage unavailable: {err}"),
+                Style::new().fg(Color::Red),
+            )),
+            Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
-        .block(Block::bordered().title(" keys — multi-tenant "));
-        frame.render_widget(empty, area);
+        .block(Block::bordered().title(title));
+        frame.render_widget(body, area);
+        draw_keys_picker(frame, area, panel);
         return;
     }
-    let constraints = [
-        Constraint::Length(22),
-        Constraint::Fill(1),
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(23),
-    ];
-    let issued = view.client_keys.len();
-    let table = Table::new(rows, constraints)
+    if rows.is_empty() {
+        let body = if panel.doc.is_none() {
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from("  loading keys usage…"),
+            ])
+        } else {
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from("  No client keys issued and no tenant usage in this window."),
+                Line::from(
+                    "  Issue one on the server:  llmux key new --name <pc> [--email addr] [--admin]",
+                ),
+                Line::from(
+                    "  Then on the client PC set  remote.host + remote.api_key  and `llmux run`.",
+                ),
+            ])
+        }
+        .block(Block::bordered().title(title));
+        frame.render_widget(body, area);
+        draw_keys_picker(frame, area, panel);
+        return;
+    }
+
+    // Only the columns this frame can hold — the name is never one of the
+    // casualties (the `Fill(1)`-starved-to-zero bug).
+    let columns = keys_visible_columns(area.width.saturating_sub(2));
+    // Scrolling stops at the last FULL page: "End" means the end of the list,
+    // not one row floating over a blank screen. Every row stays reachable —
+    // the final page contains the final row.
+    let visible = (area.height.saturating_sub(3) as usize).max(1); // borders + header
+    let scroll = panel.scroll.min(rows.len().saturating_sub(visible));
+    let table_rows: Vec<Row> =
+        rows.iter()
+            .skip(scroll)
+            .map(|row| {
+                let cells: Vec<Cell> = columns
+                    .iter()
+                    .map(|&i| {
+                        let text = row.cells.get(i).cloned().unwrap_or_default();
+                        match (row.kind, KEYS_COLUMNS[i].header) {
+                            // The state column carries the key's live color.
+                            (KeysRowKind::Key(state), "state") => Cell::from(Line::from(
+                                Span::styled(text, Style::new().fg(state.color())),
+                            )),
+                            _ => Cell::from(text),
+                        }
+                    })
+                    .collect();
+                match row.kind {
+                    KeysRowKind::Model => Row::new(cells).style(dim()),
+                    _ => Row::new(cells),
+                }
+            })
+            .collect();
+    let constraints: Vec<Constraint> = columns
+        .iter()
+        .map(|&i| match i {
+            0 => Constraint::Fill(1),
+            _ => Constraint::Length(KEYS_COLUMNS[i].width),
+        })
+        .collect();
+    let header: Vec<&str> = columns.iter().map(|&i| KEYS_COLUMNS[i].header).collect();
+    let scrolled = if scroll > 0 {
+        format!(
+            "· rows {}-{}/{} ",
+            scroll + 1,
+            (scroll + visible).min(rows.len()),
+            rows.len()
+        )
+    } else {
+        String::new()
+    };
+    let table = Table::new(table_rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::bordered().title(format!(
-            " keys — {issued} issued · per-tenant usage (admin view) "
-        )));
+        .block(Block::bordered().title(format!("{title}{scrolled}")));
     frame.render_widget(table, area);
+    draw_keys_picker(frame, area, panel);
+}
+
+/// The `f` multi-select model picker (keys-history K-0), drawn over the panel
+/// while open. Space toggles, `a` selects every offered model, `c` clears,
+/// Enter applies, Esc cancels.
+fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel) {
+    let Some(picker) = &panel.picker else {
+        return;
+    };
+    // Half the frame on a wide terminal, most of it on a narrow one: the key
+    // legend below is ~57 cells and must not be clipped at 80 columns.
+    let popup = centered_rect(area, if area.width < 130 { 80 } else { 50 }, 70);
+    frame.render_widget(Clear, popup);
+    let mut lines: Vec<Line> = Vec::new();
+    if picker.options.is_empty() {
+        lines.push(Line::from("  no models observed in this window"));
+    }
+    // Keep the cursor in view on a short popup: scroll by whole rows.
+    let visible = popup.height.saturating_sub(4) as usize;
+    let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
+    for (i, model) in picker.options.iter().enumerate().skip(first) {
+        let marker = if picker.selected.contains(model) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let line = Line::from(format!(" {marker} {model}"));
+        lines.push(if i == picker.cursor {
+            line.style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else {
+            line
+        });
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " Space toggle · a all · c clear · Enter apply · Esc cancel",
+        dim(),
+    )));
+    let title = format!(" models — {} selected ", picker.selected.len());
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        popup,
+    );
 }
 
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
@@ -7552,7 +7864,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // Keys overlay (multi-tenant #22): read-only; mutations live in
             // the CLI (`llmux key …`).
             Overlay::Keys => Line::from(vec![
-                Span::raw(" keys — issue/suspend/rotate via `llmux key …`  "),
+                Span::raw(" keys — "),
+                key("w"),
+                Span::raw(" window  "),
+                key("f"),
+                Span::raw(" models  "),
+                key("↑/↓ PgUp/PgDn Home/End"),
+                Span::raw(" scroll  "),
+                key("r"),
+                Span::raw(" refresh  "),
                 key("K/Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -7742,7 +8062,6 @@ mod tests {
             logs: Vec::new(),
             model_usage,
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
@@ -7872,11 +8191,63 @@ mod tests {
         );
     }
 
-    /// Multi-tenant #22: the keys tab renders issued keys joined with their
-    /// tenant usage (name/email, state, counts, cost, span) plus dim
-    /// per-model breakdown rows, and builtin buckets with usage.
-    #[test]
-    fn keys_overlay_renders_key_rows_usage_and_model_breakdown() {
+    // --- keys panel (multi-tenant #22 + keys-history K) ---------------------
+
+    /// A keys-usage answer with one keyed tenant (one model cell) and one
+    /// builtin bucket — the document the panel renders from.
+    fn keys_doc(window: &str, models: Vec<String>) -> crate::key_usage::KeysUsageDoc {
+        crate::key_usage::KeysUsageDoc {
+            window: window.into(),
+            models,
+            available_models: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            from_ms: 0,
+            to_ms: 1_700_100_000_000,
+            rows: 15,
+            generated_ms: 1_700_100_000_000,
+            tenants: vec![
+                crate::dashboard::TenantUsageDoc {
+                    tenant: "k-aaaa".into(),
+                    name: "pc-b".into(),
+                    email: Some("b@x.com".into()),
+                    requests: 12,
+                    ok: 11,
+                    errors: 1,
+                    tokens_in: 3_400,
+                    tokens_out: 900,
+                    cost_usd: 1.25,
+                    first_ms: 1_700_000_000_000,
+                    last_ms: 1_700_100_000_000,
+                    models: vec![crate::dashboard::TenantModelDoc {
+                        group: "claude".into(),
+                        model: "claude-opus-4-8".into(),
+                        requests: 12,
+                        tokens_in: 3_400,
+                        tokens_out: 900,
+                        cache_read: 0,
+                        cache_creation: 0,
+                        cost_usd: 1.25,
+                    }],
+                },
+                crate::dashboard::TenantUsageDoc {
+                    tenant: "local".into(),
+                    name: "local".into(),
+                    email: None,
+                    requests: 3,
+                    ok: 3,
+                    errors: 0,
+                    tokens_in: 10,
+                    tokens_out: 5,
+                    cost_usd: 0.0,
+                    first_ms: 1_700_000_000_000,
+                    last_ms: 1_700_000_000_000,
+                    models: Vec::new(),
+                },
+            ],
+            health: crate::key_usage::UsageHealth::default(),
+        }
+    }
+
+    fn keys_view() -> DashboardView {
         let mut view = view_with(Vec::new());
         view.client_keys = vec![crate::dashboard::KeyRowDoc {
             id: "k-aaaa".into(),
@@ -7888,51 +8259,37 @@ mod tests {
             created_at_ms: 1,
             revoked_at_ms: None,
         }];
-        view.tenant_usage = vec![
-            crate::dashboard::TenantUsageDoc {
-                tenant: "k-aaaa".into(),
-                name: "pc-b".into(),
-                email: Some("b@x.com".into()),
-                requests: 12,
-                ok: 11,
-                errors: 1,
-                tokens_in: 3_400,
-                tokens_out: 900,
-                cost_usd: 1.25,
-                first_ms: 1_700_000_000_000,
-                last_ms: 1_700_100_000_000,
-                models: vec![crate::dashboard::TenantModelDoc {
-                    group: "claude".into(),
-                    model: "claude-opus-4-8".into(),
-                    requests: 12,
-                    tokens_in: 3_400,
-                    tokens_out: 900,
-                    cache_read: 0,
-                    cache_creation: 0,
-                    cost_usd: 1.25,
-                }],
-            },
-            crate::dashboard::TenantUsageDoc {
-                tenant: "local".into(),
-                name: "local".into(),
-                email: None,
-                requests: 3,
-                ok: 3,
-                errors: 0,
-                tokens_in: 10,
-                tokens_out: 5,
-                cost_usd: 0.0,
-                first_ms: 1_700_000_000_000,
-                last_ms: 1_700_000_000_000,
-                models: Vec::new(),
-            },
-        ];
-        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
+        view
+    }
+
+    /// Chrome with the keys overlay open over a loaded answer.
+    fn keys_chrome(panel: crate::tui::KeysPanel) -> Chrome {
+        Chrome {
+            keys: panel,
+            ..chrome_overlay(Overlay::Keys)
+        }
+    }
+
+    fn loaded_panel() -> crate::tui::KeysPanel {
+        crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            ..Default::default()
+        }
+    }
+
+    /// Multi-tenant #22 + keys-history K-6: the keys tab renders issued keys
+    /// joined with their DURABLE tenant usage (name/email, state, counts,
+    /// cost, span) plus dim per-model breakdown rows, and builtin buckets.
+    #[test]
+    fn keys_overlay_renders_key_rows_usage_and_model_breakdown() {
+        let rows = render_rows(&keys_view(), &keys_chrome(loaded_panel()), 160, 30);
         let all = rows.join("\n");
-        assert!(all.contains("k-aaaa"), "key id row:\n{all}");
+        assert!(
+            all.contains("k-aaaa"),
+            "attribution id in the key cell:\n{all}"
+        );
         assert!(all.contains("pc-b <b@x.com>"), "name+email joined:\n{all}");
         assert!(all.contains("suspended"), "state column:\n{all}");
-        assert!(all.contains("lmk-b1b2"), "display prefix only:\n{all}");
         assert!(all.contains("$1.25"), "priced cost:\n{all}");
         assert!(
             all.contains("└ claude/claude-opus-4-8"),
@@ -7942,16 +8299,328 @@ mod tests {
         assert!(all.contains("→"), "used-from → used-to span:\n{all}");
     }
 
+    /// K-6 `name을 맨 앞`: the NAME column is first and the key metadata cell
+    /// never exceeds 16 display cells (and never carries a secret).
+    #[test]
+    fn keys_overlay_puts_name_first_and_caps_the_key_cell() {
+        let mut view = keys_view();
+        view.client_keys[0].id = "k-0123456789abcdef".into();
+        view.client_keys[0].key_prefix = "lmk-longprefix".into();
+        let mut doc = keys_doc("all", Vec::new());
+        doc.tenants[0].tenant = "k-0123456789abcdef".into();
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        assert_eq!(rows[0].cells[0], "pc-b <b@x.com>", "name is column 0");
+        let key_cell = &rows[0].cells[1];
+        assert!(
+            cell_width(key_cell) <= 16,
+            "key cell is at most 16 display cells: {key_cell:?}"
+        );
+        assert!(
+            key_cell.ends_with('…'),
+            "an over-long key cell is clipped, not wrapped: {key_cell:?}"
+        );
+        // Header order matches the rendered cells.
+        let frame = render_rows(&view, &keys_chrome(panel), 160, 30);
+        let header = frame
+            .iter()
+            .find(|l| l.contains("name") && l.contains("cost"))
+            .expect("header row");
+        let name_at = header.find("name").expect("name column");
+        let key_at = header.find("key").expect("key column");
+        assert!(name_at < key_at, "name precedes key: {header:?}");
+    }
+
+    /// K-0 `위아래 키로 볼 수 있게`: every flattened row is reachable — the
+    /// LAST row renders once the panel is scrolled to the end, on a terminal
+    /// far too short to show them all at once.
+    /// 40 tenants, each with one model row: 80 flattened rows — more than any
+    /// test terminal can show at once.
+    fn big_keys_panel() -> (DashboardView, crate::tui::KeysPanel) {
+        let mut view = keys_view();
+        let mut doc = keys_doc("all", Vec::new());
+        // 40 tenants, each with a model row: 80+ rows on a 12-row terminal.
+        doc.tenants = (0..40)
+            .map(|i| crate::dashboard::TenantUsageDoc {
+                tenant: format!("k-{i:04}"),
+                name: format!("tenant-{i:02}"),
+                email: None,
+                requests: 1,
+                ok: 1,
+                errors: 0,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                first_ms: 1_700_000_000_000,
+                last_ms: 1_700_000_000_000,
+                models: vec![crate::dashboard::TenantModelDoc {
+                    group: "claude".into(),
+                    model: format!("model-{i:02}"),
+                    requests: 1,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    cost_usd: 0.0,
+                }],
+            })
+            .collect();
+        view.client_keys.clear();
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        (view, panel)
+    }
+
+    #[test]
+    fn keys_overlay_scroll_reaches_the_final_row_offscreen() {
+        let (view, panel) = big_keys_panel();
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        assert_eq!(rows.len(), 80, "40 tenant rows + 40 model rows");
+
+        // Unscrolled, a 12-row frame cannot show the last tenant.
+        let top = render(&view, &keys_chrome(panel.clone()), 200, 12);
+        assert!(!top.contains("tenant-39"), "last row is offscreen:\n{top}");
+
+        // Scrolled to the end (what End computes), it is on screen.
+        let end = crate::tui::KeysPanel {
+            scroll: rows.len() - 1,
+            ..panel
+        };
+        let bottom = render(&view, &keys_chrome(end), 200, 12);
+        assert!(
+            bottom.contains("└ claude/model-39"),
+            "the final flattened row is reachable:\n{bottom}"
+        );
+    }
+
+    /// K-6 `name을 맨 앞` on a REAL terminal: at 100x28 and 80x24 the fixed
+    /// columns used to sum past the frame width, starving the `Fill(1)` name
+    /// column to ZERO — the name header, every tenant name and every model
+    /// label disappeared (live capture, 2026-09-14). The name column keeps a
+    /// usable budget at every width; lower-value columns yield instead.
+    #[test]
+    fn keys_overlay_keeps_names_and_model_labels_on_narrow_terminals() {
+        let view = keys_view();
+        for (w, h) in [(80, 24), (100, 28), (120, 30), (160, 40)] {
+            let text = render(&view, &keys_chrome(loaded_panel()), w, h);
+            assert!(
+                text.contains("name"),
+                "{w}x{h}: the name header survives:\n{text}"
+            );
+            assert!(
+                text.contains("pc-b"),
+                "{w}x{h}: the tenant name is visible:\n{text}"
+            );
+            assert!(
+                text.contains("└ claude/"),
+                "{w}x{h}: the model label is visible:\n{text}"
+            );
+        }
+    }
+
+    /// The narrow layout sheds the widest, lowest-value columns first (the
+    /// `used` span, then `kind`) and never the name/key/req/token/cost core.
+    #[test]
+    fn keys_overlay_sheds_low_value_columns_before_the_name_column() {
+        let view = keys_view();
+        let wide = render(&view, &keys_chrome(loaded_panel()), 200, 30);
+        assert!(wide.contains("used"), "a wide frame shows every column");
+
+        let narrow = render(&view, &keys_chrome(loaded_panel()), 80, 24);
+        assert!(
+            !narrow.contains("used"),
+            "80 cells drop the widest span column:\n{narrow}"
+        );
+        for core in ["name", "key", "req", "in", "out", "cost"] {
+            assert!(
+                narrow.contains(core),
+                "80 cells keep the {core} column:\n{narrow}"
+            );
+        }
+    }
+
+    /// The visible-column budget is derived, not hardcoded per width: every
+    /// kept column plus the name minimum fits the frame, and `name` is never
+    /// dropped.
+    #[test]
+    fn keys_visible_columns_always_fit_and_always_keep_the_name() {
+        for width in [20_u16, 40, 60, 80, 100, 120, 160, 200] {
+            let cols = keys_visible_columns(width);
+            assert_eq!(cols.first(), Some(&0), "width {width}: name is first");
+            let fixed: u16 = cols.iter().skip(1).map(|&i| KEYS_COLUMNS[i].width).sum();
+            let spacing = cols.len().saturating_sub(1) as u16;
+            assert!(
+                fixed + spacing <= width,
+                "width {width}: fixed columns {fixed} + spacing {spacing} must leave room for the name"
+            );
+        }
+    }
+
+    /// K-0: scrolling to the END shows the final PAGE, not one last row over a
+    /// blank screen — every row stays reachable, the viewport just stops at the
+    /// last full page.
+    #[test]
+    fn keys_overlay_end_scroll_shows_a_full_final_page() {
+        let (view, panel) = big_keys_panel();
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        let end = crate::tui::KeysPanel {
+            scroll: rows.len() - 1,
+            ..panel
+        };
+        let frame = render_rows(&view, &keys_chrome(end), 200, 14);
+        let text = frame.join("\n");
+        assert!(
+            text.contains("└ claude/model-39"),
+            "the very last row is on screen:\n{text}"
+        );
+        // A full page means the rows just BEFORE the end fill the viewport.
+        assert!(
+            text.contains("tenant-37") && text.contains("tenant-39"),
+            "the final page is filled, not one row over blank space:\n{text}"
+        );
+    }
+
+    /// K-0/K-6: the title states the ACTIVE filter — a filtered view can
+    /// never be read as lifetime data.
+    #[test]
+    fn keys_overlay_title_states_the_active_window_and_model_filter() {
+        let panel = crate::tui::KeysPanel {
+            window: crate::key_usage::UsageWindow::H24,
+            models: ["claude-opus-4-8".to_string()].into_iter().collect(),
+            doc: Some(std::sync::Arc::new(keys_doc(
+                "24h",
+                vec!["claude-opus-4-8".into()],
+            ))),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(text.contains("window 24h"), "window in the title:\n{text}");
+        assert!(text.contains("1 model(s)"), "filter in the title:\n{text}");
+        assert!(text.contains("15 requests"), "matched rows:\n{text}");
+    }
+
+    /// K-4/K-5: while the legacy history is migrating, the totals are partial
+    /// by construction — the panel says `importing history N%` so they cannot
+    /// be read as final.
+    #[test]
+    fn keys_overlay_labels_totals_as_partial_while_the_history_imports() {
+        let mut doc = keys_doc("all", Vec::new());
+        doc.health = crate::key_usage::UsageHealth {
+            importing: true,
+            import_pct: 42,
+            ..Default::default()
+        };
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 200, 30);
+        assert!(
+            text.contains("importing history 42%"),
+            "partial totals are labelled:\n{text}"
+        );
+
+        // At rest the label is absent (no permanent scare text).
+        let text = render(&keys_view(), &keys_chrome(loaded_panel()), 200, 30);
+        assert!(
+            !text.contains("importing history"),
+            "quiet at rest:\n{text}"
+        );
+    }
+
+    /// K-5: a failed query says so — it must never render as a valid zero, and
+    /// it must not leave the previous (differently-filtered) rows on screen.
+    #[test]
+    fn keys_overlay_shows_a_failed_query_instead_of_zeros() {
+        let panel = crate::tui::KeysPanel {
+            error: Some("database is locked".into()),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(
+            text.contains("keys usage unavailable") && text.contains("database is locked"),
+            "the failure is named:\n{text}"
+        );
+        assert!(
+            !text.contains("pc-b <b@x.com>"),
+            "no tenant rows are rendered under a failed query:\n{text}"
+        );
+    }
+
+    /// K-0: the `f` picker lists the observed models with their selection
+    /// state and its own key legend.
+    #[test]
+    fn keys_overlay_model_picker_lists_options_and_marks_selection() {
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            picker: Some(crate::tui::KeysPicker {
+                cursor: 0,
+                selected: ["gpt-6-astra".to_string()].into_iter().collect(),
+                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            }),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(text.contains("[ ] claude-opus-4-8"), "unselected:\n{text}");
+        assert!(text.contains("[x] gpt-6-astra"), "selected:\n{text}");
+        assert!(text.contains("Space toggle"), "picker legend:\n{text}");
+    }
+
+    /// The picker's key legend stays fully readable on a narrow terminal —
+    /// a half-width popup clipped it to "…Ente" at 80 columns (live capture).
+    #[test]
+    fn keys_model_picker_legend_is_readable_at_eighty_columns() {
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            picker: Some(crate::tui::KeysPicker {
+                cursor: 0,
+                selected: Default::default(),
+                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            }),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 80, 24);
+        assert!(
+            text.contains("Enter apply · Esc cancel"),
+            "the whole legend fits:\n{text}"
+        );
+    }
+
     /// The keys tab with nothing issued and no usage renders the how-to hint
     /// instead of an empty table.
     #[test]
     fn keys_overlay_empty_state_carries_the_issue_hint() {
-        let view = view_with(Vec::new());
-        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
-        let all = rows.join("\n");
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(crate::key_usage::KeysUsageDoc {
+                window: "all".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let text = render(&view_with(Vec::new()), &keys_chrome(panel), 160, 30);
         assert!(
-            all.contains("llmux key new --name"),
-            "empty-state hint:\n{all}"
+            text.contains("llmux key new --name"),
+            "empty-state hint:\n{text}"
+        );
+    }
+
+    /// Before the first answer arrives the panel says it is loading — it does
+    /// NOT show an empty table that reads like "no usage".
+    #[test]
+    fn keys_overlay_says_loading_before_the_first_answer() {
+        let panel = crate::tui::KeysPanel {
+            loading: true,
+            ..Default::default()
+        };
+        let text = render(&view_with(Vec::new()), &keys_chrome(panel), 160, 30);
+        assert!(
+            text.contains("loading keys usage"),
+            "loading state:\n{text}"
         );
     }
 
@@ -8278,6 +8947,7 @@ mod tests {
             reset_absolute: false,
             limits_input: String::new(),
             attach: None,
+            keys: Default::default(),
         }
     }
 

@@ -18,6 +18,7 @@ feature is incomplete.
 | Config file keys, proxy/scheduler/routing/account types | [`docs/configuration.md`](../docs/configuration.md) |
 | Context-window / common usage Q&A | [`docs/faq.md`](../docs/faq.md) |
 | Model catalog / aliases / `max_context` | [`docs/models.md`](../docs/models.md) |
+| **Provider/model integration, or any change to what a backend honors / drops / refuses** | [`docs/provider-compatibility.md`](../docs/provider-compatibility.md) (+ a [`README.md`](../README.md) caveat when the difference is material to a user picking a model) |
 | Islands menu-bar app behavior | [`docs/llmux-islands.md`](../docs/llmux-islands.md) |
 | Captured Claude Code / multi-model **system prompt** wire text | [`docs/system-prompts/`](../docs/system-prompts/) — especially [`samples/`](../docs/system-prompts/samples/); never replace real samples with meta-only prose |
 | Product/architecture *decisions* (not how-to) | [`.prd/`](../.prd/) |
@@ -33,14 +34,31 @@ the change. Prefer one owning doc over shotgun edits.
 1. **Classify** the change against the map above (or mark N/A).  
 2. **Edit** the owning doc so it matches shipped behavior (commands, flags,
    routes, surfaces).  
-3. **Index** — if you added a new guide, link it from
+3. **Provider axes (mandatory for any provider/model integration or
+   semantics-mapping change)** — audit each axis below against the backend you
+   touched, then update
+   [`docs/provider-compatibility.md`](../docs/provider-compatibility.md) and the
+   README caveats in the SAME PR:
+   - output cap (`max_tokens` / `max_output_tokens`) — forwarded, dropped, or refused;
+   - reasoning — prior `thinking` blocks, top-level thinking config, effort, continuity;
+   - tools and images — conversion, refusals, nested tool-result content;
+   - streaming and error semantics — terminal events, `stop_reason` mapping, 400 vs 502;
+   - usage and counting — what `output_tokens` includes, local estimate vs upstream count;
+   - auth and endpoint distinction — subscription gateway vs public vendor API; they are
+     not interchangeable, and public API docs are not a receipt for a gateway.
+
+   Every row carries its **source and date**: a `file:line`, a named test, or a dated live
+   probe against the real endpoint. Label honestly — **untested** (nobody measured it) is
+   not **unsupported** (measured and refused); never write an absolute absence you did not
+   probe.
+4. **Index** — if you added a new guide, link it from
    [`docs/README.md`](../docs/README.md) (and root README Docs section only if
    it is a primary entry point).  
-4. **Samples** — if the Claude Code / multi-model **prompt surface** changed,
+5. **Samples** — if the Claude Code / multi-model **prompt surface** changed,
    re-capture or note the drift under `docs/system-prompts/`; do not invent
    prompt text.  
-5. **Links** — open every path you touched; no broken relative links.  
-6. **PR body** — either list docs files updated, or `docs: N/A — …`.
+6. **Links** — open every path you touched; no broken relative links.
+7. **PR body** — either list docs files updated, or `docs: N/A — …`.
 
 ## Explicit non-goals
 

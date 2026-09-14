@@ -444,24 +444,34 @@ impl<F: UsageFetcher> UsagePoller<F> {
     /// vanished) accounts are a no-op. A 403 means the token was revoked —
     /// surfaced as an auth failure; a 401 is left for the auth layer's
     /// refresh path (the next poll retries with the refreshed credential).
+    /// Both outcomes are applied through the FINGERPRINT-GUARDED pool calls,
+    /// so a verdict earned by a credential that was replaced mid-poll (a
+    /// re-login) is discarded instead of landing on its successor.
     pub async fn poll_account(
         &self,
         account: &AccountId,
         now: SystemTime,
     ) -> Result<(), UsageError> {
-        let Some(AccountCredential::Oauth { access_token, .. }) = self.pool.credential(account)
-        else {
+        // Credential AND fingerprint in ONE capture: everything below is
+        // applied only if the account still IS what was read here
+        // (`docs/keys-history/relogin-trace.md` B4). A re-login that lands
+        // during the fetch must not receive this poll's verdict.
+        let Some((credential, fingerprint)) = self.pool.credential_with_fingerprint(account) else {
+            return Ok(());
+        };
+        let AccountCredential::Oauth { access_token, .. } = credential else {
             return Ok(());
         };
         match self.fetcher.fetch(&self.base_url, &access_token).await {
             Ok(snapshot) => {
-                self.pool.record_usage(account, &snapshot, now);
+                self.pool
+                    .record_usage_if(account, &fingerprint, &snapshot, now);
                 Ok(())
             }
             Err(err) => {
                 if let UsageError::Status { status } = &err {
                     if *status == http::StatusCode::FORBIDDEN {
-                        self.pool.record_auth_failure(account);
+                        self.pool.record_auth_failure_if(account, &fingerprint);
                     }
                 }
                 Err(err)
@@ -902,6 +912,75 @@ mod tests {
         let b = snapshot.accounts.iter().find(|x| x.id == id("b")).unwrap();
         assert!(!a.healthy, "403 = revoked → auth failure");
         assert!(b.healthy, "401 = expired token → refresh path owns it");
+    }
+
+    /// A fetcher that performs a RE-LOGIN (roster reload with a fresh
+    /// credential) before answering — the deterministic stand-in for "the
+    /// operator logged back in while this poll was in flight"
+    /// (`docs/keys-history/relogin-trace.md` B4).
+    struct ReloginFetcher {
+        pool: AccountPool,
+        result: Mutex<Option<Result<UsageSnapshot, UsageError>>>,
+    }
+
+    impl UsageFetcher for &ReloginFetcher {
+        fn fetch(
+            &self,
+            _base_url: &str,
+            _access_token: &str,
+        ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+            let mut relogged = oauth_account("a");
+            if let AccountCredential::Oauth { access_token, .. } = &mut relogged.credential {
+                *access_token = "at-a-relogin".into();
+            }
+            self.pool.reload_accounts(&[relogged]);
+            let result = self
+                .result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Ok(UsageSnapshot::default()));
+            async move { result }
+        }
+    }
+
+    /// B4: a 403 earned by the credential the re-login retired must not bench
+    /// the account the re-login just healed.
+    #[tokio::test]
+    async fn forbidden_from_a_retired_credential_does_not_bench_the_relogin() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&id("a"));
+        let fetcher = ReloginFetcher {
+            pool: pool.clone(),
+            result: Mutex::new(Some(Err(status_err(403)))),
+        };
+        let poller = UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
+
+        let _ = poller.poll_account(&id("a"), now()).await;
+
+        assert!(
+            pool.snapshot().accounts[0].healthy,
+            "the re-logged-in account stays healthy"
+        );
+    }
+
+    /// B4, the success half: a reading fetched with the retired credential is
+    /// not the new credential's usage, so it is discarded rather than merged.
+    #[tokio::test]
+    async fn usage_read_with_a_retired_credential_is_discarded() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = ReloginFetcher {
+            pool: pool.clone(),
+            result: Mutex::new(Some(Ok(snapshot_with(0.9)))),
+        };
+        let poller = UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
+
+        poller.poll_account(&id("a"), now()).await.expect("poll ok");
+
+        assert!(
+            pool.snapshot().accounts[0].five_hour.is_none(),
+            "a reading from the retired credential never lands"
+        );
     }
 
     #[tokio::test]

@@ -851,7 +851,7 @@ pub(crate) struct WindowedRow {
 /// On-disk schema version for [`PersistedRequest`]. Bumped only on a
 /// breaking layout change; older/garbage lines are skipped on load, never
 /// fatal.
-const PERSIST_VERSION: u8 = 1;
+pub(crate) const PERSIST_VERSION: u8 = 1;
 
 /// One finished request, serialized as a single JSON line. Carries exactly the
 /// fields of an [`ActivityEvent::RequestFinished`] needed to reconstruct it for

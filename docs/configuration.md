@@ -6,6 +6,19 @@ llmux stores local configuration at `~/.config/llmux.json` by default. It respec
 
 The config file is written with mode `0600`. Updates use atomic read-merge-write so the daemon and CLI can safely change different parts of the config while llmux is running.
 
+### Files beside the config
+
+| Path | What |
+|---|---|
+| `~/.config/llmux/usage.sqlite3` | Durable per-tenant keys usage (the `K` tab's windows/filters). `llmux-preview` builds use `~/.config/llmux-preview/usage.sqlite3`, so the two channels never share history. |
+| `<config dir>/<config stem>/usage.sqlite3` | Where the store moves when `$LLMUX_CONFIG` points at a non-default file — e.g. `LLMUX_CONFIG=/tmp/x/alt.json` → `/tmp/x/alt/usage.sqlite3`. An alternate config therefore never reads or writes your real history. |
+
+The usage database is created `0600` inside a `0700` directory and stores
+request METADATA only — timestamp, tenant id, backend group, served model,
+status, token counts. No prompts, no responses, no credentials. Deleting it
+loses only the keys tab's history (the daemon recreates it and re-imports
+whatever `activity.jsonl` still holds); everything else keeps working.
+
 ## Example
 
 ```json

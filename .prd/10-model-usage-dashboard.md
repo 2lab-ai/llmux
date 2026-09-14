@@ -192,9 +192,13 @@ credential handling, request bodies, or quota-window semantics.
 
 ## Out of Scope
 
-- Durable historical analytics across daemon restarts.
-- A browser dashboard, Prometheus/OpenMetrics endpoint, SQLite/ClickHouse/TimescaleDB sink, or
+- A browser dashboard, Prometheus/OpenMetrics endpoint, ClickHouse/TimescaleDB sink, or
   exported reporting pipeline.
+  - **Amended (keys-history, `docs/keys-history/spec.md` K):** ONE local SQLite file
+    (`usage.sqlite3`) now backs the per-tenant `keys` tab — windowed, model-filtered, and durable
+    across restarts. It is scoped to keys/tenant metering: the model-usage surfaces in this PRD
+    keep folding the in-memory activity log and `activity.jsonl`, and no external sink, exporter,
+    or analytics service is introduced.
 - Dollar-cost calculation or billing reconciliation.
 - Per-model quota-window inference or scheduler decisions based on model stats.
 - Raw prompt, response, or tool-call content logging.

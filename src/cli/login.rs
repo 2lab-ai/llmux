@@ -64,22 +64,16 @@ async fn login_oauth() -> Result<(), CliError> {
     let mut final_name = account.name.clone();
     let mut outcome = Upsert::Added;
     crate::config::update(|config: &mut Config| {
-        let mut account = account.clone();
-        // When the profile was unavailable the helper returns the placeholder
-        // `claude:account`; assign the next free `claude:account-N` against the
-        // fresh on-disk state so anonymous logins don't overwrite each other
-        // (matches the original CLI behavior).
-        if account.name == "claude:account" {
-            let n = config
-                .accounts
-                .iter()
-                .filter(|a| a.name.starts_with("claude:account-"))
-                .count()
-                + 1;
-            account.name = format!("claude:account-{n}");
-        }
-        final_name = account.name.clone();
-        outcome = config.upsert_account(account);
+        let account = account.clone();
+        outcome = config.upsert_account(account.clone());
+        // Report the name the ROSTER ended up with: an identity-matched
+        // re-login keeps the established name (`docs/keys-history/
+        // relogin-trace.md` B6), so echoing the freshly derived one would name
+        // an account that exists nowhere.
+        final_name = config
+            .find_account(&account)
+            .map(|idx| config.accounts[idx].name.clone())
+            .unwrap_or(account.name);
     })?;
 
     match outcome {
@@ -96,8 +90,9 @@ async fn login_oauth() -> Result<(), CliError> {
 /// so both build the identical `claude:<email>` account from the same flow.
 ///
 /// `upstream` is the base URL the profile fetch (`/api/oauth/profile`) hits.
-/// A profile-fetch failure degrades to an unenriched `claude:account-N` name
-/// rather than losing the freshly minted tokens. This function performs NO
+/// A profile-fetch failure is an ERROR: the account would have no stable
+/// identity to dedup on, and persisting it is what duplicated accounts
+/// (`docs/keys-history/relogin-trace.md` B7). This function performs NO
 /// config write and NO logging of the token — the caller persists it (CLI:
 /// `config::update`; dashboard: `AppState::inject_account` /
 /// `POST /llmux/inject-account`).
@@ -107,47 +102,65 @@ pub async fn oauth_login_to_account(
 ) -> Result<AccountConfig, CliError> {
     let tokens = oauth::login_interactive(client).await?;
 
-    // Profile fetch enriches uuid/name/tier; a failure degrades to an
-    // unenriched account rather than losing the freshly minted tokens.
-    let fetched = profile::fetch_profile(client, upstream, &tokens.access_token).await;
-    let (account_uuid, email, tier) = match fetched {
-        Ok(p) => {
-            if let Some(tier) = &p.tier {
-                println!("Detected Claude {tier} account: {}", p.email);
-            }
-            (p.account_uuid, p.email, p.tier)
-        }
-        Err(err) => {
-            eprintln!("warning: could not fetch account profile — {err}");
-            (String::new(), String::new(), None)
-        }
-    };
-
-    // Encode the model group in the name (`claude:<email>`) so the same email
-    // can hold a Claude AND a Codex subscription without colliding — mirrors
-    // the `codex:<email>` convention the `--codex` flow uses (req5). When the
-    // profile is unknown the name carries an empty uuid; the daemon's upsert
-    // then dedups by name, so a re-login still updates rather than duplicates.
-    let name = if email.is_empty() {
-        "claude:account".to_string()
-    } else {
-        format!("claude:{email}")
-    };
+    // The profile fetch IS the identity step: it yields the `accountUuid` every
+    // later upsert dedups on. A failure here is fatal on purpose — persisting
+    // an unidentified account is what produced duplicate `claude:account-N`
+    // rows (`docs/keys-history/relogin-trace.md` B7). The freshly minted tokens
+    // are dropped with it; re-running the login is cheap, an un-dedupable
+    // account is not.
+    let profile = profile::fetch_profile(client, upstream, &tokens.access_token)
+        .await
+        .map_err(|err| {
+            CliError::Message(format!(
+                "could not fetch the account profile ({err}); nothing was saved — re-run the login"
+            ))
+        })?;
+    if let Some(tier) = &profile.tier {
+        println!("Detected Claude {tier} account: {}", profile.email);
+    }
+    let name = claude_account_name(&profile.account_uuid, &profile.email)?;
 
     Ok(AccountConfig {
         name,
         credential: AccountCredential::Oauth {
-            account_uuid,
+            account_uuid: profile.account_uuid,
             access_token: tokens.access_token,
             // A fresh code exchange always carries a refresh token; `None`
             // (refresh-style response) degrades to empty.
             refresh_token: tokens.refresh_token.unwrap_or_default(),
             expires_at_ms: tokens.expires_at_ms,
-            tier,
+            tier: profile.tier,
             // Login mints a brand-new token — that IS a refresh for the
             // dashboard's "refreshed ago" display.
             last_refresh_ms: Some(super::now_ms()),
         },
+    })
+}
+
+/// Local label for a freshly logged-in Claude account — and the gate that
+/// refuses an UNIDENTIFIED one (`docs/keys-history/relogin-trace.md` B7).
+///
+/// The `account_uuid` is the account's only stable identity: `upsert_account`
+/// dedups on it, and `AccountCredential::account_uuid()` reports `None` when it
+/// is empty. Persisting an account without one means every later login either
+/// overwrites it by name or piles up another duplicate — so an empty uuid is a
+/// hard error, not a placeholder name. Identity is NEVER inferred from the
+/// token (a token is not an identity and it rotates); with a uuid but no email
+/// the uuid itself is the label.
+///
+/// The model group is encoded in the name (`claude:…`) so one email can hold a
+/// Claude AND a Codex subscription without colliding (req5).
+pub(crate) fn claude_account_name(account_uuid: &str, email: &str) -> Result<String, CliError> {
+    if account_uuid.trim().is_empty() {
+        return Err(CliError::Message(
+            "could not identify the account (no accountUuid in the profile); nothing was saved — re-run the login. An account with no stable identity cannot be deduped, so a later re-login would duplicate it instead of updating it."
+                .into(),
+        ));
+    }
+    Ok(if email.is_empty() {
+        format!("claude:{account_uuid}")
+    } else {
+        format!("claude:{email}")
     })
 }
 
@@ -394,6 +407,41 @@ fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `docs/keys-history/relogin-trace.md` B7: an OAuth login whose profile
+    /// could not be identified must FAIL, not persist an account with no
+    /// stable identity. `AccountCredential::account_uuid()` returns `None` for
+    /// an empty uuid, so such an account can only dedup by name — the next
+    /// unidentified login either collides with it or piles up a duplicate.
+    #[test]
+    fn an_unidentified_oauth_login_is_refused() {
+        let err =
+            claude_account_name("", "someone@x.com").expect_err("no stable identity => no account");
+        assert!(
+            err.to_string().contains("identify"),
+            "the error must say WHY nothing was saved: {err}"
+        );
+        assert!(claude_account_name("", "").is_err());
+    }
+
+    /// An identified profile names the account after its email…
+    #[test]
+    fn an_identified_login_is_named_after_its_email() {
+        assert_eq!(
+            claude_account_name("uuid-a", "me@x.com").expect("identified"),
+            "claude:me@x.com"
+        );
+    }
+
+    /// …and an identified profile with NO email falls back to the uuid — a
+    /// real stable identity. Never a token-derived value, and never a shared
+    /// placeholder two different accounts could both land on.
+    #[test]
+    fn an_identified_login_without_an_email_falls_back_to_its_uuid() {
+        let name = claude_account_name("uuid-a", "").expect("identified");
+        assert_eq!(name, "claude:uuid-a");
+        assert_ne!(name, "claude:account", "no shared placeholder");
+    }
 
     fn or_account(name: &str, key: &str) -> AccountConfig {
         AccountConfig {

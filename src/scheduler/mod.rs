@@ -502,6 +502,21 @@ impl PoolState {
         self.accounts.iter_mut().find(|a| &a.id == account)
     }
 
+    /// Whether `account`'s LIVE entry still matches `expected` — identity,
+    /// generation AND credential digest (`.prd/16-codex-usage-controls.md`
+    /// §Account identity/generation safety). The ONE place a guarded mutation
+    /// decides "is the result I am about to apply still about this account?".
+    /// Called with the write lock already held, so the answer cannot go stale
+    /// between the check and the mutation it guards.
+    fn matches_fingerprint(&self, account: &AccountId, expected: &AccountFingerprint) -> bool {
+        self.accounts
+            .iter()
+            .find(|a| &a.id == account)
+            .map(AccountFingerprint::of)
+            .as_ref()
+            == Some(expected)
+    }
+
     /// Record rate-limit headers from an upstream response. Freshest
     /// `fetched_at` wins per window; header data also self-heals a
     /// `Heuristic` cooldown when it shows capacity. When no unified windows
@@ -1224,6 +1239,11 @@ impl AccountPool {
             pool: Arc::clone(&self.inner),
             id: acct.id.clone(),
             credential: acct.credential.clone(),
+            // Taken from the SAME borrow that cloned the credential, under the
+            // SAME write lock: a fingerprint read separately could already
+            // describe a different credential than the one this request will
+            // send, which is exactly the race the guards exist to refuse.
+            fingerprint: AccountFingerprint::of(acct),
         };
         Ok(lease)
     }
@@ -1409,12 +1429,7 @@ impl AccountPool {
         now: SystemTime,
     ) -> bool {
         let mut state = self.write();
-        let live = state
-            .accounts
-            .iter()
-            .find(|a| &a.id == account)
-            .map(AccountFingerprint::of);
-        if live.as_ref() != Some(expected) {
+        if !state.matches_fingerprint(account, expected) {
             return false;
         }
         state.record_usage(account, usage, now);
@@ -1453,6 +1468,58 @@ impl AccountPool {
         self.write().update_credential(account, credential);
     }
 
+    /// [`Self::record_auth_failure`] gated on the fingerprint the caller read
+    /// the failing credential with (`docs/keys-history/relogin-trace.md` B1):
+    /// a 401 — or a dead refresh token — earned by a credential a re-login has
+    /// since RETIRED must not bench the account that re-login healed. Check and
+    /// mutation happen under ONE write lock. Returns `false` when the failure
+    /// was DISCARDED as stale.
+    pub fn record_auth_failure_if(
+        &self,
+        account: &AccountId,
+        expected: &AccountFingerprint,
+    ) -> bool {
+        let mut state = self.write();
+        if !state.matches_fingerprint(account, expected) {
+            return false;
+        }
+        state.record_auth_failure(account);
+        true
+    }
+
+    /// [`Self::update_credential`] gated the same way (relogin-trace B2): a
+    /// refresh that started from the retired credential must not overwrite the
+    /// one the re-login installed. Returns `false` when the refreshed
+    /// credential was DISCARDED.
+    pub fn update_credential_if(
+        &self,
+        account: &AccountId,
+        expected: &AccountFingerprint,
+        credential: AccountCredential,
+    ) -> bool {
+        let mut state = self.write();
+        if !state.matches_fingerprint(account, expected) {
+            return false;
+        }
+        state.update_credential(account, credential);
+        true
+    }
+
+    /// Credential AND fingerprint of one account, captured under ONE read lock
+    /// — the atomic capture every guarded background path starts from
+    /// (relogin-trace B4/B5). Reading them with two calls would leave a window
+    /// in which the fingerprint describes a credential the caller never used.
+    pub fn credential_with_fingerprint(
+        &self,
+        account: &AccountId,
+    ) -> Option<(AccountCredential, AccountFingerprint)> {
+        self.read()
+            .accounts
+            .iter()
+            .find(|a| &a.id == account)
+            .map(|a| (a.credential.clone(), AccountFingerprint::of(a)))
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, PoolState> {
         self.inner.read().expect("pool lock poisoned")
     }
@@ -1462,9 +1529,12 @@ impl AccountPool {
     }
 
     /// Replace the account roster after a config reload (TUI `R`, `import`
-    /// while running). Existing window/cooldown state is kept for accounts
-    /// that survive (credentials refresh from config); leases on removed
-    /// accounts drain naturally. A removed `current` clears the selection.
+    /// while running, a re-login's `inject_account`). Existing
+    /// window/cooldown/pause state is kept for accounts that survive
+    /// (credentials refresh from config); leases on removed accounts drain
+    /// naturally. A removed `current` clears the selection. A survivor whose
+    /// credential actually CHANGED takes a new generation and has an
+    /// `AuthFailed` health restored to `Healthy` — the re-login path.
     pub fn reload_accounts(&self, accounts: &[AccountConfig]) {
         let mut state = self.write();
         let next: Vec<AccountState> = accounts
@@ -1480,6 +1550,17 @@ impl AccountPool {
                             != credential_digest(&config.credential)
                         {
                             kept.generation = next_generation();
+                            // A CHANGED credential is the re-login itself
+                            // arriving (`docs/keys-history/spec.md` §L): heal
+                            // the auth failure it answers, exactly as
+                            // `PoolState::update_credential` does after a token
+                            // refresh. Byte-identical credentials are no new
+                            // evidence, so an unrelated reload never resurrects
+                            // a failed account; a non-auth `Errored` is not
+                            // something a credential can answer either.
+                            if kept.health == AccountHealth::AuthFailed {
+                                kept.health = AccountHealth::Healthy;
+                            }
                         }
                         kept.credential = config.credential.clone();
                         kept
@@ -1543,6 +1624,7 @@ pub struct AccountLease {
     pool: Arc<RwLock<PoolState>>,
     id: AccountId,
     credential: AccountCredential,
+    fingerprint: AccountFingerprint,
 }
 
 /// Manual impl: never print the pinned credential (it holds live secrets).
@@ -1561,6 +1643,14 @@ impl AccountLease {
 
     pub fn credential(&self) -> &AccountCredential {
         &self.credential
+    }
+
+    /// The account's fingerprint AT LEASE TIME — the token a result carries
+    /// back to [`AccountPool::record_auth_failure_if`] /
+    /// [`AccountPool::update_credential_if`] so a 401 (or a refresh) earned by
+    /// THIS credential cannot land on the credential that replaced it.
+    pub fn fingerprint(&self) -> &AccountFingerprint {
+        &self.fingerprint
     }
 }
 
@@ -2692,6 +2782,259 @@ mod tests {
         assert!(b.cooldown_until.is_some(), "surviving account keeps state");
         assert!(snapshot.accounts.iter().any(|a| a.id == id("c")));
         assert!(!snapshot.accounts.iter().any(|a| a.id == id("a")));
+    }
+
+    /// Same account name and same upstream uuid, DIFFERENT access token —
+    /// exactly what a re-login mints (`docs/keys-history/spec.md` §L step 3).
+    fn oauth_account_with_token(name: &str, access_token: &str) -> AccountConfig {
+        let mut account = oauth_account(name);
+        if let AccountCredential::Oauth {
+            access_token: slot, ..
+        } = &mut account.credential
+        {
+            *slot = access_token.to_string();
+        }
+        account
+    }
+
+    /// `docs/keys-history/spec.md` §L step 3: a re-login reaches the pool as a
+    /// roster reload, not as [`PoolState::update_credential`] — so the reload
+    /// is what must end the auth failure. Otherwise the account the operator
+    /// just logged back in stays benched until a restart.
+    #[test]
+    fn reload_with_changed_credential_clears_auth_failure() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&id("a"));
+        assert!(!pool.snapshot().accounts[0].healthy, "precondition");
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        assert!(
+            pool.snapshot().accounts[0].healthy,
+            "a re-login's fresh credential ends the auth failure"
+        );
+    }
+
+    /// §L step 4: the SAME credential re-applied (any unrelated config reload —
+    /// a pause toggle, an `import`) is no new evidence, so it must not
+    /// resurrect a failed account into selection.
+    #[test]
+    fn reload_with_unchanged_credential_keeps_auth_failure() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&id("a"));
+
+        pool.reload_accounts(&[oauth_account("a")]);
+
+        assert!(
+            !pool.snapshot().accounts[0].healthy,
+            "byte-identical credentials are not a re-login"
+        );
+    }
+
+    /// A non-auth `Errored` account is not healed either: only `AuthFailed` is
+    /// the failure a new credential answers (same rule as
+    /// [`PoolState::update_credential`]).
+    #[test]
+    fn reload_with_changed_credential_keeps_non_auth_error() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.write().accounts[0].health = AccountHealth::Errored("upstream 500".into());
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        assert_eq!(
+            pool.read().accounts[0].health,
+            AccountHealth::Errored("upstream 500".into()),
+            "a credential swap says nothing about a non-auth error"
+        );
+    }
+
+    /// §L step 4: healing auth health is the ONLY thing a re-login changes —
+    /// quota windows, the operator pause and an active cooldown all survive it.
+    #[test]
+    fn reload_with_changed_credential_keeps_quota_pause_and_cooldown() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_usage(
+            &id("a"),
+            &usage(Some(reading(0.42, NOW_SECS + 3600)), None),
+            now(),
+        );
+        pool.record_429(&id("a"), Some(Duration::from_secs(600)), now());
+        pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
+        pool.record_auth_failure(&id("a"));
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        let snapshot = pool.snapshot();
+        let a = &snapshot.accounts[0];
+        assert!(a.healthy, "auth failure healed");
+        assert_eq!(
+            a.five_hour.map(|w| w.utilization),
+            Some(0.42),
+            "quota window survives the credential swap"
+        );
+        assert_eq!(a.cooldown_until, Some(now() + Duration::from_secs(600)));
+        assert_eq!(a.cooldown_source, Some(CooldownSource::RetryAfter));
+        assert!(a.paused, "the operator pause outlives a re-login");
+    }
+
+    /// `docs/keys-history/relogin-trace.md` B1: a 401 earned by the credential
+    /// a re-login RETIRED must not bench the account that re-login healed.
+    #[test]
+    fn record_auth_failure_if_refuses_a_retired_credential() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let stale = pool.fingerprint(&id("a")).expect("fingerprint");
+
+        // The re-login lands while the old credential's request is in flight.
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        assert!(
+            !pool.record_auth_failure_if(&id("a"), &stale),
+            "the guard reports the stale result was discarded"
+        );
+        assert!(
+            pool.snapshot().accounts[0].healthy,
+            "the re-logged-in account stays healthy"
+        );
+    }
+
+    /// The same guard still benches on a REAL failure: a 401 from the account's
+    /// CURRENT credential is not stale.
+    #[test]
+    fn record_auth_failure_if_accepts_the_live_credential() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let live = pool.fingerprint(&id("a")).expect("fingerprint");
+
+        assert!(pool.record_auth_failure_if(&id("a"), &live));
+        assert!(!pool.snapshot().accounts[0].healthy);
+    }
+
+    /// B2: a refresh started from the retired credential must not overwrite the
+    /// credential the re-login installed — in-memory half of the race.
+    #[test]
+    fn update_credential_if_refuses_a_retired_credential() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let stale = pool.fingerprint(&id("a")).expect("fingerprint");
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        assert!(
+            !pool.update_credential_if(
+                &id("a"),
+                &stale,
+                oauth_account_with_token("a", "at-a-from-retired-refresh").credential,
+            ),
+            "the stale refresh is discarded"
+        );
+        match pool.credential(&id("a")).expect("credential") {
+            AccountCredential::Oauth { access_token, .. } => {
+                assert_eq!(access_token, "at-a-relogin", "the re-login token survives")
+            }
+            other => panic!("unexpected credential {other:?}"),
+        }
+    }
+
+    /// A refresh of the LIVE credential still applies (and still heals auth
+    /// health, same as the unguarded call it replaces).
+    #[test]
+    fn update_credential_if_accepts_the_live_credential_and_heals() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&id("a"));
+        let live = pool.fingerprint(&id("a")).expect("fingerprint");
+
+        assert!(pool.update_credential_if(
+            &id("a"),
+            &live,
+            oauth_account_with_token("a", "at-a-refreshed").credential,
+        ));
+        match pool.credential(&id("a")).expect("credential") {
+            AccountCredential::Oauth { access_token, .. } => {
+                assert_eq!(access_token, "at-a-refreshed")
+            }
+            other => panic!("unexpected credential {other:?}"),
+        }
+        assert!(pool.snapshot().accounts[0].healthy);
+    }
+
+    /// The lease pins credential AND fingerprint together, so the request's
+    /// result is guarded by the fingerprint of the credential it actually sent.
+    #[test]
+    fn lease_pins_the_fingerprint_of_the_credential_it_carries() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        let lease = pool.lease_for(None, &params()).expect("lease");
+        assert_eq!(
+            Some(lease.fingerprint()),
+            pool.fingerprint(&id("a")).as_ref(),
+            "fresh lease matches the live account"
+        );
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        match lease.credential() {
+            AccountCredential::Oauth { access_token, .. } => {
+                assert_eq!(
+                    access_token, "at-a",
+                    "the in-flight request keeps its token"
+                )
+            }
+            other => panic!("unexpected credential {other:?}"),
+        }
+        assert!(
+            !pool.record_auth_failure_if(&id("a"), lease.fingerprint()),
+            "a result from this lease can no longer bench the account"
+        );
+    }
+
+    /// B4's capture primitive: credential and fingerprint come from ONE lock,
+    /// so a poller can never pair a credential with a fingerprint that
+    /// describes a different one.
+    #[test]
+    fn credential_with_fingerprint_captures_both_together() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let (credential, fingerprint) =
+            pool.credential_with_fingerprint(&id("a")).expect("capture");
+        assert_eq!(fingerprint.digest, credential_digest(&credential));
+        assert_eq!(Some(&fingerprint), pool.fingerprint(&id("a")).as_ref());
+        assert!(pool.credential_with_fingerprint(&id("ghost")).is_none());
+    }
+
+    /// §L step 4 + `.prd/16` generation safety: the healed account keeps its
+    /// in-flight lease (pinned to the OLD credential until Drop) and still
+    /// takes a NEW generation, so an observation read before the re-login is
+    /// refused when it lands.
+    #[test]
+    fn reload_with_changed_credential_keeps_leases_and_invalidates_generation() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        let lease = pool.lease_for(None, &params()).expect("lease");
+        let before = pool.fingerprint(&id("a")).expect("fingerprint");
+        pool.record_auth_failure(&id("a"));
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        assert_eq!(
+            pool.snapshot().accounts[0].in_flight,
+            1,
+            "a re-login never yanks an in-flight lease"
+        );
+        let after = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert!(
+            after.generation > before.generation,
+            "swapped credential is a new generation ({} → {})",
+            before.generation,
+            after.generation
+        );
+        assert!(
+            !pool.record_usage_if(
+                &id("a"),
+                &before,
+                &usage(Some(reading(0.9, NOW_SECS + 3600)), None),
+                now()
+            ),
+            "a reading fetched before the re-login is discarded"
+        );
+        drop(lease);
+        assert_eq!(pool.snapshot().accounts[0].in_flight, 0);
     }
 
     // ---- per-group sticky (routing enabled) ----

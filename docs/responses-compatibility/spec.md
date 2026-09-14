@@ -30,10 +30,19 @@ Live probes against both endpoints (2026-09-11, synthetic fixtures — no user d
 | `tool_choice` `none` | 200, zero calls | 200, zero calls |
 | `max_output_tokens: 16` | **400 `Unsupported parameter: max_output_tokens`** | 200 `status:incomplete`, `incomplete_details.reason: max_output_tokens`, usage reports `output_tokens: 302` of which `reasoning_tokens: 286` |
 
+Re-probed 2026-09-14 with the smallest possible cap, `max_output_tokens: 1`: codex answered
+`400 {"detail":"Unsupported parameter: max_output_tokens"}` again; grok answered 200
+`status:incomplete` / `incomplete_details.reason: max_output_tokens` with visible output
+and `output_tokens: 168` of which `reasoning_tokens: 167`.
+
 The cap probe shows wire ACCEPTANCE and the visible-output effect on that one request. It
 does **not** prove the cap bounds the same total the Anthropic client means by
-`max_tokens` (the reported reasoning tokens are additional to the 16 visible ones), and it
+`max_tokens` (the reported reasoning tokens are additional to the visible ones), and it
 says nothing about billing.
+
+What the codex 400 licenses is narrow: `max_output_tokens` is refused. Whether that backend
+accepts some OTHER output-cap parameter is **unmeasured** here — no alternative field has
+been probed, so its absence from this document is not evidence that none exists.
 
 ## 2. Compatibility matrix
 

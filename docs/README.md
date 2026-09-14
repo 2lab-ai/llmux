@@ -17,6 +17,7 @@ features: [rules/documents.md](../rules/documents.md).
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex backend, install variants.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, Codex/Grok shaping, account types, email-anonymous mode.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
+- [Provider compatibility](provider-compatibility.md) — what each backend group actually honors: forwarded vs dropped vs refused request fields, the Codex/Grok `max_tokens` receipts, diagnostic headers, known unknowns.
 - [FAQ](faq.md) — context-window workarounds (including `gpt-*` → Claude 1M `/compact` → back).
 - [llmux Islands](llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, recording.
 - [System prompts (multi-model)](system-prompts/README.md) — **real captured system-prompt bodies** under [`system-prompts/samples/`](system-prompts/samples/) (CLI agent, 106k monitor, gpt SDK bot, compact, reviewer, auditor). Not a taxonomy essay.

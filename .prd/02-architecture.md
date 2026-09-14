@@ -38,6 +38,9 @@ src/
     codex.rs           # Anthropic Messages <-> OpenAI Responses translation + SSE converter
     stubs.rs           # gemini/local compile-checked drafts
   dashboard.rs         # DashboardHub + DashboardDoc (/llmux/dashboard contract)
+  key_usage.rs         # durable per-tenant keys usage: SQLite store (bundled), exact
+                       # rolling-window + model-filter queries, one-time activity.jsonl
+                       # import, GET /llmux/keys/usage document
   tui/
     mod.rs             # local + remote dashboard loops, attach client
     view.rs            # DashboardView: single render input from live state or DashboardDoc
@@ -275,7 +278,29 @@ remote control if the user binds beyond localhost.
 ## Key dependencies
 
 tokio, axum (server) + reqwest (upstream/streaming), serde/serde_json, clap, ratatui + crossterm,
-tracing + tracing-subscriber, sha2/base64 (PKCE/JWT payload decode), thiserror, ulid, uuid, libc.
+tracing + tracing-subscriber, sha2/base64 (PKCE/JWT payload decode), thiserror, ulid, uuid, libc,
+rusqlite (`bundled` — the keys-usage store compiles SQLite in, so no build or run host needs a
+system libsqlite3 or a matching version).
+
+### Durable keys usage (`key_usage.rs`, keys-history K)
+
+The ONE database in the tree, deliberately scoped: per-tenant request metadata (`ts, tenant,
+group, model, status, token counts`) in a single indexed table beside the config
+(`~/.config/llmux[-preview]/usage.sqlite3`, `0600` in a `0700` dir; an explicit `$LLMUX_CONFIG`
+derives an isolated sibling directory, which is also what keeps tests off the real file).
+
+- **Write path.** The dashboard fold queues a row per `RequestFinished`; `record` is a bounded
+  queue push, never disk IO, so no hub or pool lock is ever held across the database. One
+  dedicated writer thread drains the queue into batched transactions. A full queue drops and
+  counts (observability never applies backpressure); failures increment `errors`/`last_error`.
+- **Read path.** `GET /llmux/keys/usage` and the in-process TUI run the SAME bounded
+  `GROUP BY tenant, group, model` query on the blocking pool — cost is bounded by the ANSWER, not
+  by the history size. Nothing is queried per frame and the document never rides on
+  `/llmux/dashboard` (a 90-day answer must not be re-serialized every second).
+- **Migration.** `activity.jsonl` stays the source of truth for every other surface. Its prefix is
+  imported ONCE into the store, transactionally against a persisted byte offset, with each row
+  keyed by the identity it would have been written live under — so restart, overlap with live
+  appends, a torn trailing line, and log rotation are all handled without double counting.
 
 ## Porting pitfalls now codified
 

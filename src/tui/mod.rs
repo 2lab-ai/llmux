@@ -326,6 +326,72 @@ pub(crate) enum Overlay {
     Keys,
 }
 
+/// Keys-panel state (`docs/keys-history/spec.md` K-0): WHICH durable-usage
+/// question the `K` overlay is asking, and the answer it is showing.
+///
+/// The panel no longer renders the in-memory lifetime aggregates that ride on
+/// the dashboard document — it renders the answer to an explicit
+/// (window, models) query against the durable store, fetched in the
+/// background. That is why `loading`/`error` are first-class here: a pending
+/// or failed query must SAY so, never fall back to unfiltered data wearing a
+/// filtered label.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeysPanel {
+    /// Trailing window (`w` cycles); `all` by default — the pre-existing
+    /// behavior.
+    pub window: crate::key_usage::UsageWindow,
+    /// Selected models (`f` picker). EMPTY = every model.
+    pub models: std::collections::BTreeSet<String>,
+    /// Scroll offset in FLATTENED rows (tenant rows + their model rows).
+    pub scroll: usize,
+    /// A query is in flight.
+    pub loading: bool,
+    /// The last query's failure, shown instead of rows.
+    pub error: Option<String>,
+    /// The last successful answer (shared, so a Chrome clone is cheap).
+    /// DROPPED the moment a different question is asked — rows that answered
+    /// the previous window/filter must never sit under the new label.
+    pub doc: Option<std::sync::Arc<crate::key_usage::KeysUsageDoc>>,
+    /// Models observed by the last successful answer, cached SEPARATELY from
+    /// it so dropping stale rows never empties the `f` picker.
+    pub available: Vec<String>,
+    /// The open model picker, if any.
+    pub picker: Option<KeysPicker>,
+    /// Newest dispatched query id — older deliveries are dropped, so a fast
+    /// `w w w` can never render an out-of-order answer.
+    pub generation: u64,
+}
+
+/// The `f` multi-select model picker (keys-history K-0).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeysPicker {
+    pub cursor: usize,
+    /// Working selection — applied to the panel only on Enter.
+    pub selected: std::collections::BTreeSet<String>,
+    /// Offered names: the models observed in the current window, UNIONED with
+    /// anything already selected (so a selection made under a wider window
+    /// stays visible and deselectable).
+    pub options: Vec<String>,
+}
+
+/// One dispatched keys-usage query, drained by the event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeysQuery {
+    pub generation: u64,
+    pub window: crate::key_usage::UsageWindow,
+    pub models: Vec<String>,
+}
+
+/// One keys-usage answer delivered back to the event loop.
+#[derive(Debug)]
+pub(crate) struct KeysLoad {
+    pub generation: u64,
+    pub result: Result<crate::key_usage::KeysUsageDoc, String>,
+}
+
+/// Rows one PageUp/PageDown moves the keys panel.
+const KEYS_PAGE: usize = 10;
+
 /// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
 /// timeline default), most tokens (in+out), or most requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -395,6 +461,10 @@ pub(crate) struct Chrome {
     /// its OWN detail without the click reading as "collapse the group"
     /// (Z 2026-07-15). Keyed by any member's `ActivityKey`.
     pub expanded_run: Option<activity::ActivityKey>,
+    /// Keys-panel state (keys-history K): window/model filter, scroll, the
+    /// fetched usage document, and the open model picker. The panel renders
+    /// from THIS, not from the dashboard document's lifetime aggregates.
+    pub keys: KeysPanel,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -884,6 +954,15 @@ struct App {
     /// Closing the confirm dialog does NOT clear it; only a terminal outcome
     /// does.
     pending_redemption: Option<PendingRedemption>,
+    /// Keys panel: the durable-usage query and its answer (keys-history K).
+    keys: KeysPanel,
+    /// A keys-usage query queued by a key press, dispatched by the event loop
+    /// (blocking SQL locally, HTTP when attached) — same pattern as
+    /// `pending_raw`, so neither the DB nor the network is ever touched from a
+    /// key handler.
+    pending_keys: Option<KeysQuery>,
+    /// Sender the background keys-usage query delivers on.
+    keys_tx: Option<mpsc::Sender<KeysLoad>>,
 }
 
 impl App {
@@ -953,6 +1032,9 @@ impl App {
             control_inflight: false,
             control_tx: None,
             pending_redemption: None,
+            keys: KeysPanel::default(),
+            pending_keys: None,
+            keys_tx: None,
         }
     }
 
@@ -1138,6 +1220,7 @@ impl App {
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
             expanded_run: self.expanded_run.clone(),
+            keys: self.keys.clone(),
             model_cursor: self.model_cursor,
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
@@ -1338,7 +1421,7 @@ impl App {
             Overlay::Misc => self.on_key_misc(key.code),
             Overlay::Perf => self.on_key_perf(key.code, view),
             Overlay::Config => self.on_key_config(key.code, view),
-            Overlay::Keys => self.on_key_keys(key.code),
+            Overlay::Keys => self.on_key_keys(key.code, view),
         }
     }
 
@@ -2012,6 +2095,103 @@ impl App {
     }
 
     /// Spawn the background raw-record fetch for `req` and deliver the result
+    /// Run one queued keys-usage query and deliver the answer on the keys
+    /// channel (keys-history K-5). NEITHER path runs on the event loop: local
+    /// goes to the blocking pool (SQLite), attach spawns an HTTP GET. The
+    /// document is named + priced where the data lives, so both backends
+    /// render byte-identical rows.
+    fn spawn_keys_query(&mut self, req: KeysQuery) {
+        let Some(tx) = self.keys_tx.clone() else {
+            return; // unit tests drive the panel state directly
+        };
+        let KeysQuery {
+            generation,
+            window,
+            models,
+        } = req;
+        let now_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        match &self.backend {
+            Backend::Local(state) => {
+                let query = crate::key_usage::UsageQuery::new(window, now_ms).with_models(models);
+                let Some(store) = state.hub.usage_store() else {
+                    // No durable store on this daemon — say so; do NOT fall
+                    // back to the in-memory lifetime aggregates.
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(KeysLoad {
+                                generation,
+                                result: Err(
+                                    "durable keys usage is unavailable (no config path or the \
+                                     store failed to open)"
+                                        .to_string(),
+                                ),
+                            })
+                            .await;
+                    });
+                    return;
+                };
+                let keys = crate::dashboard::key_row_docs(state);
+                let overrides = state.config.pricing.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = store
+                        .query(&query)
+                        .map(|report| {
+                            crate::key_usage::usage_doc(
+                                report,
+                                &keys,
+                                &overrides,
+                                store.health(),
+                                now_ms,
+                            )
+                        })
+                        .map_err(|err| err.to_string());
+                    let _ = tx.blocking_send(KeysLoad { generation, result });
+                });
+            }
+            Backend::Remote(remote) => {
+                let client = remote.client.clone();
+                let api_key = remote.api_key.clone();
+                let url = format!(
+                    "{}/llmux/keys/usage?window={}&models={}",
+                    remote.base_url,
+                    window.as_str(),
+                    models
+                        .iter()
+                        .map(|m| encode_query_value(m))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                tokio::spawn(async move {
+                    let mut request = client.get(&url);
+                    if let Some(key) = &api_key {
+                        request = request.header("x-api-key", key);
+                    }
+                    let result = match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .json::<crate::key_usage::KeysUsageDoc>()
+                            .await
+                            .map_err(|err| format!("keys usage decode failed: {err}")),
+                        Ok(response) => {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                                .unwrap_or_else(|| status.to_string());
+                            Err(format!("keys usage failed: {detail}"))
+                        }
+                        Err(err) => Err(format!("keys usage failed: {err}")),
+                    };
+                    let _ = tx.send(KeysLoad { generation, result }).await;
+                });
+            }
+        }
+    }
+
     /// on the raw channel (never blocks the event loop — the local path is a
     /// backwards file scan on the blocking pool, the attach path an HTTP GET to
     /// `GET /llmux/raw-io`). Content lines are built in the task too: a Ready
@@ -2279,13 +2459,150 @@ impl App {
         }
     }
 
-    /// Key handling for the Keys overlay (`K`, multi-tenant #22): read-only
-    /// panel — `K`/`Esc` closes, `q` quits. Key MUTATIONS stay in the CLI
-    /// (`llmux key …`), matching the admin-filter decision (option A).
-    fn on_key_keys(&mut self, code: KeyCode) {
+    /// Open the Keys overlay (keys-history K-0) and ask the durable store for
+    /// the CURRENT (window, models) answer. Reopening re-queries — the panel
+    /// is a point-in-time answer, never a stale one wearing a fresh label.
+    fn open_keys(&mut self) {
+        self.overlay = Overlay::Keys;
+        self.keys.scroll = 0;
+        self.keys.picker = None;
+        self.request_keys_usage();
+    }
+
+    /// Queue a keys-usage query for the event loop. Bumps the generation so a
+    /// slower earlier answer can never overwrite a newer one.
+    ///
+    /// If the question CHANGED (window or model filter), the previous answer is
+    /// dropped right here: the title renders the new question immediately, so
+    /// keeping the old rows would label totals with a question they never
+    /// answered. A refresh of the SAME question keeps its rows (the label still
+    /// describes exactly what is drawn).
+    fn request_keys_usage(&mut self) {
+        let models: Vec<String> = self.keys.models.iter().cloned().collect();
+        let answers_this_question = self
+            .keys
+            .doc
+            .as_ref()
+            .is_some_and(|doc| doc.window == self.keys.window.as_str() && doc.models == models);
+        if !answers_this_question {
+            self.keys.doc = None;
+        }
+        self.keys.generation += 1;
+        self.keys.loading = true;
+        self.keys.error = None;
+        self.pending_keys = Some(KeysQuery {
+            generation: self.keys.generation,
+            window: self.keys.window,
+            models,
+        });
+    }
+
+    fn take_pending_keys(&mut self) -> Option<KeysQuery> {
+        self.pending_keys.take()
+    }
+
+    /// Apply one delivered answer. Stale generations are dropped.
+    fn apply_keys_load(&mut self, load: KeysLoad) {
+        if load.generation != self.keys.generation {
+            return;
+        }
+        self.keys.loading = false;
+        match load.result {
+            Ok(doc) => {
+                self.keys.available = doc.available_models.clone();
+                self.keys.doc = Some(std::sync::Arc::new(doc));
+                self.keys.error = None;
+            }
+            // The previous answer is DROPPED on failure: showing older rows
+            // under the new filter label is exactly the lie this panel must
+            // not tell.
+            Err(err) => {
+                self.keys.doc = None;
+                self.keys.error = Some(err);
+            }
+        }
+    }
+
+    /// Open the `f` model picker over the models the current answer observed,
+    /// unioned with the current selection.
+    fn open_keys_picker(&mut self) {
+        let mut options: Vec<String> = self.keys.available.clone();
+        options.extend(self.keys.models.iter().cloned());
+        options.sort();
+        options.dedup();
+        self.keys.picker = Some(KeysPicker {
+            cursor: 0,
+            selected: self.keys.models.clone(),
+            options,
+        });
+    }
+
+    /// Key handling for the Keys overlay (keys-history K-0): `w` cycles the
+    /// window, `f` opens the multi-select model picker, the arrows/Page/Home/
+    /// End scroll EVERY flattened row (key rows and their model rows), `r`
+    /// re-runs the query, `K`/`Esc` closes, `q` quits. Key MUTATIONS stay in
+    /// the CLI (`llmux key …`), matching the admin-filter decision (option A).
+    fn on_key_keys(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        if self.keys.picker.is_some() {
+            return self.on_key_keys_picker(code);
+        }
+        let rows = view
+            .map(|v| ui::keys_row_count(v, &self.chrome()))
+            .unwrap_or(0);
+        let last = rows.saturating_sub(1);
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('K') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('w') => {
+                self.keys.window = self.keys.window.next();
+                self.keys.scroll = 0;
+                self.request_keys_usage();
+            }
+            KeyCode::Char('f') => self.open_keys_picker(),
+            KeyCode::Char('r') => self.request_keys_usage(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.keys.scroll = self.keys.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.keys.scroll = (self.keys.scroll + 1).min(last);
+            }
+            KeyCode::PageUp => self.keys.scroll = self.keys.scroll.saturating_sub(KEYS_PAGE),
+            KeyCode::PageDown => self.keys.scroll = (self.keys.scroll + KEYS_PAGE).min(last),
+            KeyCode::Home => self.keys.scroll = 0,
+            KeyCode::End => self.keys.scroll = last,
+            _ => {}
+        }
+    }
+
+    /// Key handling inside the `f` picker: arrows move, Space toggles, `a`
+    /// selects every offered model, `c` clears, Enter applies (and re-queries),
+    /// `Esc`/`f` cancels without touching the active filter.
+    fn on_key_keys_picker(&mut self, code: KeyCode) {
+        let Some(picker) = self.keys.picker.as_mut() else {
+            return;
+        };
+        let last = picker.options.len().saturating_sub(1);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('f') => self.keys.picker = None,
+            KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => picker.cursor = (picker.cursor + 1).min(last),
+            KeyCode::Char(' ') => {
+                if let Some(model) = picker.options.get(picker.cursor).cloned() {
+                    if !picker.selected.remove(&model) {
+                        picker.selected.insert(model);
+                    }
+                }
+            }
+            KeyCode::Char('a') => picker.selected = picker.options.iter().cloned().collect(),
+            KeyCode::Char('c') => picker.selected.clear(),
+            KeyCode::Enter => {
+                let selected = picker.selected.clone();
+                self.keys.models = selected;
+                self.keys.picker = None;
+                self.keys.scroll = 0;
+                self.request_keys_usage();
+            }
             _ => {}
         }
     }
@@ -2636,6 +2953,8 @@ impl App {
                 self.usage_scroll = 0;
                 self.overlay = Overlay::Usage;
             }
+            // Same entry behavior as `K`: open AND ask the durable store.
+            Overlay::Keys => self.open_keys(),
             other => self.overlay = other,
         }
     }
@@ -2776,7 +3095,7 @@ impl App {
             KeyCode::Char('?') => self.overlay = Overlay::Misc,
             KeyCode::Char('c') => self.overlay = Overlay::Config,
             // Client keys / tenants (multi-tenant #22).
-            KeyCode::Char('K') => self.overlay = Overlay::Keys,
+            KeyCode::Char('K') => self.open_keys(),
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -3694,7 +4013,10 @@ impl App {
         match &mut self.backend {
             Backend::Local(state) => match state.add_apikey_account(None, &api_key) {
                 // Status echoes the assigned NAME only — never the key.
-                Ok((name, _outcome)) => self.set_status(format!("added account {name}")),
+                Ok((name, outcome)) => self.set_status(add_account_status(
+                    &name,
+                    matches!(outcome, crate::config::Upsert::Added),
+                )),
                 Err(err) => self.set_status(format!("add account failed: {err}")),
             },
             Backend::Remote(remote) => {
@@ -3793,13 +4115,15 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                let name = response
+                let body = response
                     .json::<serde_json::Value>()
                     .await
-                    .ok()
-                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or(serde_json::Value::Null);
+                let name = body["name"]
+                    .as_str()
+                    .map(str::to_string)
                     .unwrap_or_else(|| "account".into());
-                format!("added account {name}")
+                add_account_status(&name, response_added(&body))
             }
             Ok(response) => format!("add account failed: {}", response.status()),
             Err(err) => format!("add account failed: {err}"),
@@ -3972,7 +4296,10 @@ impl App {
         // Inject: in-process locally, or relay to the daemon when attached.
         match &mut self.backend {
             Backend::Local(state) => match state.inject_account(account) {
-                Ok((name, _outcome)) => self.set_status(format!("logged in: added {name}")),
+                Ok((name, outcome)) => self.set_status(login_status(
+                    &name,
+                    matches!(outcome, crate::config::Upsert::Added),
+                )),
                 Err(err) => self.set_status(format!("login persist failed: {err}")),
             },
             Backend::Remote(_) => self.perform_remote_inject(account).await,
@@ -3997,13 +4324,15 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                let name = response
+                let body = response
                     .json::<serde_json::Value>()
                     .await
-                    .ok()
-                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or(serde_json::Value::Null);
+                let name = body["name"]
+                    .as_str()
+                    .map(str::to_string)
                     .unwrap_or_else(|| account.name.clone());
-                format!("logged in: added {name}")
+                login_status(&name, response_added(&body))
             }
             Ok(response) => {
                 let status = response.status();
@@ -4705,6 +5034,11 @@ async fn event_loop(
     // a frozen TUI is exactly how an operator ends up pressing Enter twice.
     let (control_tx, mut control_rx) = mpsc::channel::<ControlResult>(4);
     app.control_tx = Some(control_tx);
+    // Keys panel (keys-history K): the windowed/filtered usage query answers
+    // here — SQLite locally, HTTP when attached — so neither ever blocks this
+    // select or the render tick.
+    let (keys_tx, mut keys_rx) = mpsc::channel::<KeysLoad>(4);
+    app.keys_tx = Some(keys_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -4785,6 +5119,12 @@ async fn event_loop(
                 app.apply_control_result(result);
                 true
             }
+            // A keys-usage query answered (keys-history K): apply it unless a
+            // newer question has already been asked.
+            Some(load) = keys_rx.recv() => {
+                app.apply_keys_load(load);
+                true
+            }
         };
         if let Some(op) = app.take_pending_control() {
             app.spawn_control(op);
@@ -4792,6 +5132,10 @@ async fn event_loop(
         }
         if let Some(req) = app.take_pending_raw() {
             app.spawn_raw_fetch(req);
+            redraw = true;
+        }
+        if let Some(req) = app.take_pending_keys() {
+            app.spawn_keys_query(req);
             redraw = true;
         }
         if let Some(req) = app.next_clip_if_idle() {
@@ -4950,6 +5294,45 @@ const HISTORY_PAGE: usize = 300;
 const HISTORY_CHUNK: usize = 512;
 const HISTORY_GROW_CHUNKS: usize = 4;
 const HISTORY_ARM_MARGIN: i64 = 40;
+
+/// Status wording for an account add (`Upsert::Added` vs `Updated`). A login
+/// or key-add over an EXISTING identity replaces that account's credentials in
+/// place — reporting it as "added" reads like a second account appeared
+/// (`docs/keys-history/spec.md` L-6).
+fn add_account_status(name: &str, added: bool) -> String {
+    let verb = if added { "added" } else { "updated" };
+    format!("{verb} account {name}")
+}
+
+/// Status wording for a completed browser/API login, same distinction.
+fn login_status(name: &str, added: bool) -> String {
+    let verb = if added { "added" } else { "updated" };
+    format!("logged in: {verb} {name}")
+}
+
+/// Read the `added` flag off an add/inject endpoint response. A daemon too old
+/// to send the field keeps the historical "added" wording — never a claim of
+/// an update it did not report.
+fn response_added(value: &serde_json::Value) -> bool {
+    value["added"].as_bool().unwrap_or(true)
+}
+
+/// Percent-encode one query-string VALUE (model names ride in from request
+/// bodies — `anthropic/claude-x`, `gpt-4.1`, anything). Unreserved characters
+/// pass through; everything else becomes `%XX`, so the comma the `models`
+/// parameter separates on can never be forged by a name.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
 
 /// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
 const MODAL_PAGE: u16 = 10;
@@ -6251,6 +6634,334 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Sessions);
     }
 
+    // --- account upsert wording (re-login over an existing account) --------
+
+    /// L-6: a login/add over an EXISTING identity replaces its credentials —
+    /// the status must say `updated`, not `added`, or an operator re-logging
+    /// in reads it as a duplicate account having appeared.
+    #[test]
+    fn account_upsert_status_distinguishes_updated_from_added() {
+        assert_eq!(add_account_status("acme", true), "added account acme");
+        assert_eq!(add_account_status("acme", false), "updated account acme");
+        assert_eq!(login_status("acme", true), "logged in: added acme");
+        assert_eq!(login_status("acme", false), "logged in: updated acme");
+        assert!(
+            !login_status("acme", false).contains("added"),
+            "an update never reads as an add"
+        );
+    }
+
+    /// The remote paths read the endpoint's `added` flag. A daemon too old to
+    /// send it keeps the historical wording rather than claiming an update it
+    /// cannot know about.
+    #[test]
+    fn remote_upsert_flag_defaults_to_added_when_absent() {
+        assert!(!response_added(&serde_json::json!({ "added": false })));
+        assert!(response_added(&serde_json::json!({ "added": true })));
+        assert!(response_added(&serde_json::json!({ "ok": true })));
+    }
+
+    // --- keys panel (keys-history K) ---------------------------------------
+
+    /// A view with one issued key, and a panel document giving it usage plus a
+    /// builtin bucket — the panel's two data sources.
+    fn keys_view_and_doc() -> (DashboardView, crate::key_usage::KeysUsageDoc) {
+        let mut view = empty_view();
+        view.client_keys = vec![crate::dashboard::KeyRowDoc {
+            id: "k-aaaa".into(),
+            name: "pc-b".into(),
+            email: None,
+            kind: "default".into(),
+            key_prefix: "lmk-b1b2".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        }];
+        let doc = crate::key_usage::KeysUsageDoc {
+            window: "all".into(),
+            available_models: vec!["model-a".into(), "model-b".into()],
+            rows: 3,
+            tenants: vec![crate::dashboard::TenantUsageDoc {
+                tenant: "k-aaaa".into(),
+                name: "pc-b".into(),
+                email: None,
+                requests: 3,
+                ok: 3,
+                errors: 0,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                first_ms: 1,
+                last_ms: 2,
+                models: vec![crate::dashboard::TenantModelDoc {
+                    group: "claude".into(),
+                    model: "model-a".into(),
+                    requests: 3,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    cost_usd: 0.0,
+                }],
+            }],
+            ..Default::default()
+        };
+        (view, doc)
+    }
+
+    /// K-0: opening the panel asks the durable store — the overlay never
+    /// renders whatever happened to be in memory from a previous question.
+    #[test]
+    fn opening_the_keys_overlay_dispatches_a_usage_query() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('K'), None);
+        assert_eq!(app.overlay, Overlay::Keys);
+        assert!(app.keys.loading, "the panel enters the loading state");
+        let query = app.take_pending_keys().expect("a query was queued");
+        assert_eq!(query.window, crate::key_usage::UsageWindow::All);
+        assert!(query.models.is_empty(), "no filter by default");
+        assert_eq!(query.generation, app.keys.generation);
+    }
+
+    /// K-2 `w`: the window cycles through the offered set and each press asks
+    /// the store again (a window change is a NEW question, not a re-label).
+    #[test]
+    fn w_cycles_the_keys_window_and_requeries() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('K'), None);
+        app.take_pending_keys();
+        app.keys.scroll = 7;
+
+        app.on_key_keys(KeyCode::Char('w'), None);
+        assert_eq!(app.keys.window, crate::key_usage::UsageWindow::H1);
+        assert_eq!(app.keys.scroll, 0, "a new window starts at the top");
+        let query = app.take_pending_keys().expect("re-queried");
+        assert_eq!(query.window, crate::key_usage::UsageWindow::H1);
+
+        for want in [
+            crate::key_usage::UsageWindow::H24,
+            crate::key_usage::UsageWindow::D7,
+            crate::key_usage::UsageWindow::D14,
+            crate::key_usage::UsageWindow::D30,
+            crate::key_usage::UsageWindow::D90,
+            crate::key_usage::UsageWindow::All,
+        ] {
+            app.on_key_keys(KeyCode::Char('w'), None);
+            assert_eq!(app.keys.window, want, "cycle wraps back to all");
+        }
+    }
+
+    /// K-0 `위아래 키로`: Down/PageDown/End reach the LAST flattened row and
+    /// clamp there; Home/Up return to the top.
+    #[test]
+    fn keys_scrolling_covers_every_row_and_clamps_at_both_ends() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.overlay = Overlay::Keys;
+        app.keys.doc = Some(std::sync::Arc::new(doc));
+        // 1 key row + 1 model row = 2 rows → last index 1.
+        assert_eq!(ui::keys_row_count(&view, &app.chrome()), 2);
+
+        app.on_key_keys(KeyCode::Down, Some(&view));
+        assert_eq!(app.keys.scroll, 1);
+        app.on_key_keys(KeyCode::Down, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "clamped at the last row");
+        app.on_key_keys(KeyCode::PageDown, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "a page past the end still clamps");
+        app.on_key_keys(KeyCode::Home, Some(&view));
+        assert_eq!(app.keys.scroll, 0);
+        app.on_key_keys(KeyCode::End, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "End lands on the final row");
+        app.on_key_keys(KeyCode::Up, Some(&view));
+        assert_eq!(app.keys.scroll, 0);
+        app.on_key_keys(KeyCode::PageUp, Some(&view));
+        assert_eq!(app.keys.scroll, 0, "PageUp at the top stays put");
+    }
+
+    /// K-3 `f`: Space toggles, Enter applies the selection AND re-queries;
+    /// the picker offers the observed models unioned with the live selection.
+    #[test]
+    fn f_picker_toggles_models_and_enter_applies_the_filter() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        let picker = app.keys.picker.as_ref().expect("picker opened");
+        assert_eq!(picker.options, vec!["model-a", "model-b"]);
+        assert!(picker.selected.is_empty(), "starts from the live filter");
+
+        app.on_key_keys(KeyCode::Char(' '), None); // select model-a
+        app.on_key_keys(KeyCode::Down, None);
+        app.on_key_keys(KeyCode::Char(' '), None); // select model-b
+        app.on_key_keys(KeyCode::Char(' '), None); // …and unselect it again
+        assert!(
+            app.pending_keys.is_none(),
+            "nothing is applied before Enter"
+        );
+
+        app.on_key_keys(KeyCode::Enter, None);
+        assert!(app.keys.picker.is_none(), "Enter closes the picker");
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-a".to_string()]
+        );
+        let query = app.take_pending_keys().expect("applied filter re-queries");
+        assert_eq!(query.models, vec!["model-a".to_string()]);
+    }
+
+    /// K-3: `a` selects every offered model, `c` clears — and Esc abandons the
+    /// working selection without touching the active filter.
+    #[test]
+    fn picker_all_clear_and_escape_leave_the_active_filter_alone() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.keys.models = ["model-a".to_string()].into_iter().collect();
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('a'), None);
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected.len(), 2, "all");
+        app.on_key_keys(KeyCode::Char('c'), None);
+        assert!(
+            app.keys.picker.as_ref().unwrap().selected.is_empty(),
+            "clear"
+        );
+
+        app.on_key_keys(KeyCode::Esc, None);
+        assert!(app.keys.picker.is_none(), "Esc closes the picker…");
+        assert_eq!(app.overlay, Overlay::Keys, "…not the overlay");
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-a".to_string()],
+            "the abandoned selection never applied"
+        );
+        assert!(app.pending_keys.is_none(), "cancel does not re-query");
+    }
+
+    /// K-5: while a CHANGED question is in flight the old answer is dropped —
+    /// the title already says the new window/filter, so leaving the previous
+    /// totals on screen would label them with a question they never answered.
+    #[test]
+    fn changing_the_question_drops_the_previous_answer_immediately() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_some());
+
+        app.on_key_keys(KeyCode::Char('w'), None); // all → 1h
+        assert!(
+            app.keys.doc.is_none(),
+            "the 24h-labelled frame must not render the all-time rows"
+        );
+        assert!(app.keys.loading);
+    }
+
+    /// …but a plain refresh (`r`, same window and filter) keeps the rows on
+    /// screen: the label still describes exactly what is drawn, so blanking
+    /// the table would only flicker.
+    #[test]
+    fn refreshing_the_same_question_keeps_the_rows_on_screen() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.on_key_keys(KeyCode::Char('r'), None);
+        assert!(app.keys.doc.is_some(), "same question → same rows stay");
+        assert!(app.keys.loading, "and a refresh is still in flight");
+    }
+
+    /// The picker keeps offering the observed models while a query is in
+    /// flight: the option list is cached separately from the answer, so
+    /// dropping stale rows cannot empty `f`.
+    #[test]
+    fn the_model_picker_still_offers_options_while_a_query_is_in_flight() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.on_key_keys(KeyCode::Char('w'), None); // in-flight, rows dropped
+        assert!(app.keys.doc.is_none());
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        let picker = app.keys.picker.as_ref().expect("picker opened");
+        assert_eq!(
+            picker.options,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "cached options survive the in-flight query"
+        );
+    }
+
+    /// K-5: a late answer to a superseded question is dropped — a fast
+    /// `w w` can never leave the panel showing the older window's rows.
+    #[test]
+    fn a_stale_keys_answer_is_ignored() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys(); // generation 1
+        app.on_key_keys(KeyCode::Char('w'), None); // generation 2
+        app.apply_keys_load(KeysLoad {
+            generation: 1,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_none(), "the superseded answer is dropped");
+        assert!(app.keys.loading, "still waiting for the current one");
+    }
+
+    /// K-5: a failed query drops the previous document — stale rows must never
+    /// sit under a label describing a different question.
+    #[test]
+    fn a_failed_keys_query_replaces_the_rows_with_the_failure() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_some());
+
+        app.on_key_keys(KeyCode::Char('w'), None);
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Err("database is locked".into()),
+        });
+        assert!(app.keys.doc.is_none(), "no rows under a failed query");
+        assert_eq!(app.keys.error.as_deref(), Some("database is locked"));
+        assert!(!app.keys.loading);
+    }
+
+    /// The `models` query parameter is percent-encoded, so a model name with a
+    /// separator or a space cannot forge extra filter entries.
+    #[test]
+    fn model_names_are_percent_encoded_for_the_query_string() {
+        assert_eq!(encode_query_value("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(
+            encode_query_value("anthropic/claude,x y"),
+            "anthropic%2Fclaude%2Cx%20y"
+        );
+    }
+
     /// `g` opens the Stats overlay only when model usage exists; `g`/`Esc`
     /// close it. The no-data guard keeps MAIN (matching the old `show_models`
     /// behavior).
@@ -7215,7 +7926,6 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
