@@ -14,6 +14,7 @@ pub mod login;
 pub mod run;
 pub mod status;
 pub mod update;
+pub mod usage;
 
 use std::path::PathBuf;
 
@@ -47,8 +48,8 @@ Remote daemon:
       llmux --remote llmux-host run     # point claude at the remote proxy
       llmux status                       # probe the remote (with remote.host set)
 
-  In remote mode run/server/dashboard/status/env/accounts/reset-usage target
-  the remote;
+  In remote mode run/server/dashboard/status/env/accounts/usage/reset-usage
+  target the remote;
   stop/restart/remove/login/import are refused (run them on the daemon's host);
   channel/update stay local (they manage this machine's binary).
 
@@ -67,7 +68,7 @@ pub struct Cli {
     /// local one, for this invocation. Overrides `remote.host` in the config;
     /// `:port` defaults to `remote.port` (else 3456), api_key from
     /// `remote.api_key`. In remote mode `run`/`server`/`dashboard`/`status`/
-    /// `env`/`accounts` target the remote, while `stop`/`restart`/`remove`/
+    /// `env`/`accounts`/`usage` target the remote, while `stop`/`restart`/`remove`/
     /// `login`/`import` are refused (they belong on the daemon's own host) and
     /// `channel`/`update` stay local. See `llmux --help` for a config example.
     #[arg(long, global = true, value_name = "HOST[:PORT]")]
@@ -105,6 +106,13 @@ pub enum Command {
     Status(StatusArgs),
     /// List configured accounts.
     Accounts(AccountsArgs),
+    /// Per-account weekly-quota summary: logged-in status, remaining 7d
+    /// usage, and when it resets — a small, stable, scripting-friendly
+    /// slice of `llmux accounts --json`'s full dashboard document, for the
+    /// one question "how much of my week is left, per account".
+    ///
+    /// Exit codes: 0 = server running, 1 = server not running (or error).
+    Usage(UsageArgs),
     /// Manage downstream client keys the proxy issues to its callers
     /// (multi-tenant): issue, list, suspend/resume, revoke, rotate.
     Key(KeyArgs),
@@ -204,6 +212,14 @@ pub struct DashboardArgs {}
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Emit raw JSON instead of the human-readable table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UsageArgs {
+    /// Emit structured JSON (`{"accounts": [...]}`) instead of the
+    /// human-readable table.
     #[arg(long)]
     pub json: bool,
 }
@@ -335,6 +351,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::list(args, remote).await,
+        Command::Usage(args) => usage::run(args, remote).await,
         Command::Key(args) => keys::run(args, remote).await,
         Command::ResetUsage(args) => daemon::reset_usage(args, remote).await,
         Command::Remove(args) => accounts::remove(args).await,
