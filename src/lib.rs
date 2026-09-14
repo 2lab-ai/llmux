@@ -10,6 +10,7 @@ pub mod config;
 pub mod dashboard;
 pub mod demo;
 pub mod event;
+pub mod key_usage;
 pub mod logging;
 pub mod pricing;
 pub mod provider;

@@ -39,6 +39,8 @@ An external Codex reset does not invalidate llmux's observed quota window, so a 
 
 `n` (from the accounts overlay or the account switcher) opens a provider picker — Claude (Anthropic OAuth), Codex (ChatGPT OAuth), Grok (xAI device code — it prints the verification URL and user code, best-effort opens the browser, then polls), OpenRouter (PKCE minting an `sk-or-v1-…` key). `↑↓` picks, `Enter` runs the flow, `Esc` cancels. The OAuth flow runs in the client that owns the keyboard, and the minted credential is injected into the daemon — in-process locally, over `POST /llmux/inject-account` when attached — so the account serves traffic without a restart and `n` is live in attach mode too. On a client with no browser (a headless SSH session), `n` refuses with the `llmux login` fallback hint instead of starting a flow that would hang.
 
+**Login identity and re-login.** A Claude OAuth login identifies the account by the `accountUuid` on its profile. If the profile fetch fails, or the profile carries no stable `accountUuid`, the login now **errors and saves nothing** — the freshly minted tokens are discarded with it — instead of storing an unidentified placeholder account that the next login would duplicate rather than update; re-running the login is the remedy. An identified profile with no email is named after its uuid. **Logging in again with an account you already have replaces the credentials in place and keeps the established local account name**, even if the profile email has since changed: operator pause, per-account limits, quota windows, cooldowns, in-flight leases and the sticky current selection are all keyed by that name, so a rename would silently resume a paused account and drop its ceilings. The account name is a stable local label, not a mirror of the current profile email. On a running daemon the re-login takes effect without a restart, and a credential that ACTUALLY changed also clears an authentication-failure bench back to healthy — re-applying byte-identical credentials (a pause toggle, an `import`, a re-inject of the same bytes) never resurrects a failed account. Work that started before the re-login and carries the retired credential — an in-flight request's 401, a dead refresh token, a background refresh or usage poll — is discarded rather than applied, so it can no longer re-bench the account or overwrite the fresh credential in memory or in the config file; a genuine 401 from the CURRENT credential still benches the account. Design detail and the races behind these guards: [re-login trace](keys-history/relogin-trace.md).
+
 ### Usage tab (calendar usage + cost)
 
 The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title carries the period totals. Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
@@ -166,13 +168,71 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
   `POST /llmux/keys/suspend` `{id, suspended}`, `POST /llmux/keys/remove`
   `{id}`, `POST /llmux/keys/rotate` `{id}`.
 - The dashboard's `keys` tab (`K`) is the admin view: every issued key with
-  its name/email, kind, state, requests, tokens, API-equivalent cost, the
+  its name (first column) and a ≤16-cell key cell (`<id>·<prefix>`, never a
+  secret), kind, state, requests, ok/err, tokens, API-equivalent cost, the
   used-from → used-to span, and a per-model breakdown — the builtin
   `local`/`legacy` buckets included, so every request is accounted for.
-  The dashboard document carries the same data as `tenant_usage` and
-  `client_keys` (metadata; never secrets). History persisted before this
-  feature shows as the `unknown` tenant — it is never folded into a live
-  bucket.
+  History persisted before multi-tenant keys shows as the `unknown` tenant —
+  it is never folded into a live bucket.
+
+### Keys usage: windows, model filter, durable history
+
+The numbers on the `keys` tab come from a durable per-tenant store, not from
+the in-memory activity fold, so they survive restarts and can be narrowed:
+
+| Key | Effect |
+|---|---|
+| `w` | Cycle the window: `all` → `1h` → `24h` → `7d` → `14d` → `30d` → `90d` → `all`. Each window is the exact closed interval `[now − duration, now]`; future-stamped rows are never counted. |
+| `f` | Multi-select the models observed in the current window — `↑/↓` move, `Space` toggles, `a` selects all, `c` clears, `Enter` applies, `Esc` cancels. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed. |
+| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. |
+| `r` | Re-run the query. |
+
+On a narrow terminal the table sheds its widest, lowest-value columns (the
+`used` span first, then `kind`/`state`/`ok/err`) so the name column and the
+`└ group/model` labels stay readable down to 80 columns.
+
+The title always states the active question (`window 24h · 2 model(s) · N
+requests`). A pending query says `loading…` and a failed one says why — a
+filtered or failed view is never redrawn as unfiltered data or as zeros.
+With explicit models selected, requests that failed before routing (no model
+attributed) drop out; under `all models` they stay, so the admin view still
+accounts for every observed completion.
+
+- **Where it lives.** `~/.config/llmux/usage.sqlite3` for a stable/dev build,
+  `~/.config/llmux-preview/usage.sqlite3` for a preview build (the two
+  channels never share history). With `$LLMUX_CONFIG` pointing elsewhere the
+  store moves to a sibling directory named after that config file
+  (`/tmp/x/alt.json` → `/tmp/x/alt/usage.sqlite3`). File `0600`, directory
+  `0700`. It holds request METADATA only — when, tenant, group, model,
+  status, token counts — never prompts, responses, or credentials.
+- **Legacy history.** On startup the daemon imports the existing
+  `activity.jsonl` prefix once (transactional byte offset + per-request
+  identity), so a restart neither re-imports nor double-counts, and requests
+  that land while the import runs are recorded exactly once. The JSONL log is
+  NOT deleted or replaced — the activity feed, sessions, perf, and stats
+  surfaces keep using it. Rotation is detected by the source's file id AND its
+  head bytes, so a replaced or truncated-and-refilled log is re-read instead of
+  silently resumed at a stale offset.
+- **Migrating a large history.** The import runs in chunks and releases the
+  store between them, so a multi-hundred-megabyte `activity.jsonl` never blocks
+  live metering or admin queries. While it runs, every answer is partial by
+  construction and the panel title says `importing history N%` (the API carries
+  `health.importing` / `health.import_pct`). A failed import is counted in
+  `health.errors` / `health.last_error`, so an incomplete history can never
+  quietly read as a complete one.
+- **Coverage caveat.** Rows come from the same best-effort activity-event
+  stream the dashboard folds (`try_send`, dropped on a full channel). This is
+  faithful metering of observed completions, not an independent billing
+  ledger. Write failures are counted and surfaced instead of being swallowed.
+- **HTTP surface (admin):** `GET /llmux/keys/usage?window=<all|1h|24h|7d|14d|30d|90d>&models=<a,b,c>`
+  — `models` is one comma-separated, percent-encoded parameter; absent means
+  every model. An unknown window is a `400`. The answer carries the applied
+  `window`/`models`, the window's `available_models`, `from_ms`/`to_ms`, the
+  matched `rows`, per-tenant totals with their priced per-model cells, and
+  the store's `health` (`written`/`dropped`/`errors`/`last_error`/`importing`/
+  `import_pct`). The
+  attach-mode dashboard renders exactly this document, so local and remote
+  show identical rows.
 
 ## Daemon and dashboard
 
@@ -497,7 +557,7 @@ llmux login --openrouter --paste
 
 `--paste` requires `--openrouter`. The key is read from stdin, never printed back, and is masked in logs like every other credential.
 
-Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, not a translator**: OpenRouter exposes a native Anthropic Messages endpoint (`POST {openrouter.upstream}/messages`), so llmux forwards the Messages body unchanged apart from its `model` field, plus dropping the Claude-Code-local `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers OpenRouter does not know. There is no SSE conversion on this path. `/v1/messages/count_tokens` is answered locally (OpenRouter has no equivalent endpoint).
+Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, not a translator**: OpenRouter exposes a native Anthropic Messages endpoint (`POST {openrouter.upstream}/messages`), so the Messages format is not converted and there is no SSE conversion on this path. The body is still normalized twice, not forwarded byte-for-byte: the `model` field is rewritten to the wire slug, and `thinking` blocks with a missing or empty `signature` — the ones the Codex/Grok translators synthesize — are stripped, dropping any message the strip leaves with an empty content array, because OpenRouter's Messages schema requires that signature. The Claude-Code-local `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers are also dropped. `/v1/messages/count_tokens` is answered locally (OpenRouter has no equivalent endpoint). The per-backend difference matrix is [provider compatibility](provider-compatibility.md).
 
 Model selection is the `or-` prefix — `/model or-ox-alpha` routes to the openrouter group and reaches OpenRouter as `stealth/ox-alpha`. A bare `or` (or a model-less request) uses `openrouter.default_model`, `or-<vendor>/<slug>` passes through verbatim for the models llmux does not curate, and an unrecognized bare name is forwarded as typed so OpenRouter's own 404 reaches you. The curated rows, their wire slugs, and their context windows are in [models.md](models.md#alias-semantics).
 

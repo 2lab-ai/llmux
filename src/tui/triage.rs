@@ -567,7 +567,6 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: Default::default(),

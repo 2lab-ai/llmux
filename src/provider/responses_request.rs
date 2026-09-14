@@ -266,9 +266,14 @@ fn convert(
         if !count_tokens {
             match flavor {
                 // Live receipt: the codex OAuth backend answers
-                // `400 Unsupported parameter: max_output_tokens`. There is no
-                // other output-cap field, so the cap cannot be forwarded — and
-                // llmux will not fake enforcement by truncating locally.
+                // `400 Unsupported parameter: max_output_tokens` (probes
+                // 2026-09-11 and 2026-09-14, cap 16 and cap 1). A search for a
+                // substitute found no supported alternative cap parameter for
+                // this backend — an absence of evidence over the fields looked
+                // at, NOT proof that none exists; if one is ever verified, the
+                // cap becomes forwardable here. Until then the cap is omitted
+                // and REPORTED: llmux will neither send a field the backend
+                // refuses nor fake enforcement by truncating locally.
                 ResponsesFlavor::Codex => report.omit("max_tokens"),
                 // Grok accepts the cap (live receipt: cap 16 → `incomplete` /
                 // `max_output_tokens`). It is NOT provably the same budget:
