@@ -44,6 +44,9 @@ only a foreground process.
 
 - No hosted/multi-user deployment. Localhost, single human, their own accounts only.
 - No analytics database or browser dashboard. The dashboard is terminal-native ratatui.
+  Amended (keys-history K): one LOCAL SQLite file holds per-tenant keys usage metadata so the
+  `keys` tab can answer windowed/filtered questions across restarts. Still no analytics service,
+  no exporter, no browser UI — and no prompt/response content in it.
 - No request-content routing (claude-code-router task-type routing). Manual switch + scheduler only.
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary

@@ -479,8 +479,8 @@ mod tests {
     }
 
     /// The grok side of the compatibility contract: the cap IS forwarded
-    /// (live receipt: cap 16 → `incomplete`/`max_output_tokens`) where codex
-    /// must omit it, and a tool-less body sends none of the tool trio (xAI
+    /// (live receipt: cap 16 → `incomplete`/`max_output_tokens`), down to a
+    /// cap of 1, and a tool-less body sends none of the tool trio (xAI
     /// rejects a `tool_choice` without tools). Exhaustive cases live in
     /// `provider::responses_request::tests`.
     #[test]
@@ -490,6 +490,14 @@ mod tests {
         let (upstream, _) =
             translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
         assert_eq!(upstream["max_output_tokens"], 1024);
+        b["max_tokens"] = json!(1);
+        let (capped, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(
+            capped["max_output_tokens"].as_u64(),
+            Some(1),
+            "a one-token cap is forwarded as one: {capped}"
+        );
         for field in ["tools", "tool_choice", "parallel_tool_calls"] {
             assert!(upstream.get(field).is_none(), "{field}: {upstream}");
         }
