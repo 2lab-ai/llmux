@@ -189,9 +189,13 @@ impl<P: Prober> IdleProber<P> {
         let Some(credential) = self.pool.credential(account) else {
             return false;
         };
-        // Grok accounts NEVER produce window data (no quota headers, no
-        // usage endpoint — docs/grok/spec.md §R3), so `probe_eligible`'s
-        // "no window" test would re-probe them forever. Spend nothing.
+        // Grok accounts never get window data from THIS prober specifically
+        // (`ReqwestProber::build` rejects it deterministically below), so
+        // `probe_eligible`'s "no window" test would re-probe them forever.
+        // Spend nothing here — grok's 7d window comes from the dedicated
+        // `UsagePoller` billing-credits poll instead (docs/grok/spec.md §R3
+        // 2026-09-13 correction; `scheduler/usage.rs::fetch_grok_credits`),
+        // which this idle-request prober is not involved in.
         //
         // OpenRouter is the same shape and for the same reason: its quota
         // model is per-key credits and rate limits, not the 5h/7d rolling

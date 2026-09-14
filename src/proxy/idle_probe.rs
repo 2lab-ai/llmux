@@ -106,10 +106,13 @@ impl ReqwestProber {
                     .map_err(|err| ProbeError::Build(err.to_string()))?;
                 Ok((req, self.codex.endpoint().to_string()))
             }
-            // Grok exposes no quota headers and no usage endpoint (spec
-            // §R3): a probe can never learn anything, so it is never built.
-            // The scheduler also gates grok out (`probe_if_idle`); this is
-            // the backstop.
+            // This chat-probe mechanism can never learn grok's quota (no
+            // quota headers on a probe body, and its real weekly source —
+            // `/billing?format=credits`, spec §R3 2026-09-13 correction — is
+            // a different endpoint polled directly by `UsagePoller`, not
+            // this request-injection prober), so it is never built. The
+            // scheduler also gates grok out (`probe_if_idle`); this is the
+            // backstop.
             AccountCredential::Grok { .. } => Err(ProbeError::Build(
                 "grok accounts expose no quota headers; idle probe skipped".into(),
             )),
