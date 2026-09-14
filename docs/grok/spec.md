@@ -48,6 +48,7 @@ core with thin per-provider adapters.
 | grok-build-0.1 | fast coding model, ctx 256K, no thinking levels | models.json:2413-2423 |
 | Quota exhaustion | HTTP 429 body `code`/`error` contains `free-usage-exhausted` → 24h rolling window | xai_executor.go:2521-2545 |
 | No usage endpoint; passive headers DO exist | no `/api/oauth/usage` equivalent (probed live: /v1/{usage,rate_limits,quota,me} 404; grok.com/rest/rate-limits 403 for OAuth2 tokens; absent from CLIProxyAPI and official grok CLI 0.2.101 binary). **Correction 2026-07-14**: 200 responses DO carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` headers (live capture: 900 req / 15M tok, no reset header) — the original "no passive quota headers" claim was wrong | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
+| **Correction 2026-09-13: there IS a weekly-quota endpoint** — `GET {grok.upstream}/billing?format=credits` (same `x-xai-token-auth: xai-grok-cli` header as chat requests) returns `config.creditUsagePercent` (0-100) + `config.currentPeriod.end` (RFC3339), the shared weekly credit pool xAI put every paid Grok product on since 2026-06. Never probed until now — the "no usage endpoint" row above only tried `/v1/{usage,rate_limits,quota,me}`. Same undocumented-endpoint tolerance contract as the rest of R3: `scheduler/usage.rs::fetch_grok_credits`/`parse_grok_credits_body` polls it on the oauth poller's cadence and feeds the 7d slot; independently confirmed against 3 community tools using the same endpoint (CodexBar, aiquokka, pi-grok) | live capture 2026-09-13; `scheduler/usage.rs` |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
 | Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in carried from grok-4.5 ($0.50/M; not listed) | docs.x.ai grok-4.6 (web, 2026-08-13) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
@@ -143,12 +144,18 @@ core with thin per-provider adapters.
   dashboard tracks per-(group, model). Add pricing entry `GROK_4_5 {input 2.0, output
   6.0, cache_read 0.5, cache_creation 0.0}` + `group == "grok"` unknown-model fallback
   (src/pricing.rs builtin table, pricing.rs:58-100).
-- Quota windows (**revised 2026-07-14**, post-ship): grok has no active usage endpoint,
-  but 200 responses carry `x-ratelimit-{limit,remaining}-{requests,tokens}` burst headers
-  (RPM/TPM-shaped, no reset). These feed the 5h slot via the standard-bucket path with an
-  estimated 60s reset horizon (`headers::STANDARD_RESET_FALLBACK`), grok accounts only.
-  The 7d gauge stays empty. A `free-usage-exhausted` park shows the existing
-  cooldown/reset countdown UI.
+- Quota windows (**revised 2026-07-14**, post-ship): 200 responses carry
+  `x-ratelimit-{limit,remaining}-{requests,tokens}` burst headers (RPM/TPM-shaped, no
+  reset). These feed the 5h slot via the standard-bucket path with an estimated 60s
+  reset horizon (`headers::STANDARD_RESET_FALLBACK`), grok accounts only. A
+  `free-usage-exhausted` park shows the existing cooldown/reset countdown UI.
+  **Revised again 2026-09-13**: the 7d gauge is no longer permanently empty —
+  `UsagePoller` now polls grok accounts too (`credential_kind == "grok"`, same
+  cadence/backoff as oauth), hitting `GET {grok.upstream}/billing?format=credits` and
+  mapping `creditUsagePercent`/`currentPeriod.end` into the 7d slot (`scheduler/usage.rs`
+  §grok billing correction above). The 5h slot is still the unrelated RPM/TPM burst
+  reading, not weekly usage — the two slots now measure genuinely different things for
+  grok, unlike every other provider where 5h/7d are both subscription-quota windows.
 - Surfaces: `llmux status` (client+server), TUI account table + activity log (model +
   effort recorded via grok `effective_request_meta` mirror), `/llmux/status` JSON
   (`group: "grok"`), islands: `UsageProvider.grok` + provider icon (new `grok` asset;

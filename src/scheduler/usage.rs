@@ -221,10 +221,77 @@ pub async fn fetch_usage(
     parse_usage_body(&body)
 }
 
-/// Injectable transport for the usage endpoint, so the poller is testable
-/// without a network.
+/// Parse `GET {grok upstream}/billing?format=credits`'s body into a
+/// [`UsageSnapshot`] with only `seven_day` populated — the shared weekly
+/// credit pool xAI put all paid Grok products on since 2026-06 (Chat,
+/// Imagine, Voice, Build, API). `config.creditUsagePercent` is 0..=100 like
+/// every other percent-scaled source in this file; `config.currentPeriod.end`
+/// (RFC3339) is the reset. `five_hour`/`scoped` stay empty — this endpoint
+/// has no burst-window or per-model breakdown, unlike the oauth usage
+/// endpoint's `limits[]`. Undocumented endpoint (docs/grok/spec.md §R3
+/// addendum) — reverse-engineered from the official `grok` CLI's own calls;
+/// same tolerance contract as [`parse_usage_body`]: a missing/malformed field
+/// drops the reading, never an error.
+pub fn parse_grok_credits_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
+    let value: Value = serde_json::from_slice(body)?;
+    let config = value.get("config");
+    let seven_day = config.and_then(|c| {
+        let percent = c.get("creditUsagePercent")?.as_f64()?;
+        if !percent.is_finite() || percent < 0.0 {
+            return None;
+        }
+        let resets_at = c
+            .get("currentPeriod")?
+            .get("end")?
+            .as_str()
+            .and_then(|s| parse_rfc3339(s).or_else(|| parse_epoch_seconds(s)))?;
+        Some(percent_reading(percent, resets_at))
+    });
+    Ok(UsageSnapshot {
+        five_hour: None,
+        seven_day,
+        scoped: Vec::new(),
+    })
+}
+
+/// One-shot fetch of the grok weekly credit pool. Pure IO, mirrors
+/// [`fetch_usage`]. `x-xai-token-auth` is the same Grok-CLI identity header
+/// [`crate::provider::grok`] attaches to chat requests — the billing
+/// endpoint requires it too (undocumented, live capture).
+pub async fn fetch_grok_credits(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+) -> Result<UsageSnapshot, UsageError> {
+    let url = format!("{}/billing?format=credits", base_url.trim_end_matches('/'));
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .header(http::header::ACCEPT, "application/json")
+        .header("x-xai-token-auth", "xai-grok-cli")
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UsageError::Status { status });
+    }
+    let body = response.bytes().await?;
+    parse_grok_credits_body(&body)
+}
+
+/// Injectable transport for the usage endpoints, so the poller is testable
+/// without a network. `fetch` covers the Anthropic-shaped `/api/oauth/usage`
+/// endpoint (oauth accounts); `fetch_grok_credits` covers grok's
+/// `/billing?format=credits` weekly pool (grok accounts) — distinct wire
+/// shapes, so distinct methods rather than overloading one.
 pub trait UsageFetcher: Send + Sync {
     fn fetch(
+        &self,
+        base_url: &str,
+        access_token: &str,
+    ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send;
+
+    fn fetch_grok_credits(
         &self,
         base_url: &str,
         access_token: &str,
@@ -247,6 +314,17 @@ impl UsageFetcher for ReqwestFetcher {
         let base_url = base_url.to_owned();
         let access_token = access_token.to_owned();
         async move { fetch_usage(&client, &base_url, &access_token).await }
+    }
+
+    fn fetch_grok_credits(
+        &self,
+        base_url: &str,
+        access_token: &str,
+    ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+        let client = self.client.clone();
+        let base_url = base_url.to_owned();
+        let access_token = access_token.to_owned();
+        async move { fetch_grok_credits(&client, &base_url, &access_token).await }
     }
 }
 
@@ -271,14 +349,21 @@ struct PollSchedule {
     consecutive_failures: u32,
 }
 
-/// Background poller: polls every oauth account at `usage_poll_secs` cadence
-/// with jitter; failures climb the backoff ladder and recover on first
-/// success. Each account has its own next-allowed-at; API-key accounts are
-/// skipped (no usage endpoint).
+/// Background poller: polls every oauth AND grok account at `usage_poll_secs`
+/// cadence with jitter; failures climb the backoff ladder and recover on
+/// first success. Each account has its own next-allowed-at; API-key/codex/
+/// openrouter accounts are skipped (no polled usage endpoint for those
+/// kinds — codex/apikey rely on the idle prober's passive headers instead,
+/// see `scheduler/idle_probe.rs`).
 pub struct UsagePoller<F = ReqwestFetcher> {
     pool: AccountPool,
     fetcher: F,
     base_url: String,
+    /// Base URL for grok's `/billing?format=credits` weekly-pool endpoint
+    /// (`config.grok.upstream`, same host the grok provider POSTs
+    /// `/responses` to — `provider::grok::GROK_CHAT_PROXY_UPSTREAM` by
+    /// default).
+    grok_base_url: String,
     config: SchedulerConfig,
     schedule: HashMap<AccountId, PollSchedule>,
     /// Wall-clock time of the last poll, for the global [`MIN_POLL_GAP`] throttle.
@@ -293,9 +378,16 @@ impl UsagePoller<ReqwestFetcher> {
         pool: AccountPool,
         client: reqwest::Client,
         base_url: String,
+        grok_base_url: String,
         config: SchedulerConfig,
     ) -> Self {
-        Self::with_fetcher(pool, ReqwestFetcher { client }, base_url, config)
+        Self::with_fetcher(
+            pool,
+            ReqwestFetcher { client },
+            base_url,
+            grok_base_url,
+            config,
+        )
     }
 }
 
@@ -305,12 +397,14 @@ impl<F: UsageFetcher> UsagePoller<F> {
         pool: AccountPool,
         fetcher: F,
         base_url: String,
+        grok_base_url: String,
         config: SchedulerConfig,
     ) -> Self {
         Self {
             pool,
             fetcher,
             base_url,
+            grok_base_url,
             config,
             schedule: HashMap::new(),
             last_poll_at: None,
@@ -336,25 +430,29 @@ impl<F: UsageFetcher> UsagePoller<F> {
         }
     }
 
-    /// Re-read the oauth roster, drop schedules for removed accounts, and give
-    /// every current account a schedule entry (new accounts due immediately).
+    /// Re-read the oauth+grok roster, drop schedules for removed accounts,
+    /// and give every current account a schedule entry (new accounts due
+    /// immediately). Grok accounts poll the weekly credit pool
+    /// (`/billing?format=credits`) on the same cadence/backoff as oauth's
+    /// `/api/oauth/usage` — see [`Self::poll_account`] for the per-kind
+    /// dispatch.
     fn refresh_schedule(&mut self, now: SystemTime) -> Vec<AccountId> {
-        let oauth_ids: Vec<AccountId> = self
+        let polled_ids: Vec<AccountId> = self
             .pool
             .snapshot()
             .accounts
             .iter()
-            .filter(|a| a.credential_kind == "oauth")
+            .filter(|a| a.credential_kind == "oauth" || a.credential_kind == "grok")
             .map(|a| a.id.clone())
             .collect();
-        self.schedule.retain(|id, _| oauth_ids.contains(id));
-        for id in &oauth_ids {
+        self.schedule.retain(|id, _| polled_ids.contains(id));
+        for id in &polled_ids {
             self.schedule.entry(id.clone()).or_insert(PollSchedule {
                 next_at: now,
                 consecutive_failures: 0,
             });
         }
-        oauth_ids
+        polled_ids
     }
 
     /// Poll one account and reschedule it (jittered interval on success, backoff
@@ -405,7 +503,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
     /// the roster each pass so account reloads are picked up; removed accounts
     /// drop their schedule entries.
     pub async fn tick(&mut self, now: SystemTime) {
-        let oauth_ids = self.refresh_schedule(now);
+        let polled_ids = self.refresh_schedule(now);
 
         // Global throttle: at most one poll per MIN_POLL_GAP, so a pass that
         // finds many accounts due never bursts a call per account.
@@ -417,7 +515,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
         }
 
         // Poll the single most-overdue due account this tick.
-        let Some(id) = oauth_ids
+        let Some(id) = polled_ids
             .iter()
             .filter(|id| self.schedule.get(*id).is_some_and(|e| e.next_at <= now))
             .min_by_key(|id| self.schedule.get(*id).map(|e| e.next_at).unwrap_or(now))
@@ -440,20 +538,36 @@ impl<F: UsageFetcher> UsagePoller<F> {
         Duration::from_secs(BACKOFF_LADDER_SECS[idx])
     }
 
-    /// Poll a single account once and record the outcome. Non-oauth (or
-    /// vanished) accounts are a no-op. A 403 means the token was revoked —
-    /// surfaced as an auth failure; a 401 is left for the auth layer's
-    /// refresh path (the next poll retries with the refreshed credential).
+    /// Poll a single account once and record the outcome. Dispatches by
+    /// credential kind — oauth hits `/api/oauth/usage`, grok hits
+    /// `/billing?format=credits` (against `grok_base_url`, a different host
+    /// than `base_url`). Every other kind (apikey/codex/openrouter, or a
+    /// vanished account) is a no-op — they never reach here since
+    /// `refresh_schedule` only schedules oauth+grok, but this stays
+    /// exhaustive rather than assuming the caller filtered correctly. A 403
+    /// means the token was revoked — surfaced as an auth failure; a 401 is
+    /// left for the auth layer's refresh path (the next poll retries with
+    /// the refreshed credential).
     pub async fn poll_account(
         &self,
         account: &AccountId,
         now: SystemTime,
     ) -> Result<(), UsageError> {
-        let Some(AccountCredential::Oauth { access_token, .. }) = self.pool.credential(account)
-        else {
+        let result = match self.pool.credential(account) {
+            Some(AccountCredential::Oauth { access_token, .. }) => {
+                Some(self.fetcher.fetch(&self.base_url, &access_token).await)
+            }
+            Some(AccountCredential::Grok { access_token, .. }) => Some(
+                self.fetcher
+                    .fetch_grok_credits(&self.grok_base_url, &access_token)
+                    .await,
+            ),
+            _ => None,
+        };
+        let Some(result) = result else {
             return Ok(());
         };
-        match self.fetcher.fetch(&self.base_url, &access_token).await {
+        match result {
             Ok(snapshot) => {
                 self.pool.record_usage(account, &snapshot, now);
                 Ok(())
@@ -526,15 +640,34 @@ mod tests {
         }
     }
 
+    fn grok_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Grok {
+                subject: format!("sub-{name}"),
+                access_token: format!("gt-{name}"),
+                refresh_token: format!("grt-{name}"),
+                expires_at_ms: 0,
+                token_endpoint: String::new(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
     fn config() -> SchedulerConfig {
         SchedulerConfig::default() // poll 300s, max age 600s
     }
 
     /// Scripted fetcher: pops the next queued result per call and records
-    /// the tokens it was called with.
+    /// the tokens it was called with. `fetch` and `fetch_grok_credits` are
+    /// separate queues/call logs — the poller must route oauth vs grok
+    /// accounts to the right one, and a test asserting on one method's
+    /// calls must not see the other's.
     struct MockFetcher {
         results: Mutex<Vec<Result<UsageSnapshot, UsageError>>>,
         calls: Mutex<Vec<String>>,
+        grok_results: Mutex<Vec<Result<UsageSnapshot, UsageError>>>,
+        grok_calls: Mutex<Vec<String>>,
     }
 
     impl MockFetcher {
@@ -542,11 +675,22 @@ mod tests {
             Self {
                 results: Mutex::new(results),
                 calls: Mutex::new(Vec::new()),
+                grok_results: Mutex::new(Vec::new()),
+                grok_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_grok_results(mut self, results: Vec<Result<UsageSnapshot, UsageError>>) -> Self {
+            self.grok_results = Mutex::new(results);
+            self
         }
 
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
+        }
+
+        fn grok_call_count(&self) -> usize {
+            self.grok_calls.lock().unwrap().len()
         }
     }
 
@@ -559,6 +703,26 @@ mod tests {
             self.calls.lock().unwrap().push(access_token.to_string());
             let result = {
                 let mut results = self.results.lock().unwrap();
+                if results.is_empty() {
+                    Ok(UsageSnapshot::default())
+                } else {
+                    results.remove(0)
+                }
+            };
+            async move { result }
+        }
+
+        fn fetch_grok_credits(
+            &self,
+            _base_url: &str,
+            access_token: &str,
+        ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+            self.grok_calls
+                .lock()
+                .unwrap()
+                .push(access_token.to_string());
+            let result = {
+                let mut results = self.grok_results.lock().unwrap();
                 if results.is_empty() {
                     Ok(UsageSnapshot::default())
                 } else {
@@ -697,6 +861,80 @@ mod tests {
         ));
     }
 
+    // ---- grok /billing?format=credits parsing ----
+
+    /// Live capture, 2026-09-13 (`GET cli-chat-proxy.grok.com/v1/billing
+    /// ?format=credits`, HTTP 200) — the shared weekly credit pool xAI put
+    /// every paid Grok product on since 2026-06. `docs/grok/spec.md §R3`'s
+    /// "grok has no active usage endpoint" claim was based on probing
+    /// `/v1/{usage,rate_limits,quota,me}` only; `/v1/billing` was never
+    /// tried.
+    const GROK_BILLING_FIXTURE: &str = r#"{
+        "config": {
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-09-13T08:04:50.056830+00:00",
+                "end": "2026-09-20T08:04:50.056830+00:00"
+            },
+            "creditUsagePercent": 47.0,
+            "onDemandCap": {"val": 0},
+            "onDemandUsed": {"val": 0},
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 47.0}],
+            "isUnifiedBillingUser": true,
+            "prepaidBalance": {"val": 0},
+            "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+            "billingPeriodStart": "2026-09-13T08:04:50.056830+00:00",
+            "billingPeriodEnd": "2026-09-20T08:04:50.056830+00:00"
+        }
+    }"#;
+
+    #[test]
+    fn grok_billing_fixture_yields_seven_day_only() {
+        let snapshot = parse_grok_credits_body(GROK_BILLING_FIXTURE.as_bytes()).unwrap();
+        assert!(
+            snapshot.five_hour.is_none(),
+            "billing endpoint has no burst window"
+        );
+        assert!(snapshot.scoped.is_empty(), "no per-model breakdown");
+        let seven = snapshot.seven_day.unwrap();
+        assert!((seven.utilization - 0.47).abs() < 1e-9, "47% → 0.47");
+        assert_eq!(
+            seven.resets_at,
+            at(1_789_891_490) + Duration::from_nanos(56_830_000),
+            // 2026-09-20T08:04:50.056830Z — sub-second preserved by
+            // `parse_rfc3339`, unlike `epoch_of` in the oauth-fixture tests.
+        );
+    }
+
+    #[test]
+    fn grok_billing_missing_config_yields_empty_snapshot() {
+        assert_eq!(
+            parse_grok_credits_body(b"{}").unwrap(),
+            UsageSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn grok_billing_malformed_percent_is_dropped_not_an_error() {
+        let body = br#"{"config": {"creditUsagePercent": "lots",
+            "currentPeriod": {"end": "2026-09-20T08:04:50Z"}}}"#;
+        assert!(parse_grok_credits_body(body).unwrap().seven_day.is_none());
+    }
+
+    #[test]
+    fn grok_billing_missing_reset_is_dropped_not_an_error() {
+        let body = br#"{"config": {"creditUsagePercent": 47.0}}"#;
+        assert!(parse_grok_credits_body(body).unwrap().seven_day.is_none());
+    }
+
+    #[test]
+    fn grok_billing_invalid_json_is_a_parse_error() {
+        assert!(matches!(
+            parse_grok_credits_body(b"not json"),
+            Err(UsageError::Parse(_))
+        ));
+    }
+
     // ---- limits[] scoped rows (fable-usage W1) ----
 
     #[test]
@@ -785,7 +1023,13 @@ mod tests {
     fn backoff_ladder_matches_spec() {
         let pool = AccountPool::new(&[]);
         let fetcher = MockFetcher::new(vec![]);
-        let poller = UsagePoller::with_fetcher(pool, &fetcher, "http://x".into(), config());
+        let poller = UsagePoller::with_fetcher(
+            pool,
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         assert_eq!(poller.backoff_delay(0), Duration::from_secs(300));
         assert_eq!(poller.backoff_delay(1), Duration::from_secs(120));
         assert_eq!(poller.backoff_delay(2), Duration::from_secs(300));
@@ -814,8 +1058,13 @@ mod tests {
     async fn successful_poll_records_usage_into_pool() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let fetcher = MockFetcher::new(vec![Ok(snapshot_with(0.42))]);
-        let mut poller =
-            UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         poller.tick(now()).await;
         assert_eq!(fetcher.call_count(), 1);
         assert_eq!(
@@ -831,16 +1080,81 @@ mod tests {
     async fn apikey_accounts_are_never_polled() {
         let pool = AccountPool::new(&[apikey_account("k")]);
         let fetcher = MockFetcher::new(vec![]);
-        let mut poller = UsagePoller::with_fetcher(pool, &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool,
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         poller.tick(now()).await;
         assert_eq!(fetcher.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn grok_accounts_are_polled_via_billing_credits_not_oauth_usage() {
+        let pool = AccountPool::new(&[grok_account("g")]);
+        let fetcher = MockFetcher::new(vec![]).with_grok_results(vec![Ok(UsageSnapshot {
+            five_hour: None,
+            seven_day: Some(WindowReading {
+                utilization: 0.47,
+                resets_at: at(NOW_SECS + 3600),
+            }),
+            scoped: Vec::new(),
+        })]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        assert_eq!(fetcher.call_count(), 0, "grok never hits /api/oauth/usage");
+        assert_eq!(fetcher.grok_call_count(), 1);
+        assert_eq!(
+            fetcher.grok_calls.lock().unwrap()[0],
+            "gt-g",
+            "bearer = the grok account's own access token"
+        );
+        let snapshot = pool.snapshot();
+        assert_eq!(
+            snapshot.accounts[0].seven_day.unwrap().utilization,
+            0.47,
+            "grok's weekly credit pool lands in the 7d slot"
+        );
+        assert!(
+            snapshot.accounts[0].five_hour.is_none(),
+            "billing endpoint has no 5h data — unaffected by this poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_billing_403_marks_auth_failure_like_oauth() {
+        let pool = AccountPool::new(&[grok_account("g")]);
+        let fetcher = MockFetcher::new(vec![]).with_grok_results(vec![Err(status_err(403))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        assert!(!pool.snapshot().accounts[0].healthy, "403 = revoked token");
     }
 
     #[tokio::test]
     async fn respects_per_account_next_allowed_at() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let fetcher = MockFetcher::new(vec![Ok(snapshot_with(0.1)), Ok(snapshot_with(0.2))]);
-        let mut poller = UsagePoller::with_fetcher(pool, &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool,
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         poller.tick(now()).await;
         assert_eq!(fetcher.call_count(), 1);
         // Immediately after: not due yet (interval 300s + jitter).
@@ -863,7 +1177,13 @@ mod tests {
             Err(status_err(500)),
             Ok(snapshot_with(0.3)),
         ]);
-        let mut poller = UsagePoller::with_fetcher(pool, &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool,
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
 
         poller.tick(now()).await; // failure #1 → next in ~120s
         assert_eq!(fetcher.call_count(), 1);
@@ -891,8 +1211,13 @@ mod tests {
     async fn forbidden_marks_auth_failure_unauthorized_does_not() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         let fetcher = MockFetcher::new(vec![Err(status_err(403)), Err(status_err(401))]);
-        let mut poller =
-            UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         // One poll per tick (MIN_POLL_GAP throttle): `a` this tick, `b` after
         // the gap. Together they cover both accounts without bursting.
         poller.tick(now()).await; // a → 403
@@ -908,8 +1233,13 @@ mod tests {
     async fn removed_accounts_drop_their_schedule() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let fetcher = MockFetcher::new(vec![Ok(snapshot_with(0.1))]);
-        let mut poller =
-            UsagePoller::with_fetcher(pool.clone(), &fetcher, "http://x".into(), config());
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            "http://grok-x".into(),
+            config(),
+        );
         poller.tick(now()).await;
         assert!(poller.schedule.contains_key(&id("a")));
         pool.reload_accounts(&[]);
