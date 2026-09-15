@@ -5810,8 +5810,15 @@ const META_W_MAX: usize = 32;
 
 impl RowMetrics {
     /// Measure the visible rows. `completed` is the already-windowed slice the
-    /// frame will render (plus slack); in-flight rows share the meta slot.
-    fn measure(width: u16, in_flight: &[InFlight], completed: &[&Completed]) -> Self {
+    /// frame will render (plus slack); in-flight rows share the meta slot AND
+    /// the duration slot (their live elapsed time renders there, so a
+    /// long-running request must not push the columns around).
+    fn measure(
+        width: u16,
+        now: SystemTime,
+        in_flight: &[InFlight],
+        completed: &[&Completed],
+    ) -> Self {
         let mut m = RowMetrics {
             width,
             meta_w: 0,
@@ -5827,6 +5834,8 @@ impl RowMetrics {
                 request.effort.as_deref(),
             );
             m.meta_w = m.meta_w.max(cell_width(&meta));
+            let elapsed = now.duration_since(request.started_at).unwrap_or_default();
+            m.dur_w = m.dur_w.max(format::elapsed_secs(elapsed).len());
         }
         for entry in completed {
             let CompletedBody::Request {
@@ -5905,9 +5914,9 @@ fn draw_activity(
         })
         .collect();
     let metrics = if chrome.activity_scroll == 0 {
-        RowMetrics::measure(area.width, in_flight, &visible)
+        RowMetrics::measure(area.width, now, in_flight, &visible)
     } else {
-        RowMetrics::measure(area.width, &[], &visible)
+        RowMetrics::measure(area.width, now, &[], &visible)
     };
     // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
     // while scrolled into history they'd steal rows from the page being read.
@@ -5939,6 +5948,20 @@ fn draw_activity(
             // completed rows. Unknown kind → 8 blank cells (alignment holds).
             let kind = request.kind.as_deref().unwrap_or("");
             spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
+            // Client Name column (activity in-flight identity): the same cell
+            // the completed row draws — the doc builder already resolved the
+            // display name off the same tenant join, so a RUNNING row shows
+            // who is asking instead of waiting for the finish. Unattributed →
+            // a blank but still padded cell, never coerced to "local".
+            let short = request
+                .client_name
+                .as_deref()
+                .map(|n| format::client_short_name(&masked_text(n, view.email_anonymous)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
+                Style::new().fg(Color::Cyan),
+            ));
             // `[model effort]` badge while in flight (issue #2, 2a): filled at
             // routing time (req11) with the same per-request values the finish
             // will record, so the running badge reads exactly like its
@@ -5954,16 +5977,59 @@ fn draw_activity(
                 ),
                 metrics.meta_w,
             ));
-            if let Some(account) = &request.account {
-                spans.push(Span::raw(format!(
-                    " → {}",
-                    row_account_name(account, view.email_anonymous, &view.domain_abbrev)
-                )));
-            }
+            // From here the row is the COMPLETED row's column sequence with the
+            // not-yet-known cells held open at full width: `…` in the status
+            // slot, the live elapsed time in the duration slot, `—` for
+            // tokens/throughput/cost. Nothing shifts when the finish lands.
+            let account = request
+                .account
+                .as_deref()
+                .map(|a| row_account_name(a, view.email_anonymous, &view.domain_abbrev))
+                .unwrap_or_default();
+            spans.push(Span::raw(format!(
+                " {} → ",
+                pad_cells(&account, ACTIVITY_EMAIL_W)
+            )));
+            spans.push(Span::styled("  …", dim()));
             spans.push(Span::styled(
-                format!(" ({}…)", format::elapsed_secs(elapsed)),
+                format!(
+                    " {} {} {}",
+                    pad_cells_left(&format::elapsed_secs(elapsed), metrics.dur_w),
+                    pad_cells_left(PENDING_CELL, metrics.tok_w),
+                    pad_cells_left(PENDING_CELL, metrics.tps_w),
+                ),
                 dim(),
             ));
+            spans.push(Span::raw(format!(
+                " {}",
+                pad_cells_left(PENDING_CELL, metrics.cost_w)
+            )));
+            // Derived session title (U2) — seeded at START time for exactly
+            // this reason, so it does not pop into existence at the finish.
+            if let Some(label) = request
+                .user_id
+                .as_deref()
+                .and_then(|id| view.session_labels.get(id))
+            {
+                spans.push(Span::styled(
+                    format!(
+                        " \u{ab}{}\u{bb}",
+                        truncate_chars(&masked_text(label, view.email_anonymous), 16)
+                    ),
+                    dim().add_modifier(Modifier::ITALIC),
+                ));
+            }
+            // Input excerpt LAST, on the same budget math as a completed row.
+            if let Some(excerpt) = request.excerpt.as_deref() {
+                let consumed: usize = spans.iter().map(|s| cell_width(&s.content)).sum();
+                let budget = (metrics.width as usize).saturating_sub(consumed + 3);
+                if budget > 0 {
+                    spans.push(Span::raw(format!(
+                        " \u{201c}{}\u{201d}",
+                        truncate_cells(&masked_text(excerpt, view.email_anonymous), budget)
+                    )));
+                }
+            }
             lines.push(Line::from(spans));
         }
     }
@@ -6126,6 +6192,11 @@ fn draw_activity(
 
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
 const ACTIVITY_EMAIL_W: usize = 10;
+
+/// Placeholder in the numeric columns of a RUNNING activity row: the value is
+/// unknowable until the finish lands, but the column still holds its width so
+/// the feed does not jump when it does.
+const PENDING_CELL: &str = "\u{2014}";
 
 /// The client Name column width on activity rows (activity client-name,
 /// Z 2026-08-24: "첫 4자만 출력") — matches the 4-char shortening rule of
@@ -9075,6 +9146,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -10339,6 +10414,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -10367,6 +10446,10 @@ mod tests {
             effort: Some("max".into()),
             fast: true,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -10397,6 +10480,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: Some("compact".into()),
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -10409,6 +10496,122 @@ mod tests {
                 < row.find("[opus-4-8]").unwrap_or(usize::MAX),
             "kind → badge order on the in-flight row: {row}"
         );
+    }
+
+    /// activity in-flight identity: a RUNNING row shows WHO is asking and
+    /// WHAT they asked — the same Name column, «session» label and “input”
+    /// excerpt its eventual completed row shows. Before this, the running row
+    /// stopped at the badge and the account.
+    #[test]
+    fn in_flight_row_shows_client_name_session_label_and_excerpt_like_a_completed_row() {
+        let mut view = view_with(Vec::new());
+        view.session_labels
+            .insert("u1".into(), "hello world".into());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
+            kind: Some("user".into()),
+            user_id: Some("u1".into()),
+            tenant: Some("k-t1".into()),
+            excerpt: Some("hello world".into()),
+            client_name: Some("Z (U09F1M5MML1)".into()),
+            started_at: std::time::SystemTime::now(),
+        }];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
+        let row = rows
+            .iter()
+            .find(|l| l.contains("[opus-4-8]"))
+            .expect("in-flight row rendered");
+        // Name cell: the 4-char short form, padded, BEFORE the badge.
+        let name_at = row.find("Z   ").expect("short client name cell: {row}");
+        let badge_at = row.find("[opus-4-8]").expect("badge");
+        assert!(name_at < badge_at, "name → badge order: {row}");
+        assert!(
+            row.contains("\u{ab}hello world\u{bb}"),
+            "derived session label rides the running row: {row}"
+        );
+        assert!(
+            row.contains("\u{201c}hello world\u{201d}"),
+            "input excerpt rides the running row: {row}"
+        );
+    }
+
+    /// The running row is not just *decorated* like a completed row — the
+    /// columns land in the SAME screen columns, which is the whole point of
+    /// sharing the layout (a shifting feed is unreadable while requests come
+    /// and go).
+    #[test]
+    fn in_flight_row_columns_align_with_a_completed_row() {
+        let mut view = view_with(Vec::new());
+        view.session_labels
+            .insert("u1".into(), "hello world".into());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
+            kind: Some("user".into()),
+            user_id: Some("u1".into()),
+            tenant: Some("k-t1".into()),
+            excerpt: Some("hello world".into()),
+            client_name: Some("Z (U09F1M5MML1)".into()),
+            started_at: std::time::SystemTime::now(),
+        }];
+        view.completed = vec![Completed {
+            at: UNIX_EPOCH + Duration::from_millis(1_000),
+            body: CompletedBody::Request {
+                id: 2,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:me@example.com".into()),
+                status: 200,
+                duration: Duration::from_millis(1_200),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: Some("u1".into()),
+                kind: Some("user".into()),
+                excerpt: Some("hello world".into()),
+                tenant: Some("k-t1".into()),
+                client_name: Some("Z (U09F1M5MML1)".into()),
+            },
+        }];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
+        let badge_rows: Vec<&String> = rows.iter().filter(|l| l.contains("[opus-4-8]")).collect();
+        assert_eq!(badge_rows.len(), 2, "one running row + one completed row");
+        // Column = display cells before the needle (byte offsets would lie
+        // about the multi-byte spinner/marker glyphs).
+        let col = |row: &str, needle: &str| {
+            let at = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {row}"));
+            row[..at].chars().count()
+        };
+        for needle in ["[opus-4-8]", " \u{2192} "] {
+            assert_eq!(
+                col(badge_rows[0], needle),
+                col(badge_rows[1], needle),
+                "`{needle}` column differs between the running and completed rows:\n{}\n{}",
+                badge_rows[0],
+                badge_rows[1]
+            );
+        }
     }
 
     #[test]
@@ -10448,7 +10651,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let cost_span = |entry: &Completed| {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10501,7 +10704,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let render = |entry: &Completed| -> String {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10617,7 +10820,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let name_cell = |entry: &Completed| {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10678,7 +10881,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let rendered_width = |entry: &Completed, w: u16| {
-            let m = RowMetrics::measure(w, &[], &[entry]);
+            let m = RowMetrics::measure(w, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10736,7 +10939,7 @@ mod tests {
         let run = [probe.clone(), probe.clone()];
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
-        let m = RowMetrics::measure(120, &[], &[&probe]);
+        let m = RowMetrics::measure(120, UNIX_EPOCH, &[], &[&probe]);
         let header = folded_run_line(
             &run,
             false,
@@ -12455,6 +12658,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: UNIX_EPOCH,
         }];
         view.completed = vec![

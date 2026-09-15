@@ -61,6 +61,21 @@ pub(crate) struct InFlight {
     /// Message-kind classification, known at start time (TUI UI-6 item 1) so
     /// the in-flight row renders the same `kind` column as its completed row.
     pub kind: Option<String>,
+    /// Keyless client identity (`metadata.user_id`), known at start time so
+    /// the RUNNING row keys the same derived session label as its eventual
+    /// completed row (TUI UI-3 U2).
+    pub user_id: Option<String>,
+    /// KEYED tenant attribution id (`k-…` / `legacy` / `local`), known at
+    /// start time. `None` only for starts emitted before this field existed
+    /// — rendered blank, never coerced into `local`.
+    pub tenant: Option<String>,
+    /// Cleaned input excerpt, known at start time so the running row shows
+    /// the same input text as its completed row.
+    pub excerpt: Option<String>,
+    /// Resolved client display name for `tenant`. The FOLD leaves this
+    /// `None` — key metadata lives in config, not here — and the doc builder
+    /// resolves it, exactly like `CompletedBody::Request::client_name`.
+    pub client_name: Option<String>,
     pub started_at: SystemTime,
 }
 
@@ -1744,6 +1759,28 @@ impl ActivityLog {
     /// brand-new id is merged into `unknown` rather than allocating a new
     /// entry (already-tracked ids and `unknown` always accumulate). This is
     /// counting only — it never affects whether the request was served.
+    /// Session label (TUI UI-3 U2): the FIRST plain user-input excerpt seen
+    /// for a client id becomes that session's derived title (nothing on the
+    /// wire carries a real one). Bounded by `MAX_CLIENTS` via the same
+    /// insert-guard as the client buckets. Called from BOTH the start and the
+    /// finish fold (activity in-flight identity) so a running row and the
+    /// completed row it becomes show the SAME label — a label that only
+    /// appeared at finish time would make the row visibly change identity.
+    fn note_session_label(
+        &mut self,
+        user_id: Option<&str>,
+        kind: Option<&str>,
+        excerpt: Option<&str>,
+    ) {
+        let (Some(uid), Some("user"), Some(text)) = (user_id, kind, excerpt) else {
+            return;
+        };
+        if !self.session_labels.contains_key(uid) && self.session_labels.len() < MAX_CLIENTS {
+            self.session_labels
+                .insert(uid.to_string(), text.chars().take(48).collect());
+        }
+    }
+
     fn record_client(&mut self, user_id: Option<&str>, status: u16, tokens: Option<TokenCounts>) {
         let key = match user_id {
             Some(id) if !id.is_empty() => {
@@ -1960,6 +1997,9 @@ impl ActivityLog {
                 method,
                 path,
                 kind,
+                user_id,
+                tenant,
+                excerpt,
             } => {
                 if self.in_flight.len() >= MAX_IN_FLIGHT {
                     let lost = self.in_flight.remove(0);
@@ -1972,6 +2012,7 @@ impl ActivityLog {
                         now,
                     );
                 }
+                self.note_session_label(user_id.as_deref(), kind.as_deref(), excerpt.as_deref());
                 self.in_flight.push(InFlight {
                     id,
                     method,
@@ -1982,6 +2023,13 @@ impl ActivityLog {
                     effort: None,
                     fast: false,
                     kind,
+                    user_id,
+                    tenant,
+                    excerpt,
+                    // Resolved by the doc builder, never here — key metadata
+                    // lives in config, not in the fold (same contract as
+                    // `CompletedBody::Request::client_name`).
+                    client_name: None,
                     started_at: now,
                 });
             }
@@ -2043,20 +2091,9 @@ impl ActivityLog {
                     model.as_deref(),
                     now,
                 );
-                // Session label (TUI UI-3 U2): the FIRST plain user-input
-                // excerpt seen for a client id becomes that session's derived
-                // title (nothing on the wire carries a real one). Bounded by
-                // MAX_CLIENTS via the same insert-guard as client buckets.
-                if let (Some(uid), Some("user"), Some(text)) =
-                    (user_id.as_deref(), kind.as_deref(), excerpt.as_deref())
-                {
-                    if !self.session_labels.contains_key(uid)
-                        && self.session_labels.len() < MAX_CLIENTS
-                    {
-                        self.session_labels
-                            .insert(uid.to_string(), text.chars().take(48).collect());
-                    }
-                }
+                // Same derived-title rule as the start fold (a finish whose
+                // start was dropped must still name its session).
+                self.note_session_label(user_id.as_deref(), kind.as_deref(), excerpt.as_deref());
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -2333,6 +2370,9 @@ mod tests {
             method: "POST".into(),
             path: "/v1/messages".into(),
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
         }
     }
 
@@ -2537,6 +2577,42 @@ mod tests {
         log.apply(finished(99, Some("b"), None), at(0));
         assert_eq!(log.completed().count(), 1);
         assert!(log.in_flight().is_empty());
+    }
+
+    /// activity in-flight identity: the RUNNING row must carry the same
+    /// identity a completed row does — client id, tenant, and the input
+    /// excerpt all land on the fold at START time (they are parsed at forward
+    /// entry, long before the finish), and the derived session label is
+    /// seeded there too so the running row and its later completed row show
+    /// the SAME «label» instead of the label appearing only after the finish.
+    #[test]
+    fn request_started_carries_identity_and_seeds_the_session_label() {
+        let mut log = ActivityLog::new(10);
+        log.apply(
+            ActivityEvent::RequestStarted {
+                id: 1,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                kind: Some("user".into()),
+                user_id: Some("u1".into()),
+                tenant: Some("k-t1".into()),
+                excerpt: Some("hello".into()),
+            },
+            at(0),
+        );
+        let row = &log.in_flight()[0];
+        assert_eq!(row.user_id.as_deref(), Some("u1"));
+        assert_eq!(row.tenant.as_deref(), Some("k-t1"));
+        assert_eq!(row.excerpt.as_deref(), Some("hello"));
+        // The display name is NOT resolved here (key metadata lives in
+        // config) — the doc builder fills it, same contract as
+        // `CompletedBody::Request::client_name`.
+        assert_eq!(row.client_name, None);
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("hello"),
+            "the session label is derived at START, not only at finish"
+        );
     }
 
     #[test]
