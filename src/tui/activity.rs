@@ -1753,12 +1753,6 @@ impl ActivityLog {
         }
     }
 
-    /// Fold one finished request into its per-client bucket (issue #32).
-    /// `user_id` is the `metadata.user_id` (or `None` → the `unknown` bucket).
-    /// Bounded by [`MAX_CLIENTS`]: once that many distinct ids are tracked, a
-    /// brand-new id is merged into `unknown` rather than allocating a new
-    /// entry (already-tracked ids and `unknown` always accumulate). This is
-    /// counting only — it never affects whether the request was served.
     /// Session label (TUI UI-3 U2): the FIRST plain user-input excerpt seen
     /// for a client id becomes that session's derived title (nothing on the
     /// wire carries a real one). Bounded by `MAX_CLIENTS` via the same
@@ -1781,6 +1775,12 @@ impl ActivityLog {
         }
     }
 
+    /// Fold one finished request into its per-client bucket (issue #32).
+    /// `user_id` is the `metadata.user_id` (or `None` → the `unknown` bucket).
+    /// Bounded by [`MAX_CLIENTS`]: once that many distinct ids are tracked, a
+    /// brand-new id is merged into `unknown` rather than allocating a new
+    /// entry (already-tracked ids and `unknown` always accumulate). This is
+    /// counting only — it never affects whether the request was served.
     fn record_client(&mut self, user_id: Option<&str>, status: u16, tokens: Option<TokenCounts>) {
         let key = match user_id {
             Some(id) if !id.is_empty() => {
@@ -2376,6 +2376,36 @@ mod tests {
         }
     }
 
+    /// [`started`] carrying the identity a real classified start carries.
+    fn started_user(id: u64, user_id: &str, excerpt: &str) -> ActivityEvent {
+        ActivityEvent::RequestStarted {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            kind: Some("user".into()),
+            user_id: Some(user_id.into()),
+            tenant: None,
+            excerpt: Some(excerpt.into()),
+        }
+    }
+
+    /// [`finished`] carrying the same identity, for the dropped-start path.
+    fn finished_user(id: u64, user_id: &str, excerpt: &str) -> ActivityEvent {
+        let mut event = finished(id, Some("a"), None);
+        if let ActivityEvent::RequestFinished {
+            user_id: uid,
+            kind,
+            excerpt: text,
+            ..
+        } = &mut event
+        {
+            *uid = Some(user_id.into());
+            *kind = Some("user".into());
+            *text = Some(excerpt.into());
+        }
+        event
+    }
+
     fn finished(id: u64, account: Option<&str>, tokens: Option<(u64, u64)>) -> ActivityEvent {
         finished_status(id, account, tokens, 200)
     }
@@ -2612,6 +2642,43 @@ mod tests {
             log.session_labels().get("u1").map(String::as_str),
             Some("hello"),
             "the session label is derived at START, not only at finish"
+        );
+    }
+
+    /// The derived session title is FIRST-excerpt-wins and is decided at the
+    /// hop that sees the excerpt first. Once the start fold seeds it, neither
+    /// a later start nor ANY finish may overwrite it — including finishes
+    /// that arrive out of order, which is the normal case under concurrency
+    /// (requests complete in whatever order upstream returns). A finish whose
+    /// start was never applied still seeds its own client, so dropping a
+    /// start costs the row nothing.
+    #[test]
+    fn session_label_keeps_the_first_excerpt_across_out_of_order_finishes() {
+        let mut log = ActivityLog::new(10);
+        log.apply(started_user(1, "u1", "first"), at(0));
+        log.apply(started_user(2, "u1", "second"), at(1));
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("first"),
+            "first excerpt wins, the second start does not overwrite it"
+        );
+
+        // Finish in REVERSE order: the newer request completes first.
+        log.apply(finished_user(2, "u1", "second"), at(2));
+        log.apply(finished_user(1, "u1", "first"), at(3));
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("first"),
+            "out-of-order finishes cannot rewrite a seeded label"
+        );
+
+        // A finish whose start was dropped (channel full / TUI attached late)
+        // seeds its own client from the finish, same rule.
+        log.apply(finished_user(3, "u2", "orphan"), at(4));
+        assert_eq!(
+            log.session_labels().get("u2").map(String::as_str),
+            Some("orphan"),
+            "a finish without a start still names its session"
         );
     }
 

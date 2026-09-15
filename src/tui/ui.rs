@@ -10542,12 +10542,63 @@ mod tests {
         );
     }
 
-    /// The running row is not just *decorated* like a completed row — the
-    /// columns land in the SAME screen columns, which is the whole point of
-    /// sharing the layout (a shifting feed is unreadable while requests come
-    /// and go).
-    #[test]
-    fn in_flight_row_columns_align_with_a_completed_row() {
+    /// Display-cell offset of byte position `at` in `row`. Byte offsets and
+    /// char counts both lie here — the spinner/marker glyphs are multi-byte
+    /// and a CJK name cell is one char but two cells wide.
+    fn cells_before(row: &str, at: usize) -> usize {
+        cell_width(&row[..at])
+    }
+
+    /// Every column boundary of an activity row that can be located by
+    /// CONTENT rather than by a hardcoded width: the badge, the email arrow,
+    /// the right edge of the duration cell, the three `—` placeholder cells
+    /// (tokens / throughput / cost) and the «session» / “input” starts.
+    ///
+    /// Right-aligned numeric cells are pinned by their RIGHT edge — that is
+    /// what the padding decides; their left edge follows from the arrow
+    /// anchor, which is asserted separately.
+    fn row_columns(row: &str) -> Vec<usize> {
+        let badge = row
+            .find("[opus-4-8]")
+            .unwrap_or_else(|| panic!("badge in {row}"));
+        let arrow = row
+            .find(" → ")
+            .unwrap_or_else(|| panic!("email arrow in {row}"));
+        let tail = &row[arrow..];
+        let first_dash = tail
+            .find('—')
+            .unwrap_or_else(|| panic!("placeholder cells in {row}"));
+        // The duration text always ends in `s`; nothing else between the
+        // arrow and the first placeholder does. Located by CONTENT so the
+        // assertion still holds when `dur_w` grows.
+        let dur_end = tail[..first_dash]
+            .rfind('s')
+            .unwrap_or_else(|| panic!("duration cell in {row}"));
+        let mut cols = vec![
+            cells_before(row, badge),
+            cells_before(row, arrow),
+            cells_before(row, arrow + dur_end) + 1,
+        ];
+        cols.extend(
+            tail.match_indices('—')
+                .map(|(at, _)| cells_before(row, arrow + at)),
+        );
+        cols.push(cells_before(
+            row,
+            row.find('«').unwrap_or_else(|| panic!("label in {row}")),
+        ));
+        cols.push(cells_before(
+            row,
+            row.find('“').unwrap_or_else(|| panic!("excerpt in {row}")),
+        ));
+        cols
+    }
+
+    /// A view holding one RUNNING and one COMPLETED request that differ ONLY
+    /// in being in flight — same kind, client name, model, account, client id
+    /// and excerpt — so any column that fails to line up is the renderer's
+    /// doing and nothing else's.
+    fn aligned_pair_view(client_name: &str, running_for: Duration) -> DashboardView {
         let mut view = view_with(Vec::new());
         view.session_labels
             .insert("u1".into(), "hello world".into());
@@ -10564,8 +10615,8 @@ mod tests {
             user_id: Some("u1".into()),
             tenant: Some("k-t1".into()),
             excerpt: Some("hello world".into()),
-            client_name: Some("Z (U09F1M5MML1)".into()),
-            started_at: std::time::SystemTime::now(),
+            client_name: Some(client_name.into()),
+            started_at: std::time::SystemTime::now() - running_for,
         }];
         view.completed = vec![Completed {
             at: UNIX_EPOCH + Duration::from_millis(1_000),
@@ -10589,29 +10640,71 @@ mod tests {
                 kind: Some("user".into()),
                 excerpt: Some("hello world".into()),
                 tenant: Some("k-t1".into()),
-                client_name: Some("Z (U09F1M5MML1)".into()),
+                client_name: Some(client_name.into()),
             },
         }];
-        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
-        let badge_rows: Vec<&String> = rows.iter().filter(|l| l.contains("[opus-4-8]")).collect();
-        assert_eq!(badge_rows.len(), 2, "one running row + one completed row");
-        // Column = display cells before the needle (byte offsets would lie
-        // about the multi-byte spinner/marker glyphs).
-        let col = |row: &str, needle: &str| {
-            let at = row
-                .find(needle)
-                .unwrap_or_else(|| panic!("{needle} in {row}"));
-            row[..at].chars().count()
-        };
-        for needle in ["[opus-4-8]", " \u{2192} "] {
-            assert_eq!(
-                col(badge_rows[0], needle),
-                col(badge_rows[1], needle),
-                "`{needle}` column differs between the running and completed rows:\n{}\n{}",
-                badge_rows[0],
-                badge_rows[1]
-            );
-        }
+        view
+    }
+
+    /// The two activity rows of `view` that carry the model badge: the
+    /// running one and the completed one.
+    fn badge_rows(view: &DashboardView) -> (String, String) {
+        let rows = render_rows(view, &chrome_overlay(Overlay::None), 160, 30);
+        let found: Vec<String> = rows
+            .into_iter()
+            .filter(|l| l.contains("[opus-4-8]"))
+            .collect();
+        assert_eq!(
+            found.len(),
+            2,
+            "one running row + one completed row, got {found:#?}"
+        );
+        (found[0].clone(), found[1].clone())
+    }
+
+    /// The running row is not merely *decorated* like a completed row — every
+    /// column lands in the SAME screen column, which is the whole point of
+    /// sharing the layout (a feed that reflows as requests come and go is
+    /// unreadable).
+    #[test]
+    fn in_flight_row_columns_align_with_a_completed_row() {
+        let view = aligned_pair_view("Z (U09F1M5MML1)", Duration::ZERO);
+        let (running, completed) = badge_rows(&view);
+        let (a, b) = (row_columns(&running), row_columns(&completed));
+        assert_eq!(
+            a.len(),
+            8,
+            "badge, arrow, duration, 3 placeholders, label, excerpt: {a:?}"
+        );
+        assert_eq!(
+            a, b,
+            "columns differ between the running and completed rows:\n{running}\n{completed}"
+        );
+    }
+
+    /// The same alignment must survive the two things that MOVE the columns:
+    /// a wide (CJK) name cell, and an in-flight row whose live elapsed time is
+    /// wider than any completed duration on screen — the running row itself
+    /// widens the shared duration column, so the completed row has to be
+    /// measured against it (`RowMetrics::measure` takes `now` for exactly
+    /// this reason).
+    #[test]
+    fn in_flight_row_columns_align_with_a_wide_name_and_a_long_run() {
+        let view = aligned_pair_view("한글이름 (U0)", Duration::from_secs(11 * 60));
+        let (running, completed) = badge_rows(&view);
+        let (a, b) = (row_columns(&running), row_columns(&completed));
+        assert_eq!(a.len(), 8, "{a:?}");
+        assert_eq!(
+            a, b,
+            "columns differ under a wide name + a long run:\n{running}\n{completed}"
+        );
+        // The running row really did widen the shared duration column: a 660s
+        // elapsed needs 6 cells, so the completed `1.2s` is now left-padded by
+        // 2 on top of the separator space after the 3-cell status.
+        assert!(
+            completed.contains("200   1.2s"),
+            "the in-flight elapsed must widen `dur_w` for BOTH rows: {completed}"
+        );
     }
 
     #[test]
