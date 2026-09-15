@@ -2590,6 +2590,198 @@ mod tests {
         );
     }
 
+    // ---- reset-gate L1 harness (issue #134): clock-injected BOUNDARY
+    // TRANSITIONS. Each test steps the SAME fixture from just-before to
+    // just-after a fable weekly `resets_at` and asserts the invariant flips.
+    // Static after-states are covered elsewhere (e.g.
+    // `reset_fable_window_no_longer_excludes_fable`). Freshest-wins merge is
+    // pinned for the five-hour slot by `stale_observation_does_not_overwrite_
+    // fresher_one` in scheduler/mod.rs; the fable scoped merge shares the
+    // same policy (`merge_scoped`) but is not yet pinned by name — L2 follow
+    // -up. Guard: these tests VERIFY behavior, they do not redesign fable
+    // policy.
+
+    /// #134 L1 invariants 1+2: crossing `resets_at` flips a critical/active
+    /// bucket from preemptively-excluded to unconstraining in the same
+    /// fixture — the expired observation carries no utilization.
+    #[test]
+    fn reset_gate_preemptive_exclusion_lifts_crossing_the_boundary() {
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(1.0, 10), // resets 10s from NOW
+            severity: LimitSeverity::Critical,
+            is_active: true,
+        }];
+        assert_eq!(
+            gate_scoped(&a, &params(), now(), false, false, RequestScope::Fable),
+            Some(IneligibleReason::FableWeeklyExhausted),
+            "just before reset: preemptive Fable exclusion holds"
+        );
+        assert_eq!(
+            gate_scoped(
+                &a,
+                &params(),
+                at(NOW_SECS + 11),
+                false,
+                false,
+                RequestScope::Fable
+            ),
+            None,
+            "just after reset: the expired bucket stops excluding"
+        );
+    }
+
+    /// #134 L1 invariant 4: the hyperbolic reset urgency collapses once the
+    /// boundary passes — an imminent-reset account's score is urgency-
+    /// dominated before, and drops to its cold (urgency=1) score after.
+    #[test]
+    fn reset_gate_urgency_collapses_after_the_boundary() {
+        let fable_acct = |reset_in: u64| {
+            let mut a = account("a");
+            a.scoped_limits = vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: window(0.5, reset_in),
+                severity: LimitSeverity::Normal,
+                is_active: true,
+            }];
+            a
+        };
+        let a = fable_acct(3600); // resets in 1h → near-max urgency
+        let before = fable_score(&a, &params(), now());
+        let after = fable_score(&a, &params(), at(NOW_SECS + 3601));
+        // Before: remaining fable headroom × ~capped urgency. After: the
+        // expired window reads utilization 0 and urgency 1 — a plain cold
+        // score, strictly below the urgency-amplified one.
+        assert!(
+            before > after * 10.0,
+            "urgency must dominate before the boundary (before={before}, after={after})"
+        );
+        assert!(
+            after > 0.0,
+            "after the boundary the account is cold-but-usable, not zero"
+        );
+    }
+
+    /// #134 L1 invariant 3 (cold anchoring): after its fable bucket resets,
+    /// the current account reads cold — and the fable lane's absolute
+    /// stickiness KEEPS the eligible anchor rather than hunting.
+    #[test]
+    fn reset_gate_cold_anchor_is_kept_after_its_reset() {
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.9, 10), // heavily used, resets in 10s
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        // Live challenger whose fable score RANKS ABOVE the cold anchor
+        // (~0.90) but inside the +25% SWITCH_MARGIN band (< 1.125):
+        // servable 0.78 x urgency ~1.28 (reset ~131h) ~= 1.00. Pure ranking
+        // would switch to it — only the margin stickiness keeps the anchor,
+        // so this fixture makes the stickiness itself load-bearing.
+        let mut b = account("b");
+        b.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.2, 131 * HOUR),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        let a_cold_at = at(NOW_SECS + 11);
+        let (sa, sb) = (
+            fable_score(&a, &params(), a_cold_at),
+            fable_score(&b, &params(), a_cold_at),
+        );
+        assert!(
+            sb > sa && sb < sa * (1.0 + SWITCH_MARGIN),
+            "fixture sanity: challenger outranks the cold anchor but sits inside the switch margin (sa={sa}, sb={sb})"
+        );
+        let mut snap = pool(vec![a, b], None);
+        snap.fable_current.insert(BackendGroup::Claude, id("a"));
+        assert_eq!(
+            pick_scoped(&snap, &params(), None, a_cold_at, RequestScope::Fable),
+            Decision::Stay,
+            "post-reset the anchor is cold AND eligible — margin stickiness keeps it against a rank-better live challenger"
+        );
+    }
+
+    /// #134 L1 invariant 5a: a manual pin outlives a fable reset boundary
+    /// that falls inside the pin window — only the pin's own expiry ends it.
+    #[test]
+    fn reset_gate_manual_pin_survives_the_reset_boundary() {
+        // The PINNED account itself carries the fable reset boundary
+        // (resets 10s from NOW) inside the 300s pin window — the FABLE lane
+        // must hold the pin straight through that boundary.
+        let mut b = account("b");
+        b.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.1, 10),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        // Live challenger that clearly outranks the post-reset (cold) pinned
+        // account beyond the switch margin: once the pin lapses, staying
+        // would contradict the fable ranking.
+        let mut a = account("a");
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.1, 30 * HOUR),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        let mut snap = pool(vec![a, b], None);
+        snap.fable_current.insert(BackendGroup::Claude, id("b"));
+        snap.manual_pin.insert(
+            BackendGroup::Claude,
+            crate::scheduler::ManualPin {
+                account: id("b"),
+                until: at(NOW_SECS + 300),
+            },
+        );
+        let fable_pick =
+            |now: SystemTime| pick_scoped(&snap, &params(), None, now, RequestScope::Fable);
+        assert_eq!(
+            fable_pick(at(NOW_SECS + 5)),
+            Decision::Stay,
+            "before the boundary: pinned"
+        );
+        assert_eq!(
+            fable_pick(at(NOW_SECS + 11)),
+            Decision::Stay,
+            "the pinned account's own fable reset passing does not break the pin"
+        );
+        assert_eq!(
+            fable_pick(at(NOW_SECS + 301)),
+            Decision::Switch { to: id("a") },
+            "past the pin's own expiry, fable scheduling resumes on rank"
+        );
+    }
+
+    /// #134 L1 invariant 5b: a 429 cooldown clears on ITS clock, not the
+    /// fable reset's — the boundary passing does not un-park the account,
+    /// and the cooldown lapsing does.
+    #[test]
+    fn reset_gate_429_cooldown_is_independent_of_the_reset_boundary() {
+        let mut a = account("a");
+        a.cooldown_until = Some(at(NOW_SECS + 50));
+        a.scoped_limits = vec![ScopedQuotaWindow {
+            scope_label: "Fable".into(),
+            window: window(0.9, 10),
+            severity: LimitSeverity::Normal,
+            is_active: true,
+        }];
+        assert_eq!(
+            eligibility(&a, &params(), at(NOW_SECS + 11), false),
+            Some(IneligibleReason::CoolingDown),
+            "fable reset passed but the 429 park has not lapsed → still parked"
+        );
+        assert_eq!(
+            eligibility(&a, &params(), at(NOW_SECS + 51), false),
+            None,
+            "the cooldown's own expiry frees the account"
+        );
+    }
+
     #[test]
     fn reset_fable_window_no_longer_excludes_fable() {
         // is_active=true but the weekly window has already reset → carries no
