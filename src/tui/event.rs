@@ -65,6 +65,22 @@ pub enum ActivityEvent {
         /// parsed. See the finish doc above: a start dropped before classify
         /// still renders complete off the `RequestFinished`.
         kind: Option<String>,
+        /// Keyless per-client attribution identity (`metadata.user_id`),
+        /// parsed at forward entry alongside `kind`, so the in-flight row can
+        /// key the same derived session label as its eventual completed row.
+        /// Mirrors `RequestFinished.user_id`; `None` when the body carried no
+        /// identity (metered into the `unknown` bucket) or never parsed.
+        user_id: Option<String>,
+        /// KEYED tenant attribution id (`k-…` / `legacy` / `local`), decided
+        /// before the request is forwarded, so the running row resolves the
+        /// same client Name column as its completed row. Mirrors
+        /// `RequestFinished.tenant`.
+        tenant: Option<String>,
+        /// Cleaned excerpt of the newest human-relevant input, available as
+        /// soon as the body is classified, so the running row shows the same
+        /// input text as its completed row. Mirrors
+        /// `RequestFinished.excerpt`.
+        excerpt: Option<String>,
     },
     /// The scheduler leased an account for request `id`. Carries the served
     /// `(group, model, effort, fast)` identity decided at lease time so the

@@ -1019,6 +1019,14 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         method: parts.method.to_string(),
         path: path_query.clone(),
         kind: Some(classified.kind.to_string()),
+        // Identity + input ride the START too (activity in-flight identity):
+        // all three are already resolved above, and the running row needs them
+        // to render the same Name / session label / input excerpt cells its
+        // eventual completed row renders. Cloned — the originals move into
+        // `ctx` just below.
+        user_id: user_id.clone(),
+        tenant: tenant.clone(),
+        excerpt: classified.excerpt.clone(),
     });
     let mut ctx = ForwardContext {
         method: parts.method,
