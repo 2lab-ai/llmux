@@ -319,7 +319,8 @@ Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex
 
 ## Activity feed
 
-The dashboard's activity panel shows one row per completed request
+The dashboard's activity panel shows one row per request — running requests
+pinned on top, then completed ones newest first
 (2026-07-15 layout):
 
 ```text
@@ -344,6 +345,13 @@ The dashboard's activity panel shows one row per completed request
   is stripped (`claude-opus-4-8[1m]` → `opus-4-8[1m]`). Columns are padded
   to the widest visible value per frame, and the input excerpt takes the
   remaining terminal width.
+- **in flight** — a RUNNING request renders the same columns, so nothing
+  shifts when it finishes: a group-colored spinner in place of `▸`, `…` in
+  the status slot, the live elapsed time in the duration slot, and `—` for
+  tokens/throughput/cost. Name, badge and email therefore line up with the
+  completed rows, and the «session» label plus the "input" excerpt are already
+  there while the request runs — both are known at forward entry, not at the
+  finish.
 - **Clicking a row** expands its detail lines (full method+path, client id,
   account, token/cost breakdown). Clicking again collapses.
 - **Grouping** — only consecutive `count` probes fold, into

@@ -313,6 +313,15 @@ impl DashboardView {
                 // Kind rides the wire too (TUI UI-6 item 1) so the attached
                 // in-flight row shows the same aligned `kind` column.
                 kind: r.kind.clone(),
+                // Identity + input + the resolved display name ride the same
+                // hop (activity in-flight identity) so an ATTACHED running row
+                // shows the same Name / session / input cells as a completed
+                // row — dropping them here is exactly how the badge was lost
+                // before (issue #2 2a).
+                user_id: r.user_id.clone(),
+                tenant: r.tenant.clone(),
+                excerpt: r.excerpt.clone(),
+                client_name: r.client_name.clone(),
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -756,6 +765,40 @@ mod tests {
         assert_eq!(view2.in_flight[0].model, None);
         assert_eq!(view2.in_flight[0].effort, None);
         assert!(!view2.in_flight[0].fast);
+    }
+
+    #[test]
+    fn from_doc_carries_in_flight_identity_for_the_name_and_excerpt() {
+        // activity in-flight identity: the Name column, the «session» label
+        // key and the “input” excerpt all ride the same HubDoc→JSON→from_doc
+        // hop the badge does. Dropping them here is exactly how the running
+        // row lost its identity before.
+        let mut json = doc_json();
+        let infl = &mut json["activity"]["in_flight"][0];
+        infl["user_id"] = serde_json::json!("u1");
+        infl["tenant"] = serde_json::json!("k-t1");
+        infl["excerpt"] = serde_json::json!("hello world");
+        infl["client_name"] = serde_json::json!("Z (U09F1M5MML1)");
+
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+
+        assert_eq!(view.in_flight.len(), 1);
+        assert_eq!(view.in_flight[0].user_id.as_deref(), Some("u1"));
+        assert_eq!(view.in_flight[0].tenant.as_deref(), Some("k-t1"));
+        assert_eq!(view.in_flight[0].excerpt.as_deref(), Some("hello world"));
+        assert_eq!(
+            view.in_flight[0].client_name.as_deref(),
+            Some("Z (U09F1M5MML1)")
+        );
+
+        // A doc WITHOUT the fields still parses (back-compat → None).
+        let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        let view2 = DashboardView::from_doc(&doc2);
+        assert_eq!(view2.in_flight[0].user_id, None);
+        assert_eq!(view2.in_flight[0].tenant, None);
+        assert_eq!(view2.in_flight[0].excerpt, None);
+        assert_eq!(view2.in_flight[0].client_name, None);
     }
 
     #[test]
