@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::auth::codex_usage::{self, CodexUsage, CodexUsageError, ResetCredit, ResetCredits};
+use crate::auth::grok_usage::{self, GrokUsageError};
 use crate::config::{AccountCredential, Config};
 use crate::proxy::server::AppState;
 use crate::scheduler::{credential_identity, AccountFingerprint, AccountId};
@@ -626,11 +627,15 @@ fn now_ms() -> u64 {
 }
 
 /// The usage source for a credential, or `None` when the provider has no
-/// usage control at all (api key / openrouter / grok).
+/// usage control at all (api key / openrouter).
 fn provider_of(credential: &AccountCredential) -> Option<&'static str> {
     match credential {
         AccountCredential::Codex { .. } => Some("codex"),
         AccountCredential::Oauth { .. } => Some("oauth"),
+        // Grok reads the xAI CLI billing endpoint (docs/grok/spec.md §R3). A
+        // usage READ only — grok has no reset credits, so the redemption paths
+        // keep refusing it via [`AppState::codex_target`].
+        AccountCredential::Grok { .. } => Some("grok"),
         _ => None,
     }
 }
@@ -850,7 +855,7 @@ impl AppState {
                 .snapshot()
                 .accounts
                 .iter()
-                .filter(|a| matches!(a.credential_kind, "codex" | "oauth"))
+                .filter(|a| matches!(a.credential_kind, "codex" | "oauth" | "grok"))
                 .map(|a| a.id.0.clone())
                 .collect(),
         };
@@ -913,7 +918,8 @@ impl AppState {
     }
 
     /// The provider-specific GET. Codex reads WHAM (which also carries the
-    /// reset counters); Anthropic oauth reuses the existing usage helper.
+    /// reset counters); Anthropic oauth reuses the existing usage helper; grok
+    /// reads the xAI CLI billing endpoint (weekly allowance → the 7d gauge).
     async fn read_usage(&self, target: &Target) -> Result<CodexUsage, UsageControlError> {
         match &target.credential {
             AccountCredential::Codex {
@@ -953,6 +959,33 @@ impl AppState {
                     )),
                 }
             }
+            AccountCredential::Grok {
+                access_token,
+                subject,
+                ..
+            } => grok_usage::fetch_billing(
+                &self.client,
+                &self.config.grok.upstream,
+                access_token,
+                subject,
+            )
+            .await
+            .map(|billing| CodexUsage {
+                // Reset credits are a codex concept: grok's counters stay
+                // UNKNOWN (never 0) so the doc keeps whatever it had.
+                usage: billing.usage,
+                ..Default::default()
+            })
+            .map_err(|err| match err {
+                // A grok upstream the billing URL cannot be derived from is a
+                // CONFIGURATION refusal (422), not an upstream failure — same
+                // contract as [`Self::wham_base`].
+                GrokUsageError::UnsupportedUpstream(_) => UsageControlError::Unsupported {
+                    account: "grok".into(),
+                    kind: err.sanitized(),
+                },
+                _ => UsageControlError::Upstream(err.sanitized()),
+            }),
             other => Err(UsageControlError::Unsupported {
                 account: target.id.0.clone(),
                 kind: other.kind().to_string(),

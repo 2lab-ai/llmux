@@ -27,10 +27,14 @@ pub const GROK_CHAT_PROXY_UPSTREAM: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Grok-CLI identity headers the official cli-chat-proxy expects
 /// (CLIProxyAPI xai_executor.go:66-69). The client version ages with the
 /// Grok CLI; bump when upstream starts rejecting it.
-const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
-const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
-const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
-const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
+///
+/// Crate-visible because the billing/usage read
+/// ([`crate::auth::grok_usage`]) carries the SAME identity trio — one
+/// definition, so a version bump cannot drift between the two callers.
+pub(crate) const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
+pub(crate) const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+pub(crate) const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
+pub(crate) const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
 
 /// Per-model thinking levels (docs/grok/spec.md §R1; source for
 /// grok-4.5/4.3/3-mini: CLIProxyAPI registry models.json:2411-2520; source
