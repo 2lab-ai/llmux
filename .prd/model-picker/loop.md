@@ -1,6 +1,6 @@
 # Model picker — loop
 
-Status: in-progress
+Status: shipped
 Date: 2026-09-17
 
 ## Build facts (measured 2026-09-17)
