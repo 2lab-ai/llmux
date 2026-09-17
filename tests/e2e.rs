@@ -3584,6 +3584,63 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
 /// validator's base64/MIME/size checks see truth rather than a placeholder.
 const COMPAT_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+/// A synthetic 4×3 lossless WebP (no user data, no capture). llmux never
+/// parses this one — both gateways answered 200 to a WebP (live probes
+/// 2026-09-17), so the assertion is that these exact bytes arrive upstream.
+/// It is a REAL WebP rather than a stand-in blob precisely so that a stray
+/// decode-and-re-encode would change the payload and fail.
+const COMPAT_WEBP_B64: &str = "UklGRmAAAABXRUJQVlA4TFQAAAAvA4AAEF+gkI0kaHbvUTih81daDQVt20jez5/NsTsDAZKgVlf6v1AzbduYWqH1m8Z39wIAjwrhQxBVOd29VXJ3n38eEASQUCUQ0QrL7LBpRP8Dsxc=";
+
+/// A synthetic 4×3 **static** GIF with palette index 0 declared transparent
+/// (no user data, no capture). Codex takes it verbatim; grok refuses the
+/// format, so llmux re-encodes it and the wire payload must decode back to
+/// [`COMPAT_GIF_PIXELS`] exactly — which is what separates a conversion from
+/// a MIME relabel.
+///
+/// ```python
+/// from PIL import Image
+/// pal = [(0,0,0),(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255),
+///        (255,0,255),(255,255,255),(16,32,48),(200,100,50),(9,9,9),(7,8,9)]
+/// im = Image.new("P", (4, 3))
+/// im.putpalette([c for rgb in pal for c in rgb] + [0] * (768 - 3 * len(pal)))
+/// im.putdata([1, 2, 3, 4, 0, 6, 7, 8, 9, 10, 11, 5])
+/// im.save("static.gif", format="GIF", transparency=0)
+/// ```
+const COMPAT_GIF_B64: &str = "R0lGODlhBAADAIMAAAAAAP8AAAD/AAAA////AAD///8A/////xAgMMhkMgkJCQcICQAAAAAAAAAAAAAAACH5BAEAAAAALAAAAAAEAAMAAAgQAAMIGEAAgIEDCBIoWFAgIAA7";
+
+/// The RGBA pixels [`COMPAT_GIF_B64`] encodes, row-major, as Pillow reads them
+/// back. The transparent sample is `[0, 0, 0, 0]`: a conversion that dropped,
+/// flattened or premultiplied the alpha channel fails here instead of reaching
+/// a user.
+const COMPAT_GIF_PIXELS: [[u8; 4]; 12] = [
+    [255, 0, 0, 255],
+    [0, 255, 0, 255],
+    [0, 0, 255, 255],
+    [255, 255, 0, 255],
+    [0, 0, 0, 0],
+    [255, 0, 255, 255],
+    [255, 255, 255, 255],
+    [16, 32, 48, 255],
+    [200, 100, 50, 255],
+    [9, 9, 9, 255],
+    [7, 8, 9, 255],
+    [0, 255, 255, 255],
+];
+
+/// A synthetic 2-frame animated GIF (2×2). One PNG cannot carry two frames, so
+/// on grok — the flavor that converts — llmux must refuse it rather than
+/// forward frame 0 as if it were the whole image.
+///
+/// ```python
+/// from PIL import Image
+/// pal = [255, 0, 0, 0, 255, 0] + [0] * 762
+/// a = Image.new("P", (2, 2)); a.putpalette(pal); a.putdata([0, 1, 0, 1])
+/// b = Image.new("P", (2, 2)); b.putpalette(pal); b.putdata([1, 0, 1, 0])
+/// a.save("anim.gif", format="GIF", save_all=True, append_images=[b],
+///        duration=100, loop=0)
+/// ```
+const COMPAT_ANIMATED_GIF_B64: &str = "R0lGODlhAgACAIEAAP8AAAD/AAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABBBAYEAAh+QQBCgACACwAAAAAAgACAIH/AAAA/wAAAAAAAAAIBgADABAYEAA7";
+
 /// Minimal Responses SSE: one text delta, then completion with usage. Enough
 /// for a 200 on either leg (stream or aggregate) without dragging tool-call
 /// bookkeeping into scenarios that are about the REQUEST side.
@@ -3845,6 +3902,243 @@ async fn compatibility_codex_forwards_image_and_tool_choice_without_output_cap()
 #[tokio::test]
 async fn compatibility_grok_forwards_image_and_tool_choice_with_mapped_output_cap() {
     compat_forwards_image_and_tool_choice(CompatFlavor::Grok, Some(256)).await;
+}
+
+/// The bytes behind a `data:image/png;base64,…` URL. The prefix assertion is
+/// half the point: a relabelled GIF would still be `image/png` in the URL,
+/// which is why the caller then decodes the pixels.
+fn decode_png_data_url(url: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let payload = url
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or_else(|| panic!("expected a png data URL, got {}", &url[..url.len().min(48)]));
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .expect("the data URL carries valid base64")
+}
+
+/// Assert the wire bytes really are the GIF fixture re-encoded as PNG: the
+/// PNG signature, the fixture's dimensions, and every pixel (alpha included)
+/// byte-for-byte. This is what separates a conversion from a MIME relabel.
+fn assert_is_the_fixture_png(bytes: &[u8]) {
+    assert_eq!(
+        bytes.get(..8),
+        Some(b"\x89PNG\r\n\x1a\n".as_slice()),
+        "the forwarded payload starts with the PNG signature"
+    );
+    let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .expect("the forwarded payload decodes as PNG");
+    let rgba = decoded.to_rgba8();
+    assert_eq!(
+        rgba.dimensions(),
+        (4, 3),
+        "the fixture's dimensions survive"
+    );
+    let seen: Vec<[u8; 4]> = rgba.pixels().map(|pixel| pixel.0).collect();
+    assert_eq!(
+        seen,
+        COMPAT_GIF_PIXELS.to_vec(),
+        "every pixel and its alpha survive the GIF→PNG conversion"
+    );
+}
+
+/// A client turn of text THEN one base64 image — the shape Claude Code sends
+/// when the user pastes a screenshot.
+fn compat_one_image_request(media_type: &str, data: &str) -> String {
+    serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what color?"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": media_type, "data": data
+                }},
+            ],
+        }],
+    })
+    .to_string()
+}
+
+/// The single `input_image` data URL an upstream body carries, after checking
+/// that the text still precedes it.
+fn compat_forwarded_image_url(upstream: &serde_json::Value) -> String {
+    let parts = upstream_content_parts(upstream);
+    let kinds: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| p["type"].as_str())
+        .filter(|t| *t == "input_text" || *t == "input_image")
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["input_text", "input_image"],
+        "text/image ORDER preserved: {upstream}"
+    );
+    parts
+        .iter()
+        .find(|p| p["type"] == "input_image")
+        .and_then(|p| p["image_url"].as_str())
+        .expect("input_image data URL")
+        .to_string()
+}
+
+/// Contract §R1a: a media type the flavor's gateway accepts goes upstream
+/// **byte-for-byte** — same media type, same base64. llmux decoding an image
+/// the backend would have taken as-is is work that can only lose fidelity.
+async fn compat_forwards_image_verbatim(flavor: CompatFlavor, media_type: &str, data: &str) {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 17));
+    let proxy = Proxy::spawn_config(flavor.config(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let body = compat_one_image_request(media_type, data);
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "{flavor:?} serves the {media_type} turn"
+    );
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1, "{flavor:?} made exactly one upstream call");
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("upstream json");
+    assert_eq!(
+        compat_forwarded_image_url(&upstream),
+        format!("data:{media_type};base64,{data}"),
+        "{flavor:?} forwards the {media_type} payload untouched"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_codex_forwards_webp_verbatim_on_the_wire() {
+    compat_forwards_image_verbatim(CompatFlavor::Codex, "image/webp", COMPAT_WEBP_B64).await;
+}
+
+#[tokio::test]
+async fn compatibility_grok_forwards_webp_verbatim_on_the_wire() {
+    compat_forwards_image_verbatim(CompatFlavor::Grok, "image/webp", COMPAT_WEBP_B64).await;
+}
+
+#[tokio::test]
+async fn compatibility_codex_forwards_gif_verbatim_on_the_wire() {
+    compat_forwards_image_verbatim(CompatFlavor::Codex, "image/gif", COMPAT_GIF_B64).await;
+}
+
+/// Contract §R1a: grok is the one gateway that refuses a format Anthropic
+/// accepts (live probe 2026-09-17: a GIF came back `400 invalid_image`
+/// "Downloaded response does not contain a valid JPG, PNG, WebP, or ICO
+/// image."), so the GIF's pixels are re-encoded as PNG — order intact, pixels
+/// intact — instead of the client getting a 400 to fix by hand. The assertion
+/// reads the actual outgoing request.
+#[tokio::test]
+async fn compatibility_grok_converts_gif_to_png_on_the_wire() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 17));
+    let proxy = Proxy::spawn_config(CompatFlavor::Grok.config(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let body = compat_one_image_request("image/gif", COMPAT_GIF_B64);
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(response.status(), 200, "grok serves the gif turn");
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1, "grok made exactly one upstream call");
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("upstream json");
+    let url = compat_forwarded_image_url(&upstream);
+    assert!(
+        !url.contains(COMPAT_GIF_B64),
+        "grok must not forward the gif payload under a png label"
+    );
+    assert_is_the_fixture_png(&decode_png_data_url(&url));
+}
+
+/// Contract §R1a + §R1: the same conversion applies to an image nested in a
+/// `tool_result`, and the nested `[text, image]` ordering is unchanged.
+#[tokio::test]
+async fn compatibility_grok_converts_nested_tool_result_gif_to_png() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(COMPAT_RESPONSES_SSE, 17));
+    let proxy = Proxy::spawn_config(CompatFlavor::Grok.config(&mock)).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result", "tool_use_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "screenshot:"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/gif", "data": COMPAT_GIF_B64
+                    }},
+                ],
+            }],
+        }],
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(response.status(), 200, "grok serves the nested gif turn");
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1, "grok made exactly one upstream call");
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("upstream json");
+    let output = &upstream["input"][0]["output"];
+    assert_eq!(
+        output[0],
+        serde_json::json!({"type": "input_text", "text": "screenshot:"}),
+        "the nested text still leads: {upstream}"
+    );
+    assert_eq!(output[1]["type"], "input_image", "{upstream}");
+    let url = output[1]["image_url"].as_str().expect("nested data URL");
+    assert_is_the_fixture_png(&decode_png_data_url(url));
+}
+
+/// Contract §R1a: an ANIMATED GIF is refused locally on the flavor that
+/// converts — one PNG would silently drop every frame but the first. Same
+/// local-400 discipline as any other unsupported content: no upstream call, no
+/// credential refresh.
+#[tokio::test]
+async fn compatibility_grok_animated_gif_is_400_without_upstream_or_refresh() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(CompatFlavor::Grok.config_expiring(&mock)).await;
+
+    let client = reqwest::Client::new();
+    let body = compat_one_image_request("image/gif", COMPAT_ANIMATED_GIF_B64);
+    let response = post_compat(&client, &proxy, &body, None).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "grok refuses an animated gif locally"
+    );
+    let doc: serde_json::Value = response.json().await.expect("error json");
+    let message = doc["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(
+        message.contains("animated"),
+        "the error says WHY, so the user can send a still: {message}"
+    );
+    assert!(
+        message.starts_with("messages[0].content[1]"),
+        "the error carries the field path: {message}"
+    );
+    assert!(
+        !message.contains(&COMPAT_ANIMATED_GIF_B64[..24]),
+        "the error never echoes the payload: {message}"
+    );
+    assert!(
+        mock.seen().is_empty(),
+        "a rejected image must not reach the upstream"
+    );
+    assert_eq!(
+        mock.token_hits(),
+        0,
+        "the rejection happens BEFORE the credential refresh"
+    );
 }
 
 /// Contract §1/§5: unsupported content is a LOCAL 400 in every mode — before
