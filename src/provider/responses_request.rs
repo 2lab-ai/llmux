@@ -7,10 +7,15 @@
 //! nameless tools all vanished with a log line the client never sees. This
 //! module replaces that policy with two rules:
 //!
-//! 1. **Convert what the endpoints actually accept.** Base64 PNG/JPEG images
-//!    (top level and nested in a `tool_result`), every `tool_choice` variant,
-//!    and — on grok — `max_tokens`. All four are live-verified against the two
-//!    OAuth backends llmux speaks to (receipts in the spec's §Evidence).
+//! 1. **Convert what the endpoints actually accept.** Base64 images (top level
+//!    and nested in a `tool_result`), every `tool_choice` variant, and — on
+//!    grok — `max_tokens`. All are live-verified against the two OAuth
+//!    backends llmux speaks to (receipts in the spec's §1). Images go
+//!    upstream **byte-for-byte** in every format the flavor's gateway answered
+//!    (see [`passthrough_media_types`]); llmux converts only where Anthropic
+//!    accepts a format the gateway does not, which today is exactly GIF on
+//!    grok ([`convert_to_png`]). Relabelling is not conversion — the pixels
+//!    are really decoded and really re-encoded.
 //! 2. **Never drop the rest silently.** Anything unsupported is a typed
 //!    [`ProviderError::InvalidRequest`] naming the JSON path (HTTP 400 locally,
 //!    no upstream call, no credential refresh). The only tolerated losses are
@@ -21,21 +26,43 @@
 //! Error strings carry the field PATH (`messages[2].content[1].source.data`)
 //! and never the payload itself: a 20 MiB base64 blob must not land in a log.
 
+use std::io::{Cursor, Write};
+
 use base64::Engine;
+use image::codecs::gif::GifDecoder;
+use image::codecs::png::PngEncoder;
+use image::{ImageDecoder, ImageEncoder, Limits};
 use serde_json::{json, Map, Value};
 
 use super::responses::RequestPlan;
 use super::ProviderError;
 
-/// Largest decoded image llmux forwards, per block. Beyond this the request is
+/// Largest decoded image llmux forwards, per block — and, for a converted
+/// GIF, the cap on the PNG that leaves here. Beyond this the request is
 /// rejected locally rather than burning an upstream round trip on a payload
 /// both backends refuse.
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
-/// Media types accepted for a base64 image. Anthropic also allows GIF/WebP;
-/// neither backend's documented input-image contract covers them, so they are
-/// rejected rather than converted into a data URL that may 400 upstream.
-const SUPPORTED_IMAGE_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg"];
+/// Largest pixel buffer llmux will allocate to convert ONE image.
+///
+/// The compressed-size cap above says nothing about this: a 99-byte GIF can
+/// legally declare 65535×65535 in its logical screen descriptor, which is a
+/// 16 GiB RGBA frame. 128 MiB is ~33 MP at RGBA — a 6016×3384 retina
+/// screenshot (81 MiB) fits with room to spare, a decompression bomb does not.
+///
+/// This budget is the ONLY size limit on the conversion path, which is why the
+/// headroom above is real rather than nominal. The `gif` backend does carry a
+/// 50 MB per-frame default (`gif` 0.14.2 `reader/mod.rs:125`, checked against
+/// `width × height × 4` since `image` asks for `ColorOutput::RGBA` in
+/// `codecs/gif.rs:61`), and `image` 0.25.10 never calls `set_memory_limit` —
+/// but that default is not on this path: `GifDecoder::read_image` writes into
+/// the caller-owned slice below (`codecs/gif.rs:157-159` →
+/// `gif` `reader/converter.rs:186-223`, whose signature takes no limit), and
+/// the crate consults its limit only when it allocates the buffer itself
+/// (`reader/decoder.rs:417-424`, the `OutputBuffer::Vec` variant). So nothing
+/// under this number can be refused by a limit llmux did not choose, and a
+/// size question never reaches the user as "not a decodable GIF image".
+const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Leading marker for a `tool_result` whose `is_error` is true. Responses has
 /// no error flag on `function_call_output`, and presenting a failed tool result
@@ -53,6 +80,61 @@ pub enum ResponsesFlavor {
     Codex,
     /// `cli-chat-proxy.grok.com/v1/responses` (Grok subscription).
     Grok,
+}
+
+impl ResponsesFlavor {
+    /// Lowercase name, as the compatibility spec and the refusal messages
+    /// spell it (`Debug` would shout `Codex` at a user reading a 400).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+}
+
+/// Media types `flavor`'s gateway takes as-is, in the order a refusal message
+/// lists them.
+///
+/// These are the formats llmux does **not** decode at all — an untrusted
+/// payload it never has to parse is one it cannot be broken by — so the
+/// client's exact base64 is what goes on the wire.
+///
+/// Live probes 2026-09-17 (receipts in the spec's §R1a): codex answered
+/// 200 to png, jpeg, webp AND gif; grok answered 200 to png, jpeg and webp and
+/// refused gif with `400 {"code":"invalid_image", … "Downloaded response does
+/// not contain a valid JPG, PNG, WebP, or ICO image."}`. Anthropic's Messages
+/// API accepts exactly jpeg/png/gif/webp, so this covers every image a client
+/// can legally send.
+fn passthrough_media_types(flavor: ResponsesFlavor) -> &'static [&'static str] {
+    match flavor {
+        ResponsesFlavor::Codex => &["image/png", "image/jpeg", "image/webp", "image/gif"],
+        ResponsesFlavor::Grok => &["image/png", "image/jpeg", "image/webp"],
+    }
+}
+
+/// Media types Anthropic accepts that `flavor`'s gateway does NOT, and that
+/// llmux therefore re-encodes as PNG instead of handing the user a 400 to fix
+/// by hand. Every entry needs a matching arm in [`convert_to_png`].
+fn converted_media_types(flavor: ResponsesFlavor) -> &'static [&'static str] {
+    match flavor {
+        // Codex takes all four Anthropic formats verbatim: nothing to convert.
+        ResponsesFlavor::Codex => &[],
+        // Grok's `invalid_image` refusal above names JPG/PNG/WebP/ICO, so a
+        // GIF's pixels travel as PNG.
+        ResponsesFlavor::Grok => &["image/gif"],
+    }
+}
+
+/// The accepted set as a refusal message names it: short form, this flavor's
+/// own list, byte-for-byte types first (`png, jpeg, webp, gif`).
+fn accepted_image_media_types(flavor: ResponsesFlavor) -> String {
+    passthrough_media_types(flavor)
+        .iter()
+        .chain(converted_media_types(flavor))
+        .map(|media_type| media_type.trim_start_matches("image/"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What this request loses on the way upstream. Empty = fully faithful.
@@ -219,6 +301,7 @@ fn convert(
         convert_message(
             index,
             message,
+            flavor,
             count_tokens,
             &mut input,
             &mut folded_system,
@@ -418,6 +501,7 @@ fn nonempty_str<'a>(path: &str, block: &'a Value, field: &str) -> Result<&'a str
 fn convert_message(
     index: usize,
     message: &Value,
+    flavor: ResponsesFlavor,
     count_tokens: bool,
     input: &mut Vec<Value>,
     folded_system: &mut Vec<String>,
@@ -474,7 +558,7 @@ fn convert_message(
                         text.push_str(value);
                     }
                     "image" => {
-                        let url = image_data_url(&bpath, block, role, count_tokens)?;
+                        let url = image_data_url(&bpath, block, role, flavor, count_tokens)?;
                         flush_text(&mut parts, &mut text, text_type);
                         parts.push(json!({"type": "input_image", "image_url": url}));
                     }
@@ -509,7 +593,7 @@ fn convert_message(
                     }
                     "tool_result" => {
                         let call_id = nonempty_str(&bpath, block, "tool_use_id")?;
-                        let output = tool_result_output(&bpath, block, role, count_tokens)?;
+                        let output = tool_result_output(&bpath, block, role, flavor, count_tokens)?;
                         flush_text(&mut parts, &mut text, text_type);
                         flush_message(input, &mut parts, out_role);
                         input.push(json!({
@@ -651,10 +735,15 @@ fn build_instructions(
 
 /// Anthropic `image` block → the `input_image.image_url` data URL both
 /// endpoints accept (live receipt: base64 PNG answered on codex AND grok).
+///
+/// The bytes are forwarded verbatim for every media type the flavor's gateway
+/// accepts ([`passthrough_media_types`]) and re-encoded as PNG only where it
+/// does not ([`converted_media_types`]).
 fn image_data_url(
     path: &str,
     block: &Value,
     role: &str,
+    flavor: ResponsesFlavor,
     count_tokens: bool,
 ) -> Result<String, ProviderError> {
     if count_tokens {
@@ -685,10 +774,18 @@ fn image_data_url(
                 .ok_or_else(|| {
                     invalid(&format!("{path}.source.media_type"), "expected a string")
                 })?;
-            if !SUPPORTED_IMAGE_MEDIA_TYPES.contains(&media_type) {
+            let converts = converted_media_types(flavor).contains(&media_type);
+            if !converts && !passthrough_media_types(flavor).contains(&media_type) {
+                // The accepted set is per flavor, so the message names WHICH
+                // flavor refused and what it would have taken — the two facts
+                // a client needs to fix the request without guessing.
                 return Err(invalid(
                     &format!("{path}.source.media_type"),
-                    &format!("unsupported image media type `{media_type}` (png and jpeg only)"),
+                    &format!(
+                        "unsupported image media type `{media_type}` ({} accepts {})",
+                        flavor.label(),
+                        accepted_image_media_types(flavor)
+                    ),
                 ));
             }
             let data = nonempty_str(&format!("{path}.source"), source, "data")?;
@@ -707,6 +804,14 @@ fn image_data_url(
             if decoded.len() > MAX_IMAGE_BYTES {
                 return Err(oversized(path));
             }
+            if converts {
+                let png = convert_to_png(path, media_type, &decoded, flavor)?;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+                return Ok(format!("data:image/png;base64,{encoded}"));
+            }
+            // Untouched bytes for every type the gateway takes as-is: the
+            // ORIGINAL base64 is reused, so a passthrough image is byte-for-byte
+            // what the client sent.
             Ok(format!("data:{media_type};base64,{data}"))
         }
         // Fetching the URL would make llmux an SSRF proxy for the client, and
@@ -732,6 +837,303 @@ fn oversized(path: &str) -> ProviderError {
     )
 }
 
+/// A `Write` sink that refuses to grow past `cap`.
+///
+/// WHERE the cap is enforced is the point: encoding first and checking the
+/// length afterwards would allocate the oversized PNG in full, which is the
+/// allocation the cap exists to prevent. The first write that would cross the
+/// cap fails and the encoder aborts.
+///
+/// Precisely what is bounded: the RETAINED PNG payload (`bytes.len()`) never
+/// exceeds `cap`. Two things are NOT bounded by `cap` and must not be claimed
+/// as such — the `Vec`'s allocated *capacity*, which grows by amortized
+/// doubling and can reach nearly `2 × cap`, and the encoder's internal
+/// deflate/filter buffers, which are the `png` crate's own and sized by it.
+/// Both are proportional to `cap`, not to the attacker's declared size.
+struct CappedWriter {
+    bytes: Vec<u8>,
+    cap: usize,
+    /// Set when a write was refused, so the caller can tell "too big" from a
+    /// genuine encoder failure instead of guessing from an IO error.
+    exceeded: bool,
+}
+
+impl CappedWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cap,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(buf.len()) > self.cap {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "encoded image exceeds the size cap",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Re-encode `bytes` as PNG for the one (flavor, media type) pair that needs
+/// it: grok + GIF.
+///
+/// Adding a future pair is one arm here plus one entry in
+/// [`converted_media_types`] — the two lists that together define "llmux
+/// converts this".
+fn convert_to_png(
+    path: &str,
+    media_type: &str,
+    bytes: &[u8],
+    flavor: ResponsesFlavor,
+) -> Result<Vec<u8>, ProviderError> {
+    match (flavor, media_type) {
+        (ResponsesFlavor::Grok, "image/gif") => {
+            gif_to_png(path, bytes, MAX_IMAGE_BYTES, MAX_DECODED_IMAGE_BYTES)
+        }
+        // Only reachable by adding a `converted_media_types` entry without a
+        // converter: a typed 400 in a request path, never a panic.
+        _ => Err(invalid(
+            &format!("{path}.source.media_type"),
+            &format!(
+                "`{media_type}` is listed as converted for {} but has no converter",
+                flavor.label()
+            ),
+        )),
+    }
+}
+
+/// Decode a static GIF and re-encode it as PNG, inside an explicit budget.
+///
+/// **Why this exists:** the grok gateway is the one backend that refuses a
+/// format Anthropic accepts. Live probe 2026-09-17: a GIF `input_image` came
+/// back `400 {"code":"invalid_image", … "Downloaded response does not contain
+/// a valid JPG, PNG, WebP, or ICO image."}`, while the same request with png,
+/// jpeg or webp answered 200. PNG is receipt-verified on that gateway (spec
+/// §1), so the GIF's pixels travel as PNG rather than as a 400 the user has
+/// to fix by hand.
+///
+/// Relabelling the bytes `image/png` would not be a fix — the backend parses
+/// them, not the label — so the pixels are really decoded and re-encoded.
+/// GIF is palette-indexed with an optional transparent index; the decoder
+/// hands back composited RGBA, and that is what the PNG carries, so alpha
+/// survives.
+///
+/// **Budgets**, each enforced BEFORE the memory it guards is allocated:
+///
+/// * `max_alloc_bytes` bounds the decoded frame, computed from the logical
+///   screen descriptor's `width × height × 4`. The caller's compressed-size
+///   cap proves nothing here: a 99-byte GIF can declare 65535×65535 (a 16 GiB
+///   frame). This check is the only size limit on the path — the `gif`
+///   backend's own per-frame default never applies to it (see
+///   [`MAX_DECODED_IMAGE_BYTES`]) — so every oversized image is refused here,
+///   by dimensions.
+/// * `max_output_bytes` bounds the PNG payload, enforced by [`CappedWriter`]
+///   *during* encoding rather than by measuring a finished buffer.
+/// * animation is refused outright — one PNG cannot carry the frames, and
+///   forwarding frame 0 would hand the model a still the user never sent.
+///
+/// Errors name the field path and never the payload.
+fn gif_to_png(
+    path: &str,
+    gif: &[u8],
+    max_output_bytes: usize,
+    max_alloc_bytes: u64,
+) -> Result<Vec<u8>, ProviderError> {
+    let corrupt = || invalid(&format!("{path}.source.data"), "not a decodable GIF image");
+    // Header only: no pixel buffer exists yet.
+    let mut decoder = GifDecoder::new(Cursor::new(gif)).map_err(|_| corrupt())?;
+    // The frame count comes from the container's own block chain because
+    // neither `image` nor its `gif` backend will answer the question:
+    // `GifDecoder::read_image` composites frame 0 and returns `Ok` on a
+    // hundred-frame animation (image 0.25.10 `codecs/gif.rs:113`). A converter
+    // that only asked "does it decode?" would forward that first frame as if
+    // it were the image the user sent.
+    match gif_frame_count(gif) {
+        Some(1) => {}
+        Some(0) | None => return Err(corrupt()),
+        Some(_) => {
+            return Err(invalid(
+                &format!("{path}.source.data"),
+                "animated GIF is not supported: a PNG cannot carry the frames and llmux will \
+                 not silently forward only the first — send a still image",
+            ))
+        }
+    }
+    let (width, height) = decoder.dimensions();
+    let color = decoder.color_type();
+    // Saturating `width × height × bytes_per_pixel` of the frame that is about
+    // to be allocated, checked against the budget while it is still a number.
+    let needed = decoder.total_bytes();
+    if needed > max_alloc_bytes {
+        return Err(too_large_to_decode(
+            path,
+            width,
+            height,
+            needed,
+            max_alloc_bytes,
+        ));
+    }
+    // `usize` can be narrower than `u64` (32-bit targets); a frame that does
+    // not fit the address space takes the same refusal as one over budget.
+    let Ok(frame_len) = usize::try_from(needed) else {
+        return Err(too_large_to_decode(
+            path,
+            width,
+            height,
+            needed,
+            max_alloc_bytes,
+        ));
+    };
+    // Defense in depth for the same budget, and here it is load-bearing too:
+    // the GIF decoder's off-screen compositing path reserves its extra frame
+    // buffer against `Limits::max_alloc` before allocating it (image 0.25.10
+    // `codecs/gif.rs:174`), which the explicit check above cannot see.
+    let mut limits = Limits::no_limits();
+    limits.max_alloc = Some(max_alloc_bytes);
+    decoder
+        .set_limits(limits)
+        .map_err(|_| too_large_to_decode(path, width, height, needed, max_alloc_bytes))?;
+
+    let mut frame = vec![0u8; frame_len];
+    decoder.read_image(&mut frame).map_err(|_| corrupt())?;
+
+    let mut sink = CappedWriter::new(max_output_bytes);
+    let encoded = PngEncoder::new(&mut sink).write_image(&frame, width, height, color.into());
+    if encoded.is_err() {
+        return Err(if sink.exceeded {
+            invalid(
+                path,
+                &format!(
+                    "image exceeds the {} MiB limit after the GIF→PNG conversion",
+                    max_output_bytes / (1024 * 1024)
+                ),
+            )
+        } else {
+            invalid(
+                &format!("{path}.source.data"),
+                "GIF could not be re-encoded as PNG",
+            )
+        });
+    }
+    Ok(sink.bytes)
+}
+
+/// How many image frames the GIF container declares, or `None` when the block
+/// chain cannot be walked to its end.
+///
+/// This is the ANIMATION check, and it allocates nothing: the walk only jumps
+/// over the lengths the container itself declares (a color table is
+/// `3 × 2^(n+1)` bytes; a pixel/extension payload is a chain of
+/// length-prefixed sub-blocks ending in a zero length).
+///
+/// `None` means bytes are MISSING — a sub-block runs past the end, or a byte
+/// where a block introducer belongs is not one — so the frame count is
+/// unknowable. The caller must refuse: silently under-counting a truncated
+/// animation is the one failure mode that would forward frame 0 as the whole
+/// image. A stream that simply ends at a block boundary without the `0x3B`
+/// trailer is complete enough to count.
+fn gif_frame_count(gif: &[u8]) -> Option<usize> {
+    /// `GIF87a` / `GIF89a`.
+    const SIGNATURE: usize = 6;
+    /// Logical screen descriptor: width, height, packed, background, aspect.
+    const SCREEN_DESCRIPTOR: usize = 7;
+    /// Image descriptor after its `0x2C` introducer: left, top, width,
+    /// height, packed.
+    const IMAGE_DESCRIPTOR: usize = 9;
+
+    /// Bytes of color table a packed field declares (bit 7 = present, low 3
+    /// bits = size exponent), or 0 when there is none.
+    fn color_table_len(packed: u8) -> usize {
+        if packed & 0x80 == 0 {
+            0
+        } else {
+            3usize << ((packed & 0x07) + 1)
+        }
+    }
+
+    /// Offset just past a chain of length-prefixed data sub-blocks.
+    fn skip_sub_blocks(gif: &[u8], mut offset: usize) -> Option<usize> {
+        loop {
+            let len = usize::from(*gif.get(offset)?);
+            offset = offset.checked_add(1)?.checked_add(len)?;
+            if offset > gif.len() {
+                return None;
+            }
+            if len == 0 {
+                return Some(offset);
+            }
+        }
+    }
+
+    if gif.len() < SIGNATURE + SCREEN_DESCRIPTOR || &gif[..3] != b"GIF" {
+        return None;
+    }
+    let mut offset = SIGNATURE + SCREEN_DESCRIPTOR + color_table_len(gif[SIGNATURE + 4]);
+    let mut frames = 0usize;
+    loop {
+        let Some(&block) = gif.get(offset) else {
+            // Ends at a block boundary: no trailer, but no missing bytes
+            // either, so the count is whole.
+            return Some(frames);
+        };
+        match block {
+            // Trailer: the container ends here; trailing bytes are not ours.
+            0x3B => return Some(frames),
+            // Extension: a label byte, then sub-blocks.
+            0x21 => offset = skip_sub_blocks(gif, offset.checked_add(2)?)?,
+            // Image descriptor — the thing being counted.
+            0x2C => {
+                let descriptor = offset.checked_add(1)?;
+                let packed = *gif.get(descriptor.checked_add(IMAGE_DESCRIPTOR - 1)?)?;
+                // …then an optional local color table, the LZW minimum code
+                // size, and the pixel sub-blocks.
+                offset = skip_sub_blocks(
+                    gif,
+                    descriptor
+                        .checked_add(IMAGE_DESCRIPTOR)?
+                        .checked_add(color_table_len(packed))?
+                        .checked_add(1)?,
+                )?;
+                frames = frames.checked_add(1)?;
+            }
+            // Not a block introducer: a malformed container has no knowable
+            // frame count.
+            _ => return None,
+        }
+    }
+}
+
+/// Refusal for a frame that would not fit the decode budget. Dimensions are
+/// metadata, not payload, and naming them is what lets a user resize.
+fn too_large_to_decode(
+    path: &str,
+    width: u32,
+    height: u32,
+    needed: u64,
+    budget: u64,
+) -> ProviderError {
+    invalid(
+        &format!("{path}.source"),
+        &format!(
+            "image is {width}×{height}, which needs {} MiB to decode (limit {} MiB)",
+            needed / (1024 * 1024),
+            budget / (1024 * 1024)
+        ),
+    )
+}
+
 /// `tool_result` → the `function_call_output.output` value: a plain string when
 /// the result is text (the historical shape), or the content-item array both
 /// endpoints accept when it carries images (live receipt: nested
@@ -740,6 +1142,7 @@ fn tool_result_output(
     path: &str,
     block: &Value,
     role: &str,
+    flavor: ResponsesFlavor,
     count_tokens: bool,
 ) -> Result<Value, ProviderError> {
     let is_error = match block.get("is_error") {
@@ -773,7 +1176,7 @@ fn tool_result_output(
                         push_text(text.to_string(), &mut parts, &mut texts);
                     }
                     "image" => {
-                        let url = image_data_url(&ipath, item, role, count_tokens)?;
+                        let url = image_data_url(&ipath, item, role, flavor, count_tokens)?;
                         has_image = true;
                         parts.push(json!({"type": "input_image", "image_url": url}));
                     }
@@ -937,9 +1340,79 @@ mod tests {
     use super::*;
     use ResponsesFlavor::{Codex, Grok};
 
-    /// A 1x1-ish base64 payload. The converter validates encoding + media type
-    /// + size, never the pixels, so any valid base64 stands in for an image.
+    /// A 1x1-ish base64 payload. Passthrough payloads are forwarded verbatim,
+    /// so the converter validates encoding + media type + size and never the
+    /// pixels: any valid base64 stands in for a passthrough image.
     const PNG_B64: &str = "aGVsbG8sIHBuZw==";
+
+    /// A synthetic 4×3 **static** GIF whose palette index 0 is declared
+    /// transparent, so [`GIF_RGBA_PIXELS`] carries eleven distinct colours and
+    /// one fully transparent sample — a conversion that dropped, flattened or
+    /// premultiplied alpha fails instead of reaching a user. No user data:
+    /// every byte comes from the literals below.
+    ///
+    /// ```python
+    /// from PIL import Image
+    /// pal = [(0,0,0),(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255),
+    ///        (255,0,255),(255,255,255),(16,32,48),(200,100,50),(9,9,9),(7,8,9)]
+    /// im = Image.new("P", (4, 3))
+    /// im.putpalette([c for rgb in pal for c in rgb] + [0] * (768 - 3 * len(pal)))
+    /// im.putdata([1, 2, 3, 4, 0, 6, 7, 8, 9, 10, 11, 5])
+    /// im.save("static.gif", format="GIF", transparency=0)
+    /// ```
+    const GIF_B64: &str = "R0lGODlhBAADAIMAAAAAAP8AAAD/AAAA////AAD///8A/////xAgMMhkMgkJCQcICQAAAAAAAAAAAAAAACH5BAEAAAAALAAAAAAEAAMAAAgQAAMIGEAAgIEDCBIoWFAgIAA7";
+
+    /// The RGBA pixels [`GIF_B64`] encodes, row-major, as **Pillow** reads
+    /// them back (`Image.open(…).convert("RGBA")`) — an independent decoder,
+    /// not the crate under test.
+    const GIF_RGBA_PIXELS: [[u8; 4]; 12] = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+        [0, 0, 0, 0],
+        [255, 0, 255, 255],
+        [255, 255, 255, 255],
+        [16, 32, 48, 255],
+        [200, 100, 50, 255],
+        [9, 9, 9, 255],
+        [7, 8, 9, 255],
+        [0, 255, 255, 255],
+    ];
+
+    /// A synthetic 2-frame animated GIF (2×2). One PNG cannot carry two
+    /// frames, so converting it would substitute a still the user never sent.
+    ///
+    /// ```python
+    /// from PIL import Image
+    /// pal = [255, 0, 0, 0, 255, 0] + [0] * 762
+    /// a = Image.new("P", (2, 2)); a.putpalette(pal); a.putdata([0, 1, 0, 1])
+    /// b = Image.new("P", (2, 2)); b.putpalette(pal); b.putdata([1, 0, 1, 0])
+    /// a.save("anim.gif", format="GIF", save_all=True, append_images=[b],
+    ///        duration=100, loop=0)
+    /// ```
+    const GIF_ANIMATED_B64: &str = "R0lGODlhAgACAIEAAP8AAAD/AAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABBBAYEAAh+QQBCgACACwAAAAAAgACAIH/AAAA/wAAAAAAAAAIBgADABAYEAA7";
+
+    /// The raw bytes behind a `data:image/png;base64,…` URL.
+    fn png_from_data_url(url: &str) -> Vec<u8> {
+        let payload = url
+            .strip_prefix("data:image/png;base64,")
+            .unwrap_or_else(|| panic!("expected a png data URL: {}", &url[..url.len().min(40)]));
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("data URL base64")
+    }
+
+    /// The single image data URL a one-image user turn produces.
+    fn single_image_url(media_type: &str, data: &str, flavor: ResponsesFlavor) -> String {
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block(media_type, data),
+        ]}]});
+        build(&body, flavor)["input"][0]["content"][0]["image_url"]
+            .as_str()
+            .expect("image_url")
+            .to_string()
+    }
 
     fn plan(session: &str) -> RequestPlan<'_> {
         RequestPlan {
@@ -1029,6 +1502,376 @@ mod tests {
         );
     }
 
+    // ---- R1a: image formats ----
+
+    #[test]
+    fn each_flavor_accepts_exactly_the_media_types_its_gateway_answered() {
+        // Live probes 2026-09-17 (spec §R1a): codex answered 200 to png,
+        // jpeg, webp AND gif; grok answered 200 to png, jpeg and webp and
+        // refused gif with `{"code":"invalid_image", … "Downloaded response
+        // does not contain a valid JPG, PNG, WebP, or ICO image."}`. These
+        // two lists ARE the contract, so they are pinned here rather than
+        // only exercised through the table-driven tests below — which iterate
+        // the lists and so could not notice one shrinking.
+        assert_eq!(
+            passthrough_media_types(Codex),
+            ["image/png", "image/jpeg", "image/webp", "image/gif"]
+        );
+        assert!(
+            converted_media_types(Codex).is_empty(),
+            "codex takes all four Anthropic formats verbatim"
+        );
+        assert_eq!(
+            passthrough_media_types(Grok),
+            ["image/png", "image/jpeg", "image/webp"]
+        );
+        assert_eq!(converted_media_types(Grok), ["image/gif"]);
+    }
+
+    #[test]
+    fn every_passthrough_media_type_is_forwarded_byte_identical() {
+        // llmux decodes only what it must: a passthrough type keeps the
+        // client's exact base64 — no re-encode, no recompression, no chance of
+        // changing an image the user did not ask to change. Nothing parses the
+        // payload on this path, which is why one stand-in blob covers the
+        // whole table.
+        for flavor in [Codex, Grok] {
+            for media_type in passthrough_media_types(flavor) {
+                assert_eq!(
+                    single_image_url(media_type, PNG_B64, flavor),
+                    format!("data:{media_type};base64,{PNG_B64}"),
+                    "{media_type} under {flavor:?} travels untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_forwards_a_real_gif_verbatim_instead_of_converting_it() {
+        // The gateway answered 200 to a GIF, so converting would be work that
+        // buys nothing and risks changing the user's pixels. Asserted on the
+        // real fixture (not the stand-in blob) so a stray decode-and-re-encode
+        // would show up as a changed payload.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            image_block("image/gif", GIF_B64),
+            {"type": "text", "text": "after"},
+        ]}]});
+        let content = &build(&body, Codex)["input"][0]["content"];
+        assert_eq!(content[0], json!({"type": "input_text", "text": "before"}));
+        assert_eq!(
+            content[1],
+            json!({"type": "input_image",
+                   "image_url": format!("data:image/gif;base64,{GIF_B64}")}),
+            "the gif's own media type and bytes reach the wire"
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "input_text", "text": "after"}),
+            "text after the image keeps its position"
+        );
+    }
+
+    #[test]
+    fn grok_converts_a_static_gif_into_a_png_preserving_every_pixel() {
+        // A relabel, a flatten-onto-white, or a premultiply all pass a MIME
+        // assertion and fail here — which is why this reads pixels.
+        let url = single_image_url("image/gif", GIF_B64, Grok);
+        assert!(
+            !url.contains(GIF_B64),
+            "the gif bytes are converted, never relabelled png"
+        );
+        let png = png_from_data_url(&url);
+        assert_eq!(
+            png.get(..8),
+            Some(b"\x89PNG\r\n\x1a\n".as_slice()),
+            "the forwarded bytes carry the PNG signature"
+        );
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("the conversion produces a decodable PNG")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (4, 3));
+        let pixels: Vec<[u8; 4]> = decoded.pixels().map(|pixel| pixel.0).collect();
+        assert_eq!(
+            pixels,
+            GIF_RGBA_PIXELS.to_vec(),
+            "every colour and the transparent sample survive the round trip"
+        );
+    }
+
+    #[test]
+    fn grok_converts_a_gif_nested_in_a_tool_result_in_place() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                {"type": "text", "text": "screenshot:"},
+                image_block("image/gif", GIF_B64),
+            ]},
+        ]}]});
+        let output = &build(&body, Grok)["input"][0]["output"];
+        assert_eq!(
+            output[0],
+            json!({"type": "input_text", "text": "screenshot:"}),
+            "nested ordering survives the conversion"
+        );
+        assert_eq!(output[1]["type"], "input_image");
+        let url = output[1]["image_url"].as_str().expect("image_url");
+        let decoded =
+            image::load_from_memory_with_format(&png_from_data_url(url), image::ImageFormat::Png)
+                .expect("nested conversion produces a decodable PNG")
+                .to_rgba8();
+        assert_eq!(decoded.dimensions(), (4, 3), "nested gif is re-encoded too");
+    }
+
+    #[test]
+    fn an_animated_gif_is_refused_on_grok_rather_than_losing_its_frames() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", GIF_ANIMATED_B64),
+        ]}]});
+        let message = reject(&body, Grok);
+        assert!(
+            message.starts_with("messages[0].content[0].source.data:")
+                && message.contains("animated"),
+            "a dropped frame must be an error, not a silent still: {message:?}"
+        );
+        assert!(
+            !message.contains(&GIF_ANIMATED_B64[..24]),
+            "the payload must never appear in the error: {message:?}"
+        );
+        // WHY it has to be an error: the decoder answers these bytes with a
+        // single composited 2×2 frame and no complaint, so a converter that
+        // only checked "does it decode?" would forward frame 0 as if it were
+        // the image the user sent.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_ANIMATED_B64)
+            .expect("fixture base64");
+        let mut frame = vec![0u8; 2 * 2 * 4];
+        GifDecoder::new(Cursor::new(bytes.as_slice()))
+            .expect("fixture decodes")
+            .read_image(&mut frame)
+            .expect("…and it decodes to one frame-sized buffer, which is the trap");
+        // Codex never reaches the frame question: it forwards the animation
+        // whole, which is the honest outcome when the gateway accepts GIF.
+        assert_eq!(
+            single_image_url("image/gif", GIF_ANIMATED_B64, Codex),
+            format!("data:image/gif;base64,{GIF_ANIMATED_B64}"),
+            "an animated gif keeps all its frames on the flavor that takes one"
+        );
+    }
+
+    #[test]
+    fn the_frame_walk_counts_what_the_container_declares() {
+        // The animation refusal above rests entirely on this walk, because
+        // `image` will not answer the question. Both fixtures are real GIFs
+        // written by Pillow, and a truncated one must be `None` (unknowable)
+        // rather than an under-count that would look static.
+        let decode = |data: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("fixture base64")
+        };
+        let still = decode(GIF_B64);
+        let animated = decode(GIF_ANIMATED_B64);
+        assert_eq!(gif_frame_count(&still), Some(1));
+        assert_eq!(gif_frame_count(&animated), Some(2));
+        assert_eq!(
+            gif_frame_count(&animated[..animated.len() / 2]),
+            None,
+            "a sub-block running past the end could have hidden more frames"
+        );
+        assert_eq!(gif_frame_count(b"not a gif at all"), None);
+        assert_eq!(gif_frame_count(&[]), None);
+    }
+
+    #[test]
+    fn unsupported_media_types_name_the_flavor_and_what_it_accepts() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/bmp", PNG_B64),
+        ]}]});
+        assert_eq!(
+            reject(&body, Codex),
+            "messages[0].content[0].source.media_type: unsupported image media type \
+             `image/bmp` (codex accepts png, jpeg, webp, gif)"
+        );
+        assert_eq!(
+            reject(&body, Grok),
+            "messages[0].content[0].source.media_type: unsupported image media type \
+             `image/bmp` (grok accepts png, jpeg, webp, gif)",
+            "grok's list includes the gif it takes only via the conversion"
+        );
+        // Nested in a tool_result, likewise.
+        let nested = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                image_block("image/bmp", PNG_B64),
+            ]},
+        ]}]});
+        assert!(reject(&nested, Grok).contains("unsupported image media type `image/bmp`"));
+    }
+
+    #[test]
+    fn a_gif_declaring_huge_dimensions_is_refused_before_the_frame_is_allocated() {
+        // 99 bytes in, 16 GiB of RGBA declared. The logical screen descriptor
+        // is what `GifDecoder::dimensions()` reports and what sizes the pixel
+        // buffer, so the 20 MiB compressed cap sees none of this. The refusal
+        // must name the DIMENSIONS ("needs … to decode"), not report a failed
+        // read — a "not decodable" here would mean we allocated first.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        bytes[6..10].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let bomb = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", &bomb),
+        ]}]});
+        let message = reject(&body, Grok);
+        assert!(
+            message.starts_with("messages[0].content[0].source:")
+                && message.contains("65535×65535")
+                && message.contains("to decode"),
+            "the budget refusal names the dimensions, not the payload: {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_still_gif_above_the_gif_crates_default_limit_still_converts_under_our_budget() {
+        // 4000×4000 RGBA is 64 MB — over the `gif` crate's 50 MB per-frame
+        // default (`reader/mod.rs:125`) and under [`MAX_DECODED_IMAGE_BYTES`].
+        // This pins that the crate's default cannot pre-empt our budget: it is
+        // not consulted on `read_image`'s caller-owned-slice path, so the only
+        // limit that decides this image is ours, and it says yes.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        bytes[6..10].copy_from_slice(&[0xA0, 0x0F, 0xA0, 0x0F]);
+        let big = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let url = single_image_url("image/gif", &big, Grok);
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "a 64 MB frame converts: {}",
+            &url[..url.len().min(40)]
+        );
+        assert!(
+            !png_from_data_url(&url).is_empty(),
+            "the converted PNG carries bytes"
+        );
+    }
+
+    #[test]
+    fn a_gif_just_over_our_decode_budget_is_refused_by_its_dimensions() {
+        // The other side of the same seam: 6000×5600 RGBA is 134,400,000 bytes,
+        // just over the 128 MiB budget. The refusal must be our typed 400
+        // naming the dimensions — a "not decodable" here would mean a decoder
+        // answered a size question we own.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        bytes[6..10].copy_from_slice(&[0x70, 0x17, 0xE0, 0x15]);
+        let bomb = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", &bomb),
+        ]}]});
+        let message = reject(&body, Grok);
+        assert!(
+            message.starts_with("messages[0].content[0].source:")
+                && message.contains("6000×5600")
+                && message.contains("to decode"),
+            "the budget refusal names the dimensions: {message:?}"
+        );
+        assert!(
+            !message.contains("not a decodable GIF image"),
+            "the payload is not blamed for our budget: {message:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_gif_is_refused_with_a_field_path_and_no_payload() {
+        // Valid base64, truncated GIF: the header parses far enough to look
+        // like an image and the pixel data is gone.
+        let full = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        let truncated = base64::engine::general_purpose::STANDARD.encode(&full[..full.len() / 2]);
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", &truncated),
+        ]}]});
+        let message = reject(&body, Grok);
+        assert!(
+            message.starts_with("messages[0].content[0].source.data:") && message.contains("GIF"),
+            "the error names the path and the format: {message:?}"
+        );
+        assert!(
+            !message.contains(&truncated[..16]),
+            "a corrupt payload must not be echoed into a log: {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_png_over_the_output_cap_aborts_the_encode() {
+        // The budget is a parameter precisely so the cap can be proven on a
+        // 4×3 image instead of a 20 MiB fixture: 16 bytes cannot even hold a
+        // PNG header, so the writer refuses mid-encode.
+        let gif = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        let err = gif_to_png("messages[0].content[0]", &gif, 16, MAX_DECODED_IMAGE_BYTES)
+            .expect_err("a 16-byte cap cannot hold a PNG");
+        let ProviderError::InvalidRequest(message) = err else {
+            panic!("expected InvalidRequest");
+        };
+        assert!(
+            message.contains("after the GIF→PNG conversion"),
+            "the cap that failed is named: {message:?}"
+        );
+        // …and the same image passes with the real cap.
+        assert!(
+            gif_to_png(
+                "messages[0].content[0]",
+                &gif,
+                MAX_IMAGE_BYTES,
+                MAX_DECODED_IMAGE_BYTES
+            )
+            .is_ok(),
+            "the 4×3 fixture is nowhere near the 20 MiB cap"
+        );
+    }
+
+    #[test]
+    fn a_frame_over_the_decode_budget_is_refused_by_the_budget_argument() {
+        // Same seam from the other side: the 4×3 fixture needs 48 bytes, so a
+        // 32-byte budget must refuse it before allocating.
+        let gif = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        let err = gif_to_png("messages[0].content[0]", &gif, MAX_IMAGE_BYTES, 32)
+            .expect_err("48 bytes of frame do not fit a 32-byte budget");
+        let ProviderError::InvalidRequest(message) = err else {
+            panic!("expected InvalidRequest");
+        };
+        assert!(
+            message.contains("4×3") && message.contains("to decode"),
+            "{message:?}"
+        );
+    }
+
+    #[test]
+    fn count_mode_still_refuses_a_gif_before_converting_it() {
+        // Counting has no honest image estimate, converted or not — and the
+        // refusal must come BEFORE the decode, so a count request can never be
+        // turned into image work.
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", GIF_B64),
+        ]}]});
+        for flavor in [Codex, Grok] {
+            let err = validate_request(&body, flavor, true).expect_err("count rejects images");
+            let ProviderError::InvalidRequest(message) = err else {
+                panic!("expected InvalidRequest");
+            };
+            assert!(
+                message.contains("token estimate"),
+                "{flavor:?}: {message:?}"
+            );
+        }
+    }
+
     #[test]
     fn text_only_tool_result_keeps_the_plain_string_output() {
         let body = json!({"messages": [{"role": "user", "content": [
@@ -1062,7 +1905,7 @@ mod tests {
     #[test]
     fn malformed_or_unsupported_images_are_refused_not_dropped() {
         let cases = [
-            (image_block("image/gif", PNG_B64), "media_type"),
+            (image_block("image/bmp", PNG_B64), "media_type"),
             (image_block("image/png", "not base64!!"), "data"),
             (json!({"type": "image"}), "source"),
         ];

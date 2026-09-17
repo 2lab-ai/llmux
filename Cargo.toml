@@ -23,6 +23,13 @@ http = "1.4.2"
 # LengthLimitError to map an over-cap request body to 413 (already in the
 # tree transitively via axum/reqwest).
 http-body-util = "0.1.3"
+# GIF→PNG re-encode for the grok Responses gateway, the one Anthropic image
+# format it refuses (`provider::responses_request`; png/jpeg/webp are forwarded
+# byte-for-byte and never parsed). Decode GIF + encode PNG is ALL this is used
+# for, so only those two format features are on — `default-features` would pull
+# nine more decoders (avif/exr/tiff/webp/…) and rayon into a proxy that needs
+# none of them, each one more attack surface on untrusted client bytes.
+image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 ratatui = "0.30.1"
 # Durable keys-usage store (docs/keys-history/spec.md K): bundled SQLite so a
 # brew/CI build never depends on a system libsqlite3 or its version.

@@ -44,16 +44,21 @@ What the codex 400 licenses is narrow: `max_output_tokens` is refused. Whether t
 accepts some OTHER output-cap parameter is **unmeasured** here — no alternative field has
 been probed, so its absence from this document is not evidence that none exists.
 
+The per-flavor **image** format receipts (both gateways probed with all four media types
+Anthropic accepts, 2026-09-17) live with the rule they justify, in §R1a.
+
 ## 2. Compatibility matrix
 
 | Anthropic input | codex | grok | Report |
 | --- | --- | --- | --- |
 | text, tool_use, tool_result (text) | converted | converted | — |
-| `image` base64 PNG/JPEG on a `user` message | `input_image` data URL | same | — |
+| `image` base64 PNG/JPEG/WebP on a `user` message | `input_image` data URL, bytes verbatim | same | — |
+| `image` base64 **GIF** on a `user` message | `input_image` data URL, bytes verbatim | decoded and re-encoded as a PNG data URL | — |
 | `image` inside a `user` `tool_result` | `output` becomes a content-item array | same | — |
 | `image` with `source.type: "url"` | **400** | **400** | — |
 | `image` on assistant/system/developer | **400** | **400** | — |
-| `image` media type other than PNG/JPEG, non-base64 data, >20 MiB decoded | **400** | **400** | — |
+| `image` media type outside PNG/JPEG/WebP/GIF, non-base64 data, >20 MiB encoded | **400** | **400** | — |
+| **animated** GIF; GIF that needs >128 MiB to decode; GIF whose PNG would exceed 20 MiB; undecodable GIF | forwarded verbatim (no decode) | **400** | — |
 | `document` / `audio` / `video` / any unknown block | **400** | **400** | — |
 | `tool_choice` `auto` / `any` / `none` / `tool{name}` | `"auto"` / `"required"` / `"none"` / `{"type":"function","name":…}` | same | — |
 | `tool_choice.disable_parallel_tool_use: true` | `parallel_tool_calls: false` | same | — |
@@ -101,6 +106,63 @@ credential refresh, no provider-failure score.
 - Error messages carry the JSON path (`messages[2].content[1].source.data`) and never the
   payload — a 20 MiB base64 blob must not reach a log. Over-cap images are refused from
   their ENCODED length, before any decode.
+
+### R1a — Image formats
+
+Anthropic's Messages API accepts exactly **jpeg, png, gif, webp**, so those four are every
+image a client can legally send. What each gateway does with them was measured, not
+assumed — live probes 2026-09-17 with synthetic fixtures, no user data:
+
+| `input_image` media type | codex | grok |
+| --- | --- | --- |
+| `image/png` | 200, reply `OK` | 200, reply `OK` |
+| `image/jpeg` | 200, reply `OK` | 200, reply `OK` |
+| `image/webp` | 200, reply `OK` | 200, reply `OK` |
+| `image/gif` | 200, reply `OK` | **400** `{"code":"invalid_image","error":"code: 'Client specified an invalid argument', message: \"Downloaded response does not contain a valid JPG, PNG, WebP, or ICO image."}` |
+
+So the accepted set is per flavor, and llmux's policy follows it exactly:
+
+| Flavor | Forwarded byte-for-byte | Re-encoded as PNG |
+| --- | --- | --- |
+| codex | png, jpeg, webp, gif | — |
+| grok | png, jpeg, webp | gif |
+
+**Passthrough is the default, and it is the point.** An accepted media type is not decoded
+at all: the client's own base64 is reused, so the bytes upstream are the bytes the client
+sent. A payload llmux never parses is one it cannot be broken by, and an image it never
+re-encodes is one it cannot degrade. The "unsupported image" 400 users saw before this
+unit came from llmux's own png/jpeg allowlist, not from either gateway.
+
+llmux converts only where Anthropic accepts a format the gateway does not — today exactly
+**GIF on grok**. Relabelling `image/gif` as `image/png` would not be a fix and is not what
+happens: the backend parses the bytes, not the label. The GIF's composited RGBA frame is
+really decoded and really re-encoded, transparent index included, so alpha survives.
+
+Three refusals guard that conversion, each **before** the memory it protects is allocated.
+They apply on grok only; on codex the same GIF is forwarded without being parsed:
+
+| Case | Why refused | Error path |
+| --- | --- | --- |
+| animated GIF | one PNG cannot carry the frames; forwarding frame 0 would substitute a still the user never sent. `image` will not answer "how many frames" (`GifDecoder::read_image` composites frame 0 and returns `Ok`), so llmux walks the container's own block chain — a truncated chain counts as unknown, not as one frame | `….source.data` |
+| declared `width × height × 4` > **128 MiB** | a 99-byte GIF can declare 65535×65535 in its logical screen descriptor (a 16 GiB frame) — the 20 MiB compressed cap sees none of that. This is the only size limit on the path (the `gif` backend's 50 MB per-frame default is not consulted when `image` hands it a caller-owned buffer), so the refusal is always llmux's typed 400 naming the dimensions, never a decoder-internal "not decodable" that blames the payload | `….source` |
+| PNG would exceed **20 MiB** | enforced by the writer *during* encoding, so the oversized buffer is never finished | `….content[n]` |
+| undecodable / truncated GIF | nothing to convert | `….source.data` |
+
+A media type outside the flavor's accepted set is a 400 naming the field path, the flavor
+and what that flavor would have taken:
+`messages[0].content[0].source.media_type: unsupported image media type \`image/bmp\`
+(codex accepts png, jpeg, webp, gif)`.
+
+Grok also rejects images under 512 total pixels ("Image has 256 total pixels (16x16), which
+is below the minimum of 512") and dimensions under 8 px. That is the gateway's own rule,
+not llmux's: such an image is forwarded and the upstream 400 propagates, exactly as today.
+
+**Cost.** `validate_request` (the pre-refresh gate) and `build_responses_body` (the
+provider) each run the full conversion, so a grok-bound GIF is decoded and re-encoded
+**twice per request** — bounded by the same per-image budgets, entirely local, and always
+before any upstream call. Every other (flavor, format) pair pays nothing, because nothing
+is decoded. Removing the second pass means threading the converted body from the gate into
+the provider, which is a `src/proxy/forward.rs` change and not part of this unit.
 
 ### R2 — tools
 
