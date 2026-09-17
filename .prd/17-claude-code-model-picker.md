@@ -39,9 +39,11 @@ Official docs fetched 2026-09-17:
   [{"model": …, "label"?: …, "description"?: …}], "replaceBuiltInOptions"?:
   bool}}`. "With it off, Claude Code skips a listed model that the built-in
   lineup already covers." "Claude Code drops a row it can't parse and keeps the
-  rest." Rows it "can't serve" are dropped and rows it can't select are greyed —
-  whether a non-Claude id survives behind a custom `ANTHROPIC_BASE_URL` is
-  [unverified until the live receipt below].
+  rest." Rows it "can't serve" are dropped and rows it can't select are greyed.
+  A non-Claude id does survive behind a custom `ANTHROPIC_BASE_URL`: verified
+  live 2026-09-17 (Claude Code v2.1.274, worktree binary in `--remote` mode,
+  `.prd/model-picker/loop.md` gap matrix) — "Grok 4.6" was listed, selectable,
+  and the turn was routed to group `grok`.
 - `code.claude.com/docs/en/model-config`: "Claude Code skips validation for the
   model ID set in `ANTHROPIC_CUSTOM_MODEL_OPTION`"; "behind an LLM gateway or a
   custom `ANTHROPIC_BASE_URL`, your provider or gateway defines the model names,
@@ -92,8 +94,11 @@ Acceptance (execute → expected observation):
 
 ## Implementation (WU 1, 2026-09-17)
 
-Landed on `feat/run-model-picker`; the live receipt (picker screen + grok
-activity line) is still open, so Status stays in-progress.
+Landed on `feat/run-model-picker`. The live receipt (picker screen + grok
+activity line) was taken 2026-09-17 against the running daemon from the
+worktree binary in `--remote localhost:3456` mode (see loop.md gap matrix);
+Status flips to shipped once the branch is merged and the preview build is
+deployed.
 
 - `src/cli/run.rs`: `model_picker_settings` (pure row builder),
   `row_description`, `has_user_settings` / `injects_model_picker` (pure

@@ -272,6 +272,10 @@ Two opt-outs, plus one failure mode:
   prints `warning: --settings given, llmux model picker lineup not injected`.
   Claude Code reads one `--settings` document, so precedence is
   all-or-nothing.
+- A `modelPicker` key in your own `~/.claude/settings.json` is shadowed by the
+  injected document for that launch (Claude Code layers `--settings` over user
+  settings key by key; llmux only inspects the pass-through argv when deciding
+  to inject). Use `--no-model-picker` to keep your own lineup.
 - Catalog fetch failure (daemon unreachable, non-200, unparseable body) —
   `warning: model picker not injected: <reason>` and `claude` starts unchanged.
   The picker is a convenience; it must never block a launch.
