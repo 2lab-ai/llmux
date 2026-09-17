@@ -147,6 +147,11 @@ pub struct RunArgs {
     /// always restarted).
     #[arg(long)]
     pub force: bool,
+    /// Do not inject the llmux catalog into Claude Code's `/model` picker
+    /// (by default `run` fetches `GET /llmux/models` from the proxy it points
+    /// `claude` at and passes the lineup as `claude --settings`).
+    #[arg(long)]
+    pub no_model_picker: bool,
     /// Arguments passed through to `claude` after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,

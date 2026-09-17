@@ -68,6 +68,8 @@ llmux run             # starts/reuses the daemon, then launches claude
 alias lx='llmux run'  # a convenient alias; args after -- pass through to claude
 ```
 
+Inside that session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows (`--no-model-picker` opts out).
+
 Want the foreground TUI dashboard instead:
 
 ```bash
