@@ -235,6 +235,56 @@ window a client gets without opting in, and advertises no aliases. The catalog
 also lists an 872,000 `max_context_window` for astra, which llmux does not
 advertise.
 
+## Claude Code `/model` picker
+
+`llmux run` puts this catalog into Claude Code's `/model` picker. Before
+spawning `claude` it fetches `GET {base_url}/llmux/models` from the very proxy
+it is about to point the client at (local or `--remote`, same api-key gate, 3s
+cap) and passes the lineup as `claude --settings '<json>'` — nothing is written
+to any settings file:
+
+```json
+{ "modelPicker": { "options": [
+  { "model": "grok-4.6", "label": "Grok 4.6", "description": "grok · efforts low…xhigh · ctx 500000" }
+] } }
+```
+
+One row per catalog entry, in catalog order:
+
+- `model` — the entry `id` **verbatim**, including a `[1m]` suffix (Claude Code
+  takes the string as-is, and the providers strip the suffix upstream). It is
+  the string llmux routes on, so selecting a row equals typing `/model <id>`.
+- `label` — the entry `name`.
+- `description` — `<group> · efforts <first…last> · ctx <max_context>`, dropping
+  the efforts part for an empty menu and the ctx part for an unpublished window.
+  The effort part is a RANGE (the menu's ends), not the whole menu.
+
+`replaceBuiltInOptions` is deliberately left unset: the built-in Anthropic rows
+stay, and Claude Code skips a listed model the built-in lineup already covers.
+Requires Claude Code **v2.1.242 or later** (where `modelPicker` was added); an
+older client ignores the key and shows only its built-in lineup.
+
+Two opt-outs, plus one failure mode:
+
+- `llmux run --no-model-picker` — spawn `claude` with no `--settings` at all.
+- Your own `--settings` in the pass-through args (`llmux run -- --settings …`,
+  either spelling) — **your document wins**: llmux never merges into it and
+  prints `warning: --settings given, llmux model picker lineup not injected`.
+  Claude Code reads one `--settings` document, so precedence is
+  all-or-nothing.
+- A `modelPicker` key in your own `~/.claude/settings.json` is shadowed by the
+  injected document for that launch (Claude Code layers `--settings` over user
+  settings key by key; llmux only inspects the pass-through argv when deciding
+  to inject). Use `--no-model-picker` to keep your own lineup.
+- Catalog fetch failure (daemon unreachable, non-200, unparseable body) —
+  `warning: model picker not injected: <reason>` and `claude` starts unchanged.
+  The picker is a convenience; it must never block a launch.
+
+Gateway model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) is NOT
+used: it keeps only ids containing `claude`/`anthropic` and needs a credential
+header, both of which defeat the purpose here. `/v1/models` stays proxied
+upstream, untouched.
+
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated

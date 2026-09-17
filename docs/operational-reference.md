@@ -133,6 +133,8 @@ just build
 
 `llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
 
+It also makes Claude Code's `/model` picker list the llmux catalog: `run` fetches `GET /llmux/models` from the proxy it is pointing `claude` at and prepends the lineup as `claude --settings '<modelPicker json>'` (no settings file is written, and the built-in Anthropic rows stay). `--no-model-picker` suppresses the injection, a `--settings` of your own in the pass-through args wins with one warning line, and a failed catalog fetch is a warning that never blocks the launch — see [`models.md`](models.md#claude-code-model-picker).
+
 Daemon stderr is written to `~/.local/state/llmux/server.log`, respecting `$XDG_STATE_HOME`. A port occupied by a foreign process is an error; llmux never overwrites it.
 
 Manual shell wiring:
