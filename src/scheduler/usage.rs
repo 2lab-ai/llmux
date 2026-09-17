@@ -58,8 +58,9 @@ pub enum UsageError {
 }
 
 /// A grok billing failure becomes a poll failure. An HTTP status is lifted into
-/// [`UsageError::Status`] so the poller's ONE auth-failure branch covers both
-/// providers instead of growing a grok-specific copy.
+/// [`UsageError::Status`] so both providers share ONE status-shaped failure for
+/// logging and the backoff ladder; the auth-failure VERDICT is per-source and
+/// lives in [`UsagePoller::poll_account`] (grok billing statuses never bench).
 impl From<GrokUsageError> for UsageError {
     fn from(err: GrokUsageError) -> Self {
         match err {
@@ -504,13 +505,23 @@ impl<F: UsageFetcher> UsagePoller<F> {
     }
 
     /// Poll a single account once and record the outcome. Accounts without a
-    /// usage source (or vanished ones) are a no-op. A 403 means the token was
-    /// revoked — surfaced as an auth failure; a 401 is left for the auth
+    /// usage source (or vanished ones) are a no-op. A 401 is left for the auth
     /// layer's refresh path (the next poll retries with the refreshed
-    /// credential), for grok exactly as for oauth: benching a serving account
-    /// because an INFORMATIONAL gauge read hit an expired access token would
-    /// cost capacity, and `forward.rs` `classify` (src/proxy/forward.rs:145)
+    /// credential) on BOTH sources: benching a serving account because an
+    /// INFORMATIONAL gauge read hit an expired access token would cost
+    /// capacity, and `forward.rs` `classify` (src/proxy/forward.rs:145)
     /// already refreshes-then-benches on a request-path 401.
+    ///
+    /// A 403 is a REVOKED-token verdict on the anthropic usage endpoint only
+    /// (`bench_on_forbidden`). The grok billing endpoint has only ever been
+    /// observed answering 200 and 401 (`docs/grok/spec.md` §R3), so its 403 is
+    /// an unverified shape — a host WAF/challenge would produce one — and
+    /// benching a healthy account on it is unrecoverable (`AccountHealth::
+    /// AuthFailed` is sticky until re-login, src/scheduler/mod.rs:757-764).
+    /// Real grok revocation is still caught on the request path by the same
+    /// `classify` hop, so the grok billing read stays informational: 403/5xx
+    /// climb the backoff ladder like any other poll failure.
+    ///
     /// Both outcomes are applied through the FINGERPRINT-GUARDED pool calls,
     /// so a verdict earned by a credential that was replaced mid-poll (a
     /// re-login) is discarded instead of landing on its successor.
@@ -529,19 +540,22 @@ impl<F: UsageFetcher> UsagePoller<F> {
         // One usage SOURCE per credential kind. A grok snapshot carries only
         // the weekly window, and `PoolState::record_usage` merges `Some`
         // windows only, so the header-fed 5h burst gauge stays intact.
-        let outcome = match &credential {
+        // `bench_on_forbidden` rides along because the 403 verdict belongs to
+        // the SOURCE, not to the account (see the doc comment above).
+        let (outcome, bench_on_forbidden) = match &credential {
             AccountCredential::Oauth { access_token, .. } => {
-                self.fetcher.fetch(&self.base_url, access_token).await
+                (self.fetcher.fetch(&self.base_url, access_token).await, true)
             }
             AccountCredential::Grok {
                 access_token,
                 subject,
                 ..
-            } => {
+            } => (
                 self.fetcher
                     .fetch_grok(&self.grok_upstream, access_token, subject)
-                    .await
-            }
+                    .await,
+                false,
+            ),
             _ => return Ok(()),
         };
         match outcome {
@@ -551,10 +565,12 @@ impl<F: UsageFetcher> UsagePoller<F> {
                 Ok(())
             }
             Err(err) => {
-                if let UsageError::Status { status } = &err {
-                    if *status == http::StatusCode::FORBIDDEN {
-                        self.pool.record_auth_failure_if(account, &fingerprint);
-                    }
+                let forbidden = matches!(
+                    &err,
+                    UsageError::Status { status } if *status == http::StatusCode::FORBIDDEN
+                );
+                if bench_on_forbidden && forbidden {
+                    self.pool.record_auth_failure_if(account, &fingerprint);
                 }
                 Err(err)
             }
@@ -1229,12 +1245,21 @@ mod tests {
         );
     }
 
-    /// Same discipline as oauth: a 403 (revoked token) benches the account, a
-    /// 401 does not — an informational gauge read must not take a serving
-    /// account out of rotation when the request path's refresh would heal it.
+    /// UNLIKE the oauth twin, NO billing status benches a grok account. The
+    /// endpoint has only ever been observed answering 200 and 401, so a 403
+    /// from that host is an unverified shape (a WAF/challenge answers that way)
+    /// while `AccountHealth::AuthFailed` is sticky until re-login
+    /// (src/scheduler/mod.rs:757-764) — an INFORMATIONAL gauge read may not
+    /// permanently retire a serving account. Real revocation is still caught on
+    /// the request path (`classify`, src/proxy/forward.rs:145). Both statuses
+    /// are plain poll failures: backoff climbs and the previous reading stays.
     #[tokio::test]
-    async fn grok_billing_forbidden_marks_auth_failure_unauthorized_does_not() {
+    async fn grok_billing_forbidden_is_a_poll_failure_not_an_auth_failure() {
         let pool = AccountPool::new(&[grok_account("g"), grok_account("h")]);
+        // A weekly reading each account already earned: a failed poll must
+        // retain it (unknown is never zero, and neither is it cleared).
+        pool.record_usage(&id("g"), &grok_weekly(0.65), now());
+        pool.record_usage(&id("h"), &grok_weekly(0.65), now());
         let fetcher = MockFetcher::new(vec![Err(status_err(403)), Err(status_err(401))]);
         let mut poller = UsagePoller::with_fetcher(
             pool.clone(),
@@ -1249,8 +1274,24 @@ mod tests {
         let snapshot = pool.snapshot();
         let g = snapshot.accounts.iter().find(|x| x.id == id("g")).unwrap();
         let h = snapshot.accounts.iter().find(|x| x.id == id("h")).unwrap();
-        assert!(!g.healthy, "403 = revoked → auth failure");
+        assert!(g.healthy, "403 semantics unverified → health unchanged");
         assert!(h.healthy, "401 = expired token → refresh path owns it");
+        assert_eq!(
+            poller.schedule[&id("g")].consecutive_failures,
+            1,
+            "403 climbs the backoff ladder like any other poll failure"
+        );
+        assert_eq!(
+            poller.schedule[&id("h")].consecutive_failures,
+            1,
+            "401 climbs the backoff ladder like any other poll failure"
+        );
+        for account in [g, h] {
+            assert!(
+                (account.seven_day.expect("7d gauge retained").utilization - 0.65).abs() < 1e-9,
+                "a failed billing read never clears the last reading"
+            );
+        }
     }
 
     /// A non-status billing failure (malformed body, refused upstream) is a

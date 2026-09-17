@@ -171,7 +171,11 @@ core with thin per-provider adapters.
     URL or token).
   - **Both paths feed it.** The periodic poller schedules grok accounts like oauth ones
     (`scheduler::usage::UsagePoller`, `usage_poll_secs` = 300 default, backoff ladder +
-    global gap shared; a 403 benches the account, a 401 is left to the refresh path), and
+    global gap shared; **no billing status ever benches a grok account** — 403/5xx are plain
+    poll failures because only 200 and 401 have been observed from that host, so a 403 is an
+    unverified shape (WAF/challenge) that would permanently retire a serving account, and
+    real revocation is caught on the request path (`classify`, src/proxy/forward.rs:145),
+    while a 401 is left to the refresh path), and
     the explicit `POST /llmux/refresh-usage` (with or without `account`) reads billing
     through `usage_controls::read_usage` with `provider: "grok"`. Reset credits stay a
     codex concept: grok's counters remain `None`, and the redemption endpoints keep
