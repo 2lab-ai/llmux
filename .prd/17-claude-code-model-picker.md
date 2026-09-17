@@ -1,6 +1,6 @@
 # Claude Code `/model` picker from the llmux catalog
 
-Status: in-progress
+Status: shipped
 Date: 2026-09-17
 
 ## Problem and target
@@ -97,8 +97,10 @@ Acceptance (execute → expected observation):
 Landed on `feat/run-model-picker`. The live receipt (picker screen + grok
 activity line) was taken 2026-09-17 against the running daemon from the
 worktree binary in `--remote localhost:3456` mode (see loop.md gap matrix);
-Status flips to shipped once the branch is merged and the preview build is
-deployed.
+Shipped: PR #161 squash-merged as main 464f5bb, deployed as
+`preview-2026-09-17-0944-464f5bb7ab85`, and re-verified with the installed
+binary (`/model` shows the catalog rows). This document describes the
+implemented contract, not a future target.
 
 - `src/cli/run.rs`: `model_picker_settings` (pure row builder),
   `row_description`, `has_user_settings` / `injects_model_picker` (pure
