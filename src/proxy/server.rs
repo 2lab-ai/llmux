@@ -1019,6 +1019,7 @@ pub async fn serve(
         state.pool.clone(),
         state.client.clone(),
         state.config.upstream.clone(),
+        state.config.grok.upstream.clone(),
         state.config.scheduler,
     )
     .with_events(state.events.clone());

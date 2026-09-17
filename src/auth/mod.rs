@@ -5,6 +5,7 @@ pub mod codex;
 pub mod codex_usage;
 pub mod credentials;
 pub mod grok;
+pub mod grok_usage;
 pub mod oauth;
 pub mod openrouter;
 pub mod profile;

@@ -47,7 +47,8 @@ core with thin per-provider adapters.
 | grok-4.5 | ctx 500K, max_out 65536, thinking `low/medium/high`, zero **not** allowed | registry models.json:2425-2443 |
 | grok-build-0.1 | fast coding model, ctx 256K, no thinking levels | models.json:2413-2423 |
 | Quota exhaustion | HTTP 429 body `code`/`error` contains `free-usage-exhausted` → 24h rolling window | xai_executor.go:2521-2545 |
-| No usage endpoint; passive headers DO exist | no `/api/oauth/usage` equivalent (probed live: /v1/{usage,rate_limits,quota,me} 404; grok.com/rest/rate-limits 403 for OAuth2 tokens; absent from CLIProxyAPI and official grok CLI 0.2.101 binary). **Correction 2026-07-14**: 200 responses DO carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` headers (live capture: 900 req / 15M tok, no reset header) — the original "no passive quota headers" claim was wrong | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
+| Active usage endpoint (**corrected 2026-09-17**) | `GET {base}/billing?format=credits` — the xAI CLI's own billing read. Headers: `Authorization: Bearer <access_token>`, `X-XAI-Token-Auth: xai-grok-cli`, `x-userid: <subject>`, `x-grok-client-version: <version>`, `Accept: application/json`; 15s timeout. 200 body: `config.currentPeriod{type,start,end}` + `creditUsagePercent` (0–100 USED) + `billingPeriodStart/End`; expired token → 401 `{"error":"Invalid or expired credentials (…)"}`. The earlier "no usage endpoint" claim was wrong: it probed /v1/{usage,rate_limits,quota,me} and grok.com/rest/rate-limits, never `/billing`. Passive `x-ratelimit-*` headers also exist (below) and remain the 5h source | xai-org/grok-build `crates/codegen/xai-grok-shell/src/extensions/billing.rs` + `credit_bar.rs`; same strings in the local grok CLI 1.0.34 binary; live capture 2026-09-17 (`creditUsagePercent: 65.0`, `USAGE_PERIOD_TYPE_WEEKLY`, period end `2026-09-22T02:19:18.817992+00:00`) |
+| Passive quota headers | 200 responses carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` (live capture: 900 req / 15M tok, no reset header) | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
 | Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in carried from grok-4.5 ($0.50/M; not listed) | docs.x.ai grok-4.6 (web, 2026-08-13) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
@@ -144,12 +145,42 @@ core with thin per-provider adapters.
   dashboard tracks per-(group, model). Add pricing entry `GROK_4_5 {input 2.0, output
   6.0, cache_read 0.5, cache_creation 0.0}` + `group == "grok"` unknown-model fallback
   (src/pricing.rs builtin table, pricing.rs:58-100).
-- Quota windows (**revised 2026-07-14**, post-ship): grok has no active usage endpoint,
-  but 200 responses carry `x-ratelimit-{limit,remaining}-{requests,tokens}` burst headers
-  (RPM/TPM-shaped, no reset). These feed the 5h slot via the standard-bucket path with an
-  estimated 60s reset horizon (`headers::STANDARD_RESET_FALLBACK`), grok accounts only.
-  The 7d gauge stays empty. A `free-usage-exhausted` park shows the existing
-  cooldown/reset countdown UI.
+- Quota windows (**revised 2026-09-17**, post-ship — supersedes the 2026-07-14 "the 7d
+  gauge stays empty" revision):
+  - **5h burst slot — headers, unchanged.** 200 responses carry
+    `x-ratelimit-{limit,remaining}-{requests,tokens}` (RPM/TPM-shaped, no reset). These
+    feed the 5h slot via the standard-bucket path with an estimated 60s reset horizon
+    (`headers::STANDARD_RESET_FALLBACK`), grok accounts only.
+  - **7d slot — the billing endpoint.** `GET {grok upstream}/billing?format=credits`
+    (identity headers + evidence in the facts table above) is grok's ACTIVE usage source:
+    `src/auth/grok_usage.rs` — `billing_url` (refuses any upstream whose path is not
+    `…/v1`; it never falls back to the production chat proxy), `fetch_billing`,
+    `parse_billing`. Mapping: `currentPeriod.type` containing `WEEKLY` →
+    `seven_day = {utilization: creditUsagePercent/100 clamped, resets_at:
+    currentPeriod.end ?? billingPeriodEnd}`; `MONTHLY` (or any other period name) → a
+    SCOPED reading labelled "Monthly limit" / the raw enum, so a 30-day allowance can
+    never masquerade as the weekly gauge. The snapshot carries no `five_hour`, and
+    `PoolState::record_usage` merges `Some` windows only, so the header-fed burst gauge is
+    left intact.
+  - **Unknown is never zero.** No `currentPeriod`, no period `type` or no usable reset
+    instant ⇒ NO window (not 0%). The single exception is upstream's proto3 JSON encoding,
+    which omits zero scalars: an ABSENT `creditUsagePercent` next to a PRESENT period
+    really is 0%. A present-but-unreadable percent, a non-`config` body, an HTML page or
+    the 401 error envelope are `Malformed` — never an empty success, and a failed read
+    retains the previous reading. Errors carry fixed sanitized phrases (never the body,
+    URL or token).
+  - **Both paths feed it.** The periodic poller schedules grok accounts like oauth ones
+    (`scheduler::usage::UsagePoller`, `usage_poll_secs` = 300 default, backoff ladder +
+    global gap shared; **no billing status ever benches a grok account** — 403/5xx are plain
+    poll failures because only 200 and 401 have been observed from that host, so a 403 is an
+    unverified shape (WAF/challenge) that would permanently retire a serving account, and
+    real revocation is caught on the request path (`classify`, src/proxy/forward.rs:145),
+    while a 401 is left to the refresh path), and
+    the explicit `POST /llmux/refresh-usage` (with or without `account`) reads billing
+    through `usage_controls::read_usage` with `provider: "grok"`. Reset credits stay a
+    codex concept: grok's counters remain `None`, and the redemption endpoints keep
+    refusing grok accounts.
+  - A `free-usage-exhausted` park still shows the existing cooldown/reset countdown UI.
 - Surfaces: `llmux status` (client+server), TUI account table + activity log (model +
   effort recorded via grok `effective_request_meta` mirror), `/llmux/status` JSON
   (`group: "grok"`), islands: `UsageProvider.grok` + provider icon (new `grok` asset;
@@ -334,7 +365,13 @@ Rust (`llmux`):
 - `src/provider/grok.rs` — NEW adapter
 - `src/provider/mod.rs` — wiring
 - `src/auth/grok.rs` — NEW: discovery, device flow, poll, refresh, JWT identity
+- `src/auth/grok_usage.rs` — NEW (2026-09-17): billing URL derivation, `GET
+  /billing?format=credits`, weekly/monthly window mapping (§R3)
 - `src/auth/mod.rs` — export
+- `src/scheduler/usage.rs` — `UsageFetcher::fetch_grok`, grok arm in `poll_account`,
+  grok accounts in the poll schedule (§R3)
+- `src/proxy/usage_controls.rs` — `provider_of` → `"grok"`, grok arm in `read_usage`,
+  grok in the all-accounts refresh filter (§R3)
 - `src/cli/login.rs`, `src/cli/mod.rs` — `--grok`
 - `src/proxy/login.rs` — `LoginProvider::Grok`, device-flow phase w/ verification URI
 - `src/proxy/server.rs` — `AppState.grok`, `POST /llmux/grok`, login status fields,
