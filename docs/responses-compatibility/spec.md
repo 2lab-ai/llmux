@@ -144,7 +144,7 @@ They apply on grok only; on codex the same GIF is forwarded without being parsed
 | Case | Why refused | Error path |
 | --- | --- | --- |
 | animated GIF | one PNG cannot carry the frames; forwarding frame 0 would substitute a still the user never sent. `image` will not answer "how many frames" (`GifDecoder::read_image` composites frame 0 and returns `Ok`), so llmux walks the container's own block chain — a truncated chain counts as unknown, not as one frame | `….source.data` |
-| declared `width × height × 4` > **128 MiB** | a 99-byte GIF can declare 65535×65535 in its logical screen descriptor (a 16 GiB frame) — the 20 MiB compressed cap sees none of that | `….source` |
+| declared `width × height × 4` > **128 MiB** | a 99-byte GIF can declare 65535×65535 in its logical screen descriptor (a 16 GiB frame) — the 20 MiB compressed cap sees none of that. This is the only size limit on the path (the `gif` backend's 50 MB per-frame default is not consulted when `image` hands it a caller-owned buffer), so the refusal is always llmux's typed 400 naming the dimensions, never a decoder-internal "not decodable" that blames the payload | `….source` |
 | PNG would exceed **20 MiB** | enforced by the writer *during* encoding, so the oversized buffer is never finished | `….content[n]` |
 | undecodable / truncated GIF | nothing to convert | `….source.data` |
 

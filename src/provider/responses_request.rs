@@ -49,6 +49,19 @@ pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// legally declare 65535×65535 in its logical screen descriptor, which is a
 /// 16 GiB RGBA frame. 128 MiB is ~33 MP at RGBA — a 6016×3384 retina
 /// screenshot (81 MiB) fits with room to spare, a decompression bomb does not.
+///
+/// This budget is the ONLY size limit on the conversion path, which is why the
+/// headroom above is real rather than nominal. The `gif` backend does carry a
+/// 50 MB per-frame default (`gif` 0.14.2 `reader/mod.rs:125`, checked against
+/// `width × height × 4` since `image` asks for `ColorOutput::RGBA` in
+/// `codecs/gif.rs:61`), and `image` 0.25.10 never calls `set_memory_limit` —
+/// but that default is not on this path: `GifDecoder::read_image` writes into
+/// the caller-owned slice below (`codecs/gif.rs:157-159` →
+/// `gif` `reader/converter.rs:186-223`, whose signature takes no limit), and
+/// the crate consults its limit only when it allocates the buffer itself
+/// (`reader/decoder.rs:417-424`, the `OutputBuffer::Vec` variant). So nothing
+/// under this number can be refused by a limit llmux did not choose, and a
+/// size question never reaches the user as "not a decodable GIF image".
 const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Leading marker for a `tool_result` whose `is_error` is true. Responses has
@@ -922,7 +935,10 @@ fn convert_to_png(
 /// * `max_alloc_bytes` bounds the decoded frame, computed from the logical
 ///   screen descriptor's `width × height × 4`. The caller's compressed-size
 ///   cap proves nothing here: a 99-byte GIF can declare 65535×65535 (a 16 GiB
-///   frame).
+///   frame). This check is the only size limit on the path — the `gif`
+///   backend's own per-frame default never applies to it (see
+///   [`MAX_DECODED_IMAGE_BYTES`]) — so every oversized image is refused here,
+///   by dimensions.
 /// * `max_output_bytes` bounds the PNG payload, enforced by [`CappedWriter`]
 ///   *during* encoding rather than by measuring a finished buffer.
 /// * animation is refused outright — one PNG cannot carry the frames, and
@@ -1712,6 +1728,57 @@ mod tests {
                 && message.contains("65535×65535")
                 && message.contains("to decode"),
             "the budget refusal names the dimensions, not the payload: {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_still_gif_above_the_gif_crates_default_limit_still_converts_under_our_budget() {
+        // 4000×4000 RGBA is 64 MB — over the `gif` crate's 50 MB per-frame
+        // default (`reader/mod.rs:125`) and under [`MAX_DECODED_IMAGE_BYTES`].
+        // This pins that the crate's default cannot pre-empt our budget: it is
+        // not consulted on `read_image`'s caller-owned-slice path, so the only
+        // limit that decides this image is ours, and it says yes.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        bytes[6..10].copy_from_slice(&[0xA0, 0x0F, 0xA0, 0x0F]);
+        let big = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let url = single_image_url("image/gif", &big, Grok);
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "a 64 MB frame converts: {}",
+            &url[..url.len().min(40)]
+        );
+        assert!(
+            !png_from_data_url(&url).is_empty(),
+            "the converted PNG carries bytes"
+        );
+    }
+
+    #[test]
+    fn a_gif_just_over_our_decode_budget_is_refused_by_its_dimensions() {
+        // The other side of the same seam: 6000×5600 RGBA is 134,400,000 bytes,
+        // just over the 128 MiB budget. The refusal must be our typed 400
+        // naming the dimensions — a "not decodable" here would mean a decoder
+        // answered a size question we own.
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(GIF_B64)
+            .expect("fixture base64");
+        bytes[6..10].copy_from_slice(&[0x70, 0x17, 0xE0, 0x15]);
+        let bomb = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let body = json!({"messages": [{"role": "user", "content": [
+            image_block("image/gif", &bomb),
+        ]}]});
+        let message = reject(&body, Grok);
+        assert!(
+            message.starts_with("messages[0].content[0].source:")
+                && message.contains("6000×5600")
+                && message.contains("to decode"),
+            "the budget refusal names the dimensions: {message:?}"
+        );
+        assert!(
+            !message.contains("not a decodable GIF image"),
+            "the payload is not blamed for our budget: {message:?}"
         );
     }
 
