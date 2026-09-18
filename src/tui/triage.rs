@@ -10,7 +10,8 @@
 //!    healthy.
 //! 2. [`display_order`] — the accounts table in backend-group blocks (Claude,
 //!    Codex, Grok, OpenRouter), ordered within a block by [`AccountSort`]:
-//!    account name (default) or the scheduler's own next-pick order. in-flight
+//!    account name in natural order ([`natural_key`], the default) or the
+//!    scheduler's own next-pick order. in-flight
 //!    is deliberately NOT a sort key anywhere (it toggles per request and
 //!    would destroy the row-position memory a glance table exists for).
 //! 3. [`collapse_completed`] — folds runs of at least [`FOLD_MIN`] CONSECUTIVE
@@ -255,8 +256,10 @@ pub(crate) fn urgent(account: &AccountSnapshot, gate: Option<IneligibleReason>) 
 /// local (`o` toggles it), never persisted to config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AccountSort {
-    /// Account name ascending (case-insensitive), config index as the stable
-    /// tiebreak. The default: a name order never moves under live usage.
+    /// Account name ascending, case-insensitive and NATURAL ([`natural_key`]:
+    /// digit runs compare as numbers, so `ai` < `ai1` < `ai2` < `ai10`), with
+    /// the lowercased name and then the config index as the stable tiebreak.
+    /// The default: a name order never moves under live usage.
     #[default]
     Name,
     /// The scheduler's literal next-pick order for the group
@@ -281,6 +284,69 @@ impl AccountSort {
     }
 }
 
+/// One comparable piece of a [`natural_key`]: a separator character, a whole
+/// run of digits taken as the number it spells, or a letter.
+///
+/// The declaration order IS the rule — the derived `Ord` orders variants by
+/// declaration, so at one position `Sep` < `Num` < `Alpha`:
+///
+/// - a separator beats a number, which is the owner's picture of the fix
+///   (Z 2026-09-18): the number is a right-aligned padded slot and the name
+///   whose slot is EMPTY comes first, so `ai@…` < `ai1@…`;
+/// - a number beats a letter, which is Finder / `sort -V` order, so
+///   `dev1@…` < `devteam@…` and `codex:2@…` < `codex:backup@…`.
+///
+/// ```text
+/// ai[    ]@iq.io
+/// ai[   1]@iq.io
+/// ai[  10]@iq.io
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NatChunk {
+    /// One non-alphanumeric character (`@`, `.`, `:`, `-`, `_`, `+` …) — the
+    /// boundary an empty number slot falls on.
+    Sep(char),
+    /// A digit run read as a number. Saturating: a run too long for `u128`
+    /// keeps the ceiling instead of panicking (ids are operator input).
+    Num(u128),
+    /// One lowercased alphanumeric non-digit character.
+    Alpha(char),
+}
+
+/// The human ("natural") sort key for an account name: lowercased, with every
+/// digit run compared as a NUMBER rather than character by character, so a
+/// block reads `ai`, `ai1`, `ai2`, … `ai10` instead of `ai10, ai1, ai2, ai`.
+///
+/// Per-character (rather than per-word) chunks are what makes the comparison
+/// land on the divergence itself, where [`NatChunk`]'s three kinds decide:
+/// separator < number < letter. Hence `ai@iq.io` < `ai1@iq.io` (empty slot
+/// first) and `dev1@iq.io` < `devteam@iq.io` / `codex:2@x` < `codex:backup@x`
+/// (a number is not a letter, and does not sort as one).
+///
+/// Digit runs that spell the same number (`ai01` vs `ai1`) tie here; callers
+/// break the tie with the lowercased name and then the config index.
+pub(crate) fn natural_key(name: &str) -> Vec<NatChunk> {
+    let mut key = Vec::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        let Some(digit) = c.to_digit(10) else {
+            key.push(if c.is_alphanumeric() {
+                NatChunk::Alpha(c.to_ascii_lowercase())
+            } else {
+                NatChunk::Sep(c)
+            });
+            continue;
+        };
+        let mut value = u128::from(digit);
+        while let Some(next) = chars.peek().and_then(|c| c.to_digit(10)) {
+            value = value.saturating_mul(10).saturating_add(u128::from(next));
+            chars.next();
+        }
+        key.push(NatChunk::Num(value));
+    }
+    key
+}
+
 /// THE display order: indices into `snapshot.accounts` in backend-group blocks
 /// ([`BackendGroup::ALL`] — Claude, Codex, Grok, OpenRouter) as the primary
 /// key in both modes, ordered within each block by `sort`. The old
@@ -299,7 +365,10 @@ pub(crate) fn display_order(
                 let mut block: Vec<usize> = (0..snapshot.accounts.len())
                     .filter(|&idx| snapshot.accounts[idx].group == group)
                     .collect();
-                block.sort_by_key(|&idx| (snapshot.accounts[idx].id.0.to_ascii_lowercase(), idx));
+                block.sort_by_key(|&idx| {
+                    let id = &snapshot.accounts[idx].id.0;
+                    (natural_key(id), id.to_ascii_lowercase(), idx)
+                });
                 order.extend(block);
             }
             // Delegated to the selector itself, so the table can never
@@ -498,6 +567,61 @@ mod tests {
         a
     }
 
+    // ---- natural name key ----
+
+    #[test]
+    fn natural_key_orders_like_a_human() {
+        let mut names = vec![
+            "ai10", "ai1", "ai", "ai2", "ai01", "AI3", "dev1", "dev", "icedac", "info", "notify",
+        ];
+        names.sort_by_key(|name| (natural_key(name), name.to_ascii_lowercase()));
+        assert_eq!(
+            names,
+            vec![
+                "ai", "ai01", "ai1", "ai2", "AI3", "ai10", "dev", "dev1", "icedac", "info",
+                "notify",
+            ],
+            "empty slot first, digit runs numeric, spelling as the tiebreak"
+        );
+
+        // At a divergence: separator < number < letter. The empty number slot
+        // still sorts first (the owner's TO-BE), but a number now beats a
+        // letter — Finder / `sort -V` order, so `devteam` no longer jumps
+        // ahead of `dev1`.
+        let mut ids = vec![
+            "devteam@x",
+            "ai2@x",
+            "codex:backup@x",
+            "ai@x",
+            "dev1@x",
+            "codex:2@x",
+            "ai10@x",
+            "ai1@x",
+        ];
+        ids.sort_by_key(|id| (natural_key(id), id.to_ascii_lowercase()));
+        assert_eq!(
+            ids,
+            vec![
+                "ai@x",
+                "ai1@x",
+                "ai2@x",
+                "ai10@x",
+                "codex:2@x",
+                "codex:backup@x",
+                "dev1@x",
+                "devteam@x",
+            ],
+            "separator (the empty number slot) < number < letter"
+        );
+
+        // A digit run far past u128 saturates instead of panicking.
+        let huge = format!("a{}", "9".repeat(60));
+        assert_eq!(
+            natural_key(&huge),
+            vec![NatChunk::Alpha('a'), NatChunk::Num(u128::MAX)]
+        );
+    }
+
     // ---- display order ----
 
     #[test]
@@ -552,6 +676,37 @@ mod tests {
             ordered_ids(&snapshot, AccountSort::Name),
             vec!["Alpha", "Beta", "beta", "zeta", "cx"],
             "case-insensitive, config index as the stable tiebreak"
+        );
+    }
+
+    #[test]
+    fn display_order_by_name_is_natural_for_numbered_accounts() {
+        // Z 2026-09-18: "ai, ai1, ai2 ... ai10 이거 정렬하면 실제 무낵이랑
+        // 정렬이 병신이잖아" — the plain lexicographic key read ai10, ai1, ai;
+        // the number slot has to compare as a NUMBER.
+        let snapshot = pool(vec![
+            grouped("ai10@insightquest.io", BackendGroup::Claude),
+            grouped("ai2@insightquest.io", BackendGroup::Claude),
+            grouped("ai@insightquest.io", BackendGroup::Claude),
+            grouped("ai1@insightquest.io", BackendGroup::Claude),
+            grouped("devteam@insightquest.io", BackendGroup::Claude),
+            grouped("dev1@insightquest.io", BackendGroup::Claude),
+            grouped("icedac@gmail.com", BackendGroup::Claude),
+            grouped("notify@insightquest.io", BackendGroup::Claude),
+        ]);
+        assert_eq!(
+            ordered_ids(&snapshot, AccountSort::Name),
+            vec![
+                "ai@insightquest.io",
+                "ai1@insightquest.io",
+                "ai2@insightquest.io",
+                "ai10@insightquest.io",
+                "dev1@insightquest.io",
+                "devteam@insightquest.io",
+                "icedac@gmail.com",
+                "notify@insightquest.io",
+            ],
+            "digit runs compare numerically; empty slot first, number before letter"
         );
     }
 
