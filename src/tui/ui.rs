@@ -220,7 +220,7 @@ pub(crate) fn draw(
     let ctx = FrameCtx {
         now,
         tz_offset: format::local_offset_secs(now),
-        order: view.display_order(now),
+        order: view.display_order(chrome.account_sort, now),
         headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
         frame: chrome.frame,
         mask: view.email_anonymous,
@@ -4250,7 +4250,11 @@ fn draw_accounts(
     chrome: &Chrome,
 ) -> Vec<AccountRowHit> {
     let snapshot = &view.snapshot;
-    let block = Block::new().borders(Borders::TOP).title(" accounts ");
+    // The title carries the active within-group order (`o` toggles it), so the
+    // operator never has to guess why two rows swapped.
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(format!(" accounts · sort {} ", chrome.account_sort.label()));
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
@@ -7911,6 +7915,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" used/left  "),
                     key("t"),
                     Span::raw(" eta/utc  "),
+                    key("o"),
+                    Span::raw(" sort  "),
                     key("S"),
                     Span::raw(" sched  "),
                     key("↑↓"),
@@ -7943,6 +7949,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 Span::raw(" used/left  "),
                 key("t"),
                 Span::raw(" eta/utc  "),
+                key("o"),
+                Span::raw(" sort  "),
                 key("Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -8780,11 +8788,12 @@ mod tests {
     fn accounts_overlay_renders_exactly_one_accounts_separator() {
         let view = view_with(Vec::new());
         let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 160, 30);
-        // A separator row is the titled top border (` accounts ────`) — the
-        // label followed by the border line. Hint TEXT mentioning the word
-        // ("no accounts — run `llmux login`…") is not a separator.
+        // A separator row is the titled top border
+        // (` accounts · sort name ────`) — the label followed by the border
+        // line. Hint TEXT mentioning the word ("no accounts — run `llmux
+        // login`…") is not a separator.
         let hits: Vec<usize> = (2..rows.len() - 2)
-            .filter(|&y| rows[y].contains("accounts ─"))
+            .filter(|&y| rows[y].contains("accounts · sort"))
             .collect();
         assert_eq!(
             hits,
@@ -8957,7 +8966,7 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::Accounts);
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -8980,13 +8989,34 @@ mod tests {
         assert!(footer.contains("r remove"), "{footer}");
     }
 
+    /// The accounts pane title names the ACTIVE within-group order, so the
+    /// operator can see which of the two `o` modes produced the rows — and
+    /// both MAIN and the overlay advertise the `o sort` key.
+    #[test]
+    fn accounts_title_shows_sort_mode() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        let name = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(name.contains("accounts · sort name"), "{name}");
+        chrome.account_sort = super::super::triage::AccountSort::Next;
+        let next = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(next.contains("accounts · sort next"), "{next}");
+        assert!(!next.contains("accounts · sort name"), "{next}");
+        // Both keybars advertise the toggle.
+        let footer = |rows: Vec<String>| rows[rows.len() - 1].clone();
+        let overlay_bar = footer(render_rows(&view, &chrome, 160, 30));
+        assert!(overlay_bar.contains("o sort"), "{overlay_bar}");
+        let main_bar = footer(render_rows(&view, &chrome_overlay(Overlay::None), 160, 30));
+        assert!(main_bar.contains("o sort"), "{main_bar}");
+    }
+
     /// The redemption confirmation names the account and the ONE reset it
     /// spends — a bare y/N with no subject is exactly what this forbids.
     #[test]
     fn reset_confirmation_names_the_account_and_one_reset() {
         let view = usage_control_view();
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -9128,6 +9158,7 @@ mod tests {
             sessions_pct: 100,
             session_cursor: 0,
             session_sort: Default::default(),
+            account_sort: Default::default(),
             config_cursor: 0,
             config_input: String::new(),
             config_saved: Default::default(),

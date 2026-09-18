@@ -913,6 +913,74 @@ pub fn selection_order(
         .collect()
 }
 
+/// THE per-group display order: [`selection_order`] restricted to ONE
+/// [`BackendGroup`] and scoped to that group throughout —
+///
+/// 1. the group's own current account first (`snapshot.current[group]`, even
+///    if it just became ineligible: it is still serving leases),
+/// 2. then the group's eligible accounts in [`rank`] order (round-robin:
+///    roster order after the current, wrapping over the GROUP's members),
+/// 3. then the group's ineligible accounts, last, in stable config order.
+///
+/// Gated and ranked with `Some(group)` exactly like [`pick`] does when routing
+/// is on, so a per-group table can never disagree with what the scheduler
+/// would actually serve for that group. Returned indices point into
+/// `snapshot.accounts` (not into the group's member list), so a caller can
+/// concatenate the groups into one display order. Pure.
+pub fn group_selection_order(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: BackendGroup,
+    now: SystemTime,
+) -> Vec<usize> {
+    let scope = Some(group);
+    let headers_only = headers_only_mode(snapshot, params, scope, now);
+    let current_id = snapshot.current.get(&group);
+    // `members` is the group's roster in config order — the rotation the
+    // round-robin branch wraps over (the pool-wide roster would skip other
+    // groups' slots and desync the cycle).
+    let mut members: Vec<usize> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut eligible: Vec<usize> = Vec::new();
+    let mut ineligible: Vec<usize> = Vec::new();
+    for (idx, account) in snapshot.accounts.iter().enumerate() {
+        if !in_group(account, scope) {
+            continue;
+        }
+        members.push(idx);
+        if current_id == Some(&account.id) {
+            current.push(idx);
+        } else if eligibility(account, params, now, headers_only).is_none() {
+            eligible.push(idx);
+        } else {
+            ineligible.push(idx);
+        }
+    }
+    if params.mode == crate::config::SchedulerMode::RoundRobin {
+        // Display the literal rotation: group-roster order starting after the
+        // group's current account (wrapping) — what round_robin_next serves.
+        let position = |idx: usize| members.iter().position(|&m| m == idx).unwrap_or(0);
+        let n = members.len().max(1);
+        let start = current.first().map_or(0, |&i| position(i) + 1);
+        eligible.sort_by_key(|&i| (position(i) + n - (start % n)) % n);
+    } else {
+        eligible.sort_by(|&a, &b| {
+            rank(
+                &snapshot.accounts[a],
+                &snapshot.accounts[b],
+                params,
+                scope,
+                now,
+            )
+        });
+    }
+    current
+        .into_iter()
+        .chain(eligible)
+        .chain(ineligible)
+        .collect()
+}
+
 /// Human-readable blocking reason for an ineligible account, with the
 /// concrete numbers an operator acts on: "cooldown 3m12s",
 /// "7d 99.4% > 99%", "usage stale 14m03s", "auth failed". Shared by the TUI
@@ -2423,6 +2491,84 @@ mod tests {
         );
         let head = selection_order(&snap, &params(), now())[0];
         assert_eq!(snap.accounts[head].id, to);
+    }
+
+    /// Parity for the per-group order the accounts table renders: for EVERY
+    /// group the head of `group_selection_order` is the account `pick` would
+    /// serve for that group — with no current (pick switches) and with a
+    /// current it is content to keep (pick stays).
+    #[test]
+    fn group_selection_order_head_agrees_with_pick_per_group() {
+        let mut grok = account("gk-a");
+        grok.credential_kind = "grok";
+        grok.group = BackendGroup::Grok;
+        let fleet = vec![
+            acct7("c-far", 0.05, 0.02, 150),
+            acct7("c-soon", 0.10, 0.10, 6),
+            codex_account("cx-a"),
+            codex_account("cx-b"),
+            grok,
+        ];
+
+        // No current in any group: the head is pick's switch target. An empty
+        // group has an empty order and pick reports exhaustion.
+        let snap = pool_groups(fleet.clone(), &[]);
+        for &group in BackendGroup::ALL {
+            let order = group_selection_order(&snap, &params(), group, now());
+            match pick(&snap, &params(), Some(group), now()) {
+                Decision::Switch { to } => {
+                    assert_eq!(snap.accounts[order[0]].id, to, "group {group:?}");
+                }
+                Decision::Exhausted { .. } => {
+                    assert!(order.is_empty(), "group {group:?} has no members");
+                }
+                Decision::Stay => panic!("no current slot cannot produce Stay ({group:?})"),
+            }
+            // Every index belongs to the group, and nothing is dropped.
+            assert!(order.iter().all(|&i| snap.accounts[i].group == group));
+            assert_eq!(
+                order.len(),
+                snap.accounts.iter().filter(|a| a.group == group).count()
+            );
+        }
+
+        // With each group parked on its best candidate, pick stays and the
+        // head IS that current account.
+        let currents = [
+            (BackendGroup::Claude, "c-soon"),
+            (BackendGroup::Codex, "cx-a"),
+            (BackendGroup::Grok, "gk-a"),
+        ];
+        let snap = pool_groups(fleet, &currents);
+        for (group, expected) in currents {
+            assert_eq!(
+                pick(&snap, &params(), Some(group), now()),
+                Decision::Stay,
+                "group {group:?}"
+            );
+            let order = group_selection_order(&snap, &params(), group, now());
+            assert_eq!(snap.accounts[order[0]].id.0, expected, "group {group:?}");
+        }
+    }
+
+    /// Round-robin: the group's rotation wraps over the GROUP's roster, not
+    /// the pool's — an interleaved codex account must not shift the cycle.
+    #[test]
+    fn group_selection_order_round_robin_rotates_within_the_group() {
+        let mut p = params();
+        p.mode = crate::config::SchedulerMode::RoundRobin;
+        let fleet = vec![
+            account("c-a"),
+            codex_account("cx"),
+            account("c-b"),
+            account("c-c"),
+        ];
+        let snap = pool_groups(fleet, &[(BackendGroup::Claude, "c-b")]);
+        let ids: Vec<&str> = group_selection_order(&snap, &p, BackendGroup::Claude, now())
+            .into_iter()
+            .map(|i| snap.accounts[i].id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["c-b", "c-c", "c-a"], "rotation wraps in-group");
     }
 
     // ---- wasted-quota simulation (the core claim, measured) ----

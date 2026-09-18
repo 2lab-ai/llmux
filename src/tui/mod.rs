@@ -33,7 +33,10 @@ mod event;
 // `llmux status` output and the dashboard agree on the display.
 pub(crate) mod format;
 pub(crate) mod logs;
-mod triage;
+// pub(crate): `Chrome` (and `DashboardView::display_order`) carry
+// `triage::AccountSort` across the crate-visible TUI surface, so the enum must
+// be at least as visible as they are.
+pub(crate) mod triage;
 mod ui;
 mod view;
 
@@ -485,6 +488,9 @@ pub(crate) struct Chrome {
     pub session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles).
     pub session_sort: SessionSort,
+    /// Within-group order of the accounts table (`o` toggles it on MAIN and
+    /// the accounts overlay). Drives BOTH the render and the row cursors.
+    pub account_sort: triage::AccountSort,
     /// Config-editor cursor row + the edit/confirm prompt text.
     pub config_cursor: usize,
     pub config_input: String,
@@ -879,6 +885,10 @@ struct App {
     session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
     session_sort: SessionSort,
+    /// Session toggle (`o` on MAIN / the accounts overlay): within-group order
+    /// of the accounts table — name (default) or the scheduler's next-pick
+    /// order. Session-local, never persisted to config.
+    account_sort: triage::AccountSort,
     /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
     config_cursor: usize,
     config_input: String,
@@ -1009,6 +1019,7 @@ impl App {
             sessions_tx: None,
             session_cursor: 0,
             session_sort: SessionSort::default(),
+            account_sort: triage::AccountSort::default(),
             config_cursor: 0,
             config_input: String::new(),
             config_pending: None,
@@ -1228,6 +1239,7 @@ impl App {
             sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
             session_sort: self.session_sort,
+            account_sort: self.account_sort,
             config_cursor: self.config_cursor,
             config_input: self.config_input.clone(),
             config_saved: self.config_saved.clone(),
@@ -1634,7 +1646,7 @@ impl App {
             {
                 // Pin the REAL account id now; display indexes reorder.
                 self.menu_account = view.and_then(|v| {
-                    let order = v.display_order(SystemTime::now());
+                    let order = v.display_order(self.account_sort, SystemTime::now());
                     order
                         .get(idx)
                         .and_then(|&i| v.snapshot.accounts.get(i))
@@ -2374,7 +2386,7 @@ impl App {
         self.close_menu();
         let idx = match (&pinned, view) {
             (Some(name), Some(v)) => {
-                let order = v.display_order(SystemTime::now());
+                let order = v.display_order(self.account_sort, SystemTime::now());
                 match order
                     .iter()
                     .position(|&i| v.snapshot.accounts.get(i).is_some_and(|a| a.id.0 == *name))
@@ -3115,6 +3127,8 @@ impl App {
             KeyCode::Char('u') => self.toggle_quota_display(view),
             // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
             KeyCode::Char('t') => self.toggle_reset_display(),
+            // Accounts row order WITHIN each backend group: name ↔ next-pick.
+            KeyCode::Char('o') => self.toggle_account_sort(),
             // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
             KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
@@ -3185,6 +3199,14 @@ impl App {
         );
     }
 
+    /// Flip the accounts table's WITHIN-GROUP order between account name and
+    /// the scheduler's next-pick order. The backend-group blocks never move;
+    /// session-local, like `t`/`u`.
+    fn toggle_account_sort(&mut self) {
+        self.account_sort = self.account_sort.toggle();
+        self.set_status(format!("accounts sorted by {}", self.account_sort.label()));
+    }
+
     /// Flip the quota-gauge fill direction between used% and remaining%
     /// (session-local override of config `quota_display`; the config default
     /// applies until the first press). Color bands stay keyed on USED
@@ -3220,6 +3242,9 @@ impl App {
             // where the gauges live full-width.
             KeyCode::Char('u') => self.toggle_quota_display(view),
             KeyCode::Char('t') => self.toggle_reset_display(),
+            // Same row-order toggle as MAIN — this overlay is the full-width
+            // accounts table, so the order matters most here.
+            KeyCode::Char('o') => self.toggle_account_sort(),
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). Rows render in selection order; the current account
             // (when one exists) is always row 0 — start the cursor there.
@@ -3278,7 +3303,7 @@ impl App {
     fn open_reset_confirm(&mut self, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(pos) = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -3298,7 +3323,7 @@ impl App {
     /// still holding for it (which `y` retries with the SAME id).
     fn set_reset_confirm_status(&mut self, idx: usize, view: &DashboardView) {
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3374,7 +3399,7 @@ impl App {
     /// (unresolved) key for this account is REUSED rather than replaced.
     fn submit_reset(&mut self, idx: usize, view: &DashboardView) {
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3704,7 +3729,7 @@ impl App {
     fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3770,7 +3795,7 @@ impl App {
     ) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3795,7 +3820,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3911,7 +3936,7 @@ impl App {
     fn refresh_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -4065,7 +4090,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -4389,7 +4414,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -6191,9 +6216,16 @@ mod tests {
         assert!(app.on_mouse(rclick, Some(&view)));
         assert_eq!(app.menu_account.as_deref(), Some("claude:a@x.com"));
 
-        // Reorder: `a` moves to display row 1. Running pause (item 1) must
-        // still act on `a`, not on whoever now sits at row 0.
-        view.snapshot.accounts.swap(0, 1);
+        // Reorder: in `next` order a state change still moves rows — `a` goes
+        // auth-broken and sinks below `b`, so display row 0 is now `b`.
+        // Running pause (item 1) must still act on `a`.
+        app.account_sort = triage::AccountSort::Next;
+        view.snapshot.accounts[0].healthy = false;
+        let order = view.display_order(app.account_sort, SystemTime::now());
+        assert_eq!(
+            view.snapshot.accounts[order[0]].id.0, "claude:b@x.com",
+            "the state change really reordered the table"
+        );
         app.on_key(press(KeyCode::Down), Some(&view));
         app.on_key(press(KeyCode::Enter), Some(&view));
         assert_eq!(
@@ -6251,6 +6283,39 @@ mod tests {
         assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
         app.on_key_sessions(KeyCode::Char('o'));
         assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
+    /// `o` toggles the accounts row order on MAIN *and* on the accounts
+    /// overlay (the one session toggle both surfaces share), names the new
+    /// mode in the status line, and starts on `name`.
+    #[test]
+    fn sort_key_toggles_mode() {
+        let view = control_view();
+        let mut app = remote_app();
+        assert_eq!(
+            app.account_sort,
+            triage::AccountSort::Name,
+            "name order is the default"
+        );
+        app.on_key_main(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Next);
+        assert!(
+            app.status_line()
+                .is_some_and(|s| s.contains("accounts sorted by next")),
+            "{:?}",
+            app.status_line()
+        );
+        app.on_key_main(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Name, "toggles back");
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("accounts sorted by name")));
+        // Same key, same state, from the accounts overlay.
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Next);
+        app.on_key_accounts(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Name);
     }
 
     #[test]
@@ -8019,7 +8084,7 @@ mod tests {
         let mut app = remote_app();
         app.overlay = Overlay::Accounts;
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -8120,7 +8185,7 @@ mod tests {
             fetched_at: now,
             source: WindowSource::UsagePoll,
         });
-        let order = view.display_order(now);
+        let order = view.display_order(Default::default(), now);
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -8142,7 +8207,7 @@ mod tests {
             crate::routing::BackendGroup::Codex,
             crate::scheduler::AccountId("codex:c@x.com".into()),
         );
-        let order = view.display_order(now);
+        let order = view.display_order(Default::default(), now);
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -8176,7 +8241,7 @@ mod tests {
         let Mode::ConfirmReset { idx } = app.mode else {
             panic!("expected the reset gate, got {:?}", app.mode);
         };
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         assert_eq!(
             view.snapshot.accounts[order[idx]].credential_kind, "codex",
             "the gate opens on an account that HAS resets"
@@ -8216,21 +8281,33 @@ mod tests {
     #[test]
     fn reset_confirm_follows_the_row_under_the_cursor_after_a_reorder() {
         let mut view = control_view();
+        // A SECOND codex account, so the codex block can actually reorder
+        // (the backend-group blocks themselves never move).
+        let mut spare = view.snapshot.accounts[1].clone();
+        spare.id = crate::scheduler::AccountId("codex:z@x.com".into());
+        view.snapshot.accounts.push(spare);
         let mut app = remote_app();
+        // `next` is the mode where a state change reorders rows.
+        app.account_sort = triage::AccountSort::Next;
         app.overlay = Overlay::Accounts;
         app.on_key_accounts(KeyCode::Char('R'), Some(&view));
         let Mode::ConfirmReset { idx } = app.mode else {
             panic!("expected the reset gate");
         };
-        // The roster reorders (the codex account moves to the other row).
-        view.snapshot.accounts.swap(0, 1);
+        // The roster reorders: the account the gate opened on goes
+        // auth-broken and sinks below its sibling, so row `idx` now holds a
+        // DIFFERENT account.
+        view.snapshot.accounts[1].healthy = false;
+        let order = view.display_order(app.account_sort, SystemTime::now());
+        assert_ne!(
+            view.snapshot.accounts[order[idx]].id.0, "codex:c@x.com",
+            "the state change really reordered the codex block"
+        );
         // Move the cursor onto the codex row and confirm.
-        let order = view.display_order(SystemTime::now());
         let codex_pos = order
             .iter()
-            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .position(|&i| view.snapshot.accounts[i].id.0 == "codex:c@x.com")
             .expect("codex row");
-        let _ = idx;
         app.on_key_confirm_reset(KeyCode::Char('y'), codex_pos, Some(&view));
         match app.pending_control.as_ref().expect("queued redemption") {
             ControlOp::Reset { account, .. } => assert_eq!(account, "codex:c@x.com"),
@@ -8238,6 +8315,7 @@ mod tests {
         }
         // Confirming on the CLAUDE row instead redeems nothing.
         let mut app = remote_app();
+        app.account_sort = triage::AccountSort::Next;
         let claude_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "oauth")
@@ -8255,7 +8333,7 @@ mod tests {
     #[test]
     fn redemption_reuses_the_held_request_id_on_retry() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -8314,7 +8392,7 @@ mod tests {
     #[test]
     fn a_busy_queue_creates_no_phantom_pending_redemption() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -8405,7 +8483,7 @@ mod tests {
     #[test]
     fn closing_the_dialog_keeps_the_pending_redemption() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
