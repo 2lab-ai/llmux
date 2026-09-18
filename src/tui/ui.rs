@@ -3480,14 +3480,25 @@ fn account_modal_lines(
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let now = ctx.now;
-    // The headers-only staleness fallback is decided PER GROUP by the selector
-    // (`headers_only_mode(.., Some(group), ..)`), while `ctx.headers_only` is
-    // the frame-wide, group-less flag. In a mixed pool (every claude account
-    // usage-stale, one codex account eligible) the global flag is false while
-    // the claude group's is true — so this modal asks the account's OWN group,
+    // BOTH degraded-mode flags are decided PER GROUP by the selector
+    // (`headers_only_mode`/`heuristic_degraded_mode` with `Some(group)`), while
+    // `ctx.headers_only` is the frame-wide, group-less flag. In a mixed pool
+    // (every claude account usage-stale or heuristic-parked, one codex account
+    // eligible) the global flags are false while the claude group's are true —
+    // so this modal asks the account's OWN group and gates exactly as
+    // `pick_scoped` does for a NonFable request (`gate_scoped` with both flags),
     // or it prints a blocked state the claude selector does not believe.
     let headers_only = select::headers_only_mode(snapshot, params, Some(account.group), now);
-    let gate = select::eligibility(account, params, now, headers_only);
+    let heuristic_degraded =
+        select::heuristic_degraded_mode(snapshot, params, Some(account.group), now);
+    let gate = select::gate_scoped(
+        account,
+        params,
+        now,
+        headers_only,
+        heuristic_degraded,
+        select::RequestScope::NonFable,
+    );
     let dash = "—".to_string();
     let abs = |at: SystemTime| format::absolute_label(at, now, ctx.tz_offset);
     // A future instant as "countdown (absolute)"; a past one says so rather
@@ -3551,6 +3562,15 @@ fn account_modal_lines(
         lines.push(modal_row(
             "blocked",
             select::blocking_reason(account, reason, params, now),
+        ));
+    }
+    if heuristic_degraded {
+        // Why a heuristic-parked account above still reads `ready`: the whole
+        // group is heuristic-locked, so the selector drops that cooldown gate.
+        // The `cooldown` section below still prints the park itself.
+        lines.push(modal_row(
+            "degraded",
+            "group heuristic lockout — cooldown gate dropped for this group".to_string(),
         ));
     }
     let groups_for =
@@ -12366,6 +12386,136 @@ mod tests {
         assert!(
             !flat.iter().any(|l| l.trim_start().starts_with("blocked")),
             "an eligible account has no `blocked` row:\n{body}"
+        );
+    }
+
+    /// The modal's gate also honors the GROUP-scoped heuristic-degraded mode,
+    /// exactly like `pick_scoped`. Every claude account is parked SOLELY by a
+    /// heuristic (retry-after-less 429) cooldown while a codex account is
+    /// eligible, so the pool-wide flag is false but the claude group's is true:
+    /// the claude selector serves the soonest-freed parked account, so the modal
+    /// must NOT claim that account is `blocked cooldown`. The park itself stays
+    /// visible in the `cooldown` section; the `degraded` row says why the gate
+    /// reads ready anyway.
+    #[test]
+    fn account_modal_gate_honors_heuristic_degraded_mode() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::select::Decision;
+        use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        let acct = |name: &str, kind: &'static str, group, park: Option<u64>| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: kind,
+            group,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: park.map(|secs| now + Duration::from_secs(secs)),
+            cooldown_source: park.map(|_| CooldownSource::Heuristic),
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        view.snapshot.accounts = vec![
+            acct(
+                "claude:a@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(600),
+            ),
+            // Frees soonest → the account the degraded selector picks.
+            acct(
+                "claude:b@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(120),
+            ),
+            // Eligible, so the POOL-wide flag never trips.
+            acct("codex:c@example.com", "codex", BackendGroup::Codex, None),
+        ];
+        assert!(
+            !select::heuristic_degraded_mode(&view.snapshot, &view.select_params, None, now),
+            "the eligible codex account keeps the POOL-wide flag false"
+        );
+        assert!(
+            select::heuristic_degraded_mode(
+                &view.snapshot,
+                &view.select_params,
+                Some(BackendGroup::Claude),
+                now
+            ),
+            "…while the all-heuristic-parked claude group IS in degraded mode"
+        );
+        let picked = select::pick_scoped(
+            &view.snapshot,
+            &view.select_params,
+            Some(BackendGroup::Claude),
+            now,
+            select::RequestScope::NonFable,
+        );
+        assert_eq!(
+            picked,
+            Decision::Switch {
+                to: AccountId("claude:b@example.com".into())
+            },
+            "the degraded selector serves the soonest-freed parked account"
+        );
+
+        let ctx = FrameCtx {
+            now,
+            tz_offset: 0,
+            order: vec![0, 1, 2],
+            headers_only: false,
+            frame: 0,
+            mask: false,
+            quota_display: view.quota_display,
+            reset_absolute: false,
+        };
+        let chrome = chrome_overlay(Overlay::None);
+        // Index 1 = the account the selector just picked.
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[1]);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let body = flat.join("\n");
+        let gate_row = flat
+            .iter()
+            .find(|l| l.trim_start().starts_with("gate"))
+            .unwrap_or_else(|| panic!("no gate row:\n{body}"));
+        // A cooldown-blocked gate row renders TIME-ONLY (`▌ 2m 00s`, the 120s
+        // park above), so the countdown's absence is the cooldown gate's
+        // absence.
+        assert!(
+            !gate_row.contains("2m"),
+            "group degraded mode ⇒ the picked account is not cooldown-blocked: {gate_row}"
+        );
+        assert!(
+            gate_row.contains("ready"),
+            "it reads as an eligible, non-current account: {gate_row}"
+        );
+        assert!(
+            !flat.iter().any(|l| l.trim_start().starts_with("blocked")),
+            "the account the selector picks has no `blocked` row:\n{body}"
+        );
+        assert!(
+            flat.iter().any(|l| l.trim_start().starts_with("degraded")),
+            "…and the `degraded` row explains why the gate reads ready:\n{body}"
+        );
+        assert!(
+            body.contains("heuristic"),
+            "the cooldown FACT stays visible in the cooldown section:\n{body}"
         );
     }
 
