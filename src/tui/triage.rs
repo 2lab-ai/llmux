@@ -221,7 +221,9 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
 // Accounts display order
 // ---------------------------------------------------------------------------
 
-/// Urgency tier of one account row: lower renders higher. in-flight is NOT a
+/// Urgency tier of one account row: lower = more urgent. It no longer drives
+/// render order (that is [`display_order`]'s group blocks + [`AccountSort`]);
+/// its only consumer is [`urgent`], the leading `!` marker. in-flight is NOT a
 /// key anywhere here (MUST-FIX 4 — row jitter would destroy position memory).
 fn tier(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> u8 {
     match gate {
@@ -557,8 +559,11 @@ mod tests {
     fn display_order_by_next_follows_group_selection_order() {
         // Within the Claude block: the group's current first even though its
         // name sorts last, then the eligible account, then the exhausted one.
+        // The current is only the head while the SELECTOR keeps it (the order
+        // is `pick`'s decision, not "current first"): at 5% it beats the cold
+        // ready account by less than SWITCH_MARGIN, so pick stays on it.
         let mut current = grouped("z-current", BackendGroup::Claude);
-        current.five_hour = Some(window(0.50));
+        current.five_hour = Some(window(0.05));
         let ready = grouped("a-ready", BackendGroup::Claude);
         let mut exhausted = grouped("m-exhausted", BackendGroup::Claude);
         exhausted.five_hour = Some(window(0.97));

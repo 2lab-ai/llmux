@@ -3480,7 +3480,14 @@ fn account_modal_lines(
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let now = ctx.now;
-    let gate = select::eligibility(account, params, now, ctx.headers_only);
+    // The headers-only staleness fallback is decided PER GROUP by the selector
+    // (`headers_only_mode(.., Some(group), ..)`), while `ctx.headers_only` is
+    // the frame-wide, group-less flag. In a mixed pool (every claude account
+    // usage-stale, one codex account eligible) the global flag is false while
+    // the claude group's is true — so this modal asks the account's OWN group,
+    // or it prints a blocked state the claude selector does not believe.
+    let headers_only = select::headers_only_mode(snapshot, params, Some(account.group), now);
+    let gate = select::eligibility(account, params, now, headers_only);
     let dash = "—".to_string();
     let abs = |at: SystemTime| format::absolute_label(at, now, ctx.tz_offset);
     // A future instant as "countdown (absolute)"; a past one says so rather
@@ -12254,6 +12261,111 @@ mod tests {
             hits.expect("layout").account_modal_max_scroll,
             None,
             "a vanished account yields the close signal"
+        );
+    }
+
+    /// The modal's gate is GROUP-scoped, exactly like the selector's. Mixed
+    /// pool: every claude account is usage-stale while a codex account is
+    /// eligible, so the POOL-wide `headers_only_mode` is false but the CLAUDE
+    /// group's is true — the claude selector serves its stale accounts through
+    /// the headers-only fallback, so the modal must read `ready`, not print a
+    /// `usage stale` block the selector does not believe.
+    #[test]
+    fn account_modal_gate_is_group_scoped() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        let acct =
+            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                id: AccountId(name.into()),
+                healthy: true,
+                credential_kind: kind,
+                group,
+                five_hour: five,
+                seven_day: None,
+                scoped_limits: Vec::new(),
+                scoped_cooldowns: Vec::new(),
+                cooldown_until: None,
+                cooldown_source: None,
+                in_flight: 0,
+                token_expires_at_ms: None,
+                last_refresh_ms: None,
+                paused: false,
+                limits: crate::config::AccountLimits::default(),
+            };
+        // Live window, but fetched way past `usage_max_age` (600s) → UsageStale.
+        let stale = QuotaWindow {
+            utilization: 0.10,
+            resets_at: now + Duration::from_secs(3_600),
+            fetched_at: now - Duration::from_secs(5_000),
+            source: WindowSource::UsagePoll,
+        };
+        view.snapshot.accounts = vec![
+            acct(
+                "claude:a@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(stale),
+            ),
+            // Codex is exempt from the staleness gate → eligible, so the
+            // pool-wide fallback never trips.
+            acct("codex:b@example.com", "codex", BackendGroup::Codex, None),
+        ];
+        assert!(
+            !select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
+            "the eligible codex account keeps the POOL-wide flag false"
+        );
+        assert!(
+            select::headers_only_mode(
+                &view.snapshot,
+                &view.select_params,
+                Some(BackendGroup::Claude),
+                now
+            ),
+            "…while the all-stale claude group IS in headers-only fallback"
+        );
+
+        let ctx = FrameCtx {
+            now,
+            tz_offset: 0,
+            order: vec![0, 1],
+            // The frame-wide flag the modal used to gate with.
+            headers_only: false,
+            frame: 0,
+            mask: false,
+            quota_display: view.quota_display,
+            reset_absolute: false,
+        };
+        let chrome = chrome_overlay(Overlay::None);
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[0]);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let body = flat.join("\n");
+        let gate_row = flat
+            .iter()
+            .find(|l| l.trim_start().starts_with("gate"))
+            .unwrap_or_else(|| panic!("no gate row:\n{body}"));
+        assert!(
+            !gate_row.contains("stale"),
+            "group-scoped fallback ⇒ the claude account is not stale-blocked: {gate_row}"
+        );
+        assert!(
+            gate_row.contains("ready"),
+            "it reads as an eligible, non-current account: {gate_row}"
+        );
+        assert!(
+            !flat.iter().any(|l| l.trim_start().starts_with("blocked")),
+            "an eligible account has no `blocked` row:\n{body}"
         );
     }
 

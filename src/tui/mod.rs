@@ -3341,8 +3341,9 @@ impl App {
             // accounts table, so the order matters most here.
             KeyCode::Char('o') => self.toggle_account_sort(),
             // Switch the active account (the `s` switcher, now scoped to this
-            // overlay). Rows render in selection order; the current account
-            // (when one exists) is always row 0 — start the cursor there.
+            // overlay). The cursor starts at row 0 — which is the first row of
+            // the first group block under EITHER sort (name order does not put
+            // the current account there), not necessarily the current account.
             KeyCode::Char('s') => {
                 let accounts = view.map_or(0, |v| v.snapshot.accounts.len());
                 if accounts == 0 {
