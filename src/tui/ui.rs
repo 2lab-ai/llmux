@@ -4592,9 +4592,12 @@ fn account_row<'a>(
     cells.push(seven_gauge);
     // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
     // same slot (after 7d) as the header/constraints reserve above, so the
-    // cells stay column-aligned. Absent-window → the same cold state 7d uses.
+    // cells stay column-aligned. Claude-only, like the 5h stub: a non-Claude
+    // row reads `-`, a Claude row with an absent window keeps the cold state
+    // 7d uses.
     if show_fable {
         cells.push(fable_gauge_cell(
+            account.group,
             account.fable_weekly(),
             now,
             max_age,
@@ -4997,11 +5000,17 @@ fn five_hour_cell(
 ///   normal utilization-based hue (also via `is_constraining`).
 ///   A trailing `!` flags the red state, mirroring the over-threshold marker on
 ///   the account windows.
-/// - Absent window (no Fable scope on this account): the same cold/stale/
-///   poll-degraded state the 7d gauge shows for an absent window, via
-///   [`classify_window_display`] — never a crash or blank.
+/// - Non-Claude group → a dim `-`, the same n/a semantics [`five_hour_text`]
+///   carries for the `5h` column (.prd/18 rule 1, extended by the owner
+///   2026-09-18: "7d fable도 코덱스 그록등 사용량 없는 열에 cold가 아니라 `-`로
+///   비워줘"). A Fable scope is a Claude-only concept, so `cold` on a Codex or
+///   Grok row was a lie about a gauge that will never populate.
+/// - Absent window on a CLAUDE row: the same cold/stale/poll-degraded state the
+///   7d gauge shows for an absent window, via [`classify_window_display`] —
+///   never a crash or blank.
 #[allow(clippy::too_many_arguments)]
 fn fable_gauge_cell(
+    group: crate::routing::BackendGroup,
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
     max_age: Duration,
@@ -5011,6 +5020,11 @@ fn fable_gauge_cell(
     fable_max: f64,
     bar_width: usize,
 ) -> Cell<'static> {
+    // Claude-only, decided before any classification: a non-Claude row has no
+    // Fable scope to ever populate, so it reads n/a rather than a cold gauge.
+    if group != crate::routing::BackendGroup::Claude {
+        return Cell::from(Span::styled("-", dim()));
+    }
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
@@ -12655,6 +12669,53 @@ mod tests {
             cell(claude),
             "○ cold",
             "a claude row with no 5h window still shows the cold state: \
+             {claude:?}\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 1 extended to the Fable column (owner 2026-09-18: "7d
+    /// fable도 코덱스 그록등 사용량 없는 열에 cold가 아니라 `-`로 비워줘"): the
+    /// `7d Fbl` cell is Claude-only. A CODEX row and a GROK row render a dim `-`
+    /// and carry no `cold` from the Fbl offset on; a CLAUDE row with no Fable
+    /// scope still reads the honest `○ cold`. The `cold` assertion is scoped to
+    /// the Fbl slice because the CLAUDE row legitimately shows `○ cold` under
+    /// `5h` (Z 2026-09-18).
+    #[test]
+    fn fable_gauge_cell_is_n_a_for_non_claude_groups() {
+        let mut view = five_hour_group_view();
+        // The helper turns the Fable column off for the 5h test; this test is
+        // about that column, so switch it on for this frame only.
+        view.show_fable_weekly = true;
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("7d Fbl"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        let fbl_at = header.find("7d Fbl").expect("7d Fbl column offset");
+        let cell = |row: &str| -> String { row.chars().skip(fbl_at).collect::<String>() };
+        for group in ["CODEX", "GROK"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(group))
+                .unwrap_or_else(|| panic!("{group} row:\n{frame}"));
+            let tail = cell(row);
+            assert!(
+                tail.trim_end().starts_with('-'),
+                "{group} Fbl cell is n/a: {tail:?}\n{frame}"
+            );
+            assert!(
+                !tail.contains("cold"),
+                "{group} row never claims a cold Fable window: {tail:?}\n{frame}"
+            );
+        }
+        let claude = rows
+            .iter()
+            .find(|r| r.contains("CLAUDE"))
+            .unwrap_or_else(|| panic!("claude row:\n{frame}"));
+        assert!(
+            cell(claude).starts_with("○ cold"),
+            "a claude row with no Fable scope still shows the cold state: \
              {claude:?}\n{frame}"
         );
     }
