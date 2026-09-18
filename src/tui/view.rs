@@ -15,6 +15,7 @@ use crate::scheduler::window::{LimitSeverity, QuotaWindow, ScopedQuotaWindow, Wi
 use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 
 use super::activity::{Completed, CompletedBody, InFlight, Totals};
+use super::triage::AccountSort;
 use super::{LastSwitch, PollHealth, TokenCounts};
 
 /// Everything one frame renders. Owned (no borrow into app state) so a
@@ -486,13 +487,13 @@ impl DashboardView {
     }
 
     /// Display order of the accounts table: indices into `snapshot.accounts`
-    /// in INTERVENTION order (glance-triage atom 2) — exhausted, then
-    /// auth-broken, then known usage descending, then ready, then paused,
-    /// then cold/unknown; stable (config index) within a tier. The same list
-    /// drives the render AND every row cursor (switch/remove/limits), so a
-    /// click can never mis-target.
-    pub(crate) fn display_order(&self, now: SystemTime) -> Vec<usize> {
-        super::triage::intervention_order(&self.snapshot, &self.select_params, now)
+    /// in backend-group blocks (Claude, Codex, Grok, OpenRouter) — the primary
+    /// key in both modes — ordered within a block by `sort`: account name
+    /// (default) or the scheduler's own next-pick order. The same list drives
+    /// the render AND every row cursor (switch/remove/limits), so a click can
+    /// never mis-target.
+    pub(crate) fn display_order(&self, sort: AccountSort, now: SystemTime) -> Vec<usize> {
+        super::triage::display_order(&self.snapshot, &self.select_params, sort, now)
     }
 
     pub(crate) fn totals_for(&self, account: &str) -> Totals {
@@ -878,7 +879,7 @@ mod tests {
             crate::scheduler::select::eligibility(b, &view.select_params, now(), false),
             Some(crate::scheduler::select::IneligibleReason::CoolingDown)
         );
-        assert_eq!(view.display_order(now()), vec![0, 1]);
+        assert_eq!(view.display_order(Default::default(), now()), vec![0, 1]);
 
         assert_eq!(view.totals_for("a").ok, 2);
         assert_eq!(view.global_totals.errors, 1);
