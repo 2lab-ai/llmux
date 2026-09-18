@@ -1,6 +1,6 @@
 # Accounts table: Fbl n/a, sort modes, detail modal — SSOT
 
-Status: in-progress
+Status: shipped (preview-2026-09-18-0609-850db8b80519)
 Date: 2026-09-18
 
 ## User instruction (verbatim, 2026-09-18)

@@ -1,6 +1,6 @@
 # 19 — Accounts table: Fbl is Claude-only, group + name/next sort, click-to-open account detail
 
-Status: in-progress
+Status: shipped (PR #166 → main 850db8b → preview-2026-09-18-0609-850db8b80519; this describes the implemented contract, not a future target)
 Date: 2026-09-18
 Owner: Z (icedac@gmail.com)
 SSOT: `.prd/tui-accounts-sort-detail/ssot.md` · loop: `.prd/tui-accounts-sort-detail/loop.md`
