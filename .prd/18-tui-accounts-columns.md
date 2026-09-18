@@ -1,6 +1,6 @@
 # 18 — Accounts table: 5h is a Claude-only stub, Fbl never gives way, status shrinks first
 
-Status: in progress
+Status: shipped — v0.2.23 (PR #164 fcd78ce; stable v0.2.23 + preview-2026-09-18-0311-7ef84b1c5d56)
 Date: 2026-09-18
 Owner: Z (icedac@gmail.com)
 SSOT: `.prd/tui-accounts-columns/ssot.md` · loop: `.prd/tui-accounts-columns/loop.md`

@@ -1,6 +1,6 @@
 # Accounts table columns — loop
 
-Status: in progress
+Status: shipped — v0.2.23 (PR #164 fcd78ce; stable v0.2.23 + preview-2026-09-18-0311-7ef84b1c5d56)
 Date: 2026-09-18
 
 ## Build facts (measured 2026-09-18)
@@ -26,17 +26,17 @@ Review (trinity, 3 engines): R1 grok APPROVE / astra REJECT (after 5h drops, 80 
 | 5h column fixed 8 wide | GREEN (live 2026-09-18) | header `5h`→`7d` offset 9 at 200 and 100 cols; `five_hour_cell_fits_eight_cells` enumerates every state (widest `◑ 100%!` = 7) |
 | Fbl never gives way; 5h drops last | GREEN (live 2026-09-18) | 80 cols: `7d Fbl` full gauge with percent, `5h` header absent; 100 cols: both present |
 | status shrinks first, floor 8 | GREEN (live 2026-09-18) | 100 cols: status 16 (`▒ 7d 100.0% > 99`); 80 cols: status 8 (`▒ 7d 100`), name 13; 74 cols: name 7, no shaving |
-| stable release v0.2.23 deployed (tap + local brew + daemon) | pending | |
-| preview rebuilt from the v0.2.23 commit and deployed | pending | |
+| stable release v0.2.23 deployed (tap + local brew + daemon) | GREEN 2026-09-18 | see ship table |
+| preview rebuilt from the v0.2.23 commit and deployed | GREEN 2026-09-18 | see ship table |
 
 ## Ship table
 
 | Step | Evidence |
 | --- | --- |
-| PR merged | |
-| `chore: release v0.2.23` on main | |
-| tag `v0.2.23` → Release run | |
-| tap stable formula + cask | |
-| `brew upgrade llmux` → `--version` | |
-| preview dispatch on `v0.2.23` → prerelease + tap bump | |
-| `brew upgrade llmux-preview` → daemon restart → `llmux status` | |
+| PR merged | #164 squash `fcd78ce` (CI 5/5) |
+| `chore: release v0.2.23` on main | `7ef84b1` (Cargo.toml + 4 lockfiles) |
+| tag `v0.2.23` → Release run | run 35301727976 success; assets llmux-{macos,linux}-{aarch64,x86_64}, LlmuxIslands-0.2.23.zip, SHA256SUMS |
+| tap stable formula + cask | tap `73f606a` (rendered locally from the release assets; the tap cron is 6h) |
+| `brew upgrade llmux` → `--version` | `llmux 0.2.23 (stable v0.2.23-7ef84b1c5d56)` |
+| preview of the release commit → prerelease + tap bump | main push run 35301730563 success → `preview-2026-09-18-0311-7ef84b1c5d56` (published 03:21:52Z, after the stable release 03:14:21Z); tap `fc53765` |
+| `brew upgrade llmux-preview` → daemon restart → `llmux status` | 2026.09.17.0944 → 2026.09.18.0311, relinked as the daily driver; `llmux restart` one-shot → ready 6s, server `0.2.23 (preview 2026-09-18-0311-7ef84b1c5d56)` pid 31635; deployed TUI capture 200/100 cols: CODEX/GROK 5h `-`, 5h 8 wide, Fbl full gauge |

@@ -1,6 +1,6 @@
 # Accounts table columns — SSOT
 
-Status: in progress
+Status: shipped — v0.2.23 (PR #164 fcd78ce; stable v0.2.23 + preview-2026-09-18-0311-7ef84b1c5d56)
 Date: 2026-09-18
 
 ## User instruction (verbatim, 2026-09-18)
