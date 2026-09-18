@@ -60,10 +60,29 @@ const WIDE_TABLE_AT: u16 = 150;
 /// leftover-space allocation made it too wide). Longer names are clipped by the
 /// cell.
 const NAME_COL_MAX: u16 = 20;
+/// Floor of the accounts-table name column (.prd/18): the header word
+/// `account`. The name column is the LAST column to give way — after `status`
+/// has shrunk to [`STATUS_COL_MIN`] and the `5h` stub has dropped — because a
+/// clipped name still identifies the row (the full id is in the detail pane),
+/// while a table ratatui shaves column-by-column reads `gr`/`CO`.
+const NAME_COL_MIN: u16 = 7;
 /// Width of the reset-inventory column (.prd/16): 3 columns hold the header
 /// (`rst`) and every realistic cell — `?`, `—`, `3`, `3*`, `12` — so the
 /// column survives the narrow layout, where the width budget is tight.
 const RESET_COL_WIDTH: u16 = 3;
+/// Width of the `5h` column (.prd/18): a fixed 8-cell stub, never a stretchy
+/// gauge. The 5h limit is a Claude-only concept and carries the least
+/// scheduling signal, so it gets the minimum that holds every cell state —
+/// the widest is `◑ 100%!` (7) — and one cell of slack. Non-Claude rows render
+/// a dim `-` here.
+const FIVE_H_COL_WIDTH: u16 = 8;
+/// The `status` column is the width sponge (.prd/18 rule 4): it renders at
+/// [`STATUS_COL_MAX`] whenever the row fits, and absorbs the whole deficit
+/// down to [`STATUS_COL_MIN`] before any other column gives way. Below that
+/// floor the reason text ("cooldown 3m12s") stops being readable at all, so
+/// the `5h` column drops instead.
+const STATUS_COL_MAX: usize = 20;
+const STATUS_COL_MIN: usize = 8;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
 /// Default rows shown in the always-visible compact model strip (req12; Z
@@ -4241,25 +4260,22 @@ fn draw_accounts(
         frame.render_widget(empty, area);
         return Vec::new();
     }
-    let mut show_fable = view.show_fable_weekly;
+    let show_fable = view.show_fable_weekly;
     // Reset-inventory column (.prd/16): shown only when the daemon reports
     // usage-control metadata at all, so an older daemon's table is
     // byte-identical to before. Compact by design — `3`, `3*`, `?`, `—` all fit
     // in 3 cells, so the column survives the narrow layout where a gauge
     // would not.
     let show_resets = !view.usage_controls.is_empty();
-    let reset_extra = if show_resets {
-        RESET_COL_WIDTH as usize + 1
-    } else {
-        0
-    };
     // The account column is a fixed `Length(name_width)` that fits the widest
     // display name up to NAME_COL_MAX (floor = the header word "account").
     // Because it is Length, not Min, leftover width after the fixed data
     // columns is NO LONGER poured into it (Z 2026-07-13: supersedes the
     // 2026-07-09 "남는 공간을 account에 최대 할당" directive — that made the
     // column too wide). Names longer than the cap are clipped by the cell.
-    let name_width = (ctx
+    // This is the width the CONTENT wants; a tight terminal shaves it down to
+    // NAME_COL_MIN as the last give-way step below.
+    let name_wanted = (ctx
         .order
         .iter()
         .map(|&idx| {
@@ -4271,87 +4287,85 @@ fn draw_accounts(
         .unwrap_or(0)
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
-    // The wide column set is used whenever it actually FITS (Z 2026-07-13:
-    // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
-    // hid req/tok and poured the width into fat bars instead). Minimum wide
-    // width = the wide fixed columns + minimum-size gauges + column spacing,
-    // mirroring the bar_width math below. WIDE_TABLE_AT now governs only the
-    // models table.
-    let wide = {
-        let n_gauges = 2 + show_fable as usize;
-        let min_wide = 47
-            + name_width as usize
+    // Minimum width of the whole row (.prd/18): every column at its floor —
+    // the stretchy gauges at QUOTA_CELL_WIDTH, the `5h` stub at
+    // FIVE_H_COL_WIDTH, `status` and `account` at whatever width is being
+    // tried — plus the one-column gap between each pair of columns. Single
+    // source for the four decisions below (wide set / 5h drop / name width /
+    // status width) and for the leftover poured into the bars, so those can
+    // never disagree about a column sum.
+    //
+    // Column sums (load-bearing, pinned by the tests):
+    //   wide   = marker 2 + group 7 + # 2 + status + account + 5h + gauges +
+    //            rst + if 3 + req 6 + tok 7  → 27 fixed, 8 non-gauge columns
+    //   narrow = the same minus req/tok      → 14 fixed, 6 non-gauge columns
+    // `n_gauges` is the count of STRETCHY gauge columns: `7d`, plus `7d Fbl`
+    // when the toggle is on. The Fbl gauge is a full gauge in BOTH sets and
+    // never gives way (.prd/18 rule 3 — the old compact `F 22h!` marker and
+    // its narrow drop are gone).
+    let n_gauges = 1 + show_fable as usize;
+    let row_min = |wide: bool, status_w: usize, with_five_h: bool, name_w: usize| -> usize {
+        let (fixed, base_cols) = if wide { (27, 8) } else { (14, 6) };
+        let width = fixed
+            + status_w
+            + name_w
             + n_gauges * QUOTA_CELL_WIDTH
-            + (8 + n_gauges - 1)
-            + reset_extra;
-        area.width as usize >= min_wide
-    };
-    // Narrow + reset column: if the row STILL does not fit, the compact Fbl
-    // marker is the one column that gives way. Without this the table overflows
-    // and ratatui shaves every column instead — the 100-col frame rendered
-    // `gr`/`CO` for group and squeezed the status/gauges (runtime QA). Priority
-    // at a tight width is identity first (group + account), then the quota
-    // gauges, then `rst`; the Fable percent is one keystroke away in the detail
-    // pane and returns as soon as the terminal is wide enough.
-    if !wide && show_fable {
-        // The same sum the narrow branch of `bar_width` builds below, with the
-        // Fbl column included: 34 fixed + name + the two gauge cells + Fbl 7 +
-        // `rst`, plus one space between each pair of columns.
-        let ncols = 9 + show_resets as usize;
-        let fixed = 34
-            + name_width as usize
-            + 2 * QUOTA_CELL_WIDTH
-            + 7
+            + if with_five_h {
+                FIVE_H_COL_WIDTH as usize
+            } else {
+                0
+            }
             + if show_resets {
                 RESET_COL_WIDTH as usize
             } else {
                 0
             };
-        show_fable = fixed + (ncols - 1) <= area.width as usize;
-    }
-    // Leftover terminal width — everything past the FIXED columns and the 1-col
-    // inter-column spacing — is poured into the quota gauge BARS instead of
-    // dying as dead space on the right (Z 2026-07-13, follow-up to the
-    // NAME_COL_MAX cap: every column is a fixed `Length` now, so without this
-    // the table packs left and wastes the right edge). Each STRETCHY gauge
-    // column grows its bar by an equal share of the leftover; the compact
-    // narrow Fbl marker never stretches. Floor = QUOTA_BAR_WIDTH (leftover 0 →
+        let ncols = base_cols + n_gauges + with_five_h as usize + show_resets as usize;
+        width + (ncols - 1)
+    };
+    let avail = area.width as usize;
+    // The wide column set is used whenever it actually FITS (Z 2026-07-13:
+    // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
+    // hid req/tok and poured the width into fat bars instead). "Fits" is judged
+    // at the same minimums the constraints use — status at its floor, the 5h
+    // stub present, the name at the width its content wants — so the set flips
+    // only when req/tok genuinely have no room, and the wide set never buys
+    // itself room by clipping names. WIDE_TABLE_AT now governs only the models
+    // table.
+    let wide = row_min(true, STATUS_COL_MIN, true, name_wanted as usize) <= avail;
+    // Give-way order (.prd/18 rule 4, owner 2026-09-18 "status 창부터 줄여줘
+    // (최소칸 8칸)"), each step taken only when the one before it was not
+    // enough:
+    //   1. `status` shrinks 20 → 8,
+    //   2. the `5h` stub drops whole (header, constraint and cell together),
+    //   3. the `account` column shrinks to NAME_COL_MIN (names clip; the full
+    //      id stays in the detail pane),
+    //   4. below that the table clips as it always did — ratatui shaves the
+    //      columns. Narrow minimum with Fbl + `rst` on = 74 cols (14 + 8 + 7 +
+    //      2×17 + 3 + 8 spaces), 70 without `rst`.
+    // The gauges never give way: `7d` and `7d Fbl` keep QUOTA_CELL_WIDTH at
+    // every width.
+    let show_five_h = row_min(wide, STATUS_COL_MIN, true, name_wanted as usize) <= avail;
+    let name_width = (avail.saturating_sub(row_min(wide, STATUS_COL_MIN, show_five_h, 0)) as u16)
+        .clamp(NAME_COL_MIN, name_wanted);
+    let status_width = avail
+        .saturating_sub(row_min(wide, 0, show_five_h, name_width as usize))
+        .clamp(STATUS_COL_MIN, STATUS_COL_MAX) as u16;
+    // Leftover terminal width — everything past the FIXED columns, the gauge
+    // minimums and the 1-col inter-column spacing — is poured into the quota
+    // gauge BARS instead of dying as dead space on the right (Z 2026-07-13,
+    // follow-up to the NAME_COL_MAX cap: every column is a fixed `Length` now,
+    // so without this the table packs left and wastes the right edge). Each
+    // stretchy gauge column grows its bar by an equal share; the fixed `5h`
+    // stub and `rst` never stretch. Floor = QUOTA_BAR_WIDTH (leftover 0 →
     // today's exact layout), ceiling = GAUGE_BAR_MAX.
     let bar_width = {
-        // `fixed_total` sums the constraint Lengths exactly as built below
-        // (name + the base QUOTA_CELL_WIDTH gauge cells + the conditional
-        // compact-7 Fbl marker) plus the (ncols - 1) inter-column spaces; the
-        // `n_gauges` stretchy gauge columns share whatever width is left.
-        let n_gauges = if wide { 2 + show_fable as usize } else { 2 };
-        let (fixed_total, ncols) = if wide {
-            // marker 2 + group 7 + # 2 + status 20 + if 3 + req 6 + tok 7 = 47,
-            // plus the compact reset column when shown (it does NOT stretch).
-            let ncols = 8 + n_gauges + show_resets as usize;
-            let fixed = 47
-                + name_width as usize
-                + n_gauges * QUOTA_CELL_WIDTH
-                + if show_resets {
-                    RESET_COL_WIDTH as usize
-                } else {
-                    0
-                };
-            (fixed, ncols)
-        } else {
-            // marker 2 + group 7 + # 2 + status 20 + if 3 = 34, + the compact
-            // 7-wide Fbl marker when shown (it does NOT stretch), + `rst`.
-            let ncols = 8 + show_fable as usize + show_resets as usize;
-            let fixed = 34
-                + name_width as usize
-                + 2 * QUOTA_CELL_WIDTH
-                + if show_fable { 7 } else { 0 }
-                + if show_resets {
-                    RESET_COL_WIDTH as usize
-                } else {
-                    0
-                };
-            (fixed, ncols)
-        };
-        let leftover = (area.width as usize).saturating_sub(fixed_total + (ncols - 1));
+        let leftover = avail.saturating_sub(row_min(
+            wide,
+            status_width as usize,
+            show_five_h,
+            name_width as usize,
+        ));
         (QUOTA_BAR_WIDTH + leftover / n_gauges).min(GAUGE_BAR_MAX)
     };
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
@@ -4373,7 +4387,17 @@ fn draw_accounts(
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
         let cursor = selected == Some(pos);
-        let row = account_row(account, view, ctx, pos, wide, cursor, bar_width, show_fable);
+        let row = account_row(
+            account,
+            view,
+            ctx,
+            pos,
+            wide,
+            cursor,
+            bar_width,
+            show_fable,
+            show_five_h,
+        );
         if cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
         } else {
@@ -4383,7 +4407,7 @@ fn draw_accounts(
 
     // "group" (claude/codex — the model group, colored + prominent) leads the
     // data columns. Issue #70: the default row is the COMPRESSED set — group,
-    // #, account, status, the three gauges, if (+ lifetime req/tok in wide).
+    // #, account, status, the 5h stub, the gauges, if (+ req/tok in wide).
     // The `auth` type, the per-window reset times, and the token expiry/refresh
     // cluster moved to the selected-account detail pane (`draw_detail`, on MAIN
     // beside the summary and full-width in the Accounts overlay) — relocated,
@@ -4391,19 +4415,24 @@ fn draw_accounts(
     //
     // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge, and
     // ONLY when `show_fable_weekly` is on — off renders the table with no
-    // column, no width taken. Wide gets a full gauge column; narrow gets a
-    // compact marker column (the width budget is tight there).
-    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
-        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
+    // column, no width taken. It is a FULL gauge column in both sets (.prd/18
+    // rule 3). The `5h` stub (.prd/18 rules 1–2) is a fixed 8-wide column that
+    // never stretches and is the first column to drop when the row overflows.
+    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = {
+        let mut header = vec!["", "group", "#", "account", "status"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
             Constraint::Length(name_width),
-            Constraint::Length(20),
-            Constraint::Length(gauge_cell),
-            Constraint::Length(gauge_cell),
+            Constraint::Length(status_width),
         ];
+        if show_five_h {
+            header.push("5h");
+            constraints.push(Constraint::Length(FIVE_H_COL_WIDTH));
+        }
+        header.push("7d");
+        constraints.push(Constraint::Length(gauge_cell));
         if show_fable {
             header.push("7d Fbl");
             constraints.push(Constraint::Length(gauge_cell));
@@ -4412,35 +4441,12 @@ fn draw_accounts(
             header.push("rst");
             constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
-        header.extend(["if", "req", "tok"]);
-        constraints.extend([
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Length(7),
-        ]);
-        (header, constraints)
-    } else {
-        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
-        let mut constraints = vec![
-            Constraint::Length(2),
-            Constraint::Length(7),
-            Constraint::Length(2),
-            Constraint::Length(name_width),
-            Constraint::Length(20),
-            Constraint::Length(gauge_cell),
-            Constraint::Length(gauge_cell),
-        ];
-        if show_fable {
-            header.push("7d Fbl");
-            // Compact marker column ("F 100%!" fits in 7): no bar, no stretch.
-            constraints.push(Constraint::Length(7));
+        header.push("if");
+        constraints.push(Constraint::Length(3));
+        if wide {
+            header.extend(["req", "tok"]);
+            constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
         }
-        if show_resets {
-            header.push("rst");
-            constraints.push(Constraint::Length(RESET_COL_WIDTH));
-        }
-        header.extend(["if"]);
-        constraints.extend([Constraint::Length(3)]);
         (header, constraints)
     };
 
@@ -4476,10 +4482,13 @@ fn account_row<'a>(
     wide: bool,
     cursor: bool,
     bar_width: usize,
-    // The EFFECTIVE Fable-column flag from `draw_accounts` (the config toggle,
-    // minus the narrow-width drop) — reading `view.show_fable_weekly` here
-    // would push a cell into a column the header/constraints did not reserve.
+    // The Fable-column toggle, and the EFFECTIVE `5h` flag from
+    // [`draw_accounts`] (the column drops whole at a width where even a
+    // floor-width status cannot make the row fit) — reading the view/config
+    // here would push a cell into a column the header/constraints did not
+    // reserve.
     show_fable: bool,
+    show_five_h: bool,
 ) -> Row<'a> {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -4539,17 +4548,6 @@ fn account_row<'a>(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let five_gauge = window_gauge_cell(
-        &account.five_hour,
-        params.five_hour_max,
-        parked,
-        now,
-        max_age,
-        consecutive_failures,
-        ctx.quota_display,
-        ctx.reset_absolute,
-        bar_width,
-    );
     let seven_gauge = window_gauge_cell(
         &account.seven_day,
         params.seven_day_max,
@@ -4576,15 +4574,29 @@ fn account_row<'a>(
     cells.push(Cell::from(status_span(
         account, gate, is_current, params, now, ctx.frame,
     )));
-    cells.extend([five_gauge, seven_gauge]);
+    // The `5h` stub (.prd/18): Claude-only, fixed 8 cells, dropped whole at a
+    // width where the row cannot hold it — the header/constraints make the same
+    // call above, so the cells stay column-aligned.
+    if show_five_h {
+        cells.push(five_hour_cell(
+            account.group,
+            &account.five_hour,
+            params.five_hour_max,
+            parked,
+            now,
+            max_age,
+            consecutive_failures,
+            ctx.quota_display,
+        ));
+    }
+    cells.push(seven_gauge);
     // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
     // same slot (after 7d) as the header/constraints reserve above, so the
-    // cells stay column-aligned. Absent-window → the same cold state 5h/7d use.
+    // cells stay column-aligned. Absent-window → the same cold state 7d uses.
     if show_fable {
         cells.push(fable_gauge_cell(
             account.fable_weekly(),
             now,
-            wide,
             max_age,
             consecutive_failures,
             ctx.quota_display,
@@ -4884,15 +4896,94 @@ fn window_gauge_cell(
     ))
 }
 
+/// The `5h` cell (.prd/18, owner 2026-09-18): a Claude-only compact stub that
+/// always fits [`FIVE_H_COL_WIDTH`], returned as `(text, style)` so the width
+/// contract is unit-testable without a terminal.
+///
+/// - Non-Claude group → a dim `-`: Codex has no 5h window source at all and the
+///   owner's rule is that the 5h limit is a Claude-only concept, so `cold` on
+///   a Codex row was a lie about a gauge that will never populate, and on a
+///   Grok row it is a burst window the owner does not want in this table
+///   (still recorded and shown in the detail pane — `.prd/18` §Tension).
+/// - Claude with no window → `{glyph} cold`, the same never-seen signal the 7d
+///   gauge carries. The `poll-degraded` LABEL does not fit 8 cells, so with an
+///   absent window the glyph alone carries the poller state and the word stays
+///   the honest `cold` (no live window has ever been seen).
+/// - Claude with a window → the percent of the FILL fraction (same
+///   `quota_display` direction as the 7d gauge), a trailing `!` when parked or
+///   past the threshold, and the display glyph prefixed when the value is not
+///   fresh: `68%`, `68%!`, `◑ 68%`, `! 68%!`. No bar, no countdown — the
+///   countdown lives in the detail pane; the widest state is `◑ 100%!` (7).
+#[allow(clippy::too_many_arguments)]
+fn five_hour_text(
+    group: crate::routing::BackendGroup,
+    window: &Option<QuotaWindow>,
+    threshold: f64,
+    parked: bool,
+    now: SystemTime,
+    max_age: Duration,
+    consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
+) -> (String, Style) {
+    if group != crate::routing::BackendGroup::Claude {
+        return ("-".to_string(), dim());
+    }
+    let display = classify_window_display(window, now, max_age, consecutive_failures);
+    let Some(window) = window else {
+        return (format!("{} cold", display.glyph()), dim());
+    };
+    let utilization = window.effective_utilization(now);
+    let color = level_color(format::gauge_level(utilization));
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => utilization,
+        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
+    };
+    let mut text = format::percent(fill);
+    if parked || utilization > threshold {
+        text.push('!');
+    }
+    if !matches!(display, WindowDisplayState::Populated) {
+        text.insert_str(0, &format!("{} ", display.glyph()));
+    }
+    (text, Style::new().fg(color))
+}
+
+/// [`five_hour_text`] as a table cell.
+#[allow(clippy::too_many_arguments)]
+fn five_hour_cell(
+    group: crate::routing::BackendGroup,
+    window: &Option<QuotaWindow>,
+    threshold: f64,
+    parked: bool,
+    now: SystemTime,
+    max_age: Duration,
+    consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
+) -> Cell<'static> {
+    let (text, style) = five_hour_text(
+        group,
+        window,
+        threshold,
+        parked,
+        now,
+        max_age,
+        consecutive_failures,
+        mode,
+    );
+    Cell::from(Span::styled(text, style))
+}
+
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
 /// following the same pattern as [`window_cells`] but as a single cell (no
 /// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
 /// critical coloring:
 ///
-/// - Present window: the same in-bar countdown gauge as 5h/7d
-///   ([`quota_bar_line`]) in wide mode, a compact `F 7d!` countdown marker in
-///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
-///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
+/// - Present window: the same in-bar countdown gauge as the 7d window
+///   ([`quota_bar_line`]) at EVERY width (.prd/18 rule 3 — the compact narrow
+///   `F 22h!` marker is gone; the Fbl gauge never gives way, the `status` and
+///   `5h` columns absorb a tight width instead). Colored by fill level through
+///   the SAME [`format::gauge_level`] / [`level_color`] palette, EXCEPT the
+///   scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
 ///   limit is engaged upstream even if the number looks calm). "Constraining"
 ///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
@@ -4907,13 +4998,12 @@ fn window_gauge_cell(
 ///   A trailing `!` flags the red state, mirroring the over-threshold marker on
 ///   the account windows.
 /// - Absent window (no Fable scope on this account): the same cold/stale/
-///   poll-degraded state 5h/7d show for an absent window, via
+///   poll-degraded state the 7d gauge shows for an absent window, via
 ///   [`classify_window_display`] — never a crash or blank.
 #[allow(clippy::too_many_arguments)]
 fn fable_gauge_cell(
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
-    wide: bool,
     max_age: Duration,
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
@@ -4925,16 +5015,12 @@ fn fable_gauge_cell(
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
         // Cold / absent: mirror the `window_cells` absent branch — the glyph +
-        // label in wide mode, a compact `F ○`-style marker in narrow mode — so
-        // a never-seen Fable window reads distinctly from an honest 0%.
-        return if wide {
-            Cell::from(Span::styled(
-                format!("{} {}", display.glyph(), display.label()),
-                dim(),
-            ))
-        } else {
-            Cell::from(Span::styled(format!("F {}", display.glyph()), dim()))
-        };
+        // label — so a never-seen Fable window reads distinctly from an honest
+        // 0%.
+        return Cell::from(Span::styled(
+            format!("{} {}", display.glyph(), display.label()),
+            dim(),
+        ));
     };
     let utilization = scoped.window.effective_utilization(now);
     // Scope signal wins: a *constraining* Fable limit is red no matter the
@@ -4953,38 +5039,16 @@ fn fable_gauge_cell(
     // `!` on the red-critical read, same signal window_cells carries with its
     // over-threshold `!`.
     let over = matches!(level, GaugeLevel::Red);
-    if wide {
-        // Same in-bar countdown gauge as the 5h/7d cells; the critical
-        // override only changes the color/`!`, never the fill math.
-        let fill = match mode {
-            crate::config::QuotaDisplay::Used => utilization,
-            crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-        };
-        let (text, bold_chars, marker) =
-            quota_bar_text(&scoped.window, now, display, reset_absolute);
-        Cell::from(quota_cell_line(
-            fill, color, &text, bold_chars, over, bar_width, marker,
-        ))
-    } else {
-        // Compact narrow marker: `F` + the top countdown unit + critical `!`
-        // (`F 7d!`), colored. No bar — the narrow width budget has no room for
-        // one. An expired window (no live reset) falls back to the mode-flipped
-        // percent so the marker never reads as a live countdown to a past
-        // reset (just-reset in `remaining` mode = `F 100%`, full quota back).
-        let label = match scoped.window.resets_at.duration_since(now) {
-            Ok(rem) if !rem.is_zero() => format::countdown_units(rem).0,
-            _ => match mode {
-                crate::config::QuotaDisplay::Used => format::percent(utilization),
-                crate::config::QuotaDisplay::Remaining => format::percent(1.0 - utilization),
-            },
-        };
-        let text = if over {
-            format!("F {label}!")
-        } else {
-            format!("F {label}")
-        };
-        Cell::from(Span::styled(text, Style::new().fg(color)))
-    }
+    // Same in-bar countdown gauge as the 7d cell, at every width; the critical
+    // override only changes the color/`!`, never the fill math.
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => utilization,
+        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
+    };
+    let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+    Cell::from(quota_cell_line(
+        fill, color, &text, bold_chars, over, bar_width, marker,
+    ))
 }
 
 /// Reset text for the detail pane: compact countdown plus the absolute local
@@ -8793,12 +8857,24 @@ mod tests {
     /// Runtime QA (100 cols, `show_fable_weekly` ON): the row used to overflow,
     /// and ratatui shaved EVERY column to fit — the group header read `gr` and
     /// the cell `CO`. At a width that cannot hold everything, identity
-    /// (group + account) and the reset count must survive; the compact Fbl
-    /// marker is what gives way, and it returns at a wider terminal.
+    /// (group + account) and the reset count must survive.
+    ///
+    /// Z 2026-09-18 (.prd/18 rules 3–4, owner: "7d-fable이 아니라 5h를 줄여줘",
+    /// "status 창부터 줄여줘"): this replaces
+    /// `narrow_100_keeps_group_and_reset_readable_by_dropping_the_fable_marker`.
+    /// The give-way order is now status (20 → 8) and then the `5h` column; the
+    /// `7d Fbl` gauge never gives way. With this view (name 14, `rst` on, Fbl
+    /// on) the narrow row minimum is `82 + status`, so 100 cols keep every
+    /// column with status at 18, while 88 cols cannot hold `5h` even with
+    /// status at its 8-col floor — there the stub drops and status settles at
+    /// 15.
     #[test]
-    fn narrow_100_keeps_group_and_reset_readable_by_dropping_the_fable_marker() {
+    fn narrow_100_keeps_fable_gauge_and_drops_five_hour_last() {
         let mut view = usage_control_view();
         view.show_fable_weekly = true;
+
+        // 100 cols: status shrinks (20 → 18) and that alone buys the row — every
+        // column, `5h` included, survives.
         let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 100, 24);
         let frame = rows.join("\n");
         let header = rows
@@ -8811,9 +8887,15 @@ mod tests {
         );
         assert!(header.contains("rst"), "{header:?}\n{frame}");
         assert!(
-            !header.contains("Fbl"),
-            "the Fbl marker gives way at 100 cols: {header:?}\n{frame}"
+            header.contains("7d Fbl"),
+            "the Fbl gauge never gives way: {header:?}\n{frame}"
         );
+        assert!(
+            header.contains("5h"),
+            "status alone absorbs the deficit at 100 cols: {header:?}\n{frame}"
+        );
+        let status_w = header.find("5h").unwrap() - header.find("status").unwrap() - 1;
+        assert_eq!(status_w, 18, "status shrank 20 → 18: {header:?}\n{frame}");
         let codex_row = rows
             .iter()
             .find(|r| r.contains("CODEX"))
@@ -8824,9 +8906,31 @@ mod tests {
             "the other group cell is intact too:\n{frame}"
         );
 
-        // Wide enough → the Fable marker is back, with `rst` still present.
+        // 88 cols: status at its floor still overflows → the `5h` stub is the
+        // column that drops. `7d Fbl`, `rst` and the identity columns stay.
+        let tight = render_rows(&view, &chrome_overlay(Overlay::Accounts), 88, 24);
+        let tight_frame = tight.join("\n");
+        let tight_header = tight
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .unwrap_or_else(|| panic!("header row:\n{tight_frame}"));
+        assert!(
+            !tight_header.contains("5h"),
+            "the 5h stub is the first column to drop: {tight_header:?}\n{tight_frame}"
+        );
+        assert!(
+            tight_header.contains("7d Fbl") && tight_header.contains("rst"),
+            "Fbl and rst survive the drop: {tight_header:?}\n{tight_frame}"
+        );
+        assert!(
+            tight.iter().any(|r| r.contains("CODEX")),
+            "identity survives too:\n{tight_frame}"
+        );
+
+        // Wide enough → every column present, `rst` included.
         let wide = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24).join("\n");
-        assert!(wide.contains("Fbl"), "{wide}");
+        assert!(wide.contains("7d Fbl"), "{wide}");
+        assert!(wide.contains("5h"), "{wide}");
         assert!(wide.contains("rst"), "{wide}");
         assert!(wide.contains("CODEX"), "{wide}");
     }
@@ -12362,16 +12466,27 @@ mod tests {
     /// Leftover-width receipt (Z 2026-07-13): with every column a fixed
     /// `Length`, the leftover terminal width is poured into the quota gauge
     /// BARS instead of dying as dead space on the right (~col 120) — the
-    /// follow-up to the NAME_COL_MAX cap. A wide (200-col) render reaches near
-    /// the right edge; the same account at 120 cols stays within the terminal.
+    /// follow-up to the NAME_COL_MAX cap. A wide (200-col) render pushes the
+    /// row far past its minimum; the same account at 120 cols stays within the
+    /// terminal.
+    ///
+    /// Z 2026-09-18 (.prd/18): the reach at 200 cols dropped from ≥170 to ≥145
+    /// (measured 149) — there are now TWO stretchy gauges (7d + Fbl) instead of
+    /// three and the 5h stub is a fixed 8, so both bars hit the GAUGE_BAR_MAX
+    /// cap before the leftover runs out. The cap winning at an ultra-wide
+    /// terminal is the intended behaviour, not dead space from a packed-left
+    /// table. This fixture (name 14, Fbl on, no `rst`) has a wide row of
+    /// `27 + status + 14 + 2×17 + 8 + 10 spaces` = 101 at the 8-col status
+    /// floor and 113 as rendered here (status at its full 20), so 149 is 36
+    /// cols of pure bar growth.
     #[test]
     fn accounts_gauges_absorb_leftover_width() {
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![fable_account()];
         view.show_fable_weekly = true;
 
-        // Wide: leftover width flows into the 3 gauge bars, so the row's content
-        // reaches near the 200-col right edge (was dying at ~120 dead-space).
+        // Wide: leftover width flows into the stretchy gauge bars, so the row's
+        // content runs far past its 113-col rendered minimum (was dying ~120).
         let wide = render_rows(&view, &chrome_overlay(Overlay::None), 200, 40);
         let wide_row = wide
             .iter()
@@ -12383,9 +12498,9 @@ mod tests {
                 )
             });
         assert!(
-            wide_row.trim_end().chars().count() >= 170,
-            "leftover width goes to the gauge bars — the row reaches near the \
-             200-col right edge instead of dying at ~120:\n{wide_row}"
+            wide_row.trim_end().chars().count() >= 145,
+            "leftover width goes to the gauge bars — the row runs well past its \
+             113-col rendered minimum instead of dying at ~120:\n{wide_row}"
         );
 
         // Narrow: the same row still fits inside a 120-col terminal (the bars
@@ -12410,6 +12525,12 @@ mod tests {
     /// `WIDE_TABLE_AT=150` predated the NAME_COL_MAX cap, so at ~149 cols the
     /// wide column set (req/tok) was hidden and the width poured into fat bars.
     /// The wide set must engage as soon as it actually fits.
+    ///
+    /// Z 2026-09-18 (.prd/18): "fits" is now judged with `status` at its 8-col
+    /// floor and `5h` at its fixed 8, so the set engages EARLIER than before —
+    /// for this fixture (Fbl on, no `rst`) the minimum wide row is
+    /// `27 + 8 + name + 2×17 + 8 + 10 spaces` = 87 + name = 101 at name 14, so
+    /// 110 cols is wide now and the narrow probe moved to 90.
     #[test]
     fn accounts_wide_set_fits_before_150() {
         let mut view = view_with(Vec::new());
@@ -12428,22 +12549,345 @@ mod tests {
             "at 149 cols the wide set fits — header shows req + tok:\n{header_149}"
         );
 
-        // 110 cols: too narrow for the wide set → header has 5h but not req.
-        let at_110 = render_rows(&view, &chrome_overlay(Overlay::None), 110, 40);
-        let header_110 = at_110
+        // 90 cols: too narrow for the wide set → header has 5h but not req.
+        let at_90 = render_rows(&view, &chrome_overlay(Overlay::None), 90, 40);
+        let header_90 = at_90
             .iter()
             .find(|line| line.contains("account") && line.contains("5h"))
-            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_110.join("\n")));
+            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_90.join("\n")));
         assert!(
-            !header_110.contains("req"),
-            "at 110 cols the narrow set still exists — no req column:\n{header_110}"
+            !header_90.contains("req"),
+            "at 90 cols the narrow set still exists — no req column:\n{header_90}"
         );
     }
 
-    /// The narrow layout compresses the gauge to an inline `F 97%` marker
-    /// (no third gauge+reset pair) when the toggle is ON, and drops it when OFF.
+    // --- .prd/18: the 5h stub, the status sponge, the un-shrinkable Fbl ------
+
+    /// A view with one account per group, every row carrying a live 7d window so
+    /// the ONLY place `cold` can come from is the 5h cell — the negative
+    /// controls and the positive control share one frame (.prd/18 tests,
+    /// Z 2026-09-18).
+    fn five_hour_group_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let now = SystemTime::now();
+        let window = |utilization: f64| QuotaWindow {
+            utilization,
+            resets_at: now + Duration::from_secs(80_000),
+            fetched_at: now,
+            source: WindowSource::UsagePoll,
+        };
+        let account =
+            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                id: AccountId(name.into()),
+                healthy: true,
+                credential_kind: kind,
+                group,
+                five_hour: five,
+                seven_day: Some(window(0.20)),
+                scoped_limits: Vec::new(),
+                scoped_cooldowns: Vec::new(),
+                cooldown_until: None,
+                cooldown_source: None,
+                in_flight: 0,
+                token_expires_at_ms: None,
+                last_refresh_ms: None,
+                paused: false,
+                limits: crate::config::AccountLimits::default(),
+            };
+        let mut view = view_with(Vec::new());
+        view.show_fable_weekly = false;
+        view.snapshot.accounts = vec![
+            // Codex has no 5h source at all; grok DOES report a header-fed burst
+            // window (.prd/18 §Tension) — both must still read `-`.
+            account("codex:me@example.com", "codex", BackendGroup::Codex, None),
+            account(
+                "grok:me@example.com",
+                "grok",
+                BackendGroup::Grok,
+                Some(window(0.30)),
+            ),
+            account("claude:me@example.com", "oauth", BackendGroup::Claude, None),
+        ];
+        view
+    }
+
+    /// .prd/18 rule 1 (owner 2026-09-18: "코덱스랑 grok은 5시간 제한이 없음 cold가
+    /// 아니라 `-` 처럼 n/a 표시해야함"): the 5h cell is Claude-only. A CODEX row
+    /// and a GROK row render a dim `-` and carry no `cold` anywhere — even the
+    /// grok row, whose burst window is real but is not a 5h limit. A CLAUDE row
+    /// with no 5h window still reads the honest `○ cold`.
     #[test]
-    fn fable_gauge_narrow_uses_compact_marker_gated_by_toggle() {
+    fn five_hour_cell_is_n_a_for_non_claude_groups() {
+        let view = five_hour_group_view();
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("5h"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        let five_at = header.find("5h").expect("5h column offset");
+        let cell = |row: &str| -> String {
+            row.chars()
+                .skip(five_at)
+                .take(FIVE_H_COL_WIDTH as usize)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        for group in ["CODEX", "GROK"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(group))
+                .unwrap_or_else(|| panic!("{group} row:\n{frame}"));
+            assert_eq!(cell(row), "-", "{group} 5h cell is n/a: {row:?}\n{frame}");
+            assert!(
+                !row.contains("cold"),
+                "{group} row never claims a cold 5h window: {row:?}\n{frame}"
+            );
+        }
+        let claude = rows
+            .iter()
+            .find(|r| r.contains("CLAUDE"))
+            .unwrap_or_else(|| panic!("claude row:\n{frame}"));
+        assert_eq!(
+            cell(claude),
+            "○ cold",
+            "a claude row with no 5h window still shows the cold state: \
+             {claude:?}\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 2 (owner: "최대 8칸 넓이로 해줘"): every 5h cell state fits
+    /// [`FIVE_H_COL_WIDTH`] — the widest is `◑ 100%!` (7 cells). Pure over
+    /// [`five_hour_text`], so the width contract holds without a terminal
+    /// (Z 2026-09-18).
+    #[test]
+    fn five_hour_cell_fits_eight_cells() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use unicode_width::UnicodeWidthStr;
+
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs(600);
+        // One window per display state: fresh (populated), old observation
+        // (stale), and the poll-degraded overlay via consecutive_failures.
+        let window = |utilization: f64, fetched_at: SystemTime| {
+            Some(QuotaWindow {
+                utilization,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at,
+                source: WindowSource::UsagePoll,
+            })
+        };
+        let cases: Vec<(&str, Option<QuotaWindow>, u32)> = vec![
+            ("populated", window(1.0, now), 0),
+            ("stale", window(1.0, now - Duration::from_secs(1_800)), 0),
+            ("poll-degraded", window(1.0, now), 3),
+            ("cold", None, 0),
+            ("cold + poll-degraded", None, 3),
+        ];
+        for (label, win, failures) in cases {
+            for parked in [false, true] {
+                for mode in [
+                    crate::config::QuotaDisplay::Used,
+                    crate::config::QuotaDisplay::Remaining,
+                ] {
+                    for group in BackendGroup::ALL {
+                        let (text, _) =
+                            five_hour_text(*group, &win, 0.9, parked, now, max_age, failures, mode);
+                        assert!(
+                            UnicodeWidthStr::width(text.as_str()) <= FIVE_H_COL_WIDTH as usize,
+                            "5h cell `{text}` ({label}, parked={parked}, \
+                             group={group:?}) fits {FIVE_H_COL_WIDTH} cells"
+                        );
+                    }
+                }
+            }
+        }
+        // The widest state is the one the column was sized for.
+        let (widest, _) = five_hour_text(
+            BackendGroup::Claude,
+            &window(1.0, now - Duration::from_secs(1_800)),
+            0.9,
+            true,
+            now,
+            max_age,
+            0,
+            crate::config::QuotaDisplay::Used,
+        );
+        assert_eq!(widest, "◑ 100%!");
+    }
+
+    /// .prd/18 rule 2: the 5h column is a FIXED 8 at every width — it never
+    /// takes a share of the leftover the stretchy gauges drink. The header
+    /// offset of `7d` minus that of `5h` is exactly 9 (8 + the inter-column
+    /// space) at a narrow, a just-wide and an ultra-wide terminal
+    /// (Z 2026-09-18).
+    #[test]
+    fn five_hour_column_is_fixed_eight_wide() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+        for w in [100u16, 149, 200] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), w, 40);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|r| r.contains("account") && r.contains("5h"))
+                .unwrap_or_else(|| panic!("header row at {w}:\n{frame}"));
+            let five = header.find("5h").expect("5h offset");
+            let seven = header.find("7d").expect("7d offset");
+            assert_eq!(
+                seven - five,
+                FIVE_H_COL_WIDTH as usize + 1,
+                "5h stays a fixed {FIVE_H_COL_WIDTH}-wide column at {w} cols: \
+                 {header:?}\n{frame}"
+            );
+        }
+    }
+
+    /// .prd/18 rule 4 (owner: "accounts 공간이 부족하면 status 창부터 줄여줘
+    /// (최소칸 8칸)"): at a width between the row's 20-status minimum (98) and
+    /// its 8-status minimum (86), `status` is the only column that gives way —
+    /// `5h`, `7d` and `7d Fbl` are all still there, and status keeps at least
+    /// its 8-cell floor (Z 2026-09-18).
+    #[test]
+    fn status_column_shrinks_before_any_gauge_gives_way() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 90, 40);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        for kept in ["5h", "7d", "7d Fbl"] {
+            assert!(
+                header.contains(kept),
+                "`{kept}` survives — only status gives way: {header:?}\n{frame}"
+            );
+        }
+        let status_w = header.find("5h").unwrap() - header.find("status").unwrap() - 1;
+        assert!(
+            (STATUS_COL_MIN..STATUS_COL_MAX).contains(&status_w),
+            "status shrank below its 20-col full width but not past its \
+             {STATUS_COL_MIN}-col floor (got {status_w}): {header:?}\n{frame}"
+        );
+        // …and the name column is untouched at this width: it is the LAST
+        // column to give way, after status and the 5h stub.
+        assert!(
+            rows.iter().any(|r| r.contains("me@example.com")),
+            "the account name is not clipped while status still has slack:\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 4, step 3 (astra review 2026-09-18): with a 20-col name the
+    /// row can overflow even after `status` is at its 8-col floor and the `5h`
+    /// stub has dropped — narrow row minimum = `14 + 8 + 20 + 2×17 + 3 + 8` = 87
+    /// with `rst` on (83 without), both past an 80-col terminal. Before the name
+    /// step the constraints summed past the frame and ratatui shaved EVERY
+    /// column (the `gr`/`CO` class this whole layout exists to prevent). The
+    /// `account` column is what gives way there — never the gauges.
+    ///
+    /// At 80 cols the arithmetic lands on exactly 80: with `rst` the name is
+    /// `80 − (14 + 8 + 34 + 3 + 8 spaces)` = 13, without it 17; status sits on
+    /// its 8-col floor in both.
+    #[test]
+    fn narrow_80_shrinks_name_to_protect_status_floor_and_fable_gauge() {
+        use crate::scheduler::AccountId;
+
+        const LONG: &str = "claude:longname-account@example.com";
+        for resets in [false, true] {
+            let mut view = view_with(Vec::new());
+            let mut account = fable_account();
+            account.id = AccountId(LONG.into());
+            view.snapshot.accounts = vec![account];
+            view.show_fable_weekly = true;
+            if resets {
+                view.usage_controls.insert(
+                    LONG.into(),
+                    crate::proxy::usage_controls::UsageControlDoc {
+                        available_resets: Some(3),
+                        applicable_resets: Some(0),
+                        ..Default::default()
+                    },
+                );
+            }
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 80, 24);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|r| r.contains("account") && r.contains("status"))
+                .unwrap_or_else(|| panic!("header row (rst={resets}):\n{frame}"));
+            for kept in ["group", "status", "7d", "7d Fbl"] {
+                assert!(
+                    header.contains(kept),
+                    "`{kept}` survives at 80 cols (rst={resets}): {header:?}\n{frame}"
+                );
+            }
+            assert!(
+                !header.contains("5h"),
+                "the 5h stub already dropped (rst={resets}): {header:?}\n{frame}"
+            );
+            // Nothing is shaved: the full header words are there, and the group
+            // cell reads CLAUDE rather than a 2-char stub.
+            let row = rows
+                .iter()
+                .find(|r| r.contains("CLAUDE"))
+                .unwrap_or_else(|| panic!("intact CLAUDE group cell (rst={resets}):\n{frame}"));
+            // status sits exactly on its floor, and its text survives.
+            let status_w = header.find("7d").unwrap() - header.find("status").unwrap() - 1;
+            assert_eq!(
+                status_w, STATUS_COL_MIN,
+                "status is at its {STATUS_COL_MIN}-col floor (rst={resets}): \
+                 {header:?}\n{frame}"
+            );
+            assert!(
+                row.contains("ready"),
+                "the status cell still spells its word (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            // The Fbl gauge kept its full cell: the 97% window's percent label.
+            assert!(
+                row.contains("3%!"),
+                "the Fbl gauge renders its percent label (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            // …and the name is the column that paid for it.
+            assert!(
+                !row.contains("longname-account@example.com"),
+                "the name column is the one that gave way (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            assert!(
+                row.contains("longname"),
+                "…clipped, not dropped (rst={resets}): {row:?}\n{frame}"
+            );
+            if resets {
+                // `rst` survives the squeeze; this oauth row has no resets at
+                // all, so its cell is the honest `—` (never a count).
+                assert!(
+                    header.contains("rst") && row.contains('—'),
+                    "the reset column survives too: {row:?}\n{frame}"
+                );
+            }
+        }
+    }
+
+    /// The narrow layout renders the FULL Fbl gauge — the same in-bar
+    /// countdown plus percent label the wide set draws — when the toggle is ON,
+    /// and no column at all when OFF.
+    ///
+    /// Z 2026-09-18 (.prd/18 rule 3, owner: "7d-fable이 아니라 5h를 줄여줘"):
+    /// this replaces `fable_gauge_narrow_uses_compact_marker_gated_by_toggle`.
+    /// The compact `F 22h!` marker is deleted — the Fbl gauge never gives way,
+    /// so a narrow terminal shrinks `status` and drops `5h` instead.
+    #[test]
+    fn fable_gauge_narrow_renders_the_full_gauge_gated_by_toggle() {
         use crate::routing::BackendGroup;
         use crate::scheduler::AccountId;
 
@@ -12454,20 +12898,27 @@ mod tests {
             AccountId("claude:me@example.com".into()),
         );
 
-        // Width < WIDE_TABLE_AT → narrow layout. The compact marker carries
-        // the top countdown unit + the critical `!` (80_000s out → "F 22h!").
+        // 90 cols → narrow set (no req/tok), yet the Fbl column is a full gauge:
+        // the in-bar countdown (80_000s out → "22h") plus the percent label of
+        // the 97% window (remaining mode → "3%", critical `!`).
         view.show_fable_weekly = true;
-        let on = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        let on = render(&view, &chrome_overlay(Overlay::None), 90, 20);
+        assert!(on.contains("7d Fbl"), "narrow toggle ON: Fbl column:\n{on}");
         assert!(
-            on.contains("F 22h!"),
-            "narrow toggle ON: compact `F 22h!` marker rendered:\n{on}"
+            on.contains("22h") && on.contains("3%!"),
+            "narrow toggle ON: the full gauge (in-bar countdown + percent), not \
+             the deleted compact marker:\n{on}"
+        );
+        assert!(
+            !on.contains("F 22h"),
+            "the compact `F 22h` marker is gone for good:\n{on}"
         );
 
         view.show_fable_weekly = false;
-        let off = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        let off = render(&view, &chrome_overlay(Overlay::None), 90, 20);
         assert!(
-            !off.contains("F 22h"),
-            "narrow toggle OFF: no Fable marker:\n{off}"
+            !off.contains("Fbl"),
+            "narrow toggle OFF: no Fbl column:\n{off}"
         );
     }
 
@@ -12582,15 +13033,18 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Narrow marker: the countdown (`F 22h`) with no critical `!`
-        // (is_active must not force the over-threshold marker at 76%).
+        // The gauge carries the countdown in the bar and 24% remaining in the
+        // label, with no critical `!` (is_active must not force the
+        // over-threshold marker at 76%). Z 2026-09-18: the narrow set draws the
+        // same full gauge as the wide one (.prd/18 rule 3), so this reads the
+        // percent label instead of the deleted `F 22h` marker.
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 22h"),
-            "76%/warning/is_active renders its normal countdown marker:\n{narrow}"
+            narrow.contains("22h") && narrow.contains("24%"),
+            "76%/warning/is_active renders its normal countdown gauge:\n{narrow}"
         );
         assert!(
-            !narrow.contains("22h!"),
+            !narrow.contains("24%!"),
             "is_active alone must NOT force the red-critical `!` marker:\n{narrow}"
         );
     }
@@ -12599,7 +13053,7 @@ mod tests {
     /// window is expired (util → 0) but its `severity` field can still be a
     /// stale `Critical` until the next usage poll. The gauge must key off the
     /// reset-aware `is_constraining` (which short-circuits on `is_expired`), so
-    /// a just-reset window renders its honest full-quota `F 100%` (remaining
+    /// a just-reset window renders its honest full-quota `100%` (remaining
     /// mode) with NO forced-red `!` — not the old red critical flash.
     #[test]
     fn fable_gauge_reset_window_is_not_forced_red() {
@@ -12652,13 +13106,13 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Expired → effective utilization 0 → remaining-mode label `F 100%`
+        // Expired → effective utilization 0 → remaining-mode label `100%`
         // (full quota is back), and because `is_constraining` short-circuits
         // on the expired window the stale `Critical` severity does NOT force
         // the red-critical `!` marker.
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 100%"),
+            narrow.contains("100%"),
             "expired/reset Fable window renders its honest full-quota 100%:\n{narrow}"
         );
         assert!(
@@ -12935,7 +13389,9 @@ mod tests {
     }
 
     /// Narrow (<80col) keeps the same reduced column set and renders without
-    /// panic — the compressed mode may clip, never crash (issue #70).
+    /// panic — the compressed mode may clip, never crash (issue #70). At 70
+    /// cols the `5h` stub is already gone (.prd/18: status is at its 8-col floor
+    /// and the row still does not fit), so the header is keyed on `7d`.
     #[test]
     fn accounts_row_narrow_uses_reduced_columns_without_panic() {
         use crate::routing::BackendGroup;
@@ -12950,7 +13406,7 @@ mod tests {
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 70, 30);
         let header = rows
             .iter()
-            .find(|r| r.contains("5h") && r.contains("7d"))
+            .find(|r| r.contains("account") && r.contains("7d"))
             .expect("narrow accounts header row");
         for gone in ["auth", "reset", "token"] {
             assert!(
