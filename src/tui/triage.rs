@@ -284,14 +284,17 @@ impl AccountSort {
     }
 }
 
-/// One comparable piece of a [`natural_key`]: a single non-digit character, or
-/// a whole run of digits taken as the number it spells.
+/// One comparable piece of a [`natural_key`]: a separator character, a whole
+/// run of digits taken as the number it spells, or a letter.
 ///
-/// `Text` is declared FIRST on purpose — the derived `Ord` orders variants by
-/// declaration, so at the same position a plain character sorts BEFORE a
-/// number. That is exactly the owner's picture of the fix (Z 2026-09-18): the
-/// number is a right-aligned padded slot, and the name whose slot is EMPTY
-/// comes first.
+/// The declaration order IS the rule — the derived `Ord` orders variants by
+/// declaration, so at one position `Sep` < `Num` < `Alpha`:
+///
+/// - a separator beats a number, which is the owner's picture of the fix
+///   (Z 2026-09-18): the number is a right-aligned padded slot and the name
+///   whose slot is EMPTY comes first, so `ai@…` < `ai1@…`;
+/// - a number beats a letter, which is Finder / `sort -V` order, so
+///   `dev1@…` < `devteam@…` and `codex:2@…` < `codex:backup@…`.
 ///
 /// ```text
 /// ai[    ]@iq.io
@@ -300,20 +303,25 @@ impl AccountSort {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NatChunk {
-    /// One lowercased non-digit character.
-    Text(char),
+    /// One non-alphanumeric character (`@`, `.`, `:`, `-`, `_`, `+` …) — the
+    /// boundary an empty number slot falls on.
+    Sep(char),
     /// A digit run read as a number. Saturating: a run too long for `u128`
     /// keeps the ceiling instead of panicking (ids are operator input).
     Num(u128),
+    /// One lowercased alphanumeric non-digit character.
+    Alpha(char),
 }
 
 /// The human ("natural") sort key for an account name: lowercased, with every
 /// digit run compared as a NUMBER rather than character by character, so a
 /// block reads `ai`, `ai1`, `ai2`, … `ai10` instead of `ai10, ai1, ai2, ai`.
 ///
-/// Per-character (rather than per-word) text chunks are what makes the empty
-/// number slot sort first: `ai@…` yields `Text('@')` where `ai1@…` yields
-/// `Num(1)`, and `Text` < `Num`.
+/// Per-character (rather than per-word) chunks are what makes the comparison
+/// land on the divergence itself, where [`NatChunk`]'s three kinds decide:
+/// separator < number < letter. Hence `ai@iq.io` < `ai1@iq.io` (empty slot
+/// first) and `dev1@iq.io` < `devteam@iq.io` / `codex:2@x` < `codex:backup@x`
+/// (a number is not a letter, and does not sort as one).
 ///
 /// Digit runs that spell the same number (`ai01` vs `ai1`) tie here; callers
 /// break the tie with the lowercased name and then the config index.
@@ -322,7 +330,11 @@ pub(crate) fn natural_key(name: &str) -> Vec<NatChunk> {
     let mut chars = name.chars().peekable();
     while let Some(c) = chars.next() {
         let Some(digit) = c.to_digit(10) else {
-            key.push(NatChunk::Text(c.to_ascii_lowercase()));
+            key.push(if c.is_alphanumeric() {
+                NatChunk::Alpha(c.to_ascii_lowercase())
+            } else {
+                NatChunk::Sep(c)
+            });
             continue;
         };
         let mut value = u128::from(digit);
@@ -571,11 +583,42 @@ mod tests {
             ],
             "empty slot first, digit runs numeric, spelling as the tiebreak"
         );
+
+        // At a divergence: separator < number < letter. The empty number slot
+        // still sorts first (the owner's TO-BE), but a number now beats a
+        // letter — Finder / `sort -V` order, so `devteam` no longer jumps
+        // ahead of `dev1`.
+        let mut ids = vec![
+            "devteam@x",
+            "ai2@x",
+            "codex:backup@x",
+            "ai@x",
+            "dev1@x",
+            "codex:2@x",
+            "ai10@x",
+            "ai1@x",
+        ];
+        ids.sort_by_key(|id| (natural_key(id), id.to_ascii_lowercase()));
+        assert_eq!(
+            ids,
+            vec![
+                "ai@x",
+                "ai1@x",
+                "ai2@x",
+                "ai10@x",
+                "codex:2@x",
+                "codex:backup@x",
+                "dev1@x",
+                "devteam@x",
+            ],
+            "separator (the empty number slot) < number < letter"
+        );
+
         // A digit run far past u128 saturates instead of panicking.
         let huge = format!("a{}", "9".repeat(60));
         assert_eq!(
             natural_key(&huge),
-            vec![NatChunk::Text('a'), NatChunk::Num(u128::MAX)]
+            vec![NatChunk::Alpha('a'), NatChunk::Num(u128::MAX)]
         );
     }
 
@@ -646,6 +689,7 @@ mod tests {
             grouped("ai2@insightquest.io", BackendGroup::Claude),
             grouped("ai@insightquest.io", BackendGroup::Claude),
             grouped("ai1@insightquest.io", BackendGroup::Claude),
+            grouped("devteam@insightquest.io", BackendGroup::Claude),
             grouped("dev1@insightquest.io", BackendGroup::Claude),
             grouped("icedac@gmail.com", BackendGroup::Claude),
             grouped("notify@insightquest.io", BackendGroup::Claude),
@@ -658,10 +702,11 @@ mod tests {
                 "ai2@insightquest.io",
                 "ai10@insightquest.io",
                 "dev1@insightquest.io",
+                "devteam@insightquest.io",
                 "icedac@gmail.com",
                 "notify@insightquest.io",
             ],
-            "digit runs compare numerically and the empty number slot sorts first"
+            "digit runs compare numerically; empty slot first, number before letter"
         );
     }
 
