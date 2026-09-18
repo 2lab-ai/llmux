@@ -1,6 +1,6 @@
 # Accounts table: Fbl n/a, sort modes, detail modal — loop
 
-Status: in-progress
+Status: shipped (preview-2026-09-18-0609-850db8b80519)
 Date: 2026-09-18
 
 ## Build facts (measured 2026-09-18, main @ eccf1ac = v0.2.23)
@@ -58,4 +58,18 @@ Trinity R3 (E diff appended as evidence): astra APPROVE ("일반 `eligibility`�
 | click → modal, pinned id, close/scroll/swallow | closed | 3 tests; live frames 4–6 |
 | modal lists every section | closed | `account_modal_renders_every_section`; live frame 4 |
 | modal gate = selector's gate | closed | `account_modal_gate_is_group_scoped`, `account_modal_gate_honors_heuristic_degraded_mode` |
-| preview deployed + live receipt | open | ship table below (filled after merge) |
+| preview deployed + live receipt | closed | ship table below; deployed frames d1–d4 |
+
+## Ship (2026-09-18)
+
+| Step | Receipt |
+| --- | --- |
+| PR #166 CI | CI (macos + ubuntu check) pass, Islands parity (semantic core, macOS shared-core shell, Arch KDE shell) pass; mergeStateStatus CLEAN |
+| merge | squash → main `850db8b` |
+| preview.yml | run 35313671826 success → prerelease `preview-2026-09-18-0609-850db8b80519` (06:16Z) |
+| tap | `Formula/llmux-preview.rb` version `2026.09.18.0609` (bumped by the release flow; the manual `bump.yml` dispatch needs a `tag` input and was not needed) |
+| brew | `2lab-ai/tap/llmux-preview 2026.09.18.0311 -> 2026.09.18.0609`; `/opt/homebrew/bin/llmux --version` → `llmux 0.2.23 (preview 2026-09-18-0609-850db8b80519)` |
+| restart | detached one-shot `llmux restart` → `restarted llmux server (pid 98671) on port 3456 → llmux 0.2.23 (preview 2026-09-18-0609-850db8b80519)`; `llmux status` server `running`, uptime 21s, `accounts: 20 (20 ready)` |
+| live smoke (deployed binary, `llmux dashboard`, tmux 200×45) | d1: header `preview 2026-09-18-0609-850db8b80519 :3456 pid 98671`, `accounts · sort name`, CLAUDE 1–15 by name, CODEX 16–19, GROK 20, `-` under `7d Fbl` on every non-Claude row. d2: `o` → `sort next`; Claude head = current `ai4` (►); **Codex head = `icedac ready` while the exhausted current `ai2` (►!) sits below** — the R1 parity fix observed live (pre-fix code would have pinned `ai2` first). d3: left-click row 3 → modal `claude:ai12@insightquest.io · oauth · CLAUDE`, `order #3 of 20 · sort name`, gate `ready`. d4: Esc → 0 modal glyphs, table intact. |
+
+Worktree `feat-tui-accounts-sort-detail` removed after merge (clean, branch deleted). Report artifact (private): https://claude.ai/artifact/9HNa7UGrKPGSwwVVQETC3W
