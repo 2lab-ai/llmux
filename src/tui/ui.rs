@@ -32,7 +32,7 @@ use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
+use super::{anim, AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -241,7 +241,15 @@ pub(crate) fn draw(
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
     match chrome.overlay {
         Overlay::None => {}
-        Overlay::Accounts => draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome),
+        // The overlay draws the SAME accounts table as MAIN over the top of
+        // it, so its row rects replace MAIN's as this frame's click targets
+        // (.prd/19 rule 6 — a row click must work on both surfaces).
+        Overlay::Accounts => {
+            let rows = draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.account_rows = rows;
+            }
+        }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
@@ -270,6 +278,17 @@ pub(crate) fn draw(
         let raw_chrome = draw_raw_modal(frame, modal);
         if let Some(hits) = hits.as_mut() {
             hits.raw_modal = Some(raw_chrome);
+        }
+    }
+
+    // The account detail modal (.prd/19 rules 6–7) layers exactly like the
+    // input modal: over MAIN and any overlay, under the footer, with its
+    // max-scroll (or the close signal for a vanished account) riding back on
+    // the hit record.
+    if let Some(modal) = &chrome.account_modal {
+        let max_scroll = draw_account_modal(frame, view, &ctx, chrome, modal);
+        if let Some(hits) = hits.as_mut() {
+            hits.account_modal_max_scroll = max_scroll;
         }
     }
 
@@ -442,6 +461,7 @@ fn draw_main(
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
+        account_modal_max_scroll: None,
         raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
@@ -620,13 +640,13 @@ fn draw_accounts_overlay(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) {
+) -> Vec<AccountRowHit> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     let [table_area, detail_area] =
         Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
-    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
@@ -637,6 +657,7 @@ fn draw_accounts_overlay(
     } else {
         draw_detail(frame, detail_area, view, ctx, chrome);
     }
+    account_rows
 }
 
 /// Stats overlay (`g`): the detailed per-model usage table + drill-down (req13;
@@ -3424,6 +3445,474 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
     Some(max_scroll)
 }
 
+/// One section header inside the account modal: dim + bold, flush left, so the
+/// dense body reads as blocks without spending a row on a blank separator (the
+/// full dump does not fit an 80×24 modal as it is).
+fn modal_section(name: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        name.to_string(),
+        dim().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One `label  value` row inside the account modal. Unknown/absent values are
+/// the caller's `—`, never an invented zero.
+fn modal_row(label: &str, value: String) -> Line<'static> {
+    modal_row_spans(label, vec![Span::raw(value)])
+}
+
+/// [`modal_row`] with a pre-styled value (status verdicts, token health).
+fn modal_row_spans(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(format!(" {label:<10}"), dim())];
+    spans.extend(value);
+    Line::from(spans)
+}
+
+/// Body of the account detail modal (.prd/19 rule 7): EVERY per-account datum
+/// the view holds, in labeled sections. Split out of [`draw_account_modal`] so
+/// the assembly stays testable as data and the draw function stays layout-only.
+fn account_modal_lines(
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    account: &AccountSnapshot,
+) -> Vec<Line<'static>> {
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let now = ctx.now;
+    let gate = select::eligibility(account, params, now, ctx.headers_only);
+    let dash = "—".to_string();
+    let abs = |at: SystemTime| format::absolute_label(at, now, ctx.tz_offset);
+    // A future instant as "countdown (absolute)"; a past one says so rather
+    // than rendering a bogus countdown.
+    let until = |at: SystemTime| match at.duration_since(now) {
+        Ok(left) => format!("{} ({})", select::compact_duration(left), abs(at)),
+        Err(_) => format!("elapsed ({})", abs(at)),
+    };
+    let ago = |at: SystemTime| match now.duration_since(at) {
+        Ok(age) => format!("{} ago ({})", select::compact_duration(age), abs(at)),
+        Err(_) => format!("ahead ({})", abs(at)),
+    };
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // --- identity ----------------------------------------------------------
+    let pos = ctx
+        .order
+        .iter()
+        .position(|&i| snapshot.accounts[i].id == account.id);
+    lines.push(modal_section("identity"));
+    lines.push(modal_row("name", masked_name(&account.id.0, ctx.mask)));
+    lines.push(modal_row(
+        "auth",
+        format!(
+            "{} · group {} · healthy {} · paused {} · urgent {}",
+            account.credential_kind,
+            account.group.as_str(),
+            yes_no(account.healthy),
+            yes_no(account.paused),
+            yes_no(triage::urgent(account, gate)),
+        ),
+    ));
+    lines.push(modal_row(
+        "order",
+        match pos {
+            Some(pos) => format!(
+                "#{} of {} · sort {}",
+                pos + 1,
+                ctx.order.len(),
+                chrome.account_sort.label()
+            ),
+            None => format!("— · sort {}", chrome.account_sort.label()),
+        },
+    ));
+
+    // --- status / gate -----------------------------------------------------
+    lines.push(modal_section("status"));
+    lines.push(modal_row_spans(
+        "gate",
+        vec![status_span(
+            account,
+            gate,
+            snapshot.is_current(&account.id),
+            params,
+            now,
+            ctx.frame,
+        )],
+    ));
+    if let Some(reason) = gate {
+        lines.push(modal_row(
+            "blocked",
+            select::blocking_reason(account, reason, params, now),
+        ));
+    }
+    let groups_for =
+        |map: &std::collections::BTreeMap<BackendGroup, crate::scheduler::AccountId>| {
+            let names: Vec<&str> = map
+                .iter()
+                .filter(|(_, id)| **id == account.id)
+                .map(|(group, _)| group.as_str())
+                .collect();
+            if names.is_empty() {
+                dash.clone()
+            } else {
+                names.join("+")
+            }
+        };
+    let pin = snapshot
+        .manual_pin
+        .iter()
+        .find(|(_, pin)| pin.account == account.id)
+        .map(|(group, pin)| format!("{} {}", group.as_str(), until(pin.until)))
+        .unwrap_or_else(|| dash.clone());
+    lines.push(modal_row(
+        "current",
+        format!(
+            "{} · fable {} · pin {pin}",
+            groups_for(&snapshot.current),
+            groups_for(&snapshot.fable_current),
+        ),
+    ));
+    lines.push(modal_row("in-flight", account.in_flight.to_string()));
+
+    // --- token -------------------------------------------------------------
+    // Timestamps and counts only: no credential byte ever reaches this modal.
+    lines.push(modal_section("token"));
+    lines.push(modal_row_spans(
+        "token",
+        token_detail_spans(account, view.refresh_ahead, now, ctx.tz_offset),
+    ));
+    lines.push(modal_row(
+        "stamps",
+        format!(
+            "expires_at {} · last_refresh {}",
+            account
+                .token_expires_at_ms
+                .map(|ms| format!("{ms} ({})", abs(UNIX_EPOCH + Duration::from_millis(ms))))
+                .unwrap_or_else(|| dash.clone()),
+            account
+                .last_refresh_ms
+                .map(|ms| format!("{ms} ({})", abs(UNIX_EPOCH + Duration::from_millis(ms))))
+                .unwrap_or_else(|| dash.clone()),
+        ),
+    ));
+
+    // --- 5h / 7d windows ---------------------------------------------------
+    let consecutive_failures = view
+        .poll_health
+        .get(&account.id.0)
+        .map_or(0, |h| h.consecutive_failures);
+    let max_age = params.usage_max_age;
+    let raw_window = |window: &Option<QuotaWindow>| match window {
+        None => format!(
+            "{dash} · state {}",
+            classify_window_display(window, now, max_age, consecutive_failures).label()
+        ),
+        Some(w) => format!(
+            "util {:.3} · eff {:.3} · resets {} · fetched {} · {} · expired {} · state {}",
+            w.utilization,
+            w.effective_utilization(now),
+            abs(w.resets_at),
+            ago(w.fetched_at),
+            match w.source {
+                crate::scheduler::window::WindowSource::Headers => "headers",
+                crate::scheduler::window::WindowSource::UsagePoll => "poll",
+            },
+            yes_no(w.is_expired(now)),
+            classify_window_display(window, now, max_age, consecutive_failures).label(),
+        ),
+    };
+    // The detail pane's own window line, re-labeled to the modal's wider label
+    // column (its first span IS the label — dropped here, never re-formatted),
+    // so `5h` and `5h raw` line their values up.
+    let window_line = |name: &'static str, window: &Option<QuotaWindow>| {
+        modal_row_spans(
+            name,
+            window_detail_line(name, window, ctx, max_age, consecutive_failures)
+                .spans
+                .into_iter()
+                .skip(1)
+                .collect(),
+        )
+    };
+    lines.push(modal_section("windows"));
+    lines.push(window_line("5h", &account.five_hour));
+    lines.push(modal_row("5h raw", raw_window(&account.five_hour)));
+    lines.push(window_line("7d", &account.seven_day));
+    lines.push(modal_row("7d raw", raw_window(&account.seven_day)));
+
+    // --- model-scoped limits ----------------------------------------------
+    let fable_ceiling = select::effective_limits(account, params).2;
+    lines.push(modal_section("scoped"));
+    if account.scoped_limits.is_empty() {
+        lines.push(modal_row("scope", format!("{dash} (none recorded)")));
+    }
+    for scoped in &account.scoped_limits {
+        let window = &scoped.window;
+        lines.push(modal_row(
+            &scoped.scope_label,
+            format!(
+                "{} · resets {} · severity {} · active {}",
+                format::percent(window.effective_utilization(now)),
+                until(window.resets_at),
+                scoped.severity.label(),
+                yes_no(scoped.is_active),
+            ),
+        ));
+        lines.push(modal_row(
+            &format!("{} raw", scoped.scope_label),
+            format!(
+                "util {:.3} · constraining {} (ceiling {}) · fetched {}",
+                window.utilization,
+                yes_no(scoped.is_constraining(now, fable_ceiling)),
+                format::percent(fable_ceiling),
+                ago(window.fetched_at),
+            ),
+        ));
+    }
+
+    // --- cooldowns ---------------------------------------------------------
+    lines.push(modal_section("cooldown"));
+    lines.push(modal_row(
+        "account",
+        match account.cooldown_until {
+            None => format!("none · source {dash}"),
+            Some(at) => format!(
+                "until {} · source {}",
+                until(at),
+                match account.cooldown_source {
+                    Some(crate::scheduler::CooldownSource::RetryAfter) => "retry-after",
+                    Some(crate::scheduler::CooldownSource::Heuristic) => "heuristic",
+                    None => "—",
+                }
+            ),
+        },
+    ));
+    if account.scoped_cooldowns.is_empty() {
+        lines.push(modal_row("scoped", format!("{dash} (none parked)")));
+    }
+    for cooldown in &account.scoped_cooldowns {
+        lines.push(modal_row(
+            cooldown.scope.label().unwrap_or("account-wide"),
+            format!(
+                "until {} · set {} · reason {:?}",
+                until(cooldown.until),
+                ago(cooldown.set_at),
+                cooldown.reason,
+            ),
+        ));
+    }
+
+    // --- ceilings ----------------------------------------------------------
+    let (five_max, seven_max, fable_max) = select::effective_limits(account, params);
+    let override_of = |value: Option<f64>, global: f64| match value {
+        Some(v) => format!("{} (override)", format::percent(v)),
+        None => format!("{dash} (global {})", format::percent(global)),
+    };
+    lines.push(modal_section("limits"));
+    lines.push(modal_row(
+        "override",
+        format!(
+            "5h {} · 7d {} · fbl {}",
+            override_of(account.limits.five_hour_max, params.five_hour_max),
+            override_of(account.limits.seven_day_max, params.seven_day_max),
+            override_of(account.limits.fable_weekly_max, params.fable_weekly_max),
+        ),
+    ));
+    lines.push(modal_row(
+        "effective",
+        format!(
+            "5h {} · 7d {} · fbl {}",
+            format::percent(five_max),
+            format::percent(seven_max),
+            format::percent(fable_max),
+        ),
+    ));
+
+    // --- lifetime totals ---------------------------------------------------
+    let totals = view.totals_for(&account.id.0);
+    lines.push(modal_section("lifetime"));
+    lines.push(modal_row(
+        "requests",
+        format!(
+            "{} req · {} ok · {} err",
+            format::human_count(totals.requests),
+            format::human_count(totals.ok),
+            format::human_count(totals.errors),
+        ),
+    ));
+    lines.push(modal_row(
+        "tokens",
+        format!(
+            "in {} · out {} · total {}",
+            format::human_count(totals.tokens_in),
+            format::human_count(totals.tokens_out),
+            format::human_count(totals.tokens_in.saturating_add(totals.tokens_out)),
+        ),
+    ));
+
+    // --- usage poller health ----------------------------------------------
+    lines.push(modal_section("poll"));
+    match view.poll_health(&account.id.0) {
+        Some(health) => {
+            lines.push(modal_row(
+                "health",
+                format!(
+                    "{} · failures {}",
+                    health
+                        .last_ok
+                        .map(|at| format!("ok {}", ago(at)))
+                        .unwrap_or_else(|| "no success yet".into()),
+                    health.consecutive_failures,
+                ),
+            ));
+            lines.push(modal_row("next", until(health.next_at)));
+        }
+        None if account.credential_kind == "oauth" => {
+            lines.push(modal_row("health", "not polled yet".into()))
+        }
+        // apikey/codex accounts have no Anthropic usage endpoint to poll.
+        None => lines.push(modal_row(
+            "health",
+            format!("n/a ({})", account.credential_kind),
+        )),
+    }
+
+    // --- usage controls (.prd/16) ------------------------------------------
+    lines.push(modal_section("resets"));
+    match view.usage_control(&account.id.0) {
+        None => lines.push(modal_row(
+            "control",
+            super::view::reset_detail(None, account.credential_kind, now),
+        )),
+        Some(control) => {
+            lines.push(modal_row(
+                "counts",
+                format!(
+                    "available {} · applicable {}",
+                    control
+                        .available_resets
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| dash.clone()),
+                    control
+                        .applicable_resets
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| dash.clone()),
+                ),
+            ));
+            lines.push(modal_row(
+                "credits",
+                if control.credits.is_empty() {
+                    format!("{dash} (none listed)")
+                } else {
+                    format!("{} listed", control.credits.len())
+                },
+            ));
+            for (i, credit) in control.credits.iter().enumerate() {
+                let field = |value: &Option<String>| value.clone().unwrap_or_else(|| dash.clone());
+                lines.push(modal_row(
+                    &format!("#{}", i + 1),
+                    format!(
+                        "id {} · type {} · status {} · granted {} · expires {} · title {} · desc {}",
+                        field(&credit.id),
+                        field(&credit.reset_type),
+                        field(&credit.status),
+                        field(&credit.granted_at),
+                        field(&credit.expires_at),
+                        field(&credit.title),
+                        field(&credit.description),
+                    ),
+                ));
+            }
+            let stamp = |ms: Option<u64>| {
+                ms.map(|ms| ago(UNIX_EPOCH + Duration::from_millis(ms)))
+                    .unwrap_or_else(|| dash.clone())
+            };
+            lines.push(modal_row(
+                "last",
+                format!(
+                    "refresh {} · reset {} · error {} ({})",
+                    stamp(control.last_refresh_ms),
+                    stamp(control.last_reset_ms),
+                    control.last_error.clone().unwrap_or_else(|| dash.clone()),
+                    stamp(control.last_error_ms),
+                ),
+            ));
+            lines.push(modal_row(
+                "pending",
+                format!(
+                    "request {} · credit {}",
+                    control
+                        .pending_request_id
+                        .clone()
+                        .unwrap_or_else(|| dash.clone()),
+                    control
+                        .pending_credit_id
+                        .clone()
+                        .unwrap_or_else(|| dash.clone()),
+                ),
+            ));
+        }
+    }
+    lines
+}
+
+/// The account detail modal (.prd/19 rules 6–7): everything the view records
+/// about ONE account, opened by a left-click on its table row and pinned to
+/// the account's REAL id. `None` = that id is no longer in the snapshot, the
+/// runtime's signal to close the modal (same contract as the input modal's
+/// aged-out entry).
+fn draw_account_modal(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    modal: &AccountModal,
+) -> Option<u16> {
+    let account = view
+        .snapshot
+        .accounts
+        .iter()
+        .find(|a| a.id.0 == modal.account)?;
+
+    let area = centered_rect(frame.area(), 80, 85);
+    frame.render_widget(Clear, area);
+
+    let title = format!(
+        " 🔍 account — {} · {} · {} ",
+        masked_name(&account.id.0, ctx.mask),
+        account.credential_kind,
+        account.group.as_str().to_uppercase(),
+    );
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(dim())
+        .title(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
+    let inner = block.inner(area);
+
+    let lines = account_modal_lines(view, ctx, chrome, account);
+    let total: usize = lines
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            wrapped_line_count(&text, inner.width)
+        })
+        .sum();
+    let max_scroll = (total as u16).saturating_sub(inner.height);
+    let scroll = modal.scroll.min(max_scroll);
+
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
+    Some(max_scroll)
+}
+
 // ---------------------------------------------------------------------------
 // Raw request/response viewer (UI-7): a CDT-style modal over MAIN with
 // Request/Response tabs — general metadata, headers, and the FULL captured
@@ -5704,6 +6193,11 @@ pub(crate) struct MainChrome {
     /// visible inner height) so the runtime can clamp its stored offset; `None`
     /// means no modal was open OR its entry aged out of the ring (→ close it).
     pub input_modal_max_scroll: Option<u16>,
+    /// Set by `draw` after rendering the account detail modal (.prd/19 rule 6),
+    /// with the same contract as [`Self::input_modal_max_scroll`]: `Some(max)`
+    /// clamps the stored scroll, `None` means no modal was open OR its pinned
+    /// account left the snapshot (→ close it).
+    pub account_modal_max_scroll: Option<u16>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
@@ -9144,6 +9638,7 @@ mod tests {
             usage_scroll: 0,
             input_modal: None,
             raw_modal: None,
+            account_modal: None,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -11577,6 +12072,188 @@ mod tests {
             hits.expect("layout").input_modal_max_scroll,
             None,
             "aged-out entry yields the close signal"
+        );
+    }
+
+    /// A view whose single account carries EVERY optional datum the modal can
+    /// print: both windows, a scoped Fable limit, a scoped cooldown, an
+    /// account-wide cooldown, a ceiling override, totals, poll health, a
+    /// manual pin and a usage-control document with one credit.
+    fn rich_account_view() -> (DashboardView, String) {
+        use crate::proxy::usage_controls::UsageControlDoc;
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{
+            LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource,
+        };
+        use crate::scheduler::{
+            AccountId, AccountSnapshot, Cooldown429Reason, CooldownScope, CooldownSource,
+            ManualPin, ModelScopedCooldown,
+        };
+
+        let name = "claude:me@example.com".to_string();
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId(name.clone()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(QuotaWindow {
+                utilization: 0.42,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now - Duration::from_secs(180),
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: Some(QuotaWindow {
+                utilization: 0.61,
+                resets_at: now + Duration::from_secs(400_000),
+                fetched_at: now - Duration::from_secs(180),
+                source: WindowSource::Headers,
+            }),
+            scoped_limits: vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: QuotaWindow {
+                    utilization: 0.97,
+                    resets_at: now + Duration::from_secs(80_000),
+                    fetched_at: now - Duration::from_secs(180),
+                    source: WindowSource::UsagePoll,
+                },
+                severity: LimitSeverity::Critical,
+                is_active: true,
+            }],
+            scoped_cooldowns: vec![ModelScopedCooldown {
+                scope: CooldownScope::ModelScoped("Fable".into()),
+                until: now + Duration::from_secs(90),
+                set_at: now - Duration::from_secs(30),
+                reason: Cooldown429Reason::FableObservedCritical,
+            }],
+            cooldown_until: Some(now + Duration::from_secs(45)),
+            cooldown_source: Some(CooldownSource::RetryAfter),
+            in_flight: 2,
+            token_expires_at_ms: Some(1_780_000_000_000),
+            last_refresh_ms: Some(1_779_000_000_000),
+            paused: false,
+            limits: crate::config::AccountLimits {
+                five_hour_max: None,
+                seven_day_max: Some(0.95),
+                fable_weekly_max: None,
+            },
+        }];
+        view.snapshot
+            .current
+            .insert(BackendGroup::Claude, AccountId(name.clone()));
+        view.snapshot
+            .fable_current
+            .insert(BackendGroup::Claude, AccountId(name.clone()));
+        view.snapshot.manual_pin.insert(
+            BackendGroup::Claude,
+            ManualPin {
+                account: AccountId(name.clone()),
+                until: now + Duration::from_secs(240),
+            },
+        );
+        view.session_totals.insert(
+            name.clone(),
+            super::super::activity::Totals {
+                requests: 12,
+                ok: 11,
+                errors: 1,
+                tokens_in: 1_200,
+                tokens_out: 300,
+            },
+        );
+        view.poll_health.insert(
+            name.clone(),
+            super::super::PollHealth {
+                last_ok: Some(now - Duration::from_secs(180)),
+                consecutive_failures: 0,
+                next_at: now + Duration::from_secs(120),
+            },
+        );
+        view.usage_controls.insert(
+            name.clone(),
+            UsageControlDoc {
+                available_resets: Some(3),
+                applicable_resets: Some(0),
+                credits: vec![crate::auth::codex_usage::ResetCredit {
+                    id: Some("cr-1".into()),
+                    reset_type: Some("codex_rate_limits".into()),
+                    status: Some("available".into()),
+                    ..Default::default()
+                }],
+                last_refresh_ms: Some(1_779_000_000_000),
+                ..Default::default()
+            },
+        );
+        (view, name)
+    }
+
+    /// .prd/19 rule 7: the modal prints every recorded section for one account.
+    /// Asserted on the MODAL's own rect (the table beneath also says `status`
+    /// and `account`), so a label can never pass from the surface underneath.
+    #[test]
+    fn account_modal_renders_every_section() {
+        let (view, name) = rich_account_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: name.clone(),
+            scroll: 0,
+        });
+        let (w, h) = (120u16, 50u16);
+        let rows = render_rows(&view, &chrome, w, h);
+        let area = centered_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            80,
+            85,
+        );
+        let body: String = rows
+            [area.y as usize..(area.y as usize + area.height as usize).min(rows.len())]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(area.x as usize)
+                    .take(area.width as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            "identity", "status", "token", "windows", "5h raw", "7d raw", "scoped", "cooldown",
+            "limits", "lifetime", "poll", "resets",
+        ] {
+            assert!(body.contains(label), "section `{label}` missing:\n{body}");
+        }
+        assert!(body.contains(&name), "the account name is in the modal");
+        assert!(
+            body.contains("esc close"),
+            "the close hint rides the modal border:\n{body}"
+        );
+    }
+
+    /// .prd/19 rule 6: a modal pinned to an account that left the snapshot
+    /// draws nothing and reports `None` — the runtime's close signal.
+    #[test]
+    fn account_modal_closes_when_account_gone() {
+        let (view, _) = rich_account_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: "claude:gone@example.com".into(),
+            scroll: 0,
+        });
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        assert_eq!(
+            hits.expect("layout").account_modal_max_scroll,
+            None,
+            "a vanished account yields the close signal"
         );
     }
 

@@ -545,6 +545,10 @@ pub(crate) struct Chrome {
     /// closed. Content-owning (cheap to clone — the body lines sit behind an
     /// `Arc`), drawn last like the input modal.
     pub raw_modal: Option<RawModal>,
+    /// The click-opened account detail modal (.prd/19 rules 6–7), or `None`
+    /// when closed. Like the input modal it stores only an identity; the body
+    /// is rebuilt from the snapshot every frame.
+    pub account_modal: Option<AccountModal>,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -554,6 +558,17 @@ pub(crate) struct Chrome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputModal {
     pub key: activity::ActivityKey,
+    pub scroll: u16,
+}
+
+/// The click-opened account detail modal (.prd/19 rules 6–7). Holds the
+/// account's REAL id — never a display index, because the table reorders every
+/// frame (`display_order`) — plus the vertical scroll offset in wrapped lines.
+/// The body is rebuilt from `view.snapshot` each frame, so it never goes stale
+/// and the render pass closes it when the account leaves the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountModal {
+    pub account: String,
     pub scroll: u16,
 }
 
@@ -929,6 +944,10 @@ struct App {
     input_modal: Option<InputModal>,
     /// The click-opened raw request/response viewer (UI-7); `None` when closed.
     raw_modal: Option<RawModal>,
+    /// The click-opened account detail modal (.prd/19 rule 6); `None` when
+    /// closed. Same post-draw reconcile as `input_modal`: the render pass
+    /// clamps the scroll, or closes the modal when the pinned account is gone.
+    account_modal: Option<AccountModal>,
     /// A queued raw-record fetch, drained by the event loop into a background
     /// task (same pattern as the other `pending_*` remote ops).
     pending_raw: Option<RawFetchReq>,
@@ -1032,6 +1051,7 @@ impl App {
             usage_scroll: 0,
             input_modal: None,
             raw_modal: None,
+            account_modal: None,
             pending_raw: None,
             raw_tx: None,
             raw_generation: 0,
@@ -1262,6 +1282,7 @@ impl App {
                 m.spin = self.frame;
                 m
             }),
+            account_modal: self.account_modal.clone(),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -1402,6 +1423,12 @@ impl App {
             self.on_key_raw_modal(key.code);
             return;
         }
+        // The account detail modal (.prd/19 rule 6) swallows keys the same way:
+        // `q` scrolls nothing and quits nothing while it is open.
+        if self.account_modal.is_some() {
+            self.on_key_account_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -1511,6 +1538,17 @@ impl App {
                         }
                     }
                 }
+            }
+            return true;
+        }
+        // The account detail modal (.prd/19 rule 6) owns the mouse the same
+        // way: the wheel scrolls it (clamped after draw), every other event is
+        // swallowed so a click can't reach the row beneath it.
+        if let Some(modal) = self.account_modal.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(3),
+                _ => {}
             }
             return true;
         }
@@ -1658,6 +1696,43 @@ impl App {
             }
             return false;
         }
+        // Left-click on an accounts row opens the account detail modal
+        // (.prd/19 rule 6). Works on MAIN and on the accounts overlay, which
+        // render the same table; the modal blocks above already returned when
+        // one is open, so no modal can be stacked. Checked BEFORE the MAIN
+        // match because the row rects are their own set — separator drags, the
+        // settings bar and the activity panel occupy different rows and are
+        // untouched.
+        if self.mode == Mode::Normal
+            && matches!(self.overlay, Overlay::None | Overlay::Accounts)
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(idx) = self
+                .account_row_chrome
+                .iter()
+                .find(|r| {
+                    mouse.row == r.area.y
+                        && mouse.column >= r.area.x
+                        && mouse.column < r.area.right()
+                })
+                .map(|r| r.display_idx)
+            {
+                // Pin the REAL account id now; display indexes reorder.
+                if let Some(id) = view.and_then(|v| {
+                    let order = v.display_order(self.account_sort, SystemTime::now());
+                    order
+                        .get(idx)
+                        .and_then(|&i| v.snapshot.accounts.get(i))
+                        .map(|a| a.id.0.clone())
+                }) {
+                    self.account_modal = Some(AccountModal {
+                        account: id,
+                        scroll: 0,
+                    });
+                }
+                return true;
+            }
+        }
         // Otherwise only MAIN (no overlay, no pending mode interaction) gets
         // the mouse.
         if self.overlay != Overlay::None || self.mode != Mode::Normal {
@@ -1795,6 +1870,26 @@ impl App {
         };
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.input_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    /// Key handling while the account detail modal is open (.prd/19 rule 6) —
+    /// the same key set as [`Self::on_key_input_modal`]: Esc/q/Enter close,
+    /// the arrows/PgUp/PgDn/Home/End scroll, everything else is swallowed so
+    /// no key reaches the table beneath.
+    fn on_key_account_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.account_modal.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.account_modal = None,
             KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
             KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
@@ -5250,6 +5345,19 @@ async fn event_loop(
                     None => app.input_modal = None,
                 }
             }
+            // Same reconcile for the account detail modal (.prd/19 rule 6):
+            // `Some(max)` clamps the scroll, `None` means the pinned account
+            // is no longer in the snapshot so the modal closes.
+            if app.account_modal.is_some() {
+                match main.account_modal_max_scroll {
+                    Some(max) => {
+                        if let Some(modal) = app.account_modal.as_mut() {
+                            modal.scroll = modal.scroll.min(max);
+                        }
+                    }
+                    None => app.account_modal = None,
+                }
+            }
             // Clamp the raw viewer's scroll offsets against what this frame
             // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
             // clamp — the modal owns its content and never closes on aging.
@@ -6245,6 +6353,143 @@ mod tests {
             "vanished pin acts on no one"
         );
         assert!(app.status_line().is_some_and(|s| s.contains("gone")));
+    }
+
+    /// Two accounts, so a click on display row 1 has a real id to resolve to.
+    fn two_account_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
+        view
+    }
+
+    /// .prd/19 rule 6: a left-click on an accounts row opens the detail modal
+    /// pinned to the REAL account id at that display position (never the index
+    /// — the table reorders), on MAIN *and* on the accounts overlay.
+    #[test]
+    fn account_click_opens_detail_modal_pinned_by_id() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = two_account_view();
+        // Display row 1 under the active sort — asserted, not assumed.
+        let order = view.display_order(triage::AccountSort::default(), SystemTime::now());
+        let wanted = view.snapshot.accounts[order[1]].id.0.clone();
+        assert_eq!(wanted, "claude:b@x.com");
+        let lclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        for overlay in [Overlay::None, Overlay::Accounts] {
+            let mut app = remote_app();
+            app.overlay = overlay;
+            app.account_row_chrome = vec![ui::AccountRowHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 6,
+                    width: 80,
+                    height: 1,
+                },
+                display_idx: 1,
+            }];
+            assert!(app.on_mouse(lclick, Some(&view)), "{overlay:?}");
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.as_str()),
+                Some(wanted.as_str()),
+                "{overlay:?}: modal pinned to the real id"
+            );
+            assert_eq!(app.account_modal.as_ref().map(|m| m.scroll), Some(0));
+            assert_eq!(app.mode, Mode::Normal, "{overlay:?}: no row cursor moved");
+            assert_eq!(app.menu_account, None, "{overlay:?}: no context menu");
+        }
+    }
+
+    /// .prd/19 rule 6: while the modal is open every key and click beneath it
+    /// is swallowed — `q` closes the modal instead of quitting, a row click
+    /// neither re-pins nor opens a menu, and Esc closes.
+    #[test]
+    fn account_modal_swallows_keys_and_clicks() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = two_account_view();
+        let open = |app: &mut App| {
+            app.account_modal = Some(AccountModal {
+                account: "claude:a@x.com".into(),
+                scroll: 0,
+            });
+        };
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 6,
+                width: 80,
+                height: 1,
+            },
+            display_idx: 1,
+        }];
+        open(&mut app);
+        // `q` never reaches the quit handler beneath the modal.
+        app.on_key(press(KeyCode::Char('q')), Some(&view));
+        assert!(!app.should_quit, "q does not quit while the modal is open");
+        assert!(app.account_modal.is_none(), "q closes the modal itself");
+
+        open(&mut app);
+        // An unbound key is swallowed: MAIN's activity scroll must not move.
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), Some(&view));
+        assert_eq!(app.activity_scroll, before, "keys don't leak beneath");
+        assert!(app.account_modal.is_some());
+        // Arrows scroll the modal, PgDn pages it.
+        app.on_key(press(KeyCode::Down), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, 1);
+        app.on_key(press(KeyCode::PageDown), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, 1 + MODAL_PAGE);
+
+        // A left-click on a row is consumed: the pin does not move, no menu
+        // opens, the mode stays Normal.
+        let lclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            app.on_mouse(lclick, Some(&view)),
+            "the modal eats the click"
+        );
+        assert_eq!(
+            app.account_modal.as_ref().map(|m| m.account.as_str()),
+            Some("claude:a@x.com"),
+            "the click did not re-pin the modal"
+        );
+        assert_eq!(app.menu_account, None);
+        assert_eq!(app.mode, Mode::Normal);
+        // The wheel scrolls it instead of the activity panel.
+        let before = app.account_modal.as_ref().unwrap().scroll;
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 6), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, before + 3);
+        assert_eq!(app.activity_scroll, 0, "the wheel did not reach MAIN");
+
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        assert!(app.account_modal.is_none(), "esc closes the modal");
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
