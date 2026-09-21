@@ -33,6 +33,17 @@ const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval while waiting for readiness / port release.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long we keep watching a drained daemon's pid after the port frees.
+/// hyper releases the listener the instant shutdown starts but keeps the
+/// PROCESS alive until every in-flight connection closes, so "port is free"
+/// never meant "old daemon is gone" — on iq-64 (2026-09-10..21) `llmux
+/// restart` reported success while pid 91799 kept running for 25 days, its
+/// refresh loop rotating the same OAuth refresh tokens as the new daemon.
+/// Short: this is a courtesy note, not a gate — the successor is already
+/// starting and the old process now bounds itself
+/// ([`crate::proxy::server::SHUTDOWN_DRAIN_DEADLINE`]).
+const LINGER_GRACE: Duration = Duration::from_secs(5);
+
 /// What is (or is not) listening on the proxy port.
 #[derive(Debug)]
 pub enum ServerProbe {
@@ -182,7 +193,10 @@ pub async fn ensure_server_running(
                 // binary against a healthy daemon.
                 exe = Some(resolve_server_exe(server_exe.clone())?);
                 // Drain the old daemon cooperatively before we spawn over it.
-                shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT).await?;
+                // Its pid comes from the probe we already have, so the drain
+                // can report a process that outlives its port.
+                shutdown_and_wait(port, api_key, RESTART_DRAIN_TIMEOUT, status_pid(&status))
+                    .await?;
                 restarting = true;
             } else {
                 return Ok(EnsureOutcome::AlreadyRunning);
@@ -394,10 +408,18 @@ async fn wait_until_ready(
 /// `NotRunning`. Never SIGKILLs; if the port is still held at the deadline it
 /// returns an error. The caller is responsible for having confirmed a
 /// llmux (not foreign) daemon is on the port first.
+///
+/// `old_pid` (from [`status_pid`] on the probe the caller already did) turns
+/// "the port is free" into a statement about the PROCESS too: a daemon whose
+/// in-flight connections never close outlives its port by design, so we watch
+/// the pid for [`LINGER_GRACE`] and say so on stderr instead of letting a
+/// silent "restarted" imply the old daemon is gone. Informational only — never
+/// an error, never a signal.
 async fn shutdown_and_wait(
     port: u16,
     api_key: Option<&str>,
     timeout: Duration,
+    old_pid: Option<u32>,
 ) -> Result<(), CliError> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -423,7 +445,7 @@ async fn shutdown_and_wait(
     let deadline = Instant::now() + timeout;
     loop {
         if let ServerProbe::NotRunning = probe_server(&proxy_base_url(port), api_key).await? {
-            return Ok(());
+            break;
         }
         if Instant::now() >= deadline {
             return Err(CliError::Message(format!(
@@ -433,6 +455,79 @@ async fn shutdown_and_wait(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+
+    if let Some(pid) = old_pid {
+        if !wait_for_exit(pid, LINGER_GRACE).await {
+            // stderr, not stdout: the restart SUCCEEDED (the new daemon owns
+            // the port) — this is a note about a process that is finishing its
+            // own business, so it must not pollute a piped "restarted ..." line.
+            // The CLI cannot know which build the old daemon is. A daemon with
+            // the drain deadline exits by itself; an older one (the iq-64 pid
+            // 91799 class) drains forever — so promise nothing, say what to
+            // check, and name the manual exit.
+            eprintln!("{}", linger_note(pid));
+        }
+    }
+    Ok(())
+}
+
+/// The stderr note for an old daemon that outlived its port. Two things it
+/// deliberately does NOT promise: that the daemon exits at all (only builds
+/// carrying `SHUTDOWN_DRAIN_DEADLINE` do, and the CLI is talking about a
+/// process it did not build), and a hard process-exit time (the deadline
+/// bounds the connection DRAIN; the daemon then still settles a pending token
+/// refresh and its config persist before returning). Names the manual exit so
+/// the operator is not left waiting on either.
+fn linger_note(pid: u32) -> String {
+    format!(
+        "note: old daemon (pid {pid}) released the port but is still alive, draining \
+         in-flight connections. Daemons at or above this version stop draining after \
+         {}m by default ({} overrides it) and then finish shutting down (a pending token \
+         refresh may add up to {}s); an older daemon may drain indefinitely — if the pid \
+         is still alive well past that, stop it with `kill {pid}`.",
+        crate::proxy::server::SHUTDOWN_DRAIN_DEADLINE.as_secs() / 60,
+        crate::proxy::server::SHUTDOWN_DRAIN_DEADLINE_ENV,
+        crate::proxy::server::REFRESH_SETTLE_TIMEOUT.as_secs()
+    )
+}
+
+/// Poll `pid` until it exits or `timeout` elapses; `true` = it is gone.
+async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Is `pid` still a live process? `kill(pid, 0)` performs the existence +
+/// permission check WITHOUT delivering a signal — we only ever observe the old
+/// daemon, never SIGKILL it (a drain we cut short is a dropped client
+/// response). A pid we are not allowed to signal (`EPERM`) counts as alive;
+/// only "no such process" counts as gone.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 is a pure query — no signal is delivered,
+    // no memory is touched, and any errno (ESRCH/EPERM) is reported in the
+    // return value.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Non-unix has no `libc` dependency here (see `Cargo.toml`
+/// `[target.'cfg(unix)'.dependencies]`); report "gone" so the note is simply
+/// never printed rather than guessed at.
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    false
 }
 
 /// `llmux reset-usage` — `POST /llmux/reset-usage` on the target daemon
@@ -509,7 +604,9 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
     let port = config.proxy.port;
     let api_key = config.proxy.api_key.as_deref();
 
-    match probe_server(&proxy_base_url(port), api_key).await? {
+    // The probe that proves it IS llmux also carries the pid, so the drain can
+    // tell the user when the process outlives the port.
+    let old_pid = match probe_server(&proxy_base_url(port), api_key).await? {
         ServerProbe::NotRunning => {
             println!("server not running on port {port}");
             return Ok(());
@@ -525,10 +622,10 @@ pub async fn stop(_args: StopArgs) -> Result<(), CliError> {
                 "port {port} is in use by something that is not llmux ({detail}) — refusing to stop it"
             )));
         }
-        ServerProbe::Running { .. } => {}
-    }
+        ServerProbe::Running { status } => status_pid(&status),
+    };
 
-    shutdown_and_wait(port, api_key, READY_TIMEOUT).await?;
+    shutdown_and_wait(port, api_key, READY_TIMEOUT, old_pid).await?;
     println!("stopped llmux server on port {port}");
     Ok(())
 }
@@ -692,6 +789,66 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         port
+    }
+
+    /// The linger note may not promise an automatic exit (the old daemon may
+    /// predate the drain deadline) nor a hard exit TIME (the deadline bounds
+    /// the drain, not the process — review M3, both rounds). It must name the
+    /// pid, scope the claim to this version and to draining, mention the
+    /// settle tail, and hand over the manual stop.
+    #[test]
+    fn linger_note_scopes_the_claim_to_draining_and_names_the_manual_stop() {
+        let note = linger_note(91799);
+        assert!(note.contains("pid 91799"), "{note}");
+        assert!(
+            note.contains("at or above this version stop draining after 10m"),
+            "{note}"
+        );
+        assert!(
+            note.contains("pending token refresh may add up to 30s"),
+            "{note}"
+        );
+        assert!(
+            note.contains("an older daemon may drain indefinitely"),
+            "{note}"
+        );
+        assert!(note.contains("kill 91799"), "{note}");
+        assert!(!note.contains("exit by themselves"), "{note}");
+        assert!(!note.contains("exits by itself"), "{note}");
+    }
+
+    /// "The port is free" never meant "the old daemon exited" (iq-64: pid
+    /// 91799 outlived its port by 25 days), so the liveness probe has to be
+    /// right about both answers: this process is alive, a reaped child is not.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_distinguishes_a_live_process_from_an_exited_one() {
+        assert!(pid_alive(std::process::id()), "our own pid is alive");
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        // `wait` REAPS it — an unreaped zombie still answers kill(pid, 0).
+        child.wait().expect("child exits");
+        assert!(!pid_alive(pid), "a reaped child (pid {pid}) is gone");
+    }
+
+    /// The linger watch is bounded: a pid that never exits must return
+    /// "still alive" at the deadline instead of hanging the CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_exit_gives_up_on_a_live_pid_and_returns_at_once_for_a_dead_one() {
+        assert!(
+            !wait_for_exit(std::process::id(), Duration::from_millis(120)).await,
+            "a live pid must time out, not report exit"
+        );
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let pid = child.id();
+        child.wait().expect("child exits");
+        assert!(wait_for_exit(pid, Duration::from_secs(5)).await);
     }
 
     #[tokio::test]

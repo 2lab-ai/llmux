@@ -1349,7 +1349,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         }
                         continue;
                     }
-                    RefreshOutcome::Permanent => {
+                    RefreshOutcome::Permanent { detail } => {
                         // Only bench if the dead refresh token is still the
                         // account's live credential (relogin-trace B1).
                         state
@@ -1357,7 +1357,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             .record_auth_failure_if(&account, lease.fingerprint());
                         state.emit(ActivityEvent::Error {
                             context: Some("refresh".into()),
-                            message: format!("{account}: refresh token dead; re-login required"),
+                            message: format!(
+                                "{account}: refresh token dead ({detail}); re-login required"
+                            ),
                         });
                         drop(lease);
                         switches += 1;
@@ -2066,7 +2068,11 @@ pub(crate) enum RefreshOutcome {
     /// New tokens are live in the pool (and persisted); use this credential.
     Refreshed(AccountCredential),
     /// Refresh token is dead (401/invalid_grant) — re-login required.
-    Permanent,
+    /// `detail` is the upstream reason rendered by [`refresh_death_detail`]:
+    /// without it the operator-visible message said only "refresh token dead",
+    /// which hid the one distinction that matters — expired (just re-login)
+    /// vs. rotated-out-from-under-us by a second daemon (iq-64, 2026-09-10..21).
+    Permanent { detail: String },
     /// Transient refresh failure — old token may still work.
     Failed,
     /// The account was RE-CREDENTIALED (a re-login) while this refresh was in
@@ -2075,6 +2081,98 @@ pub(crate) enum RefreshOutcome {
     /// pool or the config file; the caller must fall back to whatever the pool
     /// holds now, and must NOT treat this as an auth failure.
     Superseded,
+}
+
+/// Longest reason we quote in a refresh-death detail — enough to recognise an
+/// HTML error page or a provider incident string, short enough to stay one
+/// line in the TUI log. Applied to EVERY branch (structured fields included):
+/// a provider's `error_description` is as unparsed, from our point of view,
+/// as an HTML page.
+const RAW_DETAIL_LIMIT: usize = 120;
+
+/// Appended when the upstream reason says the refresh token is unknown rather
+/// than merely expired: that is the signature of a SECOND process rotating the
+/// same refresh-token family, not of a stale login.
+const ROTATED_HINT: &str =
+    " — token was rotated elsewhere (another llmux daemon or a copied config using this login?)";
+
+/// Appended when the upstream says "revoked": most often the same rotation
+/// story (grok phrases a superseded token this way), but a user revoking the
+/// grant in the provider's account settings produces the identical sentence,
+/// so the hint names both.
+const REVOKED_HINT: &str =
+    " — token was rotated elsewhere (another llmux daemon or a copied config?) or the grant was revoked upstream";
+
+/// Render the upstream reason a refresh died, for the operator-facing message.
+///
+/// WHY this exists: the message used to be "refresh token dead; re-login
+/// required" and nothing else, which hid the only distinction that changes what
+/// the operator should DO. On iq-64 (2026-09-10..21) a retired daemon kept
+/// draining for 25 days and its background refresh loop kept rotating the same
+/// OAuth refresh-token family as its successor; the loser saw `invalid_grant
+/// "Refresh token not found or invalid"` and benched a perfectly good account.
+/// Re-logging in would have been undone by the next tick — the actual fix was
+/// killing the zombie daemon.
+///
+/// Both anthropic and grok answer `{"error": ..., "error_description": ...}`,
+/// so the preference order is `error_description` (the actionable sentence),
+/// then `error`, then the raw body. Whichever branch wins, the text is
+/// upstream-authored and lands in the activity log and the TUI, so every
+/// branch goes through the same sanitizer: credentials masked, whitespace
+/// collapsed to one line, length bounded. A structured field is not trusted
+/// more than an HTML page just because it parsed.
+pub(crate) fn refresh_death_detail(status: &StatusCode, body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|doc| doc.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let reason = match (field("error"), field("error_description")) {
+        (Some(error), Some(description)) => format!("{error}: {description}"),
+        (Some(error), None) => error,
+        (None, Some(description)) => description,
+        (None, None) => body.to_string(),
+    };
+    let reason = sanitize_detail(&reason);
+    // An empty/whitespace body would otherwise render as a dangling status.
+    let reason = if reason.is_empty() {
+        "no upstream detail".to_string()
+    } else {
+        reason
+    };
+    let hint = {
+        let lower = reason.to_lowercase();
+        if lower.contains("not found or invalid") {
+            ROTATED_HINT
+        } else if lower.contains("revoked") {
+            REVOKED_HINT
+        } else {
+            ""
+        }
+    };
+    format!("{} {reason}{hint}", status.as_u16())
+}
+
+/// The one sanitizer every refresh-death reason passes through, structured
+/// or raw: mask credential-shaped tokens, collapse to one line, bound length.
+fn sanitize_detail(text: &str) -> String {
+    collapse_and_truncate(&super::logging::mask_credentials(text), RAW_DETAIL_LIMIT)
+}
+
+/// One-line rendering of an arbitrary payload: runs of whitespace (a pretty
+/// -printed JSON body, an HTML page) become single spaces, then cut to `limit`
+/// CHARACTERS — never bytes, so a multi-byte body cannot panic the slice.
+fn collapse_and_truncate(text: &str, limit: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}…", &collapsed[..cut]),
+        None => collapsed,
+    }
 }
 
 /// Refresh an oauth credential through the [`RefreshCoalescer`] (concurrent
@@ -2219,7 +2317,9 @@ pub(crate) async fn refresh_credential(
         }
         Err(crate::auth::AuthError::RefreshPermanent { status, body }) => {
             tracing::warn!(account = %account, %status, %body, "refresh token dead; re-login required");
-            RefreshOutcome::Permanent
+            RefreshOutcome::Permanent {
+                detail: refresh_death_detail(&status, &body),
+            }
         }
         Err(err) => {
             tracing::warn!(account = %account, error = %err, "token refresh failed (transient)");
@@ -3170,6 +3270,127 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    /// The refresh-death message must carry the upstream reason, and must call
+    /// out the one reason that is NOT "your login expired": a token the
+    /// provider no longer knows (or has revoked) is what a second process
+    /// rotating the same refresh-token family produces — the iq-64 zombie
+    /// daemon (2026-09-10..21), where re-logging in would have fixed nothing.
+    #[test]
+    fn refresh_death_detail_quotes_upstream_reason_and_flags_rotation() {
+        let anthropic = r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, anthropic);
+        assert!(
+            detail.contains("invalid_grant: Refresh token not found or invalid"),
+            "{detail}"
+        );
+        assert!(detail.starts_with("400 "), "{detail}");
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+
+        // grok phrases the same situation as "revoked".
+        let grok =
+            r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, grok);
+        assert!(
+            detail.contains("Refresh token has been revoked"),
+            "{detail}"
+        );
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+    }
+
+    /// A STRUCTURED reason is still upstream-authored text headed for the
+    /// activity log: a token echoed back inside `error_description` must be
+    /// masked exactly as it would be in a raw body (review M1).
+    #[test]
+    fn refresh_death_detail_masks_credentials_inside_structured_fields() {
+        let body = r#"{"error":"invalid_grant","error_description":"token sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789 rejected; header was Bearer eyJhbGciOiJSUzI1NiJ9SECRETSECRETSECRET"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert!(!detail.contains("abcdefghijklmnopqrstuvwxyz"), "{detail}");
+        assert!(!detail.contains("SECRETSECRET"), "{detail}");
+        assert!(detail.contains("invalid_grant"), "{detail}");
+        assert!(
+            detail.contains("sk-ant-"),
+            "prefix kept for recognition: {detail}"
+        );
+    }
+
+    /// Newlines in a structured field would break the one-line TUI log row
+    /// (and let an upstream forge a second "log line"); collapse them.
+    #[test]
+    fn refresh_death_detail_collapses_newlines_in_structured_fields() {
+        let body = "{\"error\":\"invalid_grant\",\"error_description\":\"line one\\n\\nline   two\\r\\nline three\"}";
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert_eq!(detail, "400 invalid_grant: line one line two line three");
+    }
+
+    /// An oversized `error_description` is bounded like a raw body — the
+    /// status prefix, the limit, and one ellipsis, no more.
+    #[test]
+    fn refresh_death_detail_bounds_an_oversized_structured_reason() {
+        let long = "x".repeat(RAW_DETAIL_LIMIT * 3);
+        let body = format!(r#"{{"error":"invalid_grant","error_description":"{long}"}}"#);
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, &body);
+        assert!(detail.ends_with('…'), "{detail}");
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{} chars: {detail}",
+            detail.chars().count()
+        );
+    }
+
+    /// "revoked" is ambiguous (rotation OR an upstream grant revocation), so
+    /// its hint names both instead of asserting rotation.
+    #[test]
+    fn refresh_death_detail_softens_the_hint_for_revoked() {
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert!(detail.contains("revoked upstream"), "{detail}");
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+    }
+
+    /// A merely EXPIRED token is an ordinary re-login — no rotation hint, or
+    /// the hint stops meaning anything.
+    #[test]
+    fn refresh_death_detail_omits_the_hint_for_a_plain_expiry() {
+        let body = r#"{"error":"invalid_grant","error_description":"Refresh token expired"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert_eq!(detail, "400 invalid_grant: Refresh token expired");
+    }
+
+    /// A provider incident answers HTML, not JSON: quote what we got (one
+    /// line, bounded) instead of losing the reason or panicking.
+    #[test]
+    fn refresh_death_detail_falls_back_to_a_truncated_raw_body() {
+        let body = format!(
+            "<html>\n  <body>{}</body>\n</html>",
+            "gateway error ".repeat(40)
+        );
+        let detail = refresh_death_detail(&StatusCode::BAD_GATEWAY, &body);
+        assert!(
+            detail.starts_with("502 <html> <body>gateway error"),
+            "{detail}"
+        );
+        assert!(!detail.contains('\n'), "collapsed to one line: {detail}");
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{detail}"
+        );
+        assert!(!detail.contains("rotated elsewhere"), "{detail}");
+
+        // Degenerate bodies stay printable rather than trailing a bare status.
+        assert_eq!(
+            refresh_death_detail(&StatusCode::BAD_REQUEST, ""),
+            "400 no upstream detail"
+        );
+        // A multi-byte body must be cut on a char boundary, not a byte one.
+        let wide = "한".repeat(200);
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, &wide);
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{detail}"
+        );
+    }
 
     #[test]
     fn redacted_header_pairs_hide_credentials_keep_names() {

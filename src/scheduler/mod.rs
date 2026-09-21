@@ -1535,6 +1535,22 @@ impl AccountPool {
     /// naturally. A removed `current` clears the selection. A survivor whose
     /// credential actually CHANGED takes a new generation and has an
     /// `AuthFailed` health restored to `Healthy` — the re-login path.
+    ///
+    /// That heal ALSO drops the account's usage evidence (5h/7d windows and
+    /// scoped limits), so the account re-enters COLD. A re-login answers an
+    /// auth failure, which means every window on the entry was read under the
+    /// credential this re-login retired — evidence about a dead login. Keeping
+    /// it deadlocks the account: the staleness gate (`select::usage_is_stale`)
+    /// treats an old window as `UsageStale` → never selected → never receives
+    /// the response headers that would refill it, while the usage poller is
+    /// the only other refill path and can be
+    /// 429-rate-limited out. Observed on iq-64 2026-09-18..21: two re-logged
+    /// accounts sat at "usage stale 2d14h" for two days with healthy tokens.
+    /// A cold account (no live windows) is explicitly eligible, so dropping
+    /// the readings re-opens selection and the first response refills them.
+    /// Byte-identical credentials (no re-login) and healthy accounts whose
+    /// credential merely rotated (a token refresh landing as a reload — same
+    /// login, so its windows are still true) keep their windows.
     pub fn reload_accounts(&self, accounts: &[AccountConfig]) {
         let mut state = self.write();
         let next: Vec<AccountState> = accounts
@@ -1560,6 +1576,18 @@ impl AccountPool {
                             // something a credential can answer either.
                             if kept.health == AccountHealth::AuthFailed {
                                 kept.health = AccountHealth::Healthy;
+                                // Usage read under the RETIRED credential is
+                                // evidence about a dead login. Re-enter COLD
+                                // (cold is eligible, stale is not) or the
+                                // healed account can never be selected and so
+                                // can never refill from headers — the iq-64
+                                // "usage stale 2d14h" deadlock documented
+                                // above. Cooldowns, pause, ceilings and
+                                // in-flight leases are NOT usage evidence and
+                                // stay exactly as they were.
+                                kept.five_hour = None;
+                                kept.seven_day = None;
+                                kept.scoped_limits.clear();
                             }
                         }
                         kept.credential = config.credential.clone();
@@ -2848,16 +2876,13 @@ mod tests {
         );
     }
 
-    /// §L step 4: healing auth health is the ONLY thing a re-login changes —
-    /// quota windows, the operator pause and an active cooldown all survive it.
+    /// §L step 4: a re-login heals auth health and drops the usage evidence the
+    /// retired credential earned (see the window tests below) — but the
+    /// operator pause and an active cooldown are NOT usage evidence and
+    /// survive it.
     #[test]
-    fn reload_with_changed_credential_keeps_quota_pause_and_cooldown() {
+    fn reload_with_changed_credential_keeps_pause_and_cooldown() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_usage(
-            &id("a"),
-            &usage(Some(reading(0.42, NOW_SECS + 3600)), None),
-            now(),
-        );
         pool.record_429(&id("a"), Some(Duration::from_secs(600)), now());
         pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
         pool.record_auth_failure(&id("a"));
@@ -2867,14 +2892,109 @@ mod tests {
         let snapshot = pool.snapshot();
         let a = &snapshot.accounts[0];
         assert!(a.healthy, "auth failure healed");
-        assert_eq!(
-            a.five_hour.map(|w| w.utilization),
-            Some(0.42),
-            "quota window survives the credential swap"
-        );
         assert_eq!(a.cooldown_until, Some(now() + Duration::from_secs(600)));
         assert_eq!(a.cooldown_source, Some(CooldownSource::RetryAfter));
         assert!(a.paused, "the operator pause outlives a re-login");
+    }
+
+    /// iq-64 2026-09-18..21: `claude:ai2` / `claude:ai10` were re-logged out of
+    /// `AuthFailed` and then sat at "usage stale 2d14h" for two days — the
+    /// windows fetched under the RETIRED credential survived the re-login, and
+    /// a stale account is never selected, so no response header ever refilled
+    /// them (the usage poller was 429-rate-limited). The heal must hand the
+    /// account back COLD, which IS eligible.
+    #[test]
+    fn relogin_of_auth_failed_account_drops_stale_usage_windows() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        // Read while the now-retired credential was still live.
+        pool.record_usage(
+            &id("a"),
+            &usage_with_fable(
+                Some(reading(0.42, NOW_SECS + 3600)),
+                Some(reading(0.80, NOW_SECS + 86_400)),
+                fable_reading(0.30, true, false),
+            ),
+            at(NOW_SECS - 200_000),
+        );
+        pool.record_auth_failure(&id("a"));
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        let state = pool.read();
+        let a = &state.accounts[0];
+        assert_eq!(a.health, AccountHealth::Healthy, "the re-login heals");
+        assert!(
+            a.five_hour.is_none(),
+            "5h window was read under the retired credential"
+        );
+        assert!(
+            a.seven_day.is_none(),
+            "7d window was read under the retired credential"
+        );
+        assert!(
+            a.scoped_limits.is_empty(),
+            "scoped limits are usage evidence too"
+        );
+    }
+
+    /// A credential that rotates on a HEALTHY account (a token refresh landing
+    /// as a config reload) is the SAME login: it answers no auth failure, so
+    /// its windows are still true and must not be thrown away.
+    #[test]
+    fn relogin_of_healthy_account_keeps_usage_windows() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_usage(
+            &id("a"),
+            &usage_with_fable(
+                Some(reading(0.42, NOW_SECS + 3600)),
+                Some(reading(0.80, NOW_SECS + 86_400)),
+                fable_reading(0.30, true, false),
+            ),
+            now(),
+        );
+
+        pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
+
+        let state = pool.read();
+        let a = &state.accounts[0];
+        assert_eq!(
+            a.five_hour.map(|w| w.utilization),
+            Some(0.42),
+            "a healthy account's windows survive a credential rotation"
+        );
+        assert_eq!(a.seven_day.map(|w| w.utilization), Some(0.80));
+        assert_eq!(a.scoped_limits.len(), 1, "scoped limits survive too");
+    }
+
+    /// §L step 4 again, from the usage side: a byte-identical credential is no
+    /// re-login at all, so it neither heals the auth failure nor discards the
+    /// windows — an unrelated reload (a pause toggle) must change nothing.
+    #[test]
+    fn identical_credential_reload_keeps_windows_and_health() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_usage(
+            &id("a"),
+            &usage_with_fable(
+                Some(reading(0.42, NOW_SECS + 3600)),
+                Some(reading(0.80, NOW_SECS + 86_400)),
+                fable_reading(0.30, true, false),
+            ),
+            at(NOW_SECS - 200_000),
+        );
+        pool.record_auth_failure(&id("a"));
+
+        pool.reload_accounts(&[oauth_account("a")]);
+
+        let state = pool.read();
+        let a = &state.accounts[0];
+        assert_eq!(
+            a.health,
+            AccountHealth::AuthFailed,
+            "same credential bytes are not a re-login"
+        );
+        assert_eq!(a.five_hour.map(|w| w.utilization), Some(0.42));
+        assert_eq!(a.seven_day.map(|w| w.utilization), Some(0.80));
+        assert_eq!(a.scoped_limits.len(), 1);
     }
 
     /// `docs/keys-history/relogin-trace.md` B1: a 401 earned by the credential
