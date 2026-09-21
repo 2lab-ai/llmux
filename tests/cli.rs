@@ -864,6 +864,116 @@ async fn run_injects_base_url_and_propagates_exit_code() {
     assert_eq!(code, Some(7), "stdout: {stdout}\nstderr: {stderr}");
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown drain deadline — the REAL binary, end to end (iq-64 zombie daemon,
+// 2026-09-10..21): a client that never closes its connection must not keep a
+// retired daemon alive past the drain deadline. Runs `llmux server --no-tui`
+// with `LLMUX_SHUTDOWN_DRAIN_DEADLINE_SECS=1`, holds a half-sent request open,
+// POSTs `/llmux/shutdown`, and asserts the PROCESS exits — not just that the
+// port frees — with the deadline warning on stderr.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
+    use std::io::{BufRead as _, Read as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let h = Harness::new();
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+        probe.local_addr().expect("probe addr").port()
+    };
+    h.seed_config(&format!(
+        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey"}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
+    ));
+
+    let mut cmd = h.cmd();
+    cmd.arg("server")
+        .arg("--no-tui")
+        .env("LLMUX_SHUTDOWN_DRAIN_DEADLINE_SECS", "1")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn llmux server");
+    let stderr = child.stderr.take().expect("child stderr");
+    // Drain stderr on a thread so the child can never block on a full pipe;
+    // collect it for the final assertion.
+    let stderr_lines = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            out.push(line);
+        }
+        out
+    });
+
+    // Wait for the listener.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut hang = loop {
+        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+            break stream;
+        }
+        assert!(Instant::now() < deadline, "server never listened on {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // A request that never finishes: declares a 100-byte body, sends 7.
+    hang.write_all(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\npartial")
+        .expect("send partial request");
+
+    // Ask for shutdown through the control plane, like `llmux stop` does.
+    let mut ctl = TcpStream::connect(("127.0.0.1", port)).expect("control connect");
+    // Bounded: a regression in the shutdown reply must fail this test, not
+    // hang the suite on an unbounded read.
+    ctl.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("control read timeout");
+    ctl.write_all(
+        b"POST /llmux/shutdown HTTP/1.1\r\nHost: x\r\nx-api-key: testkey\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .expect("send shutdown");
+    let mut reply = String::new();
+    let _ = ctl.read_to_string(&mut reply);
+    if !reply.starts_with("HTTP/1.1 200") {
+        let _ = child.kill();
+        panic!("shutdown reply: {reply:?}");
+    }
+    let requested_at = Instant::now();
+
+    // The PROCESS must exit while `hang` is still open — the deadline is 1s,
+    // the settle tail is bounded, so 15s is generous.
+    let exit_deadline = requested_at + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            panic!("server still alive 15s after shutdown with a hung connection open");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let lived = requested_at.elapsed();
+    drop(hang);
+    let lines = stderr_lines.join().expect("stderr thread");
+    let joined = lines.join("\n");
+    assert!(status.success(), "exit status {status:?}\n{joined}");
+    assert!(
+        lived >= Duration::from_millis(900),
+        "exited before the deadline could have fired: {lived:?}\n{joined}"
+    );
+    assert!(
+        joined.contains("shutdown drain deadline reached; exiting with connections still open"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("background loops stopping; draining in-flight connections (deadline 1s)"),
+        "{joined}"
+    );
+}
+
 /// Wall-clock seconds since the epoch (for building future token expiries).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
