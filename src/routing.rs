@@ -503,6 +503,7 @@ mod tests {
             BackendGroup::Claude
         );
         assert_eq!(builtin().classify(Some("sonnet[1m]")), BackendGroup::Claude);
+        assert_eq!(builtin().classify(Some("grok-4.7[1m]")), BackendGroup::Grok);
         assert_eq!(builtin().classify(Some("grok-4.6[1m]")), BackendGroup::Grok);
         assert_eq!(builtin().classify(Some("grok[1m]")), BackendGroup::Grok);
     }
@@ -771,6 +772,7 @@ mod tests {
             ("o1", BackendGroup::Codex),
             ("sol", BackendGroup::Codex),
             ("astra", BackendGroup::Codex),
+            ("grok-4.7", BackendGroup::Grok),
             ("grok-4.6", BackendGroup::Grok),
             ("grok", BackendGroup::Grok),
         ] {

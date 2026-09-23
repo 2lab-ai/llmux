@@ -488,13 +488,42 @@ mod tests {
   ]
 }"#;
         let config: Config = serde_json::from_str(raw).expect("pre-grok config parses");
-        assert_eq!(config.grok.default_model, "grok-4.6", "defaults fill in");
+        assert_eq!(config.grok.default_model, "grok-4.7", "defaults fill in");
         assert!(config.routing.grok_models.is_empty());
         // Round-trip: serialize → parse → identical value (additive-only).
         let round: Config =
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("round trip");
         assert_eq!(round, config);
+    }
+
+    /// The default-pin roll (`grok-4.6` → `grok-4.7`, 2026-09-23) must move
+    /// only the DEFAULT: an on-disk config that names a model keeps it, and a
+    /// `grok` section that omits the field still picks up the new default.
+    #[test]
+    fn explicit_grok_model_survives_a_default_pin_roll() {
+        let raw = r#"{
+  "version": 1,
+  "grok": { "default_model": "grok-4.6" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(
+            config.grok.default_model, "grok-4.6",
+            "an explicit pin is never rewritten to the new default"
+        );
+    }
+
+    #[test]
+    fn grok_section_without_a_model_takes_the_current_default() {
+        let raw = r#"{
+  "version": 1,
+  "grok": { "reasoning_effort": "high" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(config.grok.default_model, "grok-4.7");
+        assert_eq!(config.grok.reasoning_effort.as_deref(), Some("high"));
     }
 
     pub(crate) fn oauth_account(name: &str, uuid: &str) -> AccountConfig {

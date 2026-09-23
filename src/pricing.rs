@@ -90,10 +90,17 @@ const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
 /// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
 const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
-/// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; cached-input not listed
-/// on the page — carried from grok-4.5's $0.50/M rate. API-list-price
-/// equivalent for subscription traffic, like the other grok rows.
+/// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; the $0.50/M cached input
+/// was carried from grok-4.5 when this row landed and is now LISTED on the
+/// page itself (docs.x.ai, re-read 2026-09-23) — same number, no longer an
+/// inference. API-list-price equivalent for subscription traffic, like the
+/// other grok rows.
 const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// grok-4.7 (docs.x.ai pricing, 2026-09-23): $2 in / $6 out / $0.50 cached
+/// input, no cache-creation charge — unchanged from grok-4.6. The
+/// ≥200k-prompt long-context tier (rates double) is not modeled.
+/// API-list-price equivalent for subscription traffic.
+const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -122,6 +129,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
         "grok-4.5" => Some(GROK_4_5),
+        "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
         _ => None,
     };
@@ -359,6 +367,13 @@ mod tests {
         let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
         assert_eq!(
             (p6.input, p6.output, p6.cache_read, p6.cache_creation),
+            (2.0, 6.0, 0.5, 0.0)
+        );
+        // grok-4.7 (docs.x.ai 2026-09-23): same rates as 4.6 — the
+        // ≥200k-prompt long-context tier is deliberately not modeled.
+        let p7 = price_for("grok", "grok-4.7", &overrides).expect("grok-4.7 priced");
+        assert_eq!(
+            (p7.input, p7.output, p7.cache_read, p7.cache_creation),
             (2.0, 6.0, 0.5, 0.0)
         );
         let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
