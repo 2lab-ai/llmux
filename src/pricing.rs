@@ -15,7 +15,8 @@
 //! providers uniformly — codex models simply carry `cache_creation: 0.0`.
 //!
 //! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
-//! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23.
+//! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
+//! anthropic.com/claude-opus-5-5, 2026-09-22.
 
 use std::collections::HashMap;
 
@@ -57,6 +58,10 @@ impl ModelPrice {
 /// Opus-tier rates {input 5.0, output 25.0, cache_read 0.5, cache_creation 6.25}.
 /// Also the `group == "claude"` unknown-model fallback.
 const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25);
+/// Opus 5.5 (Anthropic announcement 2026-09-22): $4 in / $20 out / cache read
+/// 0.20 / cache write 5.0 — 20% below the opus tier, cache reads 60% below, so
+/// it must NOT fall to the `claude-opus-` prefix fallback.
+const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0);
 /// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75}.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
 /// Haiku-tier rates {1.0, 5.0, 0.1, 1.25}.
@@ -105,6 +110,7 @@ const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
 fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     // Exact (post-normalization) matches.
     let exact = match model_norm_lower {
+        "claude-opus-5-5" => Some(OPUS_5_5),
         "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
         | "claude-opus-4-5" => Some(OPUS_TIER),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
@@ -134,7 +140,15 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         return Some(OPENROUTER_FREE);
     }
     // Prefix fallback for versioned / suffixed slugs.
-    if model_norm_lower.starts_with("claude-opus-") {
+    if model_norm_lower.starts_with("claude-opus-5-5-") {
+        // Opus 5.5 is CHEAPER than the opus tier ($4/$20 vs $5/$25), so a dated
+        // snapshot must be caught here before the generic `claude-opus-` branch
+        // below overcharges it — same ordering as `gpt-6-astra-` ahead of
+        // `gpt-6-`. The trailing `-` is the version boundary: `claude-opus-5-50-*`
+        // and `claude-opus-5-5x` are DIFFERENT models and must miss this branch
+        // and fall to the opus tier.
+        Some(OPUS_5_5)
+    } else if model_norm_lower.starts_with("claude-opus-") {
         Some(OPUS_TIER)
     } else if model_norm_lower.starts_with("claude-sonnet-") {
         Some(SONNET_TIER)
@@ -405,6 +419,108 @@ mod tests {
             &empty(),
         );
         approx(cost, 6.25);
+    }
+
+    #[test]
+    fn opus_5_5_input_one_million_is_four_dollars() {
+        let cost = cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(cost, 4.00);
+    }
+
+    #[test]
+    fn opus_5_5_output_one_million_is_twenty_dollars() {
+        let cost = cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            &tc(0, 1_000_000, None, None),
+            &empty(),
+        );
+        approx(cost, 20.00);
+    }
+
+    #[test]
+    fn opus_5_5_cache_read_one_million_is_twenty_cents() {
+        let cost = cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            &tc(0, 0, Some(1_000_000), None),
+            &empty(),
+        );
+        approx(cost, 0.20);
+    }
+
+    #[test]
+    fn opus_5_5_cache_creation_one_million_is_five_dollars() {
+        let cost = cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            &tc(0, 0, None, Some(1_000_000)),
+            &empty(),
+        );
+        approx(cost, 5.00);
+    }
+
+    /// The display slug carries the client-side `[1m]` denominator, not a
+    /// different upstream model — `normalize_model` strips it, so both spellings
+    /// must price identically.
+    #[test]
+    fn opus_5_5_display_slug_prices_like_the_bare_slug() {
+        let cost = cost_usd(
+            "claude",
+            "claude-opus-5-5[1m]",
+            &tc(1_000_000, 0, None, None),
+            &empty(),
+        );
+        approx(cost, 4.00);
+    }
+
+    /// `opus` floated onto Opus 5.5 on 2026-09-23 while `opus-5` stayed pinned
+    /// to Opus 5. Pricing resolves through `normalize_model`, so the two aliases
+    /// must now land on DIFFERENT rates — this is the guard against the alias
+    /// roll silently leaving 5.5 traffic billed at the old opus tier.
+    #[test]
+    fn opus_alias_prices_at_five_five_while_opus_5_keeps_the_opus_tier() {
+        approx(
+            cost_usd("claude", "opus", &tc(1_000_000, 0, None, None), &empty()),
+            4.00,
+        );
+        approx(
+            cost_usd("claude", "opus-5", &tc(1_000_000, 0, None, None), &empty()),
+            5.00,
+        );
+    }
+
+    /// A dated Opus 5.5 snapshot takes the 5.5 rate, not the opus tier — the
+    /// `claude-opus-5-5-` branch has to sit AHEAD of the generic `claude-opus-`
+    /// fallback or every snapshot is billed 25% high. The version boundary is
+    /// the trailing `-`: `claude-opus-5-50-*` / `claude-opus-5-5x` are other
+    /// models and stay on the opus tier, as does a bare `claude-opus-5-` stem.
+    #[test]
+    fn opus_5_5_dated_snapshot_takes_the_five_five_rate_not_the_opus_tier() {
+        approx(
+            cost_usd(
+                "claude",
+                "claude-opus-5-5-20260922",
+                &tc(1_000_000, 0, None, None),
+                &empty(),
+            ),
+            4.00,
+        );
+        for near_miss in [
+            "claude-opus-5-",
+            "claude-opus-5-50-20260922",
+            "claude-opus-5-5x",
+        ] {
+            approx(
+                cost_usd("claude", near_miss, &tc(1_000_000, 0, None, None), &empty()),
+                5.00,
+            );
+        }
     }
 
     #[test]

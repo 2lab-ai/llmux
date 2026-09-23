@@ -68,7 +68,8 @@ not that it is zero.
   | request slug     | catalog id            | model on the wire  |
   | ---------------- | --------------------- | ------------------ |
   | `fable`, `fable-5-1` | `claude-fable-5-1[1m]` | `claude-fable-5-1` |
-  | `opus`, `opus-5` | `claude-opus-5[1m]`   | `claude-opus-5`    |
+  | `opus`, `opus-5-5` | `claude-opus-5-5[1m]` | `claude-opus-5-5` |
+  | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
   | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
   | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
 
@@ -125,8 +126,11 @@ not that it is zero.
 - **alias stability** — aliases float to the current generation, ids do not.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
-  owns an alias). Anyone who needs one specific model must send its full catalog
-  id — that is the stable handle. Usage and pricing are booked against the
+  owns an alias), then from `claude-opus-5[1m]` to `claude-opus-5-5[1m]` on
+  2026-09-23. The version alias `opus-5` did NOT move — it stays on
+  `claude-opus-5[1m]`, because floating a version-pinned alias onto a new model
+  would be silent substitution. Anyone who needs one specific model must send
+  its full catalog id — that is the stable handle. Usage and pricing are booked against the
   resolved id, not the alias, so alias traffic lands on the same row as id
   traffic.
 
@@ -161,7 +165,9 @@ model it does not curate.
 | ------------------- | ------------ | ------------------- | ------------------------------------ | ----------- | ------ |
 | claude-fable-5-1[1m] | fable, fable-5-1 | Claude Fable 5.1 | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-fable-5[1m]  | —            | Claude Fable 5      | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-opus-5[1m]   | opus, opus-5 | Claude Opus 5 [1M]  | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-opus-5-5[1m] | opus, opus-5-5 | Claude Opus 5.5 [1M] | low, medium, high, xhigh, max      | 1000000     | claude |
+| claude-opus-5-5     | —            | Claude Opus 5.5     | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-opus-5[1m]   | opus-5       | Claude Opus 5 [1M]  | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
@@ -288,9 +294,10 @@ upstream, untouched.
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
-2026-07-27, the codex context windows were re-probed 2026-08-21 (the codex
-effort menus are unchanged from 2026-07-14), and the grok rows were re-probed
-2026-08-26 (unchanged — see below).
+2026-07-27 and again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
+`opus` alias rolled onto it), the codex context windows were re-probed
+2026-08-21 (the codex effort menus are unchanged from 2026-07-14), and the grok
+rows were re-probed 2026-08-26 (unchanged — see below).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -298,6 +305,11 @@ effort menus are unchanged from 2026-07-14), and the grok rows were re-probed
   the user contract; llmux does not itself shape claude requests. The claude
   rows now live as the `CLAUDE_MODELS` const in `src/catalog.rs`, which is also
   the source for alias→id resolution in `src/provider/anthropic.rs`.
+- **claude-opus-5-5** — Anthropic announcement 2026-09-22
+  (`claude-opus-5-5`, 1M context, 128k max output, $4/M input, $20/M output,
+  cache read $0.20/M, cache write $5/M); the Claude Code 2.1.280 binary model
+  record lists `claude-opus-5-5` with `supports_1m_suffix` (and the literal
+  string `claude-opus-5-5[1m]`), which is why the `[1m]` row exists.
 - **Codex effort menus and base context windows** — the openai/codex model
   catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh

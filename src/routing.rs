@@ -761,6 +761,7 @@ mod tests {
         // they are PREFIXES, not an `o*` wildcard, so `or-…` never matches.
         let c = Classifier::default();
         for (model, expected) in [
+            ("claude-opus-5-5", BackendGroup::Claude),
             ("claude-opus-5", BackendGroup::Claude),
             ("opus", BackendGroup::Claude),
             ("fable", BackendGroup::Claude),
@@ -805,6 +806,10 @@ mod tests {
         );
         // A recognized family still wins over the default.
         assert_eq!(c.classify(Some("claude-opus-5")), BackendGroup::Claude);
+        assert_eq!(
+            c.classify(Some("claude-opus-5-5[1m]")),
+            BackendGroup::Claude
+        );
     }
 
     #[test]

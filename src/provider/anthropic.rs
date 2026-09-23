@@ -24,7 +24,7 @@ use crate::config::AccountCredential;
 /// claude ALIAS in `model` to its catalog id, strip the Claude-Code-local
 /// `[1m]` context-window suffix from `model`, and strip foreign (unsigned)
 /// thinking blocks from `messages` (issue #116). The two model steps run in
-/// that order and compose (`opus` → `claude-opus-5[1m]` → `claude-opus-5`).
+/// that order and compose (`opus` → `claude-opus-5-5[1m]` → `claude-opus-5-5`).
 /// Because the alias step runs FIRST, an alias that already carries the client
 /// suffix (`opus[1m]`, `fable[1m]`) must resolve too — that is handled on the
 /// needle side in [`crate::catalog::resolve_claude_alias`].
@@ -341,7 +341,8 @@ mod tests {
     /// the two compose into the real upstream id.
     #[test]
     fn normalize_body_resolves_curated_claude_aliases() {
-        assert_eq!(normalized_model("opus"), "claude-opus-5");
+        assert_eq!(normalized_model("opus"), "claude-opus-5-5");
+        assert_eq!(normalized_model("opus-5-5"), "claude-opus-5-5");
         assert_eq!(normalized_model("opus-5"), "claude-opus-5");
         assert_eq!(normalized_model("sonnet"), "claude-sonnet-5");
         assert_eq!(normalized_model("sonnet-5"), "claude-sonnet-5");
@@ -356,7 +357,7 @@ mod tests {
     #[test]
     fn normalize_body_resolves_an_alias_carrying_the_client_context_suffix() {
         assert_eq!(normalized_model("fable[1m]"), "claude-fable-5-1");
-        assert_eq!(normalized_model("opus[1m]"), "claude-opus-5");
+        assert_eq!(normalized_model("opus[1m]"), "claude-opus-5-5");
     }
 
     /// `haiku`'s catalog row carries NO `[1m]` suffix — proof the two steps
@@ -368,13 +369,14 @@ mod tests {
 
     #[test]
     fn normalize_body_resolves_aliases_case_insensitively_and_trimmed() {
-        assert_eq!(normalized_model("  OPUS  "), "claude-opus-5");
+        assert_eq!(normalized_model("  OPUS  "), "claude-opus-5-5");
     }
 
     /// A real id is not an alias: only the pre-existing suffix strip applies.
     #[test]
     fn normalize_body_leaves_a_real_id_to_the_suffix_strip() {
         assert_eq!(normalized_model("claude-opus-5[1m]"), "claude-opus-5");
+        assert_eq!(normalized_model("claude-opus-5-5[1m]"), "claude-opus-5-5");
     }
 
     /// A real id with no suffix and no alias match changes nothing — the body
