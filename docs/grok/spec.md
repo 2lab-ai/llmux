@@ -43,6 +43,7 @@ core with thin per-provider adapters.
 | Identity headers (cli-chat-proxy only) | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: 0.2.93`, `User-Agent: xai-grok-workspace/0.2.93` | xai_executor.go:66-69,1104-1111 |
 | Conversation header | `x-grok-conv-id: <session id>` | xai_executor.go:1085 |
 | Effort | `reasoning: {effort}` only for models with thinking levels; stripped otherwise | xai_executor.go:1206-1211 |
+| grok-4.7 | ctx 500K, max_out (not stated by /v1/models), thinking `low/medium/high/xhigh` (upstream default `high`), zero **not** allowed | live cli-chat-proxy /v1/models 2026-09-23 |
 | grok-4.6 | ctx 500K, max_out (not stated by /v1/models), thinking `low/medium/high/xhigh`, zero **not** allowed | live cli-chat-proxy /v1/models 2026-08-13 |
 | grok-4.5 | ctx 500K, max_out 65536, thinking `low/medium/high`, zero **not** allowed | registry models.json:2425-2443 |
 | grok-build-0.1 | fast coding model, ctx 256K, no thinking levels | models.json:2413-2423 |
@@ -50,7 +51,8 @@ core with thin per-provider adapters.
 | Active usage endpoint (**corrected 2026-09-17**) | `GET {base}/billing?format=credits` — the xAI CLI's own billing read. Headers: `Authorization: Bearer <access_token>`, `X-XAI-Token-Auth: xai-grok-cli`, `x-userid: <subject>`, `x-grok-client-version: <version>`, `Accept: application/json`; 15s timeout. 200 body: `config.currentPeriod{type,start,end}` + `creditUsagePercent` (0–100 USED) + `billingPeriodStart/End`; expired token → 401 `{"error":"Invalid or expired credentials (…)"}`. The earlier "no usage endpoint" claim was wrong: it probed /v1/{usage,rate_limits,quota,me} and grok.com/rest/rate-limits, never `/billing`. Passive `x-ratelimit-*` headers also exist (below) and remain the 5h source | xai-org/grok-build `crates/codegen/xai-grok-shell/src/extensions/billing.rs` + `credit_bar.rs`; same strings in the local grok CLI 1.0.34 binary; live capture 2026-09-17 (`creditUsagePercent: 65.0`, `USAGE_PERIOD_TYPE_WEEKLY`, period end `2026-09-22T02:19:18.817992+00:00`) |
 | Passive quota headers | 200 responses carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` (live capture: 900 req / 15M tok, no reset header) | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
-| Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in carried from grok-4.5 ($0.50/M; not listed) | docs.x.ai grok-4.6 (web, 2026-08-13) |
+| Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in listed $0.50/M (docs.x.ai 2026-09-23; carried from grok-4.5 when first recorded 2026-08-13) | docs.x.ai grok-4.6 (web, 2026-08-13 / re-read 2026-09-23) |
+| Pricing — grok-4.7 (API list price) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge; rates double for prompts ≥200K (tier not modeled) | docs.x.ai grok-4.7 (web, 2026-09-23) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
 
 ## Requirements → design
@@ -80,7 +82,7 @@ core with thin per-provider adapters.
   validation: https + hostname exactly `x.ai` or `*.x.ai` label-boundary suffix
   (mirror ValidateOAuthEndpoint, xai.go:47-64).
 - `GrokProvider` (new `src/provider/grok.rs`): thin adapter over the shared Responses
-  core (R5). `GrokShape { model: "grok-4.6" (default), client_model: Option, effort:
+  core (R5). `GrokShape { model: "grok-4.7" (default), client_model: Option, effort:
   Option }` — **no `fast`** (xAI has no service tier). Live-mutable behind `RwLock`
   exactly like `CodexShape` (codex.rs:96-125).
 - Request shape differences vs codex (adapter knobs, not forks):
@@ -98,7 +100,10 @@ core with thin per-provider adapters.
     document this include option; it is **not** OpenAI-exclusive. Foreign Anthropic thinking
     signatures are never converted into xAI encrypted content;
   - effort is **per-model capability, not provider-global**: a static thinking-levels
-    table (source: CLIProxyAPI registry models.json:2411-2520) —
+    table (source: CLIProxyAPI registry models.json:2411-2520; `grok-4.7` /
+    `grok-4.7-build-fast` from live cli-chat-proxy /v1/models 2026-09-23) —
+    `grok-4.7 → {low,medium,high,xhigh}`,
+    `grok-4.7-build-fast → {low,medium,high,xhigh}`,
     `grok-4.6 → {low,medium,high,xhigh}`, `grok-4.5 → {low,medium,high}`,
     `grok-4.3 → {none,low,medium,high}`,
     `grok-3-mini → {low,medium,high}`; models NOT in the table (e.g. `grok-build-0.1`,
@@ -107,7 +112,7 @@ core with thin per-provider adapters.
     requested/configured effort clamps INTO the model's level set: `none|minimal` → `low`
     when zero not allowed (else `none`), `xhigh|max|ultra` → `high` (amended
     2026-08-26: conditional since #138 — `xhigh` when the model's level set has it
-    (grok-4.6), `high` otherwise (grok-4.5); src/provider/grok.rs:297-300). When the clamped
+    (grok-4.7, grok-4.6), `high` otherwise (grok-4.5); src/provider/grok.rs:312-318). When the clamped
     result is `none` (only reachable on models whose level set contains it, e.g.
     grok-4.3), the `reasoning` field is OMITTED rather than sent as `"none"` —
     omission is this adapter's conservative wire policy; explicit `"none"` remains an
@@ -214,7 +219,7 @@ core with thin per-provider adapters.
   is delivered by the routing path above (verified in the live receipt), independent
   of these interactive control surfaces.
 - Config: new `config.grok` section `{upstream, default_model, reasoning_effort,
-  client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.6`, null, null, false).
+  client_model?, trace}` (defaults: cli-chat-proxy URL, `grok-4.7`, null, null, false).
 
 ### R5. Refactor: one Responses core, thin codex/grok adapters
 

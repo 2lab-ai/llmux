@@ -166,7 +166,7 @@ Grok settings are configurable in the config file and adjustable live from the d
 
 | Key | Default | Meaning |
 |---|---|---|
-| `grok.default_model` | `grok-4.6` | Upstream slug used when the client's model is not grok-shaped. Any `grok-*` slug is accepted, curated or not. |
+| `grok.default_model` | `grok-4.7` | Upstream slug used when the client's model is not grok-shaped. Any `grok-*` slug is accepted, curated or not. |
 | `grok.reasoning_effort` | unset | Optional: `none`, `low`, `medium`, `high`, or `xhigh`; unset = bypass (the client's own effort rides through). The value is clamped against the effective model's level set at request time, so `xhigh` reaches the wire on `grok-4.6` and lands as `high` on `grok-4.5`. |
 
 ## OpenRouter backend

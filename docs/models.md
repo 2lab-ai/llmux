@@ -47,7 +47,11 @@ not that it is zero.
 - **grok family alias** — `"grok"` is dynamic: it attaches to whichever grok id
   is the current live pin (`POST /llmux/grok` / `config.grok.default_model`). A
   bare `grok` request routes to that pin, so the catalog advertises the alias on
-  exactly the pinned entry. Any `grok-*` id also passes through verbatim.
+  exactly the pinned entry. Any `grok-*` id also passes through verbatim — after
+  one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
+  `src/provider/grok.rs`), so `grok-4.7[1m]` reaches xAI as `grok-4.7` and still
+  matches the per-model thinking-level table; `grok[1m]` resolves to the pin
+  exactly like `grok`.
 - **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
@@ -58,8 +62,10 @@ not that it is zero.
   Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
   (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
   advertised statically on the corresponding entries. The provider always
-  strips a trailing `[1m]` before the request leaves llmux, so bare and
-  suffixed aliases reach the backend as the same upstream slug.
+  strips a trailing `[1m]` before the request leaves llmux
+  (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
+  `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
+  same upstream slug.
 - **claude aliases** — the claude rows carry short user-curated aliases that
   both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
   rewritten to its catalog id before the request leaves llmux, so the alias
@@ -136,8 +142,8 @@ not that it is zero.
 
 ### Out-of-catalog grok pin
 
-The curated grok set is `grok-4.6` (the default pin) and `grok-4.5`.
-`config.grok.default_model` may pin ANY
+The curated grok set is `grok-4.7` (the default pin), `grok-4.6` and
+`grok-4.5`. `config.grok.default_model` may pin ANY
 `grok-*` slug — including ids not in the curated table below (e.g.
 `grok-4.3`, `grok-code-fast-1`). Because the provider forwards such ids
 verbatim, the pin is real and routable, so the `"grok"` family alias must have
@@ -182,7 +188,8 @@ model it does not curate.
 | gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
-| grok-4.6            | grok (pinned)| Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.6            | —            | Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
 | or-ox-alpha         | or (pinned)  | Ox Alpha (free)     | low, high, max                       | 1048576     | openrouter |
 | or-free             | —            | OpenRouter Free Models Router | —                          | 200000      | openrouter |
@@ -251,7 +258,7 @@ to any settings file:
 
 ```json
 { "modelPicker": { "options": [
-  { "model": "grok-4.6", "label": "Grok 4.6", "description": "grok · efforts low…xhigh · ctx 500000" }
+  { "model": "grok-4.7", "label": "Grok 4.7", "description": "grok · efforts low…xhigh · ctx 500000" }
 ] } }
 ```
 
@@ -297,7 +304,8 @@ Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
 2026-07-27 and again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
 `opus` alias rolled onto it), the codex context windows were re-probed
 2026-08-21 (the codex effort menus are unchanged from 2026-07-14), and the grok
-rows were re-probed 2026-08-26 (unchanged — see below).
+rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
+`grok-4.7` row, and the default pin moved 4.6 → 4.7 — see below).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -347,8 +355,21 @@ rows were re-probed 2026-08-26 (unchanged — see below).
   a real subscription token: `grok-4.6` `reasoning_efforts` `xhigh, high,
   medium, low` (upstream default `high`, ctx 500000), `grok-4.5` `high, medium,
   low` — no `xhigh` — ctx 500000. That asymmetry is why an above-`high` request
-  keeps `xhigh` on `grok-4.6` and clamps to `high` on `grok-4.5`. Grok effort
+  keeps `xhigh` on `grok-4.6` and clamps to `high` on `grok-4.5`. The `grok-4.7`
+  row (released 2026-09-21) was verified the same way against the live
+  `cli-chat-proxy` `/v1/models` on 2026-09-23 with a real subscription token:
+  `reasoning_efforts` `xhigh, high, medium, low` (upstream default `high`), ctx
+  500000 — no `none`, so an effort of `none` clamps to `low`. The same response
+  also carries `grok-4.7-build-fast` (identical menu and window); it is NOT
+  curated, but it is in the provider thinking-level table, so it gets that
+  effort menu when pinned or sent. The default pin moved `grok-4.6` → `grok-4.7`
+  on 2026-09-23. Grok effort
   menus come from the provider's per-model thinking-level table. The curated
-  grok set is `grok-4.6` (the default pin) and `grok-4.5`; other known grok ids
-  (`grok-4.3`, `grok-3-mini`, …) pass through at request time and synthesize a
-  null-metadata row when pinned.
+  grok set is `grok-4.7` (the default pin), `grok-4.6` and `grok-4.5`; other
+  known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
+  synthesize a null-metadata row when pinned.
+- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
+  is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
+  also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
+  grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
+  long-context tier.

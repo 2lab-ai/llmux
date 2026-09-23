@@ -13,7 +13,8 @@
 //! Sources (evidence gathered 2026-07-14; claude rows re-curated 2026-07-27;
 //! fable alias rolled to 5.1 on 2026-09-02; claude rows re-curated 2026-09-23
 //! to add the `claude-opus-5-5` pair and roll the floating `opus` alias off
-//! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`):
+//! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`; grok rows re-probed
+//! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7):
 //! - Claude rows: user-curated 2026-07-27, and they live in [`CLAUDE_MODELS`]
 //!   — that const is the SSOT for both these rows and the alias→id resolution
 //!   in [`crate::provider::anthropic`] (Claude Code model picker; `[1m]`
@@ -38,11 +39,13 @@
 //!   daemon.
 //! - Grok context windows / names: the live `cli-chat-proxy` `/v1/models`
 //!   probe — `grok-4.5` ctx 500000 (2026-07-14), `grok-4.6` ctx 500000, name
-//!   "Grok 4.6" (2026-08-13). Grok effort menus come from
+//!   "Grok 4.6" (2026-08-13), `grok-4.7` ctx 500000, name "Grok 4.7"
+//!   (2026-09-23; the same response also lists `grok-4.7-build-fast`, which is
+//!   NOT curated). Grok effort menus come from
 //!   [`crate::provider::grok::thinking_levels_catalog`] (models with no
-//!   thinking support get an empty menu). The curated grok set is `grok-4.6`
-//!   plus `grok-4.5`; any other `grok-*` id passes through at request time and
-//!   synthesizes a null-metadata row when pinned.
+//!   thinking support get an empty menu). The curated grok set is `grok-4.7`
+//!   plus `grok-4.6` and `grok-4.5`; any other `grok-*` id passes through at
+//!   request time and synthesizes a null-metadata row when pinned.
 
 use std::borrow::Cow;
 
@@ -127,6 +130,7 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
 /// here. The `"grok"` family alias is NOT in this table — it belongs to
 /// whichever row is the live pin (see [`catalog`]).
 const GROK_MODELS: &[(&str, &str, u64)] = &[
+    ("grok-4.7", "Grok 4.7", 500_000),
     ("grok-4.6", "Grok 4.6", 500_000),
     ("grok-4.5", "Grok 4.5", 500_000),
 ];
@@ -283,8 +287,9 @@ pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
 /// `grok_pin` / `codex_pin` are the live provider model slugs; the entry whose
 /// id equals `grok_pin` additionally advertises the `"grok"` family alias.
 ///
-/// The curated grok set is [`GROK_MODELS`] (`grok-4.6`, `grok-4.5`); when
-/// `grok_pin` matches NEITHER curated id (a config can pin ANY `grok-*` slug,
+/// The curated grok set is [`GROK_MODELS`] (`grok-4.7`, `grok-4.6`,
+/// `grok-4.5`); when
+/// `grok_pin` matches NO curated id (a config can pin ANY `grok-*` slug,
 /// e.g. `grok-code-fast-1`), a synthesized row is appended after the curated
 /// grok entries so the `"grok"` alias always has an owner: id = the pin, name =
 /// the pin verbatim, efforts from the thinking-level lookup (else empty),
@@ -510,14 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_31_entries() {
-        // The pinned (curated) case: exactly 31 rows, claude ids in order.
+    fn catalog_matches_user_contract_32_entries() {
+        // The pinned (curated) case: exactly 32 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
-        // landed (2026-09-07); 29 before the opus-5-5 pair landed (2026-09-23).
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 31);
+        // landed (2026-09-07); 29 before the opus-5-5 pair landed (2026-09-23);
+        // 31 before the grok-4.7 row landed (2026-09-23).
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(entries.len(), 32);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -729,7 +735,13 @@ mod tests {
 
     #[test]
     fn curated_grok_rows_carry_context_and_efforts() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        // grok-4.7: live /v1/models probe 2026-09-23 (ctx 500000, efforts
+        // xhigh/high/medium/low with default high — no `none`).
+        let g47 = find(&entries, "grok-4.7");
+        assert_eq!(g47.name, "Grok 4.7");
+        assert_eq!(g47.max_context, Some(500_000));
+        assert_eq!(g47.efforts, &["low", "medium", "high", "xhigh"]);
         // grok-4.6: live /v1/models probe 2026-08-13 (ctx 500000).
         let g46 = find(&entries, "grok-4.6");
         assert_eq!(g46.name, "Grok 4.6");
@@ -745,18 +757,27 @@ mod tests {
     #[test]
     fn grok_family_alias_follows_the_pin() {
         // Default pin: the newest curated row owns the alias.
+        let pinned = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(find(&pinned, "grok-4.7").aliases, vec!["grok".to_string()]);
+        assert!(find(&pinned, "grok-4.6").aliases.is_empty());
+        assert!(find(&pinned, "grok-4.5").aliases.is_empty());
+
+        // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(find(&pinned, "grok-4.6").aliases, vec!["grok".to_string()]);
+        assert!(find(&pinned, "grok-4.7").aliases.is_empty());
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
 
         // The older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.5", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(find(&pinned, "grok-4.5").aliases, vec!["grok".to_string()]);
+        assert!(find(&pinned, "grok-4.7").aliases.is_empty());
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
 
-        // Out-of-catalog pin: alias moves to the synthesized row, and NEITHER
+        // Out-of-catalog pin: alias moves to the synthesized row, and NO
         // curated row keeps it.
         let pinned = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert!(find(&pinned, "grok-4.7").aliases.is_empty());
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
         assert_eq!(find(&pinned, "grok-4.3").aliases, vec!["grok".to_string()]);
@@ -764,10 +785,14 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row, count 31.
-        for (pin, owner) in [("grok-4.6", "grok-4.6"), ("grok-4.5", "grok-4.5")] {
+        // A curated pin: no synthesized row, alias on the static row, count 32.
+        for (pin, owner) in [
+            ("grok-4.7", "grok-4.7"),
+            ("grok-4.6", "grok-4.6"),
+            ("grok-4.5", "grok-4.5"),
+        ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 31, "pin {pin}");
+            assert_eq!(entries.len(), 32, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -782,7 +807,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 32);
+        assert_eq!(entries.len(), 33);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -809,8 +834,9 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 32);
-        // Both curated rows survive an out-of-catalog pin.
+        assert_eq!(entries.len(), 33);
+        // All three curated rows survive an out-of-catalog pin.
+        assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.6").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.5").max_context, Some(500_000));
         let synth = find(&entries, "grok-4.3");
