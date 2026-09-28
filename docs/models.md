@@ -47,14 +47,19 @@ not that it is zero.
 - **grok family alias** — `"grok"` is dynamic: it attaches to whichever grok id
   is the current live pin (`POST /llmux/grok` / `config.grok.default_model`). A
   bare `grok` request routes to that pin, so the catalog advertises the alias on
-  exactly the pinned entry — the BASE row, never its `[1m]` twin (see
-  [The grok `[1m]` twin](#the-grok-1m-twin): the twin is an opt-in, because the
-  1M denominator Claude Code infers from it overstates xAI's real 500k
-  ceiling). Any `grok-*` id also passes through verbatim —
+  exactly the pinned entry — matched on the FULL id, with no preference for a
+  `[1m]` twin. Pinning `grok-4.7` therefore leaves the alias on the base row;
+  pinning `grok-4.7[1m]` puts it on the twin, which is an explicit operator
+  choice (see [The grok `[1m]` twin](#the-grok-1m-twin): llmux does not make
+  the 1M-denominated id the advertised default of the family, because the
+  denominator Claude Code infers from it overstates xAI's real 500k ceiling).
+  Any `grok-*` id also passes through verbatim —
   after one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
   `src/provider/grok.rs`), so `grok-4.7[1m]` reaches xAI as `grok-4.7` and still
   matches the per-model thinking-level table; `grok[1m]` resolves to the pin
-  exactly like `grok`.
+  exactly like `grok`. The same strip applies to the PIN itself, so a pinned
+  `grok-4.7[1m]` also leaves llmux as `grok-4.7` — the suffix is display
+  metadata on both sides.
 - **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
@@ -215,8 +220,9 @@ model it does not curate.
 "grok (pinned)" means the `grok` alias appears on that row only while
 `grok-4.7` is the live grok pin; any other pinned `grok-*` id takes the alias
 to its own curated row, or to a synthesized row when it is out of catalog
-(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). The `[1m]` twin is
-never the alias owner (see [The grok `[1m]` twin](#the-grok-1m-twin)). "or (pinned)" reads
+(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). A base-slug pin
+never hands the alias to the `[1m]` twin; pinning the suffixed id does
+(see [The grok `[1m]` twin](#the-grok-1m-twin)). "or (pinned)" reads
 the same way for the openrouter pin (see
 [Out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)); with the
 default pin it sits on `or-ox-alpha`. The openrouter ids are what a client
@@ -238,15 +244,25 @@ does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
 That 800k readout is **wrong about the backend**: xAI still cuts the request off
 at 500,000, so a session driven past 500k is rejected upstream while the client
 still shows headroom. The twin is therefore an **explicit opt-in**, not the
-default:
+face llmux puts on the family:
 
-- the bare `grok` alias stays on the pinned BASE row (`grok-4.7`), keeping
-  Claude Code's conservative 200k;
+- with the default pin `grok-4.7` the `grok` alias stays on the BASE row, so
+  `/llmux/models` and the picker present the conservative id as the family
+  default (the client window is unaffected either way — a bare `grok` is a
+  200k session in Claude Code regardless of who owns the alias, because the
+  client sizes off the id you submit);
 - the twin is listed after it, named `Grok 4.7 [1M] (500k upstream)` so the
   picker itself discloses the gap;
 - to use the bigger denominator, pick that row in `/model` or type
   `/model grok-4.7[1m]` (or `grok[1m]`, which resolves to the pin) — and stay
-  under 500k.
+  under 500k;
+- alias ownership follows the pin by exact id, so an operator who wants the
+  1M-denominated row to BE the advertised family default can pin it:
+  `config.grok.default_model = "grok-4.7[1m]"` moves the `grok` alias onto the
+  twin. llmux simply never chooses that for you. That pin changes only what
+  the catalog advertises — the provider normalises a pinned `[1m]` exactly as
+  it normalises a requested one, so the request still reaches xAI as
+  `grok-4.7` (and still finds its effort menu).
 
 This is deliberately NOT the astra arrangement: there the alias sits on the
 `[1m]` row because the 1M figure matches the backend, here it would not.
