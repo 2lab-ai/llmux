@@ -45,10 +45,14 @@ not that it is zero.
 ## Alias semantics
 
 - **grok family alias** — `"grok"` is dynamic: it attaches to whichever grok id
-  is the current live pin (`POST /llmux/grok` / `config.grok.default_model`). A
-  bare `grok` request routes to that pin, so the catalog advertises the alias on
-  exactly the pinned entry. Any `grok-*` id also passes through verbatim — after
-  one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
+  is the current live pin (`POST /llmux/grok` / `config.grok.default_model`),
+  preferring that pin's curated `[1m]` twin when one exists. With the default
+  pin `grok-4.7` the alias therefore sits on `grok-4.7[1m]` (the base
+  `grok-4.7` row carries none) — the astra asymmetry, so the ergonomic name
+  selects the larger client-side denominator; pinning `grok-4.6`, which has no
+  curated twin, puts the alias on `grok-4.6` itself. A bare `grok` request
+  routes to the pin either way. Any `grok-*` id also passes through verbatim —
+  after one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
   `src/provider/grok.rs`), so `grok-4.7[1m]` reaches xAI as `grok-4.7` and still
   matches the per-model thinking-level table; `grok[1m]` resolves to the pin
   exactly like `grok`.
@@ -142,8 +146,8 @@ not that it is zero.
 
 ### Out-of-catalog grok pin
 
-The curated grok set is `grok-4.7` (the default pin), `grok-4.6` and
-`grok-4.5`. `config.grok.default_model` may pin ANY
+The curated grok set is `grok-4.7[1m]` / `grok-4.7` (the default pin),
+`grok-4.6` and `grok-4.5`. `config.grok.default_model` may pin ANY
 `grok-*` slug — including ids not in the curated table below (e.g.
 `grok-4.3`, `grok-code-fast-1`). Because the provider forwards such ids
 verbatim, the pin is real and routable, so the `"grok"` family alias must have
@@ -188,7 +192,8 @@ model it does not curate.
 | gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
-| grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.7[1m]        | grok (pinned)| Grok 4.7 [1M]       | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.7            | —            | Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.6            | —            | Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
 | or-ox-alpha         | or (pinned)  | Ox Alpha (free)     | low, high, max                       | 1048576     | openrouter |
@@ -202,8 +207,11 @@ model it does not curate.
 | or-gemma-4-31b      | —            | Google Gemma 4 31B (free) | —                              | 262144      | openrouter |
 | or-gpt-oss-20b      | —            | OpenAI gpt-oss-20b (free) | low, medium, high              | 131072      | openrouter |
 
-"grok (pinned)" means the `grok` alias appears on that row only while it is the
-live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
+"grok (pinned)" means the `grok` alias appears on that row only while
+`grok-4.7` is the live grok pin (the alias rides the pin's `[1m]` twin when the
+curated set has one — see [alias semantics](#alias-semantics)); any other
+pinned `grok-*` id takes the alias to its own curated row, or to a synthesized
+row when it is out of catalog
 (see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). "or (pinned)" reads
 the same way for the openrouter pin (see
 [Out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)); with the
@@ -212,6 +220,21 @@ sends — the slug that reaches OpenRouter is the one in the
 [alias table](#alias-semantics), and every curated openrouter row is a free
 model (priced `$0` in and out; an UNCURATED openrouter model has no known
 rate and is reported unpriced, never as a free `$0`).
+
+### The grok `[1m]` twin
+
+`grok-4.7[1m]` and `grok-4.7` are the SAME upstream model — the provider strips
+one trailing `[1m]` before the request leaves llmux — which is why both rows
+advertise **500000**, xAI's real window from the live `/v1/models` probe. The
+twin exists only because of how Claude Code sizes its own readout: for an id it
+does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
+1M window (800k usable). Measured 2026-09-28 with Claude Code 2.1.283:
+`--model grok[1m]` → `/context` 143.1k/800k, `--model grok` → 200k. So the base
+row is the conservative 200k default and the twin is the way to see (and use)
+the 500k that is actually there — at the cost that a session driven past
+500,000 tokens is rejected UPSTREAM by xAI while Claude Code still shows
+headroom. The `grok` alias rides the twin for the same reason `astra` rides
+`gpt-6-astra[1m]`.
 
 ### The codex `[1m]` rows
 
@@ -298,6 +321,47 @@ used: it keeps only ids containing `claude`/`anthropic` and needs a credential
 header, both of which defeat the purpose here. `/v1/models` stays proxied
 upstream, untouched.
 
+### Alias exports
+
+The picker lineup alone cannot make `opus` mean what this catalog says it
+means. Measured 2026-09-28 with Claude Code 2.1.283: `sonnet`, `opus`, `haiku`,
+`fable` (and `sonnet[1m]` / `opus[1m]` / `fable[1m]`, plus `best` and
+`opusplan`) are NATIVE aliases the client resolves against its OWN model
+records before a request is built — `/model opus` reaches llmux as
+`claude-opus-5-5`, with the client's 200k compaction window, so the catalog's
+promise that `opus` is `claude-opus-5-5[1m]` never applies.
+
+So the same fetch that builds the lineup also exports, for the same launch:
+
+| env var                          | value = the catalog id owning the alias |
+| -------------------------------- | --------------------------------------- |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
+
+The values are DERIVED from the catalog alias owners at launch, never
+hardcoded: re-curating an alias onto a new row moves the export with it, and an
+alias no row owns is not exported at all (that family keeps Claude Code's own
+default). Measured effect: `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]`
+→ status line "Claude Opus 5.5 [1M]" and `/context` 221.2k/800k, versus 200k
+without it. Only the `_MODEL` variants are set — Claude Code's `_NAME`,
+`_DESCRIPTION` and `_SUPPORTED_CAPABILITIES` variants are left alone.
+
+- A var you already export is left alone (your value wins for that family; the
+  other three are still exported).
+- `llmux run --no-model-picker` disables the exports too — it is the single
+  "leave my Claude Code alone" switch. Your own `--settings`, by contrast,
+  drops only the picker document: the exports are env vars, not a settings
+  document, so they cannot collide with your lineup.
+- A failed catalog fetch exports nothing, exactly as it injects no lineup.
+
+This applies only to the four aliases Claude Code owns. An id it does not know
+(`astra`, `grok`, `or-ox-alpha`, …) is sent verbatim and gets its 200k
+assumption unless the typed id ends in `[1m]` — pick the `[1M]` row in the
+picker, or type `grok[1m]` / `astra`, whose catalog owner is already the `[1m]`
+row.
+
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
@@ -363,9 +427,12 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   also carries `grok-4.7-build-fast` (identical menu and window); it is NOT
   curated, but it is in the provider thinking-level table, so it gets that
   effort menu when pinned or sent. The default pin moved `grok-4.6` → `grok-4.7`
-  on 2026-09-23. Grok effort
+  on 2026-09-23, and the `grok-4.7[1m]` twin was added 2026-09-28 (same
+  upstream model, same 500000 — see
+  [The grok `[1m]` twin](#the-grok-1m-twin)). Grok effort
   menus come from the provider's per-model thinking-level table. The curated
-  grok set is `grok-4.7` (the default pin), `grok-4.6` and `grok-4.5`; other
+  grok set is `grok-4.7[1m]` / `grok-4.7` (the default pin), `grok-4.6` and
+  `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
   synthesize a null-metadata row when pinned.
 - **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`

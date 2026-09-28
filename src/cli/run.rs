@@ -1,7 +1,10 @@
 //! `llmux run [-- args]` — ensure the proxy is running (auto-starting a
 //! background daemon when needed), then spawn `claude` with the proxy env
 //! injected and (unless opted out) the llmux model catalog injected into
-//! Claude Code's `/model` picker.
+//! Claude Code: the `/model` picker lineup as a `--settings` document, and the
+//! catalog's alias owners as `ANTHROPIC_DEFAULT_*_MODEL` exports (the only way
+//! the aliases Claude Code resolves NATIVELY — `opus`, `fable`, `sonnet`,
+//! `haiku` — can mean what the llmux catalog says they mean).
 
 use std::time::Duration;
 
@@ -22,6 +25,10 @@ const CATALOG_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Deserialize)]
 struct CatalogRow {
     id: String,
+    /// Extra request slugs that resolve to this id — the source of the
+    /// `ANTHROPIC_DEFAULT_*_MODEL` exports (see [`alias_env`]).
+    #[serde(default)]
+    aliases: Vec<String>,
     name: String,
     #[serde(default)]
     efforts: Vec<String>,
@@ -114,6 +121,55 @@ fn row_description(row: &CatalogRow) -> String {
     parts.join(" · ")
 }
 
+/// The Claude Code aliases that never reach llmux, paired with the env var
+/// that redirects each one. Measured 2026-09-28 with Claude Code 2.1.283:
+/// `sonnet` / `opus` / `haiku` / `fable` (and their `[1m]` spellings) are
+/// NATIVE picker entries the client resolves against its OWN model records
+/// before a request is built, so `/model opus` sends `claude-opus-5-5` and the
+/// client sizes the session at 200k — llmux's catalog promise that the alias
+/// `opus` means `claude-opus-5-5[1m]` never gets a chance to apply. Exporting
+/// `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]` re-points the native
+/// record at the catalog's own id (measured: status line "Claude Opus 5.5
+/// [1M]", `/context` 221.2k/800k, versus 200k without it).
+///
+/// Only the `_MODEL` variants are set. Claude Code also reads `_NAME`,
+/// `_DESCRIPTION` and `_SUPPORTED_CAPABILITIES` for these families; llmux
+/// leaves them alone so the client keeps its own labels.
+const ALIAS_ENV: &[(&str, &str)] = &[
+    ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+    ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+    ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+];
+
+/// The `ANTHROPIC_DEFAULT_*_MODEL` exports for this catalog, PURELY from the
+/// fetched rows (so the mapping is unit-testable without a daemon or a child
+/// process): for each pair in [`ALIAS_ENV`], the FIRST row that advertises the
+/// alias contributes `(var, row.id)`.
+///
+/// Two rows are deliberately dropped:
+/// - an alias no catalog row owns exports nothing (a family llmux does not
+///   curate keeps Claude Code's own default);
+/// - a var `already_set` in the environment is left alone — the user's own
+///   export outranks the catalog, exactly as their `--settings` outranks the
+///   picker lineup. The caller passes `|var| std::env::var_os(var).is_some()`;
+///   the predicate is a parameter so tests need no process-global mutation.
+fn alias_env(
+    models: &[CatalogRow],
+    already_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    ALIAS_ENV
+        .iter()
+        .filter(|(_, var)| !already_set(var))
+        .filter_map(|&(alias, var)| {
+            models
+                .iter()
+                .find(|row| row.aliases.iter().any(|a| a == alias))
+                .map(|row| (var, row.id.clone()))
+        })
+        .collect()
+}
+
 /// Does the user's pass-through arg list already carry `--settings`? Claude
 /// Code takes ONE settings document, and the user's lineup wins — llmux never
 /// merges into it.
@@ -179,28 +235,45 @@ fn catalog_transport_reason(err: &reqwest::Error) -> String {
     }
 }
 
-/// The `--settings <json>` argv pair to PREPEND to the user's pass-through
-/// args, or an empty vec when no lineup is injected. Every failure mode is
-/// non-fatal: one warning line, then the launch continues unchanged.
-async fn picker_args(endpoint: &Endpoint, claude_args: &[String], no_picker: bool) -> Vec<String> {
-    if !injects_model_picker(claude_args, no_picker) {
-        if !no_picker {
-            eprintln!("warning: --settings given, llmux model picker lineup not injected");
-        }
-        return Vec::new();
+/// Everything ONE catalog fetch feeds into the `claude` launch: the
+/// `--settings <json>` argv pair to PREPEND to the user's pass-through args
+/// (empty when no lineup is injected), and the `ANTHROPIC_DEFAULT_*_MODEL`
+/// exports (empty when nothing is to be exported).
+///
+/// The two opt-outs are deliberately asymmetric:
+/// - `--no-model-picker` skips BOTH (and the fetch) — it is the "leave my
+///   Claude Code alone" switch;
+/// - the user's own `--settings` skips only the picker DOCUMENT. The alias
+///   exports are env vars, not a settings document, so they cannot collide
+///   with the user's lineup and still apply.
+///
+/// Every failure mode is non-fatal: one warning line, then the launch
+/// continues unchanged.
+async fn catalog_args(
+    endpoint: &Endpoint,
+    claude_args: &[String],
+    no_picker: bool,
+) -> (Vec<String>, Vec<(&'static str, String)>) {
+    if no_picker {
+        return (Vec::new(), Vec::new());
     }
     let models = match fetch_catalog(&endpoint.base_url, endpoint.api_key.as_deref()).await {
         Ok(models) => models,
         Err(reason) => {
             eprintln!("warning: model picker not injected: {reason}");
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
+    let env = alias_env(&models, |var| std::env::var_os(var).is_some());
+    if !injects_model_picker(claude_args, no_picker) {
+        eprintln!("warning: --settings given, llmux model picker lineup not injected");
+        return (Vec::new(), env);
+    }
     match model_picker_settings(&models) {
-        Some(json) => vec!["--settings".into(), json],
+        Some(json) => (vec!["--settings".into(), json], env),
         None => {
             eprintln!("warning: model picker not injected: catalog is empty");
-            Vec::new()
+            (Vec::new(), env)
         }
     }
 }
@@ -239,11 +312,14 @@ fn claude_env(endpoint: &Endpoint) -> (String, Option<String>, bool) {
 /// The proxy still replaces the client credential with the real upstream
 /// account, so subscription mode is preserved at the account layer.
 ///
-/// In both modes the catalog of the proxy being pointed at is fetched and
-/// passed as `claude --settings '<modelPicker lineup>'` so `/model` lists the
-/// llmux models (see [`model_picker_settings`]). Suppressed by
-/// `--no-model-picker` or by the user's own `--settings`; a failed fetch is a
-/// warning line, never a failed launch.
+/// In both modes the catalog of the proxy being pointed at is fetched ONCE and
+/// feeds two things: it is passed as `claude --settings '<modelPicker
+/// lineup>'` so `/model` lists the llmux models (see
+/// [`model_picker_settings`]), and its alias owners are exported as
+/// `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` so Claude Code's NATIVE
+/// aliases resolve to the catalog ids instead of its own (see [`alias_env`]).
+/// `--no-model-picker` suppresses both; the user's own `--settings` suppresses
+/// only the lineup; a failed fetch is a warning line, never a failed launch.
 pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
@@ -289,7 +365,7 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
 
     // The picker lineup goes FIRST so the user's pass-through args still have
     // the last word on every other flag.
-    let picker = picker_args(&endpoint, claude_args, args.no_model_picker).await;
+    let (picker, alias_exports) = catalog_args(&endpoint, claude_args, args.no_model_picker).await;
 
     let (base_url, api_key, remove_key) = claude_env(&endpoint);
     let mut command = tokio::process::Command::new("claude");
@@ -297,6 +373,9 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
         .args(&picker)
         .args(claude_args)
         .env("ANTHROPIC_BASE_URL", &base_url);
+    for (var, model) in &alias_exports {
+        command.env(var, model);
+    }
     if let Some(key) = &api_key {
         command.env("ANTHROPIC_API_KEY", key);
     } else if remove_key {
@@ -378,10 +457,19 @@ mod tests {
     ) -> CatalogRow {
         CatalogRow {
             id: id.into(),
+            aliases: Vec::new(),
             name: name.into(),
             efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
             max_context,
             group: group.into(),
+        }
+    }
+
+    /// A claude row that owns `aliases` — the shape [`alias_env`] reads.
+    fn aliased(id: &str, aliases: &[&str]) -> CatalogRow {
+        CatalogRow {
+            aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            ..row(id, id, &[], None, "claude")
         }
     }
 
@@ -458,6 +546,106 @@ mod tests {
         );
     }
 
+    /// A fixture mirroring the real claude block: the `[1m]` twins own the
+    /// bare aliases, the plain rows own none, and `haiku` has no twin at all.
+    fn claude_rows() -> Vec<CatalogRow> {
+        vec![
+            aliased("claude-fable-5-1[1m]", &["fable", "fable-5-1"]),
+            aliased("claude-fable-5[1m]", &[]),
+            aliased("claude-opus-5-5[1m]", &["opus", "opus-5-5"]),
+            aliased("claude-opus-5-5", &[]),
+            aliased("claude-sonnet-5[1m]", &["sonnet", "sonnet-5"]),
+            aliased("claude-sonnet-5", &[]),
+            aliased("claude-haiku-4-5", &["haiku"]),
+        ]
+    }
+
+    /// The whole point of the export: each Claude Code family var gets the
+    /// catalog's OWN id for that alias — the `[1m]` row where one exists, so
+    /// `/model opus` stops resolving to the client's 200k `claude-opus-5-5`.
+    /// Order follows `ALIAS_ENV`, not catalog order.
+    #[test]
+    fn alias_env_exports_the_catalog_alias_owners() {
+        let env = alias_env(&claude_rows(), |_| false);
+        assert_eq!(
+            env,
+            vec![
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
+                (
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                    "claude-fable-5-1[1m]".into()
+                ),
+                (
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "claude-sonnet-5[1m]".into()
+                ),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5".into()),
+            ]
+        );
+    }
+
+    /// The user's own export wins: a var already in the environment is left
+    /// alone, and the other three still go out.
+    #[test]
+    fn alias_env_leaves_an_already_set_var_alone() {
+        let env = alias_env(&claude_rows(), |var| var == "ANTHROPIC_DEFAULT_OPUS_MODEL");
+        let vars: Vec<&str> = env.iter().map(|(var, _)| *var).collect();
+        assert_eq!(
+            vars,
+            vec![
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            ]
+        );
+    }
+
+    /// An alias no row owns exports nothing — that family keeps Claude Code's
+    /// own default rather than being pointed at a guess. An empty catalog is
+    /// the degenerate case of the same rule.
+    #[test]
+    fn alias_env_skips_an_unowned_alias() {
+        let rows = vec![aliased("claude-haiku-4-5", &["haiku"])];
+        assert_eq!(
+            alias_env(&rows, |_| false),
+            vec![(
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "claude-haiku-4-5".to_string()
+            )]
+        );
+        assert!(alias_env(&[], |_| false).is_empty());
+    }
+
+    /// End-to-end over the REAL catalog module, like
+    /// [`model_picker_settings_round_trips_the_real_catalog`]: the served
+    /// document must parse into [`CatalogRow`] *with its aliases* and yield all
+    /// four exports. This is what fails if a future re-curation moves an alias
+    /// off a `[1m]` row (or drops one), which would silently restore Claude
+    /// Code's 200k denominator.
+    #[test]
+    fn alias_env_covers_every_family_of_the_real_catalog() {
+        let entries = crate::catalog::catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let doc = serde_json::json!({ "models": entries }).to_string();
+        let rows = serde_json::from_str::<CatalogResponse>(&doc)
+            .expect("the served catalog parses as CLI catalog rows")
+            .models;
+        assert_eq!(
+            alias_env(&rows, |_| false),
+            vec![
+                ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
+                (
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                    "claude-fable-5-1[1m]".into()
+                ),
+                (
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "claude-sonnet-5[1m]".into()
+                ),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5".into()),
+            ]
+        );
+    }
+
     /// The injection decision. `args` here is always the list with a leading
     /// `--` already stripped (what `run` passes), so a user `--settings` is a
     /// token of its own.
@@ -523,6 +711,66 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "grok-4.6");
         assert_eq!(models[0].max_context, Some(500_000));
+        // `aliases` is parsed, not ignored — the alias exports read it.
+        assert_eq!(models[0].aliases, vec!["grok".to_string()]);
+    }
+
+    /// Serve a one-row claude catalog and drive [`catalog_args`] end to end.
+    /// `--no-model-picker` opts out of BOTH products; the user's own
+    /// `--settings` drops only the lineup and keeps the env exports (they are
+    /// env vars, not a settings document, so they cannot collide with it).
+    #[tokio::test]
+    async fn catalog_args_opt_outs_are_asymmetric() {
+        let base_url = spawn_models_mock(
+            http::StatusCode::OK,
+            serde_json::json!({
+                "models": [{
+                    "id": "claude-opus-5-5[1m]",
+                    "aliases": ["opus", "opus-5-5"],
+                    "name": "Claude Opus 5.5 [1M]",
+                    "efforts": ["low", "max"],
+                    "max_context": 1_000_000u64,
+                    "group": "claude",
+                }]
+            })
+            .to_string(),
+        )
+        .await;
+        let endpoint = Endpoint {
+            base_url: base_url.clone(),
+            api_key: None,
+            remote: false,
+            host: "127.0.0.1".into(),
+            port: 0,
+        };
+        // The env half is asserted against the process environment rather than
+        // a fixed list, so a shell that already exports one of the four vars
+        // cannot make this flaky — that var is simply left alone.
+        let opus_expected = std::env::var_os("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none();
+
+        let (picker, env) = catalog_args(&endpoint, &[], false).await;
+        assert_eq!(picker.first().map(String::as_str), Some("--settings"));
+        assert!(
+            picker[1].contains(r#""model":"claude-opus-5-5[1m]""#),
+            "{picker:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .any(|(var, _)| *var == "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            opus_expected
+        );
+        // Only the owned alias is exported: the fixture has no fable/sonnet/
+        // haiku row, so those three families keep Claude Code's defaults.
+        assert!(env.len() <= 1, "{env:?}");
+
+        let user_settings: Vec<String> = vec!["--settings".into(), "mine.json".into()];
+        let (picker, env_with_settings) = catalog_args(&endpoint, &user_settings, false).await;
+        assert!(picker.is_empty(), "user --settings wins the lineup");
+        assert_eq!(env_with_settings, env, "alias exports still apply");
+
+        let (picker, env) = catalog_args(&endpoint, &[], true).await;
+        assert!(picker.is_empty(), "--no-model-picker skips the lineup");
+        assert!(env.is_empty(), "--no-model-picker skips the exports too");
     }
 
     /// A non-200 (or a body that is not a catalog) must return a sanitized
