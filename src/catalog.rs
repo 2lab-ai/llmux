@@ -43,9 +43,9 @@
 //!   (2026-09-23; the same response also lists `grok-4.7-build-fast`, which is
 //!   NOT curated). Grok effort menus come from
 //!   [`crate::provider::grok::thinking_levels_catalog`] (models with no
-//!   thinking support get an empty menu). The curated grok set is
-//!   `grok-4.7[1m]` and `grok-4.7` plus `grok-4.6` and `grok-4.5`; any other
-//!   `grok-*` id passes through at request time and synthesizes a
+//!   thinking support get an empty menu). The curated grok set is `grok-4.7`
+//!   (plus its opt-in `grok-4.7[1m]` picker twin), `grok-4.6` and `grok-4.5`;
+//!   any other `grok-*` id passes through at request time and synthesizes a
 //!   null-metadata row when pinned.
 
 use std::borrow::Cow;
@@ -129,23 +129,27 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
 /// max_context); effort menus are looked up per id in
 /// [`crate::provider::grok::thinking_levels_catalog`] rather than duplicated
 /// here. The `"grok"` family alias is NOT in this table — it belongs to
-/// whichever row is the live pin (see [`catalog`]).
+/// whichever row IS the live pin (see [`catalog`]); a `[1m]` twin never owns
+/// it.
 ///
-/// `grok-4.7[1m]` is the grok side of the codex astra asymmetry above: the
-/// `[1m]` suffix is a CLIENT-SIDE context denominator (the grok provider strips
-/// it before the request leaves llmux, `CLIENT_CONTEXT_SUFFIX` in
-/// [`crate::provider::grok`]), so the twin and the base row are the same
-/// upstream model. `max_context` stays 500_000 on BOTH, because that is xAI's
-/// real window (live `/v1/models` probe). The split exists only because Claude
-/// Code sizes its own readout off the id it is given: an id it does not know
-/// gets its 200k assumption unless the id ends in `[1m]`, which it reads as a
-/// 1M window (800k usable). So a session driven past 500,000 tokens on the twin
-/// is rejected UPSTREAM even though Claude Code still shows headroom — the base
-/// row is the conservative 200k default, and the twin is the user-requested
-/// picker/alias convenience for the 500k that is actually there.
+/// `grok-4.7[1m]` is an EXPLICIT OPT-IN picker row, not a second model: the
+/// `[1m]` suffix is a client-side context denominator that the grok provider
+/// strips before the request leaves llmux (`CLIENT_CONTEXT_SUFFIX` in
+/// [`crate::provider::grok`]), so the twin and the base row reach xAI as the
+/// same slug. `max_context` stays 500_000 on BOTH, because that is xAI's real
+/// window (live `/v1/models` probe).
+///
+/// It is deliberately NOT the astra arrangement. Claude Code derives an 800k
+/// usable budget from any id ending in `[1m]`, which OVERSTATES the real 500k
+/// ceiling: a session driven past 500,000 tokens is rejected UPSTREAM while
+/// the client still shows headroom. So the default — the pinned base row that
+/// owns the `grok` alias — keeps Claude Code's conservative 200k assumption,
+/// and a user who wants the bigger denominator picks the twin knowingly. The
+/// display name carries the caveat (`(500k upstream)`) so the picker itself
+/// discloses it rather than the docs alone.
 const GROK_MODELS: &[(&str, &str, u64)] = &[
-    ("grok-4.7[1m]", "Grok 4.7 [1M]", 500_000),
     ("grok-4.7", "Grok 4.7", 500_000),
+    ("grok-4.7[1m]", "Grok 4.7 [1M] (500k upstream)", 500_000),
     ("grok-4.6", "Grok 4.6", 500_000),
     ("grok-4.5", "Grok 4.5", 500_000),
 ];
@@ -299,12 +303,12 @@ pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
 }
 
 /// The known model catalog in canonical group order (`claude < codex < grok`).
-/// `grok_pin` / `codex_pin` are the live provider model slugs; the `"grok"`
-/// family alias goes to the pin's curated `[1m]` twin when one exists and
-/// otherwise to the entry whose id equals `grok_pin`.
+/// `grok_pin` / `codex_pin` are the live provider model slugs; the entry whose
+/// id equals `grok_pin` additionally advertises the `"grok"` family alias (a
+/// `[1m]` twin never does — see [`GROK_MODELS`]).
 ///
-/// The curated grok set is [`GROK_MODELS`] (`grok-4.7[1m]`, `grok-4.7`,
-/// `grok-4.6`, `grok-4.5`); when
+/// The curated grok set is [`GROK_MODELS`] (`grok-4.7`, its opt-in
+/// `grok-4.7[1m]` twin, `grok-4.6`, `grok-4.5`); when
 /// `grok_pin` matches NO curated id (a config can pin ANY `grok-*` slug,
 /// e.g. `grok-code-fast-1`), a synthesized row is appended after the curated
 /// grok entries so the `"grok"` alias always has an owner: id = the pin, name =
@@ -333,14 +337,18 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // gpt-6-sol/terra/luna — so it owns the bare `astra` and `gpt-6` aliases
     // the way sol owns `sol` / `gpt-5.6`. Deliberate asymmetry with the 5.6
     // rows: on astra those bare aliases sit on the `[1m]` TWIN rather than the
-    // base row, so a client typing `astra` / `gpt-6` gets the 1M window
-    // (OpenAI's published ~1,050,000 for astra) — the ergonomic name selects
-    // the 1M denominator, and the explicit base id `gpt-6-astra` (no aliases)
-    // is the way to pick the openai/codex catalog's 272,000 window. The
-    // provider still strips one trailing `[1m]` before the request leaves
-    // llmux, so bare and suffixed aliases reach the codex backend as the same
-    // upstream slug `gpt-6-astra` — the split is a client-side context
-    // denominator, not two upstream models.
+    // base row, so `astra` / `gpt-6` RESOLVE to the 1M row — i.e. to that
+    // row's upstream slug and to the 1_000_000 this catalog advertises for it
+    // (OpenAI's published ~1,050,000) — while the explicit base id
+    // `gpt-6-astra` (no aliases) picks the openai/codex catalog's 272,000.
+    // That is a catalog fact, NOT a client-window fact: Claude Code sizes its
+    // own readout off the SUBMITTED id, and an id it does not know (a bare
+    // `astra` / `gpt-6`) gets its 200k assumption. Only a `[1m]`-suffixed
+    // submission (`astra[1m]`, or picking the `[1M]` picker row) moves the
+    // client-side denominator. The provider strips one trailing `[1m]` before
+    // the request leaves llmux, so bare and suffixed aliases reach the codex
+    // backend as the same upstream slug `gpt-6-astra` — the split is a
+    // client-side context denominator, not two upstream models.
     //
     // The `[1m]` rows mirror the claude convention: a client-side
     // context-denominator opt-in that the provider strips before the request
@@ -418,20 +426,15 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     ));
 
     // ---- grok (curated) ----
-    // The `"grok"` alias rides the pin, and — mirroring the astra rule above —
-    // prefers the pin's `[1m]` TWIN when the curated set has one: pin
-    // `grok-4.7` puts the alias on `grok-4.7[1m]` (so a client typing `grok`
-    // gets the 1M context denominator over xAI's real 500k window), pin
-    // `grok-4.6` (no twin curated) puts it on `grok-4.6` itself. Either way at
-    // most one curated row owns it.
-    let twin_owner = GROK_MODELS
-        .iter()
-        .map(|&(id, ..)| id)
-        .find(|id| id.strip_suffix("[1m]") == Some(grok_pin));
-    let alias_owner = twin_owner.unwrap_or(grok_pin);
+    // The `"grok"` alias rides the pin: exactly the curated row whose id IS
+    // `grok_pin` carries it, so at most one curated row owns it. A `[1m]` twin
+    // NEVER owns it — deliberately unlike the astra rule above, because Claude
+    // Code reads a trailing `[1m]` as an 800k usable budget while xAI's real
+    // ceiling is 500,000; putting that mismatch behind the bare `grok` alias
+    // would make it the default instead of an informed opt-in.
     let mut pin_owned = false;
     for &(id, name, ctx) in GROK_MODELS {
-        let owns_alias = id == alias_owner;
+        let owns_alias = id == grok_pin;
         pin_owned |= owns_alias;
         entries.push(ModelEntry {
             id: Cow::Borrowed(id),
@@ -775,12 +778,26 @@ mod tests {
         // The `[1m]` twin is the SAME upstream model: xAI's real 500000 window
         // and the same effort menu (the thinking-level lookup strips the
         // suffix). Only the id/name differ, because the suffix is a Claude Code
-        // context denominator, not a different model.
+        // context denominator, not a different model — and the NAME must keep
+        // the `(500k upstream)` caveat, because Claude Code turns the `[1m]`
+        // id into an 800k budget the backend will not honor. The picker row is
+        // the only place a user sees that before choosing it.
         let g47_1m = find(&entries, "grok-4.7[1m]");
-        assert_eq!(g47_1m.name, "Grok 4.7 [1M]");
+        assert_eq!(g47_1m.name, "Grok 4.7 [1M] (500k upstream)");
         assert_eq!(g47_1m.max_context, Some(500_000));
         assert_eq!(g47_1m.efforts, g47.efforts);
         assert_eq!(g47_1m.group, "grok");
+        // Opt-in only: the twin is listed AFTER the base row, so the picker
+        // offers the safe default first.
+        let grok_ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "grok")
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(
+            grok_ids,
+            vec!["grok-4.7", "grok-4.7[1m]", "grok-4.6", "grok-4.5"]
+        );
         // grok-4.6: live /v1/models probe 2026-08-13 (ctx 500000).
         let g46 = find(&entries, "grok-4.6");
         assert_eq!(g46.name, "Grok 4.6");
@@ -795,23 +812,22 @@ mod tests {
 
     #[test]
     fn grok_family_alias_follows_the_pin() {
-        // Default pin: the pin's `[1m]` TWIN owns the alias (the astra rule),
-        // and the base `grok-4.7` row carries none — so a client typing bare
-        // `grok` picks the 1M context denominator.
+        // Default pin: the PINNED BASE row owns the alias, and its `[1m]` twin
+        // must not — deliberately unlike astra. Claude Code derives an 800k
+        // budget from a `[1m]` id while xAI cuts off at 500,000, so the twin
+        // stays an opt-in the user picks knowingly instead of the default
+        // meaning of bare `grok`.
         let pinned = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(
-            find(&pinned, "grok-4.7[1m]").aliases,
-            vec!["grok".to_string()]
-        );
+        assert_eq!(find(&pinned, "grok-4.7").aliases, vec!["grok".to_string()]);
         assert!(
-            find(&pinned, "grok-4.7").aliases.is_empty(),
-            "the base row must not also own `grok` — the twin does"
+            find(&pinned, "grok-4.7[1m]").aliases.is_empty(),
+            "the [1m] twin must never own `grok` — it would make the 800k-vs-500k \
+             budget mismatch the default"
         );
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
 
-        // An older curated row can be pinned too — the alias moves to it. No
-        // `grok-4.6[1m]` twin is curated, so the alias sits on the row itself.
+        // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(find(&pinned, "grok-4.6").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.7[1m]").aliases.is_empty());
@@ -847,10 +863,10 @@ mod tests {
 
     #[test]
     fn in_catalog_pin_does_not_synthesize_a_row() {
-        // A curated pin: no synthesized row, alias on the static row (the
-        // `[1m]` twin when the curated set has one), count 33.
+        // A curated pin: no synthesized row, alias on the row whose id IS the
+        // pin (never on a `[1m]` twin), count 33.
         for (pin, owner) in [
-            ("grok-4.7", "grok-4.7[1m]"),
+            ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
@@ -923,10 +939,13 @@ mod tests {
         // Astra alias ownership contract (fix-astra-alias-1m): unlike the
         // 5.6 sol/terra pattern where the base row owns the bare variant
         // alias, the astra bare aliases (`astra`, `gpt-6`) belong to the
-        // `[1m]` twin — so a client typing `astra` or `gpt-6` gets the 1M
-        // context window advertised on the ONLY row a client can practically
-        // reach it through. The base row keeps its openai/codex catalog
-        // window (272_000) and advertises NO aliases; six efforts on both.
+        // `[1m]` twin — so `astra` / `gpt-6` RESOLVE to that row's upstream
+        // slug and to the 1M figure this catalog advertises for it. That is
+        // catalog resolution only: Claude Code still gives a BARE `astra` its
+        // 200k assumption (it sizes off the submitted id), so the client-side
+        // 1M denominator needs `astra[1m]` or the `[1M]` picker row. The base
+        // row keeps its openai/codex catalog window (272_000) and advertises
+        // NO aliases; six efforts on both.
         let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let astra = find(&entries, "gpt-6-astra");
         assert!(

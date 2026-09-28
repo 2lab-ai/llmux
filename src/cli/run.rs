@@ -135,6 +135,13 @@ fn row_description(row: &CatalogRow) -> String {
 /// Only the `_MODEL` variants are set. Claude Code also reads `_NAME`,
 /// `_DESCRIPTION` and `_SUPPORTED_CAPABILITIES` for these families; llmux
 /// leaves them alone so the client keeps its own labels.
+///
+/// These four vars are the ONLY mechanism that changes what a bare NATIVE
+/// alias means. They do not generalize: for an id Claude Code does not know
+/// (`astra`, `grok`, `or-…`) there is no such var, the id is submitted
+/// verbatim, and the client applies its 200k assumption unless the SUBMITTED
+/// id ends in `[1m]` — catalog alias ownership decides the upstream slug, not
+/// the client's window.
 const ALIAS_ENV: &[(&str, &str)] = &[
     ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
     ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
@@ -771,6 +778,84 @@ mod tests {
         let (picker, env) = catalog_args(&endpoint, &[], true).await;
         assert!(picker.is_empty(), "--no-model-picker skips the lineup");
         assert!(env.is_empty(), "--no-model-picker skips the exports too");
+    }
+
+    /// `--no-model-picker` must skip the FETCH, not just its products: it is
+    /// the "leave my Claude Code alone" switch, so the launch must not touch
+    /// the daemon for a catalog it will not use. Observed on the server side
+    /// with a request counter — the second call proves the counter is wired,
+    /// so a broken mock cannot make the first assertion pass vacuously.
+    #[tokio::test]
+    async fn catalog_args_with_no_picker_never_fetches_the_catalog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = axum::Router::new().route(
+            "/llmux/models",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    (http::StatusCode::OK, r#"{"models":[]}"#.to_string())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let endpoint = Endpoint {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: None,
+            remote: false,
+            host: "127.0.0.1".into(),
+            port,
+        };
+
+        let (picker, env) = catalog_args(&endpoint, &[], true).await;
+        assert!(picker.is_empty());
+        assert!(env.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no catalog fetch was made");
+
+        // Same endpoint, picker enabled: the counter moves, so the zero above
+        // is a real observation and not a dead route.
+        let _ = catalog_args(&endpoint, &[], false).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failed fetch yields NEITHER product — no lineup and no alias exports
+    /// (an export built from a catalog llmux could not read would be a guess).
+    /// The launch continues; only a warning line is printed.
+    #[tokio::test]
+    async fn catalog_args_yields_nothing_when_the_fetch_fails() {
+        // Bind then drop to reserve-and-free a port nobody listens on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint = Endpoint {
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: None,
+            remote: false,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let (picker, env) = catalog_args(&endpoint, &[], false).await;
+        assert!(picker.is_empty(), "{picker:?}");
+        assert!(env.is_empty(), "{env:?}");
+
+        // An empty catalog is the same shape of non-event: no lineup, and no
+        // exports either (no row owns any alias).
+        let base_url = spawn_models_mock(http::StatusCode::OK, r#"{"models":[]}"#.into()).await;
+        let endpoint = Endpoint {
+            base_url,
+            ..endpoint
+        };
+        let (picker, env) = catalog_args(&endpoint, &[], false).await;
+        assert!(picker.is_empty(), "{picker:?}");
+        assert!(env.is_empty(), "{env:?}");
     }
 
     /// A non-200 (or a body that is not a catalog) must return a sanitized
