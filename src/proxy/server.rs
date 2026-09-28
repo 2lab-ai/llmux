@@ -4449,9 +4449,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 32 curated (11 claude + 8 codex + 3 grok + 10 openrouter) + 1
+        // 33 curated (11 claude + 8 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 33);
+        assert_eq!(models.len(), 34);
 
         let by_id = |id: &str| {
             models
@@ -4460,9 +4460,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} present"))
         };
         // The live pin (grok-4.3) carries the "grok" alias via a synthesized
-        // row; the curated grok-4.7 / grok-4.6 / grok-4.5 do not.
+        // row; the curated grok-4.7 / grok-4.7[1m] / grok-4.6 / grok-4.5 do
+        // not.
         assert_eq!(by_id("grok-4.3")["aliases"], serde_json::json!(["grok"]));
         assert_eq!(by_id("grok-4.7")["aliases"], serde_json::json!([]));
+        // The opt-in twin serializes with xAI's real window and NEVER an
+        // alias — not even when its own base row is the pin (asserted in
+        // `catalog::tests::grok_family_alias_follows_the_pin`).
+        assert_eq!(by_id("grok-4.7[1m]")["aliases"], serde_json::json!([]));
+        assert_eq!(by_id("grok-4.7[1m]")["max_context"], 500_000);
+        assert_eq!(
+            by_id("grok-4.7[1m]")["name"],
+            "Grok 4.7 [1M] (500k upstream)"
+        );
         assert_eq!(by_id("grok-4.6")["aliases"], serde_json::json!([]));
         assert_eq!(by_id("grok-4.5")["aliases"], serde_json::json!([]));
         // Static codex alias and context survive serialization.

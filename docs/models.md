@@ -47,18 +47,31 @@ not that it is zero.
 - **grok family alias** — `"grok"` is dynamic: it attaches to whichever grok id
   is the current live pin (`POST /llmux/grok` / `config.grok.default_model`). A
   bare `grok` request routes to that pin, so the catalog advertises the alias on
-  exactly the pinned entry. Any `grok-*` id also passes through verbatim — after
-  one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
+  exactly the pinned entry — matched on the FULL id, with no preference for a
+  `[1m]` twin. Pinning `grok-4.7` therefore leaves the alias on the base row;
+  pinning `grok-4.7[1m]` puts it on the twin, which is an explicit operator
+  choice (see [The grok `[1m]` twin](#the-grok-1m-twin): llmux does not make
+  the 1M-denominated id the advertised default of the family, because the
+  denominator Claude Code infers from it overstates xAI's real 500k ceiling).
+  Any `grok-*` id also passes through verbatim —
+  after one trailing `[1m]` is stripped (`CLIENT_CONTEXT_SUFFIX` in
   `src/provider/grok.rs`), so `grok-4.7[1m]` reaches xAI as `grok-4.7` and still
   matches the per-model thinking-level table; `grok[1m]` resolves to the pin
-  exactly like `grok`.
+  exactly like `grok`. The same strip applies to the PIN itself, so a pinned
+  `grok-4.7[1m]` also leaves llmux as `grok-4.7` — the suffix is display
+  metadata on both sides.
 - **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
   resolve to `gpt-6-astra[1m]` — deliberate asymmetry with the 5.6 rows: on
-  astra the bare aliases advertise the 1M row so a client typing `astra` or
-  `gpt-6` gets OpenAI's published ~1,050,000-token window, and the explicit
-  base id `gpt-6-astra` is the way to pick the openai/codex catalog's 272000.
+  astra the bare aliases advertise the 1M row, so `astra` / `gpt-6` resolve to
+  that row's upstream slug and to the ~1,050,000-token window this catalog
+  publishes for it, while the explicit base id `gpt-6-astra` is the way to pick
+  the openai/codex catalog's 272000. That is catalog resolution, **not** a
+  client-side window: Claude Code sizes its readout off the id you submit, and
+  a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
+  Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
+  denominator too.
   Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
   (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
   advertised statically on the corresponding entries. The provider always
@@ -142,8 +155,9 @@ not that it is zero.
 
 ### Out-of-catalog grok pin
 
-The curated grok set is `grok-4.7` (the default pin), `grok-4.6` and
-`grok-4.5`. `config.grok.default_model` may pin ANY
+The curated grok set is `grok-4.7` (the default pin, plus its opt-in
+`grok-4.7[1m]` twin), `grok-4.6` and `grok-4.5`.
+`config.grok.default_model` may pin ANY
 `grok-*` slug — including ids not in the curated table below (e.g.
 `grok-4.3`, `grok-code-fast-1`). Because the provider forwards such ids
 verbatim, the pin is real and routable, so the `"grok"` family alias must have
@@ -189,6 +203,7 @@ model it does not curate.
 | gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
+| grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
 | grok-4.6            | —            | Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
 | or-ox-alpha         | or (pinned)  | Ox Alpha (free)     | low, high, max                       | 1048576     | openrouter |
@@ -202,9 +217,12 @@ model it does not curate.
 | or-gemma-4-31b      | —            | Google Gemma 4 31B (free) | —                              | 262144      | openrouter |
 | or-gpt-oss-20b      | —            | OpenAI gpt-oss-20b (free) | low, medium, high              | 131072      | openrouter |
 
-"grok (pinned)" means the `grok` alias appears on that row only while it is the
-live grok pin; any other pinned `grok-*` id appears instead as a synthesized row
-(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). "or (pinned)" reads
+"grok (pinned)" means the `grok` alias appears on that row only while
+`grok-4.7` is the live grok pin; any other pinned `grok-*` id takes the alias
+to its own curated row, or to a synthesized row when it is out of catalog
+(see [Out-of-catalog grok pin](#out-of-catalog-grok-pin)). A base-slug pin
+never hands the alias to the `[1m]` twin; pinning the suffixed id does
+(see [The grok `[1m]` twin](#the-grok-1m-twin)). "or (pinned)" reads
 the same way for the openrouter pin (see
 [Out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)); with the
 default pin it sits on `or-ox-alpha`. The openrouter ids are what a client
@@ -212,6 +230,42 @@ sends — the slug that reaches OpenRouter is the one in the
 [alias table](#alias-semantics), and every curated openrouter row is a free
 model (priced `$0` in and out; an UNCURATED openrouter model has no known
 rate and is reported unpriced, never as a free `$0`).
+
+### The grok `[1m]` twin
+
+`grok-4.7[1m]` and `grok-4.7` are the SAME upstream model — the provider strips
+one trailing `[1m]` before the request leaves llmux — which is why both rows
+advertise **500000**, xAI's real window from the live `/v1/models` probe. The
+twin exists only because of how Claude Code sizes its own readout: for an id it
+does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
+1M window (800k usable). Measured 2026-09-28 with Claude Code 2.1.283:
+`--model grok[1m]` → `/context` 143.1k/800k, `--model grok` → 200k.
+
+That 800k readout is **wrong about the backend**: xAI still cuts the request off
+at 500,000, so a session driven past 500k is rejected upstream while the client
+still shows headroom. The twin is therefore an **explicit opt-in**, not the
+face llmux puts on the family:
+
+- with the default pin `grok-4.7` the `grok` alias stays on the BASE row, so
+  `/llmux/models` and the picker present the conservative id as the family
+  default (the client window is unaffected either way — a bare `grok` is a
+  200k session in Claude Code regardless of who owns the alias, because the
+  client sizes off the id you submit);
+- the twin is listed after it, named `Grok 4.7 [1M] (500k upstream)` so the
+  picker itself discloses the gap;
+- to use the bigger denominator, pick that row in `/model` or type
+  `/model grok-4.7[1m]` (or `grok[1m]`, which resolves to the pin) — and stay
+  under 500k;
+- alias ownership follows the pin by exact id, so an operator who wants the
+  1M-denominated row to BE the advertised family default can pin it:
+  `config.grok.default_model = "grok-4.7[1m]"` moves the `grok` alias onto the
+  twin. llmux simply never chooses that for you. That pin changes only what
+  the catalog advertises — the provider normalises a pinned `[1m]` exactly as
+  it normalises a requested one, so the request still reaches xAI as
+  `grok-4.7` (and still finds its effort menu).
+
+This is deliberately NOT the astra arrangement: there the alias sits on the
+`[1m]` row because the 1M figure matches the backend, here it would not.
 
 ### The codex `[1m]` rows
 
@@ -242,9 +296,12 @@ published 1,050,000-token window for Astra — it has **not** been probed throug
 the daemon, unlike the 5.6 rows above (the only astra probe so far is the
 2026-09-07 acceptance check, which confirms the backend takes the slug, not its
 ceiling). On astra the bare aliases `astra` / `gpt-6` sit on the `[1m]` row —
-opposite the 5.6 convention — so the ergonomic name selects the 1M window; the
-explicit base id `gpt-6-astra` keeps the openai/codex catalog's 272000, the
-window a client gets without opting in, and advertises no aliases. The catalog
+opposite the 5.6 convention — so the ergonomic name resolves to the 1M row's
+slug and advertised window; the explicit base id `gpt-6-astra` keeps the
+openai/codex catalog's 272000 and advertises no aliases. Note this is the
+CATALOG window, not Claude Code's: a bare `astra` is still a 200k session in
+the client, which sizes off the submitted id — type `astra[1m]` or pick the
+`[1M]` picker row for the 1M denominator. The catalog
 also lists an 872,000 `max_context_window` for astra, which llmux does not
 advertise.
 
@@ -297,6 +354,52 @@ Gateway model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) is NOT
 used: it keeps only ids containing `claude`/`anthropic` and needs a credential
 header, both of which defeat the purpose here. `/v1/models` stays proxied
 upstream, untouched.
+
+### Alias exports
+
+The picker lineup alone cannot make `opus` mean what this catalog says it
+means. Measured 2026-09-28 with Claude Code 2.1.283: `sonnet`, `opus`, `haiku`,
+`fable` (and `sonnet[1m]` / `opus[1m]` / `fable[1m]`, plus `best` and
+`opusplan`) are NATIVE aliases the client resolves against its OWN model
+records before a request is built — `/model opus` reaches llmux as
+`claude-opus-5-5`, with the client's 200k compaction window, so the catalog's
+promise that `opus` is `claude-opus-5-5[1m]` never applies.
+
+So the same fetch that builds the lineup also exports, for the same launch:
+
+| env var                          | value = the catalog id owning the alias |
+| -------------------------------- | --------------------------------------- |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
+
+The values are DERIVED from the catalog alias owners at launch, never
+hardcoded: re-curating an alias onto a new row moves the export with it, and an
+alias no row owns is not exported at all (that family keeps Claude Code's own
+default). Measured effect: `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]`
+→ status line "Claude Opus 5.5 [1M]" and `/context` 221.2k/800k, versus 200k
+without it. Only the `_MODEL` variants are set — Claude Code's `_NAME`,
+`_DESCRIPTION` and `_SUPPORTED_CAPABILITIES` variants are left alone.
+
+- A var you already export is left alone (your value wins for that family; the
+  other three are still exported).
+- `llmux run --no-model-picker` disables the exports too — it is the single
+  "leave my Claude Code alone" switch. Your own `--settings`, by contrast,
+  drops only the picker document: the exports are env vars, not a settings
+  document, so they cannot collide with your lineup.
+- A failed catalog fetch exports nothing, exactly as it injects no lineup.
+
+**These four vars are the only mechanism that changes what a bare native alias
+means, and they do not generalize.** An id Claude Code does not know (`astra`,
+`gpt-6`, `grok`, `or-ox-alpha`, …) has no such var: it is submitted verbatim
+and gets the client's 200k assumption. Catalog alias ownership decides the
+UPSTREAM slug, never the client's window — bare `astra` resolves to
+`gpt-6-astra[1m]`'s slug upstream and is still a 200k session in Claude Code.
+To move the client-side denominator for those, the SUBMITTED id has to end in
+`[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
+`/model grok[1m]` (and for grok, mind the
+[500k upstream ceiling](#the-grok-1m-twin)).
 
 ## Sources
 
@@ -363,9 +466,12 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   also carries `grok-4.7-build-fast` (identical menu and window); it is NOT
   curated, but it is in the provider thinking-level table, so it gets that
   effort menu when pinned or sent. The default pin moved `grok-4.6` → `grok-4.7`
-  on 2026-09-23. Grok effort
+  on 2026-09-23, and the opt-in `grok-4.7[1m]` picker twin was added 2026-09-28
+  (same upstream model, same 500000, never the alias owner — see
+  [The grok `[1m]` twin](#the-grok-1m-twin)). Grok effort
   menus come from the provider's per-model thinking-level table. The curated
-  grok set is `grok-4.7` (the default pin), `grok-4.6` and `grok-4.5`; other
+  grok set is `grok-4.7` (the default pin, plus its `[1m]` twin), `grok-4.6`
+  and `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
   synthesize a null-metadata row when pinned.
 - **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`

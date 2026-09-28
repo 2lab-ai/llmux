@@ -245,6 +245,22 @@ fn normalize_base_url(url: &str) -> String {
 /// that is in NO thinking-level table, silently dropping `reasoning`.
 const CLIENT_CONTEXT_SUFFIX: &str = "[1m]";
 
+/// One trailing [`CLIENT_CONTEXT_SUFFIX`] off `model` (case-insensitively,
+/// after trimming), or `model` unchanged. Upstream never accepts the suffix,
+/// so every slug that can reach the wire passes through here.
+fn strip_client_context_suffix(model: &str) -> &str {
+    let model = model.trim();
+    match model.len().checked_sub(CLIENT_CONTEXT_SUFFIX.len()) {
+        Some(cut)
+            if model.is_char_boundary(cut)
+                && model[cut..].eq_ignore_ascii_case(CLIENT_CONTEXT_SUFFIX) =>
+        {
+            &model[..cut]
+        }
+        _ => model,
+    }
+}
+
 /// Resolve the model slug requested upstream: one trailing
 /// [`CLIENT_CONTEXT_SUFFIX`] is stripped first, so every rule below sees the
 /// base slug; grok-shaped requests (`grok-` prefix / bare `grok`) then pass
@@ -252,15 +268,22 @@ const CLIENT_CONTEXT_SUFFIX: &str = "[1m]";
 /// Claude Code works with no config change (spec §R4); everything else
 /// (Anthropic default models on fallback, model-less requests) keeps the
 /// configured pin.
+///
+/// The PIN gets the same strip, on every path that returns it (model-less
+/// request, bare `grok`, non-grok-shaped fallback). A config may legitimately
+/// carry the picker's spelling — `config.grok.default_model = "grok-4.7[1m]"`
+/// is how an operator makes the 1M-denominated row the advertised family
+/// default — and without this the suffix rode the pin all the way to xAI as
+/// an unknown slug that also missed the thinking-level table (dropping
+/// `reasoning` silently). The suffix is client-side display metadata on BOTH
+/// sides of the resolution.
 fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
+    let pinned = strip_client_context_suffix(pinned);
     let Some(req) = requested else {
         return pinned.to_string();
     };
     let req = req.trim().to_ascii_lowercase();
-    let req = req
-        .strip_suffix(CLIENT_CONTEXT_SUFFIX)
-        .map(str::to_string)
-        .unwrap_or(req);
+    let req = strip_client_context_suffix(&req).to_string();
     if req == "grok" {
         // Bare family alias → the configured pin (routing classifies it
         // here; there is no upstream model literally named "grok").
@@ -782,6 +805,62 @@ mod tests {
                 "{requested} → {expected}"
             );
         }
+    }
+
+    /// The PIN side of the same strip. A config may legitimately carry the
+    /// picker's `[1m]` spelling (that is how an operator makes the
+    /// 1M-denominated row the advertised family default — see
+    /// `catalog::GROK_MODELS`), and before this fix the suffix rode the pin to
+    /// xAI on every path that returns it: a model-less request, a bare `grok`,
+    /// and a non-grok-shaped body on fallback. `grok-4.7[1m]` is not an
+    /// upstream slug and is in no thinking-level table.
+    #[test]
+    fn pinned_context_suffix_is_stripped_on_every_path() {
+        // (a) model-less request, (b) bare family alias.
+        assert_eq!(resolve_upstream_model(None, "grok-4.7[1m]"), "grok-4.7");
+        assert_eq!(
+            resolve_upstream_model(Some("grok"), "grok-4.7[1m]"),
+            "grok-4.7"
+        );
+        // Non-grok-shaped request (Anthropic default model on fallback) also
+        // falls back to the pin — same strip.
+        assert_eq!(
+            resolve_upstream_model(Some("claude-sonnet-5"), "grok-4.7[1m]"),
+            "grok-4.7"
+        );
+        // Case and padding follow the requested side; only ONE trailing
+        // suffix goes, and a suffix-free pin is untouched.
+        assert_eq!(resolve_upstream_model(None, " grok-4.7[1M] "), "grok-4.7");
+        assert_eq!(
+            resolve_upstream_model(None, "grok-4.7[1m][1m]"),
+            "grok-4.7[1m]"
+        );
+        assert_eq!(resolve_upstream_model(None, "grok-4.7"), "grok-4.7");
+        // A requested grok id still wins over the pin, suffix or not.
+        assert_eq!(
+            resolve_upstream_model(Some("grok-4.5"), "grok-4.7[1m]"),
+            "grok-4.5"
+        );
+    }
+
+    /// End to end through the translator, which is where the regression bit:
+    /// a suffixed PIN plus a body Claude sent to the grok fallback must reach
+    /// the wire as the base slug AND still find its thinking levels, so the
+    /// configured effort survives instead of being silently dropped.
+    #[test]
+    fn suffixed_pin_reaches_the_wire_as_the_base_slug_with_effort() {
+        let b = body("claude-sonnet-5");
+        let (upstream, _) = translate_request_with(&b, "s", &shape("grok-4.7[1m]", Some("xhigh")))
+            .expect("translate");
+        assert_eq!(upstream["model"], "grok-4.7", "the suffix never ships");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "the stripped slug is in the thinking-level table, so effort survives"
+        );
+        // The activity log reads the same resolution.
+        let (model, effort) = effective_request_meta(&b, &shape("grok-4.7[1m]", Some("xhigh")));
+        assert_eq!(model, "grok-4.7");
+        assert_eq!(effort.as_deref(), Some("xhigh"));
     }
 
     #[test]
