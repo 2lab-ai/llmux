@@ -90,7 +90,8 @@ not that it is zero.
   | `fable`, `fable-5-1` | `claude-fable-5-1[1m]` | `claude-fable-5-1` |
   | `opus`, `opus-5-5` | `claude-opus-5-5[1m]` | `claude-opus-5-5` |
   | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
-  | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
+  | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
+  | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
   | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
@@ -149,10 +150,12 @@ not that it is zero.
   owns an alias), then from `claude-opus-5[1m]` to `claude-opus-5-5[1m]` on
   2026-09-23. The version alias `opus-5` did NOT move — it stays on
   `claude-opus-5[1m]`, because floating a version-pinned alias onto a new model
-  would be silent substitution. Anyone who needs one specific model must send
-  its full catalog id — that is the stable handle. Usage and pricing are booked against the
-  resolved id, not the alias, so alias traffic lands on the same row as id
-  traffic.
+  would be silent substitution. `sonnet` follows the same rule: it moved from
+  `claude-sonnet-5[1m]` to `claude-sonnet-5-5[1m]` on 2026-09-29, and the
+  version alias `sonnet-5` stayed on `claude-sonnet-5[1m]`. Anyone who needs
+  one specific model must send its full catalog id — that is the stable
+  handle. Usage and pricing are booked against the resolved id, not the
+  alias, so alias traffic lands on the same row as id traffic.
 
 ### Out-of-catalog grok pin
 
@@ -192,7 +195,9 @@ model it does not curate.
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max   | 1000000     | claude |
+| claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -375,7 +380,7 @@ So the same fetch that builds the lineup also exports, for the same launch:
 | -------------------------------- | --------------------------------------- |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
 | `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
 
 The values are DERIVED from the catalog alias owners at launch, never
@@ -408,11 +413,13 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
-2026-07-27 and again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
-`opus` alias rolled onto it), the codex context windows were re-probed
-2026-08-21 (the codex effort menus are unchanged from 2026-07-14), and the grok
-rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
-`grok-4.7` row, and the default pin moved 4.6 → 4.7 — see below).
+2026-07-27, again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
+`opus` alias rolled onto it), and again 2026-09-29 (the `claude-sonnet-5-5`
+pair, with the floating `sonnet` alias rolled onto it), the codex context
+windows were re-probed 2026-08-21 (the codex effort menus are unchanged from
+2026-07-14), and the grok rows were re-probed 2026-08-26 (unchanged) and
+again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
+— see below).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -425,6 +432,16 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   cache read $0.20/M, cache write $5/M); the Claude Code 2.1.280 binary model
   record lists `claude-opus-5-5` with `supports_1m_suffix` (and the literal
   string `claude-opus-5-5[1m]`), which is why the `[1m]` row exists.
+- **claude-sonnet-5-5** — Anthropic announcement 2026-09-28 (`claude-sonnet-5-5`,
+  1M context, 128k max output, pricing UNCHANGED from Sonnet 5: $2/M input,
+  $10/M output, cache read $0.20/M, cache write $2.50/M); the Claude Code
+  2.1.284 binary model record lists `claude-sonnet-5-5` with
+  `context.native_1m` / `supports_1m_beta` and `max_output_tokens.default:
+  128000`, `pricing: "tier_2_10"` (the same tier as `claude-sonnet-5`), and
+  the literal string `claude-sonnet-5-5[1m]` in its `[1m]`-suffix allowlist —
+  which is why the `[1m]` row exists and why no new price constant was
+  needed (`claude_price` already mapped Sonnet's `(5, None | Some(5))`
+  versions to `SONNET_5`, written ahead of this catalog row landing).
 - **Claude pricing** — the Anthropic pricing page
   (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28, per 1M
   tokens as input / 5-minute cache write / 1-hour cache write / cache read /

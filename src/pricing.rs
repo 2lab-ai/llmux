@@ -1303,7 +1303,13 @@ mod tests {
             assert_eq!(claude_rates(&format!("{model}[1m]")), want, "{model}[1m]");
         }
         // The curated aliases resolve through `normalize_model` first.
-        assert_eq!(claude_rates("sonnet"), sonnet_5, "sonnet → claude-sonnet-5");
+        // `sonnet` resolves to `claude-sonnet-5-5[1m]` (the alias rolled off
+        // sonnet-5 on 2026-09-29) — same rate tier, so this stays sonnet_5.
+        assert_eq!(
+            claude_rates("sonnet"),
+            sonnet_5,
+            "sonnet → claude-sonnet-5-5"
+        );
         assert_eq!(claude_rates("fable").2, 0.25, "fable → claude-fable-5-1");
         assert_eq!(claude_rates("haiku"), (1.0, 5.0, 0.1, 1.25));
     }
