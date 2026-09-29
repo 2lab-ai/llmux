@@ -85,6 +85,17 @@ const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
 /// own page was not read for this row. Codex: no cache-creation charge, same
 /// convention as the other codex rows.
 const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
+/// gpt-6-sol (2026-09-22 launch, standard tier): $2 in / $10 out / $0.20 cached
+/// input (the announced 90% cache-read discount). Per press coverage and
+/// third-party price trackers (VentureBeat, MarkTechPost, Requesty) — OpenAI's
+/// own pricing page was not readable for this row. Codex: no cache-creation
+/// charge, same convention as the other codex rows (the API list's separate
+/// cache-write rate does not apply to subscription traffic). The >272k-prompt
+/// tier (2x input, 1.5x output) is not modeled.
+const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0);
+/// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
+/// $0.01 cached input. Same sourcing and conventions as [`GPT_6_SOL`].
+const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.0);
 /// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
 /// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
@@ -128,6 +139,8 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
+        "gpt-6-sol" => Some(GPT_6_SOL),
+        "gpt-6-luna" => Some(GPT_6_LUNA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
@@ -180,6 +193,10 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(GPT_5_6_SOL)
     } else if model_norm_lower.starts_with("gpt-6-astra-") {
         Some(GPT_6_ASTRA)
+    } else if model_norm_lower.starts_with("gpt-6-sol-") {
+        Some(GPT_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6-luna-") {
+        Some(GPT_6_LUNA)
     } else if model_norm_lower.starts_with("gpt-6-") {
         // Astra is generation 6's flagship (and its only tier), so it is the
         // `gpt-6-` default exactly as sol is for `gpt-5.6-`. The required `-`
@@ -602,16 +619,35 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_and_luna_price_at_the_gpt_6_default_until_listed() {
-        // `gpt-6-sol` / `gpt-6-luna` have NO row of their own: no published
-        // list price was read for them, and inventing one would be worse than
-        // a visible over-estimate. They fall to the `gpt-6-` prefix default
-        // (astra rates), so the dashboard's dollar figure is an UPPER BOUND for
-        // them; a `pricing` override in config replaces it per model. Give each
-        // its own const and exact arm here once the rates are confirmed.
-        for model in ["gpt-6-sol", "gpt-6-luna"] {
-            assert_eq!(builtin_price(model), Some(GPT_6_ASTRA), "{model}");
+    fn gpt_6_sol_and_luna_have_their_own_rates() {
+        // Exact slugs and dated snapshots take the sol / luna rows, NOT the
+        // `gpt-6-` astra default ($10 / $50 / $1).
+        for (model, input, output, cached) in [
+            ("gpt-6-sol", 2.00, 10.00, 0.20),
+            ("gpt-6-sol-20260922", 2.00, 10.00, 0.20),
+            ("gpt-6-luna", 0.10, 0.50, 0.01),
+            ("gpt-6-luna-20260922", 0.10, 0.50, 0.01),
+        ] {
+            approx(
+                cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty()),
+                input,
+            );
+            approx(
+                cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty()),
+                output,
+            );
+            approx(
+                cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty()),
+                cached,
+            );
+            // Codex convention: no cache-creation charge.
+            approx(
+                cost_usd("codex", model, &tc(0, 0, None, Some(1_000_000)), &empty()),
+                0.0,
+            );
         }
+        // A future gpt-6 tier we have no row for still takes the astra default.
+        assert_eq!(builtin_price("gpt-6-terra"), Some(GPT_6_ASTRA));
     }
 
     #[test]

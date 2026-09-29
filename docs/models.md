@@ -448,10 +448,15 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   sol lists low→ultra, luna low→max (no `ultra`). `gpt-6-terra` is NOT listed.
   A live request for `gpt-6-sol` through the daemon on 2026-09-28 returned a
   normal completion with `"model":"gpt-6-sol"`; `gpt-6-luna` was not probed
-  through the daemon. Both join the provider passthrough list. **No pricing row:**
-  no list price was read, so both fall to the `gpt-6-` default (astra rates) and
-  the dashboard cost is an upper bound until real rates are added. The `[1m]`
-  twin for sol reuses astra's 1000000 client denominator and has not been probed.
+  through the daemon. Both join the provider passthrough list. Pricing (standard
+  tier, per 1M tokens, launched 2026-09-22): `gpt-6-sol` $2 in / $10 out / $0.20
+  cached input; `gpt-6-luna` $0.10 in / $0.50 out / $0.01 cached input; no
+  cache-creation charge, per the codex convention. Sourced from press coverage
+  and third-party trackers (VentureBeat, MarkTechPost, Requesty) that agree on
+  the numbers — OpenAI's own pricing page was not readable, so re-check it when
+  possible. The >272k-prompt tier (2x input, 1.5x output) is not modeled. The
+  `[1m]` twin for sol reuses astra's 1000000 client denominator and has not been
+  probed.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window
