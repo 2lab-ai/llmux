@@ -3150,7 +3150,7 @@ impl App {
     /// the persisted raw-io log from `$XDG_STATE_HOME/llmux/raw-io.jsonl`, fold it
     /// into a confidence-labeled session timeline off the runtime, and open the
     /// overlay immediately with a loading spinner. The read+parse+fold is blocking
-    /// IO/CPU over a multi-MB log, so running it inline inside the async event
+    /// IO/CPU over a potentially tens-of-GB log, so running it inline inside the async event
     /// loop froze the whole TUI ~10s — it now runs on the blocking pool and the
     /// timeline arrives over `sessions_tx` as a stream of progressive partials
     /// (`stream_sessions`), mirroring the remote-fetch pattern. Each partial
@@ -5559,20 +5559,24 @@ fn load_history() -> Vec<activity::Completed> {
 }
 
 /// One progressive delivery from the streaming session loader
-/// (`stream_sessions`). Each carries the fold of ALL records read so far (fold
-/// is pure and cheap, so re-folding the accumulator per chunk is fine), a `pct`
-/// of the file consumed for the overlay title, and `done` on the final (EOF)
-/// delivery so the receiver drops the loading state.
+/// (`stream_sessions`). Each carries the session timeline for ALL records read
+/// so far (a [`crate::session::SessionFolder`] snapshot), a `pct` of the file
+/// consumed for the overlay title, and `done` on the final (EOF) delivery so
+/// the receiver drops the loading state.
+#[derive(Debug)]
 struct SessionsLoad {
     sessions: Vec<crate::session::Session>,
     done: bool,
     pct: u8,
 }
 
-/// Records accumulated between folds. Large enough that the per-chunk re-fold
-/// of the whole accumulator stays negligible (fold is a single linear pass)
-/// while partials still arrive often enough to feel progressive on a multi-MB
-/// log.
+/// Records buffered per fold batch — also the cadence of progressive partials.
+/// The buffer holds only each record's small [`crate::session::RecordMeta`]
+/// projection (never the verbatim bodies), so its memory is bounded by this
+/// count, not by record size. The batch is also the window inside which
+/// out-of-order timestamps are re-sorted for `account_rotations` (see
+/// `stream_sessions`), so it should span far more records than can be
+/// concurrently in flight.
 const SESSIONS_CHUNK_RECORDS: usize = 4096;
 
 /// `bytes_read*100/file_len`, clamped to `0..=100`; 100 for an empty/unknown
@@ -5584,12 +5588,11 @@ fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
     (bytes_read.saturating_mul(100) / file_len).min(100) as u8
 }
 
-/// Streaming, progressive variant of the session load: reads the persisted
-/// raw-io log line by line, accumulating parsed records, and every
-/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
-/// and delivers a partial over `tx`. The final partial carries `done = true`.
-/// A missing/unreadable file delivers a single empty, done partial so the
-/// overlay's loading state always clears. Runs on the blocking pool.
+/// Streaming, progressive session load over the persisted raw-io log. Opens
+/// `$XDG_STATE_HOME/llmux/raw-io.jsonl` and hands it to
+/// [`stream_sessions_from`]. A missing/unreadable file delivers a single empty,
+/// done partial so the overlay's loading state always clears. Runs on the
+/// blocking pool.
 fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
     let send_empty_done = || {
         let _ = tx.blocking_send(SessionsLoad {
@@ -5607,16 +5610,45 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
         return;
     };
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut reader = std::io::BufReader::new(file);
-    let mut records: Vec<crate::proxy::raw_io::RawIoRecord> = Vec::new();
+    stream_sessions_from(std::io::BufReader::new(file), file_len, tx);
+}
+
+/// Bounded-memory core of [`stream_sessions`]: reads the log line by line,
+/// projects each parsed record to its [`crate::session::RecordMeta`] (the
+/// verbatim request/response bodies are dropped immediately), and every
+/// `SESSIONS_CHUNK_RECORDS` records folds the batch into an incremental
+/// [`crate::session::SessionFolder`], clears the batch, and delivers a
+/// snapshot partial over `tx`. The final partial (after EOF or a read error)
+/// carries `done = true` and is always delivered, even for an empty log.
+///
+/// Memory is O(one batch of metadata + one line + the number of sessions),
+/// independent of file size. The log is not a multi-MB file in practice: every
+/// record stores the verbatim request body, and Anthropic-style clients resend
+/// the whole growing conversation each turn, so logs of tens of GB exist. The
+/// previous version kept every parsed record alive until EOF and re-folded the
+/// full accumulator per chunk, which grew the TUI's RSS with the file size.
+///
+/// Tradeoff: each batch is sorted by `(ts_ms, id)` before folding, but batches
+/// are not re-sorted against each other. The log is appended in
+/// near-chronological order (disorder comes only from overlapping concurrent
+/// requests), so a batch of thousands of records absorbs it; a record whose
+/// timestamp precedes, for its own session, one folded in an earlier batch can
+/// only shift that session's `account_rotations` — every other aggregate is
+/// order-independent and exact.
+fn stream_sessions_from<R: std::io::BufRead>(
+    mut reader: R,
+    file_len: u64,
+    tx: &mpsc::Sender<SessionsLoad>,
+) {
+    let mut folder = crate::session::SessionFolder::new();
+    let mut chunk: Vec<crate::session::RecordMeta> = Vec::with_capacity(SESSIONS_CHUNK_RECORDS);
     let mut line = String::new();
     let mut bytes_read: u64 = 0;
-    let mut since_fold: usize = 0;
     loop {
         line.clear();
         // `read_line` keeps the newline so `bytes_read` tracks real file offset
         // for an accurate `pct`.
-        match std::io::BufRead::read_line(&mut reader, &mut line) {
+        match reader.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
             Err(_) => break, // truncated/unreadable tail → fold what we have
@@ -5626,13 +5658,16 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
-            records.push(rec);
-            since_fold += 1;
+            // Keep only the metadata; the full record (bodies) drops here.
+            chunk.push(crate::session::RecordMeta::from_record(&rec));
         }
-        if since_fold >= SESSIONS_CHUNK_RECORDS {
-            since_fold = 0;
+        if chunk.len() >= SESSIONS_CHUNK_RECORDS {
+            folder.add_meta(std::mem::replace(
+                &mut chunk,
+                Vec::with_capacity(SESSIONS_CHUNK_RECORDS),
+            ));
             let partial = SessionsLoad {
-                sessions: crate::session::fold_sessions(&records),
+                sessions: folder.snapshot(),
                 done: false,
                 pct: sessions_load_pct(bytes_read, file_len),
             };
@@ -5642,10 +5677,11 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
             }
         }
     }
-    // Final fold at EOF — always delivered (even for an empty file) so the
+    folder.add_meta(chunk);
+    // Final snapshot at EOF — always delivered (even for an empty file) so the
     // loading state clears.
     let _ = tx.blocking_send(SessionsLoad {
-        sessions: crate::session::fold_sessions(&records),
+        sessions: folder.snapshot(),
         done: true,
         pct: 100,
     });
@@ -6787,8 +6823,8 @@ mod tests {
 
     /// `s` opens the Sessions overlay (issue #34); arrows move the cursor within
     /// the loaded session list and `s`/`Esc` close back to MAIN. The session list
-    /// is injected directly (the real loader reads a file off disk, not under
-    /// test here — `fold_sessions` is unit-tested in `crate::session`).
+    /// is injected directly (the loader's streaming core is covered by the
+    /// `stream_sessions_from_*` tests; the fold itself in `crate::session`).
     #[test]
     fn s_opens_sessions_overlay_navigates_and_esc_returns_to_main() {
         use crate::session::{Confidence, Session};
@@ -6927,6 +6963,103 @@ mod tests {
         assert_eq!(sessions_load_pct(100, 200), 50, "half read → 50%");
         assert_eq!(sessions_load_pct(200, 200), 100, "fully read → 100%");
         assert_eq!(sessions_load_pct(300, 200), 100, "overshoot clamps to 100");
+    }
+
+    /// End-to-end over the streaming loader's bounded-memory core: a log with
+    /// more than `SESSIONS_CHUNK_RECORDS` records (plus blank and corrupt
+    /// lines) yields one progressive partial per full batch — each equal to a
+    /// one-shot fold of the records read so far — then a final `done` partial
+    /// equal to `fold_sessions` over the whole file.
+    #[test]
+    fn stream_sessions_from_chunks_large_log_and_matches_one_shot_fold() {
+        use crate::proxy::raw_io::{RawIoRecord, RECORD_VERSION};
+        let n = 2 * SESSIONS_CHUNK_RECORDS + 777;
+        let records: Vec<RawIoRecord> = (0..n as u64)
+            .map(|i| {
+                // Pairwise-swapped timestamps (disorder inside a batch only).
+                let ts = 1_000_000 + (i ^ 1) * 10;
+                let request_body = if i % 50 == 7 {
+                    r#"{"messages":[]}"#.to_string()
+                } else {
+                    format!(r#"{{"metadata":{{"user_id":"u-{}"}}}}"#, i % 9)
+                };
+                RawIoRecord {
+                    v: RECORD_VERSION,
+                    ts_ms: ts,
+                    id: i + 1,
+                    group: Some("claude".into()),
+                    model: Some(if i % 3 == 0 { "opus" } else { "sonnet" }.into()),
+                    account: (i % 7 != 0).then(|| format!("acct-{}", (i / 5) % 3)),
+                    status: Some(200),
+                    duration_ms: (i % 4 != 0).then_some(250),
+                    request_body,
+                    response_body: format!(
+                        r#"{{"usage":{{"input_tokens":{},"output_tokens":{}}}}}"#,
+                        i % 100,
+                        i % 17
+                    ),
+                    request_headers: None,
+                    response_headers: None,
+                    upstream: None,
+                }
+            })
+            .collect();
+        let mut log = String::new();
+        for (i, r) in records.iter().enumerate() {
+            log.push_str(&serde_json::to_string(r).expect("serialize"));
+            log.push('\n');
+            if i % 1000 == 3 {
+                log.push_str("\n{not json\n"); // blank + corrupt: skipped, not counted
+            }
+        }
+        let file_len = log.len() as u64;
+
+        let (tx, mut rx) = mpsc::channel::<SessionsLoad>(4);
+        let producer = std::thread::spawn(move || {
+            stream_sessions_from(std::io::Cursor::new(log.into_bytes()), file_len, &tx);
+        });
+        let mut loads = Vec::new();
+        while let Some(load) = rx.blocking_recv() {
+            loads.push(load);
+        }
+        producer.join().expect("producer thread");
+
+        let full_batches = n / SESSIONS_CHUNK_RECORDS;
+        assert_eq!(
+            loads.len(),
+            full_batches + 1,
+            "one partial per batch + final"
+        );
+        for (k, load) in loads[..full_batches].iter().enumerate() {
+            assert!(!load.done);
+            let upto = (k + 1) * SESSIONS_CHUNK_RECORDS;
+            assert_eq!(
+                load.sessions,
+                crate::session::fold_sessions(&records[..upto]),
+                "partial {k}"
+            );
+            assert!(load.pct < 100);
+        }
+        let last = loads.last().expect("final load");
+        assert!(last.done);
+        assert_eq!(last.pct, 100);
+        assert_eq!(last.sessions, crate::session::fold_sessions(&records));
+        assert_eq!(
+            last.sessions.iter().map(|s| s.requests).sum::<u64>(),
+            n as u64
+        );
+    }
+
+    /// An empty log still delivers exactly one empty `done` partial, so the
+    /// overlay's loading state clears.
+    #[test]
+    fn stream_sessions_from_empty_log_delivers_single_done() {
+        let (tx, mut rx) = mpsc::channel::<SessionsLoad>(4);
+        stream_sessions_from(std::io::Cursor::new(Vec::new()), 0, &tx);
+        drop(tx);
+        let load = rx.blocking_recv().expect("one load");
+        assert!(load.done && load.sessions.is_empty() && load.pct == 100);
+        assert!(rx.blocking_recv().is_none());
     }
 
     /// Reopening while a load is still in flight is a no-op guard, not a second
