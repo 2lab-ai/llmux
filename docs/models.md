@@ -434,7 +434,11 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   $18.75 / $30 / $1.50 / $75; Sonnet 5.5 and 5 $2 / $2.50 / $4 / $0.20 / $10;
   Sonnet 4.6, 4.5, 4 $3 / $3.75 / $6 / $0.30 / $15; Haiku 4.5 $1 / $1.25 / $2 /
   $0.10 / $5; Haiku 3.5 (retired, `claude-3-5-haiku-*`) $0.80 / $1 / $1.60 /
-  $0.08 / $4. Dated snapshots price like their bare id: llmux parses the
+  $0.08 / $4. Both write rates are modeled: each request's 1-hour share of its
+  cache writes (Anthropic's `cache_creation.ephemeral_1h_input_tokens`) is
+  billed at the 1-hour rate and the rest at the 5-minute rate; a request that
+  reports no split is billed entirely at the 5-minute rate. Dated snapshots
+  price like their bare id: llmux parses the
   version out of the id, so `claude-opus-4-20250514` is Opus 4 while
   `claude-opus-4-5-20251101` is Opus 4.5. An unlisted version of a known family
   takes that family's default row (Opus 5, Sonnet 4.x, Haiku 4.5, Fable 5);

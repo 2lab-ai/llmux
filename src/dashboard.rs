@@ -873,6 +873,10 @@ pub struct UsageStatDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation` (0 when no request in the row
+    /// reported a split). Additive: absent in older docs → 0.
+    #[serde(default)]
+    pub cache_creation_1h: u64,
     #[serde(default)]
     pub cost_usd: f64,
     /// Whether a price was found for this row's `(group, model)` (config
@@ -1136,6 +1140,11 @@ pub struct ModelUsageDoc {
     pub cache_read: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<u64>,
+    /// 1-hour-TTL subset of `cache_creation`; omitted when no request of the
+    /// row reported a TTL split (the pricing fallback then treats every write
+    /// as 5-minute, as older daemons did).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<u64>,
     /// Epoch ms of the last completed request for this model.
     pub last_used_ms: u64,
     /// In-flight requests currently attributed to this model (req11).
@@ -1240,6 +1249,9 @@ pub struct TenantModelDoc {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation`. Additive: absent → 0.
+    #[serde(default)]
+    pub cache_creation_1h: u64,
     /// API-equivalent USD cost for this cell (0.0 when nothing prices it).
     pub cost_usd: f64,
 }
@@ -1440,6 +1452,12 @@ pub struct TokensDoc {
     pub cache_read: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<u64>,
+    /// The 1-hour-TTL subset of `cache_creation` (see
+    /// [`crate::tui::TokenCounts::cache_creation_1h`]), so an attach client
+    /// prices the request's cache writes exactly like the daemon. Additive,
+    /// absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1608,6 +1626,7 @@ fn model_usage_docs(
         tokens_out: m.tokens_out,
         cache_read: m.cache_read,
         cache_creation: m.cache_creation,
+        cache_creation_1h: m.cache_creation_1h,
         last_used_ms: epoch_ms(m.last_used),
         in_flight: 0,
         cost_usd: crate::pricing::aggregate_cost(
@@ -1618,6 +1637,7 @@ fn model_usage_docs(
                 output: m.tokens_out,
                 cache_read: m.cache_read.unwrap_or(0),
                 cache_creation: m.cache_creation.unwrap_or(0),
+                cache_creation_1h: m.cache_creation_1h.unwrap_or(0),
             },
             &m.long,
             pricing_overrides,
@@ -1681,6 +1701,7 @@ fn model_usage_docs(
             tokens_out: 0,
             cache_read: None,
             cache_creation: None,
+            cache_creation_1h: None,
             last_used_ms: epoch_ms(now),
             in_flight: n,
             accounts: Vec::new(),
@@ -1901,6 +1922,7 @@ pub(crate) fn dashboard_doc(
                         output: t.output,
                         cache_read: t.cache_read,
                         cache_creation: t.cache_creation,
+                        cache_creation_1h: t.cache_creation_1h,
                     }),
                     // Per-request API-equivalent cost: 0.0 unless group, model,
                     // and the upstream token usage are ALL known (Feature D).
@@ -1957,6 +1979,7 @@ pub(crate) fn dashboard_doc(
                     output: r.tokens_out,
                     cache_read: r.cache_read,
                     cache_creation: r.cache_creation,
+                    cache_creation_1h: r.cache_creation_1h,
                 },
                 &r.long,
                 &meta.pricing_overrides,
@@ -2007,6 +2030,7 @@ pub(crate) fn dashboard_doc(
                         output: cell.output,
                         cache_read: cell.cache_read,
                         cache_creation: cell.cache_creation,
+                        cache_creation_1h: cell.cache_creation_1h,
                     };
                     TenantModelDoc {
                         group: group.clone(),
@@ -2016,6 +2040,7 @@ pub(crate) fn dashboard_doc(
                         tokens_out: cell.output,
                         cache_read: cell.cache_read,
                         cache_creation: cell.cache_creation,
+                        cache_creation_1h: cell.cache_creation_1h,
                         cost_usd: crate::pricing::aggregate_cost(
                             group,
                             model,
@@ -2427,6 +2452,7 @@ mod tests {
                     output: 300,
                     cache_read: Some(120),
                     cache_creation: None,
+                    cache_creation_1h: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -2540,6 +2566,7 @@ mod tests {
                         output: 0,
                         cache_read: None,
                         cache_creation: None,
+                        cache_creation_1h: None,
                     }),
                     group: Some("claude".into()),
                     model: Some("claude-opus-4-8".into()),
@@ -2617,10 +2644,13 @@ mod tests {
     /// three granularities), tenant cells — equals the sum of the per-request
     /// costs of the requests it covers, for a mix of short and long tiered
     /// requests. Holds again after the history is replayed from the
-    /// persisted activity log into a fresh hub (restart hydration).
+    /// persisted activity log into a fresh hub (restart hydration). The
+    /// claude-sonnet-5 requests mix 5-minute and 1-hour cache writes (and
+    /// one with no reported split), so every aggregate must also carry the
+    /// 1-hour subset — through the activity-log round trip too.
     #[test]
     fn every_aggregate_cost_equals_the_sum_of_its_request_costs() {
-        let requests: [(&str, &str, &str, TokenCounts); 8] = [
+        let requests: [(&str, &str, &str, TokenCounts); 12] = [
             ("k-1", "grok", "grok-4.7", tok(1_000, 500, 150_000, 0)), // short
             ("k-1", "grok", "grok-4.7", tok(50_000, 2_000, 150_000, 0)), // long (== 200k)
             ("k-2", "grok", "grok-4.7", tok(250_000, 1_000, 0, 0)),   // long
@@ -2634,6 +2664,31 @@ mod tests {
                 tok(10_000, 99, 250_000, 5_000),
             ),
             ("k-2", "claude", "claude-opus-4-8", tok(1_000, 99, 2_000, 0)),
+            // (input, output, cache_read, cache_creation, 1h subset)
+            (
+                "k-1",
+                "claude",
+                "claude-sonnet-5",
+                tok_1h(10, 50, 9_000, 40_000, Some(40_000)),
+            ),
+            (
+                "k-1",
+                "claude",
+                "claude-sonnet-5",
+                tok_1h(10, 50, 9_000, 30_000, Some(12_000)),
+            ),
+            (
+                "k-2",
+                "claude",
+                "claude-sonnet-5",
+                tok_1h(10, 50, 9_000, 20_000, Some(0)),
+            ),
+            (
+                "k-2",
+                "claude",
+                "claude-sonnet-5",
+                tok_1h(10, 50, 9_000, 10_000, None),
+            ),
         ];
         let path = std::env::temp_dir().join(format!(
             "llmux-tier-{}-{}.jsonl",
@@ -2700,7 +2755,7 @@ mod tests {
             );
         };
         for (label, doc) in [("live", doc_for(&live)), ("replayed", doc_for(&replayed))] {
-            assert_eq!(doc.model_usage.len(), 3, "{label}");
+            assert_eq!(doc.model_usage.len(), 4, "{label}");
             for row in &doc.model_usage {
                 close(
                     row.cost_usd,
@@ -2715,8 +2770,8 @@ mod tests {
             );
             assert_eq!(
                 doc.usage_stats.len(),
-                9,
-                "{label}: 3 models x hour/day/month"
+                12,
+                "{label}: 4 models x hour/day/month"
             );
             for row in &doc.usage_stats {
                 assert!(row.priced);
@@ -2770,6 +2825,7 @@ mod tests {
                 output: row.tokens_out,
                 cache_read: row.cache_read.unwrap_or(0),
                 cache_creation: row.cache_creation.unwrap_or(0),
+                cache_creation_1h: 0,
             },
             &crate::pricing::TokenParts::default(),
             &HashMap::new(),
@@ -2779,6 +2835,36 @@ mod tests {
             row.cost_usd > flat + 1e-6,
             "long requests are billed at the long rates"
         );
+        // Non-vacuous for the TTL split too: 52,000 of the sonnet-5 row's
+        // 100,000 cache-write tokens are 1-hour writes. Dropping that subset
+        // anywhere (pricing every write at the 5-minute rate) is $0.078 short.
+        let row = live_doc
+            .model_usage
+            .iter()
+            .find(|r| r.model == "claude-sonnet-5")
+            .expect("claude-sonnet-5 row");
+        assert_eq!(row.cache_creation, Some(100_000));
+        assert_eq!(row.cache_creation_1h, Some(52_000));
+        let all_5m = crate::pricing::aggregate_cost(
+            "claude",
+            "claude-sonnet-5",
+            &crate::pricing::TokenParts {
+                input: row.tokens_in,
+                output: row.tokens_out,
+                cache_read: row.cache_read.unwrap_or(0),
+                cache_creation: 100_000,
+                cache_creation_1h: 0,
+            },
+            &crate::pricing::TokenParts::default(),
+            &HashMap::new(),
+        )
+        .expect("priced");
+        // 52k × ($4 − $2.50) / 1M = $0.078.
+        assert!(
+            (row.cost_usd - all_5m - 0.078).abs() < 1e-12,
+            "{}",
+            row.cost_usd
+        );
     }
 
     fn tok(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> TokenCounts {
@@ -2787,6 +2873,20 @@ mod tests {
             output,
             cache_read: Some(cache_read),
             cache_creation: Some(cache_creation),
+            cache_creation_1h: None,
+        }
+    }
+
+    fn tok_1h(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        cache_creation_1h: Option<u64>,
+    ) -> TokenCounts {
+        TokenCounts {
+            cache_creation_1h,
+            ..tok(input, output, cache_read, cache_creation)
         }
     }
 
@@ -3180,6 +3280,7 @@ mod tests {
             output: 2,
             cache_read: Some(3),
             cache_creation: None,
+            cache_creation_1h: None,
         })
         .expect("serialize");
         assert!(json.contains(r#""cache_read":3"#));
@@ -3187,6 +3288,23 @@ mod tests {
         let back: TokensDoc = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(back.cache_read, Some(3));
         assert_eq!(back.cache_creation, None);
+        // The 1-hour TTL subset is additive the same way: absent in older
+        // docs (→ None), omitted when None, carried when reported.
+        assert_eq!(old.cache_creation_1h, None);
+        let json = serde_json::to_string(&TokensDoc {
+            input: 1,
+            output: 2,
+            cache_read: None,
+            cache_creation: Some(10),
+            cache_creation_1h: Some(7),
+        })
+        .expect("serialize");
+        assert!(json.contains(r#""cache_creation_1h":7"#), "{json}");
+        let back: TokensDoc = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(
+            (back.cache_creation, back.cache_creation_1h),
+            (Some(10), Some(7))
+        );
     }
 
     #[test]
@@ -3260,6 +3378,7 @@ mod tests {
                     output: 300,
                     cache_read: Some(120),
                     cache_creation: Some(0),
+                    cache_creation_1h: None,
                 },
                 &HashMap::new(),
             );
@@ -3349,6 +3468,7 @@ mod tests {
             output: 300,
             cache_read: Some(120),
             cache_creation: None,
+            cache_creation_1h: None,
         };
         let expected = crate::pricing::cost_usd("codex", "gpt-5.5", &tokens, &HashMap::new());
 
@@ -3389,6 +3509,7 @@ mod tests {
                 cache_read: 0.0,
                 cache_creation: 0.0,
                 long_context: None,
+                cache_creation_1h: None,
             },
         );
         let mut m = meta();
@@ -3622,6 +3743,7 @@ mod tests {
                 output: m.tokens_out,
                 cache_read: m.cache_read,
                 cache_creation: m.cache_creation,
+                cache_creation_1h: None,
             },
             &HashMap::new(),
         );
@@ -3726,6 +3848,7 @@ mod tests {
                 output: 5,
                 cache_read: None,
                 cache_creation: None,
+                cache_creation_1h: None,
             }),
             group: Some("claude".into()),
             model: Some("sonnet".into()),

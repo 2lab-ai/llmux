@@ -45,6 +45,10 @@ An external Codex reset does not invalidate llmux's observed quota window, so a 
 
 The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title carries the period totals. Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Long-context pricing (grok: a request whose prompt is ≥ 200k tokens is billed entirely at the higher rates) is applied per request, so a bucket's cost is always the sum of its requests' costs, never a re-pricing of its token totals. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
+### Cache-write TTL split
+
+Anthropic bills a prompt-cache write by its TTL: a 5-minute write at 1.25× the input rate, a 1-hour write at 2× (Claude Code asks for 1-hour caching on most of its cache breakpoints). Anthropic responses report the total (`usage.cache_creation_input_tokens`) and the split (`usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`). llmux keeps the total as `cache_creation` and the 1-hour count as `cache_creation_1h`, a **subset** of it, so the 5-minute count is always `cache_creation - cache_creation_1h` and token totals never count the subset twice. Cost is `(cache_creation - cache_creation_1h) × 5-minute rate + cache_creation_1h × 1-hour rate`, per request and in every aggregate (model rows, Usage tab, tenant cells, keys panel), so an aggregate's cost is still the sum of its requests' costs. The field is additive everywhere it appears: `TokensDoc` on `GET /llmux/dashboard` activity rows, `activity.jsonl` token objects, and `ModelUsageDoc` rows omit it when no split was reported; `usage_stats` rows and tenant model cells carry it as a count that defaults to 0. A request without a reported split (codex, grok, older Anthropic responses, history recorded before this field existed) prices every write at the 5-minute rate, exactly as before. The expanded activity row shows the split as `cache_creation 100.0k (1h 60.0k)` and prices it as `cache_creation 5m $… · 1h $…`.
+
 ### Perf tab (observed performance)
 
 The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
@@ -215,6 +219,12 @@ accounts for every observed completion.
   surfaces keep using it. Rotation is detected by the source's file id AND its
   head bytes, so a replaced or truncated-and-refilled log is re-read instead of
   silently resumed at a stale offset.
+- **Schema upgrades.** The store migrates itself in place on open. Schema v2
+  adds `cache_creation_1h`, the 1-hour-TTL share of each request's cache
+  writes (see [Cache-write TTL split](#cache-write-ttl-split)). Rows written
+  before the upgrade read `0` there: their split is unknown, so their cache
+  writes stay priced at the 5-minute rate, which is how they were priced before
+  the upgrade. Nothing is backfilled.
 - **Migrating a large history.** The import runs in chunks and releases the
   store between them, so a multi-hundred-megabyte `activity.jsonl` never blocks
   live metering or admin queries. While it runs, every answer is partial by

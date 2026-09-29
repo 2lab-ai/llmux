@@ -1356,6 +1356,7 @@ mod tests {
                 // No cached_tokens key in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1395,6 +1396,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1434,6 +1436,7 @@ mod tests {
                 cache_read_input_tokens: Some(100_864),
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1465,6 +1468,7 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1492,6 +1496,7 @@ mod tests {
                 output_tokens: 9,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1887,6 +1892,7 @@ mod tests {
                 // so cache-read is an explicit Some(0), not unavailable.
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }

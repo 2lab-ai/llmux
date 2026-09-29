@@ -25,6 +25,10 @@ pub struct StreamUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
+    /// The 1-hour-TTL subset of `cache_creation_input_tokens`
+    /// (`usage.cache_creation.ephemeral_1h_input_tokens`). `None` when the
+    /// upstream sent no TTL split (codex, grok, older Anthropic responses).
+    pub cache_creation_1h_input_tokens: Option<u64>,
 }
 
 impl StreamUsage {
@@ -39,7 +43,37 @@ impl StreamUsage {
             self.cache_creation_input_tokens,
             other.cache_creation_input_tokens,
         );
+        self.cache_creation_1h_input_tokens = add_opt(
+            self.cache_creation_1h_input_tokens,
+            other.cache_creation_1h_input_tokens,
+        );
     }
+}
+
+/// The three Anthropic cache counters of one `usage` object, as
+/// `(cache_read, cache_creation, cache_creation_1h)`. Shared by the streaming
+/// (`message_start`) and non-streaming (JSON body) extractors so both read the
+/// TTL split identically.
+///
+/// `cache_creation` is the reported total `cache_creation_input_tokens`;
+/// `cache_creation_1h` is `cache_creation.ephemeral_1h_input_tokens`, a SUBSET
+/// of that total (the 5-minute count is the remainder), clamped to it so a
+/// malformed split can never claim more writes than the total. Without a
+/// split object (or without its 1h key) the 1h count is `None` and the other
+/// two are exactly what the upstream reported. A split with no total (never
+/// seen on the wire) derives the total from the split.
+pub fn cache_counters(usage: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let get = |v: &serde_json::Value, key: &str| v.get(key).and_then(serde_json::Value::as_u64);
+    let read = get(usage, "cache_read_input_tokens");
+    let split = usage.get("cache_creation");
+    let h1 = split.and_then(|s| get(s, "ephemeral_1h_input_tokens"));
+    let h5 = split.and_then(|s| get(s, "ephemeral_5m_input_tokens"));
+    let total = get(usage, "cache_creation_input_tokens").or(match (h5, h1) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    });
+    let h1 = h1.map(|h| total.map_or(h, |t| h.min(t)));
+    (read, total, h1)
 }
 
 /// Saturating add of two optional counters where `None` means "unavailable":
@@ -109,17 +143,18 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
         "message_start" => {
             let usage = value.get("message")?.get("usage")?;
             let input = usage.get("input_tokens")?.as_u64()?;
+            // Anthropic prompt-caching counters, present only when the request
+            // used caching — captured opportunistically (req8/9). The cache
+            // counters (TTL split included) come from `message_start` only:
+            // `message_delta` contributes output, and `add` SUMS the two, so
+            // reading them from both would double-count.
+            let (cache_read, cache_creation, cache_creation_1h) = cache_counters(usage);
             Some(StreamUsage {
                 input_tokens: input,
                 output_tokens: 0,
-                // Anthropic prompt-caching counters, present only when the
-                // request used caching — captured opportunistically (req8/9).
-                cache_read_input_tokens: usage
-                    .get("cache_read_input_tokens")
-                    .and_then(serde_json::Value::as_u64),
-                cache_creation_input_tokens: usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(serde_json::Value::as_u64),
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_creation,
+                cache_creation_1h_input_tokens: cache_creation_1h,
             })
         }
         "message_delta" => {
@@ -129,6 +164,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 output_tokens: output,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             })
         }
         _ => None,
@@ -643,6 +679,7 @@ mod tests {
                 // No cache keys in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             })
         );
     }
@@ -658,8 +695,103 @@ mod tests {
                 // Present in the payload → captured (explicit 0 stays Some(0)).
                 cache_read_input_tokens: Some(40000),
                 cache_creation_input_tokens: Some(0),
+                cache_creation_1h_input_tokens: None,
             })
         );
+    }
+
+    /// A `message_start` carrying Anthropic's cache-write TTL split, shaped
+    /// like live traffic.
+    fn start_with_split(total: u64, split: &str) -> String {
+        format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":3,\"cache_creation_input_tokens\":{total},\"cache_read_input_tokens\":51234,{split}\"output_tokens\":1,\"service_tier\":\"standard\"}}}}}}"
+        )
+    }
+
+    #[test]
+    fn extract_usage_message_start_captures_the_cache_ttl_split() {
+        // (total, split object, expected 1h subset)
+        for (total, split, h1) in [
+            // 5m-only (live shape: an explicit 0 for 1h).
+            (
+                169,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":169,"ephemeral_1h_input_tokens":0},"#,
+                Some(0),
+            ),
+            // 1h-only.
+            (
+                4_210,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":4210},"#,
+                Some(4_210),
+            ),
+            // Mixed.
+            (
+                5_000,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":1200,"ephemeral_1h_input_tokens":3800},"#,
+                Some(3_800),
+            ),
+            // Absent: no split object → unknown, not zero.
+            (777, "", None),
+        ] {
+            let usage = extract_usage(&start_with_split(total, split)).expect("usage");
+            assert_eq!(
+                usage,
+                StreamUsage {
+                    input_tokens: 3,
+                    output_tokens: 0,
+                    cache_read_input_tokens: Some(51_234),
+                    cache_creation_input_tokens: Some(total),
+                    cache_creation_1h_input_tokens: h1,
+                },
+                "{split}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_is_taken_once_across_start_and_delta() {
+        // `message_delta` may repeat the usage block (including the split);
+        // only `message_start` feeds the cache counters, so accumulating the
+        // stream never doubles the 1h subset.
+        let start = start_with_split(
+            5_000,
+            r#""cache_creation":{"ephemeral_5m_input_tokens":1200,"ephemeral_1h_input_tokens":3800},"#,
+        );
+        let delta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42,\"cache_creation_input_tokens\":5000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":1200,\"ephemeral_1h_input_tokens\":3800}}}";
+        let mut total = StreamUsage::default();
+        total.add(extract_usage(&start).expect("start"));
+        total.add(extract_usage(delta).expect("delta"));
+        assert_eq!(total.cache_creation_input_tokens, Some(5_000));
+        assert_eq!(total.cache_creation_1h_input_tokens, Some(3_800));
+        assert_eq!(total.output_tokens, 42);
+    }
+
+    #[test]
+    fn cache_counters_clamp_and_derive() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).expect("json");
+        // A 1h count above the total is clamped to it.
+        assert_eq!(
+            cache_counters(&v(
+                r#"{"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":99}}"#
+            )),
+            (None, Some(10), Some(10))
+        );
+        // A split without a total derives the total from the split.
+        assert_eq!(
+            cache_counters(&v(
+                r#"{"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":6}}"#
+            )),
+            (None, Some(10), Some(6))
+        );
+        // A split object without a 1h key: total kept, 1h unknown.
+        assert_eq!(
+            cache_counters(&v(
+                r#"{"cache_creation_input_tokens":8,"cache_creation":{"ephemeral_5m_input_tokens":8}}"#
+            )),
+            (None, Some(8), None)
+        );
+        // Nothing reported.
+        assert_eq!(cache_counters(&v("{}")), (None, None, None));
     }
 
     #[test]
@@ -671,6 +803,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             })
         );
     }
@@ -698,12 +831,14 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: Some(5),
             cache_creation_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
         });
         total.add(StreamUsage {
             input_tokens: 0,
             output_tokens: 7,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            cache_creation_1h_input_tokens: None,
         });
         assert_eq!(
             total,
@@ -714,6 +849,7 @@ mod tests {
                 // never reported → stays unavailable.
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }

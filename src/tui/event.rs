@@ -19,6 +19,15 @@ pub struct TokenCounts {
     pub output: u64,
     pub cache_read: Option<u64>,
     pub cache_creation: Option<u64>,
+    /// The 1-hour-TTL SUBSET of `cache_creation` (Anthropic
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`); the 5-minute count
+    /// is `cache_creation - cache_creation_1h`. `None` = the upstream reported
+    /// no TTL split (codex, grok, older records), distinct from `Some(0)` = all
+    /// writes were 5-minute. Never counted on its own in [`Self::total`].
+    /// Additive on the wire and in `activity.jsonl`: absent when `None`, and a
+    /// line written before the field existed loads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<u64>,
 }
 
 impl TokenCounts {
@@ -225,6 +234,7 @@ mod token_total_tests {
             output: 319,
             cache_read: Some(0),
             cache_creation: None,
+            cache_creation_1h: None,
         };
         // Turn N+1: conversation GREW, 26624 of the prompt got cached → fresh drops,
         // but cache_read holds it. Real context = 183231 + 188 = 183419.
@@ -233,6 +243,7 @@ mod token_total_tests {
             output: 188,
             cache_read: Some(26_624),
             cache_creation: None,
+            cache_creation_1h: None,
         };
         assert_eq!(a.total(), 182_905);
         assert_eq!(

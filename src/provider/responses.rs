@@ -694,6 +694,8 @@ impl ResponsesSseConverter {
                     .unwrap_or(0),
                 cache_read_input_tokens: cached,
                 cache_creation_input_tokens: cache_write,
+                // OpenAI reports no cache-write TTL split.
+                cache_creation_1h_input_tokens: None,
             };
         }
         let stop_reason = match forced_stop {
@@ -1391,6 +1393,7 @@ mod tests {
                 output_tokens: 302,
                 cache_read_input_tokens: Some(64),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             },
             "a capped turn still bills the tokens it really burned"
         );

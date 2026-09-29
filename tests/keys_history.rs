@@ -883,6 +883,7 @@ impl Proxy {
                     output: 200,
                     cache_read: Some(10),
                     cache_creation: Some(1),
+                    cache_creation_1h: None,
                 }),
                 group: Some("claude".into()),
                 model: Some(model.into()),

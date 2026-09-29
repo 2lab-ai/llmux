@@ -375,6 +375,7 @@ impl DashboardView {
                             output: t.output,
                             cache_read: t.cache_read,
                             cache_creation: t.cache_creation,
+                            cache_creation_1h: t.cache_creation_1h,
                         }),
                         group: group.clone(),
                         model: model.clone(),
@@ -913,6 +914,7 @@ mod tests {
                         output: 30,
                         cache_read: Some(12),
                         cache_creation: None,
+                        cache_creation_1h: None,
                     })
                 );
             }

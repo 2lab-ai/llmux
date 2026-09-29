@@ -15,6 +15,19 @@
 //! rates (input / output / cache_read / cache_creation) expresses both
 //! providers uniformly — codex models simply carry `cache_creation: 0.0`.
 //!
+//! ## Cache-write TTL split (5-minute vs 1-hour)
+//! Anthropic prices a cache write by its TTL: a 5-minute write at 1.25× input
+//! (`cache_creation`), a 1-hour write at 2× input (`cache_creation_1h`).
+//! Responses report the total (`cache_creation_input_tokens`) plus a split
+//! (`cache_creation.ephemeral_{5m,1h}_input_tokens`); llmux keeps the total and
+//! the 1-hour count as a SUBSET of it, so the 5-minute count is always
+//! `cache_creation - cache_creation_1h`. The cache-write cost is
+//! `(cc - cc_1h)·cache_creation + cc_1h·cache_creation_1h`. A request that
+//! reported no split has a 1-hour count of 0 and prices every write at the
+//! 5-minute rate, exactly as before the split existed — and so does a price
+//! row with no 1-hour rate (`cache_creation_1h: None`: codex, grok, config
+//! overrides written before the field), bit for bit.
+//!
 //! ## Long-context tier (per REQUEST, not per total)
 //! Some providers bill a request at higher rates for ALL of its tokens when
 //! that ONE request's prompt is large. A [`ModelPrice`] may carry
@@ -76,8 +89,15 @@ pub struct ModelPrice {
     pub output: f64,
     /// Cache-read tokens, USD / 1e6.
     pub cache_read: f64,
-    /// Cache-creation (write) tokens, USD / 1e6.
+    /// Cache-creation (write) tokens, USD / 1e6 — for Anthropic, the
+    /// 5-minute-TTL write rate, and the rate for any write whose TTL is
+    /// unknown.
     pub cache_creation: f64,
+    /// 1-hour-TTL cache-write tokens, USD / 1e6. `None` = the same rate as
+    /// `cache_creation` (no TTL distinction), which is what every non-Claude
+    /// row and every config entry written before this field carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<f64>,
     /// Long-context tier: when set, a request whose prompt is `>=`
     /// [`long_context_threshold`] is billed ALL its tokens at these rates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +116,10 @@ pub struct LongContextRates {
     pub output: f64,
     pub cache_read: f64,
     pub cache_creation: f64,
+    /// 1-hour cache-write rate on a long request; `None` = this tier's
+    /// `cache_creation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h: Option<f64>,
     /// Prompt size at or above which the request is long-context. Built-in
     /// data (xAI 200k, OpenAI 272k): never read from or written to config —
     /// `skip` plus `deny_unknown_fields` makes a configured `threshold` fail
@@ -116,7 +140,16 @@ impl ModelPrice {
             output,
             cache_read,
             cache_creation,
+            cache_creation_1h: None,
             long_context: None,
+        }
+    }
+
+    /// Attach a distinct 1-hour cache-write rate (Anthropic: 2× input).
+    const fn with_cache_creation_1h(self, rate: f64) -> Self {
+        Self {
+            cache_creation_1h: Some(rate),
+            ..self
         }
     }
 
@@ -151,6 +184,7 @@ impl ModelPrice {
                 output,
                 cache_read,
                 cache_creation,
+                cache_creation_1h: None,
                 threshold,
             }),
             ..self
@@ -201,14 +235,19 @@ pub fn long_context_thresholds() -> Vec<u64> {
     all
 }
 
-/// Four token counters of one request, or of a SUM of requests. The pricing
-/// input shape — absent (`None`) cache counters are `0` here.
+/// Four token counters of one request, or of a SUM of requests, plus the
+/// 1-hour subset of `cache_creation`. The pricing input shape — absent
+/// (`None`) cache counters are `0` here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenParts {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    /// Every cache-write token, whatever its TTL.
     pub cache_creation: u64,
+    /// The 1-hour-TTL SUBSET of `cache_creation` (0 when not reported). Not
+    /// an extra class: it never adds to [`Self::prompt`] or to a token total.
+    pub cache_creation_1h: u64,
 }
 
 impl TokenParts {
@@ -226,6 +265,9 @@ impl TokenParts {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.cache_creation_1h = self
+            .cache_creation_1h
+            .saturating_add(other.cache_creation_1h);
     }
 
     fn saturating_sub(&self, other: &TokenParts) -> TokenParts {
@@ -234,6 +276,9 @@ impl TokenParts {
             output: self.output.saturating_sub(other.output),
             cache_read: self.cache_read.saturating_sub(other.cache_read),
             cache_creation: self.cache_creation.saturating_sub(other.cache_creation),
+            cache_creation_1h: self
+                .cache_creation_1h
+                .saturating_sub(other.cache_creation_1h),
         }
     }
 }
@@ -245,6 +290,7 @@ impl From<&TokenCounts> for TokenParts {
             output: t.output,
             cache_read: t.cache_read.unwrap_or(0),
             cache_creation: t.cache_creation.unwrap_or(0),
+            cache_creation_1h: t.cache_creation_1h.unwrap_or(0),
         }
     }
 }
@@ -265,18 +311,21 @@ pub fn long_part(model: &str, tokens: &TokenCounts) -> TokenParts {
 }
 
 /// Per-component API-equivalent cost. `total()` is exactly the sum of the
-/// four, so a per-component display always adds up to the total shown.
+/// five, so a per-component display always adds up to the total shown.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CostBreakdown {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
+    /// Cache writes billed at the 5-minute (or TTL-unknown) rate.
     pub cache_creation: f64,
+    /// Cache writes billed at the 1-hour rate (`0.0` when none reported).
+    pub cache_creation_1h: f64,
 }
 
 impl CostBreakdown {
     pub fn total(&self) -> f64 {
-        self.input + self.output + self.cache_read + self.cache_creation
+        self.input + self.output + self.cache_read + self.cache_creation + self.cache_creation_1h
     }
 }
 
@@ -284,38 +333,38 @@ impl CostBreakdown {
 // Source for every Claude row: the Anthropic pricing page
 // (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28. USD per
 // 1M tokens, in the page's column order: base input / 5-minute cache write /
-// 1-hour cache write / cache read / output. `cache_creation` here is the
-// 5-minute write rate (1.25x input); the page's 1-hour write rate (2x input) is
-// quoted alongside each row. No row carries a long-context tier (see the
+// 1-hour cache write / cache read / output. `cache_creation` is the 5-minute
+// write rate (1.25x input) and `cache_creation_1h` the 1-hour one (2x input).
+// No row carries a long-context tier (see the
 // module docs): Claude 4.6+ bill the full 1M window at standard rates.
 
 /// Claude Opus 5, 4.8, 4.7, 4.6, 4.5: 5 / 6.25 / 10 / 0.50 / 25. Also the
 /// `group == "claude"` unknown-model fallback and the default for an Opus
 /// version this table does not list.
-const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25);
+const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25).with_cache_creation_1h(10.0);
 /// Claude Opus 5.5: 4 / 5 / 8 / 0.20 / 20 — cheaper than the opus tier (cache
 /// read is 0.05x input), so neither it nor a dated snapshot may fall to it.
-const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0);
+const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0).with_cache_creation_1h(8.0);
 /// Claude Opus 4.1 and Opus 4 (both retired): 15 / 18.75 / 30 / 1.50 / 75.
-const OPUS_4_1: ModelPrice = ModelPrice::new(15.0, 75.0, 1.5, 18.75);
+const OPUS_4_1: ModelPrice = ModelPrice::new(15.0, 75.0, 1.5, 18.75).with_cache_creation_1h(30.0);
 /// Claude Sonnet 5.5 and Sonnet 5: 2 / 2.50 / 4 / 0.20 / 10 (Sonnet 5's
 /// $2/$10 is now its standard price, not a launch promotion).
-const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5);
+const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5).with_cache_creation_1h(4.0);
 /// Claude Sonnet 4.6, 4.5, 4: 3 / 3.75 / 6 / 0.30 / 15. Also the default for a
 /// Sonnet version this table does not list.
-const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
+const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75).with_cache_creation_1h(6.0);
 /// Claude Haiku 4.5: 1 / 1.25 / 2 / 0.10 / 5. Also the default for a Haiku
 /// version this table does not list.
-const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
+const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25).with_cache_creation_1h(2.0);
 /// Claude Haiku 3.5 (retired; wire id `claude-3-5-haiku-*`): 0.80 / 1 / 1.60
 /// / 0.08 / 4.
-const HAIKU_3_5: ModelPrice = ModelPrice::new(0.8, 4.0, 0.08, 1.0);
+const HAIKU_3_5: ModelPrice = ModelPrice::new(0.8, 4.0, 0.08, 1.0).with_cache_creation_1h(1.6);
 /// Claude Fable 5: 10 / 12.50 / 20 / 1.00 / 50. Also the default for a Fable
 /// version this table does not list.
-const FABLE_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
+const FABLE_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_cache_creation_1h(20.0);
 /// Claude Fable 5.1: 10 / 12.50 / 20 / 0.25 / 50 — same as Fable 5 except the
 /// cache read, which is 0.025x input ($0.25), not Fable 5's $1.00.
-const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
+const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5).with_cache_creation_1h(20.0);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0} (OpenAI pricing page, re-read 2026-09-28). Codex has no
 /// cache-creation charge. Also the `group == "codex"` unknown-model fallback.
@@ -719,26 +768,55 @@ pub fn aggregate_cost(
 /// The single pricing formula every entry point reduces to:
 /// `component = short·flat/1e6 + long·tier/1e6` per component. Without a tier
 /// the long subset is not separated at all — `all·flat/1e6`, bit-identical to
-/// the pre-tier formula.
+/// the pre-tier formula. Cache writes additionally split by TTL
+/// ([`cache_write_cost`]).
 fn breakdown(price: ModelPrice, all: &TokenParts, long: &TokenParts) -> CostBreakdown {
     let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
     match price.long_context {
-        None => CostBreakdown {
-            input: per_m(all.input, price.input),
-            output: per_m(all.output, price.output),
-            cache_read: per_m(all.cache_read, price.cache_read),
-            cache_creation: per_m(all.cache_creation, price.cache_creation),
-        },
+        None => {
+            let (cc_5m, cc_1h) =
+                cache_write_cost(all, price.cache_creation, price.cache_creation_1h);
+            CostBreakdown {
+                input: per_m(all.input, price.input),
+                output: per_m(all.output, price.output),
+                cache_read: per_m(all.cache_read, price.cache_read),
+                cache_creation: cc_5m,
+                cache_creation_1h: cc_1h,
+            }
+        }
         Some(tier) => {
             let short = all.saturating_sub(long);
+            let (short_5m, short_1h) =
+                cache_write_cost(&short, price.cache_creation, price.cache_creation_1h);
+            let (long_5m, long_1h) =
+                cache_write_cost(long, tier.cache_creation, tier.cache_creation_1h);
             CostBreakdown {
                 input: per_m(short.input, price.input) + per_m(long.input, tier.input),
                 output: per_m(short.output, price.output) + per_m(long.output, tier.output),
                 cache_read: per_m(short.cache_read, price.cache_read)
                     + per_m(long.cache_read, tier.cache_read),
-                cache_creation: per_m(short.cache_creation, price.cache_creation)
-                    + per_m(long.cache_creation, tier.cache_creation),
+                cache_creation: short_5m + long_5m,
+                cache_creation_1h: short_1h + long_1h,
             }
+        }
+    }
+}
+
+/// Cost of `parts`' cache writes as `(5-minute, 1-hour)`. With no 1-hour rate
+/// every write takes `rate_5m` — the pre-split formula, bit for bit, and the
+/// 1-hour component is `0.0`. With one, the 1-hour subset (clamped to the
+/// total, so a malformed count can never bill more writes than happened) takes
+/// `rate_1h` and the remainder `rate_5m`.
+fn cache_write_cost(parts: &TokenParts, rate_5m: f64, rate_1h: Option<f64>) -> (f64, f64) {
+    let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
+    match rate_1h {
+        None => (per_m(parts.cache_creation, rate_5m), 0.0),
+        Some(rate_1h) => {
+            let h1 = parts.cache_creation_1h.min(parts.cache_creation);
+            (
+                per_m(parts.cache_creation - h1, rate_5m),
+                per_m(h1, rate_1h),
+            )
         }
     }
 }
@@ -845,6 +923,7 @@ mod tests {
             output,
             cache_read: cr,
             cache_creation: cc,
+            cache_creation_1h: None,
         }
     }
 
@@ -1435,7 +1514,8 @@ mod tests {
                 input: 1,
                 output: 0,
                 cache_read: 0,
-                cache_creation: 199_999
+                cache_creation: 199_999,
+                cache_creation_1h: 0,
             }
         );
         // Output never counts toward the prompt.
@@ -1568,6 +1648,7 @@ mod tests {
                 output: all.output,
                 cache_read: Some(all.cache_read),
                 cache_creation: Some(all.cache_creation),
+                cache_creation_1h: None,
             };
             let agg = aggregate_cost(group, model, &all, &long_part(model, &big), &empty())
                 .expect("priced");
@@ -1770,5 +1851,280 @@ mod tests {
                 (300_000.0 * 5.0 + 1_000.0 * 30.0) / 1e6,
             );
         }
+    }
+
+    // ---- cache-write TTL split (5-minute vs 1-hour) ----
+
+    /// A request with `cc` cache-write tokens, `h1` of them 1-hour.
+    fn tc_1h(cc: u64, h1: Option<u64>) -> TokenCounts {
+        TokenCounts {
+            cache_creation_1h: h1,
+            ..tc(0, 0, None, Some(cc))
+        }
+    }
+
+    #[test]
+    fn claude_rows_carry_the_one_hour_write_rate() {
+        // Anthropic pricing page, read 2026-09-28: 1h writes are 2x input.
+        for (model, rate_5m, rate_1h) in [
+            ("claude-fable-5-1", 12.5, 20.0),
+            ("claude-fable-5", 12.5, 20.0),
+            ("claude-opus-5-5", 5.0, 8.0),
+            ("claude-opus-5", 6.25, 10.0),
+            ("claude-opus-4-8", 6.25, 10.0),
+            ("claude-opus-4-1", 18.75, 30.0),
+            ("claude-sonnet-5-5", 2.5, 4.0),
+            ("claude-sonnet-5", 2.5, 4.0),
+            ("claude-sonnet-4-6", 3.75, 6.0),
+            ("claude-haiku-4-5", 1.25, 2.0),
+            ("claude-3-5-haiku-20241022", 1.0, 1.6),
+            // The `group == "claude"` fallback is the opus tier, 1h included.
+            ("claude-future-9", 6.25, 10.0),
+        ] {
+            let p = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(
+                (p.cache_creation, p.cache_creation_1h),
+                (rate_5m, Some(rate_1h)),
+                "{model}"
+            );
+            assert_eq!(
+                p.cache_creation_1h,
+                Some(p.input * 2.0),
+                "{model}: 2x input"
+            );
+        }
+        // Every non-Claude row keeps a single cache-write rate.
+        for (group, model) in [
+            ("codex", "gpt-5.5"),
+            ("codex", "gpt-6-sol"),
+            ("codex", "gpt-99-mystery"),
+            ("grok", "grok-4.7"),
+            ("grok", "grok-build-0.1"),
+        ] {
+            let p = price_for(group, model, &empty()).expect("priced");
+            assert_eq!(p.cache_creation_1h, None, "{model}");
+            assert!(p.long_context.is_none_or(|l| l.cache_creation_1h.is_none()));
+        }
+    }
+
+    #[test]
+    fn mixed_five_minute_and_one_hour_writes_price_each_at_its_rate() {
+        // 1M cache-write tokens, 600k of them 1-hour.
+        for (model, rate_5m, rate_1h) in [
+            ("claude-opus-4-8", 6.25, 10.0),
+            ("claude-opus-5-5", 5.0, 8.0),
+            ("claude-sonnet-5", 2.5, 4.0),
+            ("claude-fable-5-1", 12.5, 20.0),
+        ] {
+            let t = tc_1h(1_000_000, Some(600_000));
+            let b = request_breakdown("claude", model, &t, &empty()).expect("priced");
+            approx(b.cache_creation, 0.4 * rate_5m);
+            approx(b.cache_creation_1h, 0.6 * rate_1h);
+            approx(
+                cost_usd("claude", model, &t, &empty()),
+                0.4 * rate_5m + 0.6 * rate_1h,
+            );
+            // All-1h and 5m-only (an explicit Some(0)) requests.
+            approx(
+                cost_usd(
+                    "claude",
+                    model,
+                    &tc_1h(1_000_000, Some(1_000_000)),
+                    &empty(),
+                ),
+                rate_1h,
+            );
+            approx(
+                cost_usd("claude", model, &tc_1h(1_000_000, Some(0)), &empty()),
+                rate_5m,
+            );
+        }
+    }
+
+    #[test]
+    fn no_reported_split_prices_every_write_at_the_five_minute_rate_bit_for_bit() {
+        // `None` (no split reported, or history from before the split) must
+        // price exactly as before the split existed: the flat formula.
+        let t = TokenCounts {
+            cache_creation_1h: None,
+            ..tc(123_456, 7_890, Some(55_555), Some(987_654))
+        };
+        for model in ["claude-opus-4-8", "claude-sonnet-5", "claude-fable-5-1"] {
+            let p = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(
+                cost_usd("claude", model, &t, &empty()).to_bits(),
+                flat_formula(p, &t).to_bits(),
+                "{model}"
+            );
+            let b = request_breakdown("claude", model, &t, &empty()).expect("priced");
+            assert_eq!(b.cache_creation_1h, 0.0);
+        }
+    }
+
+    #[test]
+    fn non_claude_models_ignore_a_reported_split_bit_for_bit() {
+        // A row with no 1h rate prices every write at `cache_creation`, split
+        // or no split — codex / grok / openrouter stay bit-identical.
+        let with = TokenCounts {
+            cache_creation_1h: Some(40_000),
+            ..tc(10_000, 5_000, Some(20_000), Some(50_000))
+        };
+        let without = TokenCounts {
+            cache_creation_1h: None,
+            ..with
+        };
+        for (group, model) in [
+            ("codex", "gpt-5.5"),
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.5-codex"),
+            ("grok", "grok-4.7"),
+            ("grok", "grok-4.5"),
+        ] {
+            let a = cost_usd(group, model, &with, &empty());
+            let b = cost_usd(group, model, &without, &empty());
+            assert_eq!(a.to_bits(), b.to_bits(), "{model}");
+            let p = price_for(group, model, &empty()).expect("priced");
+            assert_eq!(a.to_bits(), flat_formula(p, &without).to_bits(), "{model}");
+        }
+        // An override on a Claude model without a 1h rate: same rule.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "claude-opus-4-8".to_string(),
+            ModelPrice::new(5.0, 25.0, 0.5, 6.25),
+        );
+        assert_eq!(
+            cost_usd("claude", "claude-opus-4-8", &with, &overrides).to_bits(),
+            cost_usd("claude", "claude-opus-4-8", &without, &overrides).to_bits(),
+        );
+    }
+
+    #[test]
+    fn a_split_larger_than_the_total_is_clamped() {
+        // Never bill more 1-hour writes than writes happened.
+        let t = tc_1h(1_000, Some(5_000));
+        approx(
+            cost_usd("claude", "claude-opus-4-8", &t, &empty()),
+            1_000.0 * 10.0 / 1e6,
+        );
+    }
+
+    #[test]
+    fn aggregate_cost_equals_the_sum_of_requests_with_mixed_ttl_writes() {
+        // Mixed 1h/5m/unreported requests, long and short, on a plain Claude
+        // row and on an override that also carries a long-context tier with
+        // its own 1h rate.
+        let mut tiered = HashMap::new();
+        tiered.insert(
+            "claude-sonnet-5".to_string(),
+            ModelPrice::new(2.0, 10.0, 0.2, 2.5)
+                .with_cache_creation_1h(4.0)
+                .with_long_context(4.0, 15.0, 0.4, 5.0),
+        );
+        if let Some(l) = tiered
+            .get_mut("claude-sonnet-5")
+            .and_then(|p| p.long_context.as_mut())
+        {
+            l.cache_creation_1h = Some(8.0);
+        }
+        let requests = [
+            tc_1h(40_000, Some(40_000)),
+            tc_1h(30_000, Some(12_000)),
+            tc_1h(20_000, Some(0)),
+            tc_1h(10_000, None),
+            TokenCounts {
+                cache_creation_1h: Some(90_000),
+                ..tc(100_000, 1_000, Some(50_000), Some(150_000))
+            }, // long (300k prompt)
+        ];
+        for (model, overrides) in [
+            ("claude-sonnet-5", empty()),
+            ("claude-opus-5-5", empty()),
+            ("claude-sonnet-5", tiered.clone()),
+        ] {
+            let (mut all, mut long) = (TokenParts::default(), TokenParts::default());
+            let mut sum = 0.0;
+            for t in &requests {
+                all.add(&TokenParts::from(t));
+                long.add(&long_part(model, t));
+                sum += cost_usd("claude", model, t, &overrides);
+            }
+            assert_eq!(all.cache_creation_1h, 142_000);
+            let agg = aggregate_cost("claude", model, &all, &long, &overrides).expect("priced");
+            assert!((agg - sum).abs() < 1e-12, "{model}: {agg} != {sum}");
+            // Non-vacuous: dropping the 1h subset (every write at the 5m
+            // rate) understates the aggregate.
+            let stub = |p: &TokenParts| TokenParts {
+                cache_creation_1h: 0,
+                ..*p
+            };
+            let flat = aggregate_cost("claude", model, &stub(&all), &stub(&long), &overrides)
+                .expect("priced");
+            assert!(agg > flat + 1e-6, "{model}: 1h writes must cost more");
+        }
+        // The tiered override bills the long request's 1h writes at the
+        // TIER's 1h rate: 90k × $8 + 60k × $5, and the rest at the tier too.
+        let long_req = &requests[4];
+        let b = request_breakdown("claude", "claude-sonnet-5", long_req, &tiered).expect("priced");
+        approx(b.cache_creation_1h, 90_000.0 * 8.0 / 1e6);
+        approx(b.cache_creation, 60_000.0 * 5.0 / 1e6);
+        // A tier without its own 1h rate bills 1h writes at its cache_creation
+        // (reported in the `cache_creation` component, as for a flat row with
+        // no 1h rate).
+        let mut plain_tier = tiered.clone();
+        if let Some(l) = plain_tier
+            .get_mut("claude-sonnet-5")
+            .and_then(|p| p.long_context.as_mut())
+        {
+            l.cache_creation_1h = None;
+        }
+        let b =
+            request_breakdown("claude", "claude-sonnet-5", long_req, &plain_tier).expect("priced");
+        approx(b.cache_creation, 150_000.0 * 5.0 / 1e6);
+        assert_eq!(b.cache_creation_1h, 0.0);
+    }
+
+    #[test]
+    fn config_pricing_entries_with_and_without_a_one_hour_rate() {
+        // A pre-split entry parses with no 1h rate and serializes without it.
+        let old: ModelPrice = serde_json::from_str(
+            r#"{"input": 5, "output": 25, "cache_read": 0.5, "cache_creation": 6.25}"#,
+        )
+        .expect("old entry parses");
+        assert_eq!(old.cache_creation_1h, None);
+        let json = serde_json::to_value(old).expect("serialize");
+        assert!(
+            json.get("cache_creation_1h").is_none(),
+            "no new key on the wire"
+        );
+        // A new entry carries it — flat and in the long-context tier — and
+        // round-trips.
+        let new: ModelPrice = serde_json::from_str(
+            r#"{"input": 5, "output": 25, "cache_read": 0.5, "cache_creation": 6.25,
+                "cache_creation_1h": 10,
+                "long_context": {"input": 10, "output": 37.5, "cache_read": 1,
+                                 "cache_creation": 12.5, "cache_creation_1h": 20}}"#,
+        )
+        .expect("new entry parses");
+        assert_eq!(new.cache_creation_1h, Some(10.0));
+        assert_eq!(
+            new.long_context.and_then(|l| l.cache_creation_1h),
+            Some(20.0)
+        );
+        let back: ModelPrice =
+            serde_json::from_value(serde_json::to_value(new).expect("serialize"))
+                .expect("round-trip");
+        assert_eq!(back, new);
+        // It applies as an override.
+        let mut overrides = HashMap::new();
+        overrides.insert("claude-opus-4-8".to_string(), new);
+        approx(
+            cost_usd(
+                "claude",
+                "claude-opus-4-8",
+                &tc_1h(100_000, Some(50_000)),
+                &overrides,
+            ),
+            0.05 * 6.25 + 0.05 * 10.0,
+        );
     }
 }
