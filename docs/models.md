@@ -501,5 +501,14 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   cached). llmux models that tier per request, and every aggregate (model rows,
   Usage tab, keys panel) keeps long-context requests separate so its cost is
   the sum of its requests' costs. Unknown grok ids take the grok-4.5 row, tier
-  included. Codex (`gpt-*`) and Claude rows carry no long-context tier — codex
-  traffic is subscription-billed and was deliberately excluded.
+  included. OpenAI models carry the same kind of tier at a **272,000**-token
+  prompt: gpt-6-astra $10 / $50 / $1 cached becomes $20 / $75 / $2, gpt-6-sol
+  $2 / $10 / $0.20 becomes $4 / $15 / $0.40, gpt-6-luna $0.10 / $0.50 / $0.01
+  becomes $0.20 / $0.75 / $0.02, gpt-5.6-sol $4 / $20 / $0.40 becomes $8 / $30 /
+  $0.80, gpt-5.6-terra $2 / $12 / $0.20 becomes $4 / $18 / $0.40, gpt-5.6-luna
+  $0.20 / $1.20 / $0.02 becomes $0.40 / $1.80 / $0.04, gpt-5.5 $5 / $30 / $0.50
+  becomes $10 / $45 / $1 (OpenAI pricing page, read 2026-09-28; the whole request
+  reprices). `gpt-5.5-codex` and unknown codex ids are not on that page, so they
+  stay flat. Claude rows carry no tier: Claude 4.6 and later bill the full 1M
+  window at standard rates. These are API-list-price equivalents; codex traffic
+  is subscription-billed.

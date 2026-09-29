@@ -200,7 +200,7 @@ Cost figures are API-equivalent estimates from the built-in rate table in `src/p
 }
 ```
 
-An entry replaces the model's whole built-in row, **long-context tier included**: an entry without `long_context` prices every request at its flat rates, even on a model that is tiered by default (grok). With `long_context`, a request whose prompt (fresh input + cache read + cache write) is at least the model's built-in threshold — 200,000 tokens for every model today — is billed ALL its tokens at the long rates. The threshold itself is not configurable (a `threshold` key is rejected): usage aggregates classify each request when it is recorded, without the config. Entries written before `long_context` existed load unchanged.
+An entry replaces the model's whole built-in row, **long-context tier included**: an entry without `long_context` prices every request at its flat rates, even on a model that is tiered by default (grok). With `long_context`, a request whose prompt (fresh input + cache read + cache write) is at least the model's built-in threshold — 200,000 tokens for grok, 272,000 for OpenAI models — is billed ALL its tokens at the long rates. The threshold itself is not configurable (a `threshold` key is rejected): usage aggregates classify each request when it is recorded, without the config. Entries written before `long_context` existed load unchanged.
 
 ## TUI cosmetic effects
 

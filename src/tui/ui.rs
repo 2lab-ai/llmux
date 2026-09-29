@@ -12611,11 +12611,13 @@ mod tests {
 
     #[test]
     fn models_strip_and_table_show_cost_column() {
-        // No cache tokens so the cost is exactly the input rate (gpt-5.5: $5/1M).
-        let mut row = model_row("codex", "gpt-5.5", 1_000_000, 0);
+        // No cache tokens so the cost is exactly the input rate (opus: $5/1M).
+        // An untiered model: a 1M-token codex request would itself be
+        // long-context and reprice.
+        let mut row = model_row("claude", "claude-opus-4-8", 1_000_000, 0);
         row.cache_read = None;
         let view = view_with(vec![row]);
-        // gpt-5.5 input = $5.00, in the MAIN compact strip.
+        // opus input = $5.00, in the MAIN compact strip.
         let main = render(&view, &chrome_overlay(Overlay::None), 200, 40);
         assert!(main.contains("$5.00"), "compact strip shows the $ cost");
         // And in the full table (Stats overlay).
