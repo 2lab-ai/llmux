@@ -72,9 +72,10 @@ not that it is zero.
   a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
   Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
   denominator too.
-  Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
-  (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
-  advertised statically on the corresponding entries. The provider always
+  The bare `sol` / `terra` / `luna` aliases stay on 5.6: the full ids
+  `gpt-6-sol` / `gpt-6-luna` (listed by the openai/codex catalog since it was
+  re-fetched 2026-09-28) are reachable and pass through verbatim, but own no
+  bare alias. These are advertised statically on the corresponding entries. The provider always
   strips a trailing `[1m]` before the request leaves llmux
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
@@ -196,6 +197,9 @@ model it does not curate.
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-sol[1m]       | —            | GPT-6-Sol [1M]      | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-sol           | —            | GPT-6-Sol           | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-luna          | —            | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -429,14 +433,25 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **gpt-6-astra** — same catalog re-fetched 2026-09-07: slug `gpt-6-astra`,
   display name "GPT-6-Astra", context_window 272000, max_context_window 872000,
   six reasoning levels (low, medium, high, xhigh, max, ultra), default effort
-  low, minimal client version 0.153.0. The catalog lists NO `gpt-6-sol` /
-  `-terra` / `-luna`. A live probe on 2026-09-07 confirmed the ChatGPT-account
+  low, minimal client version 0.153.0. The catalog of that date listed NO
+  `gpt-6-sol` / `-terra` / `-luna` (see the gpt-6-sol / gpt-6-luna entry below
+  for the 2026-09-28 re-fetch). A live probe on 2026-09-07 confirmed the ChatGPT-account
   codex backend ACCEPTS `gpt-6-astra` with llmux's existing header set
   (`originator: codex_cli_rs`, no client-version header), so no header change
   was needed — only adding the slug to the provider passthrough list. Pricing
   ($10/M input, $50/M output, $1/M cached input, no cache-creation charge)
   comes from third-party pricing trackers for the 2026-09 launch standard tier,
   not from an OpenAI page read directly.
+- **gpt-6-sol / gpt-6-luna** — catalog re-fetched 2026-09-28 (codex 0.158.0):
+  `gpt-6-sol` "GPT-6-Sol" and `gpt-6-luna` "GPT-6-Luna", both context_window
+  272000 / max_context_window 872000, default effort medium, `supported_in_api`;
+  sol lists low→ultra, luna low→max (no `ultra`). `gpt-6-terra` is NOT listed.
+  A live request for `gpt-6-sol` through the daemon on 2026-09-28 returned a
+  normal completion with `"model":"gpt-6-sol"`; `gpt-6-luna` was not probed
+  through the daemon. Both join the provider passthrough list. **No pricing row:**
+  no list price was read, so both fall to the `gpt-6-` default (astra rates) and
+  the dashboard cost is an upper bound until real rates are added. The `[1m]`
+  twin for sol reuses astra's 1000000 client denominator and has not been probed.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window

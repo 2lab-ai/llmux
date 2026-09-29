@@ -602,6 +602,19 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_sol_and_luna_price_at_the_gpt_6_default_until_listed() {
+        // `gpt-6-sol` / `gpt-6-luna` have NO row of their own: no published
+        // list price was read for them, and inventing one would be worse than
+        // a visible over-estimate. They fall to the `gpt-6-` prefix default
+        // (astra rates), so the dashboard's dollar figure is an UPPER BOUND for
+        // them; a `pricing` override in config replaces it per model. Give each
+        // its own const and exact arm here once the rates are confirmed.
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            assert_eq!(builtin_price(model), Some(GPT_6_ASTRA), "{model}");
+        }
+    }
+
+    #[test]
     fn gpt_60_and_gpt_6_5_do_not_resolve_to_astra_pricing() {
         // Generation boundary, same shape as the 5.60 test: a wider `gpt-60-`
         // or a newer `gpt-6.5-` generation is NOT gpt-6, so both miss the
