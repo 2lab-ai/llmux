@@ -8,8 +8,9 @@
 //!
 //! ## The four-rate model
 //! Anthropic and OpenAI both have cache tiers, but they price them differently:
-//! Anthropic bills `cache_read` at 0.1× input and `cache_creation` at 1.25×
-//! input; OpenAI/codex bills cached input at a flat discounted rate and has no
+//! Anthropic bills `cache_read` at a per-model fraction of input (0.1× on most
+//! rows, less on Opus 5.5 and Fable 5.1) and `cache_creation` at 1.25× input;
+//! OpenAI/codex bills cached input at a flat discounted rate and has no
 //! cache-creation charge. A per-model [`ModelPrice`] with four independent
 //! rates (input / output / cache_read / cache_creation) expresses both
 //! providers uniformly — codex models simply carry `cache_creation: 0.0`.
@@ -46,9 +47,10 @@
 //! group fallback stay flat. Enabling a tier on another row is a data-only
 //! change: `.with_long_context_at(..)` plus an entry in `BUILTIN_TIERED_ROWS`.
 //!
-//! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
-//! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
-//! anthropic.com/claude-opus-5-5, 2026-09-22; grok rows docs.x.ai 2026-09-28.
+//! All rates are **USD per 1,000,000 tokens**. Rates sourced: every Claude row
+//! from the Anthropic pricing page (platform.claude.com/docs/en/about-claude/
+//! pricing), read 2026-09-28; OpenAI rows from the OpenAI pricing page, read
+//! 2026-09-28; grok rows docs.x.ai 2026-09-28.
 
 use std::collections::HashMap;
 
@@ -278,19 +280,42 @@ impl CostBreakdown {
     }
 }
 
-/// Opus-tier rates {input 5.0, output 25.0, cache_read 0.5, cache_creation 6.25}.
-/// Also the `group == "claude"` unknown-model fallback.
+// ---- Claude rows ----
+// Source for every Claude row: the Anthropic pricing page
+// (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28. USD per
+// 1M tokens, in the page's column order: base input / 5-minute cache write /
+// 1-hour cache write / cache read / output. `cache_creation` here is the
+// 5-minute write rate (1.25x input); the page's 1-hour write rate (2x input) is
+// quoted alongside each row. No row carries a long-context tier (see the
+// module docs): Claude 4.6+ bill the full 1M window at standard rates.
+
+/// Claude Opus 5, 4.8, 4.7, 4.6, 4.5: 5 / 6.25 / 10 / 0.50 / 25. Also the
+/// `group == "claude"` unknown-model fallback and the default for an Opus
+/// version this table does not list.
 const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25);
-/// Opus 5.5 (Anthropic announcement 2026-09-22): $4 in / $20 out / cache read
-/// 0.20 / cache write 5.0 — 20% below the opus tier, cache reads 60% below, so
-/// it must NOT fall to the `claude-opus-` prefix fallback.
+/// Claude Opus 5.5: 4 / 5 / 8 / 0.20 / 20 — cheaper than the opus tier (cache
+/// read is 0.05x input), so neither it nor a dated snapshot may fall to it.
 const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0);
-/// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75}.
+/// Claude Opus 4.1 and Opus 4 (both retired): 15 / 18.75 / 30 / 1.50 / 75.
+const OPUS_4_1: ModelPrice = ModelPrice::new(15.0, 75.0, 1.5, 18.75);
+/// Claude Sonnet 5.5 and Sonnet 5: 2 / 2.50 / 4 / 0.20 / 10 (Sonnet 5's
+/// $2/$10 is now its standard price, not a launch promotion).
+const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5);
+/// Claude Sonnet 4.6, 4.5, 4: 3 / 3.75 / 6 / 0.30 / 15. Also the default for a
+/// Sonnet version this table does not list.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
-/// Haiku-tier rates {1.0, 5.0, 0.1, 1.25}.
-const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
-/// Fable-family rates (Fable 5 and 5.1 share the tier) {10.0, 50.0, 1.0, 12.5}.
-const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
+/// Claude Haiku 4.5: 1 / 1.25 / 2 / 0.10 / 5. Also the default for a Haiku
+/// version this table does not list.
+const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
+/// Claude Haiku 3.5 (retired; wire id `claude-3-5-haiku-*`): 0.80 / 1 / 1.60
+/// / 0.08 / 4.
+const HAIKU_3_5: ModelPrice = ModelPrice::new(0.8, 4.0, 0.08, 1.0);
+/// Claude Fable 5: 10 / 12.50 / 20 / 1.00 / 50. Also the default for a Fable
+/// version this table does not list.
+const FABLE_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
+/// Claude Fable 5.1: 10 / 12.50 / 20 / 0.25 / 50 — same as Fable 5 except the
+/// cache read, which is 0.025x input ($0.25), not Fable 5's $1.00.
+const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0} (OpenAI pricing page, re-read 2026-09-28). Codex has no
 /// cache-creation charge. Also the `group == "codex"` unknown-model fallback.
@@ -422,18 +447,21 @@ const BUILTIN_TIERED_ROWS: &[ModelPrice] = &[
 const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
-/// slug. Exact matches first, then a sensible prefix fallback (so e.g.
-/// `claude-opus-4-8-20260101` still resolves to the opus tier). Returns `None`
+/// slug. Claude ids go through a version parser ([`claude_price`], so e.g.
+/// `claude-opus-4-8-20260101` resolves to the opus tier); every other id takes
+/// exact matches first, then a prefix fallback. Returns `None`
 /// when nothing matches — callers apply the group fallback.
 fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
+    // Claude ids carry their version as dash-separated segments, where a
+    // dated snapshot (`claude-opus-4-20250514`) and a minor version
+    // (`claude-opus-4-5`) share one separator — so a prefix chain cannot tell
+    // `claude-opus-4-` (Opus 4, $15) from `claude-opus-4-5-` (Opus 4.5, $5).
+    // Parse the version instead; see [`claude_price`].
+    if let Some(p) = claude_price(model_norm_lower) {
+        return Some(p);
+    }
     // Exact (post-normalization) matches.
     let exact = match model_norm_lower {
-        "claude-opus-5-5" => Some(OPUS_5_5),
-        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
-        | "claude-opus-4-5" => Some(OPUS_TIER),
-        "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
-        "claude-haiku-4-5" => Some(HAIKU_TIER),
-        "claude-fable-5" | "claude-fable-5-1" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
@@ -461,23 +489,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         return Some(OPENROUTER_FREE);
     }
     // Prefix fallback for versioned / suffixed slugs.
-    if model_norm_lower.starts_with("claude-opus-5-5-") {
-        // Opus 5.5 is CHEAPER than the opus tier ($4/$20 vs $5/$25), so a dated
-        // snapshot must be caught here before the generic `claude-opus-` branch
-        // below overcharges it — same ordering as `gpt-6-astra-` ahead of
-        // `gpt-6-`. The trailing `-` is the version boundary: `claude-opus-5-50-*`
-        // and `claude-opus-5-5x` are DIFFERENT models and must miss this branch
-        // and fall to the opus tier.
-        Some(OPUS_5_5)
-    } else if model_norm_lower.starts_with("claude-opus-") {
-        Some(OPUS_TIER)
-    } else if model_norm_lower.starts_with("claude-sonnet-") {
-        Some(SONNET_TIER)
-    } else if model_norm_lower.starts_with("claude-haiku-") {
-        Some(HAIKU_TIER)
-    } else if model_norm_lower.starts_with("claude-fable-") {
-        Some(FABLE_TIER)
-    } else if model_norm_lower.starts_with("gpt-5.5-") {
+    if model_norm_lower.starts_with("gpt-5.5-") {
         // Generation boundary: bare `gpt-5.5` matched exactly above; the
         // prefix branch requires the `-` so `gpt-5.50-*` never takes 5.5
         // rates (mirrors codex.rs `supports_extended_efforts`).
@@ -507,6 +519,102 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     } else {
         None
     }
+}
+
+/// A Claude model id split into family and version (`major`, optional
+/// `minor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeId<'a> {
+    family: &'a str,
+    /// `None` when the segments after the family do not parse as a version
+    /// (a stray suffix, a trailing `-`): the id is a known family at an
+    /// unknown version.
+    version: Option<(u32, Option<u32>)>,
+    /// The Claude 3.x naming scheme (`claude-3-5-haiku-*`), version first.
+    legacy: bool,
+}
+
+const CLAUDE_FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+
+/// Parse a normalized, lowercased Claude id in either naming scheme:
+/// `claude-<family>-<major>[-<minor>][-<snapshot>]` (Claude 4 onward) or
+/// `claude-<major>[-<minor>]-<family>[-<snapshot>]` (Claude 3.x). A version
+/// segment is 1-2 digits and a snapshot is an 8-digit date or `latest`, which
+/// is what separates `claude-opus-4-20250514` (Opus 4, dated) from
+/// `claude-opus-4-5` (Opus 4.5) — both are `claude-opus-4-` + a digit run.
+/// Anything else (`claude-future-9`, an unlisted family) is `None`.
+fn parse_claude_id(slug: &str) -> Option<ClaudeId<'_>> {
+    let segs: Vec<&str> = slug.strip_prefix("claude-")?.split('-').collect();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_ver = |s: &str| s.len() <= 2 && digits(s);
+    let is_snapshot = |s: &str| s == "latest" || (s.len() == 8 && digits(s));
+    let num = |s: &str| s.parse::<u32>().ok();
+    // `[major, minor?]` exactly.
+    let version = |v: &[&str]| -> Option<(u32, Option<u32>)> {
+        match v {
+            [major] if is_ver(major) => Some((num(major)?, None)),
+            [major, minor] if is_ver(major) && is_ver(minor) => {
+                Some((num(major)?, Some(num(minor)?)))
+            }
+            _ => None,
+        }
+    };
+    // Strip at most one trailing snapshot segment.
+    let unsnapshot = |v: &[&str]| -> usize {
+        match v.last() {
+            Some(s) if is_snapshot(s) => v.len() - 1,
+            _ => v.len(),
+        }
+    };
+    if CLAUDE_FAMILIES.contains(segs.first()?) {
+        let rest = &segs[1..];
+        return Some(ClaudeId {
+            family: segs[0],
+            version: version(&rest[..unsnapshot(rest)]),
+            legacy: false,
+        });
+    }
+    // Claude 3.x: version, then family, then an optional snapshot — nothing
+    // else. A partial parse is not a Claude 3.x id we can price.
+    let at = segs.iter().position(|s| CLAUDE_FAMILIES.contains(s))?;
+    let tail = &segs[at + 1..];
+    if unsnapshot(tail) != 0 {
+        return None;
+    }
+    Some(ClaudeId {
+        family: segs[at],
+        version: Some(version(&segs[..at])?),
+        legacy: true,
+    })
+}
+
+/// The built-in row for a Claude id (see the Claude row constants for the
+/// source). Listed versions take their own row. An UNLISTED version of a known
+/// family (`claude-opus-5-50-*`, `claude-sonnet-6`, `claude-opus-5-5x`) takes
+/// the family's default row — the same rates the old `claude-<family>-`
+/// prefix fallback charged. Unlisted Claude 3.x ids return `None` and take the
+/// `group == "claude"` fallback, as they did before this parser existed.
+fn claude_price(slug: &str) -> Option<ModelPrice> {
+    let id = parse_claude_id(slug)?;
+    if id.legacy {
+        return match (id.family, id.version) {
+            ("haiku", Some((3, Some(5)))) => Some(HAIKU_3_5),
+            _ => None,
+        };
+    }
+    Some(match (id.family, id.version) {
+        ("opus", Some((5, Some(5)))) => OPUS_5_5,
+        ("opus", Some((5, None) | (4, Some(5..=8)))) => OPUS_TIER,
+        // `claude-opus-4` / `-4-0` / `-4-<date>` is Opus 4; `-4-1` is Opus 4.1.
+        ("opus", Some((4, None | Some(0 | 1)))) => OPUS_4_1,
+        ("opus", _) => OPUS_TIER,
+        ("sonnet", Some((5, None | Some(5)))) => SONNET_5,
+        ("sonnet", _) => SONNET_TIER,
+        ("haiku", _) => HAIKU_4_5,
+        ("fable", Some((5, Some(1)))) => FABLE_5_1,
+        ("fable", _) => FABLE_5,
+        _ => return None,
+    })
 }
 
 /// Resolve the price for `(group, model)`, honoring config `overrides` first.
@@ -1071,6 +1179,111 @@ mod tests {
             ),
             10.0,
         );
+    }
+
+    /// (input, output, cache_read, cache_creation) of a resolved Claude row.
+    fn claude_rates(model: &str) -> (f64, f64, f64, f64) {
+        let p = price_for("claude", model, &empty()).expect("claude priced");
+        assert!(
+            p.long_context.is_none(),
+            "{model}: Claude rows are untiered"
+        );
+        (p.input, p.output, p.cache_read, p.cache_creation)
+    }
+
+    /// Every Claude row family against the Anthropic pricing page (read
+    /// 2026-09-28), bare id and the `[1m]` display spelling alike.
+    #[test]
+    fn claude_rows_match_the_pricing_page() {
+        let opus = (5.0, 25.0, 0.5, 6.25);
+        let opus_legacy = (15.0, 75.0, 1.5, 18.75);
+        let sonnet_5 = (2.0, 10.0, 0.2, 2.5);
+        let sonnet_4 = (3.0, 15.0, 0.3, 3.75);
+        for (model, want) in [
+            ("claude-fable-5-1", (10.0, 50.0, 0.25, 12.5)),
+            ("claude-fable-5", (10.0, 50.0, 1.0, 12.5)),
+            ("claude-opus-5-5", (4.0, 20.0, 0.2, 5.0)),
+            ("claude-opus-5", opus),
+            ("claude-opus-4-8", opus),
+            ("claude-opus-4-7", opus),
+            ("claude-opus-4-6", opus),
+            ("claude-opus-4-5", opus),
+            ("claude-opus-4-1", opus_legacy),
+            ("claude-opus-4", opus_legacy),
+            ("claude-opus-4-0", opus_legacy),
+            ("claude-sonnet-5-5", sonnet_5),
+            ("claude-sonnet-5", sonnet_5),
+            ("claude-sonnet-4-6", sonnet_4),
+            ("claude-sonnet-4-5", sonnet_4),
+            ("claude-sonnet-4", sonnet_4),
+            ("claude-sonnet-4-0", sonnet_4),
+            ("claude-haiku-4-5", (1.0, 5.0, 0.1, 1.25)),
+            ("claude-3-5-haiku-20241022", (0.8, 4.0, 0.08, 1.0)),
+        ] {
+            assert_eq!(claude_rates(model), want, "{model}");
+            assert_eq!(claude_rates(&format!("{model}[1m]")), want, "{model}[1m]");
+        }
+        // The curated aliases resolve through `normalize_model` first.
+        assert_eq!(claude_rates("sonnet"), sonnet_5, "sonnet → claude-sonnet-5");
+        assert_eq!(claude_rates("fable").2, 0.25, "fable → claude-fable-5-1");
+        assert_eq!(claude_rates("haiku"), (1.0, 5.0, 0.1, 1.25));
+    }
+
+    /// Dated snapshots price exactly like their bare id — including the
+    /// version-vs-date ambiguity: `claude-opus-4-20250514` is Opus 4 ($15),
+    /// `claude-opus-4-5-20251101` is Opus 4.5 ($5), and
+    /// `claude-sonnet-5-5-*` is Sonnet 5.5, never a shorter `claude-sonnet-`
+    /// match.
+    #[test]
+    fn claude_dated_snapshots_price_like_their_bare_id() {
+        for (snapshot, bare) in [
+            ("claude-fable-5-1-20260901", "claude-fable-5-1"),
+            ("claude-fable-5-20260601", "claude-fable-5"),
+            ("claude-opus-5-5-20260922", "claude-opus-5-5"),
+            ("claude-opus-5-20260727", "claude-opus-5"),
+            ("claude-opus-4-8-20260101", "claude-opus-4-8"),
+            ("claude-opus-4-5-20251101", "claude-opus-4-5"),
+            ("claude-opus-4-1-20250805", "claude-opus-4-1"),
+            ("claude-opus-4-20250514", "claude-opus-4"),
+            ("claude-sonnet-5-5-20261001", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-20260801", "claude-sonnet-5"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+            ("claude-sonnet-4-20250514", "claude-sonnet-4"),
+            ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+            ("claude-3-5-haiku-latest", "claude-3-5-haiku-20241022"),
+        ] {
+            assert_eq!(claude_rates(snapshot), claude_rates(bare), "{snapshot}");
+        }
+    }
+
+    /// Version boundaries: an id that only LOOKS like a listed version is a
+    /// different model and takes its family default (the rates the old
+    /// `claude-<family>-` prefix fallback charged), never the listed row.
+    #[test]
+    fn claude_version_boundaries_fall_to_the_family_default() {
+        let opus = (5.0, 25.0, 0.5, 6.25);
+        let sonnet_4 = (3.0, 15.0, 0.3, 3.75);
+        for (model, want) in [
+            ("claude-sonnet-5-50-20261001", sonnet_4),
+            ("claude-sonnet-5-5x", sonnet_4),
+            ("claude-sonnet-55", sonnet_4),
+            ("claude-opus-4-10", opus),
+            ("claude-opus-4-1x", opus),
+            ("claude-fable-5-10", (10.0, 50.0, 1.0, 12.5)),
+            ("claude-fable-5-1-preview", (10.0, 50.0, 1.0, 12.5)),
+            ("claude-haiku-5", (1.0, 5.0, 0.1, 1.25)),
+        ] {
+            assert_eq!(claude_rates(model), want, "{model}");
+        }
+        // Unlisted families and Claude 3.x ids keep the group fallback.
+        for model in [
+            "claude-mythos-5",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-haiku",
+        ] {
+            assert_eq!(claude_rates(model), opus, "{model}");
+            assert!(builtin_price(model).is_none(), "{model}");
+        }
     }
 
     #[test]

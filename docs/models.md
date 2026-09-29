@@ -425,6 +425,21 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   cache read $0.20/M, cache write $5/M); the Claude Code 2.1.280 binary model
   record lists `claude-opus-5-5` with `supports_1m_suffix` (and the literal
   string `claude-opus-5-5[1m]`), which is why the `[1m]` row exists.
+- **Claude pricing** — the Anthropic pricing page
+  (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28, per 1M
+  tokens as input / 5-minute cache write / 1-hour cache write / cache read /
+  output: Fable 5.1 $10 / $12.50 / $20 / $0.25 / $50; Fable 5 $10 / $12.50 /
+  $20 / $1.00 / $50; Opus 5.5 $4 / $5 / $8 / $0.20 / $20; Opus 5, 4.8, 4.7,
+  4.6, 4.5 $5 / $6.25 / $10 / $0.50 / $25; Opus 4.1 and 4 (retired) $15 /
+  $18.75 / $30 / $1.50 / $75; Sonnet 5.5 and 5 $2 / $2.50 / $4 / $0.20 / $10;
+  Sonnet 4.6, 4.5, 4 $3 / $3.75 / $6 / $0.30 / $15; Haiku 4.5 $1 / $1.25 / $2 /
+  $0.10 / $5; Haiku 3.5 (retired, `claude-3-5-haiku-*`) $0.80 / $1 / $1.60 /
+  $0.08 / $4. Dated snapshots price like their bare id: llmux parses the
+  version out of the id, so `claude-opus-4-20250514` is Opus 4 while
+  `claude-opus-4-5-20251101` is Opus 4.5. An unlisted version of a known family
+  takes that family's default row (Opus 5, Sonnet 4.x, Haiku 4.5, Fable 5);
+  any other claude id, including other Claude 3.x models, takes the Opus 5
+  rates. The Mythos models are not in the catalog and have no row.
 - **Codex effort menus and base context windows** — the openai/codex model
   catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
