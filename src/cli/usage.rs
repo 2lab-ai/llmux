@@ -57,7 +57,21 @@ struct SevenDayUsage {
     /// already-elapsed window reads as reset, matching the dashboard's
     /// `effective_utilization` convention).
     resets_in_secs: u64,
+    /// 0.0-100.0, 2 decimal places — how much of the 7-day window has
+    /// elapsed, derived from `resets_in_secs` (the window is a fixed 7 days).
+    elapsed_percent: f64,
+    /// Burn-rate multiplier: `used_percent / elapsed_percent`. 1.0 = on pace
+    /// to hit 100% exactly at reset; 7.0 = a whole week's quota in one day.
+    /// `null` when under 1% of the window has elapsed (too noisy to read).
+    rate: Option<f64>,
 }
+
+/// Length of the weekly quota window.
+const WEEK_SECS: f64 = 7.0 * 86_400.0;
+
+/// Below this elapsed percentage the rate is dominated by noise, so it is
+/// reported as absent rather than as a huge multiplier.
+const MIN_ELAPSED_PERCENT_FOR_RATE: f64 = 1.0;
 
 /// `llmux usage` / `llmux usage --json`. Same probe + exit-code contract as
 /// `llmux status`/`llmux accounts --json` (0 = server running, 1 = not) —
@@ -158,11 +172,17 @@ fn seven_day_usage(window: &serde_json::Value) -> Option<SevenDayUsage> {
     let resets_in_secs = window.get("resets_in_secs")?.as_u64()?;
     let used_percent = round2(utilization.clamp(0.0, 1.0) * 100.0);
     let remaining_percent = round2(100.0 - used_percent);
+    let elapsed_percent =
+        round2(((WEEK_SECS - resets_in_secs as f64) / WEEK_SECS * 100.0).clamp(0.0, 100.0));
+    let rate = (elapsed_percent >= MIN_ELAPSED_PERCENT_FOR_RATE)
+        .then(|| round2(used_percent / elapsed_percent));
     Some(SevenDayUsage {
         used_percent,
         remaining_percent,
         resets_at,
         resets_in_secs,
+        elapsed_percent,
+        rate,
     })
 }
 
@@ -170,7 +190,8 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// Human-readable table: name, type, logged-in, 7d used/left, reset ETA.
+/// Human-readable table: name, type, logged-in, 7d used/left, the pace
+/// columns (window elapsed + burn-rate multiplier), reset ETA.
 /// `n/a` for accounts with no weekly-quota source or no reading yet.
 fn print_table(accounts: &[AccountUsage]) {
     if accounts.is_empty() {
@@ -184,19 +205,23 @@ fn print_table(accounts: &[AccountUsage]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  RESETS",
+        "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  {:>8}  {:>6}  RESETS",
         "NAME",
         "TYPE",
         "LOGGED IN",
         "7D USED",
         "7D LEFT",
+        "ELAPSED",
+        "RATE",
         name_width = name_width
     );
     for account in accounts {
-        let (used, left, resets) = match &account.seven_day {
+        let (used, left, elapsed, rate, resets) = match &account.seven_day {
             Some(w) => (
                 format!("{:.1}%", w.used_percent),
                 format!("{:.1}%", w.remaining_percent),
+                format!("{:.1}%", w.elapsed_percent),
+                w.rate.map_or_else(|| "n/a".into(), |r| format!("{r:.2}x")),
                 format!(
                     "in {}",
                     crate::scheduler::select::compact_duration(std::time::Duration::from_secs(
@@ -204,15 +229,23 @@ fn print_table(accounts: &[AccountUsage]) {
                     ))
                 ),
             ),
-            None => ("n/a".into(), "n/a".into(), "n/a".into()),
+            None => (
+                "n/a".into(),
+                "n/a".into(),
+                "n/a".into(),
+                "n/a".into(),
+                "n/a".into(),
+            ),
         };
         println!(
-            "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  {resets}",
+            "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  {:>8}  {:>6}  {resets}",
             account.name,
             account.kind,
             if account.logged_in { "yes" } else { "no" },
             used,
             left,
+            elapsed,
+            rate,
             name_width = name_width
         );
     }
@@ -248,6 +281,42 @@ mod tests {
         assert_eq!(seven.remaining_percent, 58.0);
         assert_eq!(seven.resets_at, 1_781_222_400);
         assert_eq!(seven.resets_in_secs, 3600);
+    }
+
+    fn pace(utilization: f64, resets_in_secs: u64) -> SevenDayUsage {
+        seven_day_usage(&serde_json::json!({
+            "utilization": utilization, "resets_at": 0, "resets_in_secs": resets_in_secs
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rate_is_one_when_used_tracks_elapsed() {
+        // Half the week left, half the quota used ⇒ exactly on pace.
+        let w = pace(0.5, 302_400);
+        assert_eq!(w.elapsed_percent, 50.0);
+        assert_eq!(w.rate, Some(1.0));
+    }
+
+    #[test]
+    fn rate_is_seven_when_a_week_is_burned_in_one_day() {
+        // 1 day elapsed (6 days left), 100% used ⇒ 100 / (100/7) = 7.0.
+        let w = pace(1.0, 6 * 86_400);
+        assert_eq!(w.rate, Some(7.0));
+    }
+
+    #[test]
+    fn rate_is_absent_at_the_very_start_of_the_window() {
+        // Full week left ⇒ 0% elapsed ⇒ no rate rather than a divide-by-zero.
+        let w = pace(0.02, 604_800);
+        assert_eq!(w.elapsed_percent, 0.0);
+        assert_eq!(w.rate, None);
+    }
+
+    #[test]
+    fn elapsed_clamps_when_the_window_already_reset_or_overshoots() {
+        assert_eq!(pace(0.3, 0).elapsed_percent, 100.0);
+        assert_eq!(pace(0.3, 9_999_999).elapsed_percent, 0.0);
     }
 
     #[test]
