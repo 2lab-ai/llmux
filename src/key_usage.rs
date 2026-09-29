@@ -1621,6 +1621,12 @@ mod tests {
                 250_000,
                 5_000,
             ),
+            // OpenAI's boundary is 272k, not grok's 200k: with two thresholds
+            // live the SQL prompt class must bucket per model.
+            ("k-3", "codex", "gpt-6-sol", 1_000, 10, 270_998, 0), // short (271,998)
+            ("k-3", "codex", "gpt-6-sol", 2_000, 10, 270_000, 0), // long (272,000)
+            ("k-3", "codex", "gpt-6-sol", 250_000, 10, 0, 0),     // short (> 200k!)
+            ("k-3", "codex", "gpt-5.5-codex", 300_000, 10, 0, 0), // untiered: flat
         ];
         for (i, (tenant, group, model, input, output, cr, cc)) in rows.iter().enumerate() {
             let row = UsageRow::new(
@@ -1670,7 +1676,7 @@ mod tests {
             assert!((tenant.cost_usd - want).abs() < 1e-12, "{}", tenant.tenant);
         }
         assert_eq!(
-            cells, 3,
+            cells, 5,
             "one cell per (tenant, model), prompt classes merged"
         );
         let grok47 = &doc

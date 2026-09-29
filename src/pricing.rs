@@ -12,8 +12,7 @@
 //! that ONE request's prompt is large. A [`ModelPrice`] may carry
 //! [`LongContextRates`]: a request whose prompt — fresh `input` plus
 //! `cache_read` plus `cache_creation` (`input` is always FRESH input in
-//! llmux) — is `>=`
-//! [`long_context_threshold`] is billed input, output, cache_read AND
+//! llmux) — is `>=` [`long_context_threshold`] is billed input, output, cache_read AND
 //! cache_creation at the long rates (whole-request repricing, not a marginal
 //! bracket). Explicit long rates per component, so a non-uniform tier (e.g. 2×
 //! input/cache, 1.5× output) is plain data.
@@ -30,11 +29,15 @@
 //!
 //! Tiered today: grok-4.5 / grok-4.6 / grok-4.7 (xAI, `>= 200k`, every rate
 //! doubles; docs.x.ai read 2026-09-28) — and therefore the `grok` group
-//! fallback. Deliberately NOT tiered: codex/OpenAI (`gpt-*`) rows — codex
-//! traffic is subscription-billed and the operator excluded it — and Claude
-//! rows. Enabling either later is a data-only change (a
-//! `.with_long_context(..)` on the row, plus a [`long_context_threshold`]
-//! entry if the boundary is not 200k).
+//! fallback — and the OpenAI rows gpt-5.5, gpt-5.6-{sol,terra,luna} and
+//! gpt-6-{astra,sol,luna} and gpt-6.1-sol (`>= 272k`, input and cache double, output x1.5; the
+//! OpenAI pricing page, read 2026-09-28). The threshold is carried by the
+//! built-in row ([`long_context_threshold`]), so a dated snapshot classifies
+//! exactly as it prices. Deliberately NOT tiered: Claude rows (Claude 4.6+ bill
+//! the full 1M window at standard rates) and any codex model the OpenAI page
+//! does not list — `gpt-5.5-codex`, the `gpt-5.5-` prefix and the `codex`
+//! group fallback stay flat. Enabling a tier on another row is a data-only
+//! change: `.with_long_context_at(..)` plus an entry in `BUILTIN_TIERED_ROWS`.
 //!
 //! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
 //! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
@@ -89,6 +92,17 @@ pub struct LongContextRates {
     pub output: f64,
     pub cache_read: f64,
     pub cache_creation: f64,
+    /// Prompt size at or above which the request is long-context. Built-in
+    /// data (xAI 200k, OpenAI 272k): never read from or written to config —
+    /// `skip` plus `deny_unknown_fields` makes a configured `threshold` fail
+    /// loudly — and never taken from an override (see
+    /// [`long_context_threshold`]).
+    #[serde(skip, default = "default_long_context_threshold")]
+    pub threshold: u64,
+}
+
+fn default_long_context_threshold() -> u64 {
+    DEFAULT_LONG_CONTEXT_THRESHOLD
 }
 
 impl ModelPrice {
@@ -110,12 +124,30 @@ impl ModelPrice {
         cache_read: f64,
         cache_creation: f64,
     ) -> Self {
+        self.with_long_context_at(
+            DEFAULT_LONG_CONTEXT_THRESHOLD,
+            input,
+            output,
+            cache_read,
+            cache_creation,
+        )
+    }
+
+    const fn with_long_context_at(
+        self,
+        threshold: u64,
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_creation: f64,
+    ) -> Self {
         Self {
             long_context: Some(LongContextRates {
                 input,
                 output,
                 cache_read,
                 cache_creation,
+                threshold,
             }),
             ..self
         }
@@ -132,29 +164,33 @@ impl ModelPrice {
 /// 200k tokens or more).
 pub const DEFAULT_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
 
-/// Models whose long-context boundary is NOT [`DEFAULT_LONG_CONTEXT_THRESHOLD`],
-/// keyed by normalized lowercased slug. Empty today; a provider with a
-/// different boundary is a row here plus the tier on its price row.
-const LONG_CONTEXT_THRESHOLDS: &[(&str, u64)] = &[];
+/// OpenAI's long-context boundary (docs: prompts over 272k tokens).
+pub const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 /// Prompt size (fresh input + cache_read + cache_creation of ONE request) at
-/// or above which `model` is billed at its long-context rates. Built-in data
-/// only — never a config override — because the activity fold and the SQLite
-/// usage query classify each request without a config handle, and every
-/// pricing path must agree with that classification.
+/// or above which `model` is billed at its long-context rates: the threshold
+/// carried by the model's BUILT-IN price row (exact then prefix, the same
+/// resolution as [`builtin_price`], so a dated snapshot classifies exactly as
+/// it prices). A model with no tiered built-in row has no tier, so the value
+/// is moot and the default is returned. Built-in data only — never a config
+/// override — because the activity fold and the SQLite usage query classify
+/// each request without a config handle, and every pricing path must agree
+/// with that classification.
 pub fn long_context_threshold(model: &str) -> u64 {
     let norm = normalize_model(model).to_ascii_lowercase();
-    LONG_CONTEXT_THRESHOLDS
-        .iter()
-        .find(|(slug, _)| *slug == norm)
-        .map_or(DEFAULT_LONG_CONTEXT_THRESHOLD, |&(_, t)| t)
+    builtin_price(&norm)
+        .and_then(|p| p.long_context)
+        .map_or(DEFAULT_LONG_CONTEXT_THRESHOLD, |l| l.threshold)
 }
 
 /// Every distinct threshold [`long_context_threshold`] can return, ascending.
 /// Lets a SQL `GROUP BY` bucket rows by prompt size exactly (the bucket index
 /// is how many of these a row's prompt reaches) without knowing the model.
 pub fn long_context_thresholds() -> Vec<u64> {
-    let mut all: Vec<u64> = LONG_CONTEXT_THRESHOLDS.iter().map(|&(_, t)| t).collect();
+    let mut all: Vec<u64> = BUILTIN_TIERED_ROWS
+        .iter()
+        .filter_map(|p| p.long_context.map(|l| l.threshold))
+        .collect();
     all.push(DEFAULT_LONG_CONTEXT_THRESHOLD);
     all.sort_unstable();
     all.dedup();
@@ -266,43 +302,105 @@ const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// Fable 5.1 cache reads are $0.25 (official pricing, read 2026-10-08).
 const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
-/// cache_creation 0.0}. Codex has no cache-creation charge. Also the
-/// `group == "codex"` unknown-model fallback.
-const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
-/// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
-/// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
-/// ("promotional pricing … at least through November 21, 2026"). Corrected
-/// from the launch-era $5/$30 row; OpenAI now lists a cache-write rate, so
-/// the "codex has no cache-creation charge" convention no longer holds for
-/// the rows re-read on 2026-10-06.
-const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.40, 5.0);
-/// gpt-5.6-terra (mid tier). developers.openai.com/api/docs/pricing, read
-/// 2026-10-13: $2 in / $0.20 cached / $2.50 cache write / $12 out. (Earlier
-/// rows carried $2.50 / $15 / $0.25, which is stale.)
-const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.20, 2.5);
-/// gpt-5.6-luna (budget tier). developers.openai.com model page, read
-/// 2026-10-06: $0.20 in / $0.02 cached / $1.20 out; no cache-write rate is
-/// listed for it, so that rate stays 0. Corrected from the launch-era $1/$6.
-const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.20, 1.20, 0.02, 0.0);
-/// gpt-6-astra (generation-6 flagship, released 2026-09-03). OpenAI pricing
-/// page, read 2026-10-06 (standard tier, ≤272k input): $10 in / $1 cached /
-/// $12.50 cache write / $50 out. The >272k long-context tier (rates double)
-/// and the Fast / Ultrafast tiers are not modeled.
-const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
-/// gpt-6.1-sol (released 2026-09-29; the openai/codex catalog's priority-1
-/// default). OpenAI pricing page, read 2026-10-06 (standard, ≤272k input):
-/// $2 in / $0.10 cached / $2.50 cache write / $10 out.
-const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
-/// gpt-6-sol (released 2026-09-22). developers.openai.com model page, read
-/// 2026-10-06: $2 in / $0.20 cached / $2.50 cache write / $10 out (absent
-/// from the pricing page's flagship table; the model page carries the rates).
-const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
-/// gpt-6-luna (released 2026-09-22). OpenAI pricing page, read 2026-10-06
-/// (standard, ≤272k input): $0.10 in / $0.01 cached / $0.125 cache write /
-/// $0.50 out.
-const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
-/// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
-/// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
+/// cache_creation 0.0} (OpenAI pricing page, re-read 2026-09-28). Codex has no
+/// cache-creation charge. Also the `group == "codex"` unknown-model fallback.
+/// The page does not list `gpt-5.5-codex` / `gpt-5-codex`; they keep resolving
+/// here by prefix / fallback, which is unverified.
+const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    10.0,
+    45.0,
+    1.0,
+    0.0,
+);
+/// The UNTIERED gpt-5.5 rates: the `group == "codex"` unknown-model fallback
+/// and the `gpt-5.5-` prefix (`gpt-5.5-codex`, which the pricing page does not
+/// list). Neither may claim a long-context tier nobody verified for them — and
+/// an unknown model must classify flat under [`long_context_threshold`].
+const GPT_5_5_FLAT: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-sol (flagship, 2026-07-09 launch, standard tier): $4 in / $20 out /
+/// $0.40 cached input (OpenAI model page developers.openai.com/api/docs/models/
+/// gpt-5.6-sol and the pricing page, read 2026-09-28). OpenAI calls this
+/// promotional pricing "available at least through November 21, 2026", so
+/// re-check it after that date. Cache write is $5 (1.25× input; 2× that
+/// over 272k, as with every long-context rate). Prompts over
+/// 272k bill the whole request at $8 in / $30 out / $0.80 cached.
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.4, 5.0).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    8.0,
+    30.0,
+    0.8,
+    10.0,
+);
+/// gpt-5.6-terra (mid tier): $2 in / $12 out / $0.20 cached input (OpenAI
+/// pricing page, read 2026-09-28; same promotional caveat and conventions as
+/// [`GPT_5_6_SOL`]).
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 2.5).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    4.0,
+    18.0,
+    0.4,
+    5.0,
+);
+/// gpt-5.6-luna (budget tier): $0.20 in / $1.20 out / $0.02 cached input
+/// (OpenAI pricing page, read 2026-09-28; same caveats as [`GPT_5_6_SOL`]).
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.2, 1.2, 0.02, 0.25).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    0.4,
+    1.8,
+    0.04,
+    0.5,
+);
+/// gpt-6-astra (generation-6 flagship, 2026-09 launch, standard tier): $10 in
+/// / $50 out / $1 cached input (OpenAI API pricing page, read 2026-09-28).
+/// Cache write $12.50 (1.25× input), $25 over 272k.
+const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    20.0,
+    75.0,
+    2.0,
+    25.0,
+);
+/// gpt-6-sol (2026-09-22 launch, standard tier, prompts <=272k): $2 in / $10
+/// out / $0.20 cached input (OpenAI API pricing page,
+/// developers.openai.com/api/docs/pricing, read 2026-09-28). Codex: no
+/// cache-creation charge, same convention as the other codex rows (the page's
+/// separate $2.50 cache-write rate does not apply to subscription traffic).
+/// Prompts over 272k bill the whole request at $4 in / $15 out / $0.40 cached.
+const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    4.0,
+    15.0,
+    0.4,
+    5.0,
+);
+/// gpt-6.1-sol (2026-09-29 launch, standard tier, prompts <=272k): $2 in / $10
+/// out / $0.10 cached input (OpenAI API pricing page,
+/// developers.openai.com/api/docs/pricing, read 2026-09-29). Same conventions
+/// as [`GPT_6_SOL`]: cache write $2.50 (1.25× input), $5 over 272k. Prompts
+/// over 272k bill the whole request at $4 in / $15 out / $0.20 cached. Cached
+/// input is half of gpt-6-sol's.
+const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    4.0,
+    15.0,
+    0.2,
+    5.0,
+);
+/// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
+/// $0.01 cached input; over 272k: $0.20 in / $0.75 out / $0.02 cached.
+/// Same sourcing and conventions as [`GPT_6_SOL`].
+const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.125).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    0.2,
+    0.75,
+    0.02,
+    0.25,
+);
+/// grok-4.5 (docs.x.ai, read 2026-09-28): $2 in / $6 out / $0.30 cached input
+/// (the row previously carried $0.50 — the page lists $0.30), no
+/// cache-creation charge; long context (prompt >= 200k): $4 / $12 / $0.60 for
+/// the whole request. Also the `group == "grok"` unknown-model fallback.
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
 /// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
 const GROK_4_5: ModelPrice =
@@ -319,9 +417,25 @@ const GROK_4_6: ModelPrice =
 /// API-list-price equivalent for subscription traffic.
 const GROK_4_7: ModelPrice =
     ModelPrice::new(2.0, 6.0, 0.5, 0.0).with_long_context(4.0, 12.0, 1.0, 0.0);
-// No long-context tier on the codex/OpenAI (`gpt-*`) or Claude rows, by
-// operator decision: codex traffic is subscription-billed and was excluded
-// from tiering. Enabling one is data-only (see the module docs).
+// No long-context tier on the Claude rows: Anthropic bills Claude 4.6+ at
+// standard rates across the full 1M window (pricing page, read 2026-09-28).
+
+/// Every built-in row that carries a long-context tier — the source of
+/// [`long_context_thresholds`]. Adding a tiered row means listing it here (a
+/// test fails when a resolvable tiered row's threshold is missing).
+const BUILTIN_TIERED_ROWS: &[ModelPrice] = &[
+    GPT_5_5,
+    GPT_5_6_SOL,
+    GPT_5_6_TERRA,
+    GPT_5_6_LUNA,
+    GPT_6_ASTRA,
+    GPT_6_1_SOL,
+    GPT_6_SOL,
+    GPT_6_LUNA,
+    GROK_4_5,
+    GROK_4_6,
+    GROK_4_7,
+];
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -407,7 +521,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // Generation boundary: bare `gpt-5.5` matched exactly above; the
         // prefix branch requires the `-` so `gpt-5.50-*` never takes 5.5
         // rates (mirrors codex.rs `supports_extended_efforts`).
-        Some(GPT_5_5)
+        Some(GPT_5_5_FLAT)
     } else if model_norm_lower.starts_with("gpt-5.6-terra-") {
         Some(GPT_5_6_TERRA)
     } else if model_norm_lower.starts_with("gpt-5.6-luna-") {
@@ -483,7 +597,7 @@ pub fn price_for(
     // other unknown group.
     match group.to_ascii_lowercase().as_str() {
         "claude" => Some(OPUS_TIER),
-        "codex" => Some(GPT_5_5),
+        "codex" => Some(GPT_5_5_FLAT),
         "grok" => Some(GROK_4_5),
         _ => None,
     }
@@ -569,6 +683,20 @@ fn breakdown(price: ModelPrice, all: &TokenParts, long: &TokenParts) -> CostBrea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Short-context (sub-threshold) cost of ONE token component at the
+    /// per-1M rate: prices 100k tokens and scales, because a single 1M-token
+    /// request is itself long-context on every tiered model.
+    fn per_m(group: &str, model: &str, component: usize) -> f64 {
+        let n = 100_000;
+        let t = match component {
+            0 => tc(n, 0, None, None),
+            1 => tc(0, n, None, None),
+            2 => tc(0, 0, Some(n), None),
+            _ => tc(0, 0, None, Some(n)),
+        };
+        cost_usd(group, model, &t, &empty()) * 10.0
+    }
 
     #[test]
     fn october_2026_claude_reference_rates_and_override_precedence() {
@@ -844,19 +972,14 @@ mod tests {
 
     #[test]
     fn gpt_5_5_output_one_million_is_thirty_dollars() {
-        let cost = cost_usd("codex", "gpt-5.5", &tc(0, 1_000_000, None, None), &empty());
+        let cost = per_m("codex", "gpt-5.5", 1);
         approx(cost, 30.00);
     }
 
     #[test]
     fn gpt_5_5_has_no_cache_creation_charge() {
         // Codex never bills cache creation; even a huge count costs nothing for it.
-        let cost = cost_usd(
-            "codex",
-            "gpt-5.5",
-            &tc(0, 0, None, Some(1_000_000)),
-            &empty(),
-        );
+        let cost = per_m("codex", "gpt-5.5", 3);
         approx(cost, 0.0);
     }
 
@@ -866,10 +989,12 @@ mod tests {
         // snapshot all resolve to sol rates ($4 in / $20 out, OpenAI pricing
         // page 2026-10-06).
         for model in ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-sol-20260709"] {
-            let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
+            let cost = per_m("codex", model, 0);
             approx(cost, 4.00);
-            let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
+            let out = per_m("codex", model, 1);
             approx(out, 20.00);
+            let cached = per_m("codex", model, 2);
+            approx(cached, 0.40);
         }
     }
 
@@ -878,20 +1003,15 @@ mod tests {
         // Exact `gpt-6-astra`, the bare `gpt-6` alias, and a dated snapshot
         // all resolve to astra rates ($10 in / $50 out / $1 cached input).
         for model in ["gpt-6-astra", "gpt-6", "gpt-6-astra-20260903"] {
-            let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
+            let cost = per_m("codex", model, 0);
             approx(cost, 10.00);
-            let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
+            let out = per_m("codex", model, 1);
             approx(out, 50.00);
-            let cached = cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty());
+            let cached = per_m("codex", model, 2);
             approx(cached, 1.00);
         }
         // OpenAI lists a cache-write rate for astra ($12.50, 2026-10-06).
-        let creation = cost_usd(
-            "codex",
-            "gpt-6-astra",
-            &tc(0, 0, None, Some(1_000_000)),
-            &empty(),
-        );
+        let creation = per_m("codex", "gpt-6-astra", 3);
         approx(creation, 12.50);
         // The bare ALIAS is deliberately absent from the price table: the
         // codex provider resolves `astra` to `gpt-6-astra` BEFORE the request
@@ -901,9 +1021,29 @@ mod tests {
         assert_eq!(builtin_price("astra"), None);
         assert_eq!(
             price_for("codex", "astra", &empty()),
-            Some(GPT_5_5),
+            Some(GPT_5_5_FLAT),
             "an unresolved alias would fall back to the codex group rate"
         );
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_have_their_own_rates() {
+        // Exact slugs and dated snapshots take the sol / luna rows, NOT the
+        // `gpt-6-` astra default ($10 / $50 / $1).
+        for (model, input, output, cached) in [
+            ("gpt-6-sol", 2.00, 10.00, 0.20),
+            ("gpt-6-sol-20260922", 2.00, 10.00, 0.20),
+            ("gpt-6-luna", 0.10, 0.50, 0.01),
+            ("gpt-6-luna-20260922", 0.10, 0.50, 0.01),
+        ] {
+            approx(per_m("codex", model, 0), input);
+            approx(per_m("codex", model, 1), output);
+            approx(per_m("codex", model, 2), cached);
+            // Codex convention: no cache-creation charge.
+            approx(per_m("codex", model, 3), 0.0);
+        }
+        // A future gpt-6 tier we have no row for still takes the astra default.
+        assert_eq!(builtin_price("gpt-6-terra"), Some(GPT_6_ASTRA));
     }
 
     #[test]
@@ -915,7 +1055,7 @@ mod tests {
         assert_eq!(builtin_price("gpt-6.5-astra"), None);
         assert_eq!(
             price_for("codex", "gpt-60-astra", &empty()),
-            Some(GPT_5_5),
+            Some(GPT_5_5_FLAT),
             "unknown codex model takes the group fallback"
         );
         // The boundary must not break the real family ids.
@@ -926,33 +1066,21 @@ mod tests {
 
     #[test]
     fn gpt_5_6_terra_and_luna_have_tier_rates() {
-        let terra = cost_usd(
-            "codex",
-            "gpt-5.6-terra",
-            &tc(1_000_000, 0, None, None),
-            &empty(),
-        );
-        approx(terra, 2.50);
-        let luna = cost_usd(
-            "codex",
-            "gpt-5.6-luna",
-            &tc(0, 1_000_000, None, None),
-            &empty(),
-        );
-        approx(luna, 1.20);
+        // (model, input, output, cached) per 1M, OpenAI pricing page.
+        for (model, input, output, cached) in [
+            ("gpt-5.6-terra", 2.00, 12.00, 0.20),
+            ("gpt-5.6-luna", 0.20, 1.20, 0.02),
+        ] {
+            approx(per_m("codex", model, 0), input);
+            approx(per_m("codex", model, 1), output);
+            approx(per_m("codex", model, 2), cached);
+        }
     }
 
     #[test]
     fn gpt_5_6_sol_cache_creation_is_five_dollars() {
-        // OpenAI's pricing page lists a cache-write rate since the 2026-10-06
-        // re-read; the old "codex has no cache-creation charge" row is gone.
-        let cost = cost_usd(
-            "codex",
-            "gpt-5.6-sol",
-            &tc(0, 0, None, Some(1_000_000)),
-            &empty(),
-        );
-        approx(cost, 5.0);
+        // OpenAI's pricing page lists a cache-write rate (1.25x input).
+        approx(per_m("codex", "gpt-5.6-sol", 3), 5.0);
     }
 
     #[test]
@@ -1003,70 +1131,18 @@ mod tests {
         // gpt-6.1-sol: $2 / $0.10 cached / $2.50 write / $10 (pricing page
         // 2026-10-06); bare `gpt-6.1` and a dated snapshot resolve the same.
         for model in ["gpt-6.1-sol", "gpt-6.1", "gpt-6.1-sol-20260929"] {
-            approx(
-                cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty()),
-                2.00,
-            );
-            approx(
-                cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty()),
-                10.00,
-            );
-            approx(
-                cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty()),
-                0.10,
-            );
-            approx(
-                cost_usd("codex", model, &tc(0, 0, None, Some(1_000_000)), &empty()),
-                2.50,
-            );
+            approx(per_m("codex", model, 0), 2.00);
+            approx(per_m("codex", model, 1), 10.00);
+            approx(per_m("codex", model, 2), 0.10);
+            approx(per_m("codex", model, 3), 2.50);
         }
         // gpt-6-sol: $2 / $0.20 / $2.50 / $10 (model page); gpt-6-luna:
         // $0.10 / $0.01 / $0.125 / $0.50 (pricing page).
-        approx(
-            cost_usd(
-                "codex",
-                "gpt-6-sol",
-                &tc(0, 0, Some(1_000_000), None),
-                &empty(),
-            ),
-            0.20,
-        );
-        approx(
-            cost_usd(
-                "codex",
-                "gpt-6-sol-20260922",
-                &tc(0, 1_000_000, None, None),
-                &empty(),
-            ),
-            10.00,
-        );
-        approx(
-            cost_usd(
-                "codex",
-                "gpt-6-luna",
-                &tc(1_000_000, 0, None, None),
-                &empty(),
-            ),
-            0.10,
-        );
-        approx(
-            cost_usd(
-                "codex",
-                "gpt-6-luna",
-                &tc(0, 1_000_000, None, None),
-                &empty(),
-            ),
-            0.50,
-        );
-        approx(
-            cost_usd(
-                "codex",
-                "gpt-6-luna-20260922",
-                &tc(0, 0, None, Some(1_000_000)),
-                &empty(),
-            ),
-            0.125,
-        );
+        approx(per_m("codex", "gpt-6-sol", 2), 0.20);
+        approx(per_m("codex", "gpt-6-sol-20260922", 1), 10.00);
+        approx(per_m("codex", "gpt-6-luna", 0), 0.10);
+        approx(per_m("codex", "gpt-6-luna", 1), 0.50);
+        approx(per_m("codex", "gpt-6-luna-20260922", 3), 0.125);
         // Generation boundary: `gpt-6.10-*` is not 6.1.
         assert_eq!(builtin_price("gpt-6.10-sol"), None);
         // The bare `gpt-6-` prefix still means astra.
@@ -1084,36 +1160,25 @@ mod tests {
         assert_eq!(builtin_price("gpt-5.50-mini"), None);
         assert_eq!(
             price_for("codex", "gpt-5.60-sol", &empty()),
-            Some(GPT_5_5),
+            Some(GPT_5_5_FLAT),
             "unknown codex model takes the group fallback"
         );
         // The boundary must not break real dated snapshots of the family.
         assert_eq!(builtin_price("gpt-5.6-sol-20260709"), Some(GPT_5_6_SOL));
         assert_eq!(builtin_price("gpt-5.6-terra-20260709"), Some(GPT_5_6_TERRA));
         assert_eq!(builtin_price("gpt-5.6-luna-20260709"), Some(GPT_5_6_LUNA));
-        assert_eq!(builtin_price("gpt-5.5-codex"), Some(GPT_5_5));
+        assert_eq!(builtin_price("gpt-5.5-codex"), Some(GPT_5_5_FLAT));
     }
 
     #[test]
     fn gpt_5_6_sol_cache_read_is_ten_percent_of_input() {
         // OpenAI bills cached input at the flat gpt-5.x discount (10% of the
-        // input rate). gpt-5.6-sol input is $4/1e6 (pricing page 2026-10-06),
-        // so 1e6 cache-read tokens cost $0.40 — a third of a mostly-cached
-        // prompt is billed at a tenth, not the full input rate (the codex
-        // cache-read cost regression).
-        let cache = cost_usd(
-            "codex",
-            "gpt-5.6-sol",
-            &tc(0, 0, Some(1_000_000), None),
-            &empty(),
-        );
+        // input rate). gpt-5.6-sol input is $4/1e6, so 1e6 cache-read tokens
+        // cost $0.40 — a third of a mostly-cached prompt is billed at a tenth,
+        // not the full input rate (the codex cache-read cost regression).
+        let cache = per_m("codex", "gpt-5.6-sol", 2);
         approx(cache, 0.40);
-        let input = cost_usd(
-            "codex",
-            "gpt-5.6-sol",
-            &tc(1_000_000, 0, None, None),
-            &empty(),
-        );
+        let input = per_m("codex", "gpt-5.6-sol", 0);
         approx(cache, input * 0.10);
     }
 
@@ -1227,12 +1292,7 @@ mod tests {
         // A slug from no known generation. (`gpt-6-mini` was the old sample;
         // since 2026-09-07 `gpt-6-` is a REAL generation prefix defaulting to
         // the astra flagship, exactly like `gpt-5.6-` defaults to sol.)
-        let cost = cost_usd(
-            "codex",
-            "gpt-7-mini",
-            &tc(0, 1_000_000, None, None),
-            &empty(),
-        );
+        let cost = per_m("codex", "gpt-7-mini", 1);
         approx(cost, 30.0);
     }
 
@@ -1429,7 +1489,7 @@ mod tests {
 
     #[test]
     fn untiered_models_are_bit_for_bit_unchanged() {
-        // Claude and codex rows carry no tier: even a > 200k request, and an
+        // Claude rows and unverified codex models carry no tier: even a > 200k request, and an
         // aggregate with a non-empty long subset, price at the flat formula
         // with identical floating-point results.
         let big = tc(180_000, 7_777, Some(123_456), Some(54_321));
@@ -1438,9 +1498,8 @@ mod tests {
             ("claude", "claude-opus-4-8"),
             ("claude", "claude-opus-5-5"),
             ("claude", "claude-sonnet-4-6"),
-            ("codex", "gpt-5.5"),
-            ("codex", "gpt-6-astra"),
-            ("codex", "gpt-5.6-terra"),
+            ("codex", "gpt-5.5-codex"),
+            ("codex", "gpt-99-mystery"),
         ] {
             let price = price_for(group, model, &empty()).expect("priced");
             assert!(price.long_context.is_none(), "{model} must stay untiered");
@@ -1509,28 +1568,28 @@ mod tests {
         // model's built-in threshold (200k), per request and in aggregate.
         let mut overrides = HashMap::new();
         overrides.insert(
-            "gpt-5.5".to_string(),
+            "gpt-5.5-codex".to_string(),
             ModelPrice::new(5.0, 30.0, 0.5, 0.0).with_long_context(10.0, 45.0, 1.0, 0.0),
         );
         let short = tc(199_999, 1_000, None, None);
         let long = tc(200_000, 1_000, None, None);
         approx(
-            cost_usd("codex", "gpt-5.5", &short, &overrides),
+            cost_usd("codex", "gpt-5.5-codex", &short, &overrides),
             (199_999.0 * 5.0 + 1_000.0 * 30.0) / 1e6,
         );
         approx(
-            cost_usd("codex", "gpt-5.5", &long, &overrides),
+            cost_usd("codex", "gpt-5.5-codex", &long, &overrides),
             (200_000.0 * 10.0 + 1_000.0 * 45.0) / 1e6,
         );
         let mut all = TokenParts::from(&short);
         all.add(&TokenParts::from(&long));
-        let mut lp = long_part("gpt-5.5", &short);
-        lp.add(&long_part("gpt-5.5", &long));
-        let agg = aggregate_cost("codex", "gpt-5.5", &all, &lp, &overrides).expect("priced");
+        let mut lp = long_part("gpt-5.5-codex", &short);
+        lp.add(&long_part("gpt-5.5-codex", &long));
+        let agg = aggregate_cost("codex", "gpt-5.5-codex", &all, &lp, &overrides).expect("priced");
         approx(
             agg,
-            cost_usd("codex", "gpt-5.5", &short, &overrides)
-                + cost_usd("codex", "gpt-5.5", &long, &overrides),
+            cost_usd("codex", "gpt-5.5-codex", &short, &overrides)
+                + cost_usd("codex", "gpt-5.5-codex", &long, &overrides),
         );
     }
 
@@ -1570,9 +1629,95 @@ mod tests {
         let all = long_context_thresholds();
         assert!(all.contains(&DEFAULT_LONG_CONTEXT_THRESHOLD));
         assert!(all.windows(2).all(|w| w[0] < w[1]), "ascending, distinct");
-        for (slug, t) in LONG_CONTEXT_THRESHOLDS {
-            assert!(all.contains(t), "{slug}");
+        // Every resolvable tiered row's threshold is enumerated — the SQL
+        // prompt-class query buckets on exactly this list.
+        for slug in [
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "grok-4.5",
+            "grok-4.6",
+            "grok-4.7",
+        ] {
+            let t = builtin_price(slug)
+                .and_then(|p| p.long_context)
+                .unwrap_or_else(|| panic!("{slug} is tiered"))
+                .threshold;
+            assert!(all.contains(&t), "{slug} threshold {t} enumerated");
         }
         assert_eq!(long_context_threshold("grok-4.7"), 200_000);
+    }
+
+    // ---- OpenAI (codex group) long-context tier: >272k, whole request ----
+
+    #[test]
+    fn openai_rows_tier_at_272k_on_the_whole_request() {
+        // (model, short in/out/cached, long in/out/cached) per 1M — OpenAI
+        // pricing page, read 2026-09-28.
+        for (model, short, long) in [
+            ("gpt-5.5", (5.0, 30.0, 0.5), (10.0, 45.0, 1.0)),
+            ("gpt-5.6-sol", (4.0, 20.0, 0.4), (8.0, 30.0, 0.8)),
+            ("gpt-5.6-terra", (2.0, 12.0, 0.2), (4.0, 18.0, 0.4)),
+            ("gpt-5.6-luna", (0.2, 1.2, 0.02), (0.4, 1.8, 0.04)),
+            ("gpt-6-astra", (10.0, 50.0, 1.0), (20.0, 75.0, 2.0)),
+            ("gpt-6-sol", (2.0, 10.0, 0.2), (4.0, 15.0, 0.4)),
+            ("gpt-6-luna", (0.1, 0.5, 0.01), (0.2, 0.75, 0.02)),
+        ] {
+            assert_eq!(long_context_threshold(model), 272_000, "{model}");
+            // 271_999 prompt tokens is still short; 272_000 is long, and then
+            // EVERY component (output and cached read included) reprices.
+            let below = tc(1_999, 1_000, Some(270_000), None);
+            let at = tc(2_000, 1_000, Some(270_000), None);
+            approx(
+                cost_usd("codex", model, &below, &empty()),
+                (1_999.0 * short.0 + 1_000.0 * short.1 + 270_000.0 * short.2) / 1e6,
+            );
+            approx(
+                cost_usd("codex", model, &at, &empty()),
+                (2_000.0 * long.0 + 1_000.0 * long.1 + 270_000.0 * long.2) / 1e6,
+            );
+        }
+    }
+
+    #[test]
+    fn openai_dated_snapshots_classify_like_they_price() {
+        // The threshold follows the same exact-then-prefix resolution as the
+        // price, so a dated snapshot is neither priced at the tier with the
+        // wrong boundary nor classified with the grok default.
+        for model in [
+            "gpt-5.6-sol-20260709",
+            "gpt-5.6-terra-20260709",
+            "gpt-5.6-luna-20260709",
+            "gpt-6-astra-20260903",
+            "gpt-6-sol-20260922",
+            "gpt-6-luna-20260922",
+        ] {
+            assert_eq!(long_context_threshold(model), 272_000, "{model}");
+            let p = price_for("codex", model, &empty()).expect("priced");
+            assert_eq!(
+                p.long_context.expect("tiered").threshold,
+                272_000,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_codex_models_stay_flat_and_classify_flat() {
+        // `gpt-5.5-codex` is not on OpenAI's page and an unknown codex model
+        // takes the group fallback: neither claims a tier, so neither can be
+        // repriced (and the fold's classification agrees).
+        for model in ["gpt-5.5-codex", "gpt-5.5-20260701", "gpt-99-mystery"] {
+            let p = price_for("codex", model, &empty()).expect("priced");
+            assert!(p.long_context.is_none(), "{model} is untiered");
+            approx(
+                cost_usd("codex", model, &tc(300_000, 1_000, None, None), &empty()),
+                (300_000.0 * 5.0 + 1_000.0 * 30.0) / 1e6,
+            );
+        }
     }
 }
