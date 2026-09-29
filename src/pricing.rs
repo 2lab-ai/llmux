@@ -81,20 +81,19 @@ const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
 /// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
 const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
 /// gpt-6-astra (generation-6 flagship, 2026-09 launch, standard tier): $10 in
-/// / $50 out / $1 cached input, per third-party pricing trackers — OpenAI's
-/// own page was not read for this row. Codex: no cache-creation charge, same
-/// convention as the other codex rows.
+/// / $50 out / $1 cached input (OpenAI API pricing page, read 2026-09-28).
+/// Codex: no cache-creation charge, same convention as the other codex rows.
 const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
-/// gpt-6-sol (2026-09-22 launch, standard tier): $2 in / $10 out / $0.20 cached
-/// input (the announced 90% cache-read discount). Per press coverage and
-/// third-party price trackers (VentureBeat, MarkTechPost, Requesty) — OpenAI's
-/// own pricing page was not readable for this row. Codex: no cache-creation
-/// charge, same convention as the other codex rows (the API list's separate
-/// cache-write rate does not apply to subscription traffic). The >272k-prompt
-/// tier (2x input, 1.5x output) is not modeled.
+/// gpt-6-sol (2026-09-22 launch, standard tier, prompts <=272k): $2 in / $10
+/// out / $0.20 cached input (OpenAI API pricing page,
+/// developers.openai.com/api/docs/pricing, read 2026-09-28). Codex: no
+/// cache-creation charge, same convention as the other codex rows (the page's
+/// separate $2.50 cache-write rate does not apply to subscription traffic).
+/// The >272k-prompt tier ($4 in / $15 out) is not modeled.
 const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0);
 /// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
-/// $0.01 cached input. Same sourcing and conventions as [`GPT_6_SOL`].
+/// $0.01 cached input; the >272k tier ($0.20 in / $0.75 out) is not modeled.
+/// Same sourcing and conventions as [`GPT_6_SOL`].
 const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.0);
 /// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
 /// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
