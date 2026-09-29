@@ -14,9 +14,38 @@
 //! rates (input / output / cache_read / cache_creation) expresses both
 //! providers uniformly — codex models simply carry `cache_creation: 0.0`.
 //!
+//! ## Long-context tier (per REQUEST, not per total)
+//! Some providers bill a request at higher rates for ALL of its tokens when
+//! that ONE request's prompt is large. A [`ModelPrice`] may carry
+//! [`LongContextRates`]: a request whose prompt — fresh `input` plus
+//! `cache_read` plus `cache_creation` (`input` is always FRESH input in
+//! llmux) — is `>=`
+//! [`long_context_threshold`] is billed input, output, cache_read AND
+//! cache_creation at the long rates (whole-request repricing, not a marginal
+//! bracket). Explicit long rates per component, so a non-uniform tier (e.g. 2×
+//! input/cache, 1.5× output) is plain data.
+//!
+//! Because the tier is a property of one request, a cost can NOT be derived
+//! from aggregated token totals. Every aggregate keeps the long-context subset
+//! separately ([`long_part`], folded per request) and prices through
+//! [`aggregate_cost`]; single requests go through [`cost_usd`] /
+//! [`request_breakdown`]. Both reduce to the same breakdown, so
+//! **aggregate cost == sum of per-request costs** by construction. The split
+//! point is model-keyed built-in data and deliberately independent of config
+//! overrides — the activity fold and the SQLite query classify requests with
+//! no config in hand.
+//!
+//! Tiered today: grok-4.5 / grok-4.6 / grok-4.7 (xAI, `>= 200k`, every rate
+//! doubles; docs.x.ai read 2026-09-28) — and therefore the `grok` group
+//! fallback. Deliberately NOT tiered: codex/OpenAI (`gpt-*`) rows — codex
+//! traffic is subscription-billed and the operator excluded it — and Claude
+//! rows. Enabling either later is a data-only change (a
+//! `.with_long_context(..)` on the row, plus a [`long_context_threshold`]
+//! entry if the boundary is not 200k).
+//!
 //! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
 //! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
-//! anthropic.com/claude-opus-5-5, 2026-09-22.
+//! anthropic.com/claude-opus-5-5, 2026-09-22; grok rows docs.x.ai 2026-09-28.
 
 use std::collections::HashMap;
 
@@ -26,6 +55,14 @@ use crate::tui::TokenCounts;
 /// Per-model price table entry. All four rates are **USD per 1,000,000
 /// tokens**. A zero rate means "free / not charged" (e.g. codex has no
 /// cache-creation charge → `cache_creation: 0.0`).
+///
+/// Also the config `pricing` override shape. An override REPLACES the whole
+/// entry, tier included: one without `long_context` prices every request at
+/// its flat rates (a built-in tier is dropped, not inherited); one with
+/// `long_context` applies those long rates at the model's built-in
+/// [`long_context_threshold`] (the threshold is not configurable — see the
+/// module docs). Config files written before the tier existed carry no
+/// `long_context` key and load unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelPrice {
     /// Fresh (non-cached) input tokens, USD / 1e6.
@@ -36,6 +73,24 @@ pub struct ModelPrice {
     pub cache_read: f64,
     /// Cache-creation (write) tokens, USD / 1e6.
     pub cache_creation: f64,
+    /// Long-context tier: when set, a request whose prompt is `>=`
+    /// [`long_context_threshold`] is billed ALL its tokens at these rates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context: Option<LongContextRates>,
+}
+
+/// The rates a long-context request is billed at — every component, USD per
+/// 1,000,000 tokens. Explicit rates rather than one multiplier, so a tier that
+/// scales components differently is representable. `deny_unknown_fields`: a
+/// config that tries to set e.g. a `threshold` here fails loudly instead of
+/// being silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LongContextRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_creation: f64,
 }
 
 impl ModelPrice {
@@ -45,6 +100,26 @@ impl ModelPrice {
             output,
             cache_read,
             cache_creation,
+            long_context: None,
+        }
+    }
+
+    /// Attach a long-context tier (see [`LongContextRates`]).
+    const fn with_long_context(
+        self,
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_creation: f64,
+    ) -> Self {
+        Self {
+            long_context: Some(LongContextRates {
+                input,
+                output,
+                cache_read,
+                cache_creation,
+            }),
+            ..self
         }
     }
 
@@ -52,6 +127,118 @@ impl ModelPrice {
     /// Yields `0.0` cost and never panics.
     pub const fn zero() -> Self {
         Self::new(0.0, 0.0, 0.0, 0.0)
+    }
+}
+
+/// The long-context boundary every tier modeled today uses (xAI: a prompt of
+/// 200k tokens or more).
+pub const DEFAULT_LONG_CONTEXT_THRESHOLD: u64 = 200_000;
+
+/// Models whose long-context boundary is NOT [`DEFAULT_LONG_CONTEXT_THRESHOLD`],
+/// keyed by normalized lowercased slug. Empty today; a provider with a
+/// different boundary is a row here plus the tier on its price row.
+const LONG_CONTEXT_THRESHOLDS: &[(&str, u64)] = &[];
+
+/// Prompt size (fresh input + cache_read + cache_creation of ONE request) at
+/// or above which `model` is billed at its long-context rates. Built-in data
+/// only — never a config override — because the activity fold and the SQLite
+/// usage query classify each request without a config handle, and every
+/// pricing path must agree with that classification.
+pub fn long_context_threshold(model: &str) -> u64 {
+    let norm = normalize_model(model).to_ascii_lowercase();
+    LONG_CONTEXT_THRESHOLDS
+        .iter()
+        .find(|(slug, _)| *slug == norm)
+        .map_or(DEFAULT_LONG_CONTEXT_THRESHOLD, |&(_, t)| t)
+}
+
+/// Every distinct threshold [`long_context_threshold`] can return, ascending.
+/// Lets a SQL `GROUP BY` bucket rows by prompt size exactly (the bucket index
+/// is how many of these a row's prompt reaches) without knowing the model.
+pub fn long_context_thresholds() -> Vec<u64> {
+    let mut all: Vec<u64> = LONG_CONTEXT_THRESHOLDS.iter().map(|&(_, t)| t).collect();
+    all.push(DEFAULT_LONG_CONTEXT_THRESHOLD);
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// Four token counters of one request, or of a SUM of requests. The pricing
+/// input shape — absent (`None`) cache counters are `0` here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenParts {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl TokenParts {
+    /// The prompt the long-context boundary is measured on: fresh input plus
+    /// both cache classes (llmux's `input` excludes cached tokens).
+    pub fn prompt(&self) -> u64 {
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_creation)
+    }
+
+    /// Accumulate another request's (or bucket's) parts.
+    pub fn add(&mut self, other: &TokenParts) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+    }
+
+    fn saturating_sub(&self, other: &TokenParts) -> TokenParts {
+        TokenParts {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
+            cache_creation: self.cache_creation.saturating_sub(other.cache_creation),
+        }
+    }
+}
+
+impl From<&TokenCounts> for TokenParts {
+    fn from(t: &TokenCounts) -> Self {
+        TokenParts {
+            input: t.input,
+            output: t.output,
+            cache_read: t.cache_read.unwrap_or(0),
+            cache_creation: t.cache_creation.unwrap_or(0),
+        }
+    }
+}
+
+/// The long-context share of ONE request: all of its parts when its prompt
+/// reaches `model`'s [`long_context_threshold`], otherwise zero. Aggregates
+/// fold this per request next to their totals and price with
+/// [`aggregate_cost`] — the only way a tiered cost survives aggregation.
+/// Classified for every model (not just tiered ones) so a config override
+/// that adds a tier prices already-folded history correctly.
+pub fn long_part(model: &str, tokens: &TokenCounts) -> TokenParts {
+    let parts = TokenParts::from(tokens);
+    if parts.prompt() >= long_context_threshold(model) {
+        parts
+    } else {
+        TokenParts::default()
+    }
+}
+
+/// Per-component API-equivalent cost. `total()` is exactly the sum of the
+/// four, so a per-component display always adds up to the total shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CostBreakdown {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_creation: f64,
+}
+
+impl CostBreakdown {
+    pub fn total(&self) -> f64 {
+        self.input + self.output + self.cache_read + self.cache_creation
     }
 }
 
@@ -104,22 +291,29 @@ const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0);
 /// $0.01 cached input; the >272k tier ($0.20 in / $0.75 out) is not modeled.
 /// Same sourcing and conventions as [`GPT_6_SOL`].
 const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.0);
-/// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
-/// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
+/// grok-4.5 (docs.x.ai, read 2026-09-28): $2 in / $6 out / $0.30 cached input
+/// (the row previously carried $0.50 — the page lists $0.30), no
+/// cache-creation charge; long context (prompt >= 200k): $4 / $12 / $0.60 for
+/// the whole request. Also the `group == "grok"` unknown-model fallback.
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
 /// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
-const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
-/// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; the $0.50/M cached input
-/// was carried from grok-4.5 when this row landed and is now LISTED on the
-/// page itself (docs.x.ai, re-read 2026-09-23) — same number, no longer an
-/// inference. API-list-price equivalent for subscription traffic, like the
-/// other grok rows.
-const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
-/// grok-4.7 (docs.x.ai pricing, 2026-09-23): $2 in / $6 out / $0.50 cached
-/// input, no cache-creation charge — unchanged from grok-4.6. The
-/// ≥200k-prompt long-context tier (rates double) is not modeled.
+const GROK_4_5: ModelPrice =
+    ModelPrice::new(2.0, 6.0, 0.3, 0.0).with_long_context(4.0, 12.0, 0.6, 0.0);
+/// grok-4.6 (docs.x.ai, read 2026-09-28): $2 in / $6 out / $0.50 cached input;
+/// long context (prompt >= 200k): $4 / $12 / $1.00 for the whole request.
+/// API-list-price equivalent for subscription traffic, like the other grok
+/// rows.
+const GROK_4_6: ModelPrice =
+    ModelPrice::new(2.0, 6.0, 0.5, 0.0).with_long_context(4.0, 12.0, 1.0, 0.0);
+/// grok-4.7 (docs.x.ai, read 2026-09-28): $2 in / $6 out / $0.50 cached input,
+/// no cache-creation charge — unchanged from grok-4.6, as is its long-context
+/// tier (prompt >= 200k): $4 / $12 / $1.00 for the whole request.
 /// API-list-price equivalent for subscription traffic.
-const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+const GROK_4_7: ModelPrice =
+    ModelPrice::new(2.0, 6.0, 0.5, 0.0).with_long_context(4.0, 12.0, 1.0, 0.0);
+// No long-context tier on the codex/OpenAI (`gpt-*`) or Claude rows, by
+// operator decision: codex traffic is subscription-billed and was excluded
+// from tiering. Enabling one is data-only (see the module docs).
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -266,76 +460,81 @@ pub fn price_for(
     }
 }
 
-/// API-equivalent USD cost for one [`TokenCounts`] under `(group, model)`'s
-/// price. Unknown / zero-rate model → `0.0`. Never panics.
+/// API-equivalent USD cost of ONE request under `(group, model)`'s price,
+/// long-context tier included. Unknown / zero-rate model → `0.0`. Never
+/// panics. Absent (`None`) cache fields contribute `0`.
 ///
-/// `cost = input·in/1e6 + output·out/1e6 + cache_read·cr/1e6 +
-/// cache_creation·cc/1e6`; absent (`None`) cache fields contribute `0`.
+/// Per-request only: `tokens` must be a single request's usage, because the
+/// tier is decided on its prompt size. Aggregates use [`aggregate_cost`].
 pub fn cost_usd(
     group: &str,
     model: &str,
     tokens: &TokenCounts,
     overrides: &HashMap<String, ModelPrice>,
 ) -> f64 {
-    cost_from_parts(
-        group,
-        model,
-        tokens.input,
-        tokens.output,
-        tokens.cache_read,
-        tokens.cache_creation,
-        overrides,
-    )
+    request_breakdown(group, model, tokens, overrides).map_or(0.0, |b| b.total())
 }
 
-/// Same as [`cost_usd`] but from the accumulated row fields the dashboard
-/// already holds (`tokens_in`/`tokens_out` plus the `Option` cache counters on
-/// [`crate::tui::activity::ModelUsage`]). `None` cache fields contribute `0`.
-/// Unknown / zero-rate model → `0.0`. Never panics.
-#[allow(clippy::too_many_arguments)]
-pub fn cost_from_parts(
+/// Per-component cost of ONE request (the TUI's expanded-row breakdown).
+/// `None` means "no rate known". The whole request is classified once, so a
+/// long-context request prices every component at the long rates and the
+/// four components still sum to [`cost_usd`].
+pub fn request_breakdown(
     group: &str,
     model: &str,
-    tokens_in: u64,
-    tokens_out: u64,
-    cache_read: Option<u64>,
-    cache_creation: Option<u64>,
+    tokens: &TokenCounts,
     overrides: &HashMap<String, ModelPrice>,
-) -> f64 {
-    priced_cost(
-        group,
-        model,
-        tokens_in,
-        tokens_out,
-        cache_read,
-        cache_creation,
-        overrides,
-    )
-    .unwrap_or(0.0)
+) -> Option<CostBreakdown> {
+    let all = TokenParts::from(tokens);
+    let long = long_part(model, tokens);
+    Some(breakdown(price_for(group, model, overrides)?, &all, &long))
 }
 
-/// [`cost_from_parts`] without the `0.0` sentinel: `None` means "no rate
-/// known for this `(group, model)`", so a caller can never mistake a missing
-/// rate for a free request (usage-stats review — the `priced` flag and the
-/// cost must come from ONE lookup, not two calls that merely agree today).
-#[allow(clippy::too_many_arguments)]
-pub fn priced_cost(
+/// Cost of an AGGREGATE of requests: `all` is every request's parts summed,
+/// `long` the subset from requests whose own prompt reached the threshold
+/// (summed [`long_part`]s). The short remainder is billed at the flat rates,
+/// the long subset at the tier rates, so the result equals the sum of the
+/// per-request [`cost_usd`]s. A model with no tier ignores `long` and prices
+/// `all` exactly as before tiering existed.
+///
+/// `None` means "no rate known for this `(group, model)`", so a caller can
+/// never mistake a missing rate for a free row (usage-stats review — the
+/// `priced` flag and the cost must come from ONE lookup).
+pub fn aggregate_cost(
     group: &str,
     model: &str,
-    tokens_in: u64,
-    tokens_out: u64,
-    cache_read: Option<u64>,
-    cache_creation: Option<u64>,
+    all: &TokenParts,
+    long: &TokenParts,
     overrides: &HashMap<String, ModelPrice>,
 ) -> Option<f64> {
-    let price = price_for(group, model, overrides)?;
+    Some(breakdown(price_for(group, model, overrides)?, all, long).total())
+}
+
+/// The single pricing formula every entry point reduces to:
+/// `component = short·flat/1e6 + long·tier/1e6` per component. Without a tier
+/// the long subset is not separated at all — `all·flat/1e6`, bit-identical to
+/// the pre-tier formula.
+fn breakdown(price: ModelPrice, all: &TokenParts, long: &TokenParts) -> CostBreakdown {
     let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
-    Some(
-        per_m(tokens_in, price.input)
-            + per_m(tokens_out, price.output)
-            + per_m(cache_read.unwrap_or(0), price.cache_read)
-            + per_m(cache_creation.unwrap_or(0), price.cache_creation),
-    )
+    match price.long_context {
+        None => CostBreakdown {
+            input: per_m(all.input, price.input),
+            output: per_m(all.output, price.output),
+            cache_read: per_m(all.cache_read, price.cache_read),
+            cache_creation: per_m(all.cache_creation, price.cache_creation),
+        },
+        Some(tier) => {
+            let short = all.saturating_sub(long);
+            CostBreakdown {
+                input: per_m(short.input, price.input) + per_m(long.input, tier.input),
+                output: per_m(short.output, price.output) + per_m(long.output, tier.output),
+                cache_read: per_m(short.cache_read, price.cache_read)
+                    + per_m(long.cache_read, tier.cache_read),
+                cache_creation: per_m(short.cache_creation, price.cache_creation)
+                    + per_m(long.cache_creation, tier.cache_creation),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -384,18 +583,19 @@ mod tests {
     #[test]
     fn c14_grok_prices_and_group_fallback() {
         let overrides = std::collections::HashMap::new();
+        // grok-4.5 cached input is $0.30 (docs.x.ai, read 2026-09-28).
         let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
         assert_eq!(
             (p.input, p.output, p.cache_read, p.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.3, 0.0)
         );
         let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
         assert_eq!(
             (p6.input, p6.output, p6.cache_read, p6.cache_creation),
             (2.0, 6.0, 0.5, 0.0)
         );
-        // grok-4.7 (docs.x.ai 2026-09-23): same rates as 4.6 — the
-        // ≥200k-prompt long-context tier is deliberately not modeled.
+        // grok-4.7: same flat rates as 4.6 (its long-context tier is
+        // covered by the tier tests below).
         let p7 = price_for("grok", "grok-4.7", &overrides).expect("grok-4.7 priced");
         assert_eq!(
             (p7.input, p7.output, p7.cache_read, p7.cache_creation),
@@ -904,10 +1104,17 @@ mod tests {
     }
 
     #[test]
-    fn cost_from_parts_matches_cost_usd() {
+    fn aggregate_cost_of_one_request_matches_cost_usd() {
         let tokens = tc(700, 300, Some(120), None);
         let a = cost_usd("codex", "gpt-5.5", &tokens, &empty());
-        let b = cost_from_parts("codex", "gpt-5.5", 700, 300, Some(120), None, &empty());
+        let b = aggregate_cost(
+            "codex",
+            "gpt-5.5",
+            &TokenParts::from(&tokens),
+            &long_part("gpt-5.5", &tokens),
+            &empty(),
+        )
+        .expect("priced");
         approx(a, b);
         // gpt-5.5: 700*5/1e6 + 300*30/1e6 + 120*0.5/1e6 = 0.0035 + 0.009 + 0.00006.
         approx(b, 0.0035 + 0.009 + 0.000_06);
@@ -920,5 +1127,289 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("nope".to_string(), ModelPrice::zero());
         assert!(price_for("nope", "nope", &overrides).is_some());
+    }
+
+    // ---- long-context tier (docs.x.ai, read 2026-09-28) ----
+
+    /// Old per-component formula, spelled out: the exact flat-rate cost the
+    /// module computed before tiering existed.
+    fn flat_formula(p: ModelPrice, t: &TokenCounts) -> f64 {
+        let per_m = |count: u64, rate: f64| (count as f64) * rate / 1_000_000.0;
+        per_m(t.input, p.input)
+            + per_m(t.output, p.output)
+            + per_m(t.cache_read.unwrap_or(0), p.cache_read)
+            + per_m(t.cache_creation.unwrap_or(0), p.cache_creation)
+    }
+
+    #[test]
+    fn grok_tier_boundary_is_inclusive_at_200k_prompt_tokens() {
+        // Prompt = fresh input + cache_read + cache_creation.
+        let short = tc(100_000, 1_000, Some(99_999), None); // 199,999
+        let long = tc(100_000, 1_000, Some(100_000), None); // exactly 200,000
+        approx(
+            cost_usd("grok", "grok-4.7", &short, &empty()),
+            (100_000.0 * 2.0 + 1_000.0 * 6.0 + 99_999.0 * 0.5) / 1e6,
+        );
+        approx(
+            cost_usd("grok", "grok-4.7", &long, &empty()),
+            (100_000.0 * 4.0 + 1_000.0 * 12.0 + 100_000.0 * 1.0) / 1e6,
+        );
+        // cache_creation counts toward the prompt too.
+        assert_eq!(
+            long_part("grok-4.7", &tc(1, 0, None, Some(199_999))),
+            TokenParts {
+                input: 1,
+                output: 0,
+                cache_read: 0,
+                cache_creation: 199_999
+            }
+        );
+        // Output never counts toward the prompt.
+        assert_eq!(
+            long_part("grok-4.7", &tc(199_999, 1_000_000, None, None)),
+            TokenParts::default()
+        );
+    }
+
+    #[test]
+    fn grok_long_context_rates_per_model() {
+        // (model, long input, long output, long cached) per docs.x.ai.
+        for (model, li, lo, lc) in [
+            ("grok-4.7", 4.0, 12.0, 1.0),
+            ("grok-4.6", 4.0, 12.0, 1.0),
+            ("grok-4.5", 4.0, 12.0, 0.6),
+            // Unknown grok model → grok-4.5 group fallback, tier included.
+            ("grok-build-0.1", 4.0, 12.0, 0.6),
+        ] {
+            let b = request_breakdown(
+                "grok",
+                model,
+                &tc(300_000, 1_000_000, Some(1_000_000), None),
+                &empty(),
+            )
+            .expect("priced");
+            approx(b.input, 0.3 * li);
+            approx(b.output, lo);
+            approx(b.cache_read, lc);
+        }
+    }
+
+    #[test]
+    fn a_long_request_reprices_every_component_including_cache_creation() {
+        // Distinct rates everywhere so a component billed at the wrong tier
+        // cannot hide; grok itself has no cache-write charge, so exercise the
+        // cache_creation leg through an override tier.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "grok-4.7".to_string(),
+            ModelPrice::new(1.0, 2.0, 3.0, 4.0).with_long_context(10.0, 20.0, 30.0, 40.0),
+        );
+        let t = tc(100_000, 50_000, Some(60_000), Some(40_000)); // prompt 200k
+        let b = request_breakdown("grok", "grok-4.7", &t, &overrides).expect("priced");
+        approx(b.input, 100_000.0 * 10.0 / 1e6);
+        approx(b.output, 50_000.0 * 20.0 / 1e6);
+        approx(b.cache_read, 60_000.0 * 30.0 / 1e6);
+        approx(b.cache_creation, 40_000.0 * 40.0 / 1e6);
+        // The TUI split adds up to the total exactly.
+        assert_eq!(b.total(), cost_usd("grok", "grok-4.7", &t, &overrides));
+        assert_eq!(
+            b.input + b.output + b.cache_read + b.cache_creation,
+            b.total()
+        );
+    }
+
+    #[test]
+    fn aggregate_cost_equals_the_sum_of_per_request_costs() {
+        // The bug class: one long request priced into a mixed total at flat
+        // rates. Aggregates must keep the long subset separate.
+        let requests = [
+            tc(1_000, 500, Some(150_000), None),    // short
+            tc(50_000, 2_000, Some(150_000), None), // long (== 200k)
+            tc(250_000, 1_000, None, Some(0)),      // long
+            tc(199_999, 10, None, None),            // short (boundary - 1)
+            tc(10, 20, None, None),                 // short
+        ];
+        for model in [
+            "grok-4.7",
+            "grok-4.6",
+            "grok-4.5",
+            "claude-opus-4-8",
+            "gpt-5.5",
+        ] {
+            let group = if model.starts_with("grok") {
+                "grok"
+            } else if model.starts_with("claude") {
+                "claude"
+            } else {
+                "codex"
+            };
+            let (mut all, mut long) = (TokenParts::default(), TokenParts::default());
+            let mut sum = 0.0;
+            for t in &requests {
+                all.add(&TokenParts::from(t));
+                long.add(&long_part(model, t));
+                sum += cost_usd(group, model, t, &empty());
+            }
+            let agg = aggregate_cost(group, model, &all, &long, &empty()).expect("priced");
+            assert!(
+                (agg - sum).abs() < 1e-12,
+                "{model}: aggregate {agg} != sum {sum}"
+            );
+            if group == "grok" {
+                // Non-vacuous: pricing the mixed total flat undercounts.
+                let flat = aggregate_cost(group, model, &all, &TokenParts::default(), &empty())
+                    .expect("priced");
+                assert!(agg > flat + 1e-6, "{model}: long requests must cost more");
+            }
+        }
+    }
+
+    #[test]
+    fn untiered_models_are_bit_for_bit_unchanged() {
+        // Claude and codex rows carry no tier: even a > 200k request, and an
+        // aggregate with a non-empty long subset, price at the flat formula
+        // with identical floating-point results.
+        let big = tc(180_000, 7_777, Some(123_456), Some(54_321));
+        let small = tc(700, 300, Some(120), None);
+        for (group, model) in [
+            ("claude", "claude-opus-4-8"),
+            ("claude", "claude-opus-5-5"),
+            ("claude", "claude-sonnet-4-6"),
+            ("codex", "gpt-5.5"),
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.6-terra"),
+        ] {
+            let price = price_for(group, model, &empty()).expect("priced");
+            assert!(price.long_context.is_none(), "{model} must stay untiered");
+            for t in [&big, &small] {
+                assert_eq!(
+                    cost_usd(group, model, t, &empty()).to_bits(),
+                    flat_formula(price, t).to_bits(),
+                    "{model}"
+                );
+            }
+            let mut all = TokenParts::from(&big);
+            all.add(&TokenParts::from(&small));
+            let summed = TokenCounts {
+                input: all.input,
+                output: all.output,
+                cache_read: Some(all.cache_read),
+                cache_creation: Some(all.cache_creation),
+            };
+            let agg = aggregate_cost(group, model, &all, &long_part(model, &big), &empty())
+                .expect("priced");
+            assert_eq!(
+                agg.to_bits(),
+                flat_formula(price, &summed).to_bits(),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_model_stays_unpriced_under_every_entry_point() {
+        let t = tc(300_000, 1, Some(1), Some(1));
+        approx(cost_usd("weirdgroup", "nope", &t, &empty()), 0.0);
+        assert!(request_breakdown("weirdgroup", "nope", &t, &empty()).is_none());
+        assert!(aggregate_cost(
+            "weirdgroup",
+            "nope",
+            &TokenParts::from(&t),
+            &long_part("nope", &t),
+            &empty()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn override_without_a_tier_drops_the_builtin_tier() {
+        // An override REPLACES the whole row: no `long_context` means flat
+        // rates for every request, even a long one on a tiered model.
+        let mut overrides = HashMap::new();
+        overrides.insert("grok-4.7".to_string(), ModelPrice::new(1.0, 1.0, 1.0, 1.0));
+        let long = tc(300_000, 1_000_000, None, None);
+        approx(cost_usd("grok", "grok-4.7", &long, &overrides), 1.3);
+        let agg = aggregate_cost(
+            "grok",
+            "grok-4.7",
+            &TokenParts::from(&long),
+            &long_part("grok-4.7", &long),
+            &overrides,
+        )
+        .expect("priced");
+        approx(agg, 1.3);
+    }
+
+    #[test]
+    fn override_with_a_tier_applies_at_the_builtin_threshold_even_on_an_untiered_model() {
+        // Enabling a tier by config on an untiered model works, at the
+        // model's built-in threshold (200k), per request and in aggregate.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "gpt-5.5".to_string(),
+            ModelPrice::new(5.0, 30.0, 0.5, 0.0).with_long_context(10.0, 45.0, 1.0, 0.0),
+        );
+        let short = tc(199_999, 1_000, None, None);
+        let long = tc(200_000, 1_000, None, None);
+        approx(
+            cost_usd("codex", "gpt-5.5", &short, &overrides),
+            (199_999.0 * 5.0 + 1_000.0 * 30.0) / 1e6,
+        );
+        approx(
+            cost_usd("codex", "gpt-5.5", &long, &overrides),
+            (200_000.0 * 10.0 + 1_000.0 * 45.0) / 1e6,
+        );
+        let mut all = TokenParts::from(&short);
+        all.add(&TokenParts::from(&long));
+        let mut lp = long_part("gpt-5.5", &short);
+        lp.add(&long_part("gpt-5.5", &long));
+        let agg = aggregate_cost("codex", "gpt-5.5", &all, &lp, &overrides).expect("priced");
+        approx(
+            agg,
+            cost_usd("codex", "gpt-5.5", &short, &overrides)
+                + cost_usd("codex", "gpt-5.5", &long, &overrides),
+        );
+    }
+
+    #[test]
+    fn config_pricing_entries_stay_backward_compatible() {
+        // A pre-tier config entry (no `long_context`) still loads, untiered,
+        // and serializes back without the new key.
+        let old: ModelPrice = serde_json::from_str(
+            r#"{"input": 1.0, "output": 2.0, "cache_read": 0.1, "cache_creation": 1.25}"#,
+        )
+        .expect("old entry parses");
+        assert_eq!(old, ModelPrice::new(1.0, 2.0, 0.1, 1.25));
+        let json = serde_json::to_value(old).expect("serialize");
+        assert!(json.get("long_context").is_none(), "no new key on the wire");
+        // A tiered entry parses and round-trips.
+        let tiered: ModelPrice = serde_json::from_str(
+            r#"{"input": 2, "output": 6, "cache_read": 0.5, "cache_creation": 0,
+                "long_context": {"input": 4, "output": 12, "cache_read": 1, "cache_creation": 0}}"#,
+        )
+        .expect("tiered entry parses");
+        assert_eq!(tiered, GROK_4_7);
+        let back: ModelPrice =
+            serde_json::from_value(serde_json::to_value(tiered).expect("serialize"))
+                .expect("round-trip");
+        assert_eq!(back, tiered);
+        // The threshold is not configurable: an attempt fails loudly.
+        assert!(serde_json::from_str::<ModelPrice>(
+            r#"{"input": 2, "output": 6, "cache_read": 0.5, "cache_creation": 0,
+                "long_context": {"threshold": 100000, "input": 4, "output": 12,
+                                 "cache_read": 1, "cache_creation": 0}}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn long_context_thresholds_cover_every_model_threshold() {
+        let all = long_context_thresholds();
+        assert!(all.contains(&DEFAULT_LONG_CONTEXT_THRESHOLD));
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "ascending, distinct");
+        for (slug, t) in LONG_CONTEXT_THRESHOLDS {
+            assert!(all.contains(t), "{slug}");
+        }
+        assert_eq!(long_context_threshold("grok-4.7"), 200_000);
     }
 }

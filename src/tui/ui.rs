@@ -7245,19 +7245,22 @@ fn completed_detail_lines(
                 ),
             ));
             // Per-component + total API-equivalent cost (item #4). Empty
-            // overrides = built-in default rate table. Each component is priced
-            // in isolation via `cost_from_parts`, so the four add up to total.
+            // overrides = built-in default rate table. The request is priced
+            // ONCE as a whole (a long-context request reprices every
+            // component), then split — so the four add up to the total.
             let empty = std::collections::HashMap::new();
             let (g, m) = (
                 group.as_deref().unwrap_or(""),
                 model.as_deref().unwrap_or(""),
             );
-            let cost_in = crate::pricing::cost_from_parts(g, m, t.input, 0, None, None, &empty);
-            let cost_out = crate::pricing::cost_from_parts(g, m, 0, t.output, None, None, &empty);
-            let cost_cr = crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &empty);
-            let cost_cc =
-                crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &empty);
-            let cost_total = cost_in + cost_out + cost_cr + cost_cc;
+            let cost = crate::pricing::request_breakdown(g, m, t, &empty).unwrap_or_default();
+            let (cost_in, cost_out, cost_cr, cost_cc) = (
+                cost.input,
+                cost.output,
+                cost.cache_read,
+                cost.cache_creation,
+            );
+            let cost_total = cost.total();
             lines.push(Line::from(vec![
                 Span::styled("       cost    ", dim()),
                 Span::raw(format!(
@@ -7788,7 +7791,9 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
 /// pricing the token parts locally so the `$` column stays useful during a
 /// rolling upgrade. The fallback holds no config overrides (empty map = the
 /// built-in default rate table); an unknown/zero-rate `(group, model)` still
-/// yields `0.0`.
+/// yields `0.0`. A model with a long-context tier also yields `0.0` here: the
+/// doc carries only token TOTALS, and a tiered cost cannot be derived from
+/// totals (the tier is per request), so no number beats a wrong one.
 fn model_cost(m: &ModelUsageDoc) -> f64 {
     if m.cost_usd > 0.0 {
         return m.cost_usd;
@@ -7796,15 +7801,24 @@ fn model_cost(m: &ModelUsageDoc) -> f64 {
     if m.tokens_in.saturating_add(m.tokens_out) == 0 {
         return 0.0;
     }
-    crate::pricing::cost_from_parts(
-        &m.group,
-        &m.model,
-        m.tokens_in,
-        m.tokens_out,
-        m.cache_read,
-        m.cache_creation,
-        &std::collections::HashMap::new(),
-    )
+    let empty = std::collections::HashMap::new();
+    match crate::pricing::price_for(&m.group, &m.model, &empty) {
+        Some(price) if price.long_context.is_none() => crate::pricing::aggregate_cost(
+            &m.group,
+            &m.model,
+            &crate::pricing::TokenParts {
+                input: m.tokens_in,
+                output: m.tokens_out,
+                cache_read: m.cache_read.unwrap_or(0),
+                cache_creation: m.cache_creation.unwrap_or(0),
+            },
+            // Untiered: the long subset is ignored by construction.
+            &crate::pricing::TokenParts::default(),
+            &empty,
+        )
+        .unwrap_or(0.0),
+        _ => 0.0,
+    }
 }
 
 /// "—" when unavailable (the upstream never reported it), else a human count —
@@ -9874,6 +9888,7 @@ mod tests {
             cache_creation: 4,
             cost_usd,
             priced: true,
+            long: Default::default(),
         }
     }
 
@@ -11855,6 +11870,65 @@ mod tests {
         assert!(model_cost(&idle).abs() < 1e-12);
     }
 
+    /// Long-context tier: the expanded row prices the request ONCE and then
+    /// splits it, so a long grok request shows every component at the long
+    /// rates and the four still add up to the total (isolated per-component
+    /// pricing would have classified each component's own "prompt").
+    #[test]
+    fn detail_cost_split_of_a_long_tiered_request_sums_to_its_total() {
+        let mut entry = completed_request(
+            1_000,
+            Some("grok"),
+            Some("grok-4.7"),
+            150_000,
+            1_000_000,
+            200,
+        );
+        let CompletedBody::Request { tokens, .. } = &mut entry.body else {
+            unreachable!("seeded a request")
+        };
+        let t = tokens.as_mut().expect("tokens");
+        t.cache_read = Some(100_000); // prompt 250k → long
+        let t = *t;
+        let text: Vec<String> = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let cost = text
+            .iter()
+            .find(|l| l.trim_start().starts_with("cost"))
+            .expect("cost line");
+        // Long rates $4 / $12 / $1 cached: 0.6 + 12 + 0.1 = 12.70.
+        assert!(
+            cost.contains(
+                "in $0.6000 · out $12.00 · cache_read $0.1000 · cache_creation $0.0000 · $12.70"
+            ),
+            "{cost}"
+        );
+        let b = crate::pricing::request_breakdown("grok", "grok-4.7", &t, &Default::default())
+            .expect("priced");
+        assert_eq!(
+            b.input + b.output + b.cache_read + b.cache_creation,
+            b.total()
+        );
+        assert_eq!(
+            b.total(),
+            crate::pricing::cost_usd("grok", "grok-4.7", &t, &Default::default())
+        );
+    }
+
+    /// The old-daemon fallback only has token TOTALS; a tiered model's cost
+    /// is not derivable from those, so it refuses rather than under-price.
+    #[test]
+    fn model_cost_fallback_refuses_tiered_models() {
+        let mut m = model_row("grok", "grok-4.7", 250_000, 1_000);
+        m.cost_usd = 0.0;
+        assert_eq!(model_cost(&m), 0.0);
+        // A server-computed cost is still used as-is.
+        m.cost_usd = 1.5;
+        assert_eq!(model_cost(&m), 1.5);
+    }
+
     #[test]
     fn model_total_counts_all_four_token_classes() {
         // Distinct per-class values so a dropped class is caught: the strip's
@@ -12949,6 +13023,7 @@ mod tests {
                 output: 2.0,
                 cache_read: 0.1,
                 cache_creation: 1.25,
+                long_context: None,
             },
         );
         config.paused_accounts.insert("a@x.com".into());

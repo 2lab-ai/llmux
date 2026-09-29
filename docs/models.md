@@ -493,8 +493,13 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   and `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
   synthesize a null-metadata row when pinned.
-- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
-  is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
-  also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
-  grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
-  long-context tier.
+- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-28: `grok-4.7`
+  and `grok-4.6` are $2.00 in / $6.00 out / $0.50 cached input per 1M tokens,
+  `grok-4.5` $2.00 / $6.00 / $0.30. A request whose prompt (fresh input + cached
+  input + cache writes) is **≥ 200,000 tokens** is billed ALL of its tokens at
+  the long-context rates: $4.00 / $12.00 / $1.00 cached (grok-4.5: $0.60
+  cached). llmux models that tier per request, and every aggregate (model rows,
+  Usage tab, keys panel) keeps long-context requests separate so its cost is
+  the sum of its requests' costs. Unknown grok ids take the grok-4.5 row, tier
+  included. Codex (`gpt-*`) and Claude rows carry no long-context tier — codex
+  traffic is subscription-billed and was deliberately excluded.

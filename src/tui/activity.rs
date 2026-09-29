@@ -264,11 +264,16 @@ pub(crate) struct UsageCell {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Long-context subset of the four counters above (requests whose own
+    /// prompt reached the tier threshold, [`crate::pricing::long_part`]) —
+    /// the tier is per request, so the cell must keep it separate to be
+    /// priceable ([`crate::pricing::aggregate_cost`]).
+    pub long: crate::pricing::TokenParts,
 }
 
 impl UsageCell {
-    /// Fold one finished request into the cell.
-    fn add(&mut self, tokens: Option<TokenCounts>) {
+    /// Fold one finished request of `model` into the cell.
+    fn add(&mut self, model: &str, tokens: Option<TokenCounts>) {
         self.requests = self.requests.saturating_add(1);
         if let Some(t) = tokens {
             self.input = self.input.saturating_add(t.input);
@@ -277,6 +282,7 @@ impl UsageCell {
             self.cache_creation = self
                 .cache_creation
                 .saturating_add(t.cache_creation.unwrap_or(0));
+            self.long.add(&crate::pricing::long_part(model, &t));
         }
     }
 
@@ -287,6 +293,7 @@ impl UsageCell {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.long.add(&other.long);
     }
 }
 
@@ -445,6 +452,8 @@ struct ModelStats {
     tokens_out: u64,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    /// Long-context subset of the token counters (see [`UsageCell::long`]).
+    long: crate::pricing::TokenParts,
     last_used: Option<SystemTime>,
     /// Which account(s) served this model (req19).
     accounts: HashMap<String, Totals>,
@@ -466,6 +475,7 @@ impl ModelStats {
         self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
         self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
         self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
+        self.long.add(&other.long);
         self.last_used = match (self.last_used, other.last_used) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -497,6 +507,9 @@ pub(crate) struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: Option<u64>,
     pub cache_creation: Option<u64>,
+    /// Long-context subset of the token counters — the pricing input that
+    /// keeps a tiered model's row cost equal to the sum of its requests.
+    pub long: crate::pricing::TokenParts,
     pub last_used: SystemTime,
     pub accounts: Vec<ModelAccount>,
     pub efforts: Vec<ModelCount>,
@@ -1181,6 +1194,8 @@ pub(crate) struct TenantModelStats {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Long-context subset of the four counters (see [`UsageCell::long`]).
+    pub long: crate::pricing::TokenParts,
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1532,7 +1547,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(model, tokens);
         }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
@@ -1547,7 +1562,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(model, tokens);
         }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
@@ -1558,7 +1573,7 @@ impl ActivityLog {
             .or_default()
             .entry(key)
             .or_default()
-            .add(tokens);
+            .add(model, tokens);
     }
 
     /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
@@ -1619,6 +1634,7 @@ impl ActivityLog {
                 tokens_out: c.output,
                 cache_read: c.cache_read,
                 cache_creation: c.cache_creation,
+                long: c.long,
                 // Priced at doc-build time (the log holds no pricing config);
                 // conservative `false` here so a row that ever bypasses the
                 // doc build renders `—`, never a fabricated $0.
@@ -1727,6 +1743,7 @@ impl ActivityLog {
             entry.cache_read = crate::proxy::sse::add_opt(entry.cache_read, t.cache_read);
             entry.cache_creation =
                 crate::proxy::sse::add_opt(entry.cache_creation, t.cache_creation);
+            entry.long.add(&crate::pricing::long_part(model, &t));
         }
         entry.last_used = Some(now);
         let effort_label = effort.clone().unwrap_or_else(|| "none".to_string());
@@ -1862,6 +1879,7 @@ impl ActivityLog {
                 cell.cache_creation = cell
                     .cache_creation
                     .saturating_add(t.cache_creation.unwrap_or(0));
+                cell.long.add(&crate::pricing::long_part(model, &t));
             }
         }
     }
@@ -1936,6 +1954,7 @@ impl ActivityLog {
                     tokens_out: stats.tokens_out,
                     cache_read: stats.cache_read,
                     cache_creation: stats.cache_creation,
+                    long: stats.long,
                     last_used: stats.last_used.unwrap_or(SystemTime::UNIX_EPOCH),
                     accounts,
                     efforts: sorted_counts(&stats.efforts),

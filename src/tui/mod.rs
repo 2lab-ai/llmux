@@ -6850,6 +6850,7 @@ mod tests {
             cache_creation: 0,
             cost_usd: 0.1,
             priced: true,
+            long: Default::default(),
         };
         let mut view = empty_view();
         view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets

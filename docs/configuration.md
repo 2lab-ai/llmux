@@ -188,6 +188,20 @@ The setting is included in `GET /llmux/status` and can be changed live through `
 
 This differs from demo mode: demo mode uses stable fake identities and suppresses config writes for recording; email anonymous mode preserves the real daemon state and only masks rendered identities.
 
+## Pricing overrides
+
+Cost figures are API-equivalent estimates from the built-in rate table in `src/pricing.rs`. `pricing` overrides it per model (key = model slug, `[1m]` suffix ignored, case-insensitive; USD per 1M tokens):
+
+```json
+"pricing": {
+  "gpt-5.5":  { "input": 5.0, "output": 30.0, "cache_read": 0.5, "cache_creation": 0.0 },
+  "grok-4.7": { "input": 2.0, "output": 6.0, "cache_read": 0.5, "cache_creation": 0.0,
+                "long_context": { "input": 4.0, "output": 12.0, "cache_read": 1.0, "cache_creation": 0.0 } }
+}
+```
+
+An entry replaces the model's whole built-in row, **long-context tier included**: an entry without `long_context` prices every request at its flat rates, even on a model that is tiered by default (grok). With `long_context`, a request whose prompt (fresh input + cache read + cache write) is at least the model's built-in threshold — 200,000 tokens for every model today — is billed ALL its tokens at the long rates. The threshold itself is not configurable (a `threshold` key is rejected): usage aggregates classify each request when it is recorded, without the config. Entries written before `long_context` existed load unchanged.
+
 ## TUI cosmetic effects
 
 `tui_effects` (default `true`) gates the dashboard's cosmetic animations: the `max` effort token's rainbow marquee and the headline-model name gradient (`fable-5*`, `gpt-5.6-sol*`). Set it to `false` for a calmer board — those tokens keep a distinct static color and bold instead of cycling. Working spinners animate regardless of this setting. Like `email_anonymous`, the flag is carried on the dashboard document so both the local TUI and `llmux attach` honor it.
