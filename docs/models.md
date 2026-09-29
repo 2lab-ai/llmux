@@ -440,8 +440,8 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   (`originator: codex_cli_rs`, no client-version header), so no header change
   was needed — only adding the slug to the provider passthrough list. Pricing
   ($10/M input, $50/M output, $1/M cached input, no cache-creation charge)
-  comes from third-party pricing trackers for the 2026-09 launch standard tier,
-  not from an OpenAI page read directly.
+  was first taken from third-party pricing trackers for the 2026-09 launch
+  standard tier and confirmed against OpenAI's API pricing page on 2026-09-28.
 - **gpt-6-sol / gpt-6-luna** — catalog re-fetched 2026-09-28 (codex 0.158.0):
   `gpt-6-sol` "GPT-6-Sol" and `gpt-6-luna` "GPT-6-Luna", both context_window
   272000 / max_context_window 872000, default effort medium, `supported_in_api`;
