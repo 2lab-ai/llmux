@@ -100,6 +100,14 @@ const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
 /// separate $2.50 cache-write rate does not apply to subscription traffic).
 /// The >272k-prompt tier ($4 in / $15 out) is not modeled.
 const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0);
+/// gpt-6.1-sol (2026-09-29 launch, standard tier, prompts <=272k): $2 in / $10
+/// out / $0.10 cached input (OpenAI API pricing page,
+/// developers.openai.com/api/docs/pricing, read 2026-09-29). Same conventions
+/// as [`GPT_6_SOL`]: no cache-creation charge for codex traffic (the page's
+/// $2.50 cache-write rate does not apply to subscription traffic), and the
+/// >272k-prompt tier ($4 in / $15 out / $0.20 cached) is not modeled here.
+/// Cached input is half of gpt-6-sol's $0.20.
+const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 0.0);
 /// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
 /// $0.01 cached input; the >272k tier ($0.20 in / $0.75 out) is not modeled.
 /// Same sourcing and conventions as [`GPT_6_SOL`].
@@ -148,6 +156,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
         "gpt-6-sol" => Some(GPT_6_SOL),
+        "gpt-6.1-sol" => Some(GPT_6_1_SOL),
         "gpt-6-luna" => Some(GPT_6_LUNA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
@@ -203,6 +212,8 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(GPT_6_ASTRA)
     } else if model_norm_lower.starts_with("gpt-6-sol-") {
         Some(GPT_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.1-sol-") {
+        Some(GPT_6_1_SOL)
     } else if model_norm_lower.starts_with("gpt-6-luna-") {
         Some(GPT_6_LUNA)
     } else if model_norm_lower.starts_with("gpt-6-") {
@@ -635,6 +646,9 @@ mod tests {
         for (model, input, output, cached) in [
             ("gpt-6-sol", 2.00, 10.00, 0.20),
             ("gpt-6-sol-20260922", 2.00, 10.00, 0.20),
+            // gpt-6.1-sol: same $2 / $10 as gpt-6-sol but $0.10 cached input.
+            ("gpt-6.1-sol", 2.00, 10.00, 0.10),
+            ("gpt-6.1-sol-20260929", 2.00, 10.00, 0.10),
             ("gpt-6-luna", 0.10, 0.50, 0.01),
             ("gpt-6-luna-20260922", 0.10, 0.50, 0.01),
         ] {

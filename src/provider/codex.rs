@@ -264,6 +264,7 @@ const PASSTHROUGH_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-6-astra",
     "gpt-6-sol",
+    "gpt-6.1-sol",
     "gpt-6-luna",
 ];
 
@@ -769,7 +770,14 @@ mod tests {
         // `gpt-6-sol` / `gpt-6-luna` are passthrough slugs: the request is
         // forwarded verbatim rather than rewritten to the configured pin, so
         // accounting sees the model that really runs.
-        for slug in ["gpt-6-sol", "gpt-6-luna", "GPT-6-Sol", "gpt-6-sol[1m]"] {
+        for slug in [
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "GPT-6-Sol",
+            "gpt-6-sol[1m]",
+            "gpt-6.1-sol[1m]",
+        ] {
             let body =
                 format!(r#"{{"model":"{slug}","messages":[{{"role":"user","content":"hi"}}]}}"#);
             let (model, _, _) = provider.request_meta(body.as_bytes());
