@@ -105,8 +105,8 @@ const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0);
 /// developers.openai.com/api/docs/pricing, read 2026-09-29). Same conventions
 /// as [`GPT_6_SOL`]: no cache-creation charge for codex traffic (the page's
 /// $2.50 cache-write rate does not apply to subscription traffic), and the
-/// >272k-prompt tier ($4 in / $15 out / $0.20 cached) is not modeled here.
-/// Cached input is half of gpt-6-sol's $0.20.
+/// tier for prompts over 272k ($4 in / $15 out / $0.20 cached) is not modeled
+/// here. Cached input is half of gpt-6-sol's $0.20.
 const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 0.0);
 /// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
 /// $0.01 cached input; the >272k tier ($0.20 in / $0.75 out) is not modeled.
