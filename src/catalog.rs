@@ -414,6 +414,24 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         Some(272_000),
         Vec::new(),
     ));
+    // `gpt-6.1-sol` (codex catalog, 2026-09-29): context_window 272000 /
+    // max_context_window 872000, default effort low, the six-level menu.
+    // Owns no alias (bare `sol` stays on 5.6); the `[1m]` twin mirrors
+    // gpt-6-sol's client denominator and has not been probed.
+    entries.push(codex_entry(
+        "gpt-6.1-sol[1m]",
+        "GPT-6.1-Sol [1M]",
+        CODEX_EFFORTS_FULL,
+        Some(1_000_000),
+        Vec::new(),
+    ));
+    entries.push(codex_entry(
+        "gpt-6.1-sol",
+        "GPT-6.1-Sol",
+        CODEX_EFFORTS_FULL,
+        Some(272_000),
+        Vec::new(),
+    ));
     entries.push(codex_entry(
         "gpt-6-luna",
         "GPT-6-Luna",
@@ -604,9 +622,10 @@ mod tests {
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
         // landed (2026-09-07); 29 before the opus-5-5 pair landed (2026-09-23);
         // 31 before the grok-4.7 row landed (2026-09-23); 32 before the
-        // `grok-4.7[1m]` twin landed (2026-09-28).
+        // `grok-4.7[1m]` twin landed (2026-09-28); 36 before the gpt-6.1-sol pair
+        // landed (2026-09-29).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 36);
+        assert_eq!(entries.len(), 38);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -887,7 +906,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 36, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 38, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -941,7 +960,7 @@ mod tests {
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 36, "pin {pin}");
+            assert_eq!(entries.len(), 38, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -956,7 +975,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 37);
+        assert_eq!(entries.len(), 39);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -983,7 +1002,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 37);
+        assert_eq!(entries.len(), 39);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));
