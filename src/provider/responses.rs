@@ -2397,4 +2397,99 @@ mod tests {
             br#"{"safeguards":[{"type":"other"},{"type":"dangerous_tool_use","classifier_context":{}}]}"#
         ));
     }
+
+    /// The streamed `safeguard_results` keys are EXACTLY the ids announced in
+    /// every tool_use `content_block_start` — never an empty `""` key from a
+    /// block wired before its `call_id` was known.
+    fn assert_safeguard_keys_match_announced(events: &[(String, Value)]) {
+        let announced: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter(|(t, v)| t == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .map(|(_, v)| {
+                v["content_block"]["id"]
+                    .as_str()
+                    .expect("tool id")
+                    .to_string()
+            })
+            .collect();
+        let keys: std::collections::BTreeSet<String> = find(events, "message_delta")["delta"]
+            ["safeguard_results"][0]["status"]["tool_uses"]
+            .as_object()
+            .expect("tool_uses map")
+            .keys()
+            .cloned()
+            .collect();
+        assert!(!keys.contains(""), "no empty key: {keys:?}");
+        assert!(
+            !announced.contains(""),
+            "no empty announced id: {announced:?}"
+        );
+        assert_eq!(keys, announced, "keys == announced tool ids");
+    }
+
+    #[test]
+    fn safeguard_keys_cover_a_tool_that_claims_the_wire_after_open_text() {
+        // The text item is never closed by `output_item.done`, so the tool's
+        // `output_item.added` is the first wire claim after text.
+        let (_, events) = run_with_safeguards(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "msg_1", "type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1",
+                   "output_index": 0, "delta": "let me "}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1",
+                   "output_index": 0, "delta": "run it"}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                   "output_index": 1, "delta": "{\"command\":\"ls\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": "{\"command\":\"ls\"}"}}),
+            json!({"type": "response.completed",
+                   "response": {"id": "r", "status": "completed", "usage": usage_fixture()}}),
+        ]);
+        assert_eq!(
+            find(&events, "message_delta")["delta"]["stop_reason"],
+            "tool_use"
+        );
+        assert_safeguard_keys_match_announced(&events);
+    }
+
+    #[test]
+    fn safeguard_keys_cover_a_buffered_tool_wired_in_the_terminal_flush() {
+        // Same shape as `a_buffered_argumentless_tool_call_still_reaches_the_stream`:
+        // c1 holds the wire, argumentless c2 is buffered and only gets its
+        // `content_block_start` from the terminal flush.
+        let (_, events) = run_with_safeguards(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                   "output_index": 0, "delta": "{\"x\":1}"}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_2", "type": "function_call", "call_id": "c2",
+                            "name": "now", "arguments": ""}}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_2", "type": "function_call", "call_id": "c2",
+                            "name": "now", "arguments": ""}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": "{\"x\":1}"}}),
+            json!({"type": "response.completed",
+                   "response": {"id": "r", "status": "completed",
+                                "incomplete_details": null, "usage": usage_fixture()}}),
+        ]);
+        assert_eq!(
+            streamed_tool_calls(&events)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["c1", "c2"],
+            "both calls reach the wire"
+        );
+        assert_safeguard_keys_match_announced(&events);
+    }
 }
