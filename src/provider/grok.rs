@@ -34,7 +34,10 @@ pub const GROK_CHAT_PROXY_UPSTREAM: &str = "https://cli-chat-proxy.grok.com/v1";
 pub(crate) const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
 pub(crate) const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 pub(crate) const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
-pub(crate) const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
+pub(crate) const GROK_CLIENT_VERSION_VALUE: &str = "1.0.34";
+/// `User-Agent` for the cli-chat-proxy identity. `concat!` needs a literal,
+/// so keep the version in sync with [`GROK_CLIENT_VERSION_VALUE`].
+pub(crate) const GROK_USER_AGENT: &str = concat!("xai-grok-workspace/", "1.0.34");
 
 /// Per-model thinking levels (docs/grok/spec.md §R1; source for
 /// grok-4.5/4.3/3-mini: CLIProxyAPI registry models.json:2411-2520; source
@@ -204,9 +207,7 @@ impl GrokProvider {
             );
             headers.insert(
                 http::header::USER_AGENT,
-                HeaderValue::from_static(
-                    concat!("xai-grok-workspace/", "0.2.93"), // keep in sync with GROK_CLIENT_VERSION_VALUE
-                ),
+                HeaderValue::from_static(GROK_USER_AGENT),
             );
         }
 
@@ -638,10 +639,10 @@ mod tests {
             .expect("build");
         assert_eq!(req.headers.get("authorization").unwrap(), "Bearer at-1");
         assert_eq!(req.headers.get("x-xai-token-auth").unwrap(), "xai-grok-cli");
-        assert_eq!(req.headers.get("x-grok-client-version").unwrap(), "0.2.93");
+        assert_eq!(req.headers.get("x-grok-client-version").unwrap(), "1.0.34");
         assert_eq!(
             req.headers.get("user-agent").unwrap(),
-            "xai-grok-workspace/0.2.93"
+            "xai-grok-workspace/1.0.34"
         );
         assert!(
             req.headers.get("x-grok-conv-id").is_none(),

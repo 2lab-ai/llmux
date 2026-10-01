@@ -100,8 +100,8 @@
    per-conversation) →
    headers: `Authorization: Bearer {access_token}`, `Accept: text/event-stream`,
    and (upstream == official cli-chat-proxy) identity trio
-   `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 0.2.93` /
-   `User-Agent: xai-grok-workspace/0.2.93` — **no `x-grok-conv-id`** (spec §R1,
+   `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-client-version: 1.0.34` /
+   `User-Agent: xai-grok-workspace/1.0.34` — **no `x-grok-conv-id`** (spec §R1,
    consensus round 3: CLIProxyAPI omits it for standard chat) →
    `POST https://cli-chat-proxy.grok.com/v1/responses` →
    Responses SSE → `responses::SseTransform` (shared, currently proxy/sse.rs path) →
