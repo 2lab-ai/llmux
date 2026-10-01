@@ -209,6 +209,45 @@ impl AggBlock {
     }
 }
 
+/// Whether an Anthropic Messages request body asks for server-side tool-use
+/// review: a top-level `safeguards` array carrying a `dangerous_tool_use`
+/// entry (Claude Code auto mode). Anything else — absent, not an array, no
+/// such entry, or a body that is not JSON — is `false`.
+pub fn requests_tool_use_review(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|b| {
+            b.get("safeguards")?.as_array().map(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.get("type").and_then(Value::as_str) == Some("dangerous_tool_use"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The `safeguard_results` answer to a `dangerous_tool_use` safeguard: the
+/// review is `available`, and each tool use in `ids` was `skipped`.
+///
+/// Behind a gateway Claude Code latches the WHOLE session to local
+/// classification when `safeguard_results` is missing, a tool id is absent
+/// from the map, or the status is session-level `unavailable` — so silence
+/// from a translated backend turns server-side review off for every later
+/// turn, the Anthropic ones included. A per-call `skipped` does not latch:
+/// the client classifies just that action locally. No reviewer ever saw
+/// these calls, so `skipped` is the only honest answer — never fabricate an
+/// `evaluated` verdict.
+fn skipped_safeguard_results<'a>(ids: impl IntoIterator<Item = &'a str>) -> Value {
+    let tool_uses: serde_json::Map<String, Value> = ids
+        .into_iter()
+        .map(|id| (id.to_string(), json!({"type": "skipped"})))
+        .collect();
+    json!([{
+        "type": "dangerous_tool_use",
+        "status": {"type": "available", "tool_uses": tool_uses},
+    }])
+}
+
 /// Stateful Responses→Anthropic SSE converter. One instance per upstream
 /// response; feed COMPLETE upstream events in, get well-formed Anthropic SSE
 /// bytes out (`event: <type>\ndata: <json>\n\n`, indexes sequenced).
@@ -259,6 +298,12 @@ pub struct ResponsesSseConverter {
     /// Count of upstream SSE events parsed (any `data:` event), so the trace
     /// can show whether the stream produced events at all vs. hung.
     events_seen: u64,
+    /// The client asked for tool-use review; see
+    /// [`Self::with_safeguards_requested`].
+    safeguards_requested: bool,
+    /// Tool ids announced in a streamed `content_block_start`, in order — the
+    /// exact set the streamed `safeguard_results` must cover.
+    announced_tool_ids: Vec<String>,
 }
 
 impl Default for ResponsesSseConverter {
@@ -293,6 +338,8 @@ impl ResponsesSseConverter {
             error: None,
             raw_usage: None,
             events_seen: 0,
+            safeguards_requested: false,
+            announced_tool_ids: Vec::new(),
         }
     }
 
@@ -308,6 +355,15 @@ impl ResponsesSseConverter {
     /// like [`Self::with_client_model`].
     pub fn with_tag(mut self, tag: &'static str) -> Self {
         self.tag = tag;
+        self
+    }
+
+    /// Answer the client's `dangerous_tool_use` safeguard (see
+    /// [`requests_tool_use_review`]) with `safeguard_results` on the terminal
+    /// `message_delta` and the aggregate. Off by default, which keeps the
+    /// response byte-shape unchanged for clients that did not ask.
+    pub fn with_safeguards_requested(mut self, requested: bool) -> Self {
+        self.safeguards_requested = requested;
         self
     }
 
@@ -450,6 +506,10 @@ impl ResponsesSseConverter {
         self.blocks[pos].wire_index = Some(index);
         self.blocks[pos].wired = true;
         self.open_pos = Some(pos);
+        if self.blocks[pos].kind == BlockKind::ToolUse {
+            self.announced_tool_ids
+                .push(self.blocks[pos].tool_id.clone());
+        }
         let block = &self.blocks[pos];
         let content_block = match block.kind {
             BlockKind::Text => json!({"type": "text", "text": ""}),
@@ -702,12 +762,17 @@ impl ResponsesSseConverter {
             None => "end_turn",
         };
         self.stop_reason = Some(stop_reason.to_string());
+        let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": null});
+        if self.safeguards_requested {
+            delta["safeguard_results"] =
+                skipped_safeguard_results(self.announced_tool_ids.iter().map(String::as_str));
+        }
         Self::emit(
             out,
             "message_delta",
             &json!({
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "delta": delta,
                 "usage": {
                     "input_tokens": self.usage.input_tokens,
                     "cache_read_input_tokens": self.cached_input_tokens,
@@ -832,7 +897,17 @@ impl ResponsesSseConverter {
                 }
             })
             .collect();
-        Some(json!({
+        // Keyed by the tool uses actually in `content`: a capped turn's
+        // dropped calls are not in the aggregate, so they are not keyed.
+        let safeguard_results = self.safeguards_requested.then(|| {
+            skipped_safeguard_results(
+                content
+                    .iter()
+                    .filter(|b| b["type"] == "tool_use")
+                    .filter_map(|b| b["id"].as_str()),
+            )
+        });
+        let mut message = json!({
             "id": if self.message_id.is_empty() {
                 format!("msg_{}_{}", self.tag, ulid::Ulid::new().to_string().to_lowercase())
             } else {
@@ -851,7 +926,11 @@ impl ResponsesSseConverter {
                     self.usage.cache_creation_input_tokens.unwrap_or(0),
                 "output_tokens": self.usage.output_tokens,
             },
-        }))
+        });
+        if let Some(results) = safeguard_results {
+            message["safeguard_results"] = results;
+        }
+        Some(message)
     }
 
     /// Upstream error message, when the stream ended in `response.failed` /
@@ -2159,5 +2238,163 @@ mod tests {
             content[0]["text"], "let me run",
             "partial text is preserved"
         );
+    }
+
+    // ---- Claude Code auto-mode safeguards (`safeguard_results`) ----
+
+    /// Same as [`run`], but with the converter told the client requested
+    /// server-side tool-use review.
+    fn run_with_safeguards(events: &[Value]) -> (ResponsesSseConverter, Vec<(String, Value)>) {
+        let mut converter = ResponsesSseConverter::new().with_safeguards_requested(true);
+        let mut emitted = Vec::new();
+        for e in events {
+            emitted.extend_from_slice(&converter.on_event(&event(e)));
+        }
+        emitted.extend_from_slice(&converter.on_end());
+        let text = String::from_utf8(emitted).expect("utf8");
+        let parsed = text
+            .split("\n\n")
+            .filter(|c| !c.trim().is_empty())
+            .map(|chunk| {
+                let mut event_type = String::new();
+                let mut data = String::new();
+                for line in chunk.lines() {
+                    if let Some(t) = line.strip_prefix("event: ") {
+                        event_type = t.to_string();
+                    } else if let Some(d) = line.strip_prefix("data: ") {
+                        data = d.to_string();
+                    }
+                }
+                (
+                    event_type,
+                    serde_json::from_str(&data).expect("data is json"),
+                )
+            })
+            .collect();
+        (converter, parsed)
+    }
+
+    fn two_tool_calls() -> Vec<Value> {
+        vec![
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                   "output_index": 0, "delta": "{\"command\":\"ls\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "c1",
+                            "name": "Bash", "arguments": "{\"command\":\"ls\"}"}}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_2", "type": "function_call", "call_id": "c2",
+                            "name": "Read", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_2",
+                   "output_index": 1, "delta": "{\"path\":\"/a\"}"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_2", "type": "function_call", "call_id": "c2",
+                            "name": "Read", "arguments": "{\"path\":\"/a\"}"}}),
+            json!({"type": "response.completed",
+                   "response": {"id": "r", "status": "completed", "usage": usage_fixture()}}),
+        ]
+    }
+
+    fn text_only_turn() -> Vec<Value> {
+        vec![
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "msg_1", "type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "item_id": "msg_1",
+                   "output_index": 0, "delta": "hello"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "msg_1", "type": "message"}}),
+            json!({"type": "response.completed",
+                   "response": {"id": "r", "status": "completed", "usage": usage_fixture()}}),
+        ]
+    }
+
+    fn skipped_for(ids: &[&str]) -> Value {
+        let tool_uses: serde_json::Map<String, Value> = ids
+            .iter()
+            .map(|id| (id.to_string(), json!({"type": "skipped"})))
+            .collect();
+        json!([{
+            "type": "dangerous_tool_use",
+            "status": {"type": "available", "tool_uses": tool_uses},
+        }])
+    }
+
+    #[test]
+    fn requested_safeguards_mark_every_streamed_tool_use_skipped() {
+        let (_, events) = run_with_safeguards(&two_tool_calls());
+        let announced: Vec<&str> = events
+            .iter()
+            .filter(|(t, v)| t == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .map(|(_, v)| v["content_block"]["id"].as_str().expect("tool id"))
+            .collect();
+        assert_eq!(announced, vec!["c1", "c2"]);
+        let delta = &find(&events, "message_delta")["delta"];
+        assert_eq!(delta["stop_reason"], "tool_use");
+        assert_eq!(
+            delta["safeguard_results"],
+            skipped_for(&announced),
+            "every announced tool id is covered by a non-latching `skipped`"
+        );
+    }
+
+    #[test]
+    fn requested_safeguards_mark_every_aggregate_tool_use_skipped() {
+        let (converter, _) = run_with_safeguards(&two_tool_calls());
+        let message = converter.into_message_json().expect("aggregate");
+        let ids: Vec<&str> = message["content"]
+            .as_array()
+            .expect("content")
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().expect("tool id"))
+            .collect();
+        assert_eq!(ids, vec!["c1", "c2"]);
+        assert_eq!(message["safeguard_results"], skipped_for(&ids));
+    }
+
+    #[test]
+    fn unrequested_safeguards_leave_the_response_shape_untouched() {
+        let (converter, events) = run(&two_tool_calls());
+        for (t, v) in &events {
+            assert!(
+                !v.to_string().contains("safeguard_results"),
+                "{t} must not carry safeguard_results: {v}"
+            );
+        }
+        let message = converter.into_message_json().expect("aggregate");
+        assert!(message.get("safeguard_results").is_none(), "{message}");
+    }
+
+    #[test]
+    fn requested_safeguards_without_tool_uses_report_an_empty_available_map() {
+        let (converter, events) = run_with_safeguards(&text_only_turn());
+        let delta = &find(&events, "message_delta")["delta"];
+        assert_eq!(delta["stop_reason"], "end_turn");
+        assert_eq!(delta["safeguard_results"], skipped_for(&[]));
+        let message = converter.into_message_json().expect("aggregate");
+        assert_eq!(message["safeguard_results"], skipped_for(&[]));
+    }
+
+    #[test]
+    fn tool_use_review_detector_reads_only_a_dangerous_tool_use_safeguard() {
+        assert!(!requests_tool_use_review(br#"{"model":"x"}"#), "absent");
+        assert!(
+            !requests_tool_use_review(br#"{"safeguards":{"type":"dangerous_tool_use"}}"#),
+            "not an array"
+        );
+        assert!(!requests_tool_use_review(br#"{"safeguards":[]}"#), "empty");
+        assert!(
+            !requests_tool_use_review(br#"{"safeguards":[{"type":"other"}]}"#),
+            "no dangerous_tool_use"
+        );
+        assert!(!requests_tool_use_review(b"not json"), "non-JSON");
+        assert!(!requests_tool_use_review(b""), "empty body");
+        assert!(requests_tool_use_review(
+            br#"{"safeguards":[{"type":"other"},{"type":"dangerous_tool_use","classifier_context":{}}]}"#
+        ));
     }
 }
