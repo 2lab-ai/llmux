@@ -1264,6 +1264,101 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["usage"]["output_tokens"], 11);
 }
 
+/// Claude Code auto mode's server-side tool-use review request, as a body
+/// fragment. `stream` is spliced in so the same request drives both legs.
+fn safeguarded_request(stream: bool, safeguards: bool) -> String {
+    let safeguards = if safeguards {
+        r#","safeguards":[{"type":"dangerous_tool_use","classifier_context":{}}]"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{"model":"claude-sonnet-4-5","max_tokens":1024,"stream":{stream},
+            "messages":[{{"role":"user","content":"weather in Seoul?"}}]{safeguards}}}"#
+    )
+}
+
+/// The only honest answer a translated backend can give: review `available`,
+/// every tool call `skipped` (non-latching), never an invented verdict.
+fn skipped_call_w1() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "dangerous_tool_use",
+        "status": {"type": "available", "tool_uses": {"call_w1": {"type": "skipped"}}},
+    }])
+}
+
+/// A codex-served streaming turn answers a `dangerous_tool_use` safeguard on
+/// its terminal `message_delta`, so the client does not latch the session to
+/// local classification.
+#[tokio::test]
+async fn codex_stream_answers_requested_safeguards_with_skipped() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(true, true)).await;
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    let events = parse_anthropic_sse(&body);
+    let delta = &events
+        .iter()
+        .find(|(t, _)| t == "message_delta")
+        .unwrap_or_else(|| panic!("no message_delta in:\n{body}"))
+        .1["delta"];
+    assert_eq!(delta["stop_reason"], "tool_use");
+    assert_eq!(
+        delta["safeguard_results"],
+        skipped_call_w1(),
+        "full body:\n{body}"
+    );
+}
+
+/// Non-stream twin: the aggregate carries a top-level `safeguard_results`.
+#[tokio::test]
+async fn codex_aggregate_answers_requested_safeguards_with_skipped() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(false, true)).await;
+    assert_eq!(response.status(), 200);
+    let message: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(message["content"][1]["id"], "call_w1");
+    assert_eq!(message["safeguard_results"], skipped_call_w1(), "{message}");
+}
+
+/// Without a safeguard in the request, neither leg grows the field.
+#[tokio::test]
+async fn codex_without_safeguards_emits_no_safeguard_results() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(true, false)).await;
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    assert!(
+        parse_anthropic_sse(&body)
+            .iter()
+            .any(|(t, _)| t == "message_delta"),
+        "stream completed:\n{body}"
+    );
+    assert!(!body.contains("safeguard_results"), "full body:\n{body}");
+
+    let response = post_messages(&client, &proxy, &safeguarded_request(false, false)).await;
+    assert_eq!(response.status(), 200);
+    let message: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(message["stop_reason"], "tool_use");
+    assert!(message.get("safeguard_results").is_none(), "{message}");
+}
+
 /// The codex twin of `client_context_window_suffix_is_stripped_before_upstream`:
 /// a raw client (curl / an SDK) sends the `[1m]` context-window annotation
 /// VERBATIM — Claude Code strips it client-side, nothing else does. Without the

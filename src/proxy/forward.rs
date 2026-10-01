@@ -2877,7 +2877,8 @@ async fn relay_translate(
         let converter = match served {
             BackendGroup::Grok => state.grok.converter(),
             _ => state.codex.converter(),
-        };
+        }
+        .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
         let totals = state.totals.clone();
         let logger = state.logger.clone();
         let request_id = ctx.request_id;
@@ -3078,7 +3079,8 @@ async fn relay_translate(
     let mut converter = match served {
         BackendGroup::Grok => state.grok.converter(),
         _ => state.codex.converter(),
-    };
+    }
+    .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
     // Cloned before `bytes_stream()` consumes the response — the aggregate
     // raw-io capture below wants the upstream response headers.
     let upstream_headers = response.headers().clone();
