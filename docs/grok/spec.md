@@ -40,7 +40,7 @@ core with thin per-provider adapters.
 | Chat base URL (subscription/OAuth) | `https://cli-chat-proxy.grok.com/v1` | types.go:13 |
 | Chat base URL (API key — **non-goal v1**) | `https://api.x.ai/v1` | types.go:10 |
 | Chat endpoint | `POST {base}/responses`, SSE | xai_executor.go:151,616 |
-| Identity headers (cli-chat-proxy only) | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: 0.2.93`, `User-Agent: xai-grok-workspace/0.2.93` | xai_executor.go:66-69,1104-1111 |
+| Identity headers (cli-chat-proxy only) | `X-XAI-Token-Auth: xai-grok-cli`, `x-grok-client-version: 1.0.34`, `User-Agent: xai-grok-workspace/1.0.34` | xai_executor.go:66-69,1104-1111 |
 | Conversation header | `x-grok-conv-id: <session id>` | xai_executor.go:1085 |
 | Effort | `reasoning: {effort}` only for models with thinking levels; stripped otherwise | xai_executor.go:1206-1211 |
 | grok-4.7 | ctx 500K, max_out (not stated by /v1/models), thinking `low/medium/high/xhigh` (upstream default `high`), zero **not** allowed | live cli-chat-proxy /v1/models 2026-09-23 |
@@ -349,7 +349,7 @@ Only synthetic outcomes are summarized here; no raw account/user payloads are pu
 
 ## Risks / open items
 
-1. **cli-chat-proxy client-version pinning**: header value `0.2.93` may age; kept in one
+1. **cli-chat-proxy client-version pinning**: header value `1.0.34` may age; kept in one
    const with a comment, config-overridable via `grok.upstream` remaining functional
    even if identity headers change requirements. (CLIProxyAPI pins the same way.)
 2. **Subscription/public wire drift**: R6's dated fixtures establish only those observed
