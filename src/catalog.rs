@@ -14,7 +14,11 @@
 //! fable alias rolled to 5.1 on 2026-09-02; claude rows re-curated 2026-09-23
 //! to add the `claude-opus-5-5` pair and roll the floating `opus` alias off
 //! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`; grok rows re-probed
-//! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7):
+//! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7;
+//! claude rows re-curated again 2026-09-29 to add the `claude-sonnet-5-5`
+//! pair and roll the floating `sonnet` alias off `claude-sonnet-5[1m]` onto
+//! `claude-sonnet-5-5[1m]` — `sonnet-5` stays version-pinned, mirroring the
+//! opus-5-5 roll):
 //! - Claude rows: user-curated 2026-07-27, and they live in [`CLAUDE_MODELS`]
 //!   — that const is the SSOT for both these rows and the alias→id resolution
 //!   in [`crate::provider::anthropic`] (Claude Code model picker; `[1m]`
@@ -27,11 +31,12 @@
 //!   [`CLAUDE_MODELS`] as the mapping source.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14 and re-fetched
-//!   2026-09-07 for generation 6. `gpt-6-astra` and `gpt-5.6-sol/terra`
-//!   support low..ultra; `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh.
-//!   `gpt-6-astra` is a SINGLE tier (no sol/terra/luna twins) with catalog
-//!   context 272,000. The `[1m]` rows are the codex side of the `[1m]` opt-in
-//!   and carry OpenAI's published ~1,050,000-token window rather than the
+//!   2026-09-07 for generation 6, and again 2026-09-28 (which added
+//!   `gpt-6-sol` / `gpt-6-luna`). `gpt-6-astra`, `gpt-6-sol` and
+//!   `gpt-5.6-sol/terra` support low..ultra; `gpt-6-luna` and `gpt-5.6-luna`
+//!   low..max; `gpt-5.5` low..xhigh. `gpt-6-astra` owns the bare generation
+//!   aliases; all gpt-6 rows have catalog context 272,000. The `[1m]` rows are
+//!   the codex side of the `[1m]` opt-in and carry OpenAI's published ~1,050,000-token window rather than the
 //!   catalog figure; live probes 2026-08-21 against the ChatGPT-account
 //!   backend corroborate it on SOL specifically (910,229 accepted, ~936k
 //!   rejected) and reach only 555,029 accepted on terra — astra's `[1m]` row
@@ -116,8 +121,15 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
     ("claude-opus-4-8[1m]", &[], "Claude Opus 4.8", 1_000_000),
     ("claude-opus-4-6[1m]", &[], "Claude Opus 4.6", 1_000_000),
     (
+        "claude-sonnet-5-5[1m]",
+        &["sonnet", "sonnet-5-5"],
+        "Claude Sonnet 5.5 [1M]",
+        1_000_000,
+    ),
+    ("claude-sonnet-5-5", &[], "Claude Sonnet 5.5", 200_000),
+    (
         "claude-sonnet-5[1m]",
-        &["sonnet", "sonnet-5"],
+        &["sonnet-5"],
         "Claude Sonnet 5 [1M]",
         1_000_000,
     ),
@@ -345,8 +357,8 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // ---- codex ----
     // Newest generation first. `gpt-6-astra` (openai/codex models.json,
     // fetched 2026-09-07) shipped as a single tier — there is no
-    // gpt-6-sol/terra/luna — so it owns the bare `astra` and `gpt-6` aliases
-    // the way sol owns `sol` / `gpt-5.6`. Deliberate asymmetry with the 5.6
+    // gpt-6-sol/terra/luna at the time — so it owns the bare `astra` and
+    // `gpt-6` aliases the way sol owns `sol` / `gpt-5.6`. Deliberate asymmetry with the 5.6
     // rows: on astra those bare aliases sit on the `[1m]` TWIN rather than the
     // base row, so `astra` / `gpt-6` RESOLVE to the 1M row — i.e. to that
     // row's upstream slug and to the 1_000_000 this catalog advertises for it
@@ -390,6 +402,33 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "gpt-6-astra",
         "GPT-6-Astra",
         CODEX_EFFORTS_FULL,
+        Some(272_000),
+        Vec::new(),
+    ));
+    // `gpt-6-sol` / `gpt-6-luna` (openai/codex models.json, fetched
+    // 2026-09-28: context_window 272000, max_context_window 872000; sol lists
+    // the six-level menu, luna stops at `max`). They own NO aliases: bare
+    // `sol` / `luna` keep meaning the 5.6 tiers. `gpt-6-sol[1m]` mirrors the
+    // astra twin's 1_000_000 client denominator (same family figure, not
+    // probed per model); luna gets no twin, like `gpt-5.6-luna`.
+    entries.push(codex_entry(
+        "gpt-6-sol[1m]",
+        "GPT-6-Sol [1M]",
+        CODEX_EFFORTS_FULL,
+        Some(1_000_000),
+        Vec::new(),
+    ));
+    entries.push(codex_entry(
+        "gpt-6-sol",
+        "GPT-6-Sol",
+        CODEX_EFFORTS_FULL,
+        Some(272_000),
+        Vec::new(),
+    ));
+    entries.push(codex_entry(
+        "gpt-6-luna",
+        "GPT-6-Luna",
+        CODEX_EFFORTS_LUNA,
         Some(272_000),
         Vec::new(),
     ));
@@ -569,16 +608,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_33_entries() {
-        // The pinned (curated) case: exactly 33 rows, claude ids in order.
+    fn catalog_matches_user_contract_35_entries() {
+        // The pinned (curated) case: exactly 35 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
         // landed (2026-09-07); 29 before the opus-5-5 pair landed (2026-09-23);
         // 31 before the grok-4.7 row landed (2026-09-23); 32 before the
-        // `grok-4.7[1m]` twin landed (2026-09-28).
+        // `grok-4.7[1m]` twin landed (2026-09-28); 34 before the
+        // sonnet-5-5 pair landed (2026-09-29).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 33);
+        assert_eq!(entries.len(), 38);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -595,6 +635,8 @@ mod tests {
                 "claude-opus-5",
                 "claude-opus-4-8[1m]",
                 "claude-opus-4-6[1m]",
+                "claude-sonnet-5-5[1m]",
+                "claude-sonnet-5-5",
                 "claude-sonnet-5[1m]",
                 "claude-sonnet-5",
                 "claude-haiku-4-5",
@@ -655,8 +697,16 @@ mod tests {
         assert!(find(&entries, "claude-opus-4-8[1m]").aliases.is_empty());
         assert!(find(&entries, "claude-opus-4-6[1m]").aliases.is_empty());
         assert_eq!(
+            find(&entries, "claude-sonnet-5-5[1m]").aliases,
+            vec!["sonnet", "sonnet-5-5"]
+        );
+        assert!(find(&entries, "claude-sonnet-5-5").aliases.is_empty());
+        // The `sonnet` alias MOVED off sonnet-5 onto sonnet-5-5 (2026-09-29) —
+        // the version-pinned `sonnet-5` STAYS here, mirroring the opus-5-5
+        // roll: letting it drift to 5.5 would be silent model substitution.
+        assert_eq!(
             find(&entries, "claude-sonnet-5[1m]").aliases,
-            vec!["sonnet", "sonnet-5"]
+            vec!["sonnet-5"]
         );
         assert!(find(&entries, "claude-sonnet-5").aliases.is_empty());
         assert_eq!(find(&entries, "claude-haiku-4-5").aliases, vec!["haiku"]);
@@ -678,6 +728,14 @@ mod tests {
             Some(1_000_000)
         );
         assert_eq!(find(&entries, "claude-opus-5").max_context, Some(200_000));
+        assert_eq!(
+            find(&entries, "claude-sonnet-5-5[1m]").max_context,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            find(&entries, "claude-sonnet-5-5").max_context,
+            Some(200_000)
+        );
         assert_eq!(
             find(&entries, "claude-sonnet-5[1m]").max_context,
             Some(1_000_000)
@@ -779,6 +837,10 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5[1m]",
             "claude-opus-4-8[1m]",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5[1m]",
+            "claude-sonnet-5",
+            "claude-sonnet-5[1m]",
             "grok-4.6",
             "grok-4.5",
             "gpt-5.6-sol",
@@ -859,7 +921,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 33, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 38, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -913,7 +975,7 @@ mod tests {
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 33, "pin {pin}");
+            assert_eq!(entries.len(), 38, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -928,7 +990,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 34);
+        assert_eq!(entries.len(), 39);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -955,7 +1017,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 34);
+        assert_eq!(entries.len(), 39);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));

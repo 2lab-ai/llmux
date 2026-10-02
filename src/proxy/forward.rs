@@ -3232,6 +3232,9 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
     let Some(usage) = value.get("usage") else {
         return sse::StreamUsage::default();
     };
+    // Cache counters present only when the upstream reported them (req8/9);
+    // the TTL split is read by the same helper as the streaming path.
+    let (cache_read, cache_creation, cache_creation_1h) = sse::cache_counters(usage);
     sse::StreamUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -3241,13 +3244,9 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
             .get("output_tokens")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        // Cache counters present only when the upstream reported them (req8/9).
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(serde_json::Value::as_u64),
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        cache_creation_1h_input_tokens: cache_creation_1h,
     }
 }
 
@@ -3259,6 +3258,7 @@ fn token_counts(usage: sse::StreamUsage) -> TokenCounts {
         output: usage.output_tokens,
         cache_read: usage.cache_read_input_tokens,
         cache_creation: usage.cache_creation_input_tokens,
+        cache_creation_1h: usage.cache_creation_1h_input_tokens,
     }
 }
 
@@ -3272,6 +3272,51 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    /// Non-streaming bodies read the cache-write TTL split exactly like the
+    /// streaming path: 5m-only, 1h-only, mixed, and absent (unknown, not 0).
+    #[test]
+    fn json_body_usage_captures_the_cache_ttl_split() {
+        let body = |total: u64, split: &str| {
+            format!(
+                r#"{{"id":"msg_1","type":"message","usage":{{"input_tokens":3,"cache_creation_input_tokens":{total},"cache_read_input_tokens":900,{split}"output_tokens":17,"service_tier":"standard"}}}}"#
+            )
+        };
+        for (total, split, h1) in [
+            (
+                169,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":169,"ephemeral_1h_input_tokens":0},"#,
+                Some(0),
+            ),
+            (
+                2_048,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":2048},"#,
+                Some(2_048),
+            ),
+            (
+                3_000,
+                r#""cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":2000},"#,
+                Some(2_000),
+            ),
+            (555, "", None),
+        ] {
+            let usage = usage_from_json_body(body(total, split).as_bytes());
+            assert_eq!(
+                usage,
+                sse::StreamUsage {
+                    input_tokens: 3,
+                    output_tokens: 17,
+                    cache_read_input_tokens: Some(900),
+                    cache_creation_input_tokens: Some(total),
+                    cache_creation_1h_input_tokens: h1,
+                },
+                "{split}"
+            );
+            // …and it reaches the activity event's token counts.
+            let t = token_counts(usage);
+            assert_eq!((t.cache_creation, t.cache_creation_1h), (Some(total), h1));
+        }
+    }
 
     /// The refresh-death message must carry the upstream reason, and must call
     /// out the one reason that is NOT "your login expired": a token the

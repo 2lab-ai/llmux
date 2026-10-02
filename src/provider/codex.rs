@@ -248,7 +248,9 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
 /// Upstream slugs the ChatGPT-account codex backend is known to accept
 /// (probed 2026-07-10; `gpt-5.6-luna` parses upstream but currently returns
 /// "Model not found" — kept so it starts working the moment OpenAI enables
-/// it; `gpt-6-astra` accepted by the same header set on the 2026-09-07 probe).
+/// it; `gpt-6-astra` accepted by the same header set on the 2026-09-07 probe;
+/// `gpt-6-sol` accepted on 2026-09-28, after the openai/codex catalog began
+/// listing `gpt-6-sol` and `gpt-6-luna` alongside astra).
 /// Requests naming one of these are forwarded VERBATIM; the bare `gpt-5.6` id
 /// maps to the sol flagship and the bare `gpt-6` id to astra (the backend
 /// rejects bare generation ids); any other requested model keeps the
@@ -261,14 +263,17 @@ const PASSTHROUGH_MODELS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
 ];
 
 /// The latest gpt generation the bare variant aliases (`sol`/`terra`/`luna`)
 /// and the bare `gpt-5.6` id resolve to. This is the ONE const to bump when a
 /// new generation ships THOSE VARIANTS. It deliberately stays at `gpt-5.6`
-/// even though generation 6 shipped: gpt-6 has no sol/terra/luna tier (the
-/// openai/codex catalog of 2026-09-07 lists a single `gpt-6-astra`), so
-/// bumping it would resolve `sol` to a slug that does not exist upstream.
+/// even though generation 6 shipped: the openai/codex catalog lists only
+/// astra, sol and luna for gpt-6 (no terra; it listed astra alone on
+/// 2026-09-07), and which slug a bare `sol` should mean is the maintainers'
+/// call — `gpt-6-sol` is reachable by its full id, which passes through.
 const LATEST_GPT_GENERATION: &str = "gpt-5.6";
 
 /// Bare variant aliases: routing classifies these to codex (see
@@ -278,9 +283,10 @@ const LATEST_GPT_GENERATION: &str = "gpt-5.6";
 /// [`GPT_6_FLAGSHIP`] / [`GPT_6_ALIAS`].
 const VARIANT_ALIASES: &[&str] = &["sol", "terra", "luna"];
 
-/// The generation-6 flagship, which shipped as a SINGLE tier (no
-/// sol/terra/luna twins), hence its own consts rather than a row in
-/// [`VARIANT_ALIASES`].
+/// The generation-6 flagship. Generation 6 launched as a single tier and has
+/// since gained `gpt-6-sol` / `gpt-6-luna` (both in [`PASSTHROUGH_MODELS`],
+/// reached by their full ids); the bare `astra` / `gpt-6` aliases still mean
+/// astra, hence its own consts rather than a row in [`VARIANT_ALIASES`].
 const GPT_6_FLAGSHIP: &str = "gpt-6-astra";
 /// Bare alias for [`GPT_6_FLAGSHIP`]; routing classifies it to codex.
 const GPT_6_ALIAS: &str = "astra";
@@ -590,8 +596,8 @@ mod tests {
     fn bare_variant_aliases_resolve_to_latest_generation() {
         // `sol`/`terra`/`luna` map to `gpt-5.6-<variant>` (latest generation),
         // case-insensitively, regardless of the configured pin. Generation 6
-        // shipped a single tier, so `astra` and the bare `gpt-6` both land on
-        // `gpt-6-astra` while sol/terra/luna STAY on 5.6.
+        // launched as a single tier, so `astra` and the bare `gpt-6` both land
+        // on `gpt-6-astra` while the bare sol/terra/luna STAY on 5.6.
         for (alias, expected) in [
             ("sol", "gpt-5.6-sol"),
             ("terra", "gpt-5.6-terra"),
@@ -760,19 +766,29 @@ mod tests {
                 "{requested} is recorded as the resolved upstream slug"
             );
         }
-        // Generation 6 shipped ONE tier: `gpt-6-sol` does not exist upstream,
-        // so it is an unknown id and keeps the configured pin. Accounting then
-        // sees gpt-5.6-sol — the model that really runs — not an astra-priced
-        // phantom.
-        let body = br#"{"model":"gpt-6-sol","messages":[{"role":"user","content":"hi"}]}"#;
-        let (model, _, _) = provider.request_meta(body);
-        assert_eq!(model, "gpt-5.6-sol", "no gpt-6-sol tier — the pin stands");
-        for absent in ["gpt-6-terra", "gpt-6-luna"] {
+        // `gpt-6-sol` / `gpt-6-luna` are passthrough slugs: the request is
+        // forwarded verbatim rather than rewritten to the configured pin, so
+        // accounting sees the model that really runs.
+        for slug in ["gpt-6-sol", "gpt-6-luna", "GPT-6-Sol", "gpt-6-sol[1m]"] {
+            let body =
+                format!(r#"{{"model":"{slug}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+            let (model, _, _) = provider.request_meta(body.as_bytes());
             assert_eq!(
-                resolve_upstream_model(Some(absent), CODEX_MODEL),
-                CODEX_MODEL
+                model,
+                slug.trim_end_matches("[1m]").to_ascii_lowercase(),
+                "{slug} passes through"
             );
         }
+        // The bare `sol` / `luna` aliases still mean generation 5.6.
+        assert_eq!(
+            resolve_upstream_model(Some("sol"), CODEX_MODEL),
+            "gpt-5.6-sol"
+        );
+        // No `gpt-6-terra` is listed upstream: an unknown id keeps the pin.
+        assert_eq!(
+            resolve_upstream_model(Some("gpt-6-terra"), CODEX_MODEL),
+            CODEX_MODEL
+        );
     }
 
     #[test]
@@ -1340,6 +1356,7 @@ mod tests {
                 // No cached_tokens key in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1379,6 +1396,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1418,6 +1436,7 @@ mod tests {
                 cache_read_input_tokens: Some(100_864),
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1449,6 +1468,7 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1476,6 +1496,7 @@ mod tests {
                 output_tokens: 9,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1871,6 +1892,7 @@ mod tests {
                 // so cache-read is an explicit Some(0), not unavailable.
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }

@@ -7233,10 +7233,17 @@ fn completed_detail_lines(
     }
     match tokens {
         Some(t) => {
+            // A reported TTL split shows the 1-hour share of the cache writes
+            // (a subset of `cache_creation`, never an extra class). Without
+            // one the line is unchanged.
+            let split = t
+                .cache_creation_1h
+                .map(|h1| format!(" (1h {})", format::human_count(h1)))
+                .unwrap_or_default();
             lines.push(indent(
                 "tokens",
                 format!(
-                    "in {} · out {} · cache_read {} · cache_creation {} · total {}",
+                    "in {} · out {} · cache_read {} · cache_creation {}{split} · total {}",
                     format::human_count(t.input),
                     format::human_count(t.output),
                     opt_count(t.cache_read),
@@ -7245,29 +7252,36 @@ fn completed_detail_lines(
                 ),
             ));
             // Per-component + total API-equivalent cost (item #4). Empty
-            // overrides = built-in default rate table. Each component is priced
-            // in isolation via `cost_from_parts`, so the four add up to total.
+            // overrides = built-in default rate table. The request is priced
+            // ONCE as a whole (a long-context request reprices every
+            // component), then split — so the components add up to the total.
             let empty = std::collections::HashMap::new();
             let (g, m) = (
                 group.as_deref().unwrap_or(""),
                 model.as_deref().unwrap_or(""),
             );
-            let cost_in = crate::pricing::cost_from_parts(g, m, t.input, 0, None, None, &empty);
-            let cost_out = crate::pricing::cost_from_parts(g, m, 0, t.output, None, None, &empty);
-            let cost_cr = crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &empty);
-            let cost_cc =
-                crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &empty);
-            let cost_total = cost_in + cost_out + cost_cr + cost_cc;
+            let cost = crate::pricing::request_breakdown(g, m, t, &empty).unwrap_or_default();
+            // With a split, cache writes show as their 5-minute and 1-hour
+            // parts; without one the 1-hour part is 0.0 by construction, so
+            // the four shown components still sum to the total.
+            let cache_write = if t.cache_creation_1h.is_some() {
+                format!(
+                    "cache_creation 5m {} · 1h {}",
+                    format_cost(cost.cache_creation),
+                    format_cost(cost.cache_creation_1h),
+                )
+            } else {
+                format!("cache_creation {}", format_cost(cost.cache_creation))
+            };
             lines.push(Line::from(vec![
                 Span::styled("       cost    ", dim()),
                 Span::raw(format!(
-                    "in {} · out {} · cache_read {} · cache_creation {} · ",
-                    format_cost(cost_in),
-                    format_cost(cost_out),
-                    format_cost(cost_cr),
-                    format_cost(cost_cc),
+                    "in {} · out {} · cache_read {} · {cache_write} · ",
+                    format_cost(cost.input),
+                    format_cost(cost.output),
+                    format_cost(cost.cache_read),
                 )),
-                Span::styled(format_cost(cost_total), Style::new().fg(Color::Green)),
+                Span::styled(format_cost(cost.total()), Style::new().fg(Color::Green)),
             ]));
         }
         None => lines.push(indent("tokens", "—".to_string())),
@@ -7788,7 +7802,9 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
 /// pricing the token parts locally so the `$` column stays useful during a
 /// rolling upgrade. The fallback holds no config overrides (empty map = the
 /// built-in default rate table); an unknown/zero-rate `(group, model)` still
-/// yields `0.0`.
+/// yields `0.0`. A model with a long-context tier also yields `0.0` here: the
+/// doc carries only token TOTALS, and a tiered cost cannot be derived from
+/// totals (the tier is per request), so no number beats a wrong one.
 fn model_cost(m: &ModelUsageDoc) -> f64 {
     if m.cost_usd > 0.0 {
         return m.cost_usd;
@@ -7796,15 +7812,25 @@ fn model_cost(m: &ModelUsageDoc) -> f64 {
     if m.tokens_in.saturating_add(m.tokens_out) == 0 {
         return 0.0;
     }
-    crate::pricing::cost_from_parts(
-        &m.group,
-        &m.model,
-        m.tokens_in,
-        m.tokens_out,
-        m.cache_read,
-        m.cache_creation,
-        &std::collections::HashMap::new(),
-    )
+    let empty = std::collections::HashMap::new();
+    match crate::pricing::price_for(&m.group, &m.model, &empty) {
+        Some(price) if price.long_context.is_none() => crate::pricing::aggregate_cost(
+            &m.group,
+            &m.model,
+            &crate::pricing::TokenParts {
+                input: m.tokens_in,
+                output: m.tokens_out,
+                cache_read: m.cache_read.unwrap_or(0),
+                cache_creation: m.cache_creation.unwrap_or(0),
+                cache_creation_1h: m.cache_creation_1h.unwrap_or(0),
+            },
+            // Untiered: the long subset is ignored by construction.
+            &crate::pricing::TokenParts::default(),
+            &empty,
+        )
+        .unwrap_or(0.0),
+        _ => 0.0,
+    }
 }
 
 /// "—" when unavailable (the upstream never reported it), else a human count —
@@ -8696,6 +8722,7 @@ mod tests {
             endpoints: Vec::new(),
             // Old-daemon default: tests exercise the local pricing fallback.
             cost_usd: 0.0,
+            cache_creation_1h: None,
         }
     }
 
@@ -8904,6 +8931,7 @@ mod tests {
                         cache_read: 0,
                         cache_creation: 0,
                         cost_usd: 1.25,
+                        cache_creation_1h: 0,
                     }],
                 },
                 crate::dashboard::TenantUsageDoc {
@@ -9043,6 +9071,7 @@ mod tests {
                     cache_read: 0,
                     cache_creation: 0,
                     cost_usd: 0.0,
+                    cache_creation_1h: 0,
                 }],
             })
             .collect();
@@ -9874,6 +9903,8 @@ mod tests {
             cache_creation: 4,
             cost_usd,
             priced: true,
+            long: Default::default(),
+            cache_creation_1h: 0,
         }
     }
 
@@ -11396,6 +11427,7 @@ mod tests {
                     output: out,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_1h: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -11763,6 +11795,7 @@ mod tests {
                     output: 169,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_1h: None,
                 }),
                 group: Some("claude".into()),
                 model: Some("claude-opus-4-8".into()),
@@ -11853,6 +11886,126 @@ mod tests {
         let mut idle = model_row("claude", "claude-opus-4-8", 0, 0);
         idle.cache_read = None;
         assert!(model_cost(&idle).abs() < 1e-12);
+    }
+
+    /// Long-context tier: the expanded row prices the request ONCE and then
+    /// splits it, so a long grok request shows every component at the long
+    /// rates and the four still add up to the total (isolated per-component
+    /// pricing would have classified each component's own "prompt").
+    /// Cache-write TTL split: the expanded row shows the 1-hour share of the
+    /// writes and prices it at the 1h rate, the five components summing to
+    /// the total; a request without a split renders exactly as before.
+    #[test]
+    fn detail_cost_shows_the_cache_write_ttl_split() {
+        let lines_for = |h1: Option<u64>| -> Vec<String> {
+            let mut entry =
+                completed_request(1_000, Some("claude"), Some("claude-sonnet-5"), 0, 0, 200);
+            let CompletedBody::Request { tokens, .. } = &mut entry.body else {
+                unreachable!("seeded a request")
+            };
+            let t = tokens.as_mut().expect("tokens");
+            t.cache_creation = Some(100_000);
+            t.cache_creation_1h = h1;
+            completed_detail_lines(&entry, false, &Default::default())
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let find = |lines: &[String], prefix: &str| {
+            lines
+                .iter()
+                .find(|l| l.trim_start().starts_with(prefix))
+                .cloned()
+                .expect(prefix)
+        };
+        // 40k 5-minute writes at $2.50 + 60k 1-hour writes at $4.
+        let split = lines_for(Some(60_000));
+        assert!(
+            find(&split, "tokens").contains("cache_creation 100.0k (1h 60.0k)"),
+            "{split:?}"
+        );
+        let cost = find(&split, "cost");
+        assert!(
+            cost.contains("cache_creation 5m $0.1000 · 1h $0.2400 · $0.3400"),
+            "{cost}"
+        );
+        let t = TokenCounts {
+            input: 0,
+            output: 0,
+            cache_read: None,
+            cache_creation: Some(100_000),
+            cache_creation_1h: Some(60_000),
+        };
+        let b =
+            crate::pricing::request_breakdown("claude", "claude-sonnet-5", &t, &Default::default())
+                .expect("priced");
+        assert_eq!(
+            b.input + b.output + b.cache_read + b.cache_creation + b.cache_creation_1h,
+            b.total()
+        );
+        // No split reported: unchanged line, every write at $2.50.
+        let plain = lines_for(None);
+        assert!(!find(&plain, "tokens").contains("1h"));
+        let cost = find(&plain, "cost");
+        assert!(
+            cost.contains("· cache_creation $0.2500 · $0.2500"),
+            "{cost}"
+        );
+    }
+
+    #[test]
+    fn detail_cost_split_of_a_long_tiered_request_sums_to_its_total() {
+        let mut entry = completed_request(
+            1_000,
+            Some("grok"),
+            Some("grok-4.7"),
+            150_000,
+            1_000_000,
+            200,
+        );
+        let CompletedBody::Request { tokens, .. } = &mut entry.body else {
+            unreachable!("seeded a request")
+        };
+        let t = tokens.as_mut().expect("tokens");
+        t.cache_read = Some(100_000); // prompt 250k → long
+        let t = *t;
+        let text: Vec<String> = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let cost = text
+            .iter()
+            .find(|l| l.trim_start().starts_with("cost"))
+            .expect("cost line");
+        // Long rates $4 / $12 / $1 cached: 0.6 + 12 + 0.1 = 12.70.
+        assert!(
+            cost.contains(
+                "in $0.6000 · out $12.00 · cache_read $0.1000 · cache_creation $0.0000 · $12.70"
+            ),
+            "{cost}"
+        );
+        let b = crate::pricing::request_breakdown("grok", "grok-4.7", &t, &Default::default())
+            .expect("priced");
+        assert_eq!(
+            b.input + b.output + b.cache_read + b.cache_creation,
+            b.total()
+        );
+        assert_eq!(
+            b.total(),
+            crate::pricing::cost_usd("grok", "grok-4.7", &t, &Default::default())
+        );
+    }
+
+    /// The old-daemon fallback only has token TOTALS; a tiered model's cost
+    /// is not derivable from those, so it refuses rather than under-price.
+    #[test]
+    fn model_cost_fallback_refuses_tiered_models() {
+        let mut m = model_row("grok", "grok-4.7", 250_000, 1_000);
+        m.cost_usd = 0.0;
+        assert_eq!(model_cost(&m), 0.0);
+        // A server-computed cost is still used as-is.
+        m.cost_usd = 1.5;
+        assert_eq!(model_cost(&m), 1.5);
     }
 
     #[test]
@@ -12537,11 +12690,13 @@ mod tests {
 
     #[test]
     fn models_strip_and_table_show_cost_column() {
-        // No cache tokens so the cost is exactly the input rate (gpt-5.5: $5/1M).
-        let mut row = model_row("codex", "gpt-5.5", 1_000_000, 0);
+        // No cache tokens so the cost is exactly the input rate (opus: $5/1M).
+        // An untiered model: a 1M-token codex request would itself be
+        // long-context and reprice.
+        let mut row = model_row("claude", "claude-opus-4-8", 1_000_000, 0);
         row.cache_read = None;
         let view = view_with(vec![row]);
-        // gpt-5.5 input = $5.00, in the MAIN compact strip.
+        // opus input = $5.00, in the MAIN compact strip.
         let main = render(&view, &chrome_overlay(Overlay::None), 200, 40);
         assert!(main.contains("$5.00"), "compact strip shows the $ cost");
         // And in the full table (Stats overlay).
@@ -12949,6 +13104,8 @@ mod tests {
                 output: 2.0,
                 cache_read: 0.1,
                 cache_creation: 1.25,
+                long_context: None,
+                cache_creation_1h: None,
             },
         );
         config.paused_accounts.insert("a@x.com".into());
@@ -14189,6 +14346,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            cache_creation_1h: None,
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {

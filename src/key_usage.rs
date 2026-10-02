@@ -41,7 +41,11 @@ use crate::tui::activity::normalize_model;
 use crate::tui::{ActivityEvent, TokenCounts};
 
 /// Schema version stored in `meta`. Bump only with a migration.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// - 1: the original table.
+/// - 2: `cache_creation_1h` (the 1-hour-TTL subset of `cache_creation`),
+///   added in place on open by `UsageDb::migrate`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Schema version of `activity.jsonl` lines this importer understands — the
 /// SAME constant the writer stamps them with ([`crate::tui::activity`]), not a
@@ -249,6 +253,12 @@ pub struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation` (see [`UsageRow::cache_creation_1h`]).
+    pub cache_creation_1h: u64,
+    /// Long-context subset of the four counters: the rows whose OWN prompt
+    /// reached the model's tier threshold. Derived per stored row (one row =
+    /// one request), so no extra column is persisted.
+    pub long: crate::pricing::TokenParts,
 }
 
 /// The result of one [`UsageQuery`]: the matched tenant rows plus the filter
@@ -289,6 +299,12 @@ pub struct UsageRow {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// The 1-hour-TTL subset of `cache_creation`, priced at the 1h write rate.
+    /// 0 when the request reported no split — and for every row written
+    /// before schema v2, whose split is UNKNOWN: those keep pricing all their
+    /// writes at the 5-minute rate, as they did when written. No split is
+    /// fabricated for them.
+    pub cache_creation_1h: u64,
 }
 
 impl UsageRow {
@@ -330,6 +346,20 @@ impl UsageRow {
         self
     }
 
+    /// Set every token counter from one request's [`TokenCounts`] — the ONE
+    /// mapping shared by the live path ([`Self::from_event`]) and the legacy
+    /// import, so neither can drop a counter the other keeps.
+    pub fn with_token_counts(self, t: &TokenCounts) -> Self {
+        let mut row = self.with_tokens(
+            t.input,
+            t.output,
+            t.cache_read.unwrap_or(0),
+            t.cache_creation.unwrap_or(0),
+        );
+        row.cache_creation_1h = t.cache_creation_1h.unwrap_or(0);
+        row
+    }
+
     /// Build a row from a finished-request event folded at `now`. `None` for
     /// every other event variant (only completions are metered).
     pub fn from_event(event: &ActivityEvent, now: SystemTime) -> Option<Self> {
@@ -355,12 +385,7 @@ impl UsageRow {
             *status,
         );
         Some(match tokens {
-            Some(t) => row.with_tokens(
-                t.input,
-                t.output,
-                t.cache_read.unwrap_or(0),
-                t.cache_creation.unwrap_or(0),
-            ),
+            Some(t) => row.with_token_counts(t),
             None => row,
         })
     }
@@ -464,16 +489,52 @@ impl UsageDb {
                  tokens_in      INTEGER NOT NULL DEFAULT 0,
                  tokens_out     INTEGER NOT NULL DEFAULT 0,
                  cache_read     INTEGER NOT NULL DEFAULT 0,
-                 cache_creation INTEGER NOT NULL DEFAULT 0
+                 cache_creation INTEGER NOT NULL DEFAULT 0,
+                 cache_creation_1h INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage(ts_ms);
              CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage(model, ts_ms);
              CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);",
         )
         .map_err(|e| UsageError::sqlite(&path, e))?;
-        let db = Self { conn, path };
-        db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+        let mut db = Self { conn, path };
+        db.migrate()?;
         Ok(db)
+    }
+
+    /// Bring an existing store up to [`SCHEMA_VERSION`], in place.
+    ///
+    /// v1 → v2 adds `cache_creation_1h INTEGER NOT NULL DEFAULT 0`. Keyed on
+    /// the column's PRESENCE (not the stored version number), so a crash
+    /// between the `ALTER` and the version write, or a store whose version row
+    /// was lost, re-converges instead of failing on a duplicate column. The
+    /// `ALTER` and the version bump share one transaction. Existing rows read
+    /// `0` in the new column: their TTL split is UNKNOWN, and a 1-hour count of
+    /// 0 prices every write at the 5-minute rate — exactly what they were
+    /// priced at before the column existed. Nothing is backfilled or guessed.
+    fn migrate(&mut self) -> Result<(), UsageError> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| UsageError::sqlite(&self.path, e))?;
+        let has_1h = tx
+            .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'cache_creation_1h'")
+            .and_then(|mut stmt| stmt.exists([]))
+            .map_err(|e| UsageError::sqlite(&self.path, e))?;
+        if !has_1h {
+            tx.execute(
+                "ALTER TABLE usage ADD COLUMN cache_creation_1h INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| UsageError::sqlite(&self.path, e))?;
+        }
+        tx.execute(
+            "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            [SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| UsageError::sqlite(&self.path, e))?;
+        tx.commit().map_err(|e| UsageError::sqlite(&self.path, e))
     }
 
     /// Where this store lives (`:memory:` for the ephemeral one).
@@ -521,18 +582,31 @@ impl UsageDb {
     }
 
     /// Run one bounded, indexed aggregate query. The SQL returns at most one
-    /// row per `(tenant, group, model)` present in the window — never the
-    /// underlying request rows, so cost is bounded by the ANSWER, not by how
-    /// much history exists.
+    /// row per `(tenant, group, model, prompt class)` present in the window —
+    /// never the underlying request rows, so cost is bounded by the ANSWER,
+    /// not by how much history exists.
+    ///
+    /// The prompt class is how many of [`crate::pricing::long_context_thresholds`]
+    /// a stored request's prompt reaches (a handful of values), which is
+    /// enough to split each model's cell into its short and long-context
+    /// subsets exactly — the long-context tier is priced per request, so a
+    /// plain `SUM` per model could not be priced correctly.
     pub fn query(&self, query: &UsageQuery) -> Result<UsageReport, UsageError> {
         let from_ms = query.window.from_ms(query.now_ms);
         let to_ms = query.now_ms;
-        let mut sql = String::from(
+        let thresholds = crate::pricing::long_context_thresholds();
+        let prompt_class = thresholds
+            .iter()
+            .map(|t| format!("((tokens_in + cache_read + cache_creation) >= {t})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let mut sql = format!(
             "SELECT tenant, grp, model, COUNT(*), \
              SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END), \
              SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), \
              SUM(tokens_in), SUM(tokens_out), SUM(cache_read), SUM(cache_creation), \
-             MIN(ts_ms), MAX(ts_ms) \
+             MIN(ts_ms), MAX(ts_ms), {prompt_class} AS prompt_class, \
+             SUM(cache_creation_1h) \
              FROM usage WHERE ts_ms >= ?1 AND ts_ms <= ?2",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![
@@ -550,7 +624,7 @@ impl UsageDb {
             }
             sql.push(')');
         }
-        sql.push_str(" GROUP BY tenant, grp, model");
+        sql.push_str(" GROUP BY tenant, grp, model, prompt_class");
 
         let mut stmt = self
             .conn
@@ -571,6 +645,8 @@ impl UsageDb {
                     cache_creation: r.get::<_, i64>(9)? as u64,
                     first_ms: r.get::<_, i64>(10)? as u64,
                     last_ms: r.get::<_, i64>(11)? as u64,
+                    prompt_class: r.get::<_, i64>(12)? as usize,
+                    cache_creation_1h: r.get::<_, i64>(13)? as u64,
                 })
             })
             .map_err(|e| UsageError::sqlite(&self.path, e))?;
@@ -599,15 +675,46 @@ impl UsageDb {
             // failures stay in the tenant totals (same rule as the in-memory
             // fold), so the two can legitimately disagree on token sums.
             if let (Some(group), Some(model)) = (row.group.clone(), row.model.clone()) {
-                entry.models.push(ModelUsage {
-                    group,
-                    model,
-                    requests: row.requests,
-                    tokens_in: row.tokens_in,
-                    tokens_out: row.tokens_out,
+                // Several prompt-class rows fold into ONE model cell. Class
+                // `c` means the prompt reached thresholds[..c], so the rows
+                // are long-context for this model iff its own threshold is
+                // among those.
+                let parts = crate::pricing::TokenParts {
+                    input: row.tokens_in,
+                    output: row.tokens_out,
                     cache_read: row.cache_read,
                     cache_creation: row.cache_creation,
-                });
+                    cache_creation_1h: row.cache_creation_1h,
+                };
+                let long = row.prompt_class > 0
+                    && crate::pricing::long_context_threshold(&model)
+                        <= thresholds[row.prompt_class.min(thresholds.len()) - 1];
+                let cell = match entry
+                    .models
+                    .iter_mut()
+                    .position(|m| m.group == group && m.model == model)
+                {
+                    Some(i) => &mut entry.models[i],
+                    None => {
+                        entry.models.push(ModelUsage {
+                            group,
+                            model,
+                            ..Default::default()
+                        });
+                        entry.models.last_mut().expect("just pushed")
+                    }
+                };
+                cell.requests += row.requests;
+                cell.tokens_in = cell.tokens_in.saturating_add(parts.input);
+                cell.tokens_out = cell.tokens_out.saturating_add(parts.output);
+                cell.cache_read = cell.cache_read.saturating_add(parts.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(parts.cache_creation);
+                cell.cache_creation_1h = cell
+                    .cache_creation_1h
+                    .saturating_add(parts.cache_creation_1h);
+                if long {
+                    cell.long.add(&parts);
+                }
             }
         }
 
@@ -816,26 +923,16 @@ impl UsageDb {
                 other => Err(UsageError::sqlite(&self.path, other)),
             })
     }
-
-    fn set_meta(&self, key: &str, value: &str) -> Result<(), UsageError> {
-        self.conn
-            .execute(
-                "INSERT INTO meta (k, v) VALUES (?1, ?2) \
-                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                rusqlite::params![key, value],
-            )
-            .map(|_| ())
-            .map_err(|e| UsageError::sqlite(&self.path, e))
-    }
 }
 
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO usage \
-     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, \
+      cache_creation_1h) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 /// Owned bind values for [`INSERT_SQL`] (owned, so the array outlives the
 /// statement call without borrowing a temporary).
-fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 10] {
+fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 11] {
     use rusqlite::types::Value;
     let text = |v: &Option<String>| match v {
         Some(v) => Value::Text(v.clone()),
@@ -852,6 +949,7 @@ fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 10] {
         Value::Integer(row.tokens_out as i64),
         Value::Integer(row.cache_read as i64),
         Value::Integer(row.cache_creation as i64),
+        Value::Integer(row.cache_creation_1h as i64),
     ]
 }
 
@@ -868,6 +966,9 @@ struct GroupRow {
     cache_creation: u64,
     first_ms: u64,
     last_ms: u64,
+    /// How many long-context thresholds this group's prompts reach.
+    prompt_class: usize,
+    cache_creation_1h: u64,
 }
 
 fn total_tokens(m: &ModelUsage) -> u64 {
@@ -999,12 +1100,7 @@ fn parse_legacy_line(line: &str) -> Option<UsageRow> {
         parsed.status,
     );
     Some(match parsed.tokens {
-        Some(t) => row.with_tokens(
-            t.input,
-            t.output,
-            t.cache_read.unwrap_or(0),
-            t.cache_creation.unwrap_or(0),
-        ),
+        Some(t) => row.with_token_counts(&t),
         None => row,
     })
 }
@@ -1320,14 +1416,18 @@ pub fn usage_doc(
                 .models
                 .into_iter()
                 .map(|m| {
-                    let tokens = TokenCounts {
+                    let all = crate::pricing::TokenParts {
                         input: m.tokens_in,
                         output: m.tokens_out,
-                        cache_read: Some(m.cache_read),
-                        cache_creation: Some(m.cache_creation),
+                        cache_read: m.cache_read,
+                        cache_creation: m.cache_creation,
+                        cache_creation_1h: m.cache_creation_1h,
                     };
                     TenantModelDoc {
-                        cost_usd: crate::pricing::cost_usd(&m.group, &m.model, &tokens, overrides),
+                        cost_usd: crate::pricing::aggregate_cost(
+                            &m.group, &m.model, &all, &m.long, overrides,
+                        )
+                        .unwrap_or(0.0),
                         group: m.group,
                         model: m.model,
                         requests: m.requests,
@@ -1335,6 +1435,7 @@ pub fn usage_doc(
                         tokens_out: m.tokens_out,
                         cache_read: m.cache_read,
                         cache_creation: m.cache_creation,
+                        cache_creation_1h: m.cache_creation_1h,
                     }
                 })
                 .collect();
@@ -1546,5 +1647,307 @@ mod tests {
             .expect("import after refill");
         assert_eq!(outcome.imported, 4, "the refilled content is read");
         assert_eq!(db.row_count().unwrap(), 8);
+    }
+
+    /// Long-context tier: the keys report prices each (tenant, model) cell as
+    /// the sum of its stored per-request costs. Rows are one request each,
+    /// so the tier is derived per row at query time — rows written before
+    /// the tier existed (same schema, no new column) price correctly.
+    #[test]
+    fn tenant_cell_cost_equals_the_sum_of_its_request_costs() {
+        let db = UsageDb::open_in_memory().expect("open");
+        // (tenant, group, model, in, out, cache_read, cache_creation)
+        let rows = [
+            ("k-1", "grok", "grok-4.7", 1_000, 500, 150_000, 0), // short
+            ("k-1", "grok", "grok-4.7", 50_000, 2_000, 150_000, 0), // long (== 200k)
+            ("k-1", "grok", "grok-4.7", 199_000, 10, 0, 999),    // short (199,999)
+            ("k-1", "grok", "grok-4.7", 199_000, 10, 0, 1_000),  // long (200,000)
+            ("k-2", "grok", "grok-4.5", 300_000, 900, 10_000, 0), // long
+            ("k-2", "grok", "grok-4.5", 20_000, 900, 10_000, 0), // short
+            (
+                "k-2",
+                "claude",
+                "claude-opus-4-8",
+                10_000,
+                99,
+                250_000,
+                5_000,
+            ),
+            // OpenAI's boundary is 272k, not grok's 200k: with two thresholds
+            // live the SQL prompt class must bucket per model.
+            ("k-3", "codex", "gpt-6-sol", 1_000, 10, 270_998, 0), // short (271,998)
+            ("k-3", "codex", "gpt-6-sol", 2_000, 10, 270_000, 0), // long (272,000)
+            ("k-3", "codex", "gpt-6-sol", 250_000, 10, 0, 0),     // short (> 200k!)
+            ("k-3", "codex", "gpt-5.5-codex", 300_000, 10, 0, 0), // untiered: flat
+        ];
+        for (i, (tenant, group, model, input, output, cr, cc)) in rows.iter().enumerate() {
+            let row = UsageRow::new(
+                1_000 + i as u64,
+                i as u64,
+                Some(tenant),
+                Some(group),
+                Some(model),
+                200,
+            )
+            .with_tokens(*input, *output, *cr, *cc);
+            assert!(db.insert(&row).expect("insert"));
+        }
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10_000))
+            .expect("query");
+        assert_eq!(report.rows, rows.len() as u64);
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 10_000);
+        let sum = |tenant: &str, model: Option<&str>| -> f64 {
+            rows.iter()
+                .filter(|r| r.0 == tenant && model.is_none_or(|m| m == r.2))
+                .map(|(_, g, m, i, o, cr, cc)| {
+                    let t = TokenCounts {
+                        input: *i,
+                        output: *o,
+                        cache_read: Some(*cr),
+                        cache_creation: Some(*cc),
+                        cache_creation_1h: None,
+                    };
+                    crate::pricing::cost_usd(g, m, &t, &HashMap::new())
+                })
+                .sum()
+        };
+        let mut cells = 0;
+        for tenant in &doc.tenants {
+            for cell in &tenant.models {
+                cells += 1;
+                let want = sum(&tenant.tenant, Some(&cell.model));
+                assert!(
+                    (cell.cost_usd - want).abs() < 1e-12,
+                    "{} {}: {} != {want}",
+                    tenant.tenant,
+                    cell.model,
+                    cell.cost_usd
+                );
+            }
+            let want = sum(&tenant.tenant, None);
+            assert!((tenant.cost_usd - want).abs() < 1e-12, "{}", tenant.tenant);
+        }
+        assert_eq!(
+            cells, 5,
+            "one cell per (tenant, model), prompt classes merged"
+        );
+        let grok47 = &doc
+            .tenants
+            .iter()
+            .find(|t| t.tenant == "k-1")
+            .expect("k-1")
+            .models[0];
+        assert_eq!((grok47.requests, grok47.tokens_in), (4, 449_000));
+    }
+
+    /// Cache-write TTL split: a cell's cost is the sum of its requests' costs
+    /// with 1-hour writes at the 1h rate, whichever path wrote the row (live
+    /// event or legacy `activity.jsonl` import).
+    #[test]
+    fn one_hour_cache_writes_price_per_row_and_sum_per_cell() {
+        let tmp = TempDir::new();
+        let mut db = UsageDb::open_in_memory().expect("open");
+        let t = |cc: u64, h1: Option<u64>| TokenCounts {
+            input: 100,
+            output: 1_000,
+            cache_read: Some(50_000),
+            cache_creation: Some(cc),
+            cache_creation_1h: h1,
+        };
+        // (model, tokens): all-1h, mixed, 5m-only, and no reported split.
+        let requests = [
+            ("claude-fable-5-1", t(40_000, Some(40_000))),
+            ("claude-fable-5-1", t(30_000, Some(10_000))),
+            ("claude-fable-5-1", t(20_000, Some(0))),
+            ("claude-fable-5-1", t(10_000, None)),
+            ("claude-opus-5-5", t(8_000, Some(6_000))),
+        ];
+        // Live path: the first three via `from_event`.
+        for (i, (model, tokens)) in requests[..3].iter().enumerate() {
+            let event = ActivityEvent::RequestFinished {
+                id: i as u64,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: None,
+                status: 200,
+                duration: std::time::Duration::from_millis(1),
+                tokens: Some(*tokens),
+                group: Some("claude".into()),
+                model: Some((*model).into()),
+                effort: None,
+                fast: None,
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+                tenant: Some("k-1".into()),
+            };
+            let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000 + i as u64);
+            let row = UsageRow::from_event(&event, at).expect("row");
+            assert!(db.insert(&row).expect("insert"));
+        }
+        // Legacy-import path: the rest as persisted activity lines.
+        let jsonl = tmp.path().join("activity.jsonl");
+        for (i, (model, tokens)) in requests.iter().enumerate().skip(3) {
+            let line = serde_json::json!({
+                "v": LEGACY_PERSIST_VERSION, "ts_ms": 1_000 + i as u64, "id": i as u64,
+                "status": 200, "group": "claude", "model": model, "tenant": "k-1",
+                "tokens": tokens,
+            });
+            append(&jsonl, &format!("{line}\n"));
+        }
+        let imported = db
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import")
+            .imported;
+        assert_eq!(imported, 2);
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10_000))
+            .expect("query");
+        let cells = &report.tenants[0].models;
+        let fable = cells
+            .iter()
+            .find(|m| m.model == "claude-fable-5-1")
+            .expect("fable");
+        assert_eq!(
+            (fable.cache_creation, fable.cache_creation_1h),
+            (100_000, 50_000)
+        );
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 10_000);
+        let tenant = &doc.tenants[0];
+        for cell in &tenant.models {
+            let want: f64 = requests
+                .iter()
+                .filter(|(m, _)| *m == cell.model)
+                .map(|(m, t)| crate::pricing::cost_usd("claude", m, t, &HashMap::new()))
+                .sum();
+            assert!((cell.cost_usd - want).abs() < 1e-12, "{}", cell.model);
+        }
+        // Non-vacuous: pricing fable's 50k 1-hour writes at the 5-minute rate
+        // would be 50k × ($20 − $12.50) / 1M = $0.375 short.
+        let fable_doc = tenant
+            .models
+            .iter()
+            .find(|m| m.model == "claude-fable-5-1")
+            .expect("fable doc");
+        assert_eq!(fable_doc.cache_creation_1h, 50_000);
+        let all_5m = crate::pricing::aggregate_cost(
+            "claude",
+            "claude-fable-5-1",
+            &crate::pricing::TokenParts {
+                input: fable_doc.tokens_in,
+                output: fable_doc.tokens_out,
+                cache_read: fable_doc.cache_read,
+                cache_creation: fable_doc.cache_creation,
+                cache_creation_1h: 0,
+            },
+            &crate::pricing::TokenParts::default(),
+            &HashMap::new(),
+        )
+        .expect("priced");
+        assert!((fable_doc.cost_usd - all_5m - 0.375).abs() < 1e-12);
+    }
+
+    /// Schema v1 → v2: a store created by the previous release (no
+    /// `cache_creation_1h` column, `schema_version` 1) opens in place with
+    /// every row preserved, the new column defaulting to 0 — so its rows keep
+    /// pricing every cache write at the 5-minute rate, as before — and new
+    /// rows carry their split. Reopening is idempotent.
+    #[test]
+    fn a_schema_v1_store_migrates_in_place() {
+        let tmp = TempDir::new();
+        let path = tmp.path().join("usage.sqlite3");
+        {
+            let conn = Connection::open(&path).expect("v1 store");
+            conn.execute_batch(
+                "CREATE TABLE usage (
+                     event_key      TEXT PRIMARY KEY,
+                     ts_ms          INTEGER NOT NULL,
+                     tenant         TEXT NOT NULL,
+                     grp            TEXT,
+                     model          TEXT,
+                     status         INTEGER NOT NULL,
+                     tokens_in      INTEGER NOT NULL DEFAULT 0,
+                     tokens_out     INTEGER NOT NULL DEFAULT 0,
+                     cache_read     INTEGER NOT NULL DEFAULT 0,
+                     cache_creation INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX usage_ts_idx ON usage(ts_ms);
+                 CREATE INDEX usage_model_ts_idx ON usage(model, ts_ms);
+                 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO meta (k, v) VALUES ('schema_version', '1');
+                 INSERT INTO meta (k, v) VALUES ('import_offset:x', '42');
+                 INSERT INTO usage VALUES
+                     ('1000:1', 1000, 'k-1', 'claude', 'claude-opus-4-8', 200, 10, 20, 30, 1000000),
+                     ('1001:2', 1001, 'k-2', 'grok', 'grok-4.7', 500, 5, 6, 7, 0);",
+            )
+            .expect("v1 schema");
+        }
+        let db = UsageDb::open(&path).expect("migrate");
+        assert_eq!(db.row_count().expect("count"), 2, "rows preserved");
+        assert_eq!(
+            db.get_meta("schema_version").expect("meta").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            db.get_meta("import_offset:x").expect("meta").as_deref(),
+            Some("42"),
+            "other meta untouched"
+        );
+        let old_1h: Vec<(String, i64)> = db
+            .conn
+            .prepare("SELECT event_key, cache_creation_1h FROM usage ORDER BY event_key")
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(old_1h, vec![("1000:1".into(), 0), ("1001:2".into(), 0)]);
+        // The pre-migration opus row: 1M writes of UNKNOWN TTL at the 5m
+        // rate ($6.25) + 10 in ($5) + 20 out ($25) + 30 read ($0.50).
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10_000))
+            .expect("query");
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 10_000);
+        let opus = doc.tenants.iter().find(|t| t.tenant == "k-1").expect("k-1");
+        let want = (10.0 * 5.0 + 20.0 * 25.0 + 30.0 * 0.5 + 1_000_000.0 * 6.25) / 1e6;
+        assert!((opus.cost_usd - want).abs() < 1e-12, "{}", opus.cost_usd);
+        // A new row carries its split; reopening keeps both.
+        let row = UsageRow::new(
+            2_000,
+            3,
+            Some("k-1"),
+            Some("claude"),
+            Some("claude-opus-4-8"),
+            200,
+        )
+        .with_token_counts(&TokenCounts {
+            input: 0,
+            output: 0,
+            cache_read: None,
+            cache_creation: Some(4_000),
+            cache_creation_1h: Some(3_000),
+        });
+        assert!(db.insert(&row).expect("insert"));
+        drop(db);
+        let db = UsageDb::open(&path).expect("reopen is idempotent");
+        assert_eq!(db.row_count().expect("count"), 3);
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10_000))
+            .expect("query");
+        let cell = &report
+            .tenants
+            .iter()
+            .find(|t| t.tenant == "k-1")
+            .expect("k-1")
+            .models[0];
+        assert_eq!(
+            (cell.cache_creation, cell.cache_creation_1h),
+            (1_004_000, 3_000)
+        );
     }
 }

@@ -264,11 +264,19 @@ pub(crate) struct UsageCell {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation` (0 for requests that reported no
+    /// split) — priced at the 1h cache-write rate.
+    pub cache_creation_1h: u64,
+    /// Long-context subset of the four counters above (requests whose own
+    /// prompt reached the tier threshold, [`crate::pricing::long_part`]) —
+    /// the tier is per request, so the cell must keep it separate to be
+    /// priceable ([`crate::pricing::aggregate_cost`]).
+    pub long: crate::pricing::TokenParts,
 }
 
 impl UsageCell {
-    /// Fold one finished request into the cell.
-    fn add(&mut self, tokens: Option<TokenCounts>) {
+    /// Fold one finished request of `model` into the cell.
+    fn add(&mut self, model: &str, tokens: Option<TokenCounts>) {
         self.requests = self.requests.saturating_add(1);
         if let Some(t) = tokens {
             self.input = self.input.saturating_add(t.input);
@@ -277,6 +285,10 @@ impl UsageCell {
             self.cache_creation = self
                 .cache_creation
                 .saturating_add(t.cache_creation.unwrap_or(0));
+            self.cache_creation_1h = self
+                .cache_creation_1h
+                .saturating_add(t.cache_creation_1h.unwrap_or(0));
+            self.long.add(&crate::pricing::long_part(model, &t));
         }
     }
 
@@ -287,6 +299,10 @@ impl UsageCell {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.cache_creation_1h = self
+            .cache_creation_1h
+            .saturating_add(other.cache_creation_1h);
+        self.long.add(&other.long);
     }
 }
 
@@ -445,6 +461,11 @@ struct ModelStats {
     tokens_out: u64,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    /// 1-hour-TTL subset of `cache_creation`; `None` until a request reports
+    /// a split.
+    cache_creation_1h: Option<u64>,
+    /// Long-context subset of the token counters (see [`UsageCell::long`]).
+    long: crate::pricing::TokenParts,
     last_used: Option<SystemTime>,
     /// Which account(s) served this model (req19).
     accounts: HashMap<String, Totals>,
@@ -466,6 +487,9 @@ impl ModelStats {
         self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
         self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
         self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
+        self.cache_creation_1h =
+            crate::proxy::sse::add_opt(self.cache_creation_1h, other.cache_creation_1h);
+        self.long.add(&other.long);
         self.last_used = match (self.last_used, other.last_used) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -497,6 +521,11 @@ pub(crate) struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: Option<u64>,
     pub cache_creation: Option<u64>,
+    /// 1-hour-TTL subset of `cache_creation` (see [`ModelStats`]).
+    pub cache_creation_1h: Option<u64>,
+    /// Long-context subset of the token counters — the pricing input that
+    /// keeps a tiered model's row cost equal to the sum of its requests.
+    pub long: crate::pricing::TokenParts,
     pub last_used: SystemTime,
     pub accounts: Vec<ModelAccount>,
     pub efforts: Vec<ModelCount>,
@@ -1181,6 +1210,10 @@ pub(crate) struct TenantModelStats {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation` (see [`UsageCell`]).
+    pub cache_creation_1h: u64,
+    /// Long-context subset of the four counters (see [`UsageCell::long`]).
+    pub long: crate::pricing::TokenParts,
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1532,7 +1565,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(model, tokens);
         }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
@@ -1547,7 +1580,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(model, tokens);
         }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
@@ -1558,7 +1591,7 @@ impl ActivityLog {
             .or_default()
             .entry(key)
             .or_default()
-            .add(tokens);
+            .add(model, tokens);
     }
 
     /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
@@ -1619,6 +1652,8 @@ impl ActivityLog {
                 tokens_out: c.output,
                 cache_read: c.cache_read,
                 cache_creation: c.cache_creation,
+                cache_creation_1h: c.cache_creation_1h,
+                long: c.long,
                 // Priced at doc-build time (the log holds no pricing config);
                 // conservative `false` here so a row that ever bypasses the
                 // doc build renders `—`, never a fabricated $0.
@@ -1727,6 +1762,9 @@ impl ActivityLog {
             entry.cache_read = crate::proxy::sse::add_opt(entry.cache_read, t.cache_read);
             entry.cache_creation =
                 crate::proxy::sse::add_opt(entry.cache_creation, t.cache_creation);
+            entry.cache_creation_1h =
+                crate::proxy::sse::add_opt(entry.cache_creation_1h, t.cache_creation_1h);
+            entry.long.add(&crate::pricing::long_part(model, &t));
         }
         entry.last_used = Some(now);
         let effort_label = effort.clone().unwrap_or_else(|| "none".to_string());
@@ -1862,6 +1900,10 @@ impl ActivityLog {
                 cell.cache_creation = cell
                     .cache_creation
                     .saturating_add(t.cache_creation.unwrap_or(0));
+                cell.cache_creation_1h = cell
+                    .cache_creation_1h
+                    .saturating_add(t.cache_creation_1h.unwrap_or(0));
+                cell.long.add(&crate::pricing::long_part(model, &t));
             }
         }
     }
@@ -1936,6 +1978,8 @@ impl ActivityLog {
                     tokens_out: stats.tokens_out,
                     cache_read: stats.cache_read,
                     cache_creation: stats.cache_creation,
+                    cache_creation_1h: stats.cache_creation_1h,
+                    long: stats.long,
                     last_used: stats.last_used.unwrap_or(SystemTime::UNIX_EPOCH),
                     accounts,
                     efforts: sorted_counts(&stats.efforts),
@@ -2314,6 +2358,7 @@ mod tests {
                     output: 10,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_1h: None,
                 }),
                 group: Some("claude".into()),
                 model: Some("claude-fable-5".into()),
@@ -2884,6 +2929,7 @@ mod tests {
             output,
             cache_read,
             cache_creation: None,
+            cache_creation_1h: None,
         })
     }
 
@@ -2909,7 +2955,8 @@ mod tests {
         assert_eq!(normalize_model("opus"), "claude-opus-5-5");
         assert_eq!(normalize_model("opus-5-5"), "claude-opus-5-5");
         assert_eq!(normalize_model("opus-5"), "claude-opus-5");
-        assert_eq!(normalize_model("sonnet"), "claude-sonnet-5");
+        assert_eq!(normalize_model("sonnet"), "claude-sonnet-5-5");
+        assert_eq!(normalize_model("sonnet-5-5"), "claude-sonnet-5-5");
         assert_eq!(normalize_model("sonnet-5"), "claude-sonnet-5");
         assert_eq!(normalize_model("fable"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");
@@ -3654,6 +3701,7 @@ mod tests {
                 output,
                 cache_read,
                 cache_creation: None,
+                cache_creation_1h: None,
             }),
             group: Some(group.into()),
             model: Some(model.into()),
@@ -4057,6 +4105,70 @@ mod tests {
         assert_eq!(record.ttft_ms, Some(800));
     }
 
+    /// Cache-write TTL split in `activity.jsonl`: a line written before the
+    /// field existed loads with the split UNKNOWN (`None`, its writes priced
+    /// at the 5-minute rate); a request without a split persists byte-for-byte
+    /// as before (no new key); a request with one round-trips it into the
+    /// model rows.
+    #[test]
+    fn persisted_lines_with_and_without_the_ttl_split_load() {
+        let dir = TempDir::new();
+        let path = dir.file();
+        let old = r#"{"v":1,"ts_ms":1000,"id":1,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":400,"cache_creation":1000},"group":"claude","model":"claude-opus-4-8","effort":null}"#;
+        std::fs::write(&path, format!("{old}\n")).expect("seed old line");
+        let record: PersistedRequest = serde_json::from_str(old).expect("old line parses");
+        assert_eq!(
+            record.tokens.map(|t| t.cache_creation_1h),
+            Some(None),
+            "absent split is unknown"
+        );
+        let event = |id: u64, h1: Option<u64>| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(1_500),
+            tokens: Some(TokenCounts {
+                input: 10,
+                output: 30,
+                cache_read: Some(400),
+                cache_creation: Some(1_000),
+                cache_creation_1h: h1,
+            }),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: None,
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: None,
+        };
+        let at = UNIX_EPOCH + Duration::from_secs(2);
+        persist_request(Some(&path), &event(2, None), at);
+        persist_request(Some(&path), &event(3, Some(600)), at);
+        let text = std::fs::read_to_string(&path).expect("read log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[1].contains("cache_creation_1h"), "{}", lines[1]);
+        assert!(
+            lines[2].contains(r#""cache_creation_1h":600"#),
+            "{}",
+            lines[2]
+        );
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        log.load_persisted(Some(&path));
+        let rows = log.model_usage();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_creation, Some(3_000));
+        assert_eq!(rows[0].cache_creation_1h, Some(600));
+    }
+
     #[test]
     fn perf_fold_gates_and_series_separation() {
         // Trinity contract C3/C4 (+ review MUST-FIX 8): throughput samples
@@ -4086,6 +4198,7 @@ mod tests {
                     output,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_1h: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -4180,6 +4293,7 @@ mod tests {
                 output: 10,
                 cache_read: None,
                 cache_creation: None,
+                cache_creation_1h: None,
             }),
             group: Some("codex".into()),
             model: Some("gpt-5.5".into()),

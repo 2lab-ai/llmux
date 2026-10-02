@@ -72,9 +72,10 @@ not that it is zero.
   a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
   Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
   denominator too.
-  Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
-  (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
-  advertised statically on the corresponding entries. The provider always
+  The bare `sol` / `terra` / `luna` aliases stay on 5.6: the full ids
+  `gpt-6-sol` / `gpt-6-luna` (listed by the openai/codex catalog since it was
+  re-fetched 2026-09-28) are reachable and pass through verbatim, but own no
+  bare alias. These are advertised statically on the corresponding entries. The provider always
   strips a trailing `[1m]` before the request leaves llmux
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
@@ -89,7 +90,8 @@ not that it is zero.
   | `fable`, `fable-5-1` | `claude-fable-5-1[1m]` | `claude-fable-5-1` |
   | `opus`, `opus-5-5` | `claude-opus-5-5[1m]` | `claude-opus-5-5` |
   | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
-  | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
+  | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
+  | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
   | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
@@ -148,10 +150,12 @@ not that it is zero.
   owns an alias), then from `claude-opus-5[1m]` to `claude-opus-5-5[1m]` on
   2026-09-23. The version alias `opus-5` did NOT move — it stays on
   `claude-opus-5[1m]`, because floating a version-pinned alias onto a new model
-  would be silent substitution. Anyone who needs one specific model must send
-  its full catalog id — that is the stable handle. Usage and pricing are booked against the
-  resolved id, not the alias, so alias traffic lands on the same row as id
-  traffic.
+  would be silent substitution. `sonnet` follows the same rule: it moved from
+  `claude-sonnet-5[1m]` to `claude-sonnet-5-5[1m]` on 2026-09-29, and the
+  version alias `sonnet-5` stayed on `claude-sonnet-5[1m]`. Anyone who needs
+  one specific model must send its full catalog id — that is the stable
+  handle. Usage and pricing are booked against the resolved id, not the
+  alias, so alias traffic lands on the same row as id traffic.
 
 ### Out-of-catalog grok pin
 
@@ -191,11 +195,16 @@ model it does not curate.
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max   | 1000000     | claude |
+| claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-sol[1m]       | —            | GPT-6-Sol [1M]      | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-sol           | —            | GPT-6-Sol           | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-luna          | —            | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -371,7 +380,7 @@ So the same fetch that builds the lineup also exports, for the same launch:
 | -------------------------------- | --------------------------------------- |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
 | `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
 
 The values are DERIVED from the catalog alias owners at launch, never
@@ -404,11 +413,13 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 ## Sources
 
 Evidence gathered 2026-07-14; the claude rows and their aliases were re-curated
-2026-07-27 and again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
-`opus` alias rolled onto it), the codex context windows were re-probed
-2026-08-21 (the codex effort menus are unchanged from 2026-07-14), and the grok
-rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
-`grok-4.7` row, and the default pin moved 4.6 → 4.7 — see below).
+2026-07-27, again 2026-09-23 (the `claude-opus-5-5` pair, with the floating
+`opus` alias rolled onto it), and again 2026-09-29 (the `claude-sonnet-5-5`
+pair, with the floating `sonnet` alias rolled onto it), the codex context
+windows were re-probed 2026-08-21 (the codex effort menus are unchanged from
+2026-07-14), and the grok rows were re-probed 2026-08-26 (unchanged) and
+again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
+— see below).
 
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
@@ -421,6 +432,35 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   cache read $0.20/M, cache write $5/M); the Claude Code 2.1.280 binary model
   record lists `claude-opus-5-5` with `supports_1m_suffix` (and the literal
   string `claude-opus-5-5[1m]`), which is why the `[1m]` row exists.
+- **claude-sonnet-5-5** — Anthropic announcement 2026-09-28 (`claude-sonnet-5-5`,
+  1M context, 128k max output, pricing UNCHANGED from Sonnet 5: $2/M input,
+  $10/M output, cache read $0.20/M, cache write $2.50/M); the Claude Code
+  2.1.284 binary model record lists `claude-sonnet-5-5` with
+  `context.native_1m` / `supports_1m_beta` and `max_output_tokens.default:
+  128000`, `pricing: "tier_2_10"` (the same tier as `claude-sonnet-5`), and
+  the literal string `claude-sonnet-5-5[1m]` in its `[1m]`-suffix allowlist —
+  which is why the `[1m]` row exists and why no new price constant was
+  needed (`claude_price` already mapped Sonnet's `(5, None | Some(5))`
+  versions to `SONNET_5`, written ahead of this catalog row landing).
+- **Claude pricing** — the Anthropic pricing page
+  (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28, per 1M
+  tokens as input / 5-minute cache write / 1-hour cache write / cache read /
+  output: Fable 5.1 $10 / $12.50 / $20 / $0.25 / $50; Fable 5 $10 / $12.50 /
+  $20 / $1.00 / $50; Opus 5.5 $4 / $5 / $8 / $0.20 / $20; Opus 5, 4.8, 4.7,
+  4.6, 4.5 $5 / $6.25 / $10 / $0.50 / $25; Opus 4.1 and 4 (retired) $15 /
+  $18.75 / $30 / $1.50 / $75; Sonnet 5.5 and 5 $2 / $2.50 / $4 / $0.20 / $10;
+  Sonnet 4.6, 4.5, 4 $3 / $3.75 / $6 / $0.30 / $15; Haiku 4.5 $1 / $1.25 / $2 /
+  $0.10 / $5; Haiku 3.5 (retired, `claude-3-5-haiku-*`) $0.80 / $1 / $1.60 /
+  $0.08 / $4. Both write rates are modeled: each request's 1-hour share of its
+  cache writes (Anthropic's `cache_creation.ephemeral_1h_input_tokens`) is
+  billed at the 1-hour rate and the rest at the 5-minute rate; a request that
+  reports no split is billed entirely at the 5-minute rate. Dated snapshots
+  price like their bare id: llmux parses the
+  version out of the id, so `claude-opus-4-20250514` is Opus 4 while
+  `claude-opus-4-5-20251101` is Opus 4.5. An unlisted version of a known family
+  takes that family's default row (Opus 5, Sonnet 4.x, Haiku 4.5, Fable 5);
+  any other claude id, including other Claude 3.x models, takes the Opus 5
+  rates. The Mythos models are not in the catalog and have no row.
 - **Codex effort menus and base context windows** — the openai/codex model
   catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
@@ -429,14 +469,29 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **gpt-6-astra** — same catalog re-fetched 2026-09-07: slug `gpt-6-astra`,
   display name "GPT-6-Astra", context_window 272000, max_context_window 872000,
   six reasoning levels (low, medium, high, xhigh, max, ultra), default effort
-  low, minimal client version 0.153.0. The catalog lists NO `gpt-6-sol` /
-  `-terra` / `-luna`. A live probe on 2026-09-07 confirmed the ChatGPT-account
+  low, minimal client version 0.153.0. The catalog of that date listed NO
+  `gpt-6-sol` / `-terra` / `-luna` (see the gpt-6-sol / gpt-6-luna entry below
+  for the 2026-09-28 re-fetch). A live probe on 2026-09-07 confirmed the ChatGPT-account
   codex backend ACCEPTS `gpt-6-astra` with llmux's existing header set
   (`originator: codex_cli_rs`, no client-version header), so no header change
   was needed — only adding the slug to the provider passthrough list. Pricing
   ($10/M input, $50/M output, $1/M cached input, no cache-creation charge)
-  comes from third-party pricing trackers for the 2026-09 launch standard tier,
-  not from an OpenAI page read directly.
+  was first taken from third-party pricing trackers for the 2026-09 launch
+  standard tier and confirmed against OpenAI's API pricing page on 2026-09-28.
+- **gpt-6-sol / gpt-6-luna** — catalog re-fetched 2026-09-28 (codex 0.158.0):
+  `gpt-6-sol` "GPT-6-Sol" and `gpt-6-luna` "GPT-6-Luna", both context_window
+  272000 / max_context_window 872000, default effort medium, `supported_in_api`;
+  sol lists low→ultra, luna low→max (no `ultra`). `gpt-6-terra` is NOT listed.
+  A live request for `gpt-6-sol` through the daemon on 2026-09-28 returned a
+  normal completion with `"model":"gpt-6-sol"`; `gpt-6-luna` was not probed
+  through the daemon. Both join the provider passthrough list. Pricing (standard
+  tier, per 1M tokens, launched 2026-09-22; OpenAI API pricing page, read
+  2026-09-28): `gpt-6-sol` $2 in / $10 out / $0.20 cached input; `gpt-6-luna`
+  $0.10 in / $0.50 out / $0.01 cached input; no cache-creation charge, per the
+  codex convention (the page lists cache writes at $2.50 / $0.125, which do not
+  apply to subscription traffic). The >272k-prompt tier (sol $4 in / $15 out,
+  luna $0.20 in / $0.75 out) is not modeled. The `[1m]` twin for sol reuses
+  astra's 1000000 client denominator and has not been probed.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window
@@ -474,8 +529,22 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   and `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
   synthesize a null-metadata row when pinned.
-- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
-  is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
-  also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
-  grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
-  long-context tier.
+- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-28: `grok-4.7`
+  and `grok-4.6` are $2.00 in / $6.00 out / $0.50 cached input per 1M tokens,
+  `grok-4.5` $2.00 / $6.00 / $0.30. A request whose prompt (fresh input + cached
+  input + cache writes) is **≥ 200,000 tokens** is billed ALL of its tokens at
+  the long-context rates: $4.00 / $12.00 / $1.00 cached (grok-4.5: $0.60
+  cached). llmux models that tier per request, and every aggregate (model rows,
+  Usage tab, keys panel) keeps long-context requests separate so its cost is
+  the sum of its requests' costs. Unknown grok ids take the grok-4.5 row, tier
+  included. OpenAI models carry the same kind of tier at a **272,000**-token
+  prompt: gpt-6-astra $10 / $50 / $1 cached becomes $20 / $75 / $2, gpt-6-sol
+  $2 / $10 / $0.20 becomes $4 / $15 / $0.40, gpt-6-luna $0.10 / $0.50 / $0.01
+  becomes $0.20 / $0.75 / $0.02, gpt-5.6-sol $4 / $20 / $0.40 becomes $8 / $30 /
+  $0.80, gpt-5.6-terra $2 / $12 / $0.20 becomes $4 / $18 / $0.40, gpt-5.6-luna
+  $0.20 / $1.20 / $0.02 becomes $0.40 / $1.80 / $0.04, gpt-5.5 $5 / $30 / $0.50
+  becomes $10 / $45 / $1 (OpenAI pricing page, read 2026-09-28; the whole request
+  reprices). `gpt-5.5-codex` and unknown codex ids are not on that page, so they
+  stay flat. Claude rows carry no tier: Claude 4.6 and later bill the full 1M
+  window at standard rates. These are API-list-price equivalents; codex traffic
+  is subscription-billed.
