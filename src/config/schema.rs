@@ -59,8 +59,10 @@ pub struct Config {
     /// model slug (display suffixes like `[1m]` are stripped on lookup; match
     /// is case-insensitive). An entry here wins over the built-in default rate
     /// table in [`crate::pricing`]; absent/empty (the default) means "use the
-    /// built-in rates". All rates are USD per 1,000,000 tokens. Additive: a
-    /// config written before this field loads with an empty map.
+    /// built-in rates". All rates are USD per 1,000,000 tokens. An entry
+    /// replaces the whole built-in row, long-context tier included (see
+    /// [`ModelPrice`]). Additive: a config written before this field loads
+    /// with an empty map.
     #[serde(default)]
     pub pricing: HashMap<String, ModelPrice>,
     /// Raw input/output payload capture (Feature B). When `enabled` (the

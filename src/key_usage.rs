@@ -249,6 +249,10 @@ pub struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Long-context subset of the four counters: the rows whose OWN prompt
+    /// reached the model's tier threshold. Derived per stored row (one row =
+    /// one request), so no extra column is persisted.
+    pub long: crate::pricing::TokenParts,
 }
 
 /// The result of one [`UsageQuery`]: the matched tenant rows plus the filter
@@ -521,18 +525,30 @@ impl UsageDb {
     }
 
     /// Run one bounded, indexed aggregate query. The SQL returns at most one
-    /// row per `(tenant, group, model)` present in the window — never the
-    /// underlying request rows, so cost is bounded by the ANSWER, not by how
-    /// much history exists.
+    /// row per `(tenant, group, model, prompt class)` present in the window —
+    /// never the underlying request rows, so cost is bounded by the ANSWER,
+    /// not by how much history exists.
+    ///
+    /// The prompt class is how many of [`crate::pricing::long_context_thresholds`]
+    /// a stored request's prompt reaches (a handful of values), which is
+    /// enough to split each model's cell into its short and long-context
+    /// subsets exactly — the long-context tier is priced per request, so a
+    /// plain `SUM` per model could not be priced correctly.
     pub fn query(&self, query: &UsageQuery) -> Result<UsageReport, UsageError> {
         let from_ms = query.window.from_ms(query.now_ms);
         let to_ms = query.now_ms;
-        let mut sql = String::from(
+        let thresholds = crate::pricing::long_context_thresholds();
+        let prompt_class = thresholds
+            .iter()
+            .map(|t| format!("((tokens_in + cache_read + cache_creation) >= {t})"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let mut sql = format!(
             "SELECT tenant, grp, model, COUNT(*), \
              SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END), \
              SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), \
              SUM(tokens_in), SUM(tokens_out), SUM(cache_read), SUM(cache_creation), \
-             MIN(ts_ms), MAX(ts_ms) \
+             MIN(ts_ms), MAX(ts_ms), {prompt_class} AS prompt_class \
              FROM usage WHERE ts_ms >= ?1 AND ts_ms <= ?2",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![
@@ -550,7 +566,7 @@ impl UsageDb {
             }
             sql.push(')');
         }
-        sql.push_str(" GROUP BY tenant, grp, model");
+        sql.push_str(" GROUP BY tenant, grp, model, prompt_class");
 
         let mut stmt = self
             .conn
@@ -571,6 +587,7 @@ impl UsageDb {
                     cache_creation: r.get::<_, i64>(9)? as u64,
                     first_ms: r.get::<_, i64>(10)? as u64,
                     last_ms: r.get::<_, i64>(11)? as u64,
+                    prompt_class: r.get::<_, i64>(12)? as usize,
                 })
             })
             .map_err(|e| UsageError::sqlite(&self.path, e))?;
@@ -599,15 +616,42 @@ impl UsageDb {
             // failures stay in the tenant totals (same rule as the in-memory
             // fold), so the two can legitimately disagree on token sums.
             if let (Some(group), Some(model)) = (row.group.clone(), row.model.clone()) {
-                entry.models.push(ModelUsage {
-                    group,
-                    model,
-                    requests: row.requests,
-                    tokens_in: row.tokens_in,
-                    tokens_out: row.tokens_out,
+                // Several prompt-class rows fold into ONE model cell. Class
+                // `c` means the prompt reached thresholds[..c], so the rows
+                // are long-context for this model iff its own threshold is
+                // among those.
+                let parts = crate::pricing::TokenParts {
+                    input: row.tokens_in,
+                    output: row.tokens_out,
                     cache_read: row.cache_read,
                     cache_creation: row.cache_creation,
-                });
+                };
+                let long = row.prompt_class > 0
+                    && crate::pricing::long_context_threshold(&model)
+                        <= thresholds[row.prompt_class.min(thresholds.len()) - 1];
+                let cell = match entry
+                    .models
+                    .iter_mut()
+                    .position(|m| m.group == group && m.model == model)
+                {
+                    Some(i) => &mut entry.models[i],
+                    None => {
+                        entry.models.push(ModelUsage {
+                            group,
+                            model,
+                            ..Default::default()
+                        });
+                        entry.models.last_mut().expect("just pushed")
+                    }
+                };
+                cell.requests += row.requests;
+                cell.tokens_in = cell.tokens_in.saturating_add(parts.input);
+                cell.tokens_out = cell.tokens_out.saturating_add(parts.output);
+                cell.cache_read = cell.cache_read.saturating_add(parts.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(parts.cache_creation);
+                if long {
+                    cell.long.add(&parts);
+                }
             }
         }
 
@@ -868,6 +912,8 @@ struct GroupRow {
     cache_creation: u64,
     first_ms: u64,
     last_ms: u64,
+    /// How many long-context thresholds this group's prompts reach.
+    prompt_class: usize,
 }
 
 fn total_tokens(m: &ModelUsage) -> u64 {
@@ -1320,14 +1366,17 @@ pub fn usage_doc(
                 .models
                 .into_iter()
                 .map(|m| {
-                    let tokens = TokenCounts {
+                    let all = crate::pricing::TokenParts {
                         input: m.tokens_in,
                         output: m.tokens_out,
-                        cache_read: Some(m.cache_read),
-                        cache_creation: Some(m.cache_creation),
+                        cache_read: m.cache_read,
+                        cache_creation: m.cache_creation,
                     };
                     TenantModelDoc {
-                        cost_usd: crate::pricing::cost_usd(&m.group, &m.model, &tokens, overrides),
+                        cost_usd: crate::pricing::aggregate_cost(
+                            &m.group, &m.model, &all, &m.long, overrides,
+                        )
+                        .unwrap_or(0.0),
                         group: m.group,
                         model: m.model,
                         requests: m.requests,
@@ -1546,5 +1595,96 @@ mod tests {
             .expect("import after refill");
         assert_eq!(outcome.imported, 4, "the refilled content is read");
         assert_eq!(db.row_count().unwrap(), 8);
+    }
+
+    /// Long-context tier: the keys report prices each (tenant, model) cell as
+    /// the sum of its stored per-request costs. Rows are one request each,
+    /// so the tier is derived per row at query time — rows written before
+    /// the tier existed (same schema, no new column) price correctly.
+    #[test]
+    fn tenant_cell_cost_equals_the_sum_of_its_request_costs() {
+        let db = UsageDb::open_in_memory().expect("open");
+        // (tenant, group, model, in, out, cache_read, cache_creation)
+        let rows = [
+            ("k-1", "grok", "grok-4.7", 1_000, 500, 150_000, 0), // short
+            ("k-1", "grok", "grok-4.7", 50_000, 2_000, 150_000, 0), // long (== 200k)
+            ("k-1", "grok", "grok-4.7", 199_000, 10, 0, 999),    // short (199,999)
+            ("k-1", "grok", "grok-4.7", 199_000, 10, 0, 1_000),  // long (200,000)
+            ("k-2", "grok", "grok-4.5", 300_000, 900, 10_000, 0), // long
+            ("k-2", "grok", "grok-4.5", 20_000, 900, 10_000, 0), // short
+            (
+                "k-2",
+                "claude",
+                "claude-opus-4-8",
+                10_000,
+                99,
+                250_000,
+                5_000,
+            ),
+            // OpenAI's boundary is 272k, not grok's 200k: with two thresholds
+            // live the SQL prompt class must bucket per model.
+            ("k-3", "codex", "gpt-6-sol", 1_000, 10, 270_998, 0), // short (271,998)
+            ("k-3", "codex", "gpt-6-sol", 2_000, 10, 270_000, 0), // long (272,000)
+            ("k-3", "codex", "gpt-6-sol", 250_000, 10, 0, 0),     // short (> 200k!)
+            ("k-3", "codex", "gpt-5.5-codex", 300_000, 10, 0, 0), // untiered: flat
+        ];
+        for (i, (tenant, group, model, input, output, cr, cc)) in rows.iter().enumerate() {
+            let row = UsageRow::new(
+                1_000 + i as u64,
+                i as u64,
+                Some(tenant),
+                Some(group),
+                Some(model),
+                200,
+            )
+            .with_tokens(*input, *output, *cr, *cc);
+            assert!(db.insert(&row).expect("insert"));
+        }
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10_000))
+            .expect("query");
+        assert_eq!(report.rows, rows.len() as u64);
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 10_000);
+        let sum = |tenant: &str, model: Option<&str>| -> f64 {
+            rows.iter()
+                .filter(|r| r.0 == tenant && model.is_none_or(|m| m == r.2))
+                .map(|(_, g, m, i, o, cr, cc)| {
+                    let t = TokenCounts {
+                        input: *i,
+                        output: *o,
+                        cache_read: Some(*cr),
+                        cache_creation: Some(*cc),
+                    };
+                    crate::pricing::cost_usd(g, m, &t, &HashMap::new())
+                })
+                .sum()
+        };
+        let mut cells = 0;
+        for tenant in &doc.tenants {
+            for cell in &tenant.models {
+                cells += 1;
+                let want = sum(&tenant.tenant, Some(&cell.model));
+                assert!(
+                    (cell.cost_usd - want).abs() < 1e-12,
+                    "{} {}: {} != {want}",
+                    tenant.tenant,
+                    cell.model,
+                    cell.cost_usd
+                );
+            }
+            let want = sum(&tenant.tenant, None);
+            assert!((tenant.cost_usd - want).abs() < 1e-12, "{}", tenant.tenant);
+        }
+        assert_eq!(
+            cells, 5,
+            "one cell per (tenant, model), prompt classes merged"
+        );
+        let grok47 = &doc
+            .tenants
+            .iter()
+            .find(|t| t.tenant == "k-1")
+            .expect("k-1")
+            .models[0];
+        assert_eq!((grok47.requests, grok47.tokens_in), (4, 449_000));
     }
 }

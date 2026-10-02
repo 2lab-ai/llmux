@@ -75,6 +75,8 @@ use view::DashboardView;
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.5",
@@ -6174,7 +6176,7 @@ mod tests {
         // Newest generation first, and every entry is distinct (a duplicate
         // would make the modulo cycle skip a model forever).
         assert_eq!(CODEX_MODELS[0], "gpt-6-astra");
-        assert_eq!(CODEX_MODELS.len(), 6);
+        assert_eq!(CODEX_MODELS.len(), 8);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -6849,6 +6851,7 @@ mod tests {
             cache_creation: 0,
             cost_usd: 0.1,
             priced: true,
+            long: Default::default(),
         };
         let mut view = empty_view();
         view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets
