@@ -1279,11 +1279,16 @@ fn safeguarded_request(stream: bool, safeguards: bool) -> String {
 }
 
 /// The only honest answer a translated backend can give: review `available`,
-/// every tool call `skipped` (non-latching), never an invented verdict.
-fn skipped_call_w1() -> serde_json::Value {
+/// every tool call per-call `unavailable` (`unsupported`) so the client
+/// classifies that call locally without latching the session, never an
+/// invented verdict.
+fn unavailable_call_w1() -> serde_json::Value {
     serde_json::json!([{
         "type": "dangerous_tool_use",
-        "status": {"type": "available", "tool_uses": {"call_w1": {"type": "skipped"}}},
+        "status": {
+            "type": "available",
+            "tool_uses": {"call_w1": {"type": "unavailable", "reason": "unsupported"}},
+        },
     }])
 }
 
@@ -1291,7 +1296,7 @@ fn skipped_call_w1() -> serde_json::Value {
 /// its terminal `message_delta`, so the client does not latch the session to
 /// local classification.
 #[tokio::test]
-async fn codex_stream_answers_requested_safeguards_with_skipped() {
+async fn codex_stream_answers_requested_safeguards_with_unavailable() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
     let proxy =
@@ -1310,14 +1315,14 @@ async fn codex_stream_answers_requested_safeguards_with_skipped() {
     assert_eq!(delta["stop_reason"], "tool_use");
     assert_eq!(
         delta["safeguard_results"],
-        skipped_call_w1(),
+        unavailable_call_w1(),
         "full body:\n{body}"
     );
 }
 
 /// Non-stream twin: the aggregate carries a top-level `safeguard_results`.
 #[tokio::test]
-async fn codex_aggregate_answers_requested_safeguards_with_skipped() {
+async fn codex_aggregate_answers_requested_safeguards_with_unavailable() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
     let proxy =
@@ -1328,7 +1333,11 @@ async fn codex_aggregate_answers_requested_safeguards_with_skipped() {
     assert_eq!(response.status(), 200);
     let message: serde_json::Value = response.json().await.expect("json");
     assert_eq!(message["content"][1]["id"], "call_w1");
-    assert_eq!(message["safeguard_results"], skipped_call_w1(), "{message}");
+    assert_eq!(
+        message["safeguard_results"],
+        unavailable_call_w1(),
+        "{message}"
+    );
 }
 
 /// Without a safeguard in the request, neither leg grows the field.

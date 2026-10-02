@@ -226,21 +226,36 @@ pub fn requests_tool_use_review(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The per-call `reason` on a translated backend's `unavailable` tool use: no
+/// reviewer exists behind this backend. Must never be `"truncated"` (the
+/// client does not fall back to its local classifier for it) or `"refused"`
+/// (the client takes its policy-refusal block path).
+const SAFEGUARD_UNAVAILABLE_REASON: &str = "unsupported";
+
 /// The `safeguard_results` answer to a `dangerous_tool_use` safeguard: the
-/// review is `available`, and each tool use in `ids` was `skipped`.
+/// review is `available`, and each tool use in `ids` is per-call
+/// `unavailable` with [`SAFEGUARD_UNAVAILABLE_REASON`].
 ///
-/// Behind a gateway Claude Code latches the WHOLE session to local
-/// classification when `safeguard_results` is missing, a tool id is absent
-/// from the map, or the status is session-level `unavailable` — so silence
-/// from a translated backend turns server-side review off for every later
-/// turn, the Anthropic ones included. A per-call `skipped` does not latch:
-/// the client classifies just that action locally. No reviewer ever saw
-/// these calls, so `skipped` is the only honest answer — never fabricate an
-/// `evaluated` verdict.
-fn skipped_safeguard_results<'a>(ids: impl IntoIterator<Item = &'a str>) -> Value {
+/// Two levels, two meanings. Behind a gateway Claude Code latches the WHOLE
+/// session to local classification when `safeguard_results` is missing, a
+/// tool id is absent from the map, or the session-level `status` is
+/// `unavailable` — so silence from a translated backend turns server-side
+/// review off for every later turn, the Anthropic ones included. A per-call
+/// `unavailable` (reason neither `"truncated"` nor `"refused"`) does not
+/// latch: the client's local classifier decides just that call, and the
+/// rest of the session keeps server review. A per-call `skipped` is NOT
+/// equivalent — measured live on Claude Code 2.1.286/2.1.287, the client
+/// treats it as "gave no verdict" and denies the action. No reviewer ever
+/// saw these calls, so never fabricate an `evaluated` verdict.
+fn unavailable_safeguard_results<'a>(ids: impl IntoIterator<Item = &'a str>) -> Value {
     let tool_uses: serde_json::Map<String, Value> = ids
         .into_iter()
-        .map(|id| (id.to_string(), json!({"type": "skipped"})))
+        .map(|id| {
+            (
+                id.to_string(),
+                json!({"type": "unavailable", "reason": SAFEGUARD_UNAVAILABLE_REASON}),
+            )
+        })
         .collect();
     json!([{
         "type": "dangerous_tool_use",
@@ -765,7 +780,7 @@ impl ResponsesSseConverter {
         let mut delta = json!({"stop_reason": stop_reason, "stop_sequence": null});
         if self.safeguards_requested {
             delta["safeguard_results"] =
-                skipped_safeguard_results(self.announced_tool_ids.iter().map(String::as_str));
+                unavailable_safeguard_results(self.announced_tool_ids.iter().map(String::as_str));
         }
         Self::emit(
             out,
@@ -900,7 +915,7 @@ impl ResponsesSseConverter {
         // Keyed by the tool uses actually in `content`: a capped turn's
         // dropped calls are not in the aggregate, so they are not keyed.
         let safeguard_results = self.safeguards_requested.then(|| {
-            skipped_safeguard_results(
+            unavailable_safeguard_results(
                 content
                     .iter()
                     .filter(|b| b["type"] == "tool_use")
@@ -2312,10 +2327,15 @@ mod tests {
         ]
     }
 
-    fn skipped_for(ids: &[&str]) -> Value {
+    fn unavailable_for(ids: &[&str]) -> Value {
         let tool_uses: serde_json::Map<String, Value> = ids
             .iter()
-            .map(|id| (id.to_string(), json!({"type": "skipped"})))
+            .map(|id| {
+                (
+                    id.to_string(),
+                    json!({"type": "unavailable", "reason": "unsupported"}),
+                )
+            })
             .collect();
         json!([{
             "type": "dangerous_tool_use",
@@ -2324,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_safeguards_mark_every_streamed_tool_use_skipped() {
+    fn requested_safeguards_mark_every_streamed_tool_use_unavailable() {
         let (_, events) = run_with_safeguards(&two_tool_calls());
         let announced: Vec<&str> = events
             .iter()
@@ -2336,13 +2356,13 @@ mod tests {
         assert_eq!(delta["stop_reason"], "tool_use");
         assert_eq!(
             delta["safeguard_results"],
-            skipped_for(&announced),
-            "every announced tool id is covered by a non-latching `skipped`"
+            unavailable_for(&announced),
+            "every announced tool id is covered by a non-latching per-call `unavailable`"
         );
     }
 
     #[test]
-    fn requested_safeguards_mark_every_aggregate_tool_use_skipped() {
+    fn requested_safeguards_mark_every_aggregate_tool_use_unavailable() {
         let (converter, _) = run_with_safeguards(&two_tool_calls());
         let message = converter.into_message_json().expect("aggregate");
         let ids: Vec<&str> = message["content"]
@@ -2353,7 +2373,7 @@ mod tests {
             .map(|b| b["id"].as_str().expect("tool id"))
             .collect();
         assert_eq!(ids, vec!["c1", "c2"]);
-        assert_eq!(message["safeguard_results"], skipped_for(&ids));
+        assert_eq!(message["safeguard_results"], unavailable_for(&ids));
     }
 
     #[test]
@@ -2374,9 +2394,9 @@ mod tests {
         let (converter, events) = run_with_safeguards(&text_only_turn());
         let delta = &find(&events, "message_delta")["delta"];
         assert_eq!(delta["stop_reason"], "end_turn");
-        assert_eq!(delta["safeguard_results"], skipped_for(&[]));
+        assert_eq!(delta["safeguard_results"], unavailable_for(&[]));
         let message = converter.into_message_json().expect("aggregate");
-        assert_eq!(message["safeguard_results"], skipped_for(&[]));
+        assert_eq!(message["safeguard_results"], unavailable_for(&[]));
     }
 
     #[test]
