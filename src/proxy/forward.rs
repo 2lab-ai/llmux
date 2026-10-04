@@ -151,31 +151,11 @@ pub fn classify(status: StatusCode, headers: &HeaderMap) -> UpstreamSignal {
     }
 }
 
-/// Classify a reqwest send failure: connect refused / reset / timeout are
-/// transient (close the client connection, let it retry); everything else
-/// is persistent (mark account, switch, bounded retry).
-pub fn classify_send_error(err: &reqwest::Error) -> UpstreamSignal {
-    if err.is_connect() || err.is_timeout() {
-        return UpstreamSignal::Transient;
-    }
-    // Connection resets surface as io errors buried in the source chain.
-    let mut source = std::error::Error::source(err);
-    while let Some(inner) = source {
-        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::UnexpectedEof
-            ) {
-                return UpstreamSignal::Transient;
-            }
-        }
-        source = std::error::Error::source(inner);
-    }
-    UpstreamSignal::Persistent
+/// A send failure has no upstream authentication verdict. Return a recoverable
+/// transport error without benching the account; actual 401s are handled by
+/// `classify` after a response arrives.
+pub fn classify_send_error(_err: &reqwest::Error) -> UpstreamSignal {
+    UpstreamSignal::Transient
 }
 
 /// Strip hop-by-hop headers, `accept-encoding` (avoid decompression
@@ -3754,6 +3734,18 @@ mod tests {
             out.get("content-type").expect("content-type kept"),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn non_connect_send_error_is_transient() {
+        let err = reqwest::Client::new()
+            .get("ftp://127.0.0.1/")
+            .send()
+            .await
+            .expect_err("unsupported scheme");
+        assert!(!err.is_connect());
+        assert!(!err.is_timeout());
+        assert_eq!(classify_send_error(&err), UpstreamSignal::Transient);
     }
 
     #[test]

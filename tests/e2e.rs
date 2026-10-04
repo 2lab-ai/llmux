@@ -192,6 +192,69 @@ async fn post_messages(client: &reqwest::Client, proxy: &Proxy, body: &str) -> r
         .expect("proxy reachable")
 }
 
+/// An HTTP protocol error is neither connect nor timeout, but must not turn
+/// the sole account into AuthFailed. A subsequent request can reuse it.
+#[tokio::test]
+async fn transport_protocol_error_does_not_bench_the_sole_account() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let upstream = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        for reply in [
+            &b"HTTP/1.1 invalid\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+        ] {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0; 8192];
+            let read = socket.read(&mut request).await.expect("request");
+            assert!(read > 0);
+            socket.write_all(reply).await.expect("reply");
+            socket.shutdown().await.expect("close");
+        }
+    });
+    let proxy = Proxy::spawn(
+        &upstream,
+        vec![AccountConfig {
+            name: "a".into(),
+            credential: AccountCredential::Apikey {
+                api_key: "test-key".into(),
+            },
+        }],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let first = post_messages(&client, &proxy, r#"{"messages":[]}"#).await;
+    assert_eq!(first.status(), 502);
+    assert!(proxy.pool.snapshot().accounts[0].healthy);
+    let second = post_messages(&client, &proxy, r#"{"messages":[]}"#).await;
+    assert_eq!(second.status(), 200);
+    assert!(proxy.pool.snapshot().accounts[0].healthy);
+    server.await.expect("server");
+}
+
+#[tokio::test]
+async fn actual_auth_rejection_still_benches_the_sole_account() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::AuthRejected);
+    let proxy = Proxy::spawn(
+        &mock.base_url(),
+        vec![AccountConfig {
+            name: "a".into(),
+            credential: AccountCredential::Apikey {
+                api_key: "test-key".into(),
+            },
+        }],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let _ = post_messages(&client, &proxy, r#"{"messages":[]}"#).await;
+    assert!(!proxy.pool.snapshot().accounts[0].healthy);
+    assert!(proxy.pool.lease_for(None, &default_params()).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // 1. Byte-identical relay + auth rewrite
 // ---------------------------------------------------------------------------
