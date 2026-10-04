@@ -137,6 +137,8 @@ It also makes Claude Code's `/model` picker list the llmux catalog: `run` fetche
 
 Daemon stderr is written to `~/.local/state/llmux/server.log`, respecting `$XDG_STATE_HOME`. A port occupied by a foreign process is an error; llmux never overwrites it.
 
+Upstream transport send failures return a recoverable 502 without marking the account authentication-failed. Subsequent requests can select the same account without restarting the daemon; actual upstream 401s retain the refresh/authentication-failure handling.
+
 Manual shell wiring:
 
 ```bash
