@@ -554,7 +554,11 @@ pub(crate) fn expiry_label(expires_at: &str, now: SystemTime) -> String {
     }
 }
 
-/// The soonest expiry among the listed credits, when any carries one.
+/// The soonest expiry among the listed live credits, when any carries one —
+/// compared as PARSED instants, not as strings (RFC3339 with mixed UTC
+/// offsets does not sort lexically). Unparseable rows cannot win, so a
+/// malformed value never displaces a real soonest expiry; they stay visible
+/// in the per-row listing.
 pub(crate) fn earliest_expiry(
     control: &crate::proxy::usage_controls::UsageControlDoc,
 ) -> Option<&str> {
@@ -562,8 +566,13 @@ pub(crate) fn earliest_expiry(
         .credits
         .iter()
         .filter(|c| c.status.as_deref() != Some("spent"))
-        .filter_map(|c| c.expires_at.as_deref())
-        .min()
+        .filter_map(|c| {
+            let raw = c.expires_at.as_deref()?;
+            let at = crate::scheduler::headers::parse_rfc3339(raw)?;
+            Some((at, raw))
+        })
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, raw)| raw)
 }
 
 /// The compact accounts-table cell for an account's reset count:
@@ -1279,6 +1288,29 @@ mod tests {
             "not-a-date",
             "unparseable stays visible"
         );
+        // Soonest expiry is chosen by INSTANT: the +09:00 row expires before
+        // the Z row even though it sorts after it as a string, and a
+        // malformed row never wins.
+        let credit = |id: &str, expires: &str| crate::auth::codex_usage::ResetCredit {
+            id: Some(id.into()),
+            status: Some("available".into()),
+            expires_at: Some(expires.into()),
+            ..Default::default()
+        };
+        let mixed = UsageControlDoc {
+            credits: vec![
+                credit("z", "2026-10-22T23:00:00Z"),
+                credit("kst", "2026-10-23T00:30:00+09:00"),
+                credit("bad", "garbage"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(earliest_expiry(&mixed), Some("2026-10-23T00:30:00+09:00"));
+        let only_bad = UsageControlDoc {
+            credits: vec![credit("bad", "garbage")],
+            ..Default::default()
+        };
+        assert_eq!(earliest_expiry(&only_bad), None);
         assert!(expiry_label("2026-01-01T00:00:00Z", now).ends_with("(expired)"));
         let doc = |available, applicable| UsageControlDoc {
             available_resets: available,

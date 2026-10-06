@@ -38,6 +38,14 @@ use crate::tui::ActivityEvent;
 
 pub use crate::auth::codex_usage::ResetOutcome;
 
+/// The retained error for a Claude read whose `cedar_ember.eligible` was
+/// null (observed live under upstream rate limiting, 2026-10-06): the usage
+/// windows are good, the reset inventory is unknown for THIS read and the
+/// previous observation is kept, visibly stale.
+const RESET_STATUS_UNKNOWN: &str =
+    "reset-grant status unknown on this read (upstream throttled?); \
+     the reset inventory shown is from the previous successful read";
+
 // ---------------------------------------------------------------------------
 // Wire types (shared by the HTTP handlers, the CLI and the TUI)
 // ---------------------------------------------------------------------------
@@ -1075,21 +1083,33 @@ impl AppState {
             if fresh.applicable_resets.is_some() {
                 doc.applicable_resets = fresh.applicable_resets;
             }
-            if let Some(eligibility) = &fresh.eligibility {
-                // A NEGATIVE verdict makes the counts UNKNOWN for this surface
-                // — a stale "1 owned" from an earlier eligible read must not
-                // outlive the verdict that revoked it. A null verdict (seen
-                // live under rate limiting) is NOT a revocation: it keeps the
-                // previous counts, per the rule that only success moves them.
-                if eligibility.eligible == Some(false) {
-                    doc.available_resets = None;
-                    doc.applicable_resets = None;
-                }
-                doc.eligibility = Some(eligibility.clone());
-            }
             doc.last_refresh_ms = Some(now_ms());
             doc.last_error = None;
             doc.last_error_ms = None;
+            if let Some(eligibility) = &fresh.eligibility {
+                match eligibility.eligible {
+                    // A NEGATIVE verdict makes the counts UNKNOWN for this
+                    // surface — a stale "1 owned" from an earlier eligible
+                    // read must not outlive the verdict that revoked it.
+                    Some(false) => {
+                        doc.available_resets = None;
+                        doc.applicable_resets = None;
+                        doc.credits.clear();
+                        doc.eligibility = Some(eligibility.clone());
+                    }
+                    Some(true) => doc.eligibility = Some(eligibility.clone()),
+                    // A null verdict (seen live under rate limiting) is NOT a
+                    // revocation and NOT a fresh grant observation either: the
+                    // usage windows above are good, but the reset inventory —
+                    // counts, rows, expiry, weekly reset — stays exactly as the
+                    // last real read left it, and the retained error says so,
+                    // so the detail pane never shows the old count as fresh.
+                    None => {
+                        doc.last_error = Some(RESET_STATUS_UNKNOWN.into());
+                        doc.last_error_ms = Some(now_ms());
+                    }
+                }
+            }
         });
         (
             RefreshResult {
@@ -1185,6 +1205,17 @@ impl AppState {
                     ));
                 };
                 let eligibility = status.eligibility();
+                // A null verdict is a FAILED inventory read, not an empty
+                // inventory: the previous rows/expiry stay on the doc, the
+                // listing reports the failure, and a new redemption's
+                // fresh-inventory gate refuses (never fed the retained rows).
+                if eligibility.eligible.is_none() {
+                    self.usage_controls.update(&target.id.0, |doc| {
+                        doc.last_error = Some(RESET_STATUS_UNKNOWN.into());
+                        doc.last_error_ms = Some(now_ms());
+                    });
+                    return Err(UsageControlError::Upstream(RESET_STATUS_UNKNOWN.into()));
+                }
                 self.usage_controls.update(&target.id.0, |doc| {
                     match eligibility.eligible {
                         // Revoked for this surface: the counts are unknown.
@@ -1192,9 +1223,7 @@ impl AppState {
                             doc.available_resets = None;
                             doc.applicable_resets = None;
                         }
-                        Some(true) => doc.applicable_resets = status.applicable_count(),
-                        // Null verdict (throttled read): keep what we had.
-                        None => {}
+                        _ => doc.applicable_resets = status.applicable_count(),
                     }
                     doc.eligibility = Some(eligibility.clone());
                 });
@@ -1288,9 +1317,11 @@ impl AppState {
         self.hydrate_pending().await?;
 
         // Claude redemption is a per-organization route, so the org uuid is
-        // resolved HERE — before any receipt exists — from the profile
-        // endpoint (a read). A failure here spends nothing and leaves nothing
-        // pending.
+        // resolved HERE from the profile endpoint (a read): for a NEW
+        // redemption that is before any receipt exists, so a failure spends
+        // nothing and leaves nothing pending; on a RETRY the existing receipt
+        // simply stays held (a profile outage delays the retry, it cannot
+        // double-spend).
         let org_uuid = match &target.credential {
             AccountCredential::Oauth { access_token, .. } => Some(
                 crate::auth::profile::fetch_profile(

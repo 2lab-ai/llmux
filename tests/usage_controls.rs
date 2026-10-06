@@ -621,10 +621,13 @@ async fn claude_account_reads_grants_and_redeems_one_by_id() {
 }
 
 /// A throttled read answers 200 with `cedar_ember.eligible: null` (observed
-/// live 2026-10-06 under a probe burst). That is NOT a revocation: the
-/// previously known counts survive, and only an explicit `false` clears them.
+/// live 2026-10-06 under a probe burst). That is NOT a revocation and NOT a
+/// fresh inventory: the entitlement listing fails (previous rows retained),
+/// a usage refresh keeps the known counts/rows/expiry/weekly reset but flags
+/// the inventory as stale through the retained error, a new redemption is
+/// refused before any POST, and only an explicit `false` clears the counts.
 #[tokio::test]
-async fn claude_null_eligibility_keeps_known_counts_but_false_clears_them() {
+async fn claude_null_eligibility_keeps_known_inventory_visibly_stale_and_false_clears_it() {
     const THROTTLED: &str = r#"{
       "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
       "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
@@ -632,39 +635,83 @@ async fn claude_null_eligibility_keeps_known_counts_but_false_clears_them() {
       "cedar_ember": {"eligible":null,"ineligible_reason":null,"at_limit":false,"exhausted":[],"grants":[],"next_grant_id":null,"weekly_resets_at":null,"cooldown_until":null,"event_props":null}
     }"#;
     let mock = WhamMock::spawn().await;
-    mock.push_claude_usage(200, CLAUDE_USAGE_ELIGIBLE);
-    mock.push_claude_usage(200, THROTTLED);
-    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE);
+    mock.push_claude_usage(200, CLAUDE_USAGE_ELIGIBLE); // 1. list
+    mock.push_claude_usage(200, THROTTLED); // 2. list
+    mock.push_claude_usage(200, THROTTLED); // 3. refresh
+    mock.push_claude_usage(200, THROTTLED); // 4. consume's fresh-inventory read
+    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE); // 5. refresh
     let proxy = Proxy::spawn(&mock, vec![oauth_account("cl")]).await;
 
-    let refresh = || {
-        post_admin(
-            &proxy,
-            "/llmux/refresh-usage",
-            serde_json::json!({"account":"cl"}),
-        )
-    };
-    let (_, body) = refresh().await;
-    assert_eq!(body["results"][0]["usage_control"]["available_resets"], 1);
+    // 1. A real read establishes the inventory.
+    let (status, list) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(list["available_count"], 1);
+    assert_eq!(
+        list["credits"][0]["expires_at"],
+        "2099-10-22T16:00:00+00:00"
+    );
 
-    let (status, body) = refresh().await;
+    // 2. The throttled listing is a FAILED inventory read, not an empty one.
+    let (status, err) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        err.to_string().contains("previous successful read"),
+        "{err}"
+    );
+
+    // 3. A throttled usage refresh keeps everything from read 1 and says so.
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     let control = &body["results"][0]["usage_control"];
+    assert_eq!(control["available_resets"], 1, "{control}");
     assert_eq!(
-        control["available_resets"], 1,
-        "a null verdict keeps the known count: {control}"
-    );
-    assert!(
-        control["eligibility"].get("eligible").is_none(),
+        control["credits"][0]["expires_at"], "2099-10-22T16:00:00+00:00",
         "{control}"
     );
-
-    let (_, body) = refresh().await;
-    let control = &body["results"][0]["usage_control"];
-    assert!(
-        control.get("available_resets").is_none(),
-        "an explicit false clears it: {control}"
+    assert_eq!(
+        control["eligibility"]["weekly_resets_at"], "2099-10-12T22:00:00+00:00",
+        "the weekly reset from the real read survives: {control}"
     );
+    assert!(
+        control["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("previous successful read")),
+        "the retained count is flagged stale: {control}"
+    );
+
+    // 4. A new redemption needs a FRESH inventory; the throttled read refuses
+    //    before any POST — the retained rows are never fed to the gate.
+    let (status, err) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-stale","confirm":true}),
+    )
+    .await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        !mock
+            .seen()
+            .iter()
+            .any(|s| s.method == "POST" && s.path.contains("reset_rate_limits")),
+        "no redemption POST on a stale inventory: {:?}",
+        mock.seen_paths()
+    );
+
+    // 5. An explicit `false` clears counts and rows and names the reason.
+    let (_, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
+    let control = &body["results"][0]["usage_control"];
+    assert!(control.get("available_resets").is_none(), "{control}");
+    assert!(control.get("credits").is_none(), "rows cleared: {control}");
     assert_eq!(control["eligibility"]["ineligible_reason"], "surface");
 }
 
