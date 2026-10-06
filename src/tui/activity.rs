@@ -2909,7 +2909,8 @@ mod tests {
         assert_eq!(normalize_model("opus"), "claude-opus-5-5");
         assert_eq!(normalize_model("opus-5-5"), "claude-opus-5-5");
         assert_eq!(normalize_model("opus-5"), "claude-opus-5");
-        assert_eq!(normalize_model("sonnet"), "claude-sonnet-5");
+        assert_eq!(normalize_model("sonnet"), "claude-sonnet-5-5");
+        assert_eq!(normalize_model("sonnet-5-5"), "claude-sonnet-5-5");
         assert_eq!(normalize_model("sonnet-5"), "claude-sonnet-5");
         assert_eq!(normalize_model("fable"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");

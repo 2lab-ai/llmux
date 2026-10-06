@@ -156,7 +156,7 @@ Codex settings are configurable in the config file and adjustable live from the 
 |---|---|
 | `codex.default_model` | Upstream Codex model slug; default `gpt-5.6-sol`. |
 | `codex.fast` | Sends `service_tier: "priority"` when true. |
-| `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (`ultra` on `gpt-5.6-sol`/`-terra`). `max`/`ultra` clamp to `xhigh` on models below the gpt-5.6 family. |
+| `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (`ultra` on `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol`/`-terra`). `max`/`ultra` clamp to `xhigh` on models below the gpt-5.6 family. |
 
 For Claude Code model-selection details, including `gpt-5.5[1m]` and the long-context compaction workaround, see [operational-reference.md](operational-reference.md#selecting-the-codex-model-from-claude-code) and [faq.md](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
 
