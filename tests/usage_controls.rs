@@ -635,9 +635,21 @@ async fn claude_null_eligibility_keeps_known_inventory_visibly_stale_and_false_c
       "cedar_ember": {"eligible":null,"ineligible_reason":null,"at_limit":false,"exhausted":[],"grants":[],"next_grant_id":null,"weekly_resets_at":null,"cooldown_until":null,"event_props":null}
     }"#;
     let mock = WhamMock::spawn().await;
+    const WHOLE_NULL: &str = r#"{
+      "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+      "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+      "limits": [], "cedar_ember": null
+    }"#;
+    const KEY_ABSENT: &str = r#"{
+      "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+      "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+      "limits": []
+    }"#;
     mock.push_claude_usage(200, CLAUDE_USAGE_ELIGIBLE); // 1. list
     mock.push_claude_usage(200, THROTTLED); // 2. list
     mock.push_claude_usage(200, THROTTLED); // 3. refresh
+    mock.push_claude_usage(200, WHOLE_NULL); // 3b. refresh (object null)
+    mock.push_claude_usage(200, KEY_ABSENT); // 3c. refresh (key absent)
     mock.push_claude_usage(200, THROTTLED); // 4. consume's fresh-inventory read
     mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE); // 5. refresh
     let proxy = Proxy::spawn(&mock, vec![oauth_account("cl")]).await;
@@ -683,6 +695,35 @@ async fn claude_null_eligibility_keeps_known_inventory_visibly_stale_and_false_c
             .is_some_and(|e| e.contains("previous successful read")),
         "the retained count is flagged stale: {control}"
     );
+
+    // 3b/3c. The other throttled shapes — the whole object null, or the key
+    //        absent — are the same unknown: nothing is lost, nothing looks
+    //        fresh, and the stale flag from 3 is not wiped by them.
+    for shape in ["object null", "key absent"] {
+        let (status, body) = post_admin(
+            &proxy,
+            "/llmux/refresh-usage",
+            serde_json::json!({"account":"cl"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{shape}: {body}");
+        let control = &body["results"][0]["usage_control"];
+        assert_eq!(control["available_resets"], 1, "{shape}: {control}");
+        assert_eq!(
+            control["credits"][0]["expires_at"], "2099-10-22T16:00:00+00:00",
+            "{shape}: {control}"
+        );
+        assert_eq!(
+            control["eligibility"]["weekly_resets_at"], "2099-10-12T22:00:00+00:00",
+            "{shape}: {control}"
+        );
+        assert!(
+            control["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("previous successful read")),
+            "{shape}: still flagged stale: {control}"
+        );
+    }
 
     // 4. A new redemption needs a FRESH inventory; the throttled read refuses
     //    before any POST — the retained rows are never fed to the gate.

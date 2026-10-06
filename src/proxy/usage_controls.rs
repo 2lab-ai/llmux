@@ -979,11 +979,16 @@ impl AppState {
                         applicable_resets: status.applicable_count(),
                         eligibility: Some(status.eligibility()),
                     },
-                    // No `cedar_ember` in the body (seen under rate limiting):
-                    // the windows are good, the grant counters stay UNKNOWN.
+                    // No `cedar_ember` object in the body (null / absent —
+                    // another throttled shape): the windows are good, the
+                    // grant inventory is UNKNOWN for this read. Normalize to
+                    // an all-None verdict so `apply_refresh` takes the same
+                    // "retain + flag stale" branch as `eligible: null`.
                     None => CodexUsage {
                         usage: read.usage,
-                        ..Default::default()
+                        available_resets: None,
+                        applicable_resets: None,
+                        eligibility: Some(ResetEligibility::default()),
                     },
                 })
                 .map_err(upstream)
