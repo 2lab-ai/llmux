@@ -248,11 +248,13 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
 /// Upstream slugs the ChatGPT-account codex backend is known to accept
 /// (probed 2026-07-10; `gpt-5.6-luna` parses upstream but currently returns
 /// "Model not found" — kept so it starts working the moment OpenAI enables
-/// it; `gpt-6-astra` accepted by the same header set on the 2026-09-07 probe).
-/// Requests naming one of these are forwarded VERBATIM; the bare `gpt-5.6` id
-/// maps to the sol flagship and the bare `gpt-6` id to astra (the backend
-/// rejects bare generation ids); any other requested model keeps the
-/// configured pin.
+/// it; `gpt-6-astra` accepted by the same header set on the 2026-09-07 probe;
+/// `gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna` each answered HTTP 200 with
+/// the slug echoed as `model` on a 2026-10-06 probe through the live daemon —
+/// one 16-token request per slug, pinned via `POST /llmux/codex`).
+/// Requests naming one of these are forwarded VERBATIM; the bare generation
+/// ids map to their flagship ([`GENERATION_ALIASES`]; the backend rejects
+/// bare generation ids); any other requested model keeps the configured pin.
 const PASSTHROUGH_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-5.5-codex",
@@ -361,6 +363,16 @@ fn supports_extended_efforts(model: &str) -> bool {
         || m.starts_with("gpt-6.1-")
 }
 
+/// `ultra` ("maximum reasoning with automatic task delegation") is listed for
+/// the sol/terra/astra tiers but NOT for luna (`gpt-5.6-luna`, `gpt-6-luna` —
+/// openai/codex models.json @ d63a9b83, 2026-10-06). The picker menu alone
+/// cannot constrain a configured or directly submitted value, so the clamp in
+/// [`resolve_reasoning_effort`] uses this too.
+fn supports_ultra(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    supports_extended_efforts(&m) && !m.contains("-luna")
+}
+
 /// Per-request reasoning effort: a CONFIGURED shape effort (dashboard `e`
 /// cycle / config `reasoning_effort`) OVERRIDES whatever the client sent —
 /// that is what selecting a concrete value in the UI means (UI-3 U12).
@@ -380,6 +392,11 @@ fn resolve_reasoning_effort(
     let clamp = |e: String| {
         if (e == "max" || e == "ultra") && !supports_extended_efforts(upstream_model) {
             "xhigh".to_string()
+        } else if e == "ultra" && !supports_ultra(upstream_model) {
+            // Luna tiers list low..max only (models.json 2026-10-06): `ultra`
+            // lands as `max`, the top of their menu, rather than reaching a
+            // backend that would reject it.
+            "max".to_string()
         } else {
             e
         }
@@ -789,6 +806,53 @@ mod tests {
                 CODEX_MODEL
             );
         }
+    }
+
+    #[test]
+    fn ultra_clamps_to_max_on_luna_from_both_sources() {
+        // Client-supplied `ultra` on a luna model.
+        let body = json!({
+            "model": "gpt-6-luna",
+            "output_config": { "effort": "ultra" },
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        let (model, effort, _) = effective_request_meta(&body, &CodexShape::default());
+        assert_eq!(model, "gpt-6-luna");
+        assert_eq!(effort.as_deref(), Some("max"), "luna has no ultra tier");
+        // Configured `ultra` on the 5.6 luna, via the alias.
+        let shape = CodexShape {
+            model: CODEX_MODEL.to_string(),
+            client_model: None,
+            fast: false,
+            effort: Some("ultra".into()),
+        };
+        let body = json!({ "model": "gpt-5.6-luna", "messages": [{"role":"user","content":"hi"}] });
+        let (_, effort, _) = effective_request_meta(&body, &shape);
+        assert_eq!(effort.as_deref(), Some("max"));
+        // `ultra` still rides through on the tiers that list it.
+        for m in [
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ] {
+            let body = json!({
+                "model": m,
+                "output_config": { "effort": "ultra" },
+                "messages": [{"role":"user","content":"hi"}]
+            });
+            let (_, effort, _) = effective_request_meta(&body, &CodexShape::default());
+            assert_eq!(effort.as_deref(), Some("ultra"), "{m}");
+        }
+        // Below the extended families it still clamps to xhigh.
+        let body = json!({
+            "model": "gpt-5.5",
+            "output_config": { "effort": "ultra" },
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        let (_, effort, _) = effective_request_meta(&body, &CodexShape::default());
+        assert_eq!(effort.as_deref(), Some("xhigh"));
     }
 
     #[test]

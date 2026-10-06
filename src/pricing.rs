@@ -228,8 +228,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     } else if model_norm_lower.starts_with("gpt-6-luna-") {
         Some(GPT_6_LUNA)
     } else if model_norm_lower.starts_with("gpt-6-") {
-        // Astra is generation 6's flagship (and its only tier), so it is the
-        // `gpt-6-` default exactly as sol is for `gpt-5.6-`. The required `-`
+        // Astra is generation 6's flagship, so it is the `gpt-6-` default
+        // exactly as sol is for `gpt-5.6-` (sol/luna have their own exact and
+        // prefix rows above). The required `-`
         // is the generation boundary: `gpt-60-*` and `gpt-6.5-*` are DIFFERENT
         // generations and must miss this branch (mirrors codex.rs
         // `supports_extended_efforts`).
