@@ -95,6 +95,16 @@ pub struct Config {
     /// field loads with effects ON.
     #[serde(default = "default_true")]
     pub tui_effects: bool,
+    /// Claude Code version llmux identifies as (`User-Agent:
+    /// claude-cli/<v> (external, cli)`) when it reads or redeems Claude
+    /// usage-limit reset grants — the Anthropic endpoint gates those on the
+    /// client surface and version (`ineligible_reason: surface | cli_version`).
+    /// `None` = the built-in
+    /// [`crate::auth::claude_resets::DEFAULT_CLAUDE_CLI_VERSION`]; set it when
+    /// the daemon starts answering `cli_version` and a rebuild is not at hand.
+    /// Additive: absent in older configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_cli_version: Option<String>,
     /// TUI gradient animation tuning (UI-8): drift speed + per-group base
     /// colors for the headline-model gradient, and an optional solid override
     /// for the `max` effort token. Display-only, carried on the dashboard
@@ -320,6 +330,7 @@ impl Default for Config {
             raw_io: RawIoConfig::default(),
             email_anonymous: false,
             tui_effects: true,
+            claude_cli_version: None,
             tui_gradient: TuiGradient::default(),
             show_fable_weekly: true,
             domain_abbrev: default_domain_abbrev(),

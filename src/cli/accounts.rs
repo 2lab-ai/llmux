@@ -368,10 +368,29 @@ async fn fetch_resets(
 /// this command can never redeem.
 async fn resets(endpoint: &Endpoint, account: &str) -> Result<(), CliError> {
     let list = fetch_resets(endpoint, account).await?;
+    let now = std::time::SystemTime::now();
     println!(
         "{account} — resets {}",
         reset_count_label(list.available_count, list.applicable_available_count)
     );
+    if let Some(e) = &list.eligibility {
+        match (e.eligible, e.ineligible_reason.as_deref()) {
+            (Some(false), reason) => println!(
+                "  not eligible on this surface: {} — grants are read through the usage \
+                 endpoint as Claude Code; `cli_version` means the daemon's \
+                 `claude_cli_version` is below the server's floor",
+                reason.unwrap_or("no reason given")
+            ),
+            (None, _) => println!("  eligibility unknown (upstream did not say)"),
+            (Some(true), _) => {}
+        }
+        if let Some(weekly) = e.weekly_resets_at.as_deref() {
+            println!(
+                "  weekly window resets {}",
+                crate::tui::view::expiry_label(weekly, now)
+            );
+        }
+    }
     if let Some(warning) = &list.applicability_warning {
         println!("  note: {warning}");
     }
@@ -395,13 +414,21 @@ async fn resets(endpoint: &Endpoint, account: &str) -> Result<(), CliError> {
             .map(|id| format!(" · id {id}"))
             .unwrap_or_default();
         println!("  [{status}] {title} ({kind}){id}");
-        if let Some(granted) = &credit.granted_at {
-            let expires = credit
-                .expires_at
-                .as_deref()
-                .map(|e| format!(" · expires {e}"))
-                .unwrap_or_default();
-            println!("       granted {granted}{expires}");
+        let granted = credit
+            .granted_at
+            .as_deref()
+            .map(|g| format!("granted {g}"))
+            .unwrap_or_default();
+        let expires = credit
+            .expires_at
+            .as_deref()
+            .map(|e| format!("expires {} [{e}]", crate::tui::view::expiry_label(e, now)))
+            .unwrap_or_default();
+        match (granted.is_empty(), expires.is_empty()) {
+            (true, true) => {}
+            (false, true) => println!("       {granted}"),
+            (true, false) => println!("       {expires}"),
+            (false, false) => println!("       {granted} · {expires}"),
         }
         if let Some(description) = &credit.description {
             println!("       {description}");
@@ -465,8 +492,8 @@ fn choose_credit<'a>(
         .ok_or_else(|| {
             format!(
                 "no redeemable reset: {owned} owned, but no credit row is `available` with \
-                 reset_type `{}`",
-                crate::auth::codex_usage::CODEX_RATE_LIMITS
+                 a known reset_type ({})",
+                crate::auth::codex_usage::REDEEMABLE_RESET_TYPES.join(", ")
             )
         })
 }
@@ -540,6 +567,13 @@ fn outcome_report(account: &str, ack: &ConsumeResponse) -> (String, bool) {
         ResetOutcome::NoCredit => (
             format!(
                 "no reset credit available upstream for {account} · request id {id} — \
+                 nothing was spent{applicability}"
+            ),
+            false,
+        ),
+        ResetOutcome::Cooldown => (
+            format!(
+                "upstream is in a post-reset cooldown for {account} · request id {id} — \
                  nothing was spent{applicability}"
             ),
             false,
