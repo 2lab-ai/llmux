@@ -190,6 +190,8 @@ This differs from demo mode: demo mode uses stable fake identities and suppresse
 
 ## TUI cosmetic effects
 
+`claude_cli_version` (optional, default = the version built into the binary) is the Claude Code version llmux identifies as — `User-Agent: claude-cli/<version> (external, cli)` — when it reads or redeems Claude usage-limit reset grants (`GET /api/oauth/usage?cedar_ember=1`, `POST …/reset_rate_limits`). Anthropic gates those on the client surface and version; when Claude accounts start showing `n/e` with reason `cli_version` in the `rst` column, set this to the currently released Claude Code version. Read at daemon startup; see [operational-reference.md](operational-reference.md#usage-controls-refresh--resets).
+
 `tui_effects` (default `true`) gates the dashboard's cosmetic animations: the `max` effort token's rainbow marquee and the headline-model name gradient (`fable-5*`, `gpt-5.6-sol*`). Set it to `false` for a calmer board — those tokens keep a distinct static color and bold instead of cycling. Working spinners animate regardless of this setting. Like `email_anonymous`, the flag is carried on the dashboard document so both the local TUI and `llmux attach` honor it.
 
 `tui_gradient` tunes those gradients (all fields optional; shown with defaults):

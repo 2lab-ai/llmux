@@ -18,6 +18,9 @@ pub struct Profile {
     pub tier: Option<String>,
     pub display_name: Option<String>,
     pub org_name: Option<String>,
+    /// `organization.uuid` — the path segment of the per-organization
+    /// endpoints (reset-grant redemption). `None` when not reported.
+    pub org_uuid: Option<String>,
     pub has_claude_max: Option<bool>,
     pub has_claude_pro: Option<bool>,
 }
@@ -67,6 +70,8 @@ struct ProfileAccount {
 struct ProfileOrganization {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 /// Pure parse of the profile JSON body (test seam).
@@ -92,6 +97,7 @@ fn parse_profile(body: &str) -> Result<Profile, AuthError> {
         tier,
         display_name: account.display_name,
         org_name: parsed.organization.name,
+        org_uuid: parsed.organization.uuid.filter(|u| !u.is_empty()),
         has_claude_max: account.has_claude_max,
         has_claude_pro: account.has_claude_pro,
     })

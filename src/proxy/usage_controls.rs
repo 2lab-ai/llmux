@@ -26,7 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::auth::codex_usage::{self, CodexUsage, CodexUsageError, ResetCredit, ResetCredits};
+use crate::auth::claude_resets;
+use crate::auth::codex_usage::{
+    self, CodexUsage, CodexUsageError, ResetCredit, ResetCredits, ResetEligibility,
+};
 use crate::auth::grok_usage::{self, GrokUsageError};
 use crate::config::{AccountCredential, Config};
 use crate::proxy::server::AppState;
@@ -54,6 +57,11 @@ pub struct UsageControlDoc {
     /// Entitlement rows, populated only by an explicit list read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credits: Vec<ResetCredit>,
+    /// Claude accounts only: whether this surface may see/redeem reset
+    /// grants, the server's reason when not, and the weekly window's reset.
+    /// `None` for codex/grok and before the first Claude read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility: Option<ResetEligibility>,
     /// Epoch ms of the last SUCCESSFUL control refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh_ms: Option<u64>,
@@ -102,6 +110,12 @@ pub struct RefreshResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResetCreditsResponse {
     pub account: String,
+    /// `"codex"` (WHAM reset credits) or `"oauth"` (Claude reset grants).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Claude accounts: the server's eligibility verdict for THIS surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibility: Option<ResetEligibility>,
     /// Resets owned (unknown when absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_count: Option<u64>,
@@ -634,7 +648,7 @@ fn provider_of(credential: &AccountCredential) -> Option<&'static str> {
         AccountCredential::Oauth { .. } => Some("oauth"),
         // Grok reads the xAI CLI billing endpoint (docs/grok/spec.md §R3). A
         // usage READ only — grok has no reset credits, so the redemption paths
-        // keep refusing it via [`AppState::codex_target`].
+        // keep refusing it via [`AppState::reset_target`].
         AccountCredential::Grok { .. } => Some("grok"),
         _ => None,
     }
@@ -939,25 +953,32 @@ impl AppState {
                 .map_err(upstream)
             }
             AccountCredential::Oauth { access_token, .. } => {
-                let fetch = crate::scheduler::usage::fetch_usage(
+                // Same usage document the poller reads, plus the reset-grant
+                // status (`?cedar_ember=1`, Claude Code identity) so the
+                // `rst` column fills on an explicit refresh exactly as codex's
+                // does from its usage body.
+                claude_resets::fetch_usage_with_resets(
                     &self.client,
                     &self.config.upstream,
                     access_token,
-                );
-                match tokio::time::timeout(codex_usage::CONTROL_TIMEOUT, fetch).await {
-                    Ok(Ok(usage)) => Ok(CodexUsage {
-                        usage,
+                    self.claude_cli_version(),
+                )
+                .await
+                .map(|read| match read.resets {
+                    Some(status) => CodexUsage {
+                        usage: read.usage,
+                        available_resets: status.available_count(),
+                        applicable_resets: status.applicable_count(),
+                        eligibility: Some(status.eligibility()),
+                    },
+                    // No `cedar_ember` in the body (seen under rate limiting):
+                    // the windows are good, the grant counters stay UNKNOWN.
+                    None => CodexUsage {
+                        usage: read.usage,
                         ..Default::default()
-                    }),
-                    // The anthropic helper's error Display is already
-                    // credential-free, but keep the sanitized phrasing.
-                    Ok(Err(_)) => Err(UsageControlError::Upstream(
-                        "usage endpoint request failed".into(),
-                    )),
-                    Err(_) => Err(UsageControlError::Upstream(
-                        "usage endpoint request timed out".into(),
-                    )),
-                }
+                    },
+                })
+                .map_err(upstream)
             }
             AccountCredential::Grok {
                 access_token,
@@ -1054,6 +1075,18 @@ impl AppState {
             if fresh.applicable_resets.is_some() {
                 doc.applicable_resets = fresh.applicable_resets;
             }
+            if let Some(eligibility) = &fresh.eligibility {
+                // A NEGATIVE verdict makes the counts UNKNOWN for this surface
+                // — a stale "1 owned" from an earlier eligible read must not
+                // outlive the verdict that revoked it. A null verdict (seen
+                // live under rate limiting) is NOT a revocation: it keeps the
+                // previous counts, per the rule that only success moves them.
+                if eligibility.eligible == Some(false) {
+                    doc.available_resets = None;
+                    doc.applicable_resets = None;
+                }
+                doc.eligibility = Some(eligibility.clone());
+            }
             doc.last_refresh_ms = Some(now_ms());
             doc.last_error = None;
             doc.last_error_ms = None;
@@ -1070,13 +1103,24 @@ impl AppState {
         )
     }
 
-    /// Fresh entitlement list for one codex account. A pure read: it never
-    /// redeems anything.
+    /// The Claude Code version llmux identifies as on the reset-grant
+    /// endpoints: the config override, else the built-in default.
+    fn claude_cli_version(&self) -> &str {
+        self.config
+            .claude_cli_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(claude_resets::DEFAULT_CLAUDE_CLI_VERSION)
+    }
+
+    /// Fresh entitlement list for one codex or Claude account. A pure read:
+    /// it never redeems anything.
     pub async fn reset_credits(
         &self,
         account: &str,
     ) -> Result<ResetCreditsResponse, UsageControlError> {
-        let target = self.codex_target(account)?;
+        let target = self.reset_target(account)?;
         let _guard = self
             .usage_controls
             .try_lock(account)
@@ -1092,9 +1136,15 @@ impl AppState {
         Ok(self.credits_response(account, credits))
     }
 
-    fn codex_target(&self, account: &str) -> Result<Target, UsageControlError> {
+    /// An account whose provider has reset entitlements: codex (WHAM reset
+    /// credits) or Claude oauth (usage-limit reset grants). Everything else
+    /// (api key, grok, openrouter) is refused with 422 before any IO.
+    fn reset_target(&self, account: &str) -> Result<Target, UsageControlError> {
         let target = self.target(account)?;
-        if !matches!(target.credential, AccountCredential::Codex { .. }) {
+        if !matches!(
+            target.credential,
+            AccountCredential::Codex { .. } | AccountCredential::Oauth { .. }
+        ) {
             return Err(UsageControlError::Unsupported {
                 account: account.to_string(),
                 kind: target.credential.kind().to_string(),
@@ -1103,28 +1153,73 @@ impl AppState {
         Ok(target)
     }
 
+    /// The provider-specific entitlement list. Codex reads WHAM's credit
+    /// list; Claude reads the usage document with `cedar_ember=1` and
+    /// projects the grants onto the same shape (recording the eligibility
+    /// verdict on the control doc as it goes).
     async fn read_credits(&self, target: &Target) -> Result<ResetCredits, UsageControlError> {
-        let AccountCredential::Codex {
-            access_token,
-            account_id,
-            ..
-        } = &target.credential
-        else {
-            return Err(UsageControlError::Unsupported {
+        match &target.credential {
+            AccountCredential::Codex {
+                access_token,
+                account_id,
+                ..
+            } => {
+                let base = self.wham_base()?;
+                codex_usage::fetch_reset_credits(&self.client, &base, access_token, account_id)
+                    .await
+                    .map_err(upstream)
+            }
+            AccountCredential::Oauth { access_token, .. } => {
+                let read = claude_resets::fetch_usage_with_resets(
+                    &self.client,
+                    &self.config.upstream,
+                    access_token,
+                    self.claude_cli_version(),
+                )
+                .await
+                .map_err(upstream)?;
+                let Some(status) = read.resets else {
+                    return Err(UsageControlError::Upstream(
+                        "the usage read carried no reset-grant status (upstream rate limit?);                          try again in a minute"
+                            .into(),
+                    ));
+                };
+                let eligibility = status.eligibility();
+                self.usage_controls.update(&target.id.0, |doc| {
+                    match eligibility.eligible {
+                        // Revoked for this surface: the counts are unknown.
+                        Some(false) => {
+                            doc.available_resets = None;
+                            doc.applicable_resets = None;
+                        }
+                        Some(true) => doc.applicable_resets = status.applicable_count(),
+                        // Null verdict (throttled read): keep what we had.
+                        None => {}
+                    }
+                    doc.eligibility = Some(eligibility.clone());
+                });
+                Ok(status.to_credits())
+            }
+            other => Err(UsageControlError::Unsupported {
                 account: target.id.0.clone(),
-                kind: target.credential.kind().to_string(),
-            });
-        };
-        let base = self.wham_base()?;
-        codex_usage::fetch_reset_credits(&self.client, &base, access_token, account_id)
-            .await
-            .map_err(upstream)
+                kind: other.kind().to_string(),
+            }),
+        }
     }
 
     fn credits_response(&self, account: &str, credits: ResetCredits) -> ResetCreditsResponse {
         let redeemable = redeemable_credit(&credits, None).is_some();
+        let provider = self
+            .target(account)
+            .ok()
+            .and_then(|t| provider_of(&t.credential))
+            .map(str::to_string);
         let doc = self.usage_controls.update(account, |doc| {
             doc.credits = credits.credits.clone();
+            // A list with a known count overwrites; a list WITHOUT one (an
+            // ineligible or unknown Claude read) leaves whatever the last
+            // read established — `read_credits` already cleared it when the
+            // verdict was negative.
             if credits.available_count.is_some() {
                 doc.available_resets = credits.available_count;
             }
@@ -1134,6 +1229,8 @@ impl AppState {
         });
         ResetCreditsResponse {
             account: account.to_string(),
+            provider,
+            eligibility: doc.eligibility.clone(),
             available_count: credits.available_count.or(doc.available_resets),
             applicable_available_count: doc.applicable_resets,
             credits: credits.credits,
@@ -1149,8 +1246,8 @@ impl AppState {
         }
     }
 
-    /// Redeem exactly ONE reset credit — the only irreversible operation in
-    /// this module.
+    /// Redeem exactly ONE reset credit (codex) or reset grant (Claude) — the
+    /// only irreversible operation in this module.
     ///
     /// Order is load-bearing: validate → per-account try-lock → pending-receipt
     /// check → (new redemption only) fresh inventory gate → persist receipt →
@@ -1178,8 +1275,7 @@ impl AppState {
             }
             other => other.map(str::to_string),
         };
-        let target = self.codex_target(&request.account)?;
-        let base = self.wham_base()?;
+        let target = self.reset_target(&request.account)?;
         let account = request.account.as_str();
 
         let _guard = self
@@ -1190,6 +1286,33 @@ impl AppState {
         // Crash recovery: a receipt written by a previous process still binds
         // this account (a restart must not spend a fresh key).
         self.hydrate_pending().await?;
+
+        // Claude redemption is a per-organization route, so the org uuid is
+        // resolved HERE — before any receipt exists — from the profile
+        // endpoint (a read). A failure here spends nothing and leaves nothing
+        // pending.
+        let org_uuid = match &target.credential {
+            AccountCredential::Oauth { access_token, .. } => Some(
+                crate::auth::profile::fetch_profile(
+                    &self.client,
+                    &self.config.upstream,
+                    access_token,
+                )
+                .await
+                .map_err(|_| {
+                    UsageControlError::Upstream(
+                        "could not read the account profile for its organization id".into(),
+                    )
+                })?
+                .org_uuid
+                .ok_or_else(|| {
+                    UsageControlError::Upstream(
+                        "the account profile reports no organization id".into(),
+                    )
+                })?,
+            ),
+            _ => None,
+        };
 
         let rows = self.usage_controls.pending_rows(account);
         // A receipt that does NOT bind the current credential — a predecessor's,
@@ -1274,30 +1397,58 @@ impl AppState {
             });
         }
 
-        let AccountCredential::Codex {
-            access_token,
-            account_id,
-            ..
-        } = &target.credential
-        else {
-            return Err(UsageControlError::Unsupported {
-                account: account.to_string(),
-                kind: target.credential.kind().to_string(),
-            });
-        };
         // LAST gate before the irreversible call, covering both the new-receipt
         // and the retry path: never spend a credit with a credential the pool
         // has already replaced.
         self.still_current(&target)?;
-        let result = codex_usage::consume_reset_credit(
-            &self.client,
-            &base,
-            access_token,
-            account_id,
-            request_id,
-            credit_id.as_deref(),
-        )
-        .await;
+        let result = match &target.credential {
+            AccountCredential::Codex {
+                access_token,
+                account_id,
+                ..
+            } => {
+                let base = self.wham_base()?;
+                codex_usage::consume_reset_credit(
+                    &self.client,
+                    &base,
+                    access_token,
+                    account_id,
+                    request_id,
+                    credit_id.as_deref(),
+                )
+                .await
+            }
+            AccountCredential::Oauth { access_token, .. } => {
+                // The Claude route requires the grant id (`grant_id_required`
+                // is a server refusal); the projection always carries one.
+                let Some(grant_id) = credit_id.as_deref() else {
+                    return Err(UsageControlError::Invalid(
+                        "a Claude reset grant must be redeemed by id".into(),
+                    ));
+                };
+                let Some(org_uuid) = org_uuid.as_deref() else {
+                    return Err(UsageControlError::Upstream(
+                        "organization id unavailable for the redemption".into(),
+                    ));
+                };
+                claude_resets::consume_reset_grant(
+                    &self.client,
+                    &self.config.upstream,
+                    access_token,
+                    self.claude_cli_version(),
+                    org_uuid,
+                    grant_id,
+                    request_id,
+                )
+                .await
+            }
+            other => {
+                return Err(UsageControlError::Unsupported {
+                    account: account.to_string(),
+                    kind: other.kind().to_string(),
+                })
+            }
+        };
 
         let result = match result {
             Ok(result) => result,
@@ -1352,8 +1503,9 @@ impl AppState {
         // a SUCCESSFUL redemption — never a retryable redemption failure, and
         // never silence.
         if result.outcome.spent() {
+            let provider = provider_of(&target.credential).unwrap_or("codex");
             let usage = self.read_usage(&target).await;
-            let applied = self.commit_refresh(account, "codex", &target, usage).await;
+            let applied = self.commit_refresh(account, provider, &target, usage).await;
             if !applied.ok {
                 warnings.push(format!(
                     "redemption succeeded but the follow-up usage read failed: {}",

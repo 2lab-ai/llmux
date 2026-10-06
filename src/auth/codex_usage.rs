@@ -114,6 +114,24 @@ pub struct CodexUsage {
     pub usage: UsageSnapshot,
     pub available_resets: Option<u64>,
     pub applicable_resets: Option<u64>,
+    /// Claude reset-grant eligibility riding the same read
+    /// ([`crate::auth::claude_resets`]); `None` for providers that do not
+    /// report one (codex, grok) or when the server omitted it.
+    pub eligibility: Option<ResetEligibility>,
+}
+
+/// Account-level reset-grant eligibility as the Anthropic usage endpoint
+/// reports it (`cedar_ember.eligible` / `ineligible_reason` /
+/// `weekly_resets_at`). Carried on the control doc so an ineligible account
+/// shows WHY instead of a bare unknown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResetEligibility {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_resets_at: Option<String>,
 }
 
 /// `GET /wham/rate-limit-reset-credits`. `available_count` is `None` when the
@@ -152,21 +170,34 @@ pub struct ResetCredit {
     pub description: Option<String>,
 }
 
-/// The reset credit type llmux redeems. Other `reset_type`s (should they
-/// appear) are not assumed redeemable here.
+/// The codex reset credit type llmux redeems. Other codex `reset_type`s
+/// (should they appear) are not assumed redeemable here.
 pub const CODEX_RATE_LIMITS: &str = "codex_rate_limits";
+
+/// Every `reset_type` llmux knows how to redeem: the codex WHAM type and the
+/// Claude grant projection ([`crate::auth::claude_resets::CLAUDE_RATE_LIMITS`]).
+pub const REDEEMABLE_RESET_TYPES: &[&str] = &[
+    CODEX_RATE_LIMITS,
+    crate::auth::claude_resets::CLAUDE_RATE_LIMITS,
+];
 
 impl ResetCredit {
     /// A row that is redeemable RIGHT NOW per the upstream list: status
-    /// `available` and the codex rate-limit reset type.
+    /// `available` and a reset type this build knows how to redeem.
     pub fn is_redeemable(&self) -> bool {
         self.status.as_deref() == Some("available")
-            && self.reset_type.as_deref() == Some(CODEX_RATE_LIMITS)
+            && self
+                .reset_type
+                .as_deref()
+                .is_some_and(|t| REDEEMABLE_RESET_TYPES.contains(&t))
     }
 }
 
-/// The four terminal codes of `POST …/consume`. Anything else is
-/// [`CodexUsageError::UnknownOutcome`] — uncertain, not a fifth outcome.
+/// The terminal outcomes of a redemption. Codex `POST …/consume` answers the
+/// first four; the Claude `reset_rate_limits` call adds `cooldown` (the
+/// account is inside a post-reset cooling period — nothing was spent).
+/// Anything else is [`CodexUsageError::UnknownOutcome`] — uncertain, not a
+/// further outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetOutcome {
@@ -174,6 +205,7 @@ pub enum ResetOutcome {
     AlreadyRedeemed,
     NothingToReset,
     NoCredit,
+    Cooldown,
 }
 
 impl ResetOutcome {
@@ -189,6 +221,7 @@ impl ResetOutcome {
             Self::AlreadyRedeemed => "already_redeemed",
             Self::NothingToReset => "nothing_to_reset",
             Self::NoCredit => "no_credit",
+            Self::Cooldown => "cooldown",
         }
     }
 }
@@ -246,6 +279,7 @@ pub fn parse_usage(body: &[u8], now: SystemTime) -> Result<CodexUsage, CodexUsag
         usage,
         available_resets: count(credits, "available_count"),
         applicable_resets: count(credits, "applicable_available_count"),
+        eligibility: None,
     })
 }
 
@@ -632,5 +666,7 @@ mod tests {
             "both spend the entitlement → re-read"
         );
         assert!(!ResetOutcome::NothingToReset.spent() && !ResetOutcome::NoCredit.spent());
+        assert!(!ResetOutcome::Cooldown.spent(), "cooldown spends nothing");
+        assert_eq!(ResetOutcome::Cooldown.label(), "cooldown");
     }
 }

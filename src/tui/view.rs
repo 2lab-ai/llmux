@@ -527,8 +527,43 @@ impl DashboardView {
 /// no controls at all, which is a DIFFERENT display state from "we have not
 /// looked yet" — an apikey account must never read as an account with unknown
 /// resets.
-fn has_usage_controls(credential_kind: &str) -> bool {
-    matches!(credential_kind, "codex")
+/// Providers whose accounts carry rate-limit reset entitlements: codex (WHAM
+/// reset credits) and Claude oauth (usage-limit reset grants, read through
+/// the same usage endpoint with `cedar_ember=1`).
+pub(crate) fn has_usage_controls(credential_kind: &str) -> bool {
+    matches!(credential_kind, "codex" | "oauth")
+}
+
+/// Compact "expires" rendering for an RFC3339 grant/credit expiry: absolute
+/// local time (`MM-DD HH:MM`, or `HH:MM` inside a day) plus the remaining
+/// countdown — the "만료일" the claude.ai card shows, in the TUI's own idiom.
+/// Falls back to the raw string when it does not parse, so an odd upstream
+/// value is still visible rather than blanked.
+pub(crate) fn expiry_label(expires_at: &str, now: SystemTime) -> String {
+    let Some(at) = crate::scheduler::headers::parse_rfc3339(expires_at) else {
+        return expires_at.to_string();
+    };
+    let offset = super::format::local_offset_secs(at);
+    let absolute = super::format::absolute_label(at, now, offset);
+    match at.duration_since(now) {
+        Ok(remaining) => format!(
+            "{absolute} (in {})",
+            crate::scheduler::select::compact_duration(remaining)
+        ),
+        Err(_) => format!("{absolute} (expired)"),
+    }
+}
+
+/// The soonest expiry among the listed credits, when any carries one.
+pub(crate) fn earliest_expiry(
+    control: &crate::proxy::usage_controls::UsageControlDoc,
+) -> Option<&str> {
+    control
+        .credits
+        .iter()
+        .filter(|c| c.status.as_deref() != Some("spent"))
+        .filter_map(|c| c.expires_at.as_deref())
+        .min()
 }
 
 /// The compact accounts-table cell for an account's reset count:
@@ -545,6 +580,14 @@ pub(crate) fn reset_cell(
 ) -> String {
     if !has_usage_controls(credential_kind) {
         return "—".to_string();
+    }
+    // A Claude account the server declared ineligible on this surface is not
+    // "unknown" — the verdict is known; the detail pane carries the reason.
+    if control
+        .and_then(|c| c.eligibility.as_ref())
+        .is_some_and(|e| e.eligible == Some(false))
+    {
+        return "n/e".to_string();
     }
     match control.and_then(|c| c.available_resets) {
         None => "?".to_string(),
@@ -576,9 +619,17 @@ pub(crate) fn reset_detail(
     let Some(control) = control else {
         return "unknown — press f to refresh".to_string();
     };
-    let mut text = match control.available_resets {
-        None => "unknown — press f to refresh".to_string(),
-        Some(owned) => {
+    let ineligible = control
+        .eligibility
+        .as_ref()
+        .filter(|e| e.eligible == Some(false));
+    let mut text = match (ineligible, control.available_resets) {
+        (Some(e), _) => format!(
+            "not eligible on this surface ({})",
+            e.ineligible_reason.as_deref().unwrap_or("no reason given")
+        ),
+        (None, None) => "unknown — press f to refresh".to_string(),
+        (None, Some(owned)) => {
             let applicable = match control.applicable_resets {
                 Some(applicable) => format!(" · {applicable} applicable now"),
                 None => " · applicable unknown".to_string(),
@@ -586,6 +637,16 @@ pub(crate) fn reset_detail(
             format!("{owned} owned{applicable}")
         }
     };
+    if let Some(expires) = earliest_expiry(control) {
+        text.push_str(&format!(" · expires {}", expiry_label(expires, now)));
+    }
+    if let Some(weekly) = control
+        .eligibility
+        .as_ref()
+        .and_then(|e| e.weekly_resets_at.as_deref())
+    {
+        text.push_str(&format!(" · weekly resets {}", expiry_label(weekly, now)));
+    }
     if let Some(ms) = control.last_refresh_ms {
         let age = now.duration_since(ms_time(ms)).unwrap_or_default();
         text.push_str(&format!(
@@ -1162,10 +1223,63 @@ mod tests {
         use crate::proxy::usage_controls::UsageControlDoc;
         assert_eq!(reset_cell(None, "codex"), "?", "no metadata = unknown");
         assert_eq!(
+            reset_cell(None, "oauth"),
+            "?",
+            "claude accounts have controls too"
+        );
+        assert_eq!(
             reset_cell(None, "apikey"),
             "—",
             "a provider with no controls is not 'unknown'"
         );
+        assert_eq!(reset_cell(None, "grok"), "—");
+        let ineligible = UsageControlDoc {
+            eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                eligible: Some(false),
+                ineligible_reason: Some("surface".into()),
+                weekly_resets_at: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(reset_cell(Some(&ineligible), "oauth"), "n/e");
+        let detail = reset_detail(Some(&ineligible), "oauth", SystemTime::UNIX_EPOCH);
+        assert!(
+            detail.starts_with("not eligible on this surface (surface)"),
+            "{detail}"
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_300_000);
+        let eligible = UsageControlDoc {
+            available_resets: Some(1),
+            applicable_resets: Some(1),
+            eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                eligible: Some(true),
+                ineligible_reason: None,
+                weekly_resets_at: Some("2026-10-12T22:00:00+00:00".into()),
+            }),
+            credits: vec![crate::auth::codex_usage::ResetCredit {
+                id: Some("g".into()),
+                status: Some("available".into()),
+                expires_at: Some("2026-10-22T16:00:00+00:00".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let detail = reset_detail(Some(&eligible), "oauth", now);
+        assert!(
+            detail.starts_with("1 owned · 1 applicable now · expires "),
+            "{detail}"
+        );
+        assert!(detail.contains("weekly resets"), "{detail}");
+        assert!(
+            detail.contains("(in "),
+            "a future expiry carries a countdown: {detail}"
+        );
+        assert_eq!(
+            expiry_label("not-a-date", now),
+            "not-a-date",
+            "unparseable stays visible"
+        );
+        assert!(expiry_label("2026-01-01T00:00:00Z", now).ends_with("(expired)"));
         let doc = |available, applicable| UsageControlDoc {
             available_resets: available,
             applicable_resets: applicable,
