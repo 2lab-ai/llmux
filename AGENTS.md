@@ -43,6 +43,17 @@ Three operational skills live in `.claude/skills/` (shared mechanics in
   refresh `llmux` brew formula → verify → hot-deploy + restart → `llmux status`
   (client + server).
 
+- **model update** (모델 업데이트 / "모델 추가해줘" / "새 모델 확인해줘", even when
+  the user names only one model) — ALWAYS sweep all three subscription providers
+  (claude, codex, grok) for models the catalog does not yet carry; for each new
+  model confirm (1) the exact model id, (2) API pay-as-you-go pricing (input /
+  output / cache rates), (3) the maximum context window, each with its source
+  URL and date; then add the rows to `src/catalog.rs` + `src/pricing.rs`, move
+  the family aliases (`sonnet` / `opus` / `fable` / `sol` / `terra` / `luna` /
+  `astra` / `grok`) to the newest generation, and update `docs/models.md` in the
+  same PR. The sweep runs only when the user asks — never as a background poll.
+  (Standing instruction 2026-10-06.)
+
 Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
 `.prd/07-scheduler-research.md`.
 
