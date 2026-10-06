@@ -60,21 +60,27 @@ not that it is zero.
   exactly like `grok`. The same strip applies to the PIN itself, so a pinned
   `grok-4.7[1m]` also leaves llmux as `grok-4.7` — the suffix is display
   metadata on both sides.
-- **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
-  generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
-  `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
-  resolve to `gpt-6-astra[1m]` — deliberate asymmetry with the 5.6 rows: on
-  astra the bare aliases advertise the 1M row, so `astra` / `gpt-6` resolve to
-  that row's upstream slug and to the ~1,050,000-token window this catalog
-  publishes for it, while the explicit base id `gpt-6-astra` is the way to pick
-  the openai/codex catalog's 272000. That is catalog resolution, **not** a
-  client-side window: Claude Code sizes its readout off the id you submit, and
-  a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
-  Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
-  denominator too.
-  Generation 6 shipped a SINGLE tier, so `sol` / `terra` / `luna` stay on 5.6
-  (there is no `gpt-6-sol` and a request for one would 404 upstream). These are
-  advertised statically on the corresponding entries. The provider always
+- **codex variant aliases** — `sol` / `terra` / `luna` / `astra` resolve to the
+  NEWEST gpt generation that ships that variant (openai/codex `models.json`,
+  read 2026-10-06): `sol` → `gpt-6.1-sol` (released 2026-09-29), `luna` →
+  `gpt-6-luna` (2026-09-22), `astra` → `gpt-6-astra`, and `terra` →
+  `gpt-5.6-terra` (generation 6 shipped no terra tier, so moving it would
+  resolve to a slug that 404s upstream). The bare generation ids resolve to
+  that generation's flagship: `gpt-5.6` → `gpt-5.6-sol`, `gpt-6` →
+  `gpt-6-astra`, `gpt-6.1` → `gpt-6.1-sol`. `sol` moved from `gpt-5.6-sol` and
+  `luna` from `gpt-5.6-luna` on 2026-10-06 — the 5.6 rows stay in the catalog
+  and remain addressable by full id.
+  `astra` and the bare `gpt-6` id advertise on `gpt-6-astra[1m]` — a deliberate
+  asymmetry: on astra the bare aliases advertise the 1M row, so `astra` /
+  `gpt-6` resolve to that row's upstream slug and to the ~1,050,000-token window
+  this catalog publishes for it, while the explicit base id `gpt-6-astra` is the
+  way to pick the openai/codex catalog's 272000. The 6.1-sol / 6-sol / 6-luna
+  pairs follow the 5.6 convention instead (aliases on the base row; the `[1m]`
+  twin is an explicit opt-in). That is catalog resolution, **not** a client-side
+  window: Claude Code sizes its readout off the id you submit, and a bare alias
+  — an id it does not know — gets its 200k assumption. Type `sol[1m]` /
+  `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
+  denominator too. These are advertised statically on the corresponding entries. The provider always
   strips a trailing `[1m]` before the request leaves llmux
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
@@ -89,7 +95,8 @@ not that it is zero.
   | `fable`, `fable-5-1` | `claude-fable-5-1[1m]` | `claude-fable-5-1` |
   | `opus`, `opus-5-5` | `claude-opus-5-5[1m]` | `claude-opus-5-5` |
   | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
-  | `sonnet`, `sonnet-5` | `claude-sonnet-5[1m]` | `claude-sonnet-5` |
+  | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
+  | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
   | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
@@ -146,9 +153,13 @@ not that it is zero.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
   owns an alias), then from `claude-opus-5[1m]` to `claude-opus-5-5[1m]` on
-  2026-09-23. The version alias `opus-5` did NOT move — it stays on
-  `claude-opus-5[1m]`, because floating a version-pinned alias onto a new model
-  would be silent substitution. Anyone who needs one specific model must send
+  2026-09-23. `sonnet` moved from `claude-sonnet-5[1m]` to
+  `claude-sonnet-5-5[1m]` on 2026-10-06 (Sonnet 5.5 released 2026-09-28), and
+  on the same day the codex `sol` alias moved from `gpt-5.6-sol` to
+  `gpt-6.1-sol` and `luna` from `gpt-5.6-luna` to `gpt-6-luna`. The version
+  aliases `opus-5` / `sonnet-5` and the bare generation id `gpt-5.6` did NOT
+  move — they stay on their generation, because floating a version-pinned
+  alias onto a new model would be silent substitution. Anyone who needs one specific model must send
   its full catalog id — that is the stable handle. Usage and pricing are booked against the
   resolved id, not the alias, so alias traffic lands on the same row as id
   traffic.
@@ -191,16 +202,24 @@ model it does not curate.
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-sonnet-5[1m] | sonnet, sonnet-5 | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max | 1000000     | claude |
+| claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6.1-sol         | sol, gpt-6.1 | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-sol[1m]       | —            | GPT-6-Sol [1M]      | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-sol           | —            | GPT-6-Sol           | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6-luna[1m]      | —            | GPT-6-Luna [1M]     | low, medium, high, xhigh, max        | 1000000     | codex  |
+| gpt-6-luna          | luna         | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-sol         | gpt-5.6      | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
-| gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
+| gpt-5.6-luna        | —            | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
@@ -304,6 +323,14 @@ the client, which sizes off the submitted id — type `astra[1m]` or pick the
 `[1M]` picker row for the 1M denominator. The catalog
 also lists an 872,000 `max_context_window` for astra, which llmux does not
 advertise.
+
+`gpt-6.1-sol[1m]`, `gpt-6-sol[1m]` and `gpt-6-luna[1m]` (added 2026-10-06)
+follow the same pattern as astra's twin — 1000000 advertised on the strength of
+OpenAI's published 1,050,000 window for those models, unprobed through the
+daemon — but keep the 5.6 alias convention: the bare `sol` / `luna` aliases
+sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
+and the `[1m]` twin is an explicit opt-in. models.json lists the same
+272,000 / 872,000 pair for all three, which llmux does not advertise.
 
 ## Claude Code `/model` picker
 

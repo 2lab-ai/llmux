@@ -561,7 +561,9 @@ mod tests {
             aliased("claude-fable-5[1m]", &[]),
             aliased("claude-opus-5-5[1m]", &["opus", "opus-5-5"]),
             aliased("claude-opus-5-5", &[]),
-            aliased("claude-sonnet-5[1m]", &["sonnet", "sonnet-5"]),
+            aliased("claude-sonnet-5-5[1m]", &["sonnet", "sonnet-5-5"]),
+            aliased("claude-sonnet-5-5", &[]),
+            aliased("claude-sonnet-5[1m]", &["sonnet-5"]),
             aliased("claude-sonnet-5", &[]),
             aliased("claude-haiku-4-5", &["haiku"]),
         ]
@@ -584,7 +586,7 @@ mod tests {
                 ),
                 (
                     "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    "claude-sonnet-5[1m]".into()
+                    "claude-sonnet-5-5[1m]".into()
                 ),
                 ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5".into()),
             ]
@@ -646,7 +648,7 @@ mod tests {
                 ),
                 (
                     "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    "claude-sonnet-5[1m]".into()
+                    "claude-sonnet-5-5[1m]".into()
                 ),
                 ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5".into()),
             ]
