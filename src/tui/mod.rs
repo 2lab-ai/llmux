@@ -74,7 +74,10 @@ use view::DashboardView;
 /// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 const CODEX_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.5",
@@ -84,7 +87,7 @@ const CODEX_MODELS: &[&str] = &[
 /// Reasoning-effort levels cycled with `e` (and the group-settings bar);
 /// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
 /// U12). A concrete value OVERRIDES every request. `max` is native on the
-/// gpt-5.6 family and on `gpt-6-astra`, and clamps to `xhigh` on older models.
+/// gpt-5.6 / gpt-6 / gpt-6.1 families, and clamps to `xhigh` on older models.
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
 /// Values are the config superset (`none|low|medium|high|xhigh`) — per-model
@@ -6171,10 +6174,11 @@ mod tests {
     /// a model llmux can route but cannot be cycled to is not switchable.
     #[test]
     fn codex_model_cycle_reaches_gpt_6_astra_from_the_sol_pin() {
-        // Newest generation first, and every entry is distinct (a duplicate
-        // would make the modulo cycle skip a model forever).
-        assert_eq!(CODEX_MODELS[0], "gpt-6-astra");
-        assert_eq!(CODEX_MODELS.len(), 6);
+        // Newest generation first (gpt-6.1-sol, the openai/codex catalog's
+        // priority-1 default since 2026-09-29), and every entry is distinct (a
+        // duplicate would make the modulo cycle skip a model forever).
+        assert_eq!(CODEX_MODELS[0], "gpt-6.1-sol");
+        assert_eq!(CODEX_MODELS.len(), 9);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -6211,7 +6215,7 @@ mod tests {
         app.cycle_codex_model(Some(&view));
         assert_eq!(
             app.take_pending_codex().map(|c| c.model),
-            Some("gpt-6-astra".to_string())
+            Some("gpt-6.1-sol".to_string())
         );
     }
 

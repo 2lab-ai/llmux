@@ -16,7 +16,10 @@
 //!
 //! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
 //! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
-//! anthropic.com/claude-opus-5-5, 2026-09-22.
+//! anthropic.com/claude-opus-5-5, 2026-09-22; Sonnet 5 / 5.5 and the gpt-6 /
+//! gpt-6.1 family from platform.claude.com/docs/en/about-claude/pricing and
+//! developers.openai.com/api/docs/pricing, both read 2026-10-06 (that read
+//! also corrected the stale gpt-5.6-sol / gpt-5.6-luna rows below).
 
 use std::collections::HashMap;
 
@@ -62,8 +65,16 @@ const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25);
 /// 0.20 / cache write 5.0 — 20% below the opus tier, cache reads 60% below, so
 /// it must NOT fall to the `claude-opus-` prefix fallback.
 const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0);
-/// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75}.
+/// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75} — the 4.x generation
+/// (`claude-sonnet-4-6` / `-4-5`) and the `claude-sonnet-` prefix fallback.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
+/// Sonnet 5 and Sonnet 5.5 (platform.claude.com pricing, read 2026-10-06):
+/// $2 in / $10 out / cache read 0.20 / cache write (5m) 2.50. Sonnet 5's
+/// planned 2026-09-01 increase to the $3/$15 tier was cancelled (pricing-page
+/// footnote), so both generations share this row; it is CHEAPER than
+/// `SONNET_TIER`, so the exact matches below must catch them before the
+/// `claude-sonnet-` prefix fallback overcharges them.
+const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// Haiku-tier rates {1.0, 5.0, 0.1, 1.25}.
 const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
 /// Fable-family rates (Fable 5 and 5.1 share the tier) {10.0, 50.0, 1.0, 12.5}.
@@ -72,19 +83,36 @@ const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
 /// `group == "codex"` unknown-model fallback.
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
-/// gpt-5.6-sol (flagship, 2026-07-09 launch): same rates as gpt-5.5
-/// ($5 in / $30 out, cache read at 90% discount). Codex: no cache-creation
-/// charge.
-const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+/// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
+/// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
+/// ("promotional pricing … at least through November 21, 2026"). Corrected
+/// from the launch-era $5/$30 row; OpenAI now lists a cache-write rate, so
+/// the "codex has no cache-creation charge" convention no longer holds for
+/// the rows re-read on 2026-10-06.
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.40, 5.0);
 /// gpt-5.6-terra (mid tier): $2.50 in / $15 out, cache read 0.25.
 const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
-/// gpt-5.6-luna (budget tier): $1 in / $6 out, cache read 0.1.
-const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 6.0, 0.1, 0.0);
-/// gpt-6-astra (generation-6 flagship, 2026-09 launch, standard tier): $10 in
-/// / $50 out / $1 cached input, per third-party pricing trackers — OpenAI's
-/// own page was not read for this row. Codex: no cache-creation charge, same
-/// convention as the other codex rows.
-const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0);
+/// gpt-5.6-luna (budget tier). developers.openai.com model page, read
+/// 2026-10-06: $0.20 in / $0.02 cached / $1.20 out; no cache-write rate is
+/// listed for it, so that rate stays 0. Corrected from the launch-era $1/$6.
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.20, 1.20, 0.02, 0.0);
+/// gpt-6-astra (generation-6 flagship, released 2026-09-03). OpenAI pricing
+/// page, read 2026-10-06 (standard tier, ≤272k input): $10 in / $1 cached /
+/// $12.50 cache write / $50 out. The >272k long-context tier (rates double)
+/// and the Fast / Ultrafast tiers are not modeled.
+const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
+/// gpt-6.1-sol (released 2026-09-29; the openai/codex catalog's priority-1
+/// default). OpenAI pricing page, read 2026-10-06 (standard, ≤272k input):
+/// $2 in / $0.10 cached / $2.50 cache write / $10 out.
+const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
+/// gpt-6-sol (released 2026-09-22). developers.openai.com model page, read
+/// 2026-10-06: $2 in / $0.20 cached / $2.50 cache write / $10 out (absent
+/// from the pricing page's flagship table; the model page carries the rates).
+const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
+/// gpt-6-luna (released 2026-09-22). OpenAI pricing page, read 2026-10-06
+/// (standard, ≤272k input): $0.10 in / $0.01 cached / $0.125 cache write /
+/// $0.50 out.
+const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
 /// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
 /// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
 /// Like the codex rows, an API-list-price EQUIVALENT for subscription
@@ -120,6 +148,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-opus-5-5" => Some(OPUS_5_5),
         "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
         | "claude-opus-4-5" => Some(OPUS_TIER),
+        "claude-sonnet-5-5" | "claude-sonnet-5" => Some(SONNET_5),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
         "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5" | "claude-fable-5-1" => Some(FABLE_TIER),
@@ -128,6 +157,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
+        "gpt-6-sol" => Some(GPT_6_SOL),
+        "gpt-6-luna" => Some(GPT_6_LUNA),
+        "gpt-6.1" | "gpt-6.1-sol" => Some(GPT_6_1_SOL),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
@@ -158,6 +190,13 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(OPUS_5_5)
     } else if model_norm_lower.starts_with("claude-opus-") {
         Some(OPUS_TIER)
+    } else if model_norm_lower.starts_with("claude-sonnet-5-5-")
+        || model_norm_lower.starts_with("claude-sonnet-5-")
+    {
+        // Sonnet 5 / 5.5 are CHEAPER than the sonnet tier — same ordering
+        // argument as `claude-opus-5-5-` above. The trailing `-` is the
+        // version boundary (`claude-sonnet-50-*` must miss this branch).
+        Some(SONNET_5)
     } else if model_norm_lower.starts_with("claude-sonnet-") {
         Some(SONNET_TIER)
     } else if model_norm_lower.starts_with("claude-haiku-") {
@@ -178,8 +217,16 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.1-") {
+        // Generation 6.1 has one tier (sol); `gpt-6.10-*` must miss this
+        // branch, hence the required `-`.
+        Some(GPT_6_1_SOL)
     } else if model_norm_lower.starts_with("gpt-6-astra-") {
         Some(GPT_6_ASTRA)
+    } else if model_norm_lower.starts_with("gpt-6-sol-") {
+        Some(GPT_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6-luna-") {
+        Some(GPT_6_LUNA)
     } else if model_norm_lower.starts_with("gpt-6-") {
         // Astra is generation 6's flagship (and its only tier), so it is the
         // `gpt-6-` default exactly as sol is for `gpt-5.6-`. The required `-`
@@ -559,12 +606,13 @@ mod tests {
     #[test]
     fn gpt_5_6_sol_matches_exact_and_bare_and_prefix() {
         // Exact `gpt-5.6-sol`, the bare `gpt-5.6` alias, and a future dated
-        // snapshot all resolve to sol rates ($5 in / $30 out / $0.5 cache read).
+        // snapshot all resolve to sol rates ($4 in / $20 out, OpenAI pricing
+        // page 2026-10-06).
         for model in ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-sol-20260709"] {
             let cost = cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty());
-            approx(cost, 5.00);
+            approx(cost, 4.00);
             let out = cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty());
-            approx(out, 30.00);
+            approx(out, 20.00);
         }
     }
 
@@ -580,14 +628,14 @@ mod tests {
             let cached = cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty());
             approx(cached, 1.00);
         }
-        // Codex convention: no cache-creation charge.
+        // OpenAI lists a cache-write rate for astra ($12.50, 2026-10-06).
         let creation = cost_usd(
             "codex",
             "gpt-6-astra",
             &tc(0, 0, None, Some(1_000_000)),
             &empty(),
         );
-        approx(creation, 0.0);
+        approx(creation, 12.50);
         // The bare ALIAS is deliberately absent from the price table: the
         // codex provider resolves `astra` to `gpt-6-astra` BEFORE the request
         // (and the recorded model) leaves llmux, so pricing only ever sees the
@@ -634,18 +682,131 @@ mod tests {
             &tc(0, 1_000_000, None, None),
             &empty(),
         );
-        approx(luna, 6.00);
+        approx(luna, 1.20);
     }
 
     #[test]
-    fn gpt_5_6_has_no_cache_creation_charge() {
+    fn gpt_5_6_sol_cache_creation_is_five_dollars() {
+        // OpenAI's pricing page lists a cache-write rate since the 2026-10-06
+        // re-read; the old "codex has no cache-creation charge" row is gone.
         let cost = cost_usd(
             "codex",
             "gpt-5.6-sol",
             &tc(0, 0, None, Some(1_000_000)),
             &empty(),
         );
-        approx(cost, 0.0);
+        approx(cost, 5.0);
+    }
+
+    #[test]
+    fn sonnet_5_and_5_5_take_the_two_dollar_row_not_the_sonnet_tier() {
+        // Both generations are $2 / $10 / 0.20 / 2.50 (platform.claude.com
+        // pricing, 2026-10-06); the 4.x ids keep the $3 / $15 tier and the
+        // generic prefix fallback still lands there.
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5[1m]",
+        ] {
+            let cost = cost_usd("claude", model, &tc(1_000_000, 0, None, None), &empty());
+            approx(cost, 2.00);
+            let out = cost_usd("claude", model, &tc(0, 1_000_000, None, None), &empty());
+            approx(out, 10.00);
+            let cr = cost_usd("claude", model, &tc(0, 0, Some(1_000_000), None), &empty());
+            approx(cr, 0.20);
+            let cw = cost_usd("claude", model, &tc(0, 0, None, Some(1_000_000)), &empty());
+            approx(cw, 2.50);
+        }
+        // The `sonnet` alias resolves to sonnet-5-5 before pricing.
+        approx(
+            cost_usd("claude", "sonnet", &tc(1_000_000, 0, None, None), &empty()),
+            2.00,
+        );
+        approx(
+            cost_usd(
+                "claude",
+                "claude-sonnet-4-6",
+                &tc(1_000_000, 0, None, None),
+                &empty(),
+            ),
+            3.00,
+        );
+        assert_eq!(builtin_price("claude-sonnet-50-1"), Some(SONNET_TIER));
+    }
+
+    #[test]
+    fn gpt_6_1_sol_and_gen6_tiers_have_their_own_rates() {
+        // gpt-6.1-sol: $2 / $0.10 cached / $2.50 write / $10 (pricing page
+        // 2026-10-06); bare `gpt-6.1` and a dated snapshot resolve the same.
+        for model in ["gpt-6.1-sol", "gpt-6.1", "gpt-6.1-sol-20260929"] {
+            approx(
+                cost_usd("codex", model, &tc(1_000_000, 0, None, None), &empty()),
+                2.00,
+            );
+            approx(
+                cost_usd("codex", model, &tc(0, 1_000_000, None, None), &empty()),
+                10.00,
+            );
+            approx(
+                cost_usd("codex", model, &tc(0, 0, Some(1_000_000), None), &empty()),
+                0.10,
+            );
+            approx(
+                cost_usd("codex", model, &tc(0, 0, None, Some(1_000_000)), &empty()),
+                2.50,
+            );
+        }
+        // gpt-6-sol: $2 / $0.20 / $2.50 / $10 (model page); gpt-6-luna:
+        // $0.10 / $0.01 / $0.125 / $0.50 (pricing page).
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-6-sol",
+                &tc(0, 0, Some(1_000_000), None),
+                &empty(),
+            ),
+            0.20,
+        );
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-6-sol-20260922",
+                &tc(0, 1_000_000, None, None),
+                &empty(),
+            ),
+            10.00,
+        );
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-6-luna",
+                &tc(1_000_000, 0, None, None),
+                &empty(),
+            ),
+            0.10,
+        );
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-6-luna",
+                &tc(0, 1_000_000, None, None),
+                &empty(),
+            ),
+            0.50,
+        );
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-6-luna-20260922",
+                &tc(0, 0, None, Some(1_000_000)),
+                &empty(),
+            ),
+            0.125,
+        );
+        // Generation boundary: `gpt-6.10-*` is not 6.1.
+        assert_eq!(builtin_price("gpt-6.10-sol"), None);
+        // The bare `gpt-6-` prefix still means astra.
+        assert_eq!(builtin_price("gpt-6-terra-x"), Some(GPT_6_ASTRA));
     }
 
     #[test]
@@ -672,16 +833,17 @@ mod tests {
     #[test]
     fn gpt_5_6_sol_cache_read_is_ten_percent_of_input() {
         // OpenAI bills cached input at the flat gpt-5.x discount (10% of the
-        // input rate). gpt-5.6-sol input is $5/1e6, so 1e6 cache-read tokens
-        // cost $0.50 — a third of a mostly-cached prompt is billed at a tenth,
-        // not the full input rate (the codex cache-read cost regression).
+        // input rate). gpt-5.6-sol input is $4/1e6 (pricing page 2026-10-06),
+        // so 1e6 cache-read tokens cost $0.40 — a third of a mostly-cached
+        // prompt is billed at a tenth, not the full input rate (the codex
+        // cache-read cost regression).
         let cache = cost_usd(
             "codex",
             "gpt-5.6-sol",
             &tc(0, 0, Some(1_000_000), None),
             &empty(),
         );
-        approx(cache, 0.50);
+        approx(cache, 0.40);
         let input = cost_usd(
             "codex",
             "gpt-5.6-sol",

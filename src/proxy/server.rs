@@ -4449,9 +4449,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 33 curated (11 claude + 8 codex + 4 grok + 10 openrouter) + 1
+        // 41 curated (13 claude + 14 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 34);
+        assert_eq!(models.len(), 42);
 
         let by_id = |id: &str| {
             models
@@ -4478,8 +4478,14 @@ mod tests {
         // Static codex alias and context survive serialization.
         assert_eq!(
             by_id("gpt-5.6-sol")["aliases"],
-            serde_json::json!(["sol", "gpt-5.6"])
+            serde_json::json!(["gpt-5.6"])
         );
+        assert_eq!(
+            by_id("gpt-6.1-sol")["aliases"],
+            serde_json::json!(["sol", "gpt-6.1"])
+        );
+        assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
+        assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
         assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
         // no aliases (those stay on the base rows), base sol unchanged.
