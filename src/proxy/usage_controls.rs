@@ -1203,11 +1203,15 @@ impl AppState {
                 )
                 .await
                 .map_err(upstream)?;
+                // No grant object at all (null / absent — the other throttled
+                // shape) is the SAME unknown as `eligible: null` below: same
+                // retained error, same refusal, previous rows untouched.
                 let Some(status) = read.resets else {
-                    return Err(UsageControlError::Upstream(
-                        "the usage read carried no reset-grant status (upstream rate limit?);                          try again in a minute"
-                            .into(),
-                    ));
+                    self.usage_controls.update(&target.id.0, |doc| {
+                        doc.last_error = Some(RESET_STATUS_UNKNOWN.into());
+                        doc.last_error_ms = Some(now_ms());
+                    });
+                    return Err(UsageControlError::Upstream(RESET_STATUS_UNKNOWN.into()));
                 };
                 let eligibility = status.eligibility();
                 // A null verdict is a FAILED inventory read, not an empty
