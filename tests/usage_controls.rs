@@ -68,6 +68,7 @@ struct Seen {
     path: String,
     authorization: Option<String>,
     account_id: Option<String>,
+    user_agent: Option<String>,
     body: String,
 }
 
@@ -90,6 +91,10 @@ struct MockState {
     credits: Mutex<VecDeque<Scripted>>,
     consume: Mutex<VecDeque<Scripted>>,
     usage_gate: Mutex<Option<UsageGate>>,
+    /// Anthropic side (Claude reset grants, `.prd/20`): scripted replies for
+    /// `GET /api/oauth/usage` and `POST /api/organizations/{org}/reset_rate_limits`.
+    claude_usage: Mutex<VecDeque<Scripted>>,
+    claude_consume: Mutex<VecDeque<Scripted>>,
 }
 
 struct WhamMock {
@@ -109,6 +114,15 @@ impl WhamMock {
             .route(
                 "/backend-api/wham/rate-limit-reset-credits/consume",
                 post(handle_consume),
+            )
+            // Anthropic routes, same mock: the daemon's `upstream` points here
+            // in the Claude tests (`config_for` sets it), so the reset-grant
+            // read and redeem never leave the test.
+            .route("/api/oauth/usage", get(handle_claude_usage))
+            .route("/api/oauth/profile", get(handle_claude_profile))
+            .route(
+                "/api/organizations/{org}/reset_rate_limits",
+                post(handle_claude_consume),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -185,6 +199,27 @@ impl WhamMock {
             .push_back((status, body.to_string(), 0));
     }
 
+    fn push_claude_usage(&self, status: u16, body: &str) {
+        self.state
+            .claude_usage
+            .lock()
+            .expect("lock")
+            .push_back((status, body.to_string(), 0));
+    }
+
+    fn push_claude_consume(&self, status: u16, body: &str) {
+        self.state
+            .claude_consume
+            .lock()
+            .expect("lock")
+            .push_back((status, body.to_string(), 0));
+    }
+
+    /// The value a daemon carries in `upstream` (the Anthropic base).
+    fn anthropic_upstream(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
     fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().expect("lock").clone()
     }
@@ -206,8 +241,94 @@ fn record(state: &MockState, method: &str, path: &str, headers: &http::HeaderMap
         path: path.to_string(),
         authorization: header("authorization"),
         account_id: header("chatgpt-account-id"),
+        user_agent: header("user-agent"),
         body,
     });
+}
+
+/// The Anthropic usage document with the `cedar_ember` grant block — the
+/// 2026-10-06 live read through `api/oauth/usage?cedar_ember=1` as Claude
+/// Code, identifiers removed (`.prd/20-claude-reset-grants.md`).
+const CLAUDE_USAGE_ELIGIBLE: &str = r#"{
+  "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+  "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+  "limits": [],
+  "cedar_ember": {
+    "eligible": true, "ineligible_reason": null, "at_limit": false, "exhausted": [],
+    "grants": [{
+      "id": "opus55-launch-promax-20260921",
+      "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+      "resets_total": 1, "resets_left": 1,
+      "starts_at": "2026-09-22T16:00:00+00:00", "ends_at": "2099-10-22T16:00:00+00:00",
+      "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+      "paused": false, "usable_now": true, "use_requires_limit": false,
+      "percent_used": {"five_hour": 2, "seven_day": 0}, "blocking": [], "arm": null
+    }],
+    "next_grant_id": "opus55-launch-promax-20260921",
+    "weekly_resets_at": "2099-10-12T22:00:00+00:00", "cooldown_until": null,
+    "event_props": null
+  }
+}"#;
+
+/// The same document as the server answers an unidentified client (live
+/// 2026-10-06): ineligible for THIS surface, no grants.
+const CLAUDE_USAGE_SURFACE: &str = r#"{
+  "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+  "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+  "limits": [],
+  "cedar_ember": {"eligible":false,"ineligible_reason":"surface","at_limit":false,"exhausted":[],"grants":[],"next_grant_id":null,"weekly_resets_at":null,"cooldown_until":null,"event_props":null}
+}"#;
+
+const CLAUDE_PROFILE: &str = r#"{"account":{"uuid":"acct-uuid","email":"a@x.com","has_claude_max":true},"organization":{"uuid":"org-uuid-1","name":"a's Organization","organization_type":"claude_max"}}"#;
+
+async fn handle_claude_usage(
+    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
+    headers: http::HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> (http::StatusCode, String) {
+    let query = query.unwrap_or_default();
+    record(
+        &state,
+        "GET",
+        &format!("/api/oauth/usage?{query}"),
+        &headers,
+        String::new(),
+    );
+    // The background usage poller reads this route WITHOUT `cedar_ember=1`
+    // (and never parses the grant block); it must not consume the bodies a
+    // test scripted for the explicit control reads.
+    if !query.contains("cedar_ember=1") {
+        return (http::StatusCode::OK, CLAUDE_USAGE_ELIGIBLE.to_string());
+    }
+    next(&state.claude_usage, CLAUDE_USAGE_ELIGIBLE).await
+}
+
+async fn handle_claude_profile(
+    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
+    headers: http::HeaderMap,
+) -> (http::StatusCode, String) {
+    record(&state, "GET", "/api/oauth/profile", &headers, String::new());
+    (http::StatusCode::OK, CLAUDE_PROFILE.to_string())
+}
+
+async fn handle_claude_consume(
+    axum::extract::State(state): axum::extract::State<Arc<MockState>>,
+    axum::extract::Path(org): axum::extract::Path<String>,
+    headers: http::HeaderMap,
+    body: String,
+) -> (http::StatusCode, String) {
+    record(
+        &state,
+        "POST",
+        &format!("/api/organizations/{org}/reset_rate_limits"),
+        &headers,
+        body,
+    );
+    next(
+        &state.claude_consume,
+        r#"{"result":"reset","reason":null,"reset":true,"grant_id":"opus55-launch-promax-20260921","resets_left":0,"cleared":["five_hour","seven_day"],"weekly_resets_at":null,"cooldown_until":null}"#,
+    )
+    .await
 }
 
 async fn next(queue: &Mutex<VecDeque<Scripted>>, default: &str) -> (http::StatusCode, String) {
@@ -319,6 +440,20 @@ fn codex_account(name: &str) -> AccountConfig {
     }
 }
 
+fn oauth_account(name: &str) -> AccountConfig {
+    AccountConfig {
+        name: name.to_string(),
+        credential: AccountCredential::Oauth {
+            account_uuid: format!("uuid-{name}"),
+            access_token: format!("oat-{name}"),
+            refresh_token: format!("ort-{name}"),
+            expires_at_ms: far_future_ms(),
+            tier: Some("max".into()),
+            last_refresh_ms: None,
+        },
+    }
+}
+
 fn apikey_account(name: &str) -> AccountConfig {
     AccountConfig {
         name: name.to_string(),
@@ -389,7 +524,337 @@ fn config_for(mock: &WhamMock, accounts: Vec<AccountConfig>) -> Config {
     };
     config.codex.upstream = mock.codex_upstream();
     config.codex.token_url = format!("http://127.0.0.1:{}/token", mock.addr.port());
+    config.upstream = mock.anthropic_upstream();
     config
+}
+
+// ---------------------------------------------------------------------------
+// Claude reset grants (.prd/20)
+// ---------------------------------------------------------------------------
+
+/// A Claude oauth account reads its reset grants through the usage document
+/// (`?cedar_ember=1`, Claude Code identity) on an explicit refresh AND on the
+/// entitlement listing; the listing projects the grant onto the shared credit
+/// shape with its expiry; redemption posts the documented body to the
+/// organization route with the client's request id.
+#[tokio::test]
+async fn claude_account_reads_grants_and_redeems_one_by_id() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![oauth_account("cl"), codex_account("cx")]).await;
+
+    // Refresh fills the counters from the grant block.
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let control = &body["results"][0]["usage_control"];
+    assert_eq!(body["results"][0]["provider"], "oauth");
+    assert_eq!(control["available_resets"], 1);
+    assert_eq!(control["applicable_resets"], 1);
+    assert_eq!(control["eligibility"]["eligible"], true);
+    assert_eq!(
+        control["eligibility"]["weekly_resets_at"],
+        "2099-10-12T22:00:00+00:00"
+    );
+    let read = mock
+        .seen()
+        .into_iter()
+        .find(|s| s.path.starts_with("/api/oauth/usage") && s.path.contains("cedar_ember=1"))
+        .expect("grant read (cedar_ember=1) reached the anthropic mock");
+    assert_eq!(read.authorization.as_deref(), Some("Bearer oat-cl"));
+    let ua = read.user_agent.expect("user agent sent");
+    assert!(
+        ua.starts_with("claude-cli/") && ua.ends_with(" (external, cli)"),
+        "the grant read identifies as Claude Code: {ua}"
+    );
+
+    // The entitlement listing: one available credit with the grant's expiry.
+    let (status, list) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(list["provider"], "oauth");
+    assert_eq!(list["available_count"], 1);
+    assert_eq!(list["redeemable"], true);
+    assert_eq!(list["eligibility"]["eligible"], true);
+    let credit = &list["credits"][0];
+    assert_eq!(credit["id"], "opus55-launch-promax-20260921");
+    assert_eq!(credit["reset_type"], "claude_rate_limits");
+    assert_eq!(credit["status"], "available");
+    assert_eq!(credit["expires_at"], "2099-10-22T16:00:00+00:00");
+    assert_eq!(credit["granted_at"], "2026-09-22T16:00:00+00:00");
+
+    // Redeem: the body is the documented program/grant/request triple, the
+    // route is the organization's, and the outcome maps to `reset`.
+    let (status, ack) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-claude-1","confirm":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{ack}");
+    assert_eq!(ack["outcome"], "reset");
+    assert_eq!(ack["request_id"], "rid-claude-1");
+    assert_eq!(ack["credit_id"], "opus55-launch-promax-20260921");
+    assert_eq!(ack["windows_reset"], 2);
+    let post = mock
+        .seen()
+        .into_iter()
+        .find(|s| s.method == "POST" && s.path.contains("reset_rate_limits"))
+        .expect("redemption reached the anthropic mock");
+    assert_eq!(
+        post.path, "/api/organizations/org-uuid-1/reset_rate_limits",
+        "organization id comes from the profile endpoint"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&post.body).expect("json body");
+    assert_eq!(sent["program"], "cedar_ember");
+    assert_eq!(sent["grant_id"], "opus55-launch-promax-20260921");
+    assert_eq!(sent["request_id"], "rid-claude-1");
+    assert_eq!(post.authorization.as_deref(), Some("Bearer oat-cl"));
+    // No WHAM traffic for a Claude account.
+    assert!(
+        !mock.seen().iter().any(|s| s.path.starts_with("/wham")),
+        "{:?}",
+        mock.seen_paths()
+    );
+}
+
+/// A throttled read answers 200 with `cedar_ember.eligible: null` (observed
+/// live 2026-10-06 under a probe burst). That is NOT a revocation and NOT a
+/// fresh inventory: the entitlement listing fails (previous rows retained),
+/// a usage refresh keeps the known counts/rows/expiry/weekly reset but flags
+/// the inventory as stale through the retained error, a new redemption is
+/// refused before any POST, and only an explicit `false` clears the counts.
+#[tokio::test]
+async fn claude_null_eligibility_keeps_known_inventory_visibly_stale_and_false_clears_it() {
+    const THROTTLED: &str = r#"{
+      "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+      "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+      "limits": [],
+      "cedar_ember": {"eligible":null,"ineligible_reason":null,"at_limit":false,"exhausted":[],"grants":[],"next_grant_id":null,"weekly_resets_at":null,"cooldown_until":null,"event_props":null}
+    }"#;
+    let mock = WhamMock::spawn().await;
+    const WHOLE_NULL: &str = r#"{
+      "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+      "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+      "limits": [], "cedar_ember": null
+    }"#;
+    const KEY_ABSENT: &str = r#"{
+      "five_hour":  { "utilization": 2.0, "resets_at": "2099-01-01T03:59:59+00:00" },
+      "seven_day":  { "utilization": 0.0, "resets_at": "2099-01-04T08:59:59+00:00" },
+      "limits": []
+    }"#;
+    mock.push_claude_usage(200, CLAUDE_USAGE_ELIGIBLE); // 1. list
+    mock.push_claude_usage(200, THROTTLED); // 2. list
+    mock.push_claude_usage(200, THROTTLED); // 3. refresh
+    mock.push_claude_usage(200, WHOLE_NULL); // 3b. refresh (object null)
+    mock.push_claude_usage(200, KEY_ABSENT); // 3c. refresh (key absent)
+    mock.push_claude_usage(200, THROTTLED); // 4. consume's fresh-inventory read
+    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE); // 5. refresh
+    let proxy = Proxy::spawn(&mock, vec![oauth_account("cl")]).await;
+
+    // 1. A real read establishes the inventory.
+    let (status, list) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(list["available_count"], 1);
+    assert_eq!(
+        list["credits"][0]["expires_at"],
+        "2099-10-22T16:00:00+00:00"
+    );
+
+    // 2. The throttled listing is a FAILED inventory read, not an empty one.
+    let (status, err) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        err.to_string().contains("previous successful read"),
+        "{err}"
+    );
+
+    // 3. A throttled usage refresh keeps everything from read 1 and says so.
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let control = &body["results"][0]["usage_control"];
+    assert_eq!(control["available_resets"], 1, "{control}");
+    assert_eq!(
+        control["credits"][0]["expires_at"], "2099-10-22T16:00:00+00:00",
+        "{control}"
+    );
+    assert_eq!(
+        control["eligibility"]["weekly_resets_at"], "2099-10-12T22:00:00+00:00",
+        "the weekly reset from the real read survives: {control}"
+    );
+    assert!(
+        control["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("previous successful read")),
+        "the retained count is flagged stale: {control}"
+    );
+
+    // 3b/3c. The other throttled shapes — the whole object null, or the key
+    //        absent — are the same unknown: nothing is lost, nothing looks
+    //        fresh, and the stale flag from 3 is not wiped by them.
+    for shape in ["object null", "key absent"] {
+        let (status, body) = post_admin(
+            &proxy,
+            "/llmux/refresh-usage",
+            serde_json::json!({"account":"cl"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{shape}: {body}");
+        let control = &body["results"][0]["usage_control"];
+        assert_eq!(control["available_resets"], 1, "{shape}: {control}");
+        assert_eq!(
+            control["credits"][0]["expires_at"], "2099-10-22T16:00:00+00:00",
+            "{shape}: {control}"
+        );
+        assert_eq!(
+            control["eligibility"]["weekly_resets_at"], "2099-10-12T22:00:00+00:00",
+            "{shape}: {control}"
+        );
+        assert!(
+            control["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("previous successful read")),
+            "{shape}: still flagged stale: {control}"
+        );
+    }
+
+    // 4. A new redemption needs a FRESH inventory; the throttled read refuses
+    //    before any POST — the retained rows are never fed to the gate.
+    let (status, err) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-stale","confirm":true}),
+    )
+    .await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        !mock
+            .seen()
+            .iter()
+            .any(|s| s.method == "POST" && s.path.contains("reset_rate_limits")),
+        "no redemption POST on a stale inventory: {:?}",
+        mock.seen_paths()
+    );
+
+    // 5. An explicit `false` clears counts and rows and names the reason.
+    let (_, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
+    let control = &body["results"][0]["usage_control"];
+    assert!(control.get("available_resets").is_none(), "{control}");
+    assert!(control.get("credits").is_none(), "rows cleared: {control}");
+    assert_eq!(control["eligibility"]["ineligible_reason"], "surface");
+}
+
+/// Claude's extra terminal outcome `cooldown` spends nothing and releases the
+/// receipt; its `unavailable` answer is UNCERTAIN — the receipt is kept and
+/// only the same request id may retry, exactly like an unknown codex code.
+#[tokio::test]
+async fn claude_cooldown_is_terminal_and_unavailable_is_uncertain() {
+    let mock = WhamMock::spawn().await;
+    mock.push_claude_consume(
+        200,
+        r#"{"result":"cooldown","reason":"cooldown","reset":false,"grant_id":"opus55-launch-promax-20260921","resets_left":1,"cleared":[],"weekly_resets_at":null,"cooldown_until":"2099-10-07T00:00:00+00:00"}"#,
+    );
+    mock.push_claude_consume(200, r#"{"result":"unavailable","reason":"unavailable"}"#);
+    let proxy = Proxy::spawn(&mock, vec![oauth_account("cl")]).await;
+
+    let (status, ack) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-cool","confirm":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{ack}");
+    assert_eq!(ack["outcome"], "cooldown");
+    assert_eq!(ack["windows_reset"], 0);
+    assert!(
+        ack["usage_control"].get("pending_request_id").is_none(),
+        "a terminal outcome releases the receipt: {ack}"
+    );
+
+    let (status, err) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-unav","confirm":true}),
+    )
+    .await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        err.to_string().contains("rid-unav"),
+        "the uncertain error hands back THIS attempt's id: {err}"
+    );
+    let (status, list) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(
+        list["pending_request_id"], "rid-unav",
+        "the receipt stays until the same id resolves it"
+    );
+    assert_eq!(
+        posts(&mock)
+            .iter()
+            .filter(|p| p.path.contains("reset_rate_limits"))
+            .count(),
+        2,
+        "exactly one POST per redemption attempt"
+    );
+}
+
+/// The surface-ineligible answer is a KNOWN verdict, not an empty inventory:
+/// counts stay unknown, the reason rides on the doc, nothing is redeemable,
+/// and a redemption is refused before any POST.
+#[tokio::test]
+async fn claude_surface_ineligible_is_unknown_not_zero_and_refuses_redemption() {
+    let mock = WhamMock::spawn().await;
+    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE);
+    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE);
+    mock.push_claude_usage(200, CLAUDE_USAGE_SURFACE);
+    let proxy = Proxy::spawn(&mock, vec![oauth_account("cl")]).await;
+
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/refresh-usage",
+        serde_json::json!({"account":"cl"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let control = &body["results"][0]["usage_control"];
+    assert!(control.get("available_resets").is_none(), "{control}");
+    assert_eq!(control["eligibility"]["eligible"], false);
+    assert_eq!(control["eligibility"]["ineligible_reason"], "surface");
+
+    let (status, list) = get_admin(&proxy, "/llmux/reset-credits?account=cl").await;
+    assert_eq!(status, 200, "{list}");
+    assert!(list.get("available_count").is_none(), "{list}");
+    assert_eq!(list["redeemable"], false);
+    assert_eq!(list["credits"], serde_json::json!([]));
+    assert_eq!(list["eligibility"]["ineligible_reason"], "surface");
+
+    let (status, err) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cl","redeem_request_id":"rid-x","confirm":true}),
+    )
+    .await;
+    assert_ne!(status, 200, "{err}");
+    assert!(
+        !mock
+            .seen()
+            .iter()
+            .any(|s| s.method == "POST" && s.path.contains("reset_rate_limits")),
+        "no redemption POST: {:?}",
+        mock.seen_paths()
+    );
 }
 
 async fn post_admin(

@@ -3813,6 +3813,22 @@ fn account_modal_lines(
             super::view::reset_detail(None, account.credential_kind, now),
         )),
         Some(control) => {
+            if let Some(e) = &control.eligibility {
+                lines.push(modal_row(
+                    "eligible",
+                    format!(
+                        "{} · reason {} · weekly resets {}",
+                        e.eligible
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| dash.clone()),
+                        e.ineligible_reason.clone().unwrap_or_else(|| dash.clone()),
+                        e.weekly_resets_at
+                            .as_deref()
+                            .map(|w| super::view::expiry_label(w, now))
+                            .unwrap_or_else(|| dash.clone()),
+                    ),
+                ));
+            }
             lines.push(modal_row(
                 "counts",
                 format!(
@@ -3845,7 +3861,11 @@ fn account_modal_lines(
                         field(&credit.reset_type),
                         field(&credit.status),
                         field(&credit.granted_at),
-                        field(&credit.expires_at),
+                        credit
+                            .expires_at
+                            .as_deref()
+                            .map(|e| super::view::expiry_label(e, now))
+                            .unwrap_or_else(|| dash.clone()),
                         field(&credit.title),
                         field(&credit.description),
                     ),
@@ -9367,8 +9387,8 @@ mod tests {
 
     /// The accounts overlay shows the per-account reset count at BOTH a narrow
     /// and a wide terminal, and the `*` marks "owned but upstream reports none
-    /// applicable now". The claude row, which has no resets at all, shows `—`
-    /// — never `0`.
+    /// applicable now". The claude row carries reset grants too but has not
+    /// been read yet, so it shows `?` — never `0`.
     #[test]
     fn accounts_overlay_shows_reset_counts_at_narrow_and_wide_widths() {
         let view = usage_control_view();
@@ -9392,8 +9412,8 @@ mod tests {
                 .find(|r| r.contains("me@example.com") && r.contains("CLAUDE"))
                 .unwrap_or_else(|| panic!("claude row at {w}x{h}:\n{frame}"));
             assert!(
-                claude_row.contains('—'),
-                "a provider without resets renders n/a, not 0: {claude_row:?}"
+                claude_row.contains('?'),
+                "an unread claude row renders unknown, not 0: {claude_row:?}"
             );
         }
     }
@@ -12998,6 +13018,7 @@ mod tests {
                 raw_io,
                 email_anonymous: _,
                 tui_effects: _,
+                claude_cli_version: _,
                 tui_gradient,
                 show_fable_weekly: _,
                 domain_abbrev: _,
@@ -13899,10 +13920,10 @@ mod tests {
                 "…clipped, not dropped (rst={resets}): {row:?}\n{frame}"
             );
             if resets {
-                // `rst` survives the squeeze; this oauth row has no resets at
-                // all, so its cell is the honest `—` (never a count).
+                // `rst` survives the squeeze; this oauth row carries a read
+                // grant doc (3 owned, 0 applicable), so its cell is `3*`.
                 assert!(
-                    header.contains("rst") && row.contains('—'),
+                    header.contains("rst") && row.contains("3*"),
                     "the reset column survives too: {row:?}\n{frame}"
                 );
             }
