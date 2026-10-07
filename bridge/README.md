@@ -21,6 +21,9 @@ Rust passes one JSON request through stdin: `{body, credential, upstream,
 directory}`. `body` is an Anthropic-shaped full transcript. `credential` contains
 only the selected access token/API key, never a refresh token. stdout starts
 with a JSON HTTP status line followed by Anthropic SSE (or an error body).
+Before streaming, known SDK failures also include an allowlisted `error_code`
+in that private status line. Rust checks that code and status together; only
+SDK-origin account restrictions participate in immediate account failover.
 
 - `query()` receives the current structured user message and replays prior
   user/assistant/image/tool blocks through its public `sessionStore` + `resume`
@@ -66,6 +69,31 @@ cancellation ownership. On a completed external tool boundary the bridge kills
 the SDK-owned native process before returning from the async iterator: its
 graceful close otherwise converts canceled permission requests into tool errors
 and can start additional inference. Error output never includes raw SDK stderr or credentials.
+
+## Error lifecycle
+
+The mapping covers the complete `SDKAssistantMessageError` union in pinned
+`0.3.292/sdk.d.ts`. Only a pre-stream error can change account selection.
+
+| SDK code | Status / meaning |
+| --- | --- |
+| `authentication_failed` | 401: existing refresh-once authentication lifecycle |
+| `oauth_org_not_allowed`, `account_on_hold`, `verification_required` | 403: account needs intervention; switch without a token refresh |
+| `billing_error` | 402: unavailable account credit; switch without a token refresh |
+| `rate_limit` | 429: existing rate-limit lifecycle |
+| `invalid_request`, `model_not_found` | 400 / 404: return request error; do not disqualify the account |
+| `overloaded`, `cloud_credential_error` | 503: transient; no account rejection |
+| `server_error`, `unknown` | 500 / 502: upstream/transport failure |
+| `max_output_tokens` | Ignore the synthetic diagnostic during a stream and preserve the real `max_tokens` stop; an isolated diagnostic without a stream fails 502 |
+
+The pinned native SDK labels `cloud_credential_error` explicitly transient:
+it describes loading a host cloud credential, not expiration of the selected
+Claude OAuth token. It emits the synthetic `max_output_tokens` assistant error
+before the real `message_delta`; treating that diagnostic as an account failure
+would discard valid partial output. Raw API error frames before `message_start`
+retain HTTP failure status; errors after streaming begins remain terminal SSE.
+Unknown error strings are replaced by `unknown`, never reflected as trusted
+codes or diagnostic text.
 
 ## Verification
 

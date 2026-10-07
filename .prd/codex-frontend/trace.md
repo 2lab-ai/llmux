@@ -74,3 +74,11 @@ adapter; SDK leg is labeled SDK transport rather than private vendor HTTP.
 strict validation, request-owned Luna shape and its total deadline. Responses
 adaptation applies only to Responses ingress; original raw bytes remain available
 for both paths. The combined e2e suite covers both routing contracts.
+
+2026-10-07 MODIFIED after installed-preview RED: typed SDK permanent-account
+rejections now carry an explicit internal disposition to shared forwarding,
+separate from generic HTTP status. The existing fingerprint-protected health
+mark and bounded same-request failover apply without rotating OAuth tokens.
+Refreshable auth, request errors, transient failures and output-limit stops keep
+their separate lifecycle. Actual installed full-pool failure, focused subprocess
+regressions and the correction's release receipts are tracked in loop.md.

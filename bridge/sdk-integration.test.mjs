@@ -11,13 +11,14 @@ const bridge=fileURLToPath(new URL('./claude-agent.mjs',import.meta.url));
 const tool={name:'exec_command',description:'Execute a command in the client sandbox',input_schema:{type:'object',properties:{cmd:{type:'string'},timeout:{type:'number'}},required:['cmd'],additionalProperties:false}};
 function frames(kind='text', structuredValue){
  const block=kind==='structured'?{type:'tool_use',id:'structured_sdk',name:'StructuredOutput',input:{}}:kind==='tool'?{type:'tool_use',id:'call_native_sdk',name:'mcp__llmux__exec_command',input:{}}:{type:'text',text:''};
- return [{type:'message_start',message:{id:'msg_mock',type:'message',role:'assistant',model:'claude-sonnet-4-6',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:17,output_tokens:1}}},{type:'content_block_start',index:0,content_block:block},{type:'content_block_delta',index:0,delta:kind==='structured'?{type:'input_json_delta',partial_json:JSON.stringify({output:structuredValue})}:kind==='tool'?{type:'input_json_delta',partial_json:'{"cmd":"printf sdk_fixture"}'}:{type:'text_delta',text:'SDK fixture complete'}},{type:'content_block_stop',index:0},{type:'message_delta',delta:{stop_reason:(kind==='tool'||kind==='structured')?'tool_use':'end_turn',stop_sequence:null},usage:{input_tokens:17,output_tokens:5}},{type:'message_stop'}];
+ return [{type:'message_start',message:{id:'msg_mock',type:'message',role:'assistant',model:'claude-sonnet-4-6',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:17,output_tokens:1}}},{type:'content_block_start',index:0,content_block:block},{type:'content_block_delta',index:0,delta:kind==='structured'?{type:'input_json_delta',partial_json:JSON.stringify({output:structuredValue})}:kind==='tool'?{type:'input_json_delta',partial_json:'{"cmd":"printf sdk_fixture"}'}:{type:'text_delta',text:'SDK fixture complete'}},{type:'content_block_stop',index:0},{type:'message_delta',delta:{stop_reason:(kind==='tool'||kind==='structured')?'tool_use':kind==='max_tokens'?'max_tokens':'end_turn',stop_sequence:null},usage:{input_tokens:17,output_tokens:5}},{type:'message_stop'}];
 }
 async function execute(body,kind='text',structuredValue) {
  const requests=[];
  const server=http.createServer(async(req,res)=>{
   let raw='';for await(const c of req)raw+=c;
   requests.push({url:req.url,body:JSON.parse(raw),headers:req.headers});
+  if(typeof kind==='object'){res.writeHead(kind.status,{'content-type':'application/json'});res.end(JSON.stringify({type:'error',error:kind.error}));return;}
   if(kind==='401'||kind==='429'){res.writeHead(Number(kind),{'content-type':'application/json'});res.end(JSON.stringify({type:'error',error:{type:kind==='401'?'authentication_error':'rate_limit_error',message:'fixture failure'}}));return;}
   res.writeHead(200,{'content-type':'text/event-stream'});res.end(frames(kind,structuredValue).map(f=>`event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join(''));
  });
@@ -29,7 +30,7 @@ async function execute(body,kind='text',structuredValue) {
  try {await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve);});}
  finally {clearTimeout(timeout);server.close();}
  assert.equal(stderr,'');
- return {requests,output,status:JSON.parse(output.split('\n')[0]).status,events:output.split('\n').filter(l=>l.startsWith('data: ')).map(l=>JSON.parse(l.slice(6)))};
+ return {requests,output,header:JSON.parse(output.split('\n')[0]),status:JSON.parse(output.split('\n')[0]).status,events:output.split('\n').filter(l=>l.startsWith('data: ')).map(l=>JSON.parse(l.slice(6)))};
 }
 const body={model:'claude-sonnet-4-6',max_tokens:512,system:'Use only client tools',tools:[tool],messages:[{role:'user',content:'Run printf using the client'}]};
 test('actual SDK retains tool JSON schema and yields external call without execution',{timeout:40000},async()=>{
@@ -96,4 +97,33 @@ test('structured output still hands client tool calls back to Codex',{timeout:40
  assert.equal(result.requests.length,1);
  assert.equal(result.events.find(e=>e.type==='content_block_start').content_block.name,'exec_command');
  assert.equal(result.events.find(e=>e.type==='message_delta').delta.stop_reason,'tool_use');
+});
+
+test('actual SDK organization OAuth restriction preserves permanent account code',{timeout:40000},async()=>{
+ const result=await execute({...body,tools:[]},{status:403,error:{type:'permission_error',message:'OAuth authentication is currently not allowed for this organization'}});
+ assert.deepEqual(result.header,{status:403,error_code:'oauth_org_not_allowed'});
+ assert.equal(result.requests.length,1);assert.equal(result.events.length,0);
+ assert.ok(!result.output.includes('fixture-not-a-real-secret'));
+});
+test('actual SDK model not found remains a request error without account rejection',{timeout:40000},async()=>{
+ const result=await execute({...body,tools:[]},{status:404,error:{type:'not_found_error',message:'model does not exist'}});
+ assert.deepEqual(result.header,{status:404,error_code:'model_not_found'});
+ assert.equal(result.events.length,0);
+});
+test('actual SDK output limit preserves partial text and max_tokens termination',{timeout:40000},async()=>{
+ const result=await execute({...body,tools:[]},'max_tokens');
+ assert.deepEqual(result.header,{status:200});assert.equal(result.requests.length,1);
+ assert.equal(result.events.find(e=>e.type==='message_delta').delta.stop_reason,'max_tokens');
+ assert.equal(result.events.find(e=>e.delta?.type==='text_delta').delta.text,'SDK fixture complete');
+ assert.ok(!result.events.some(e=>e.type==='error'));
+});
+test('actual SDK verification restriction preserves permanent account code',{timeout:40000},async()=>{
+ const result=await execute({...body,tools:[]},{status:403,error:{type:'permission_error',message:'Organization verification required',details:{error_code:'verification_required'}}});
+ assert.deepEqual(result.header,{status:403,error_code:'verification_required'});
+ assert.equal(result.requests.length,1);assert.equal(result.events.length,0);
+});
+test('actual SDK exhausted credit balance retains billing status',{timeout:40000},async()=>{
+ const result=await execute({...body,tools:[]},{status:400,error:{type:'invalid_request_error',message:'Credit balance is too low'}});
+ assert.deepEqual(result.header,{status:402,error_code:'billing_error'});
+ assert.equal(result.requests.length,1);assert.equal(result.events.length,0);
 });

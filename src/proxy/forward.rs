@@ -1948,6 +1948,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             });
         }
         ctx.dispatched = Some(std::time::Instant::now());
+        let mut sdk_account_rejected = false;
         let send_result = if endpoint == "claude-agent-sdk" {
             match crate::provider::claude_sdk::send(
                 &upstream_req.body,
@@ -1956,7 +1957,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             )
             .await
             {
-                Ok(response) => Ok(response),
+                Ok(sdk) => {
+                    sdk_account_rejected = sdk.account_rejected;
+                    Ok(sdk.response)
+                }
                 Err(detail) => {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
                     return error_response(StatusCode::BAD_GATEWAY, "proxy_error", &detail);
@@ -2034,7 +2038,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         }
 
         // 5. Taxonomy.
-        match classify(response.status(), response.headers()) {
+        let signal = if sdk_account_rejected {
+            UpstreamSignal::Persistent
+        } else {
+            classify(response.status(), response.headers())
+        };
+        match signal {
             UpstreamSignal::Relay => {
                 return match translate_stream {
                     Some(client_stream) => {
@@ -2326,6 +2335,16 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 return transient_response(&format!("upstream returned {status}"));
             }
             UpstreamSignal::Persistent => {
+                let status = response.status();
+                let detail = upstream_error_detail(response).await;
+                tracing::warn!(account = %account, %status, "SDK account rejected; switching");
+                ctx.log(format!(
+                    "=== RESPONSE {status} (account rejected) ===\n{detail}"
+                ));
+                state.emit(ActivityEvent::Error {
+                    context: Some("upstream".into()),
+                    message: format!("{status} from {account}: {detail}; switching account"),
+                });
                 state
                     .pool
                     .record_auth_failure_if(&account, lease.fingerprint());

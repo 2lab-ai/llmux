@@ -99,14 +99,40 @@ export function buildRequest(body, credential, upstream, directory, inherited = 
     parent_tool_use_id: null, session_id: sessionId, client_composed: true}};
 }
 
+// Complete SDKAssistantMessageError union from the pinned 0.3.292 sdk.d.ts.
+// Account-policy errors are distinct from expired authentication: refreshing an
+// otherwise valid token cannot fix an organization ban, hold, or verification.
+const SDK_ERROR_STATUS = Object.freeze({
+  authentication_failed: 401,
+  oauth_org_not_allowed: 403,
+  account_on_hold: 403,
+  verification_required: 403,
+  billing_error: 402,
+  rate_limit: 429,
+  overloaded: 503,
+  invalid_request: 400,
+  model_not_found: 404,
+  server_error: 500,
+  unknown: 502,
+  // A normal output limit is handled by its subsequent message_delta, not an
+  // HTTP error. Without a stream, an isolated synthetic error is incomplete.
+  max_output_tokens: 502,
+  // The native SDK labels cloud credential loading errors transient. Never
+  // refresh or disqualify the selected Claude account for a host/cloud error.
+  cloud_credential_error: 503,
+});
+function sdkErrorCode(error) {
+  const code = typeof error === 'string' ? error : error?.error;
+  return Object.hasOwn(SDK_ERROR_STATUS, code) ? code : undefined;
+}
 export function errorStatus(error) {
   if (error instanceof InvalidRequest) return 400;
-  const code = typeof error === 'string' ? error : error?.error;
-  if (['authentication_failed', 'authentication_error'].includes(code)) return 401;
-  if (['rate_limit', 'rate_limit_error'].includes(code)) return 429;
-  if (['invalid_request', 'invalid_request_error'].includes(code)) return 400;
-  if (code === 'billing_error') return 402;
-  return 502;
+  const code = sdkErrorCode(error) ?? sdkErrorCode(error?.type);
+  if (code) return SDK_ERROR_STATUS[code];
+  const type = typeof error === 'string' ? error : error?.type;
+  const statuses = {authentication_error:401,rate_limit_error:429,invalid_request_error:400,
+    permission_error:403,not_found_error:404,overloaded_error:503,api_error:500};
+  return Object.hasOwn(statuses,type) ? statuses[type] : 502;
 }
 
 export async function run(input, runtime, output = process.stdout) {
@@ -118,13 +144,13 @@ export async function run(input, runtime, output = process.stdout) {
   let stopped = false;
   let failed = false;
   const write = async value => { if (!output.write(value)) await once(output, 'drain'); };
-  const headers = async status => {
-    if (!sentHeaders) { await write(JSON.stringify({status}) + '\n'); sentHeaders = true; }
+  const headers = async (status, errorCode) => {
+    if (!sentHeaders) { await write(JSON.stringify({status,...(errorCode ? {error_code:errorCode} : {})}) + '\n'); sentHeaders = true; }
   };
   const event = async value => { await headers(200); await write(`event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`); };
-  const failure = async (status, message) => {
+  const failure = async (status, message, code) => {
     failed = true;
-    if (!sentHeaders) { await headers(status); await write(JSON.stringify({type:'error',error:{type:status === 429 ? 'rate_limit_error' : status === 401 ? 'authentication_error' : status === 400 ? 'invalid_request_error' : 'api_error',message}})); }
+    if (!sentHeaders) { await headers(status,sdkErrorCode(code)); await write(JSON.stringify({type:'error',error:{type:({400:'invalid_request_error',401:'authentication_error',402:'billing_error',403:'permission_error',404:'not_found_error',429:'rate_limit_error',503:'overloaded_error'})[status] ?? 'api_error',message}})); }
     else await event({type:'error',error:{type:'api_error',message}});
     cancel();
   };
@@ -168,9 +194,15 @@ export async function run(input, runtime, output = process.stdout) {
     let roundUsage = {}, delta;
     for await (const item of query) {
       if (item.parent_tool_use_id) continue;
-      if (item.type === 'assistant' && item.error) { await failure(errorStatus(item), 'Claude Agent SDK request failed (' + item.error + ').'); break; }
-      if (item.type === 'rate_limit_event' && item.rate_limit_info?.status === 'rejected') { await failure(429,'Claude account rate limit exceeded.'); break; }
-      if (item.type === 'system' && item.subtype === 'api_retry') { await failure(item.error_status ?? 502,'Claude Agent SDK upstream request failed.'); break; }
+      if (item.type === 'assistant' && item.error) {
+        // The SDK emits this synthetic diagnostic BEFORE the real max_tokens
+        // delta. Preserve that partial response and its honest stop reason.
+        if (item.error === 'max_output_tokens' && started) continue;
+        const code = sdkErrorCode(item) ?? 'unknown';
+        await failure(errorStatus(code), 'Claude Agent SDK request failed (' + code + ').', code); break;
+      }
+      if (item.type === 'rate_limit_event' && item.rate_limit_info?.status === 'rejected') { await failure(429,'Claude account rate limit exceeded.','rate_limit'); break; }
+      if (item.type === 'system' && item.subtype === 'api_retry') { await failure(sdkErrorCode(item) ? errorStatus(item) : item.error_status ?? 502,'Claude Agent SDK upstream request failed.',sdkErrorCode(item)); break; }
       if (item.type === 'result') {
         if (request.structured && !item.is_error && Object.hasOwn(item, 'structured_output')) {
           if (!item.structured_output || !Object.hasOwn(item.structured_output,'output')) {await failure(502,'SDK omitted the structured output value.'); break;}
@@ -213,7 +245,7 @@ export async function run(input, runtime, output = process.stdout) {
         if (!external && (internal || request.structured) && delta?.delta?.stop_reason !== 'max_tokens') continue;
         if (!delta) {await failure(502,'SDK omitted the response stop reason.'); break;}
         await event({...delta,usage}); await event(frame); stopped = true; cancel(); break;
-      } else if (frame.type === 'error') {failed = true; await event(frame); cancel(); break;}
+      } else if (frame.type === 'error') {await failure(errorStatus(frame.error),'Claude Agent SDK upstream stream failed.',sdkErrorCode(frame.error?.type)); break;}
     }
     if (!stopped && !failed) await failure(502,'Claude Agent SDK stream ended before a complete response.');
   } catch (error) {
