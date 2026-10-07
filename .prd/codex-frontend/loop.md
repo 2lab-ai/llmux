@@ -135,3 +135,15 @@ account rejected with SDK organization HTTP 403, then request id 1 completed
 using the healthy second account at `/v1/responses`, endpoint OpenAi. The old
 binary returned HTTP 502 for that same setup. Corrected prerelease installation
 and actual installed-client tool smokes remain required before shipped status.
+
+Root's independent full gate observed two refreshes in the C3 exactly-once
+fixture. Source inspection identifies a scheduling race consistent with this
+result (the failing schedule itself was not traced): its mock returns a 1-hour
+token, inside the 7-hour background-refresh window; a
+late startup sweep can issue a second legitimate refresh after the request's
+forced refresh. This same race is already documented in server.rs near pending
+receipt hydration. The native 401, concurrent OAuth request-refresh and SDK 401
+fixtures now set refresh_ahead_secs=0 so their counts measure request-owned
+refreshes. Exact counts, bearer order and persistence assertions are unchanged;
+the separate background-refresh acceptance test remains active. Complete just
+check passed afterward, /private/tmp/llmux-sdk-refresh-fixture-check.log.

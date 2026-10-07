@@ -672,11 +672,15 @@ async fn expired_token_refreshes_once_for_concurrent_requests_and_persists() {
 
     let mock = MockUpstream::spawn().await;
     mock.set_token_delay(Duration::from_millis(200)); // widen the race window
-    let proxy = Proxy::spawn(
-        &mock.base_url(),
-        vec![oauth_account_expiring("a", "at-stale", 1_000)], // long expired
-    )
-    .await;
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account_expiring("a", "at-stale", 1_000)], // long expired
+        ..Default::default()
+    };
+    // Count request-owned refreshes only. The mock returns a 1h token, inside
+    // the default 7h background window; a later first sweep could refresh again.
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
 
     let client = reqwest::Client::new();
     let url = proxy.url("/v1/messages");
@@ -1413,11 +1417,11 @@ async fn codex_401_refreshes_once_and_retries() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::AuthRejected);
     mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 32));
-    let proxy = Proxy::spawn_config(codex_config(
-        &mock,
-        vec![codex_account("cx", "at-codex-stale")],
-    ))
-    .await;
+    let mut config = codex_config(&mock, vec![codex_account("cx", "at-codex-stale")]);
+    // Keep this 401 contract independent of the startup background sweep. The
+    // refreshed mock token lasts 1h, less than the default 7h refresh-ahead window.
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
 
     let client = reqwest::Client::new();
     let response = post_messages(
@@ -5696,11 +5700,15 @@ async fn responses_sdk_other_errors_keep_request_and_refresh_semantics() {
     ] {
         fixture.rejection(code, status);
         let mock = MockUpstream::spawn().await;
-        let proxy = Proxy::spawn(
-            &mock.base_url(),
-            vec![oauth_account("a", "at-sdk-rejected")],
-        )
-        .await;
+        let mut config = Config {
+            upstream: mock.base_url(),
+            accounts: vec![oauth_account("a", "at-sdk-rejected")],
+            ..Default::default()
+        };
+        // The 401 case counts request-owned refreshes, not a background sweep
+        // over the newly returned mock token's shorter lifetime.
+        config.scheduler.refresh_ahead_secs = 0;
+        let proxy = Proxy::spawn_config(config).await;
         let response = reqwest::Client::new()
             .post(proxy.url("/v1/responses"))
             .bearer_auth(E2E_ADMIN_KEY)
