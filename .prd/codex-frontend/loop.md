@@ -74,3 +74,26 @@ Responses ingress uses the new boundary adapter. Integrated gate receipt:
 /private/tmp/llmux-codex-integrated-check.log — complete just check passed (exit 0),
 including all auto_classifier and Responses e2e cases. Integrated cargo build
 also passed; packaged bootstrap/live schema verification remains release work.
+
+## Round 4 — CI packaging correction
+
+PR #188 Arch KDE CI exposed a reduced Docker source context missing the three
+compile-time embedded bridge files. Both the initial COPY and the local Git
+fixture consumed by makepkg now carry those files. Docker context excludes
+node_modules; the pinned manifests and script remain included. The Islands CI
+path filters include bridge and Docker context rules. Other release
+workflows build a complete checkout. CI is rerun on the corrected source before
+release; the feature remains in-progress until installed-preview verification.
+
+The same CI run exposed the existing macOS shutdown-test fixture reaching the
+real upstream through its default startup idle probe. The fixture now disables
+that unrelated network work and preserves daemon stderr on timeout; its 1-second
+drain and 15-second process-exit assertions remain unchanged. CI did not retain
+the original daemon stderr, so a specific runtime-stall cause is not claimed.
+
+Local correction receipts: complete just check passed (including the unchanged
+drain deadline assertions), /private/tmp/llmux-codex-packaging-check.log. A real
+Docker build using the same COPY and fixture git-add lines cloned the resulting
+Git repository and byte-compared all three bridge assets successfully; receipt
+/private/tmp/llmux-codex-packaging-context.log. The full Arch Qt/package job remains
+the remote CI gate, rather than being inferred from the smaller context check.

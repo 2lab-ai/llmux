@@ -885,8 +885,11 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
         probe.local_addr().expect("probe addr").port()
     };
+    // This test measures local connection drain only. The default immediate
+    // idle sweep would send this fake key to the real upstream and can leave
+    // blocking DNS work running during Tokio runtime teardown.
     h.seed_config(&format!(
-        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey"}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
+        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey","idle_probe":{{"enabled":false}}}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
     ));
 
     let mut cmd = h.cmd();
@@ -951,7 +954,9 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         }
         if Instant::now() >= exit_deadline {
             let _ = child.kill();
-            panic!("server still alive 15s after shutdown with a hung connection open");
+            let _ = child.wait();
+            let joined = stderr_lines.join().expect("stderr thread").join("\n");
+            panic!("server still alive 15s after shutdown with a hung connection open\n{joined}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
