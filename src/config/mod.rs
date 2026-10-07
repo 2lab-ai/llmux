@@ -138,6 +138,10 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
         Err(err) => return Err(io_err(path, err)),
     };
     let mut config: Config = serde_json::from_str(&raw)?;
+    config
+        .claude_code
+        .validate()
+        .map_err(ConfigError::Invalid)?;
     if config.version != 1 {
         return Err(ConfigError::UnsupportedVersion(config.version));
     }
@@ -235,6 +239,10 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 
 /// [`save`] against an explicit path.
 pub fn save_path(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    config
+        .claude_code
+        .validate()
+        .map_err(ConfigError::Invalid)?;
     // Demo mode loads aliased account names; never let those reach disk.
     if crate::demo::enabled() {
         tracing::debug!("LLMUX_DEMO_MODE: config save suppressed");

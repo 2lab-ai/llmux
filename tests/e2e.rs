@@ -5735,3 +5735,286 @@ async fn responses_sdk_other_errors_keep_request_and_refresh_semantics() {
         );
     }
 }
+
+// Sanitized shapes from Claude Code 2.1.292 captures #50/#55, 2026-10-07.
+fn internal_quota(session: &str) -> serde_json::Value {
+    serde_json::json!({"model":"haiku","max_tokens":1,"metadata":{"user_id":session},"messages":[{"role":"user","content":"quota"}]})
+}
+fn internal_title(session: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({"model":"haiku","max_tokens":32000,"stream":stream,"temperature":1,"thinking":{"type":"disabled"},"tools":[],"metadata":{"user_id":session},
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.292;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions. Return JSON with a single title field."}],
+        "messages":[{"role":"user","content":"<session>Inspect the fixture</session>\nWrite the title in the predominant language of the session."}],
+        "output_config":{"format":{"type":"json_schema","schema":llmux::proxy::internal_requests::title_schema()}}})
+}
+fn resolved_alias(alias: &str) -> String {
+    llmux::provider::codex::effective_request_meta(
+        &serde_json::json!({"model":alias}),
+        &llmux::provider::codex::CodexShape {
+            model: alias.into(),
+            client_model: None,
+            fast: false,
+            effort: None,
+        },
+    )
+    .0
+}
+#[tokio::test]
+async fn internal_routing_initial_quota_uses_validated_hint_and_real_codex_headers() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(
+        &classifier_response_sse("ok"),
+        128,
+        &[("x-codex-primary-used-percent", "23")],
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.codex.reasoning_effort = Some("ultra".into());
+    config.codex.client_model = Some("global-override".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .json(&internal_quota("bootstrap"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "23");
+    assert_eq!(response.headers()["x-llmux-quota-mode"], "availability");
+    assert!(!response
+        .headers()
+        .keys()
+        .any(|h| h.as_str().starts_with("anthropic-ratelimit")));
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(message["model"], resolved_alias("luna"));
+    let seen = mock.seen();
+    let body: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(body["model"], resolved_alias("luna"));
+    assert_eq!(body["reasoning"]["effort"], "low");
+    for hint in [None, Some("gpt-made-up"), Some("sol[1m][1m]")] {
+        let mut request = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .json(&internal_quota("bootstrap"));
+        if let Some(hint) = hint {
+            request = request.header("x-llmux-claude-launch-model", hint);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            404,
+            "hint must not create persistent session state"
+        );
+    }
+    for timestamp in [
+        None,
+        Some("0".to_string()),
+        Some((epoch_ms_now() + 60_000).to_string()),
+    ] {
+        let mut request = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-claude-launch-model", "sol")
+            .json(&internal_quota("expired"));
+        if let Some(timestamp) = timestamp {
+            request = request.header("x-llmux-claude-launch-time", timestamp);
+        }
+        assert_eq!(request.send().await.unwrap().status(), 404);
+    }
+    assert_eq!(mock.seen().len(), 1);
+}
+#[tokio::test]
+async fn internal_routing_title_schema_temperature_and_effective_model_both_legs() {
+    for stream in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        for text in ["Working.", r#"{"title":"Fixture inspection"}"#] {
+            mock.push(ScriptedResponse::sse_plain(
+                &classifier_response_sse(text),
+                256,
+            ));
+        }
+        let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+        config.codex.client_model = Some("global-override".into());
+        config.claude_code.gpt_model_mapping.haiku = "terra".into();
+        let proxy = Proxy::spawn_config(config).await;
+        let client = reqwest::Client::new();
+        post_messages(
+            &client,
+            &proxy,
+            &auto_main_request("title-s", "sol").to_string(),
+        )
+        .await
+        .bytes()
+        .await
+        .unwrap();
+        let request = internal_title("title-s", stream);
+        let classified =
+            llmux::proxy::classify::classify("/v1/messages", request.to_string().as_bytes());
+        assert_eq!(classified.kind, "title");
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        assert!(response.headers()["x-llmux-omitted-fields"]
+            .to_str()
+            .unwrap()
+            .contains("temperature"));
+        let text = response.text().await.unwrap();
+        assert!(text.contains(&resolved_alias("terra")), "{text}");
+        assert!(!text.contains("global-override"));
+        let body: serde_json::Value = serde_json::from_slice(&mock.seen()[1].body).unwrap();
+        assert_eq!(body["model"], resolved_alias("terra"));
+        assert_eq!(
+            body["text"]["format"]["schema"],
+            llmux::proxy::internal_requests::title_schema()
+        );
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body.get("temperature").is_none());
+        let strict = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-compatibility", "strict")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(strict.status(), 400);
+        let mut generic = auto_main_request("title-s", "sol");
+        generic["temperature"] = serde_json::json!(1);
+        assert_eq!(
+            post_messages(&client, &proxy, &generic.to_string())
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(mock.seen().len(), 2);
+    }
+}
+#[tokio::test]
+async fn internal_routing_configured_tiers_and_security_override_do_not_hijack_main_switch() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            256,
+        ));
+    }
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>5</severity>"),
+        256,
+    ));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    let mut config = routing_config(
+        &mock,
+        vec![
+            codex_account("cx", "at-codex"),
+            oauth_account("cl", "at-claude"),
+        ],
+        "error",
+    );
+    config.claude_code.gpt_model_mapping.opus = "luna".into();
+    config.claude_code.gpt_model_mapping.sonnet = "sol".into();
+    config.claude_code.gpt_model_mapping.haiku = "terra".into();
+    config.claude_code.auto_classifier_model = "terra".into();
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("tiers", "sol").to_string(),
+    )
+    .await
+    .bytes()
+    .await
+    .unwrap();
+    for (tier, target) in [("opus", "luna"), ("sonnet", "sol"), ("haiku", "terra")] {
+        let mut worker = auto_main_request("tiers", tier);
+        worker["system"][0]["text"] =
+            serde_json::json!("x-anthropic-billing-header: cc_is_subagent=true;");
+        worker["output_config"] = serde_json::json!({"effort":"high"});
+        let response = post_messages(&client, &proxy, &worker.to_string()).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.seen().last().unwrap().body).unwrap();
+        assert_eq!(body["model"], resolved_alias(target));
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("tiers", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&mock.seen()[4].body).unwrap();
+    assert_eq!(body["model"], resolved_alias("terra"));
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    // A human asking for the old title phrase is still an authoritative MAIN.
+    let mut main = auto_main_request("tiers", "sonnet");
+    main["messages"][0]["content"] = serde_json::json!("Write a 5-10 word title for my code");
+    let response = post_messages(&client, &proxy, &main.to_string()).await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .json(&internal_quota("tiers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 7);
+    assert_eq!(seen[5].authorization.as_deref(), Some("Bearer at-claude"));
+    assert_eq!(seen[6].authorization.as_deref(), Some("Bearer at-claude"));
+    assert!(seen.iter().all(|r| r.launch_model_hint.is_none()));
+}
+
+#[tokio::test]
+async fn internal_routing_unknown_session_pinned_count_and_disabled_are_unchanged() {
+    for disabled in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+        config.routing.enabled = !disabled;
+        let proxy = Proxy::spawn_config(config).await;
+        let client = reqwest::Client::new();
+        for path in ["/v1/messages", "/llmux/claude/v1/messages"] {
+            let response = client
+                .post(proxy.url(path))
+                .header("x-api-key", "client-supplied-key")
+                .header("x-llmux-claude-launch-model", "sol")
+                .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+                .json(&internal_title("unknown", false))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if path.starts_with("/llmux/") {
+                    403
+                } else if disabled {
+                    400
+                } else {
+                    404
+                }
+            ); // normal auth/compatibility contracts
+        }
+        let response = client
+            .post(proxy.url("/v1/messages/count_tokens"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-claude-launch-model", "sol")
+            .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+            .json(&internal_quota("unknown"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), if disabled { 200 } else { 404 });
+        assert!(mock.seen().is_empty());
+    }
+}

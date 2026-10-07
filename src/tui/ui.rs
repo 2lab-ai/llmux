@@ -2883,6 +2883,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
         },
         CfgRow {
             section: "routing",
+            label: "Claude Code GPT mapping",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "claude_code in config; restart required",
+            action: None,
+        },
+        CfgRow {
+            section: "routing",
             label: "model lists",
             value: "config file".into(),
             state: CfgState::ReadOnly,
@@ -13055,6 +13063,7 @@ mod tests {
                 openrouter,
                 scheduler,
                 routing,
+                claude_code,
                 pricing: _,
                 raw_io,
                 email_anonymous: _,
@@ -13071,6 +13080,15 @@ mod tests {
                 client_keys: _,
                 accounts: _,
             } = &config;
+            let crate::config::schema::ClaudeCodeConfig {
+                gpt_model_mapping,
+                auto_classifier_model: _,
+            } = claude_code;
+            let crate::config::schema::GptModelMapping {
+                opus: _,
+                sonnet: _,
+                haiku: _,
+            } = gpt_model_mapping;
             let crate::config::ProxyConfig {
                 port: _,
                 api_key: _,
@@ -13183,6 +13201,10 @@ mod tests {
             "scheduler.usage_max_age_secs",
             "scheduler.usage_poll_secs",
             "scheduler.refresh_ahead_secs",
+            "claude_code.gpt_model_mapping.opus",
+            "claude_code.gpt_model_mapping.sonnet",
+            "claude_code.gpt_model_mapping.haiku",
+            "claude_code.auto_classifier_model",
             "routing.enabled",
             "routing.claude_models",
             "routing.codex_models",
