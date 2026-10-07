@@ -1,5 +1,9 @@
 # Prompt families (wire contracts)
 
+Scope: these are dated Messages-client prompt families. They are not a catalog of
+Codex-native prompts or the private prompts added by the Claude SDK bridge; see
+[the capture scope](README.md).
+
 Each family is a **different system-prompt contract**. Model swap reuses the
 family; it does not invent a new one.
 

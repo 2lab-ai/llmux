@@ -95,6 +95,15 @@ retain HTTP failure status; errors after streaming begins remain terminal SSE.
 Unknown error strings are replaced by `unknown`, never reflected as trusted
 codes or diagnostic text.
 
+## Packaging and raw capture
+
+Filtered Docker/source contexts must include the embedded script, package manifest
+and lockfile; any intermediate git snapshot used by a package build must track
+them too. `node_modules` is a runtime/test install, not a source asset.
+Raw I/O captures label this boundary `claude-agent-sdk`: its Messages input/output
+is the bridge transport, not a capture of the SDK’s private vendor HTTP. Client
+Responses input/output remains available separately; capture defaults to enabled.
+
 ## Verification
 
 ```sh

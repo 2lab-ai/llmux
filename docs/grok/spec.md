@@ -1,5 +1,9 @@
 # Grok provider — spec
 
+Ingress scope: the provider design and dated receipts below describe incoming
+Anthropic Messages. For the later incoming OpenAI Responses path, see the
+[frontend transport matrix](../provider-compatibility.md#frontend-transport-matrix).
+
 > STV artifact (zbrain rules/STV.md). The companion `trace.md` is the source of truth for
 > execution paths; this file fixes scope, design decisions, and the File Map.
 > Reference implementation analyzed: router-for-me/CLIProxyAPI (Go) — its xAI executor,

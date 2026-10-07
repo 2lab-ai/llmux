@@ -42,6 +42,12 @@ hooks and unrelated inherited credentials disabled. SDK-owned web search runs
 inside the SDK when the caller enables server web search. SDK identity and
 continuation reminders are additional to the caller's conversation.
 
+Grok and OpenRouter models use Responses-to-Messages conversion followed by their
+existing provider adapters; they do not use the Claude SDK. These are bounded
+translated paths, not full native Responses parity. The installed native-Codex/Claude
+release smoke receipts do not establish live Grok/OpenRouter parity. See the
+[frontend transport matrix](../provider-compatibility.md#frontend-transport-matrix).
+
 Claude's SDK cannot enforce `parallel_tool_calls:false`, non-auto/non-none
 `tool_choice`, `temperature`, `top_p` or an explicit non-default `service_tier`; these are explicit HTTP 400 errors.
 `exec --output-schema` maps `text.format` JSON Schema to the SDK structured-output
@@ -71,7 +77,9 @@ refresh path. Request errors do not disable accounts; see the
   malformed and unknown explicit OpenAI credentials are rejected, including locally.
 - Send the full conversation with `store:false`; stored responses,
   `previous_response_id`, `conversation` and background jobs are not implemented.
-- Stream errors end in `response.failed`; nonstream failures return HTTP 502.
+- Errors after streaming starts end in `response.failed`. Invalid requests return
+  400; client authentication returns 401, and upstream request errors retain their
+  status. Malformed/truncated terminal streams fail aggregate JSON with 502.
   Disconnecting releases the account lease and terminates SDK processes.
 
 OpenAI endpoint activity uses a dark gray row background, even when Claude served
@@ -82,7 +90,9 @@ clients; see [activity rendering](activity.md).
 Raw I/O records retain the original Responses input and returned Responses output.
 The upstream leg on the Claude route is explicitly labeled `claude-agent-sdk` and
 records the Messages transport passed to/from the SDK, not a claim about the SDK's
-private HTTP request. Captures remain opt-in and use the existing size/redaction rules.
+private HTTP request. Capture is enabled by default (`raw_io.enabled`); disable it in configuration if
+needed. Existing size/redaction rules apply, and raw bodies may contain private
+prompt content. The SDK transport leg is not a replayable vendor HTTP request.
 
 Sources: `src/cli/run.rs`, `src/proxy/responses.rs`, `src/proxy/forward.rs`,
 `src/provider/claude_sdk.rs` and [bridge contracts](../../bridge/README.md),

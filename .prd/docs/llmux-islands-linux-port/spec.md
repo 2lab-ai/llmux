@@ -80,6 +80,10 @@ layout and color tokens.
 
 ### ActivityReceipt
 
+Endpoint origin is independent of provider/model. `open_ai` receipts use a dark gray
+background in native surfaces (the TUI uses RGB(40,40,40)); `anthropic` keeps the normal
+background. See [endpoint flow](../../../docs/codex-frontend/activity.md).
+
     receipt_id
     kind               in_flight | request | note
     occurred_at_ms
@@ -88,6 +92,7 @@ layout and color tokens.
     path?
     account_display?
     provider?
+    endpoint           anthropic | open_ai (legacy missing field defaults to anthropic)
     model?
     effort?
     fast
