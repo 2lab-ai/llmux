@@ -4831,3 +4831,542 @@ async fn compatibility_codex_strict_mode_rejects_thinking_config() {
 async fn compatibility_grok_strict_mode_rejects_thinking_config() {
     compat_strict_rejects_thinking_config(CompatFlavor::Grok).await;
 }
+
+// Sanitized wire shape captured on 2026-10-07, Claude Code 2.1.292.
+// Policy/transcript content is deliberately synthetic; no real commands or secrets.
+fn auto_classifier_request(session: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-sonnet-5[1m]", "max_tokens": 64, "stream": stream,
+        "metadata": {"user_id": session}, "thinking": {"type": "disabled"},
+        "stop_sequences": ["</severity>"],
+        "system": [{"type":"text","text":"You are a security monitor for autonomous AI coding agents. Output <severity>N</severity> where N is an integer 0-100 and 50 is exactly the allow/block boundary."}],
+        "messages": [{"role":"user","content":"<transcript>Read a fixture.</transcript> Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those. Respond with <severity>N</severity> ONLY. Grade HARM ONLY — do NOT reduce for user intent. No other text."}]
+    })
+}
+
+fn auto_main_request(session: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model, "metadata":{"user_id":session},
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.290; cc_entrypoint=cli;"},
+            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
+        "tools":[{"name":"Read","description":"Read a fixture","input_schema":{"type":"object"}}],
+        "messages":[{"role":"user","content":"Read the fixture"}]
+    })
+}
+
+fn classifier_response_sse(text: &str) -> String {
+    use serde_json::json;
+    [json!({"type":"response.created","response":{"id":"resp_classifier"}}),
+     json!({"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}),
+     json!({"type":"response.output_text.delta","delta":text}),
+     json!({"type":"response.output_item.done","item":{"type":"message"}}),
+     json!({"type":"response.completed","response":{"id":"resp_classifier","usage":{"input_tokens":100,"output_tokens":7}}})]
+     .iter().map(|v|format!("event: {}\ndata: {}\n\n",v["type"].as_str().unwrap(),v)).collect()
+}
+
+#[tokio::test]
+async fn auto_classifier_gpt_session_routes_luna_and_preserves_severity_stop() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>5</severity>"),
+        11,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.codex.reasoning_effort = Some("ultra".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let main = post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("session-a", "sol").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("session-a", false).to_string(),
+    )
+    .await;
+    let status = response.status();
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "classifier must work with NO Claude account: {message}"
+    );
+    assert_eq!(message["content"][0]["text"], "<severity>5");
+    assert_eq!(message["stop_reason"], "stop_sequence");
+    assert_eq!(message["stop_sequence"], "</severity>");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert_eq!(body["model"], "gpt-6-luna");
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    assert_eq!(seen[1].authorization.as_deref(), Some("Bearer at-codex"));
+}
+
+#[tokio::test]
+async fn auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict() {
+    for stream in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        let verdict="<thinking>Unrequested deletion is harmful.</thinking><severity>95</severity><category>Delete Important Data</category>";
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(verdict),
+            7,
+        ));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(
+            &client,
+            &proxy,
+            &auto_main_request("s", "gpt-5.6-sol").to_string(),
+        )
+        .await
+        .bytes()
+        .await
+        .unwrap();
+        let mut request = auto_classifier_request("s", stream);
+        request.as_object_mut().unwrap().remove("stop_sequences");
+        request["max_tokens"] = serde_json::json!(8192);
+        request["messages"][0]["content"]=serde_json::json!("Use <thinking> first, then respond with <severity>N</severity>, plus <category>Exact BLOCK Rule Name</category> when a BLOCK rule matches.");
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        if stream {
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let events = parse_anthropic_sse(&response.text().await.unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|(t, _)| t == "content_block_delta")
+                    .unwrap()
+                    .1["delta"]["text"],
+                verdict
+            );
+            let delta = &events.iter().find(|(t, _)| t == "message_delta").unwrap().1["delta"];
+            assert_eq!(delta["stop_reason"], "end_turn");
+            assert!(delta["stop_sequence"].is_null());
+        } else {
+            let message: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(message["content"][0]["text"], verdict);
+            assert_eq!(message["stop_reason"], "end_turn");
+        }
+        let upstream: serde_json::Value = serde_json::from_slice(&mock.seen()[1].body).unwrap();
+        assert_eq!(upstream["model"], "gpt-6-luna");
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_streaming_stage_one_and_raw_provenance() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>90</severity>"),
+        3,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", true).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["x-llmux-compatibility-warnings"]
+        .to_str()
+        .unwrap()
+        .contains("classifier_local_stop"));
+    let events = parse_anthropic_sse(&response.text().await.unwrap());
+    assert_eq!(
+        events
+            .iter()
+            .find(|(t, _)| t == "content_block_delta")
+            .unwrap()
+            .1["delta"]["text"],
+        "<severity>90"
+    );
+    let delta = &events.iter().find(|(t, _)| t == "message_delta").unwrap().1["delta"];
+    assert_eq!(delta["stop_reason"], "stop_sequence");
+    assert_eq!(delta["stop_sequence"], "</severity>");
+    let path = proxy._tmp.path().join("raw-io.jsonl");
+    let record = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Some(record) = raw
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|r| r["model"] == "gpt-6-luna")
+                {
+                    break record;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original: serde_json::Value =
+        serde_json::from_str(record["request_body"].as_str().unwrap()).unwrap();
+    assert_eq!(original["model"], "claude-sonnet-5[1m]");
+    assert_eq!(original["stop_sequences"][0], "</severity>");
+    let upstream: serde_json::Value =
+        serde_json::from_str(record["upstream"]["request_body"].as_str().unwrap()).unwrap();
+    assert_eq!(upstream["model"], "gpt-6-luna");
+    assert_eq!(upstream["reasoning"]["effort"], "medium");
+}
+
+#[tokio::test]
+async fn auto_classifier_invalid_outputs_fail_before_streaming_any_verdict() {
+    for text in [
+        "<severity>0",
+        "<severity>101</severity>",
+        "<thinking>unfinished <severity>0</severity>",
+        "",
+    ] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(text),
+            128,
+        ));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            502,
+            "must not emit success SSE for {text}"
+        );
+        let message: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(message["type"], "error");
+        assert!(message.get("content").is_none());
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged() {
+    let client = reqwest::Client::new();
+    // Unknown main model / daemon restart must never use another session's GPT.
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("unknown", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 404);
+    assert!(mock.seen().is_empty());
+    // A count probe with a main-looking body must not seed session state.
+    let response = client
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("x-api-key", "client-supplied-key")
+        .json(&auto_main_request("s", "sol"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", false).to_string()
+        )
+        .await
+        .status(),
+        404
+    );
+    // Legacy routing-disabled path stays untouched, including a monitor after GPT.
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at")], "error");
+    config.routing.enabled = false;
+    let proxy = Proxy::spawn_config(config).await;
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", false).to_string(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        400,
+        "generic Codex stop refusal must remain"
+    );
+    assert_eq!(mock.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_classifier_strict_policy_and_generic_stop_refusal_remain() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-compatibility", "strict")
+        .json(&auto_classifier_request("s", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(mock.seen().len(), 1);
+    let mut normal = auto_main_request("s", "sol");
+    normal["stop_sequences"] = serde_json::json!(["</severity>"]);
+    assert_eq!(
+        post_messages(&client, &proxy, &normal.to_string())
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(mock.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_classifier_subagent_does_not_undo_main_switchback() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::ok(r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"<severity>7"}],"stop_reason":"stop_sequence","stop_sequence":"</severity>","usage":{"input_tokens":1,"output_tokens":1}}"#));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![
+            codex_account("cx", "at-codex"),
+            oauth_account("cl", "at-claude"),
+        ],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for request in [
+        auto_main_request("s", "sol"),
+        auto_main_request("s", "claude-sonnet-5"),
+    ] {
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut sub = auto_main_request("s", "sol");
+    sub["system"][0]["text"] = serde_json::json!("cc_is_subagent=true");
+    post_messages(&client, &proxy, &sub.to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        mock.seen()[3].authorization.as_deref(),
+        Some("Bearer at-claude")
+    );
+}
+
+#[tokio::test]
+async fn auto_classifier_failed_incomplete_and_oversize_streams_never_expose_verdict() {
+    let completed = classifier_response_sse("<severity>0</severity>");
+    let prefix = completed.split("event: response.completed").next().unwrap();
+    let failed=format!("{prefix}event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"fixture failure\"}}}}}}\n\n");
+    let incomplete=format!("{prefix}event: response.incomplete\ndata: {{\"type\":\"response.incomplete\",\"response\":{{\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}}}}}}\n\n");
+    let oversized = classifier_response_sse(&format!(
+        "<severity>0</severity>{}",
+        "x".repeat(1024 * 1024)
+    ));
+    for body in [prefix.to_string(), failed, incomplete, oversized] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        mock.push(ScriptedResponse::sse_plain(&body, 256 * 1024));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), 502);
+        let message: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(message["type"], "error");
+        assert!(message.get("content").is_none());
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_codex_unavailable_never_falls_back_to_claude() {
+    for empty in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        let claude = oauth_account("cl", "at-claude");
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at-codex"), claude.clone()],
+            "fallback",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        if empty {
+            proxy.pool.reload_accounts(&[claude]);
+        } else {
+            proxy.pool.record_429(
+                &AccountId("cx".into()),
+                Some(Duration::from_secs(600)),
+                SystemTime::now(),
+            );
+        }
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", false).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), if empty { 404 } else { 429 });
+        assert_eq!(
+            mock.seen().len(),
+            1,
+            "must not use available Claude account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_silent_stream_errors_without_success_verdict() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let prefix = classifier_response_sse("<severity>0</severity>")
+        .split("event: response.completed")
+        .next()
+        .unwrap()
+        .to_string();
+    mock.push(ScriptedResponse::SseThenStall { prefix });
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at")], "error");
+    config.proxy.forward_idle_timeout_secs = 1;
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert!(body.get("content").is_none());
+}
