@@ -320,8 +320,8 @@ derives an isolated sibling directory, which is also what keeps tests off the re
 The Responses ingress and Claude Agent SDK transport share the scheduler, leases,
 refresh/retry taxonomy and accounting with Messages. The client protocol remains
 separate from the backend group. See [feature contract](21-codex-frontend.md) and
-[vertical traces](codex-frontend/trace.md); implementation is tracked there until
-preview verification closes the feature.
+[vertical traces](codex-frontend/trace.md). The shipped contract and verified
+preview release are recorded in [the convergence loop](codex-frontend/loop.md).
 
 ## Claude Code auto-mode routing exception (2026-10-07)
 
