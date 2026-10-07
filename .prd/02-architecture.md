@@ -385,7 +385,7 @@ adapter removes only default temperature 1 with diagnostics and maps the capture
 schema to Responses `text.format`; generic/strict controls remain unchanged.
 
 `cli::claude_context` conservatively resolves launcher model provenance and merges
-a reserved custom header. Only an exact startup quota may use it when no observed
+a reserved custom header. Only exact startup quota or no-tools title requests may use it when no observed
 session exists; it does not seed state. Ingress raw capture retains the original
 request; transport strips the reserved header. Existing tenant authorization,
 provider pinning, routing-off and count endpoints take precedence. Targets validate

@@ -281,7 +281,10 @@ configurable Opus→`sol`, Sonnet→`terra`, Haiku→`luna` alias mapping. The s
 and normalized session isolation used by monitors applies. Main execution requests
 remain authoritative even if their text resembles a title/compaction prompt;
 subagents cannot overwrite that choice. Unknown sessions are unchanged, apart from
-an exact initial `quota`/`max_tokens:1` probe carrying `llmux run` launch context.
+an exact initial `quota`/`max_tokens:1` probe or captured no-tools session-title
+request carrying fresh `llmux run` launch context. A title can arrive before the
+first main turn; E2E `internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session`
+covers that order, configured aliases, stale hints and observed Claude priority.
 Mapped requests never fall back to Claude on Codex exhaustion.
 
 | Axis | Internal-task behavior and evidence (2026-10-07) |

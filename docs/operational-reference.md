@@ -650,13 +650,15 @@ In a GPT main session, llmux maps implicit Opus/Sonnet/Haiku requests to
 Titles are labeled `title`; activity records the actual effective model.
 Explicit main Claude choices remain authoritative, including a switch after launch.
 
-The startup quota call occurs before the first main request. `llmux run` supplies
+Startup quota and session-title calls can occur before the first main request.
+`llmux run` supplies
 `x-llmux-claude-launch-model` only when it can resolve the launch choice: explicit
 `--model`, `ANTHROPIC_MODEL`, or ordinary user/project/local/flag settings model,
 with native alias environment overrides considered. Both `--model=value` and
 `--model value` work; `CLAUDE_CONFIG_DIR` is respected. Unrelated
 `ANTHROPIC_CUSTOM_HEADERS` are preserved, and the reserved hint is stripped before
-upstream forwarding. Hints only affect an exact quota probe and never override an
+upstream forwarding. Hints only affect an exact quota probe or captured no-tools session-title request,
+not arbitrary helpers, and never override an
 observed session choice or populate session state.
 
 This is a conservative resolver, not a clone of Claude Code settings: agent/routine

@@ -5989,7 +5989,7 @@ async fn internal_routing_unknown_session_pinned_count_and_disabled_are_unchange
                 .post(proxy.url(path))
                 .header("x-api-key", "client-supplied-key")
                 .header("x-llmux-claude-launch-model", "sol")
-                .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+                .header("x-llmux-claude-launch-time", "0")
                 .json(&internal_title("unknown", false))
                 .send()
                 .await
@@ -6009,7 +6009,7 @@ async fn internal_routing_unknown_session_pinned_count_and_disabled_are_unchange
             .post(proxy.url("/v1/messages/count_tokens"))
             .header("x-api-key", "client-supplied-key")
             .header("x-llmux-claude-launch-model", "sol")
-            .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+            .header("x-llmux-claude-launch-time", "0")
             .json(&internal_quota("unknown"))
             .send()
             .await
@@ -6017,4 +6017,78 @@ async fn internal_routing_unknown_session_pinned_count_and_disabled_are_unchange
         assert_eq!(response.status(), if disabled { 200 } else { 404 });
         assert!(mock.seen().is_empty());
     }
+}
+
+#[tokio::test]
+async fn internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse(r#"{"title":"Fixture inspection"}"#),
+        256,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.claude_code.gpt_model_mapping.haiku = "terra".into();
+    config.codex.client_model = Some("global-main-override".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let title = internal_title("title-before-main", true);
+    let request = || {
+        client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .json(&title)
+    };
+    // Real native race: title starts before any authoritative main execution.
+    let response = request()
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "initial title must work with no Claude account"
+    );
+    let text = response.text().await.unwrap();
+    assert!(text.contains(&resolved_alias("terra")));
+    assert!(!text.contains("global-main-override"));
+    let seen = mock.seen();
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(sent["model"], resolved_alias("terra"));
+    assert_eq!(
+        sent["text"]["format"]["schema"],
+        llmux::proxy::internal_requests::title_schema()
+    );
+    // Hint use must not seed session state. Missing/expired/unknown hints stay Claude.
+    for (model, time) in [
+        (None, None),
+        (Some("sol"), Some("0".to_string())),
+        (Some("gpt-unknown"), Some(epoch_ms_now().to_string())),
+    ] {
+        let mut call = request();
+        if let Some(model) = model {
+            call = call.header("x-llmux-claude-launch-model", model);
+        }
+        if let Some(time) = time {
+            call = call.header("x-llmux-claude-launch-time", time);
+        }
+        assert_eq!(call.send().await.unwrap().status(), 404);
+    }
+    // A known Claude main choice wins even over a still-fresh GPT launch hint.
+    let main = post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("title-before-main", "sonnet").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 404);
+    let response = request()
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(mock.seen().len(), 1);
 }

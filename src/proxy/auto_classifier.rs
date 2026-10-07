@@ -63,7 +63,7 @@ pub(super) fn system_blocks(body: &Value) -> Vec<&str> {
 
 impl Sessions {
     /// Utility lookups never seed state. A bounded bootstrap hint is used only
-    /// for the initial exact quota probe, never over an observed main choice.
+    /// for an exact startup quota/title request, never over an observed main choice.
     pub fn gpt_context(&self, tenant: Option<&str>, body: &Value, hint: Option<&str>) -> bool {
         if let Some(key) = identity(tenant, body) {
             if let Some((_, gpt)) = self.entries.get(&key) {

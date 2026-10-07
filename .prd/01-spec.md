@@ -52,7 +52,7 @@ only a foreground process.
 - No general task-content routing (claude-code-router). Narrow compatibility exception:
   recognized Claude Code internal requests in a GPT main session use configurable
   Opus→sol/Sonnet→terra/Haiku→luna aliases; monitors separately default to Luna.
-  Exact startup quota probes can consume proven launcher context before the first
+  Exact startup quota/title requests can consume proven launcher context before the first
   main turn. This is harness compatibility, not arbitrary task-content routing.
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary

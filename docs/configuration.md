@@ -282,5 +282,5 @@ Explicit concrete model IDs are available when pinning is intentional.
 A genuine main `/model` switch to Claude remains Claude and resets session context;
 these mappings do not change the model picker or native alias environment exports.
 Pinned provider routes and disabled model routing bypass the adapter. Unknown
-sessions retain normal routing, except the initial quota probe can use the bounded
+sessions retain normal routing, except exact initial quota/title requests can use the bounded
 launch context provided by `llmux run`. See [launch context and quota behavior](operational-reference.md#claude-code-internal-model-routing).
