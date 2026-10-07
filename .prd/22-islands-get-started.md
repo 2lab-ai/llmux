@@ -1,5 +1,5 @@
 # Islands get started
-Status: in-progress
+Status: shipped
 Date: 2026-10-08
 
 ## Problem
@@ -28,3 +28,16 @@ local GUI HTTP auth also conflicts with the daemon's admin-only control API.
 
 Source boundary, executable paths and evidence: [trace](islands-get-started/trace.md),
 [original request](islands-get-started/ssot.md), [loop](islands-get-started/loop.md).
+
+## Delivery verified 2026-10-08
+
+Shipped in [preview 2040](https://github.com/2lab-ai/llmux/releases/tag/preview-2026-10-07-2040-7fe64d172929),
+source 7fe64d1. The installed CLI/server and Islands app match that release; the
+unmodified native HTTP executor discovers the installed CLI and authenticates
+dashboard/status. Five reviewed native-view videos were saved as separate Threads
+drafts without publishing. See the [acceptance receipts and limits](islands-get-started/loop.md#round-4--paired-preview-and-closure).
+
+Actual GUI connection state and Finder/Terminal Automation dispatch were not
+observed. The app process/payload, native HTTP path, command quoting and installed
+CLI tool roundtrips were verified separately; fixture footage does not imply a
+live login or button-click recording.
