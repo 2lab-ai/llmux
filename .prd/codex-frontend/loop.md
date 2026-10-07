@@ -21,7 +21,7 @@ Date: 2026-10-07
 
 | Gate | Evidence | State |
 |---|---|---|
-| protocol contract RED | baseline /v1/responses absent | test pending |
+| protocol contract RED | baseline /v1/responses absent → actual HTTP regression | implemented and passing |
 | native Codex model text/tool | actual CLI native-tool.out | verified pre-integration |
 | Claude SDK model text/tool | actual CLI claude-tool.out / claude-patch.out | verified pre-integration |
 | activity origin | docs/codex-frontend/activity.md | implementation gates pass |
@@ -64,3 +64,13 @@ publication, installed-binary smoke. Status remains in-progress.
 - Pre-header cancellation verified separately: SDK processes59582/59631 alive
   before any readable HTTP bytes, both gone0.17s after socket shutdown. Receipt
   /private/tmp/llmux-codex-live/cancel-before-headers-receipt.json.
+
+## Round 3 — main integration
+
+Feature source committed as a9189d9 after the complete just check passed. Main
+1991a8b is integrated without dropping its auto-classifier tests or documentation.
+The outer classifier deadline and request-owned model shape remain intact; only
+Responses ingress uses the new boundary adapter. Integrated gate receipt:
+/private/tmp/llmux-codex-integrated-check.log — complete just check passed (exit 0),
+including all auto_classifier and Responses e2e cases. Integrated cargo build
+also passed; packaged bootstrap/live schema verification remains release work.

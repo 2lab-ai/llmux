@@ -32,7 +32,7 @@ their *capabilities* the same. Public API docs are a hypothesis about them, not 
 | --- | --- | --- | --- | --- |
 | `max_tokens` (output cap) | forwarded | forwarded (`src/provider/openrouter.rs:563-577`) | **not sent at all** — the one cap field measured there is refused | forwarded as `max_output_tokens`, **meaning unproven** |
 | `temperature` / `top_p` / `top_k` | forwarded | forwarded | **400** | **400** |
-| non-empty `stop_sequences` | forwarded | forwarded | **400** | **400** |
+| non-empty `stop_sequences` | forwarded | forwarded | **400**, except [scoped monitor adapter](#claude-code-auto-mode-monitors) | **400** |
 | assistant `thinking` history | forwarded when **signed**; a block with a missing/empty `signature` is stripped¹ | same¹ | **dropped** | **dropped** |
 | assistant `redacted_thinking` | forwarded untouched (it carries no `signature` field by design) | same | **dropped** | **dropped** |
 | `model` field | rewritten: alias resolved, `[1m]` client suffix stripped | rewritten to the OpenRouter wire slug (`or-ox-alpha` → `stealth/ox-alpha`) | replaced by the served upstream model (`src/provider/responses_request.rs:134`) | same |
@@ -197,3 +197,33 @@ Evidence: `tests/e2e.rs::responses_*`, `src/proxy/responses.rs::tests`,
 [Codex frontend guide](codex-frontend/README.md) explains installation, client
 configuration and unsupported stored/background response features. Claude SDK
 adds its own identity/reminders: role/content preservation is not byte-identity.
+
+## Claude Code auto-mode monitors
+
+**2026-10-07 compatibility exception:** a recognized Claude Code security monitor
+for a recently observed GPT main session uses the Codex `luna` alias with medium
+effort. It does not inherit global main-model effort or fast mode. Tenant plus
+normalized device/session identity isolates concurrent sessions. Main CLI turns
+(including tool-result continuations) update context; subagents and harness control
+requests do not. The state has a six-hour TTL, 4096-entry cap, and no disk recovery.
+Unknown sessions retain normal routing; an unavailable Codex group does not fall
+back to Claude for a mapped monitor. This is a transport/model change, not an
+authorization policy replacement or an assurance that two models judge identically.
+
+| Axis | Monitor behavior and evidence (2026-10-07) |
+| --- | --- |
+| Prompt and output | Policy/transcript forwarded through existing Responses text conversion. Both severity stages supported: Stage 1 closing tag, Stage 2 optional closed `<thinking>`, severity 0–100 and optional category. Historical block yes/no supported when named by system contract. `src/proxy/auto_classifier.rs`; unit tests `severity_stage_one_stop_and_stage_two_thinking_are_preserved`, `historical_block_contract_and_unknown_shapes` |
+| Stop and cap | Only a recognized single `</severity>`/`</block>` stop may be removed from provider input and applied to the completed, validated output. Actual closing delimiter is excluded and `stop_reason/stop_sequence` are set truthfully. `classifier_local_stop` warning is returned. `max_tokens` is still omitted/reported: no output-token/billing-cap promise. Generic stop refusal and strict original-control validation remain. E2E `auto_classifier_strict_policy_and_generic_stop_refusal_remain` |
+| Reasoning | Request-owned medium effort; original top-level `thinking` remains omitted/reported. No prior-reasoning continuity added. Textual Stage 2 `<thinking>` is validated and preserved; provider reasoning summaries are excluded from the delivered verdict. E2E `auto_classifier_gpt_session_routes_luna_and_preserves_severity_stop` sets global ultra to prove override isolation |
+| Tools/images | Monitor requests must have no tools. Existing image/content refusal and conversion policy is unchanged. No classifier result is turned into a tool call or fabricated native safeguard evaluation |
+| Streaming/errors | Both client modes buffer and validate the complete actual verdict. Successful upstream stream buffer cap 1 MiB, total request deadline 60 seconds; malformed, failed, incomplete, truncated or oversized output produces an error, never partial approval. E2E `auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict`, `auto_classifier_failed_incomplete_and_oversize_streams_never_expose_verdict`, `auto_classifier_silent_stream_errors_without_success_verdict` |
+| Usage/counting | Original upstream usage retained, including reasoning. Count endpoint never learns main context or uses this adapter. Raw request remains original; translated upstream and activity identify actual Luna/medium. E2E `auto_classifier_streaming_stage_one_and_raw_provenance`, `auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged` |
+| Auth/endpoint | Existing Codex subscription credentials and `/responses` endpoint; no public OpenAI API assumption. E2E first regression proves success with no Claude account; `auto_classifier_codex_unavailable_never_falls_back_to_claude` covers configured fallback policy too |
+
+These are mock-based routing/contract receipts, not live safety-quality equivalence
+claims. The real CLI 2.1.292 Stage 1 wire shape was observed on 2026-10-07:
+Sonnet request, max_tokens 64, disabled thinking, no tools, stop `</severity>`,
+nonstream response `<severity>5` with a stop-sequence reason. Stage 2's no-stop
+8192-token request and thinking/severity/category parser were inspected in the
+installed 2.1.292 client. Test prompts are sanitized synthetic fixtures; no full
+user transcript or credential is committed.

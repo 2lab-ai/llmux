@@ -30,6 +30,7 @@ src/
   proxy/
     server.rs          # axum listener, /llmux/* control endpoints, background tasks
     forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
+    auto_classifier.rs # bounded main-session context + Luna monitor verdict adapter
     sse.rs             # passthrough + transform relay; SseTransform trait
     logging.rs         # optional request logs, credential masking
   provider/
@@ -227,6 +228,7 @@ The translator:
   as `max_output_tokens` with warning `max_tokens_semantics` (not an omission). Positive integer
   validation is not clamping, a total-budget guarantee, or a billing cap;
 - rejects non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` with local 400
+  (the scoped auto-mode adapter handles its recognized closing-tag stop before translation)
   rather than infer subscription support from public schemas. Empty stop sequences are
   vacuous; malformed values fail. Top-level `thinking` is shape-validated, then omitted with
   `thinking_config` in omissions/warnings (strict: 400), without enforcing `budget_tokens` or
@@ -320,3 +322,23 @@ refresh/retry taxonomy and accounting with Messages. The client protocol remains
 separate from the backend group. See [feature contract](21-codex-frontend.md) and
 [vertical traces](codex-frontend/trace.md); implementation is tracked there until
 preview verification closes the feature.
+
+## Claude Code auto-mode routing exception (2026-10-07)
+
+`AppState.auto_classifier_sessions` holds at most 4096 tenant/session entries with a
+6-hour TTL. Only recognized main CLI execution turns update it, at request entry;
+subagents and control turns do not. The current JSON-in-string `metadata.user_id`
+is normalized to device/session, excluding account UUID. State is not persisted.
+
+On POST `/v1/messages`, with model routing enabled, a recognized security monitor
+for a known GPT main session receives a request-owned Codex shape (`luna`, medium,
+no priority override). Original client bytes remain available for raw-io capture;
+provider input and activity metadata use the effective shape. An empty/exhausted
+Codex group never falls back to Claude for this exception.
+
+The monitor adapter alone can remove a recognized closing-tag stop from provider
+input and apply it to a complete, validated verdict. Both client delivery modes
+buffer until validation (1 MiB successful-upstream-stream limit; 60-second total
+request deadline). Generic Responses control validation and strict-mode checks
+remain unchanged. Details and regression receipts are in
+[`docs/provider-compatibility.md`](../docs/provider-compatibility.md#claude-code-auto-mode-monitors).

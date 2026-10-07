@@ -82,3 +82,7 @@ Sources: `src/cli/run.rs`, `src/proxy/responses.rs`, `src/proxy/forward.rs`,
 `src/provider/claude_sdk.rs` and [bridge contracts](../../bridge/README.md),
 verified 2026-10-07. Native model schema and provider configuration were checked
 against Codex CLI 0.160.1; SDK is pinned to 0.3.292.
+
+Codex treats the custom `llmux` provider as lacking remote compaction support,
+so context compaction uses ordinary Responses summarization requests. No separate
+`/responses/compact` endpoint or remote-compaction override is configured.

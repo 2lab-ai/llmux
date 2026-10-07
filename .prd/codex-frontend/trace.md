@@ -48,13 +48,13 @@ row background. Older rows default to Anthropic. Errors/cancellations retain ori
 
 | Files | Contract | Status |
 |---|---|---|
-| src/cli/{mod,run}.rs | T1 launch/catalog | pending |
-| src/proxy/{forward,sse,server,mod}.rs | T1/T2 shared transport | pending |
-| src/proxy/responses.rs | T1/T2 protocol boundary | pending |
-| src/provider/{mod,codex,claude_sdk}.rs, bridge/ | native Codex / SDK | pending |
-| src/tui/{event,activity,view,ui,mod}.rs, src/dashboard.rs | T3 origin | pending |
-| tests/ + module tests | contract verification | pending |
-| README.md, docs/{operational-reference,provider-compatibility}.md | user docs | pending |
+| src/cli/{mod,run}.rs | T1 launch/catalog | implemented; local gates pass |
+| src/proxy/{forward,sse,server,mod}.rs | T1/T2 shared transport | implemented; local gates pass |
+| src/proxy/responses.rs | T1/T2 protocol boundary | implemented; local gates pass |
+| src/provider/{mod,codex,claude_sdk}.rs, bridge/ | native Codex / SDK | implemented; local gates pass |
+| src/tui/{event,activity,view,ui,mod}.rs, src/dashboard.rs | T3 origin | implemented; local gates pass |
+| tests/ + module tests | contract verification | implemented; local gates pass |
+| README.md, docs/{operational-reference,provider-compatibility}.md | user docs | implemented; local gates pass |
 
 ## Trace deviations
 
@@ -69,3 +69,8 @@ MODIFIED: Claude SDK preserves the catalog [1m] model suffix so SDK emits the
 required context beta (actual SDK test), unlike raw Messages alias normalization.
 ADDED: OpenAI request/response raw capture occurs outside the final protocol
 adapter; SDK leg is labeled SDK transport rather than private vendor HTTP.
+
+2026-10-07 INTEGRATED: main1991a8b auto-mode classifier retains original-control
+strict validation, request-owned Luna shape and its total deadline. Responses
+adaptation applies only to Responses ingress; original raw bytes remain available
+for both paths. The combined e2e suite covers both routing contracts.
