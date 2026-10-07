@@ -41,7 +41,8 @@ procedure B = publish+verify brew).
 ## Common mistakes
 
 - Treating a release asset alone as publication: preview `publish` must also pass its
-  automatic tap bump. Dispatch `bump.yml` only for diagnosed recovery, not every preview.
+  automatic tap bump. Diagnose and rerun its idempotent publish job on failure; the
+  tap’s manual dispatch currently targets Dbotter and skips llmux jobs.
 - Rebuilding/restarting unchanged runtime for docs-only followups: follow the shared
   reference’s reviewed `[skip ci]` documentation path instead.
 - `gh release view` hiding the prerelease (shows stable) — use `gh release list`.

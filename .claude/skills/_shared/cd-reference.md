@@ -1,7 +1,7 @@
 # llmux CD reference (shared procedures)
 
 Not an invokable skill — shared mechanics for the `build` / `deploy` / `release` runbooks.
-Release topology and Codex frontend procedures checked against the repository workflows on 2026-10-07.
+Release topology checked against llmux workflows and the tap’s current `bump.yml` on 2026-10-08; Codex frontend procedures verified 2026-10-07.
 
 ## Topology
 
@@ -13,10 +13,13 @@ Release topology and Codex frontend procedures checked against the repository wo
   version, then a stable release `v<x.y.z>`.
 - Tap: `2lab-ai/homebrew-tap` (tapped as `2lab-ai/tap`), two formulae: `llmux` (stable,
   from latest `v*`) and `llmux-preview` (from latest `preview-*`). The tap's `bump.yml`
-  renders formulae from release assets on `workflow_dispatch` or a 6h schedule.
+  renders llmux formulae/casks on its schedule. As checked 2026-10-08, manual
+  `workflow_dispatch` requires Dbotter inputs and skips llmux jobs; do not dispatch
+  it expecting an immediate llmux update.
   **Preview publication directly bumps the preview formula and Islands cask in its
   own required `publish` step** (`.github/scripts/bump-tap-preview.sh`); a missing
-  token or failed push fails publication. Stable releases still need the tap workflow.
+  token or failed push fails publication. Stable releases need the scheduled tap
+  update or the narrow reviewed template-rendering fallback in procedure B.
 - Local daemon: `/opt/homebrew/bin/llmux server --no-tui`, control port 3456. The PATH
   binary is a brew symlink into the Cellar.
 
@@ -39,15 +42,28 @@ Restart is safe when `llmux status` shows `in_flight: 0` across accounts.
 ## Procedure B — publish brew formula + verify it landed
 
 For a preview, first verify the successful preview `publish` job and that the tap
-points to its exact tag; it already performed the bump. For a stable release,
-dispatch the tap workflow and wait. Dispatch for a preview only as recovery for a
-verified stale tap, after diagnosing the failed publish step. Then upgrade.
+points to its exact tag; it already performed the bump. For stable, inspect the
+current tap workflow before choosing a trigger. Its llmux jobs are schedule-only
+as of 2026-10-08, so immediate stable publication uses this scoped fallback:
+
+1. Pin the exact released `v<version>` and download all four CLI assets, the
+   matching `LlmuxIslands-<version>.zip` and `SHA256SUMS`. Verify every asset’s actual
+   digest against that manifest; do not infer hashes from a different release.
+2. In an isolated checkout of the current tap, render **only** `Formula/llmux.rb`
+   and `Casks/llmux-islands.rb` from their existing `.tmpl` files using the pinned
+   version and measured hashes. Run `ruby -c` on both and review the two-file diff,
+   asset URLs, architectures and app dependency/version. Preserve unrelated tap files.
+3. Publish the reviewed tap change through the authorized release workflow, then
+   verify the remote formula and cask point to the same exact tag before upgrading.
+   Do not alter the shared tap workflow or supply unrelated Dbotter inputs.
+
+For a failed preview bump, diagnose and rerun its idempotent publish job rather
+than dispatching the tap’s unrelated manual workflow. Then upgrade.
+Primary source: [tap `bump.yml`](https://github.com/2lab-ai/homebrew-tap/blob/master/.github/workflows/bump.yml), checked 2026-10-08.
 
 ```bash
 formula=llmux-preview   # or: llmux
-# Stable only, or diagnosed preview recovery:
-# gh workflow run bump.yml --repo 2lab-ai/homebrew-tap
-# Identify that exact dispatched run, then gh run watch --repo 2lab-ai/homebrew-tap <run-id> --exit-status
+# First verify the exact formula/cask publication using procedure B above.
 brew update
 brew upgrade "$formula" || brew install "2lab-ai/tap/$formula"
 brew info --json=v2 "$formula" | python3 -c 'import json,sys;print(json.load(sys.stdin)["formulae"][0]["installed"][0]["version"])'
