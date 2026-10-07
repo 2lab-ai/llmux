@@ -1,5 +1,8 @@
 # Claude Code `/model` picker from the llmux catalog
 
+Scope: this record describes the Claude Code picker. The later Codex client has a
+separate catalog adapter; see [Codex frontend](21-codex-frontend.md).
+
 Status: shipped
 Date: 2026-09-17
 

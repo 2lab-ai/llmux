@@ -7,7 +7,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | Command | Description |
 |---|---|
 | `server [--port N] [--no-tui] [--log-to DIR]` | Start the proxy. `--log-to` writes one file per request with credentials masked. If a llmux daemon already owns the port, attach to it instead. |
-| `run [--force] [-- args]` | Ensure the daemon is running, then spawn `claude` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
+| `run [--codex] [--force] [--no-model-picker] [-- args]` | Ensure the local daemon is running, then spawn `claude` or, with `--codex`, `codex` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
 | `stop` | Stop a running server gracefully via `POST /llmux/shutdown`. |
 | `restart` | Cooperatively drain a running daemon, then respawn it from this binary after an upgrade. |
 | `login [--api \| --codex \| --grok \| --openrouter [--paste]]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account; `--grok` runs the xAI device-code flow; `--openrouter` runs the OpenRouter OAuth PKCE flow in the browser and mints a long-lived `sk-or-v1-…` key. `--paste` (only with `--openrouter`) prompts for an existing key instead of opening a browser — and is also the automatic fallback when the browser flow cannot complete locally. |
@@ -134,7 +134,7 @@ just build
 
 ### Running Claude Code through llmux
 
-`llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
+`llmux run` spawns `claude` with `ANTHROPIC_BASE_URL` set (plus remote client authentication in remote mode) and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
 
 It also makes Claude Code's `/model` picker list the llmux catalog: `run` fetches `GET /llmux/models` from the proxy it is pointing `claude` at and prepends the lineup as `claude --settings '<modelPicker json>'` (no settings file is written, and the built-in Anthropic rows stay). `--no-model-picker` suppresses the injection, a `--settings` of your own in the pass-through args wins with one warning line, and a failed catalog fetch is a warning that never blocks the launch — see [`models.md`](models.md#claude-code-model-picker).
 
@@ -146,6 +146,24 @@ Manual shell wiring:
 eval "$(llmux env)"
 claude
 ```
+
+### Running Codex through llmux
+
+`llmux run --codex` launches the installed Codex CLI with a session-only Responses
+provider and temporary llmux model catalog. For example:
+
+```sh
+llmux run --codex -- exec -m haiku 'Run the tests'
+```
+
+Local readiness/version handling and `--force` match the Claude launcher; remote
+mode targets the configured daemon without starting or restarting a local one.
+Arguments after `--`, working directory and exit/signal status pass through.
+Claude-through-Codex needs Node.js 18+ and npm on the daemon host; the pinned SDK
+installs lazily from embedded assets. Caller tools execute in Codex. See the
+[frontend guide](codex-frontend/README.md), [model picker](models.md#codex-model-picker)
+and [SDK account-error lifecycle](provider-compatibility.md#claude-agent-sdk-account-errors).
+`llmux env` remains a Claude Code export command.
 
 ## Multi-tenant client keys
 
@@ -318,7 +336,7 @@ Scheduler knobs:
 
 Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.6-sol`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, plus `ultra` on `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol`/`-terra`; `max`/`ultra` clamp to `xhigh` below the gpt-5.6 family; omitted by default). Grok request-shaping is the same minus `fast` (xAI has no service tier): `default_model` (default `grok-4.7`) and `reasoning_effort` (`none`|`low`|`medium`|`high`|`xhigh`, clamped per model at request time; omitted by default).
 
-Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
+Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; keyless loopback data-plane access remains available. Explicit malformed, conflicting or invalid OpenAI credentials are rejected even on localhost; control endpoints still require admin authentication.
 
 `email_anonymous` (default `false`) masks account emails on every display surface. The TUI render layer uses the same stable fake-email mapping as demo mode, and llmux Islands pixelizes emails in its Usage panel. The value is served in `GET /llmux/status` and can be flipped live via `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ toggle.
 
@@ -386,12 +404,17 @@ over the dashboard with the request's captured payloads (from
 `raw-io.jsonl`; see `raw_io` in [configuration.md](configuration.md)).
 
 - **Tabs follow the wire.** A translated (codex/grok) exchange shows all
-  four legs — `Request` (client → llmux) → `Upstream Req` (the rewritten
+  four HTTP legs — `Request` (client → llmux) → `Upstream Req` (the rewritten
   Responses-API request llmux sent) → `Upstream Resp` (the provider's
   verbatim reply before conversion) → `Response` (what the client
   received). A byte-identity Anthropic passthrough shows the classic 2 tabs
   (client and upstream exchange are the same bytes). Click a tab or walk
   with `←`/`→`/`Tab`/`h`/`l`.
+For Claude-through-Codex, the `claude-agent-sdk` upstream legs record the Messages
+bridge transport, not the SDK’s private HTTP bytes; only the original client
+request is a replayable HTTP request. Raw capture is enabled by default and follows
+the configured size/redaction limits.
+
 - **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
   wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
   Proportional scrollbars render on the right and bottom edges when the
@@ -505,7 +528,7 @@ A ChatGPT/Codex subscription credential can be added with `llmux login --codex` 
 llmux import --from ~/.codex/auth.json
 ```
 
-The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE (or an aggregated Messages JSON response for `stream: false`). The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, reasoning summaries, ordinary client-defined tools, and the bounded image subset below are supported. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE (or an aggregated Messages JSON response for `stream: false`). The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, reasoning summaries, ordinary client-defined tools, and the bounded image subset below are supported. `/v1/messages/count_tokens` is answered locally; unsupported legacy translated endpoints return 501. The separate `/v1/responses` (alias `/responses`) and `/v1/models` routes are supported; see [Codex frontend](codex-frontend/README.md).
 
 ### Codex / Grok compatibility contract
 
@@ -612,6 +635,8 @@ Cost: the ten curated models are free (`$0` in and out). An uncurated openrouter
 
 ```bash
 just check    # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
+# after npm ci --ignore-scripts in bridge/:
+just check-bridge  # actual pinned SDK + bridge regression tests
 just build    # cargo build --release --locked
 ```
 

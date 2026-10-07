@@ -1,5 +1,9 @@
 # llmux — Research note: CLIProxyAPI (2026-06-13)
 
+Historical research snapshot: retain the dated findings below. Current dual-frontend
+routing and model endpoints are defined in [the current spec](01-spec.md) and
+[Codex frontend](21-codex-frontend.md).
+
 Deep-dive on [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (Go, MIT,
 ~37k★, latest v7.1.x). Purpose: it is the **generalized superset** of what llmux does narrowly.
 Mining its proven internal factoring for llmux's roadmap milestones — **without** adopting its

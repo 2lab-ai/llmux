@@ -1,8 +1,8 @@
 # Provider compatibility
 
-One harness, four backend groups — **not** four identical APIs. Claude Code sends the same
-Anthropic Messages request every time; what survives the trip depends on which group serves
-it. This page is the readable difference matrix: what llmux forwards, what it drops (and
+Two client frontends share four backend groups. What survives depends on both the
+incoming protocol and the selected backend. The detailed legacy matrix below
+describes **incoming Anthropic Messages**; Responses has its own transport and controls. This page is the readable difference matrix: what llmux forwards, what it drops (and
 reports), and what it refuses outright, with the code line or dated receipt behind each row.
 
 Read it before you trust a request field on a non-Claude model. Deeper detail lives in the
@@ -10,7 +10,27 @@ Read it before you trust a request field on a non-Claude model. Deeper detail li
 user-facing contract) and the [responses compatibility spec](responses-compatibility/spec.md)
 (the translation rules and their receipts).
 
-## Wire paths
+## Frontend transport matrix
+
+| Backend | Incoming Anthropic Messages | Incoming OpenAI Responses |
+| --- | --- | --- |
+| Claude | Native Messages with auth/model/thinking normalization | Official Claude Agent SDK; Responses converted to full Messages transcript and results converted back |
+| Codex | Messages → Responses → Messages | Native Responses history/tools/encrypted reasoning preserved |
+| Grok | Messages → Grok Responses → Messages | Responses → Messages → existing Grok adapter → Responses |
+| OpenRouter | Native Messages with model/thinking normalization | Responses → Messages → OpenRouter Messages → Responses |
+
+Transport source checked 2026-10-07: [`src/proxy/forward.rs`](../src/proxy/forward.rs)
+(`run_taxonomy_loop`) and [`src/proxy/responses.rs`](../src/proxy/responses.rs)
+(`messages_request`). This table describes implementation paths, not live parity
+proof for every backend; installed release smokes cover native Codex and Claude SDK.
+
+The [Codex frontend guide](codex-frontend/README.md) owns Responses controls,
+structured output, tool replay and refusal/omission rules. In particular, Claude
+SDK requests preserve `[1m]`, execute caller tools in the Codex client and reject
+unsupported sampling/forced-tool controls. Native Codex Responses retains reasoning
+continuity; the Messages translation losses below do not apply universally.
+
+## Wire paths (incoming Messages)
 
 | Group | Upstream | Path |
 | --- | --- | --- |
@@ -22,7 +42,7 @@ user-facing contract) and the [responses compatibility spec](responses-compatibi
 The two gateways share Responses *syntax* with the vendors' public APIs; that does not make
 their *capabilities* the same. Public API docs are a hypothesis about them, not a receipt.
 
-## Difference matrix
+## Difference matrix (incoming Messages)
 
 `forwarded` = sent upstream as-is · `dropped` = not sent, named in a response header ·
 `400` = refused locally by llmux before any upstream call or credential refresh ·
@@ -120,7 +140,9 @@ llmux maps `incomplete_details.reason: "max_output_tokens"` to Anthropic `stop_r
 
 ## No reasoning continuity on Codex/Grok
 
-Prior assistant `thinking` blocks are dropped, and neither gateway's own encrypted reasoning
+This section applies to **incoming Messages**. Native Codex Responses preserves
+caller-supplied encrypted reasoning and history. For Messages translation, prior
+assistant `thinking` blocks are dropped, and neither gateway's own encrypted reasoning
 is stored or replayed by llmux. Multi-turn text and tool transcripts are unaffected, but a
 `gpt-*` or `grok-*` turn does not resume the previous turn's private reasoning. A top-level
 `thinking` config is validated and then dropped: `budget_tokens` bounds nothing upstream and

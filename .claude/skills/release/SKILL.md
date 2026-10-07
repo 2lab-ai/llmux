@@ -17,6 +17,11 @@ track the same version. After step 6, also confirm `brew info --cask llmux-islan
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
 procedure B = publish+verify brew).
 
+Docs-only followups to a verified release use the shared reference’s `[skip ci]`
+documentation path; they do not need a new version, tag or daemon restart. Filtered
+build contexts must retain the three embedded bridge assets, and SDK changes need
+`just check-bridge` alongside the Rust gate.
+
 ## Steps
 
 1. **Pre-flight + version.** `just check` green, tree intentional. `Cargo.toml` is currently
@@ -52,7 +57,9 @@ procedure B = publish+verify brew).
    `/opt/homebrew/bin/llmux restart`. Verify `--version` reports `<new> (stable <id>)`.
 8. **Final verify — client AND server.** `/opt/homebrew/bin/llmux status`: both the local
    client view and the running daemon's accounts reflect the new build. This is the owner's
-   required end-state.
+   required end-state. For frontend/runtime changes, also run the shared reference’s
+   installed native-Codex and Claude-SDK tool smokes; ensure daemon Node/npm and
+   packaged SDK bootstrap work without a repository runtime override.
 9. **Report** new version, release URL, brew version, and the `status` summary.
 
 ## Common mistakes

@@ -62,10 +62,19 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
 - **A stable release requires a version bump.** The release workflow fails if the `v*` tag
   ≠ `Cargo.toml` version, and the last version's tag already exists. Pick the next version
   *with the user*.
-- **Brew tap bump is release-driven.** Preview/stable publish should dispatch
-  `2lab-ai/homebrew-tap` `bump.yml` (auto when TAP_DISPATCH_TOKEN is wired). If
-  the formula is still stale, `gh workflow run bump.yml --repo 2lab-ai/homebrew-tap`,
-  wait, then `brew update && brew upgrade`.
+- **Preview publication includes the tap bump.** `preview.yml` directly renders and
+  pushes the preview formula/cask; failures fail the publish job. Stable uses the tap’s
+  `bump.yml`. Preview dispatch is diagnosed recovery, not an unconditional extra step.
+  See the shared CD reference for exact verification and docs-only `[skip ci]` handling.
+- **Frontend is separate from backend.** `run` launches Claude Code; `run --codex`
+  launches Codex. Claude on Responses must use the official SDK with selected-account
+  isolation, external client-tool execution and shared scheduler/error semantics.
+  Preserve endpoint origin independently of model/provider in Activity and native views.
+- **SDK assets are build inputs.** Keep `bridge/claude-agent.mjs`, `package.json`
+  and `package-lock.json` in filtered source/build contexts. Claude-through-Codex needs
+  Node.js 18+ and npm on the daemon; normal binaries lazily bootstrap without a checkout.
+  Bridge changes require locked npm installation and `just check-bridge` in addition to
+  the required Rust gate. See [bridge contracts](bridge/README.md).
 - **Local hot-deploy gotcha.** The Cellar binary is read-only (`r-xr-xr-x`), so `cp` over it
   fails — `rm -f "$(readlink -f /opt/homebrew/bin/llmux)"` first, then `cp`, `chmod 755`,
   then `llmux restart`. A later `brew upgrade` overwrites a hot-deployed dev binary.
