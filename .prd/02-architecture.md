@@ -30,7 +30,8 @@ src/
   proxy/
     server.rs          # axum listener, /llmux/* control endpoints, background tasks
     forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
-    auto_classifier.rs # bounded main-session context + Luna monitor verdict adapter
+    auto_classifier.rs # bounded main-session context + monitor verdict adapter
+    internal_requests.rs # scoped utility/subagent signatures and alias mapping
     responses.rs       # OpenAI ingress validation, transcript/tool conversion, SSE/JSON output
     sse.rs             # passthrough + transform relay; SseTransform trait
     logging.rs         # optional request logs, credential masking
@@ -254,7 +255,7 @@ The translator:
   as `max_output_tokens` with warning `max_tokens_semantics` (not an omission). Positive integer
   validation is not clamping, a total-budget guarantee, or a billing cap;
 - rejects non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` with local 400
-  (the scoped auto-mode adapter handles its recognized closing-tag stop before translation)
+  (scoped adapters handle monitor closing-tag stops and title default temperature before translation; strict mode checks original controls)
   rather than infer subscription support from public schemas. Empty stop sequences are
   vacuous; malformed values fail. Top-level `thinking` is shape-validated, then omitted with
   `thinking_config` in omissions/warnings (strict: 400), without enforcing `budget_tokens` or
@@ -361,7 +362,7 @@ subagents and control turns do not. The current JSON-in-string `metadata.user_id
 is normalized to device/session, excluding account UUID. State is not persisted.
 
 On POST `/v1/messages`, with model routing enabled, a recognized security monitor
-for a known GPT main session receives a request-owned Codex shape (`luna`, medium,
+for a known GPT main session receives a request-owned Codex shape (`claude_code.auto_classifier_model`, default `luna`, medium,
 no priority override). Original client bytes remain available for raw-io capture;
 provider input and activity metadata use the effective shape. An empty/exhausted
 Codex group never falls back to Claude for this exception.
@@ -372,3 +373,27 @@ buffer until validation (1 MiB successful-upstream-stream limit; 60-second total
 request deadline). Generic Responses control validation and strict-mode checks
 remain unchanged. Details and regression receipts are in
 [`docs/provider-compatibility.md`](../docs/provider-compatibility.md#claude-code-auto-mode-monitors).
+
+### Internal model mapping and bootstrap context
+
+`internal_requests` recognizes quota, title and helper/subagent wire signatures.
+The same bounded session registry selects `claude_code.gpt_model_mapping` targets;
+real main execution wins over display-kind heuristics and explicit Claude switches
+clear GPT context. Utility routes own their provider shape/response model too, but
+only monitors use verdict buffering and the special deadline/size limit. The title
+adapter removes only default temperature 1 with diagnostics and maps the captured
+schema to Responses `text.format`; generic/strict controls remain unchanged.
+
+`cli::claude_context` conservatively resolves launcher model provenance and merges
+a reserved custom header. Only an exact startup quota may use it when no observed
+session exists; it does not seed state. Ingress raw capture retains the original
+request; transport strips the reserved header. Existing tenant authorization,
+provider pinning, routing-off and count endpoints take precedence. Targets validate
+against the central Codex catalog on config load/save/server start; mapping changes
+require restart. Real Codex quota headers are relayed without Anthropic fabrication.
+
+Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
+120 seconds and not in the future; both reserved headers are stripped upstream.
+Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
+clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
+restart inside that short window can reuse launch context until a main turn is observed.

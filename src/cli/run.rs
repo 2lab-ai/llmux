@@ -386,6 +386,23 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
 
     let (base_url, api_key, remove_key) = claude_env(&endpoint);
     let mut command = tokio::process::Command::new("claude");
+    let launch_model = super::claude_context::launch_model(claude_args, &alias_exports);
+    if launch_model.is_none() {
+        tracing::debug!(
+            "initial quota has no proven launch model; waiting for main-session context"
+        );
+    }
+    let headers = super::claude_context::custom_headers(
+        std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok().as_deref(),
+        launch_model.as_deref(),
+        crate::proxy::raw_io::now_ms(),
+    );
+    if headers.is_empty() {
+        command.env_remove("ANTHROPIC_CUSTOM_HEADERS");
+    } else {
+        command.env("ANTHROPIC_CUSTOM_HEADERS", headers);
+    }
+
     command
         .args(&picker)
         .args(claude_args)

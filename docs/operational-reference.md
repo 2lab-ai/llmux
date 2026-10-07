@@ -546,7 +546,7 @@ These are **subscription gateways**, not the public OpenAI or xAI API: Codex use
 | Positive-integer `max_tokens` | Omitted upstream; omission/warning `max_tokens`; strict mode returns 400 | Forwarded unchanged as `max_output_tokens`; warning `max_tokens_semantics`; strict mode returns 400 |
 | Prior assistant `thinking` / `redacted_thinking` | Omitted with matching omission/warning names; strict mode returns 400 | Same |
 | Top-level `thinking` configuration | Validate shape, then omit with `thinking_config` omission/warning; strict mode returns 400 | Same |
-| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; scoped monitor exception below | Same, without the monitor exception |
+| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; scoped monitor/title exceptions below | Same, without the scoped exceptions |
 | Text/tool-only `count_tokens` | Local heuristic, including serialized tool schemas/property names; `X-Llmux-Token-Count: estimate` | Same |
 | Image `count_tokens` (top-level or nested) | Local HTTP 400: no reliable image-token estimate | Same |
 | Process-wide `prompt_cache_key` | Retained | Omitted; routing scope of a shared key is unproven |
@@ -564,7 +564,7 @@ Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **be
 **Claude Code auto-mode monitors.** With routing enabled, llmux remembers the main
 CLI model for each tenant/device/session (at most 4096 entries, six hours, cleared
 on daemon restart). After a GPT main turn, its auto-mode security monitor uses
-`luna` (currently `gpt-6-luna`) with **medium** effort, independent of the main
+`claude_code.auto_classifier_model` (default alias `luna`) with **medium** effort, independent of the main
 model's effort/fast settings. Main model changes update this context; subagents,
 quota/count probes, compact/summary and other control calls do not. Unknown
 sessions, other endpoints, routing-disabled traffic and Claude main sessions keep
@@ -581,15 +581,15 @@ timeout, malformed output, truncated completion, or provider failure. The total
 deadline is 60 seconds; a successful upstream stream over 1 MiB is refused.
 
 Original requested Sonnet model/stop remain in raw-io; the upstream half and
-activity model show Luna/medium. The route trace includes
-`reason=gpt_main_session_auto_classifier`. `classifier_local_stop` appears in
+activity model show the effective configured model/medium. The route trace includes
+`reason=gpt_main_session_internal_request`. `classifier_local_stop` appears in
 compatibility warnings when the local adapter is used. **Strict mode still rejects
 unsupported original controls**, and ordinary stop requests still return 400.
 This local output boundary is not a generation or billing cap; Codex still omits
 `max_tokens` and top-level thinking configuration with existing diagnostics.
 See [provider contract and dated tests](provider-compatibility.md#claude-code-auto-mode-monitors).
 
-**Other generation controls.** Outside the monitor exception above, non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
+**Other generation controls.** Outside the scoped monitor and [title](#claude-code-internal-model-routing) exceptions, non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
 
 **Limits are not billing caps.** Codex's subscription endpoint rejected `max_output_tokens: 16` in the dated probe below; llmux does not send it, clamp it, or fake truncation. Grok accepted that field and stopped at an observed 16 non-reasoning output tokens, but reported **302 output tokens including 286 reasoning tokens**. That is evidence of a visible-output cap for that fixture, not an Anthropic-equivalent total-generation budget or a billing guarantee. Reasoning usage can be additional to the requested visible output. A `response.incomplete` (or a `response.completed` envelope with `status: "incomplete"`) whose reason is `max_output_tokens` maps to Messages `stop_reason: "max_tokens"`, retaining partial text and usage. Other incomplete reasons become an Anthropic error event for SSE or HTTP 502 for aggregate JSON. Truncated tool arguments must never be repaired to an executable `{}` call; clients must not execute incomplete tool calls.
 
@@ -641,3 +641,43 @@ just build    # cargo build --release --locked
 ```
 
 Contributor conventions are in [`../AGENTS.md`](../AGENTS.md).
+
+## Claude Code internal model routing
+
+In a GPT main session, llmux maps implicit Opus/Sonnet/Haiku requests to
+`sol`/`terra`/`luna`. Configure `claude_code.gpt_model_mapping` and the separate
+`claude_code.auto_classifier_model` in [configuration](configuration.md#claude-code-internal-models-claude_code).
+Titles are labeled `title`; activity records the actual effective model.
+Explicit main Claude choices remain authoritative, including a switch after launch.
+
+The startup quota call occurs before the first main request. `llmux run` supplies
+`x-llmux-claude-launch-model` only when it can resolve the launch choice: explicit
+`--model`, `ANTHROPIC_MODEL`, or ordinary user/project/local/flag settings model,
+with native alias environment overrides considered. Both `--model=value` and
+`--model value` work; `CLAUDE_CONFIG_DIR` is respected. Unrelated
+`ANTHROPIC_CUSTOM_HEADERS` are preserved, and the reserved hint is stripped before
+upstream forwarding. Hints only affect an exact quota probe and never override an
+observed session choice or populate session state.
+
+This is a conservative resolver, not a clone of Claude Code settings: agent/routine
+selection, resumed sessions, nonstandard settings-source/safe/restricted modes and
+known managed policy/available-model restrictions suppress implicit inference.
+Model-changing `settings.env` or global `.claude.json`/legacy `.config.json` environment overrides also suppress inference, because native
+trust/merge rules can apply them after the launcher reads its own environment.
+Explicit `--model` still works with safe mode and settings-source flags unless a
+known policy restriction makes it uncertain. Remote-only policy, worktree-specific
+settings or native selection overrides not visible at launch cannot be inferred;
+the first genuine main request supplies authoritative context. Direct `claude`
+launches without `llmux run` also rely on that observed context.
+
+For GPT sessions the quota call checks Codex availability. Actual Codex quota
+headers remain available, but native Claude UI does not interpret them as Claude
+usage percentages. llmux does not manufacture Claude limits/reset times. The
+Codex gateway's existing output-cap omission also applies to this probe. See the
+[provider contract](provider-compatibility.md#claude-code-internal-tasks).
+
+Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
+120 seconds and not in the future; both reserved headers are stripped upstream.
+Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
+clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
+restart inside that short window can reuse launch context until a main turn is observed.

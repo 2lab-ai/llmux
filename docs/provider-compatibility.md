@@ -51,7 +51,7 @@ their *capabilities* the same. Public API docs are a hypothesis about them, not 
 | What you send | Claude | OpenRouter | Codex | Grok |
 | --- | --- | --- | --- | --- |
 | `max_tokens` (output cap) | forwarded | forwarded (`src/provider/openrouter.rs:563-577`) | **not sent at all** — the one cap field measured there is refused | forwarded as `max_output_tokens`, **meaning unproven** |
-| `temperature` / `top_p` / `top_k` | forwarded | forwarded | **400** | **400** |
+| `temperature` / `top_p` / `top_k` | forwarded | forwarded | **400**, except recognized session-title default temperature [below](#claude-code-internal-tasks) | **400** |
 | non-empty `stop_sequences` | forwarded | forwarded | **400**, except [scoped monitor adapter](#claude-code-auto-mode-monitors) | **400** |
 | assistant `thinking` history | forwarded when **signed**; a block with a missing/empty `signature` is stripped¹ | same¹ | **dropped** | **dropped** |
 | assistant `redacted_thinking` | forwarded untouched (it carries no `signature` field by design) | same | **dropped** | **dropped** |
@@ -223,7 +223,7 @@ adds its own identity/reminders: role/content preservation is not byte-identity.
 ## Claude Code auto-mode monitors
 
 **2026-10-07 compatibility exception:** a recognized Claude Code security monitor
-for a recently observed GPT main session uses the Codex `luna` alias with medium
+for a recently observed GPT main session uses `claude_code.auto_classifier_model` (default alias `luna`) with medium
 effort. It does not inherit global main-model effort or fast mode. Tenant plus
 normalized device/session identity isolates concurrent sessions. Main CLI turns
 (including tool-result continuations) update context; subagents and harness control
@@ -239,7 +239,7 @@ authorization policy replacement or an assurance that two models judge identical
 | Reasoning | Request-owned medium effort; original top-level `thinking` remains omitted/reported. No prior-reasoning continuity added. Textual Stage 2 `<thinking>` is validated and preserved; provider reasoning summaries are excluded from the delivered verdict. E2E `auto_classifier_gpt_session_routes_luna_and_preserves_severity_stop` sets global ultra to prove override isolation |
 | Tools/images | Monitor requests must have no tools. Existing image/content refusal and conversion policy is unchanged. No classifier result is turned into a tool call or fabricated native safeguard evaluation |
 | Streaming/errors | Both client modes buffer and validate the complete actual verdict. Successful upstream stream buffer cap 1 MiB, total request deadline 60 seconds; malformed, failed, incomplete, truncated or oversized output produces an error, never partial approval. E2E `auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict`, `auto_classifier_failed_incomplete_and_oversize_streams_never_expose_verdict`, `auto_classifier_silent_stream_errors_without_success_verdict` |
-| Usage/counting | Original upstream usage retained, including reasoning. Count endpoint never learns main context or uses this adapter. Raw request remains original; translated upstream and activity identify actual Luna/medium. E2E `auto_classifier_streaming_stage_one_and_raw_provenance`, `auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged` |
+| Usage/counting | Original upstream usage retained, including reasoning. Count endpoint never learns main context or uses this adapter. Raw request remains original; translated upstream and activity identify the configured effective model/medium. E2E `auto_classifier_streaming_stage_one_and_raw_provenance`, `auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged` |
 | Auth/endpoint | Existing Codex subscription credentials and `/responses` endpoint; no public OpenAI API assumption. E2E first regression proves success with no Claude account; `auto_classifier_codex_unavailable_never_falls_back_to_claude` covers configured fallback policy too |
 
 These are mock-based routing/contract receipts, not live safety-quality equivalence
@@ -273,3 +273,34 @@ as a fresh request on another account.
 
 Evidence: `bridge/*.test.mjs` audits the SDK enum and actual SDK error sequence;
 `tests/e2e.rs::responses_sdk_*` drives the Rust subprocess and HTTP lifecycle.
+
+## Claude Code internal tasks
+
+**2026-10-07:** recognized implicit requests in a GPT main session use the
+configurable Opus→`sol`, Sonnet→`terra`, Haiku→`luna` alias mapping. The same tenant
+and normalized session isolation used by monitors applies. Main execution requests
+remain authoritative even if their text resembles a title/compaction prompt;
+subagents cannot overwrite that choice. Unknown sessions are unchanged, apart from
+an exact initial `quota`/`max_tokens:1` probe carrying `llmux run` launch context.
+Mapped requests never fall back to Claude on Codex exhaustion.
+
+| Axis | Internal-task behavior and evidence (2026-10-07) |
+| --- | --- |
+| Output/cap | Native title `{title:string}` JSON schema maps to Responses `text.format` with `name:session_title`, `strict:true`. Other title schemas fail locally. `max_tokens` remains omitted/reported, including the quota probe's `1`: this is an availability probe, **not** a one-token billing guarantee. E2E `internal_routing_title_schema_temperature_and_effective_model_both_legs`; strict schema accepted by real Codex Luna gateway probe on 2026-10-07 |
+| Generation controls | Only recognized no-tools session titles may omit the captured default `temperature:1`; omission is reported in compatibility headers. Other temperatures and generic sampling/stop controls retain local 400. Strict mode validates original controls and refuses loss. Same title E2E |
+| Reasoning | Titles/quota use request-owned low effort; workers preserve valid client effort independently of global main settings. Prior thinking/continuity policy unchanged; security remains medium. E2E `internal_routing_configured_tiers_and_security_override_do_not_hijack_main_switch` |
+| Tools/images | Helpers/subagents use existing bounded client-tool and image conversion/refusal policy. Title/quota signatures require no tools; no new tool or image support is implied. `src/proxy/internal_requests.rs` |
+| Streaming/errors | Titles/helpers use normal streaming or JSON aggregation, with actual effective model identity. Monitor-only verdict buffering, 60-second deadline and 1 MiB cap do not apply to workers. Provider protocol failures retain existing error behavior; no title/verdict is fabricated. Same title E2E tests both modes and global client-model override |
+| Usage/counting | Genuine `x-codex-*` quota headers are preserved; `x-llmux-quota-source:codex` and `x-llmux-quota-mode:availability` identify the probe. No Anthropic utilization/reset/status headers are invented. Claude Code's native quota consumer cannot display Codex percentages from these headers; HTTP 200 only establishes availability. Count endpoints never consume launch hints or change context. E2Es `internal_routing_initial_quota_uses_validated_hint_and_real_codex_headers`, `internal_routing_unknown_session_pinned_count_and_disabled_are_unchanged` |
+| Auth/endpoint | Existing Codex subscription credentials/gateway are used; no new credentials or public OpenAI API assumptions. Reserved launch header is removed before forwarding, other custom headers preserved. Original ingress bytes remain in raw logs; effective upstream model is logged. E2E configured tiers verifies Claude switchback and no hint leakage |
+
+Captured native title fingerprint: `You are naming a coding session so the user can
+pick it out of a long list of sessions.` with `<session>…</session>` input, empty
+tools, temperature 1 and `{title:string}` schema (Claude Code 2.1.292). This also
+fixes the activity label from `user` to `title`. No new prompt text is injected.
+
+Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
+120 seconds and not in the future; both reserved headers are stripped upstream.
+Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
+clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
+restart inside that short window can reuse launch context until a main turn is observed.

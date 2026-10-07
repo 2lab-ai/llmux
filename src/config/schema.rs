@@ -40,6 +40,9 @@ pub struct Config {
     /// OpenAI Codex backend endpoints (used only by `type: "codex"` accounts).
     #[serde(default)]
     pub codex: CodexConfig,
+    /// Claude Code internal-model substitutions, scoped to GPT main sessions.
+    #[serde(default)]
+    pub claude_code: ClaudeCodeConfig,
     /// xAI Grok backend endpoints (used only by `type: "grok"` accounts).
     /// Additive (`#[serde(default)]`): pre-grok configs load with defaults.
     #[serde(default)]
@@ -190,6 +193,66 @@ pub struct Config {
     pub accounts: Vec<AccountConfig>,
 }
 
+/// Targets are catalog aliases by default, resolved anew for each request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeCodeConfig {
+    pub gpt_model_mapping: GptModelMapping,
+    pub auto_classifier_model: String,
+}
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            gpt_model_mapping: GptModelMapping::default(),
+            auto_classifier_model: "luna".into(),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GptModelMapping {
+    pub opus: String,
+    pub sonnet: String,
+    pub haiku: String,
+}
+impl Default for GptModelMapping {
+    fn default() -> Self {
+        Self {
+            opus: "sol".into(),
+            sonnet: "terra".into(),
+            haiku: "luna".into(),
+        }
+    }
+}
+impl ClaudeCodeConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let models = crate::catalog::catalog("", "", "");
+        for (field, value) in [
+            ("gpt_model_mapping.opus", &self.gpt_model_mapping.opus),
+            ("gpt_model_mapping.sonnet", &self.gpt_model_mapping.sonnet),
+            ("gpt_model_mapping.haiku", &self.gpt_model_mapping.haiku),
+            ("auto_classifier_model", &self.auto_classifier_model),
+        ] {
+            let target = value.trim().to_ascii_lowercase();
+            if target.is_empty()
+                || target.len() > 128
+                || !models.iter().any(|m| {
+                    m.group == "codex"
+                        && (m.id == target
+                            || m.aliases
+                                .iter()
+                                .any(|a| a == target.strip_suffix("[1m]").unwrap_or(&target)))
+                })
+            {
+                return Err(format!(
+                    "claude_code.{field} must name a known Codex model or alias"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Authorization kind of an issued client key: `default` unlocks the data
 /// plane only (`/v1/*` forwarding); `admin` additionally unlocks the control
 /// plane (`/llmux/*` management + dashboard).
@@ -322,6 +385,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             upstream: default_upstream(),
             codex: CodexConfig::default(),
+            claude_code: ClaudeCodeConfig::default(),
             grok: GrokConfig::default(),
             openrouter: OpenRouterConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -1308,4 +1372,75 @@ fn default_routing_group() -> String {
 
 fn default_on_empty_group() -> String {
     "error".to_string()
+}
+
+#[cfg(test)]
+mod claude_code_tests {
+    use super::*;
+    #[test]
+    fn claude_code_defaults_partial_overrides_and_validation() {
+        let value: Config =
+            serde_json::from_str(r#"{"claude_code":{"gpt_model_mapping":{"sonnet":"luna"}}}"#)
+                .unwrap();
+        assert_eq!(value.claude_code.gpt_model_mapping.opus, "sol");
+        assert_eq!(value.claude_code.gpt_model_mapping.sonnet, "luna");
+        assert_eq!(value.claude_code.gpt_model_mapping.haiku, "luna");
+        assert_eq!(value.claude_code.auto_classifier_model, "luna");
+        value.claude_code.validate().unwrap();
+        for bad in [
+            "",
+            "sonnet",
+            "gpt-unrecognized",
+            "luna[1m][1m]",
+            "sol\nBad: header",
+        ] {
+            let mut config = ClaudeCodeConfig::default();
+            config.gpt_model_mapping.haiku = bad.into();
+            assert!(config.validate().is_err(), "{bad:?}");
+        }
+        for raw in [
+            r#"{"claude_code":null}"#,
+            r#"{"claude_code":{"gpt_model_mapping":null}}"#,
+            r#"{"claude_code":{"auto_classifier_model":null}}"#,
+            r#"{"claude_code":{"unknown":true}}"#,
+        ] {
+            assert!(serde_json::from_str::<Config>(raw).is_err());
+        }
+        let dir = std::env::temp_dir().join(format!("llmux-mapping-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        crate::config::save_path(&path, &value).unwrap();
+        assert_eq!(
+            crate::config::load_path(&path).unwrap().claude_code,
+            value.claude_code
+        );
+        let before = std::fs::read(&path).unwrap();
+        let mut invalid = value.clone();
+        invalid.claude_code.auto_classifier_model = "sonnet".into();
+        assert!(crate::config::save_path(&path, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(crate::config::load_path(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+        // Every configured alias resolves through the same current catalog as
+        // ordinary requests. No test pins a generation-specific model id.
+        for alias in ["sol", "terra", "luna"] {
+            let entry = crate::catalog::catalog("", "", "")
+                .into_iter()
+                .find(|m| m.group == "codex" && m.aliases.iter().any(|a| a == alias))
+                .unwrap();
+            let shape = crate::provider::codex::CodexShape {
+                model: alias.into(),
+                client_model: None,
+                fast: false,
+                effort: None,
+            };
+            let actual = crate::provider::codex::effective_request_meta(
+                &serde_json::json!({"model":alias}),
+                &shape,
+            )
+            .0;
+            assert_eq!(actual, entry.id.trim_end_matches("[1m]"));
+        }
+    }
 }
