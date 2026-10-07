@@ -42,6 +42,10 @@ whatever `activity.jsonl` still holds); everything else keeps working.
     "default_group": "claude",
     "on_empty_group": "error"
   },
+  "claude_code": {
+    "gpt_model_mapping": { "opus": "sol", "sonnet": "terra", "haiku": "luna" },
+    "auto_classifier_model": "luna"
+  },
   "codex": {
     "default_model": "gpt-5.6-sol",
     "fast": false
@@ -230,3 +234,24 @@ Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`;
 ### Downgrading past a new account type
 
 The account list is an internally-tagged enum, so a config carrying a `type` an older binary does not know makes that binary **fail to parse the whole file** — nothing is silently dropped. Before downgrading to a pre-openrouter binary, remove the `or:*` accounts (`llmux remove <name>`, run from the new binary); the same contract applies to `grok:*` accounts and pre-grok binaries. Everything else is additive in both directions: the `openrouter` block and `routing.openrouter_models` are ignored harmlessly by older binaries, and a config written by an older binary loads here with the new keys at their defaults.
+
+## Claude Code internal models (`claude_code`)
+
+With routing enabled and a known GPT main session, implicit Claude Code requests
+use `gpt_model_mapping`: Opus → `sol`, Sonnet → `terra`, Haiku → `luna` by default.
+This includes session titles, quota probes and recognized helper/subagent turns.
+The safety classifier uses the independent `auto_classifier_model` (default `luna`,
+medium effort), regardless of its incoming Sonnet name.
+
+Edit these values in the config file and restart the daemon. Partial objects keep
+unspecified defaults. Targets must be known Codex catalog models or aliases; null,
+unknown targets and Claude targets fail configuration validation. Defaults are
+aliases, resolved on every request through the central model catalog: a catalog
+alias update advances internal requests without rewriting this configuration.
+Explicit concrete model IDs are available when pinning is intentional.
+
+A genuine main `/model` switch to Claude remains Claude and resets session context;
+these mappings do not change the model picker or native alias environment exports.
+Pinned provider routes and disabled model routing bypass the adapter. Unknown
+sessions retain normal routing, except the initial quota probe can use the bounded
+launch context provided by `llmux run`. See [launch context and quota behavior](operational-reference.md#claude-code-internal-model-routing).
