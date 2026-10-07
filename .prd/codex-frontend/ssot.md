@@ -1,5 +1,5 @@
 # Codex frontend — fixed target
-Status: in-progress
+Status: shipped
 Date: 2026-10-07
 
 ## User request (verbatim)
