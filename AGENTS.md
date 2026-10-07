@@ -63,8 +63,10 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
   ≠ `Cargo.toml` version, and the last version's tag already exists. Pick the next version
   *with the user*.
 - **Preview publication includes the tap bump.** `preview.yml` directly renders and
-  pushes the preview formula/cask; failures fail the publish job. Stable uses the tap’s
-  `bump.yml`. Preview dispatch is diagnosed recovery, not an unconditional extra step.
+  pushes the preview formula/cask; failures fail the publish job. As of 2026-10-08
+  the tap’s llmux jobs are schedule-only; manual dispatch is for Dbotter. Immediate
+  stable delivery uses the shared reference’s reviewed two-file template fallback;
+  preview recovery reruns the failed publish job.
   See the shared CD reference for exact verification and docs-only `[skip ci]` handling.
 - **Frontend is separate from backend.** `run` launches Claude Code; `run --codex`
   launches Codex. Claude on Responses must use the official SDK with selected-account
