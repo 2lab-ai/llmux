@@ -500,6 +500,7 @@
       ],
       "properties": {
         "receipt_id": { "type": "string" },
+        "endpoint": { "enum": ["anthropic", "open_ai"], "default": "anthropic" },
         "kind": { "enum": ["in_flight", "request", "note"] },
         "occurred_at_ms": { "type": "integer", "minimum": 0 },
         "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },

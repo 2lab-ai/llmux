@@ -45,3 +45,16 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked
+
+      - name: Install Node for Claude Agent SDK integration tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Claude Agent SDK bridge contracts (real SDK, local mock)
+        working-directory: bridge
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test

@@ -378,6 +378,7 @@ struct LlmuxDashboardActivity: Decodable {
 
 /// One started-but-unfinished request.
 struct LlmuxDashboardInFlight: Decodable {
+    var endpoint: String? = nil
     let id: UInt64
     let method: String
     let path: String
@@ -387,7 +388,7 @@ struct LlmuxDashboardInFlight: Decodable {
     let model: String?           // additive
 
     enum CodingKeys: String, CodingKey {
-        case id, method, path, account, group, model
+        case id, method, path, account, group, model, endpoint
         case startedAtMs = "started_at_ms"
     }
 }
@@ -398,6 +399,7 @@ struct LlmuxDashboardInFlight: Decodable {
 /// a `request` row has the HTTP fields. Unknown future kinds still decode
 /// (only `kind` + `at_ms` are common), keeping the doc additive.
 struct LlmuxDashboardCompleted: Decodable {
+    var endpoint: String? = nil
     let kind: String             // "request" | "note"
     let atMs: UInt64
 
@@ -428,7 +430,7 @@ struct LlmuxDashboardCompleted: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case kind, method, path, account, status, tokens, group, model, effort, tenant, text, error
+        case kind, method, path, account, status, tokens, group, model, effort, tenant, text, error, endpoint
         case atMs = "at_ms"
         case durationMs = "duration_ms"
         case costUsd = "cost_usd"

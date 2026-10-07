@@ -122,6 +122,23 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                     .and_then(serde_json::Value::as_u64),
             })
         }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            let usage = value.get("response")?.get("usage")?;
+            let input = usage.get("input_tokens")?.as_u64()?;
+            let cache = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            Some(StreamUsage {
+                input_tokens: input.saturating_sub(cache),
+                output_tokens: usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                cache_read_input_tokens: Some(cache),
+                cache_creation_input_tokens: None,
+            })
+        }
         "message_delta" => {
             let output = value.get("usage")?.get("output_tokens")?.as_u64()?;
             Some(StreamUsage {
@@ -132,6 +149,32 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
             })
         }
         _ => None,
+    }
+}
+
+/// Anthropic message_delta counters are cumulative when present. The SDK
+/// bridge includes final input/cache totals after internal WebSearch rounds.
+fn observe_usage(event: &str, usage: &mut StreamUsage) {
+    let data = event
+        .lines()
+        .find_map(|line| line.strip_prefix("data:").map(str::trim));
+    let value = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
+    if let Some(v) = value.filter(|v| v["type"] == "message_delta") {
+        let u = &v["usage"];
+        if let Some(n) = u["input_tokens"].as_u64() {
+            usage.input_tokens = n;
+        }
+        if let Some(n) = u["output_tokens"].as_u64() {
+            usage.output_tokens = n;
+        }
+        if let Some(n) = u["cache_read_input_tokens"].as_u64() {
+            usage.cache_read_input_tokens = Some(n);
+        }
+        if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
+            usage.cache_creation_input_tokens = Some(n);
+        }
+    } else if let Some(observed) = extract_usage(event) {
+        usage.add(observed);
     }
 }
 
@@ -213,7 +256,10 @@ pub fn contains_error_event(payload: &[u8]) -> bool {
     for chunk in text.split("\n\n") {
         for line in chunk.lines() {
             if let Some(name) = line.strip_prefix("event:") {
-                if name.trim() == "error" {
+                if matches!(
+                    name.trim(),
+                    "error" | "response.failed" | "response.incomplete"
+                ) {
                     return true;
                 }
             } else if let Some(d) = line
@@ -221,7 +267,10 @@ pub fn contains_error_event(payload: &[u8]) -> bool {
                 .or_else(|| line.strip_prefix("data:"))
             {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(d.trim()) {
-                    if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                    if matches!(
+                        value.get("type").and_then(serde_json::Value::as_str),
+                        Some("error" | "response.failed" | "response.incomplete")
+                    ) {
                         return true;
                     }
                 }
@@ -244,6 +293,24 @@ pub fn contains_content_delta(payload: &[u8]) -> bool {
         return false;
     };
     for chunk in text.split("\n\n") {
+        for line in chunk.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+                    if matches!(
+                        v["type"].as_str(),
+                        Some(
+                            "response.output_text.delta"
+                                | "response.function_call_arguments.delta"
+                                | "response.custom_tool_call_input.delta"
+                                | "response.reasoning_summary_text.delta"
+                        )
+                    ) && v["delta"].as_str().is_some_and(|s| !s.is_empty())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         let mut named_delta = false;
         let mut data: Option<&str> = None;
         for line in chunk.lines() {
@@ -500,6 +567,7 @@ pub fn passthrough_body<F>(
 where
     F: FnOnce(StreamUsage, Vec<u8>, RawCapture, Option<String>, StreamTiming) + Send + 'static,
 {
+    let native_responses = upstream.headers().contains_key("x-llmux-native-responses");
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut events = EventBuffer::new();
@@ -508,9 +576,14 @@ where
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
         let mut timing = StreamTiming::default();
+        let mut terminal = false;
         let mut stream = Box::pin(upstream.bytes_stream());
         loop {
-            let item = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            let next = tokio::select! {
+                _ = tx.closed() => { timing.client_gone=true; break; },
+                item = tokio::time::timeout(idle_timeout, stream.next()) => item,
+            };
+            let item = match next {
                 Ok(Some(item)) => item,
                 // Upstream finished (stream exhausted).
                 Ok(None) => break,
@@ -530,10 +603,28 @@ where
                 Ok(chunk) => {
                     timing.on_chunk();
                     for event in events.push(&chunk) {
-                        timing.on_payload(event.as_bytes());
-                        if let Some(observed) = extract_usage(&event) {
-                            usage.add(observed);
+                        if native_responses
+                            && event
+                                .lines()
+                                .filter_map(|l| l.strip_prefix("data:"))
+                                .filter_map(|d| {
+                                    serde_json::from_str::<serde_json::Value>(d.trim()).ok()
+                                })
+                                .any(|v| {
+                                    matches!(
+                                        v["type"].as_str(),
+                                        Some(
+                                            "response.completed"
+                                                | "response.failed"
+                                                | "response.incomplete"
+                                        )
+                                    )
+                                })
+                        {
+                            terminal = true;
                         }
+                        timing.on_payload(event.as_bytes());
+                        observe_usage(&event, &mut usage);
                     }
                     // Backpressure: bounded channel; client disconnect drops
                     // the receiver and we stop polling upstream. Send FIRST,
@@ -555,8 +646,12 @@ where
         timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
             timing.on_payload(rest.as_bytes());
-            if let Some(observed) = extract_usage(&rest) {
-                usage.add(observed);
+            observe_usage(&rest, &mut usage);
+        }
+        if native_responses && !terminal && !timing.client_gone {
+            timing.saw_error_event = true;
+            if error.is_none() {
+                error = Some("Responses stream ended without a terminal event".into());
             }
         }
         finish(usage, captured, raw_captured, error, timing);
@@ -724,5 +819,14 @@ mod tests {
         assert_eq!(add_opt(Some(3), None), Some(3));
         assert_eq!(add_opt(None, Some(4)), Some(4));
         assert_eq!(add_opt(Some(3), Some(4)), Some(7));
+    }
+    #[test]
+    fn sdk_internal_round_totals_replace_initial_usage() {
+        let mut usage = StreamUsage::default();
+        observe_usage(MESSAGE_START, &mut usage);
+        observe_usage("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":50,\"output_tokens\":12,\"cache_read_input_tokens\":20}}",&mut usage);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, Some(20));
     }
 }

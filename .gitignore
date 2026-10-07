@@ -11,3 +11,6 @@ dist/*.backup.app/
 
 # linked worktrees (DEV.md convention)
 .worktrees/
+
+# Agent SDK bridge development dependencies
+/bridge/node_modules/

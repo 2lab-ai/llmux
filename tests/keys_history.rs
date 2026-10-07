@@ -875,6 +875,7 @@ impl Proxy {
                 id,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: llmux::tui::Endpoint::Anthropic,
                 account: Some("acct".into()),
                 status,
                 duration: Duration::from_millis(5),

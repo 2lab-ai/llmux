@@ -1082,6 +1082,8 @@ Kirigami.ScrollablePage {
 
                 delegate: IslandCard {
                     id: receiptCard
+                    fillColor: receipt.kind !== "note" && receipt.endpoint === "open_ai"
+                        ? "#282828" : IslandTheme.surface
                     required property var modelData
                     readonly property var receipt: statisticsPage.objectOrEmpty(modelData)
                     Layout.fillWidth: true

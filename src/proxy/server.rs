@@ -1614,6 +1614,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
         .route("/llmux/shutdown", post(shutdown))
         .route("/models", get(models_endpoint))
+        .route("/v1/models", get(openai_models_endpoint))
         .route("/llmux/models", get(models_endpoint))
         .route("/v1/oauth/token", post(oauth_token_relay))
         // Root reachability ping, answered LOCALLY (Z 2026-07-15, startup-set
@@ -1692,8 +1693,20 @@ async fn client_auth(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
     let loopback = peer.is_some_and(|ip| ip.is_loopback());
-    let presented = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-    match state.keys.resolve(presented, loopback) {
+    let openai =
+        super::responses::is_responses_path(req.uri().path()) || req.uri().path() == "/v1/models";
+    let presented = if openai {
+        match openai_client_key(req.headers()) {
+            Ok(key) => key,
+            Err(detail) => return super::responses::error(StatusCode::UNAUTHORIZED, detail),
+        }
+    } else {
+        req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+    };
+    match state
+        .keys
+        .resolve(presented, loopback && (!openai || presented.is_none()))
+    {
         Resolution::Allowed(tenant) => {
             if is_control_plane(req.uri().path()) && !tenant.admin {
                 return auth_error(
@@ -1708,6 +1721,43 @@ async fn client_auth(
         Resolution::Revoked => auth_error(StatusCode::UNAUTHORIZED, "client key revoked"),
         Resolution::Denied => auth_error(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
     }
+}
+
+/// Explicit malformed or conflicting credentials never become a keyless request.
+fn openai_client_key(headers: &http::HeaderMap) -> Result<Option<&str>, &'static str> {
+    let api = headers
+        .get("x-api-key")
+        .map(|v| v.to_str().map_err(|_| "Invalid proxy API key"))
+        .transpose()?;
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .map(|v| {
+            let value = v.to_str().map_err(|_| "Invalid authorization header")?;
+            let (scheme, key) = value
+                .split_once(' ')
+                .ok_or("Expected Bearer authorization")?;
+            if !scheme.eq_ignore_ascii_case("bearer")
+                || key.is_empty()
+                || key.chars().any(char::is_whitespace)
+            {
+                return Err("Expected Bearer authorization");
+            }
+            Ok(key)
+        })
+        .transpose()?;
+    if api.is_some() && bearer.is_some() && api != bearer {
+        return Err("Conflicting proxy credentials");
+    }
+    Ok(bearer.or(api))
+}
+
+async fn openai_models_endpoint(State(state): State<AppState>) -> Response {
+    let rows = crate::catalog::catalog(
+        &state.grok.model(),
+        &state.codex.model(),
+        state.openrouter.model(),
+    );
+    axum::Json(serde_json::json!({"object":"list","data": rows.iter().map(|row| serde_json::json!({"id":row.id,"object":"model","created":0,"owned_by":row.group})).collect::<Vec<_>>()})).into_response()
 }
 
 /// Domain errors of the client-key admin surface (multi-tenant #22), mapped
@@ -2531,7 +2581,7 @@ async fn grok_config_endpoint(
 ///
 /// Registering root `/models` reserves a path that previously fell through to
 /// the upstream proxy fallback; Anthropic exposes no root `/models`, and
-/// `/v1/models` is untouched (still proxied), so nothing regresses.
+/// `/v1/models` is the OpenAI-shaped catalog for the Responses frontend.
 async fn models_endpoint(State(state): State<AppState>) -> Response {
     let models = crate::catalog::catalog(
         &state.grok.model(),
@@ -4501,11 +4551,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn models_routes_registered_and_v1_models_still_proxies() {
-        // Drive the REAL router on an ephemeral loopback port. Zero accounts,
-        // so the proxy fallback answers `/v1/models` with an error
-        // synchronously (no upstream network call) — proving that path is NOT
-        // intercepted by the catalog handler.
+    async fn models_routes_registered_and_v1_models_has_openai_shape() {
+        // Both client protocols discover the catalog locally, without accounts
+        // or upstream requests; the OpenAI path has its native list envelope.
         let dir = TempDir::new();
         let path = dir.path().join("llmux.json");
         let state = endpoint_state(&path, Vec::new());
@@ -4541,18 +4589,20 @@ mod tests {
         assert!(b1.contains("\"models\""), "catalog shape present");
         assert!(b1.contains("gpt-5.6-sol"), "curated ids present");
 
-        // `/v1/models` is not intercepted: it reaches the proxy fallback, which
-        // with no accounts returns an error — never the catalog shape.
+        // The Responses feature intentionally reserves /v1/models as OpenAI's list.
         let rv = client
             .get(format!("{base}/v1/models"))
             .send()
             .await
             .expect("GET /v1/models");
-        let bv = rv.text().await.expect("body");
-        assert!(
-            !bv.contains("gpt-5.6-sol"),
-            "/v1/models must reach the fallback, not return the catalog"
-        );
+        assert_eq!(rv.status(), reqwest::StatusCode::OK);
+        let bv: serde_json::Value = rv.json().await.expect("OpenAI list");
+        assert_eq!(bv["object"], "list");
+        assert!(bv["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "gpt-5.6-sol" && m["object"] == "model"));
     }
 
     // ---- multi-tenant client keys (#22) ----

@@ -17,3 +17,7 @@ build:
 # Format the tree
 fmt:
     cargo fmt
+
+# Agent SDK contracts (install locked deps separately with `cd bridge && npm ci --ignore-scripts`)
+check-bridge:
+    cd bridge && npm test

@@ -27,6 +27,7 @@ pub(crate) fn from_activity_with_account_privacy(
     for row in &activity.in_flight {
         receipts.push(ActivityReceipt {
             receipt_id: format!("in_flight:{}", row.id),
+            endpoint: row.endpoint,
             kind: ReceiptKind::InFlight,
             occurred_at_ms: row.started_at_ms,
             status: None,
@@ -57,6 +58,7 @@ pub(crate) fn from_activity_with_account_privacy(
     for (index, row) in activity.completed.iter().enumerate() {
         match row {
             CompletedDoc::Request {
+                endpoint,
                 at_ms,
                 method,
                 path,
@@ -97,6 +99,7 @@ pub(crate) fn from_activity_with_account_privacy(
                 });
                 receipts.push(ActivityReceipt {
                     receipt_id,
+                    endpoint: *endpoint,
                     kind: ReceiptKind::Request,
                     occurred_at_ms: *at_ms,
                     status: Some(*status),
@@ -134,6 +137,7 @@ pub(crate) fn from_activity_with_account_privacy(
             }
             CompletedDoc::Note { at_ms, text, error } => receipts.push(ActivityReceipt {
                 receipt_id: format!("note:{at_ms}:{index}"),
+                endpoint: llmux::tui::Endpoint::Anthropic,
                 kind: ReceiptKind::Note,
                 occurred_at_ms: *at_ms,
                 status: None,

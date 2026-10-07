@@ -303,6 +303,7 @@ impl DashboardView {
                 id: r.id,
                 method: r.method.clone(),
                 path: r.path.clone(),
+                endpoint: r.endpoint,
                 account: r.account.clone(),
                 // group/model/effort/fast are filled at routing time and
                 // carried over the wire so the in-flight row shows the same
@@ -336,6 +337,7 @@ impl DashboardView {
                     at_ms,
                     method,
                     path,
+                    endpoint,
                     account,
                     status,
                     duration_ms,
@@ -363,6 +365,7 @@ impl DashboardView {
                         id: *id,
                         method: method.clone(),
                         path: path.clone(),
+                        endpoint: *endpoint,
                         account: account.clone(),
                         status: *status,
                         duration: Duration::from_millis(*duration_ms),
@@ -1400,5 +1403,37 @@ mod tests {
             view.snapshot.accounts[0].group,
             crate::routing::BackendGroup::Grok
         );
+    }
+
+    #[test]
+    fn endpoint_origin_survives_dashboard_wire_and_attached_view() {
+        use crate::tui::Endpoint;
+        let mut json = doc_json();
+        for (wire, expected) in [
+            (Some("open_ai"), Endpoint::OpenAi),
+            (None, Endpoint::Anthropic),
+        ] {
+            {
+                let row = &mut json["activity"]["in_flight"][0];
+                if let Some(wire) = wire {
+                    row["endpoint"] = wire.into();
+                } else {
+                    row.as_object_mut().unwrap().remove("endpoint");
+                }
+            }
+            let row = &mut json["activity"]["completed"][0];
+            if let Some(wire) = wire {
+                row["endpoint"] = wire.into();
+            } else {
+                row.as_object_mut().unwrap().remove("endpoint");
+            }
+            let doc: DashboardDoc = serde_json::from_value(json.clone()).expect("decode");
+            let doc: DashboardDoc =
+                serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            let view = DashboardView::from_doc(&doc);
+            assert_eq!(view.in_flight[0].endpoint, expected);
+            assert!(matches!(&view.completed[0].body,
+                CompletedBody::Request { endpoint, .. } if *endpoint == expected));
+        }
     }
 }
