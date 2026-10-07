@@ -1,5 +1,9 @@
 # Schedulers
 
+Both client frontends use the same account pool, leases and quota accounting.
+The Claude Agent SDK additionally supplies typed account-restriction errors to
+this lifecycle; see [SDK error mapping](provider-compatibility.md#claude-agent-sdk-account-errors).
+
 Which account serves the next request is decided by the scheduler. Two algorithms ship; switch live with `S` in the TUI (persisted to `scheduler.mode`), or `POST /llmux/scheduler-mode {"mode": "default" | "round-robin"}`.
 
 **Why switching matters:** the upstream prompt cache is scoped per account — every account switch invalidates it, and the next request re-reads the full conversation context uncached (token cost + latency). Both schedulers are therefore sticky on the current account; they differ in *when* they move and *who* is next.

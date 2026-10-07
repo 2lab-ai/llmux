@@ -28,7 +28,8 @@ be a JSON DashboardDoc; additive fields may be absent.
 
 PollTick → FetchDashboard(request_id) → HTTP DashboardDoc → derive::dashboard
 → UiState.usage/statistics/window. DashboardDoc.activity.completed[*] →
-receipts::from_activity → ActivityReceipt[*]. DashboardDoc.accounts[*].name +
+receipts::from_activity → ActivityReceipt[*] (including endpoint origin, independent
+of provider/model; `open_ai` dark gray, missing legacy value `anthropic`). DashboardDoc.accounts[*].name +
 email_anonymous → privacy::display_account → AccountTile.display_name and
 ActivityReceipt.account_display.
 

@@ -1,5 +1,9 @@
 # Claude Code system prompts (multi-model, real wire captures)
 
+Scope: these dated captures concern Claude Code/SDK **as a Messages client**,
+not the later Codex → llmux → Claude Agent SDK transport. They do not capture the
+new bridge’s private SDK HTTP prompt; see [raw transport boundaries](../codex-frontend/README.md#http-and-activity).
+
 **This directory ships the actual system-prompt text** captured from llmux
 `raw-io.jsonl` on 2026-07-14, lightly sanitized (paths / host identity /
 session memory). Not a taxonomy essay.

@@ -1,5 +1,10 @@
 # llmux Islands for Linux
 
+Activity receipts distinguish incoming OpenAI requests with dark gray backgrounds,
+including Claude models served through the SDK; see [endpoint activity](../docs/codex-frontend/activity.md).
+Node.js/npm are required only on a daemon serving Claude-through-Codex, not by the
+native Islands UI itself.
+
 Native Qt 6/QML/Kirigami shell for Arch Linux and KDE Plasma. It uses the
 same Rust semantic state, reducer, daemon protocol, privacy rules, and receipt
 projection as the cross-platform `llmux-islands-core`; QML only renders state

@@ -39,8 +39,8 @@ metadata-only: it does not expose prompt or response bodies.
 | Models | requests, ok/errors, in-flight, last use, cache read/create availability, serving accounts, cost |
 | Clients | abbreviated client id, requests, tokens, errors, cost, last-seen when available |
 | Health | status, credential type, cooldown/block reason, token expiry, refresh state |
-| In-flight request receipt | id, method/path, account, provider/model, effort/fast, elapsed time |
-| Completed request receipt | timestamp, status, method/path, account, model, tokens, cache availability, API-equivalent cost, duration |
+| In-flight request receipt | id, method/path, account, endpoint origin, provider/model, effort/fast, elapsed time |
+| Completed request receipt | timestamp, status, method/path, account, endpoint origin, model, tokens, cache availability, API-equivalent cost, duration |
 | Note receipt | timestamp, text, error flag |
 | Verification receipt | operation id, kind, target, start/end, outcome, human-safe message; no secret material |
 

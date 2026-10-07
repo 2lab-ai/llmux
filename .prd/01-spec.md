@@ -1,6 +1,6 @@
 # llmux — Spec
 
-Multi-account, multi-provider LLM proxy for Claude Code, implemented in Rust with a quota-expiry-aware scheduler, a persistent daemon, a rich terminal dashboard, and an experimental OpenAI Codex provider.
+Multi-account, multi-provider LLM proxy for Claude Code and Codex CLI, implemented in Rust with a quota-expiry-aware scheduler, a persistent daemon, and terminal/native dashboards. Incoming Anthropic Messages and OpenAI Responses share account routing; Claude models on the Responses frontend use the official Claude Agent SDK.
 
 Historical note: proxy/OAuth mechanics began from [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT), while the current shipped implementation is Rust.
 
@@ -20,8 +20,9 @@ only a foreground process.
 
 ## Goals (implemented)
 
-1. **Drop-in proxy for Claude Code** — `ANTHROPIC_BASE_URL=http://localhost:<port>` is the whole
-   integration contract. Claude Code works unmodified.
+1. **Two unmodified client frontends** — Claude Code uses `ANTHROPIC_BASE_URL=http://localhost:<port>`;
+   `llmux run --codex` supplies a session-only Codex provider at `/v1/responses`. Both retain
+   their own client tools and permissions; llmux does not synchronize client settings.
 2. **Quota-maximizing scheduling, not plain rotation** — exploit window expiry ("토큰의 유통기한"):
    score each account by *usable burst now × weekly-quota perishability*, so quota that resets
    soon (and would otherwise be lost) is burned first while long-runway accounts are preserved.
@@ -32,17 +33,18 @@ only a foreground process.
    server keeps polling/refreshing tokens even when no dashboard is attached.
 5. **Observable control surface** — `llmux status` is herdr-style, and `llmux dashboard`
    attaches to an already-running daemon instead of attempting to bind the port again.
-6. **Provider abstraction with a working Codex provider** — Anthropic passthrough remains the fast
-   identity path; OpenAI Codex (ChatGPT subscription via `llmux login --codex` or
+6. **Provider abstraction with a working Codex provider** — incoming Anthropic Messages keeps the native
+   Claude path; OpenAI Codex (ChatGPT subscription via `llmux login --codex` or
    `~/.codex/auth.json`) is selected by the request's `model` under default model→group routing,
-   with a config-driven upstream model (`codex.default_model`, default `gpt-5.5`). Gemini/local
+   with a config-driven upstream model (`codex.default_model`, default `gpt-5.6-sol`). Gemini/local
    remain compile-checked stubs.
 7. **brew-installable stable + preview** — `brew install 2lab-ai/tap/llmux` (stable) and
    `brew install 2lab-ai/tap/llmux-preview` (rolling preview).
 
 ## Non-goals (v0.1)
 
-- No hosted/multi-user deployment. Localhost, single human, their own accounts only.
+- No hosted subscription brokerage. One human’s own accounts, with local or remote clients
+  and issued client keys; see [remote CLI](13-remote-cli.md).
 - No analytics database or browser dashboard. The dashboard is terminal-native ratatui.
   Amended (keys-history K): one LOCAL SQLite file holds per-tenant keys usage metadata so the
   `keys` tab can answer windowed/filtered questions across restarts. Still no analytics service,
@@ -55,10 +57,13 @@ only a foreground process.
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary
   multimodal Messages parity. URL images, unknown blocks, and unsupported media return local 400.
-- No private-reasoning replay/ciphertext cache, exact local image token counting, or guaranteed
-  Anthropic-equivalent generation/billing cap on subscription Responses gateways.
-- Non-`/v1/messages` endpoints remain limited: text/tool-only `count_tokens` is a labeled local
-  estimate; image counts return 400; other endpoints return clear 501.
+- No ciphertext replay cache for Messages translation, exact local image token counting, or
+  guaranteed Anthropic-equivalent generation/billing cap on subscription Responses gateways.
+  Native Codex Responses preserves caller-supplied encrypted reasoning and full history.
+- Besides Messages, `/v1/responses` (alias `/responses`) and `/v1/models` are supported.
+  Legacy translated text/tool-only `count_tokens` is a labeled local estimate; image counts
+  return 400; unsupported legacy translated endpoints return 501. Stored Responses history,
+  `previous_response_id`, conversation handles and background jobs are not implemented.
 
 ## Functional requirements
 
@@ -67,8 +72,13 @@ only a foreground process.
 - Forward Anthropic-shaped requests to a selected account/provider, rewriting auth:
   strip client `x-api-key`/`authorization`, inject selected account credential.
 - Strip hop-by-hop headers; drop `accept-encoding` (avoid decompression mismatch).
+- `POST /v1/responses` and `/responses` accept full-transcript OpenAI requests;
+  `GET /v1/models` returns an OpenAI-shaped catalog, while `/llmux/models` retains metadata.
+  Bearer and `x-api-key` use the same tenant resolver. Explicit malformed/conflicting/unknown
+  OpenAI credentials fail even on loopback; absent credentials retain local legacy access.
 - SSE streaming with backpressure and client-disconnect detection.
-  - Anthropic passthrough path is byte-identity and observes usage only.
+  - Native Claude Messages normalizes model aliases/context suffixes/foreign thinking,
+    then relays response bytes and observes usage.
   - Codex path transforms OpenAI Responses SSE into Anthropic Messages SSE.
 - `POST /v1/oauth/token` is relayed raw (Claude Code's own token refresh passes through).
 - Control endpoints:
@@ -79,8 +89,8 @@ only a foreground process.
 - Optional per-request file logging with credential masking.
 
 ### FR2 — Account model
-- Account types: `oauth` (Claude subscription), `apikey` (Anthropic API key), and `codex`
-  (OpenAI Codex / ChatGPT subscription token from `~/.codex/auth.json`).
+- Account types: `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex`
+  (ChatGPT subscription), `grok` (xAI subscription) and `openrouter` (OpenRouter API key).
 - Sources: PKCE OAuth login (browser flow), API-key login, import from
   `~/.claude/.credentials.json`, import from teamclaude config, import from Codex auth.json,
   inline JSON.
@@ -124,16 +134,22 @@ Selection algorithm (pure over a snapshot; re-evaluated on ineligibility and a 6
 ### FR4 — Providers
 
 #### Anthropic passthrough
-Identity provider. Request/response bodies are not rewritten; only auth/header handling and usage
-observation happen.
+For incoming Messages: native Anthropic transport with auth/header rewriting, model
+normalization and unsigned foreign-thinking removal; response bytes pass through unchanged.
+For incoming Responses: use the pinned Claude Agent SDK with isolated environment and selected
+account. Preserve full transcripts, external client-tool roundtrips, images and structured output;
+caller tools execute in Codex. Supported controls and explicit refusals are defined in
+[the frontend contract](21-codex-frontend.md) and [compatibility matrix](../docs/provider-compatibility.md).
 
 #### OpenAI Codex provider (working)
 - Added via `llmux login --codex` (ChatGPT OAuth) or imported from Codex CLI credentials
   (`~/.codex/auth.json`), using ChatGPT OAuth tokens.
 - Upstream: `POST https://chatgpt.com/backend-api/codex/responses`.
-- Upstream model is `codex.default_model` (default **`gpt-5.5`**), with optional `fast`
+- Recognized requested Codex models take precedence; otherwise the fallback is `codex.default_model` (default **`gpt-5.6-sol`**), with optional `fast`
   (`service_tier: "priority"`) and `reasoning_effort` — all settable live from the dashboard.
-- Translates Anthropic Messages requests to OpenAI Responses input:
+- Incoming OpenAI Responses preserves native history, custom/namespaced tools and encrypted
+  reasoning, with stream/JSON aggregation and compatibility reporting.
+- Incoming Anthropic Messages is translated to OpenAI Responses input:
   - Top-level `system` and message-level `role:"system"` are folded into `instructions`; Codex
     rejects `role:"system"` input items.
   - `tool_use` ↔ `function_call`, `tool_result` ↔ `function_call_output`.
@@ -142,7 +158,7 @@ observation happen.
 - Parses `x-codex-primary/secondary-*` quota headers into the same 5h/7d windows.
 - Refreshes tokens via `auth.openai.com/oauth/token` and persists them.
 
-#### Responses compatibility — Codex and Grok
+#### Messages-to-Responses compatibility — Codex and Grok
 
 - Both adapters preserve PNG/JPEG base64 images in user content and nested user tool results,
   with text/image order. Validate MIME, nonempty base64, decoded size ≤20 MiB, roles, and tool
@@ -193,13 +209,18 @@ Public Responses schemas alone are not evidence of subscription-endpoint equival
 - `server` — foreground server; TUI when TTY, plain logs otherwise. If a daemon already runs, it
   attaches instead of attempting to bind the port.
 - `dashboard` — attach-mode dashboard client; polls the daemon and renders the same layout.
-- `run [--force] [-- args]` — ensure daemon is running, then spawn `claude` with
-  `ANTHROPIC_BASE_URL`; `--force` restarts a same-version daemon.
+- `run [--codex] [--force] [--no-model-picker] [-- args]` — ensure the local daemon is
+  running, then spawn `claude` or `codex` against its matching endpoint. Catalog injection is
+  session-only; pass-through arguments, cwd and exit/signal status are retained. `--force`
+  restarts a same-version local daemon; remote mode never starts/restarts a local daemon.
 - `stop` — graceful daemon shutdown. `restart` — drain and respawn from this binary.
 - `login [--api|--codex]`, `import [--from PATH|--json J]`, `env`, `status`, `accounts [-v]`,
   `remove <name>`, `api <path>`.
 
 ### FR6 — TUI / dashboard
+- Endpoint origin is independent of backend: OpenAI rows use dark gray (RGB(40,40,40) in the TUI); Anthropic rows
+  retain the existing background. Origin survives failures/cancellation, persistence, attached
+  TUI and native Islands; missing legacy fields default to Anthropic.
 - Rich ratatui dashboard: account table in actual selection order; quota bars; reset countdown +
   local reset time; token expiry + last-refresh marker (`7h53m ↻6m`); per-account in-flight and
   totals; scheduler pane; poller health; request/min; activity and log panes.
@@ -209,7 +230,11 @@ Public Responses schemas alone are not evidence of subscription-endpoint equival
 
 ## Distribution & release
 
-- `justfile`: `check` (fmt + clippy -D warnings + tests), `build`.
+- `justfile`: `check` (fmt + clippy -D warnings + Rust tests), `build`, `check-bridge`
+  (actual pinned SDK tests after locked npm install). CI runs both Rust and bridge tests.
+- Claude-through-Codex requires Node.js 18+ and npm on the daemon host. The binary embeds
+  the bridge script, manifest and lockfile; first use installs pinned SDK dependencies into
+  a private cache. No checkout is required at runtime.
 - CI: `ci.yml` (gate), `preview.yml` (prerelease tag `preview-<date>-<sha>`, 4 binaries),
   `release.yml` (stable tag `v*`; Cargo.toml version must match tag).
 - Tap: `2lab-ai/homebrew-tap` renders `llmux-preview.rb` and `llmux.rb` from templates.
@@ -231,6 +256,9 @@ Against mock upstreams and live dogfood:
    `400 System messages are not allowed`.
 10. Dashboard endpoint + attach-mode TUI share one view-model and support manual switching.
 11. Preview and stable Homebrew formulae install; `brew test 2lab-ai/tap/llmux` passes.
+12. Actual installed Codex CLI executes external tools against both Codex and Claude SDK
+    backends; SDK policy rejection fails over within one request, and endpoint origin persists.
+    Corrected preview and installed acceptance evidence: [Codex frontend loop](codex-frontend/loop.md).
 
 ## Risks / tensions
 

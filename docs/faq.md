@@ -37,11 +37,19 @@ Yes. The `gpt-` prefix still matches the Codex group. llmux strips the display s
 
 ## Does llmux replace Claude Code?
 
-No. llmux intentionally keeps Claude Code as the harness. It sits behind Claude Code as a local Anthropic-compatible proxy so the account/model layer can move while your harness stays fixed.
+No. `llmux run` launches Claude Code; `llmux run --codex` launches Codex CLI. llmux routes each client’s model traffic while that client retains its own tool execution, permissions and settings. It does not convert one client’s configuration into the other’s.
 
 ## Can I use llmux with only Claude accounts?
 
-Yes. The durable core is multi-account Claude scheduling and Claude Code integration. Codex routing is optional.
+Yes, with either frontend. To use a Claude model from Codex, run `llmux run --codex -- exec -m haiku 'Explain this repository'`. Install Codex CLI on the client and Node.js 18+ plus npm on the daemon host; llmux installs the pinned Claude Agent SDK on first use. A ChatGPT account is needed for the Codex **backend**, not for choosing the Codex **client**. See [the frontend guide](codex-frontend/README.md).
+
+## Why are some Activity rows dark gray?
+
+Dark gray (RGB(40,40,40) in the TUI) means the request arrived through an OpenAI endpoint, even if Claude served it. Anthropic requests keep their existing background, including GPT requests from Claude Code. [Endpoint origin](codex-frontend/activity.md) is separate from backend/model.
+
+## What happens when a Claude account rejects SDK access?
+
+Known SDK organization, account-hold, verification and billing restrictions exclude that credential and try another eligible account before streaming. Authentication expiry still refreshes once; invalid requests do not disable accounts. See the [error mapping](provider-compatibility.md#claude-agent-sdk-account-errors).
 
 ## Is llmux for sharing accounts across a team?
 

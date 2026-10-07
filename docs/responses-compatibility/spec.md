@@ -1,5 +1,9 @@
 # Responses request compatibility — spec (codex + grok)
 
+Ingress scope: the provider design and dated receipts below describe incoming
+Anthropic Messages. For the later incoming OpenAI Responses path, see the
+[frontend transport matrix](../provider-compatibility.md#frontend-transport-matrix).
+
 What an Anthropic Messages request becomes on the two Responses backends llmux speaks to,
 and what happens to the parts that do not fit. Implementation:
 `src/provider/responses_request.rs`. Response-side (terminal events, counting) lives in
