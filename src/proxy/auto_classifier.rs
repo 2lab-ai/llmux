@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::provider::codex::{effective_request_meta, CodexShape};
 use crate::routing::BackendGroup;
 
-const MAIN: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+pub(super) const MAIN: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const MONITOR: &str = "You are a security monitor for autonomous AI coding agents";
 const TTL: Duration = Duration::from_secs(6 * 3600);
 const CAPACITY: usize = 4096;
@@ -49,7 +49,7 @@ fn identity(tenant: Option<&str>, body: &Value) -> Option<(String, String)> {
     Some((tenant.to_string(), session))
 }
 
-fn system_blocks(body: &Value) -> Vec<&str> {
+pub(super) fn system_blocks(body: &Value) -> Vec<&str> {
     match body.get("system") {
         Some(Value::String(text)) => vec![text],
         Some(Value::Array(blocks)) => blocks
@@ -62,13 +62,33 @@ fn system_blocks(body: &Value) -> Vec<&str> {
 }
 
 impl Sessions {
+    /// Utility lookups never seed state. A bounded bootstrap hint is used only
+    /// for the initial exact quota probe, never over an observed main choice.
+    pub fn gpt_context(&self, tenant: Option<&str>, body: &Value, hint: Option<&str>) -> bool {
+        if let Some(key) = identity(tenant, body) {
+            if let Some((_, gpt)) = self.entries.get(&key) {
+                return *gpt;
+            }
+        }
+        hint.is_some_and(|model| {
+            model.len() <= 128
+                && crate::catalog::catalog("", "", "").iter().any(|m| {
+                    m.group == "codex"
+                        && (m.id == model
+                            || m.aliases
+                                .iter()
+                                .any(|a| a == model.strip_suffix("[1m]").unwrap_or(model)))
+                })
+        })
+    }
+
     /// Called only for POST /v1/messages while model routing is enabled.
     /// Returns true only for a monitor in a recently observed GPT main session.
     pub fn observe(
         &mut self,
         tenant: Option<&str>,
         body: &Value,
-        kind: &str,
+        _kind: &str,
         group: BackendGroup,
         now: Instant,
     ) -> bool {
@@ -82,8 +102,7 @@ impl Sessions {
         if monitor {
             return self.entries.get(&key).is_some_and(|(_, gpt)| *gpt);
         }
-        let main = matches!(kind, "user" | "other")
-            && body.get("max_tokens").and_then(Value::as_u64) != Some(1)
+        let main = body.get("max_tokens").and_then(Value::as_u64) != Some(1)
             && system.iter().any(|s| s.trim_start().starts_with(MAIN))
             && !system.iter().any(|s| {
                 s.contains("cc_is_subagent=true") || s.contains("running within the Claude Agent")
@@ -117,6 +136,7 @@ impl Sessions {
 enum Contract {
     Severity,
     Block,
+    Utility,
 }
 
 /// Per-request override. Original client bytes stay in ForwardContext.body.
@@ -127,10 +147,16 @@ pub struct Route {
     pub shape: CodexShape,
     contract: Contract,
     stop: Option<&'static str>,
+    pub title_format: Option<Value>,
+    pub omitted_temperature: bool,
 }
 
 impl Route {
     pub fn new(original: &Value) -> Result<Self, &'static str> {
+        Self::monitor(original, "luna")
+    }
+
+    pub fn monitor(original: &Value, model: &str) -> Result<Self, &'static str> {
         if original
             .get("tools")
             .is_some_and(|v| !matches!(v, Value::Array(a) if a.is_empty()))
@@ -148,6 +174,7 @@ impl Route {
         let expected = match contract {
             Contract::Severity => "</severity>",
             Contract::Block => "</block>",
+            Contract::Utility => return Err("utility has no classifier stop"),
         };
         let stop = match original.get("stop_sequences") {
             None | Some(Value::Null) => None,
@@ -158,7 +185,7 @@ impl Route {
             _ => return Err("unsupported auto classifier stop sequence"),
         };
         let mut body = original.clone();
-        body["model"] = json!("luna");
+        body["model"] = json!(model);
         // Local stop handling is ONLY available on this recognized request.
         // Generic Responses translation continues refusing nonempty stops.
         if stop.is_some() {
@@ -169,18 +196,49 @@ impl Route {
         Ok(Self {
             body: Bytes::from(body.to_string()),
             shape: CodexShape {
-                model: "luna".into(),
+                model: model.into(),
                 client_model: None,
                 fast: false,
                 effort: Some("medium".into()),
             },
             contract,
             stop,
+            title_format: None,
+            omitted_temperature: false,
         })
     }
 
+    pub fn utility(
+        body: Value,
+        model: &str,
+        effort: Option<String>,
+        title_format: Option<Value>,
+        omitted_temperature: bool,
+    ) -> Self {
+        Self {
+            body: Bytes::from(body.to_string()),
+            shape: CodexShape {
+                model: model.into(),
+                client_model: None,
+                fast: false,
+                effort,
+            },
+            contract: Contract::Utility,
+            stop: None,
+            title_format,
+            omitted_temperature,
+        }
+    }
+
+    pub fn is_monitor(&self) -> bool {
+        !matches!(self.contract, Contract::Utility)
+    }
+
     pub fn meta(&self) -> (String, Option<String>, bool) {
-        effective_request_meta(&json!({"model":"luna"}), &self.shape)
+        effective_request_meta(
+            &serde_json::from_slice(&self.body).unwrap_or(Value::Null),
+            &self.shape,
+        )
     }
 
     pub fn local_stop(&self) -> bool {
@@ -192,6 +250,10 @@ impl Route {
     /// Stop trimming reflects the actual emitted closing tag, including on the
     /// buffered-stream leg; it is not an upstream token-generation cap.
     pub fn finish(&self, message: &mut Value) -> Result<(), &'static str> {
+        if !self.is_monitor() {
+            message["model"] = json!(self.meta().0);
+            return Ok(());
+        }
         if message.get("stop_reason").and_then(Value::as_str) != Some("end_turn") {
             return Err("auto classifier did not complete successfully");
         }
@@ -230,6 +292,7 @@ impl Route {
                 }
                 (tail, number)
             }
+            Contract::Utility => return Ok(()),
             Contract::Block => {
                 let (value, tail) = tag(verdict, "block")?;
                 if !matches!(value, "yes" | "no") {
@@ -400,13 +463,9 @@ mod tests {
         for kind in [
             "quota", "count", "compact", "audit", "suggest", "recap", "title", "sdk", "summary",
         ] {
-            sessions.observe(
-                Some("t"),
-                &main("claude-sonnet-5"),
-                kind,
-                BackendGroup::Claude,
-                now,
-            );
+            let mut control = main("claude-sonnet-5");
+            control["tools"] = json!([]);
+            sessions.observe(Some("t"), &control, kind, BackendGroup::Claude, now);
         }
         assert!(sessions.observe(
             Some("t"),

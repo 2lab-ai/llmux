@@ -182,6 +182,8 @@ pub fn classify_send_error(err: &reqwest::Error) -> UpstreamSignal {
 /// mismatch) and `content-length` (recomputed by reqwest from the buffered
 /// body) from an outgoing request.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    headers.remove(super::internal_requests::LAUNCH_MODEL_HEADER);
+    headers.remove(super::internal_requests::LAUNCH_TIME_HEADER);
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
@@ -867,6 +869,18 @@ fn compatibility_gate(
             )));
         }
     };
+    if ctx
+        .auto_classifier
+        .as_ref()
+        .is_some_and(|r| r.omitted_temperature)
+    {
+        report.omitted_fields.push("temperature");
+        report.warnings.push("temperature");
+        report.omitted_fields.sort_unstable();
+        report.omitted_fields.dedup();
+        report.warnings.sort_unstable();
+        report.warnings.dedup();
+    }
     if ctx.auto_classifier.as_ref().is_some_and(|r| r.local_stop()) {
         report.warnings.push("classifier_local_stop");
         report.warnings.sort_unstable();
@@ -1113,31 +1127,65 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         group.filter(|_| parts.method == Method::POST && parts.uri.path() == "/v1/messages")
     {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-            let mapped = state
+            let task = super::internal_requests::task(&value, classified.kind);
+            let hint = if task == Some(super::internal_requests::Task::Quota)
+                && super::internal_requests::fresh_launch(
+                    parts
+                        .headers
+                        .get(super::internal_requests::LAUNCH_TIME_HEADER)
+                        .and_then(|h| h.to_str().ok()),
+                    super::raw_io::now_ms(),
+                ) {
+                parts
+                    .headers
+                    .get(super::internal_requests::LAUNCH_MODEL_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            } else {
+                None
+            };
+            let (monitor, gpt) = state
                 .auto_classifier_sessions
                 .lock()
                 .map(|mut sessions| {
-                    sessions.observe(
+                    let monitor = sessions.observe(
                         tenant.as_deref(),
                         &value,
                         classified.kind,
                         request_group,
                         started,
+                    );
+                    (
+                        monitor,
+                        sessions.gpt_context(tenant.as_deref(), &value, hint),
                     )
                 })
-                .unwrap_or(false);
-            if mapped {
-                match super::auto_classifier::Route::new(&value) {
+                .unwrap_or((false, false));
+            let candidate = if monitor {
+                Some(super::auto_classifier::Route::monitor(
+                    &value,
+                    &state.config.claude_code.auto_classifier_model,
+                ))
+            } else if gpt {
+                task.and_then(|task| {
+                    super::internal_requests::target(&value, &state.config.claude_code)
+                        .map(|model| super::internal_requests::route(&value, task, model))
+                })
+            } else {
+                None
+            };
+            if let Some(candidate) = candidate {
+                match candidate {
                     Ok(route) => {
                         tracing::info!(requested_model = model.as_deref().unwrap_or("<none>"),
-                            effective_model = %route.meta().0, reason = "gpt_main_session_auto_classifier",
-                            "routing auto classifier to luna");
+                            target_alias = %route.shape.model, effective_model = %route.meta().0,
+                            kind = classified.kind, reason = "gpt_main_session_internal_request",
+                            "routing Claude Code internal request through configured GPT alias");
                         auto_classifier = Some(route);
                         group = Some(BackendGroup::Codex);
                     }
                     Err(message) => {
                         state.emit(ActivityEvent::Error {
-                            context: Some("auto_classifier".into()),
+                            context: Some("claude_code".into()),
                             message: message.into(),
                         });
                         return error_response(
@@ -1204,7 +1252,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             body_excerpt(&ctx.ingress_body)
         ));
     }
-    let mut response = if ctx.auto_classifier.is_some() {
+    let mut response = if ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor()) {
         // One wall-clock deadline covers queueing, retries, headers and body.
         // Cancellation drops the lease; no partial verdict has been exposed.
         match tokio::time::timeout(
@@ -1861,6 +1909,16 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         state
                             .codex
                             .build_request_with_shape(&route.body, &credential, &route.shape)
+                            .and_then(|(mut request, stream)| {
+                                if let Some(format) = &route.title_format {
+                                    let mut body: serde_json::Value =
+                                        serde_json::from_slice(&request.body)
+                                            .map_err(|e| ProviderError::Convert(e.to_string()))?;
+                                    body["text"] = serde_json::json!({"format":format});
+                                    request.body = Bytes::from(body.to_string());
+                                }
+                                Ok((request, stream))
+                            })
                     } else {
                         state.codex.build_request(&ctx.body, &credential)
                     };
@@ -3259,6 +3317,22 @@ async fn relay_translate(
     served: BackendGroup,
     upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
+    let quota_headers = if ctx.kind.as_deref() == Some("quota") && ctx.auto_classifier.is_some() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in response.headers() {
+            if name.as_str().starts_with("x-codex-") {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+        headers.insert("x-llmux-quota-source", HeaderValue::from_static("codex"));
+        headers.insert(
+            "x-llmux-quota-mode",
+            HeaderValue::from_static("availability"),
+        );
+        headers
+    } else {
+        HeaderMap::new()
+    };
     let status = response.status();
     // Request trace (best-effort): input breakdown captured now from the
     // inbound body, terminal outcome written at each return below. `model` is
@@ -3347,13 +3421,16 @@ async fn relay_translate(
         return client_error;
     }
 
-    if client_stream && ctx.auto_classifier.is_none() {
+    if client_stream && ctx.auto_classifier.as_ref().is_none_or(|r| !r.is_monitor()) {
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
         let converter = match served {
             BackendGroup::Grok => state.grok.converter(),
-            _ => state.codex.converter(),
+            _ => match &ctx.auto_classifier {
+                Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
+                None => state.codex.converter(),
+            },
         }
         .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
         let totals = state.totals.clone();
@@ -3410,6 +3487,7 @@ async fn relay_translate(
                     .iter()
                     .map(|(name, value)| (name.to_string(), value.clone())),
             );
+            pairs.extend(redacted_header_pairs(&quota_headers));
             pairs
         });
         let raw_io_upstream_res_headers = raw_io_path
@@ -3540,6 +3618,7 @@ async fn relay_translate(
             },
         );
         let mut out = Response::new(body);
+        out.headers_mut().extend(quota_headers);
         *out.status_mut() = StatusCode::OK;
         out.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -3557,7 +3636,10 @@ async fn relay_translate(
     use tokio_stream::StreamExt as _;
     let mut converter = match served {
         BackendGroup::Grok => state.grok.converter(),
-        _ => state.codex.converter(),
+        _ => match &ctx.auto_classifier {
+            Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
+            None => state.codex.converter(),
+        },
     }
     .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
     // Cloned before `bytes_stream()` consumes the response — the aggregate
@@ -3578,7 +3660,7 @@ async fn relay_translate(
         match item {
             Ok(chunk) => {
                 classifier_bytes = classifier_bytes.saturating_add(chunk.len());
-                if ctx.auto_classifier.is_some()
+                if ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor())
                     && classifier_bytes > super::auto_classifier::RESPONSE_LIMIT
                 {
                     ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
@@ -3653,7 +3735,8 @@ async fn relay_translate(
             // receives. Client response headers are the synthesized ones
             // (mirroring `out` below); the upstream's real headers + verbatim
             // pre-transform reply ride in the record's `upstream` half (UI-8).
-            let buffered_stream = client_stream && ctx.auto_classifier.is_some();
+            let buffered_stream =
+                client_stream && ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor());
             let message_bytes = if buffered_stream {
                 super::auto_classifier::message_sse(&message)
             } else {
@@ -3671,6 +3754,7 @@ async fn relay_translate(
             // Same losses, same headers as the streamed leg — the aggregate
             // client must not have to ask twice to learn what was dropped.
             apply_compatibility_headers(&mut client_headers, ctx.compatibility.as_ref());
+            client_headers.extend(quota_headers);
             let upstream_raw = upstream_meta.map(|m| {
                 m.into_raw(
                     raw_io_max_body,

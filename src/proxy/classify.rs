@@ -77,7 +77,10 @@ fn kind_from_signatures(system: &str, last_user: &str, max_tokens: Option<u64>) 
     {
         return "compact";
     }
-    if last_user.contains("5-10 word title") {
+    if system.contains(
+        "You are naming a coding session so the user can pick it out of a long list of sessions.",
+    ) || last_user.contains("5-10 word title")
+    {
         return "title";
     }
     if last_user.starts_with("[SUGGESTION MODE") {

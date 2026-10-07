@@ -400,6 +400,7 @@ impl AppState {
         logger: Option<Arc<RequestLogger>>,
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
+        config.claude_code.validate().map_err(ProxyError::Config)?;
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
         // Operator pause set from the loaded config — applied before the pool
         // serves its first selection so a paused account never gets picked at

@@ -48,8 +48,10 @@ only a foreground process.
   `keys` tab can answer windowed/filtered questions across restarts. Still no analytics service,
   no exporter, no browser UI — and no prompt/response content in it.
 - No general task-content routing (claude-code-router). Narrow compatibility exception:
-  Claude Code auto-mode monitors in an observed GPT main session use `luna`, with
-  session isolation and validated stop/output adaptation (see operational reference).
+  recognized Claude Code internal requests in a GPT main session use configurable
+  Opus→sol/Sonnet→terra/Haiku→luna aliases; monitors separately default to Luna.
+  Exact startup quota probes can consume proven launcher context before the first
+  main turn. This is harness compatibility, not arbitrary task-content routing.
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary
   multimodal Messages parity. URL images, unknown blocks, and unsupported media return local 400.
@@ -155,7 +157,8 @@ observation happen.
   total-generation budget or billing cap. Invalid values return 400; no fabricated truncation,
   limit clamping, or subtraction of reasoning usage to appear within the requested cap.
 - Non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` return local 400
-  (except the scoped auto-mode monitor closing-tag adapter described above);
+  (except recognized monitor closing-tag and session-title default-temperature adapters;
+  strict mode still validates original controls);
   public-API support is not subscription-gateway proof. Empty stop sequences are vacuous;
   malformed stop sequences return 400. Top-level `thinking` configuration is shape-validated
   then omitted with omission/warning `thinking_config` (strict: 400). Neither its `budget_tokens`

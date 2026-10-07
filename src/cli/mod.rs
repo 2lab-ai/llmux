@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod api;
 pub mod brew;
 pub mod channel;
+pub mod claude_context;
 pub mod daemon;
 pub mod env;
 pub mod import;

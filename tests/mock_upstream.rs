@@ -123,6 +123,7 @@ pub struct SeenRequest {
     /// Codex header assertions (`Chatgpt-Account-Id` / `originator`).
     pub chatgpt_account_id: Option<String>,
     pub originator: Option<String>,
+    pub launch_model_hint: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -302,6 +303,7 @@ async fn catch_all(
         x_api_key: header("x-api-key"),
         chatgpt_account_id: header("chatgpt-account-id"),
         originator: header("originator"),
+        launch_model_hint: header("x-llmux-claude-launch-model"),
         body: body.to_vec(),
     });
 
@@ -434,6 +436,7 @@ async fn token_endpoint(
             x_api_key: header("x-api-key"),
             chatgpt_account_id: header("chatgpt-account-id"),
             originator: header("originator"),
+            launch_model_hint: header("x-llmux-claude-launch-model"),
             body: body.to_vec(),
         });
     shared.token_hits.fetch_add(1, Ordering::SeqCst);
