@@ -23,6 +23,17 @@ The older [spec](../.prd/11-llmux-islands-spec.md) and
 macOS inputs.
 User guide: [`../docs/llmux-islands.md`](../docs/llmux-islands.md).
 
+## Get started
+
+Installed users do not need Xcode: open Islands, connect an account, then choose
+Claude Code/Codex and a project folder. **Open in Terminal** launches the existing
+llmux frontend only after a click. See the [user guide](../docs/llmux-islands.md#first-launch)
+for prerequisites, old-CLI recovery and remote limitations.
+
+The new macOS setup and launcher are native executor UI; shared dashboard state,
+provider selection, scheduler and Linux semantics are unchanged. See the active
+[get-started contract](../.prd/22-islands-get-started.md).
+
 ## Build & run
 
 Requires Xcode 15+, XcodeGen (`brew install xcodegen`), and the stable Rust
@@ -54,9 +65,7 @@ hide it.
 | Pause/resume an account | `POST /llmux/pause-account` |
 | Email anonymity and operator events | `POST /llmux/settings`, `POST /llmux/events` |
 
-Remote daemons require HTTPS and an `x-api-key`; redirects are denied. Loopback
-may use HTTP, is exempt from the control key, and never receives a configured
-remote key header.
+Remote daemons require HTTPS and an `x-api-key`; redirects are denied. Loopback may use HTTP and authenticates through the private `llmux islands-connection --port N` handoff. The CLI reads only its owned config; the native executor receives only a matching local endpoint/control key through bounded Process pipes. It never receives provider credentials, persists the key, or sends a configured remote key to loopback. HTTP 401/403 prevents daemon spawning. Remote-key reuse is restricted to the same endpoint.
 
 ## Layout
 

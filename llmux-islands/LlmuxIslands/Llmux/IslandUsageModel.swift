@@ -297,6 +297,12 @@ final class IslandUsageModel: ObservableObject {
         }
     }
 
+    func retryConnection() async {
+        guard !SnapshotMode.isActive else { return }
+        await DaemonLauncher.ensureRunning(client: .current())
+        await refresh()
+    }
+
     private func executeCoreEffects(
         _ effects: [SharedCoreEffect],
         runtime: SharedUiCoreRuntime,
@@ -936,7 +942,7 @@ final class IslandUsageModel: ObservableObject {
 
         case "persist_settings":
             guard let change = effect.change else { throw LlmuxError.invalidResponse }
-            return try persistLocalSettings(change, context: context)
+            return try await persistLocalSettings(change, context: context)
 
         case "set_autostart":
             guard let enabled = effect.enabled else { throw LlmuxError.invalidResponse }
@@ -984,7 +990,7 @@ final class IslandUsageModel: ObservableObject {
     private func persistLocalSettings(
         _ change: SharedCoreLocalSettingsChange,
         context: ExecutorContext
-    ) throws -> ExecutorAck {
+    ) async throws -> ExecutorAck {
         switch change.kind {
         case "screen_selected":
             guard let id = change.id else { throw LlmuxError.invalidResponse }
@@ -1027,6 +1033,7 @@ final class IslandUsageModel: ObservableObject {
             else { throw LlmuxError.invalidResponse }
             // Clear the authorization marker before changing endpoints, then
             // restore it only after the whole validated transaction lands.
+            await LocalControlAuth.shared.invalidate()
             LlmuxSettings.apiKey = apiKey
             LlmuxSettings.host = host
             LlmuxSettings.port = port
@@ -1232,6 +1239,7 @@ final class IslandUsageModel: ObservableObject {
         if let error = error as? SharedUiCoreError {
             return error.localizedDescription
         }
+        if let error = error as? LocalConnectionError { return error.localizedDescription }
         return "The llmux operation failed."
     }
 

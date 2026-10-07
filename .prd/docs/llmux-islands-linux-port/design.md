@@ -91,3 +91,10 @@ The implementation is accepted only when all of the following are true:
   centered 32px controls;
 - no local Docker build is used; authoritative Arch/KDE rendering remains in
   the existing GitHub Actions job.
+
+## Later macOS get-started amendment (2026-10-08)
+
+The earlier preserve-layout constraint remains the baseline for quota tiles,
+Statistics and the menu. The explicitly requested [get-started change](../../22-islands-get-started.md)
+adds a native setup state and project launcher above existing usage tiles. It does
+not adopt the KDE presentation or change shared reducer/ABI semantics.

@@ -73,6 +73,8 @@ targets:
       # redirect denial) plus its UserDefaults-backed configuration.
       - path: LlmuxIslands/Llmux/LlmuxClient.swift
       - path: LlmuxIslands/Llmux/DaemonLauncher.swift
+      - path: LlmuxIslands/Llmux/LocalControlAuth.swift
+      - path: LlmuxIslands/Llmux/CodingLaunchPlan.swift
       - path: LlmuxIslands/Settings/LlmuxSettings.swift
       # Pure Swift decode mirror of Rust's versioned UiState JSON contract.
       - path: LlmuxIslands/SharedCore/SharedUiState.swift

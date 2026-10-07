@@ -7,6 +7,8 @@ struct IslandUsageView: View {
     @ObservedObject var model: IslandUsageModel
     @ObservedObject var viewModel: NotchViewModel
 
+    var snapshotAdding = false
+    var snapshotProject: URL? = nil
     @State private var adding = false
     @State private var now = Date()
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -17,6 +19,8 @@ struct IslandUsageView: View {
             GridItem(.flexible(minimum: 150), spacing: 10),
         ]
     }
+
+    private var effectiveAdding: Bool { adding || snapshotAdding }
 
     private var loginInProgress: Bool {
         guard let phase = model.login?.phase else { return false }
@@ -33,15 +37,17 @@ struct IslandUsageView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("Usage")
+            Text(model.tiles.isEmpty ? "Get started" : "Your AI workspace")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(.white)
             connectionBadge
             Spacer()
-            iconButton(adding ? "xmark" : "plus", disabled: loginInProgress) {
-                adding.toggle()
-            }
+            Button(effectiveAdding ? "Done" : "Connect account") { adding.toggle() }
+                .font(.system(size: 11, weight: .medium))
+                .disabled(loginInProgress)
+                .help("Connect an existing Claude, ChatGPT, Grok or API account")
             iconButton("arrow.clockwise") { Task { await model.refresh() } }
+                .accessibilityLabel("Refresh accounts")
         }
         .padding(.horizontal, 2)
     }
@@ -49,7 +55,7 @@ struct IslandUsageView: View {
     @ViewBuilder private var connectionBadge: some View {
         switch model.connection {
         case .connecting: badge(.white.opacity(0.4), "connecting…")
-        case .online: badge(TerminalColors.green, "\(model.tiles.count)")
+        case .online: badge(TerminalColors.green, model.tiles.isEmpty ? "Connected" : "\(model.tiles.count) accounts")
         case .offline: badge(TerminalColors.red, "offline")
         }
     }
@@ -64,19 +70,53 @@ struct IslandUsageView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if adding {
+        if effectiveAdding {
             AddAccountInline(model: model, onDone: { adding = false })
         } else if let login = model.login {
             LoginProgressView(login: login, model: model)
-        } else if case .offline = model.connection, model.tiles.isEmpty {
-            stateMessage(icon: "bolt.horizontal.circle",
-                         title: "llmux not reachable",
-                         detail: "check the configured llmux endpoint and credentials",
-                         tint: TerminalColors.red.opacity(0.85))
+        } else if case .connecting = model.connection, model.tiles.isEmpty {
+            VStack(spacing: 14) {
+                ProgressView().controlSize(.small)
+                Text("Getting your workspace ready").font(.system(size: 17, weight: .semibold))
+                Text("Connecting to llmux. A local daemon starts automatically.")
+                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+            }.frame(maxWidth: .infinity).padding(.vertical, 38)
+        } else if case .offline(let reason) = model.connection {
+            VStack(spacing: 14) {
+                stateMessage(icon: "link.badge.plus", title: "Let’s reconnect llmux",
+                             detail: reason, tint: TerminalColors.red.opacity(0.85))
+                HStack {
+                    Button("Retry") { Task { await model.retryConnection() } }.buttonStyle(.borderedProminent)
+                    Button("Connection settings") { viewModel.showConnectionSettings() }
+                    Button("Copy update command") {
+                        guard !SnapshotMode.isActive else { return }
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(IslandsRecovery.command(
+                            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
+                            llmuxInstalled: InstalledTools.find("llmux") != nil), forType: .string)
+                    }
+                }.font(.system(size: 11))
+            }.padding(.bottom, 20)
         } else if model.tiles.isEmpty {
-            stateMessage(icon: "tray", title: "No accounts yet", detail: "add one with the + button", tint: .white.opacity(0.35))
+            VStack(alignment: .leading, spacing: 18) {
+                Text("One place for your AI accounts.").font(.system(size: 22, weight: .semibold))
+                Text("Connect an account you already use. Then choose a project and open Claude Code or Codex.")
+                    .font(.system(size: 13)).foregroundStyle(.white.opacity(0.65)).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 18) {
+                    Label("Connect account", systemImage: "1.circle.fill")
+                    Label("Choose project", systemImage: "2.circle")
+                    Label("Start coding", systemImage: "3.circle")
+                }.font(.system(size: 11)).foregroundStyle(.white.opacity(0.65))
+                Button("Connect your first account") { adding = true }
+                    .buttonStyle(.borderedProminent).tint(TerminalColors.green)
+                Text("Use the accounts you already have.")
+                    .font(.system(size: 11)).foregroundStyle(.white.opacity(0.45))
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
+                .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.055)))
         } else {
             ScrollView(.vertical, showsIndicators: false) {
+                StartCodingView(isOnline: model.connection == .online, fixtureProject: snapshotProject)
+                    .padding(.bottom, 12)
                 if !model.attention.isEmpty {
                     NeedsAttentionSection(items: model.attention)
                         .padding(.bottom, 8)
@@ -98,7 +138,8 @@ struct IslandUsageView: View {
         VStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: 26)).foregroundColor(tint)
             Text(title).foregroundColor(.white.opacity(0.7))
-            Text(detail).font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.4))
+            Text(detail).font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
@@ -246,9 +287,9 @@ private struct AddAccountInline: View {
         case .grok:
             // Device-code flow: the daemon polls while the user approves on
             // the opened x.ai page (docs/grok/spec.md T2).
-            "llmux opens a grok.com verification page — approve the code there while llmux waits. The token stays in the daemon — it never reaches this app."
+            "Sign in to Grok in your browser and approve the verification code."
         default:
-            "llmux opens your browser to sign in to your \(kind == .claude ? "Claude" : "ChatGPT") subscription. The token stays in the daemon — it never reaches this app."
+            "Sign in to your \(kind == .claude ? "Claude" : "ChatGPT") account in your browser."
         }
     }
 
