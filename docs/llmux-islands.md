@@ -1,8 +1,8 @@
 # llmux Islands
 
-`llmux-islands` is the native macOS companion for llmux. It gives the same multi-account usage cockpit a glanceable menu-bar/notch surface while keeping llmux as the only source of truth.
+`llmux-islands` is the native macOS companion for llmux. It gives the same multi-account usage cockpit a glanceable floating-notch surface while keeping llmux as the only source of truth.
 
-The app does not read `~/.config/llmux.json`, does not touch provider credentials, and does not run separate usage scripts. It talks to the running llmux daemon over HTTP.
+The app does not read `~/.config/llmux.json` or provider credentials. It asks the installed llmux CLI for an endpoint-bound local control key through a private pipe, keeps it only in the HTTP executor, and reads usage from the daemon. Remote connections use their explicitly configured control key.
 
 ![llmux Islands demo](../screenshots/llmux-islands-demo.gif)
 
@@ -20,9 +20,7 @@ Llmux Islands [mascot] [Claude activity] [Codex activity] [Grok activity]
 ```
 
 Activity counters are hidden when the count is zero. When one or more sessions
-are active, the indicator animates with a rainbow loop; the mascot makes a
-small jump whose speed scales with activity up to the capped high-activity
-state.
+are active, the counter animates with a rainbow loop; the mascot stays still.
 
 **OpenRouter accounts are not modeled yet** (2026-08-21). The shared UI
 contract has no openrouter provider case, so an `or:*` account surfaces here
@@ -60,21 +58,16 @@ daemon, or persist state.
 
 ## Requirements
 
-- macOS with Xcode 15+.
-- XcodeGen: `brew install xcodegen`.
-- A running llmux daemon on `http://127.0.0.1:3456`.
+- macOS 14 or later and llmux installed on the same computer.
+- Claude Code or Codex installed to launch that coding app from Islands.
+- An existing Claude, ChatGPT, Grok or API-key account to connect.
 
-Start the daemon with either:
-
-```bash
-llmux run
-```
-
-or, if you only want the daemon/TUI:
-
-```bash
-llmux server
-```
+No Xcode or manual daemon command is needed for the installed app. Islands starts
+its configured local daemon when necessary. Local control authentication requires
+an llmux build that includes the private Islands handoff; an older CLI shows an
+update instruction, rather than treating an unauthorized daemon as stopped.
+Node.js/npm are needed on a daemon serving Claude models to Codex through the
+Agent SDK; see [Codex frontend prerequisites](codex-frontend/README.md).
 
 ## Install
 
@@ -84,7 +77,29 @@ brew install 2lab-ai/tap/llmux-islands
 
 Then launch `LlmuxIslands.app` from Applications, Spotlight, or Finder.
 
+## First launch
+
+Open the floating notch at the top of your screen by clicking or hovering over it.
+An empty or unavailable workspace opens setup once at launch. The screen separates
+connecting, ready with no accounts, connection failure, and connected accounts.
+
+1. Choose **Connect your first account**, then the account provider. The existing
+   daemon-owned sign-in flow opens the provider authentication page.
+2. Once the account appears, choose **Claude Code** or **Codex**, then **Choose
+   project folder**. Folder selection starts no process.
+3. Choose **Open in Terminal**. A new Terminal session runs `llmux run` or
+   `llmux run --codex` in that folder. **Copy command** is an alternative.
+
+The app reports Terminal dispatch, not a completed model request. Missing tools
+have a copyable installation command. A Terminal permission refusal leaves the
+copy-command route available. Project launch currently supports local connections;
+remote users launch their existing CLI with their configured remote connection.
+No project path is persisted by the launcher.
+
 ## Build and run from source
+
+Developers need Xcode 15+, XcodeGen (`brew install xcodegen`), and Rust via rustup.
+
 
 ```bash
 cd llmux-islands
@@ -95,7 +110,7 @@ xcodebuild -project LlmuxIslands.xcodeproj -scheme LlmuxIslands -configuration D
 open build/Build/Products/Debug/LlmuxIslands.app
 ```
 
-Click the menu-bar gauge icon to open or hide the island.
+Click the notch again or click outside it to hide the island. macOS has no menu-bar gauge icon.
 
 ## Email anonymous mode
 
@@ -106,7 +121,26 @@ When enabled, email addresses in the Usage area are post-processed into a pixeli
 This is different from demo mode:
 
 - **Email anonymous mode** preserves your real live usage state and pixelizes emails in the UI.
-- **Demo mode** replaces identities with stable fake addresses and suppresses config writes for public demos.
+- **Demo mode** replaces displayed identities with stable fake addresses and keeps the notch open. It still uses the live daemon; use fixture snapshots for isolated media.
+
+## Privacy-safe screen captures
+
+For fixture-only production-view PNGs, run the built executable directly:
+
+```bash
+LLMUX_ISLANDS_SNAPSHOT_DIR=/tmp/islands-captures \
+LLMUX_ISLANDS_SNAPSHOT_KIND=onboarding \
+/path/to/LlmuxIslands.app/Contents/MacOS/LlmuxIslands -emailAnonymousEnabled YES
+```
+
+This exits before any app window, daemon, credential helper or Terminal action.
+`onboarding` renders connecting, empty, account connection, offline, ready and
+project-selected screens using synthetic data. `stats` includes mixed incoming
+Anthropic/OpenAI Activity rows; `label` renders the closed notch. Label footage as
+demo data. Snapshot mode never reads a saved project, remote host or tool inventory
+for the launcher. The existing live `--demo` mode below still polls the daemon;
+it is not the same privacy boundary. The old recorder scripts may quit a running
+Islands app and should not be used to capture an unrelated active session.
 
 ## Demo and recording mode
 
@@ -143,15 +177,22 @@ The app capture needs a one-time macOS **Screen Recording** grant for the termin
 
 ## Remote daemon
 
-Loopback access is unauthenticated by default. For a remote daemon, configure the app with the daemon host/port and the llmux `x-api-key` from your llmux config.
+Local control requests are authenticated too. The private CLI handoff returns only the control key for the matching configured proxy port; it refuses a remote CLI configuration. The key never enters view state, saved app preferences, logs, or clipboard. HTTP 401/403 means the daemon is already running and does not trigger a spawn/restart.
+
+For a remote daemon, configure HTTPS host/port and its control `x-api-key` in **Connection settings**. A stored remote key is bound to that endpoint: changing host/port requires an explicit replacement, and switching to local discards it. Redirects remain denied.
 
 Do not expose mutating llmux endpoints to an untrusted network without the API key.
 
 ## Troubleshooting
 
-### The island is blank or says llmux is not running
+### The island cannot connect
 
-Start or restart the daemon:
+Use **Retry** or **Connection settings**. If the private local helper is missing,
+use **Copy update command** to update both llmux and Islands on the app’s release
+channel (preview date version or stable version). Source builds require rebuilding
+the matching CLI too. Keep the app port
+equal to `proxy.port` in the CLI configuration; a mismatch fails closed. Do not
+restart merely because the daemon returned 401/403. For manual diagnosis:
 
 ```bash
 llmux restart

@@ -3,8 +3,8 @@ import Foundation
 /// Thin async client over the llmux daemon's HTTP control API. The app is a pure
 /// consumer of this surface — it never reads `~/.config/llmux.json` or touches
 /// provider credentials (`.prd/11-llmux-islands-spec.md` FR4). Defaults to the
-/// loopback daemon (`http://127.0.0.1:3456`), which llmux exempts from the
-/// `x-api-key` gate; an `apiKey` is only needed to reach a remote daemon.
+/// loopback daemon (`http://127.0.0.1:3456`). Local control authentication comes
+/// only from the private CLI handoff; `apiKey` belongs to the remote endpoint.
 struct LlmuxClient: Sendable {
     var baseURL: String
     var apiKey: String?
@@ -102,8 +102,17 @@ struct LlmuxClient: Sendable {
     }
 
     private func send(_ req: URLRequest) async throws -> Data {
-        let (data, resp) = try await Self.session.data(for: req)
+        let request: URLRequest
+        if try isRemoteEndpoint() {
+            request = req
+        } else {
+            request = try await LocalControlAuth.shared.authorize(req, endpoint: baseURL)
+        }
+        let (data, resp) = try await Self.session.data(for: request)
         if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                await LocalControlAuth.shared.invalidate()
+            }
             throw LlmuxError.http(http.statusCode, Self.errorMessage(from: data))
         }
         return data

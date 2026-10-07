@@ -11,7 +11,7 @@
 //  normally.
 //
 //  Dispatch rule (one gate, two artifact families):
-//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage|stats` selects explicitly.
+//  - `LLMUX_ISLANDS_SNAPSHOT_KIND=label|menu|usage|stats|onboarding` selects explicitly.
 //  - When KIND is unset: the **label** family renders if a label-ish env is
 //    present (`LLMUX_ISLANDS_DEMO_INFLIGHT` or `LLMUX_ISLANDS_SNAPSHOT_T`);
 //    otherwise the **menu + usage + stats** family renders.
@@ -65,6 +65,7 @@ enum SnapshotMode {
         case menu
         case usage
         case stats
+        case onboarding
     }
 
     enum SnapshotError: Error, CustomStringConvertible {
@@ -83,7 +84,7 @@ enum SnapshotMode {
             case .invalidWallClock(let raw):
                 return "LLMUX_ISLANDS_SNAPSHOT_T must be a non-negative number of seconds, got \"\(raw)\""
             case .invalidKind(let raw):
-                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats, got \"\(raw)\""
+                return "LLMUX_ISLANDS_SNAPSHOT_KIND must be label|menu|usage|stats|onboarding, got \"\(raw)\""
             case .missingFixture(let file):
                 return "snapshot fixture is missing from the app bundle: \(file)"
             }
@@ -128,6 +129,7 @@ enum SnapshotMode {
             case .menu: written += try renderMenu(into: dir)
             case .usage: written += try renderUsage(into: dir)
             case .stats: written += try renderStats(into: dir)
+            case .onboarding: written += try renderOnboarding(into: dir)
             }
         }
         return written
@@ -234,6 +236,35 @@ enum SnapshotMode {
         return [url.path]
     }
 
+    /// Production views, deterministic state, no live settings or executors.
+    @MainActor
+    private static func renderOnboarding(into dir: URL) throws -> [String] {
+        let model = IslandUsageModel.shared
+        model.dashboard = nil
+        let states: [(String, IslandUsageModel.Connection, Bool, Bool)] = [
+            ("setup-connecting", .connecting, false, false),
+            ("setup-empty", .online, false, false),
+            ("setup-connect-account", .online, true, false),
+            ("setup-offline", .offline("Update llmux, then retry the local connection."), false, false),
+            ("setup-ready", .online, false, true),
+            ("setup-project", .online, false, true),
+        ]
+        var written: [String] = []
+        for (name, connection, adding, ready) in states {
+            model.tiles = ready ? fixtureTiles() : []
+            model.connection = connection
+            let viewModel = makeViewModel()
+            viewModel.contentType = .usage
+            let url = dir.appendingPathComponent(name + ".png")
+            let project = name == "setup-project" ? URL(fileURLWithPath: "/Demo/Projects/my-first-app") : nil
+            try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel,
+                snapshotAdding: adding, snapshotProject: project),
+                size: viewModel.openedSize, to: url)
+            written.append(url.path)
+        }
+        return written
+    }
+
     /// The Statistics panel (issue #68 v2): the full panel as opened from the
     /// ☰ menu (`stats.png`, Overview selected) plus each section rendered
     /// standalone (`stats-{overview,models,clients,health}.png`).
@@ -304,7 +335,7 @@ enum SnapshotMode {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         try writeHosted(
             view: receipts,
-            size: CGSize(width: 560, height: 260),
+            size: CGSize(width: 560, height: 360),
             to: receiptsURL
         )
         written.append(receiptsURL.path)
@@ -386,12 +417,36 @@ enum SnapshotMode {
         guard let url = Bundle.main.url(forResource: resource, withExtension: "json") else {
             throw SnapshotError.missingFixture("\(resource).json")
         }
+        // Keep the bundled resource byte-identical to the validated shared
+        // fixture. The mixed-origin capture is an explicit, in-memory scenario;
+        // it still passes through the real Rust dashboard decoder and reducer.
+        let source = try Data(contentsOf: url)
+        guard var document = try JSONSerialization.jsonObject(with: source) as? [String: Any],
+              var activity = document["activity"] as? [String: Any],
+              var completed = activity["completed"] as? [[String: Any]],
+              var anthropic = completed.first,
+              anthropic["kind"] as? String == "request"
+        else { throw SharedUiCoreError.invalidOutput }
+        anthropic["endpoint"] = "anthropic"
+        anthropic["path"] = "/v1/messages"
+        completed[0] = anthropic
+        var openAIClaude = anthropic
+        openAIClaude["endpoint"] = "open_ai"
+        openAIClaude["path"] = "/v1/responses"
+        openAIClaude["at_ms"] = 1_700_000_001_500 as UInt64
+        var openAICodex = openAIClaude
+        openAICodex["group"] = "codex"
+        openAICodex["model"] = "gpt-6.1-sol"
+        openAICodex["at_ms"] = 1_700_000_001_750 as UInt64
+        completed.insert(contentsOf: [openAIClaude, openAICodex], at: 1)
+        activity["completed"] = completed
+        document["activity"] = activity
         let nowMs: UInt64 = 1_700_000_010_000
         let now = Date(timeIntervalSince1970: TimeInterval(nowMs) / 1000)
         return StatsFixture(
             now: now,
             nowMs: nowMs,
-            dashboardJSON: try Data(contentsOf: url)
+            dashboardJSON: try JSONSerialization.data(withJSONObject: document)
         )
     }
 

@@ -29,7 +29,16 @@ enum ConnectionApiKeyIntent {
         candidateEndpoint: String,
         candidateIsRemote: Bool
     ) throws -> ConnectionApiKeyResolution {
-        let key = resolvedKey(existing: existingKey)
+        // A stored remote key is bound to its exact endpoint. Moving back to
+        // local discards it; changing remote requires an explicit replacement.
+        let key: String
+        if !candidateIsRemote {
+            key = ""
+        } else if case .keep = self, existingEndpoint != candidateEndpoint {
+            key = ""
+        } else {
+            key = resolvedKey(existing: existingKey)
+        }
         let explicitlyCleared: Bool
         switch self {
         case .clear:

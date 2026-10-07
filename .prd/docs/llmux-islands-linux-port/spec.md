@@ -376,3 +376,12 @@ a receipt-detail crop.
 
 The root llmux package remains the daemon and wire DTO authority. The core may
 depend on the root library by path; the root must not depend on the GUI crates.
+
+## macOS local-control amendment (2026-10-08)
+
+The [get-started contract](../../22-islands-get-started.md) explicitly adds a
+CLI-owned, endpoint-bound local-control handoff. Native Swift does not read provider
+configuration or credentials. Its executor receives only the local control key
+through private bounded pipes, and never puts it in UiState or persistence.
+Remote keys remain native connection settings, restricted to their chosen endpoint.
+No Rust shared state or Linux ABI field changes are required.

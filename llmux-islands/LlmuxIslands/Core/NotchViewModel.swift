@@ -65,6 +65,8 @@ class NotchViewModel: ObservableObject {
     @Published var openReason: NotchOpenReason = .unknown
     @Published var contentType: NotchContentType = .usage
     @Published var isHovering: Bool = false
+    @Published var connectionSettingsExpanded = false
+    private var offeredSetup = false
 
     // MARK: - Dependencies
 
@@ -118,12 +120,12 @@ class NotchViewModel: ObservableObject {
     /// tile height (token footer removed, usage rows enlarged).
     private var usageOpenedHeight: CGFloat {
         let count = IslandUsageModel.shared.tiles.count
-        let chrome: CGFloat = 96          // notch header + "Usage" toolbar + paddings
+        let chrome: CGFloat = count == 0 ? 140 : 270          // notch header + "Usage" toolbar + paddings
         let perRow: CGFloat = 186         // one grid row of enlarged tiles (measured ≈180)
         let rowSpacing: CGFloat = 10
         let rows = max(1, Int(ceil(Double(max(count, 1)) / 2.0)))
         let desired = chrome + CGFloat(rows) * perRow + CGFloat(max(0, rows - 1)) * rowSpacing
-        let minHeight: CGFloat = 240
+        let minHeight: CGFloat = 350
         let maxHeight = max(minHeight, screenRect.height - 72)
         return min(max(desired, minHeight), maxHeight)
     }
@@ -158,6 +160,18 @@ class NotchViewModel: ObservableObject {
     }
 
     private func observeSelectors() {
+        IslandUsageModel.shared.$connection
+            .dropFirst()
+            .sink { [weak self] connection in
+                guard let self, !self.offeredSetup, !SnapshotMode.isActive,
+                      connection != .connecting else { return }
+                self.offeredSetup = true
+                if IslandUsageModel.shared.tiles.isEmpty {
+                    self.contentType = .usage
+                    self.notchOpen(reason: .boot)
+                }
+            }.store(in: &cancellables)
+
         screenSelector.$isPickerExpanded
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
@@ -329,6 +343,13 @@ class NotchViewModel: ObservableObject {
 
         lastNonMenuContentType = contentType
         contentType = .menu
+        reportNavigation()
+    }
+
+    func showConnectionSettings() {
+        connectionSettingsExpanded = true
+        contentType = .menu
+        notchOpen(reason: .click)
         reportNavigation()
     }
 

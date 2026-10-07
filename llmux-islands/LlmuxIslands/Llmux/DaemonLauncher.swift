@@ -57,7 +57,11 @@ enum DaemonLauncher {
         req.timeoutInterval = 1.5
         guard let (_, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse else { return false }
-        return (200..<300).contains(http.statusCode)
+        return isRunningStatus(http.statusCode)
+    }
+
+    static func isRunningStatus(_ status: Int) -> Bool {
+        (200..<300).contains(status) || status == 401 || status == 403
     }
 
     /// GUI apps launched from Finder don't inherit the shell PATH (no

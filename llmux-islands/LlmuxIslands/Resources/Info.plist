@@ -20,6 +20,8 @@
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>2lab.ai</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Open the coding app you choose in Terminal, in your selected project folder.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>
