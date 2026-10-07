@@ -1,5 +1,9 @@
 # OpenRouter provider — spec
 
+Ingress scope: the provider design and dated receipts below describe incoming
+Anthropic Messages. For the later incoming OpenAI Responses path, see the
+[frontend transport matrix](../provider-compatibility.md#frontend-transport-matrix).
+
 > STV artifact (zbrain rules/STV.md), same shape as [`docs/grok/spec.md`].
 > All upstream facts below are LIVE-PROBED (2026-08-21) or quoted from OpenRouter docs;
 > nothing here is inferred from the grok/codex precedent.

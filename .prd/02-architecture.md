@@ -31,12 +31,15 @@ src/
     server.rs          # axum listener, /llmux/* control endpoints, background tasks
     forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
     auto_classifier.rs # bounded main-session context + Luna monitor verdict adapter
+    responses.rs       # OpenAI ingress validation, transcript/tool conversion, SSE/JSON output
     sse.rs             # passthrough + transform relay; SseTransform trait
     logging.rs         # optional request logs, credential masking
   provider/
     mod.rs             # Provider trait + UnifiedRequest/Response types
     anthropic.rs       # passthrough impl (identity hooks, zero-copy fast path)
-    codex.rs           # Anthropic Messages <-> OpenAI Responses translation + SSE converter
+    codex.rs           # native Responses + Messages translation to Codex subscription gateway
+    claude_sdk.rs      # embedded SDK bootstrap, typed errors, private request process group
+    grok.rs openrouter.rs # other backend transports
     stubs.rs           # gemini/local compile-checked drafts
   dashboard.rs         # DashboardHub + DashboardDoc (/llmux/dashboard contract)
   key_usage.rs         # durable per-tenant keys usage: SQLite store (bundled), exact
@@ -48,6 +51,9 @@ src/
     ui.rs              # ratatui renderer, no fork between local/attach
     activity.rs logs.rs format.rs event.rs
   build_info.rs        # channel + build id from env (herdr pattern)
+bridge/
+  claude-agent.mjs  # actual pinned SDK, full transcript replay and external tool boundary
+  package.json package-lock.json # embedded integrity-locked runtime dependencies
 tests/
   e2e.rs               # mock upstream + proxy acceptance scenarios
   mock_upstream.rs     # Anthropic/Codex simulators (headers, 429, SSE)
@@ -56,14 +62,18 @@ tests/
 ## Runtime topology
 
 ```text
-Claude Code
-  │ ANTHROPIC_BASE_URL=http://localhost:3456
-  ▼
+Claude Code (/v1/messages)       Codex CLI (/v1/responses)
+  │ ANTHROPIC_BASE_URL              │ session-only llmux provider
+  └─────────────────┬───────────────┘
+                    ▼
 llmux daemon (axum)
   ├─ AccountPool (scheduler state, windows, leases)
   ├─ Provider dispatch
-  │   ├─ AnthropicPassthrough → https://api.anthropic.com
-  │   └─ CodexProvider       → https://chatgpt.com/backend-api/codex/responses
+  │   ├─ Claude + Messages  → native Anthropic HTTP
+  │   ├─ Claude + Responses → private Node / Claude Agent SDK process → Anthropic
+  │   ├─ Codex             → subscription Responses (native or translated ingress)
+  │   ├─ Grok              → Messages adapter → subscription Responses
+  │   └─ OpenRouter        → native Messages (Responses ingress converts first)
   ├─ Background tasks
   │   ├─ usage poller (Claude OAuth accounts)
   │   ├─ token refresh pass (< refresh_ahead_secs remaining)
@@ -78,7 +88,9 @@ llmux daemon (axum)
 
 `llmux run` is a client command: it probes `/llmux/status`, spawns a detached daemon with
 `server --no-tui` if none is running, waits until ready, then launches `claude` with
-`ANTHROPIC_BASE_URL`. `llmux dashboard` is an attach client: it polls `/llmux/dashboard`
+`ANTHROPIC_BASE_URL`; `--codex` instead launches Codex with session-only provider/catalog
+settings. Remote mode uses the selected daemon without a local lifecycle action.
+`llmux dashboard` is an attach client: it polls `/llmux/dashboard`
 and renders the same ratatui layout without binding the proxy port.
 
 ## Concurrency model
@@ -122,14 +134,17 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
 
 ## Provider dispatch and request flow
 
-1. Buffer incoming request body and create an activity item.
+1. Buffer and preserve the original ingress body; record endpoint origin separately from model
+   and provider. OpenAI validation/auth precedes upstream traffic. Metadata normalized for
+   activity never replaces the raw client request.
 2. Acquire an `AccountLease`. When `routing.enabled` (see `routing.rs`), the request's
-   `model` first selects a backend **group** (claude vs codex; the model field — previously
-   only carried through `UnifiedRequest` as a future routing key — now drives selection), the
+   `model` first selects a backend **group** (Claude, Codex, Grok or OpenRouter), the
    scheduler is filtered to that group, and the lease is sticky per group. The leased
    credential then determines the provider:
-   - `oauth` / `apikey` → `AnthropicPassthrough`.
-   - `codex` → `CodexProvider`.
+   - `oauth` / `apikey` → native Messages, or the official Claude SDK for Responses ingress.
+   - `codex` → native Responses, or Messages-to-Responses conversion.
+   - `grok` / `openrouter` → existing provider adapter; Responses ingress first converts
+     to Messages with explicit compatibility validation.
 
    Routing is **on by default**, so the `model` normally selects the group. With routing disabled
    no group filter is applied: a single legacy current slot is used and codex becomes the
@@ -138,29 +153,40 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
    credential refresh or upstream traffic. `validate_request` returns typed `InvalidRequest`
    (local HTTP 400) or a sorted/deduplicated compatibility report. Strict policy rejects any
    report issue. Valid text/tool counts return the local labeled estimate here; image counts
-   fail locally. Anthropic/OpenRouter request paths retain their existing behavior.
+   fail locally. Responses preflight separately validates native/SDK controls and reports
+   omissions; strict policy rejects any report before refresh. Native Messages
+   Anthropic/OpenRouter paths retain their existing behavior.
 4. Refresh credential if near expiry; on one 401, force refresh and retry once. Build request:
-   - Anthropic: identity body, inject Bearer or x-api-key.
+   - Claude Messages: normalize model/foreign thinking, inject Bearer or x-api-key.
+   - Claude Responses: bootstrap pinned SDK if needed, pass only selected credential and
+     transcript into a private process group with isolated HOME/cwd/settings. No fallback HTTP
+     implementation; caller tools return to Codex for execution.
    - Codex/Grok: shared Messages→Responses translation with an explicit `ResponsesFlavor`
      argument alongside `RequestPlan`, plus adapter-owned auth/model/effort. Builder validation also protects
      direct callers; only the HTTP layer applies client strict policy and diagnostic headers.
 5. Send upstream, classify response, and retry/switch according to taxonomy.
 6. Relay response:
-   - Anthropic: byte-identity SSE/body relay; usage observed from emitted Anthropic SSE.
-   - Codex: Responses SSE transform relay; converter emits Anthropic SSE and usage accounting sees
+   - Incoming Messages / Claude: byte-identity SSE/body relay; usage observed from emitted Anthropic SSE.
+   - Incoming Messages / Codex: Responses SSE transform relay; converter emits Anthropic SSE and usage accounting sees
      the emitted events.
-7. Finish activity, record totals, update DashboardHub.
+   - OpenAI ingress: preserve native Responses SSE or convert SDK/adapter Messages output
+     back to Responses, including terminal errors and JSON aggregation. Partial tool arguments
+     never become executable calls. Disconnect cancels SDK and releases the account lease.
+7. Finish activity, record totals, update DashboardHub; persist `endpoint` through TUI/native
+   projections. SDK raw upstream legs are labeled bridge transport, not private vendor HTTP.
 
 ## Error taxonomy (forward.rs)
 
 | Upstream signal | Action |
 |---|---|
 | 429 + retry-after | Park that account. If short, wait and retry same account; if long, switch and retry request. |
+| Typed SDK organization/hold/verification (403), billing (402) | Fingerprint-guarded account exclusion and same-request switch before streaming; no OAuth refresh. Generic 403 is not this signal. |
+| SDK invalid request / model missing | Return 400 / 404; keep account eligible. Late errors terminate the stream without replay. |
 | 401 on refreshable account | Force one refresh, retry; second 401 marks auth_failed and switches. |
 | 5xx / connect reset / timeout | Transient: return 502/close so client retries. |
 | Persistent provider error | Mark account error or return provider-shaped error, depending on retryability. |
-| Codex non-2xx | Wrap body as Anthropic error event/body; never relay raw Codex JSON to Claude Code. |
-| Codex 2xx stream without content-type | Treat as SSE by contract. The live backend omits `content-type`; malformed streams terminate with Anthropic `error`. |
+| Codex non-2xx with Messages ingress | Wrap body as Anthropic error event/body; never relay raw Codex JSON to Claude Code. |
+| Codex 2xx stream without content-type with Messages ingress | Treat as SSE by contract. The live backend omits `content-type`; malformed streams terminate with Anthropic `error`. |
 
 ## Config schema (v1)
 
@@ -172,7 +198,7 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
   "codex": {
     "upstream": "https://chatgpt.com/backend-api/codex",
     "token_url": "https://auth.openai.com/oauth/token",
-    "default_model": "gpt-5.5",
+    "default_model": "gpt-5.6-sol",
     "fast": false
   },
   "scheduler": {
@@ -204,7 +230,7 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
 `migrate.rs` reads teamclaude's `~/.config/teamclaude.json`; `credentials.rs` reads
 `~/.claude/.credentials.json`; `auth/codex.rs` reads Codex CLI `~/.codex/auth.json`.
 
-## Shared Codex / Grok translation details
+## Shared Codex / Grok translation details (incoming Messages)
 
 `provider::responses` owns Messages→Responses validation/conversion and the reverse SSE state
 machine; adapters own endpoint, credentials, model and effort resolution. `ResponsesFlavor`
@@ -273,9 +299,12 @@ A single accepted fixture proves neither all-model support nor reasoning-budget 
 
 ## Control-plane auth
 
-Control endpoints share the status endpoint's gate: loopback clients are exempt; non-loopback
-clients need the generated proxy API key. This preserves local UX while avoiding unauthenticated
-remote control if the user binds beyond localhost.
+Control routes (`/llmux/*`, except `/llmux/models`) require the proxy admin key or
+an admin-kind client key even on loopback. Data-plane routes retain keyless local
+access. OpenAI Responses and `/v1/models` accept Bearer or `x-api-key` through the
+same tenant resolver; malformed/conflicting/unknown explicit credentials never
+fall back to keyless access. See `server.rs::client_auth` / `is_control_plane` and
+[remote authentication](../docs/remote.md), checked 2026-10-07.
 
 ## Key dependencies
 
@@ -310,7 +339,8 @@ derives an isolated sibling directory, which is also what keeps tests off the re
 - Anthropic reset vs Codex reset timestamps differ; parse per source.
 - Do not require `content-type: text/event-stream` for Codex 2xx; live backend omits it.
 - Never emit `role:"system"` in Codex input.
-- Mask credentials in logs; request logging is opt-in and capped.
+- Mask credentials in logs; `--log-to` request files are opt-in and capped. Separate
+  `raw_io` payload capture defaults to enabled with its own retention/size controls.
 - TTY detection: bind/probe happens before TUI init so bind errors never corrupt the terminal.
 - Config writes must preserve concurrently refreshed tokens.
 

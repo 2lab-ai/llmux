@@ -1,8 +1,7 @@
 # The accidental AI debugger
 
 llmux was built as a router. But once every **model request** your agent makes
-flows through `localhost:3456`, and llmux keeps the raw bytes of both halves of
-every exchange, you get something you didn't install it for: **DevTools for your
+flows through `localhost:3456`, and llmux records the exchanges at its transport boundaries, you get something you didn't install it for: **DevTools for your
 agent's model traffic**.
 
 ![llmux raw viewer demo — from the live activity feed into the raw request/response viewer: request body, then the Response tab with the SSE stream and rate-limit headers](../screenshots/llmux-raw-viewer-demo.gif)
@@ -16,11 +15,16 @@ agent's model traffic**.
   burned 236k tokens on that turn" has a one-glance answer.
 - **A DevTools-style raw viewer.** Open any request (`🔍 request` on an expanded
   row) into a modal over the dashboard. A translated codex/grok exchange shows all
-  four legs of the wire — `Request` (what Claude Code sent) → `Upstream Req` (what
+  four legs of the wire — `Request` (what the client sent) → `Upstream Req` (what
   llmux rewrote it into) → `Upstream Resp` (the provider's verbatim reply) →
   `Response` (what your client received). Headers, SSE events, rate-limit state,
   request bodies: scroll, pan, and read the actual bytes.
-- **Copy as curl.** One keypress reconstructs a `curl` for a tab's side of the
+- **SDK transport boundary.** For Claude through Codex, the client legs preserve
+  Responses while the upstream legs labeled `claude-agent-sdk` contain the Messages
+  bridge transport. They do not expose the SDK’s private Anthropic HTTP request
+  and cannot be replayed as a vendor curl. Capture defaults to enabled and can be
+  disabled with `raw_io.enabled`.
+- **Copy as curl.** For HTTP legs, one keypress reconstructs a `curl` for that side of the
   exchange — credential values stay `•••redacted`, so substitute your own before
   replaying. Raw bodies copy to the clipboard, and `save all` writes the whole
   record JSON to `~/Downloads`. A provider bug report with the exact failing frame
