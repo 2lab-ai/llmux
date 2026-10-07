@@ -1128,14 +1128,16 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
             let task = super::internal_requests::task(&value, classified.kind);
-            let hint = if task == Some(super::internal_requests::Task::Quota)
-                && super::internal_requests::fresh_launch(
-                    parts
-                        .headers
-                        .get(super::internal_requests::LAUNCH_TIME_HEADER)
-                        .and_then(|h| h.to_str().ok()),
-                    super::raw_io::now_ms(),
-                ) {
+            let hint = if matches!(
+                task,
+                Some(super::internal_requests::Task::Quota | super::internal_requests::Task::Title)
+            ) && super::internal_requests::fresh_launch(
+                parts
+                    .headers
+                    .get(super::internal_requests::LAUNCH_TIME_HEADER)
+                    .and_then(|h| h.to_str().ok()),
+                super::raw_io::now_ms(),
+            ) {
                 parts
                     .headers
                     .get(super::internal_requests::LAUNCH_MODEL_HEADER)

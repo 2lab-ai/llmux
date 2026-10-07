@@ -1,4 +1,4 @@
-//! Conservative launch context for the quota request sent BEFORE the first
+//! Conservative launch context for quota/title requests sent BEFORE the first
 //! main turn. This is not a complete Claude settings implementation. Unknown
 //! policy/agent/resume sources deliberately produce no hint.
 use crate::proxy::internal_requests::{LAUNCH_MODEL_HEADER, LAUNCH_TIME_HEADER};
