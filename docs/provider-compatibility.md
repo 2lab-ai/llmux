@@ -227,3 +227,27 @@ nonstream response `<severity>5` with a stop-sequence reason. Stage 2's no-stop
 8192-token request and thinking/severity/category parser were inspected in the
 installed 2.1.292 client. Test prompts are sanitized synthetic fixtures; no full
 user transcript or credential is committed.
+
+### Claude Agent SDK account errors
+
+The pinned SDK's typed error is distinct from an arbitrary HTTP 403. Before any
+client stream starts, `oauth_org_not_allowed`, `account_on_hold` and
+`verification_required` (403), and `billing_error` (402), reject the leased
+credential and retry the same request with another eligible account. The existing
+fingerprint guard prevents a stale response from benching a replacement credential.
+The same organization-rejected credential was also observed returning native
+Messages HTTP 403 (`oauth_not_allowed_for_organization`), so this is not inferred
+to be a local SDK-only setting restriction. These restrictions do not rotate
+OAuth refresh tokens. `authentication_failed`
+(401) retains the single forced refresh followed by normal authentication failover.
+
+Request/model errors (400/404) leave account health unchanged. Rate limits retain
+429 scheduling. Overload, cloud-credential setup errors and server/unknown errors
+remain transient; cloud setup failures do not refresh a Claude OAuth token.
+The SDK's synthetic `max_output_tokens` warning is followed by its real
+`max_tokens` stop and becomes an incomplete Responses result, not an account error.
+Once output has started, a later failure terminates that stream and is not replayed
+as a fresh request on another account.
+
+Evidence: `bridge/*.test.mjs` audits the SDK enum and actual SDK error sequence;
+`tests/e2e.rs::responses_sdk_*` drives the Rust subprocess and HTTP lifecycle.

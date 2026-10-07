@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {PassThrough} from 'node:stream';
-import {buildRequest,run} from './claude-agent.mjs';
+import {buildRequest,run,errorStatus} from './claude-agent.mjs';
 
 const credential={type:'oauth',token:'fixture-token'};
 const basic={model:'claude-sonnet-4-6',max_tokens:256,system:'system instruction',messages:[{role:'user',content:'hello'}]};
@@ -11,9 +11,9 @@ const text=[{type:'content_block_start',index:0,content_block:{type:'text',text:
 async function fakeRun(body,frames) {
  let options,closed=false,content='';
  const stream=new PassThrough();stream.on('data',x=>content+=x);
- const result=(async function*(){for(const event of frames) yield {type:'stream_event',event};})();result.close=()=>{closed=true;};
+ const result=(async function*(){for(const event of frames) yield event.sdk ?? {type:'stream_event',event};})();result.close=()=>{closed=true;};
  await run({body,credential,upstream:'https://api.anthropic.com'}, {McpServer:class {constructor(){this.server={setRequestHandler(){}};}}, query(input){options=input.options;return result;}},stream);
- return {options,closed,header:JSON.parse(content.split('\n')[0]),events:content.split('\n').filter(s=>s.startsWith('data: ')).map(s=>JSON.parse(s.slice(6)))};
+ return {options,closed,content,header:JSON.parse(content.split('\n')[0]),events:content.split('\n').filter(s=>s.startsWith('data: ')).map(s=>JSON.parse(s.slice(6)))};
 }
 test('settings, credentials, process env and disabled builtins are isolated',()=>{
  const {options}=buildRequest(basic,credential,'https://api.anthropic.com','/private/tmp/isolated',{PATH:'/bin',HOME:'/secret',ANTHROPIC_AUTH_TOKEN:'proxy-key',ANTHROPIC_API_KEY:'wrong-key',CLAUDECODE:'nested',NODE_OPTIONS:'--import=malicious',HTTP_PROXY:'http://recursive',OPENAI_API_KEY:'other-key'});
@@ -74,4 +74,41 @@ test('tool choice none disables external and internal WebSearch tools',async()=>
  assert.deepEqual(built.tools,[]);assert.deepEqual(built.options.tools,[]);assert.equal(built.webSearch,false);
  const result=await fakeRun(body,[start(),...text,...finish()]);
  assert.equal((await result.options.canUseTool('WebSearch',{query:'ignored'})).behavior,'deny');
+});
+
+const sdkErrorCases = [
+ ['authentication_failed',401],['oauth_org_not_allowed',403],['account_on_hold',403],
+ ['verification_required',403],['billing_error',402],['rate_limit',429],
+ ['overloaded',503],['invalid_request',400],['model_not_found',404],
+ ['server_error',500],['unknown',502],['max_output_tokens',502],['cloud_credential_error',503],
+];
+for (const [code,status] of sdkErrorCases) {
+ test(`SDK error ${code} maps to ${status} before streaming`,async()=>{
+  assert.equal(errorStatus(code),status);assert.equal(errorStatus({error:code}),status);
+  const result=await fakeRun(basic,[{sdk:{type:'assistant',error:code}}]);
+  assert.deepEqual(result.header,{status,error_code:code});
+  assert.equal(result.events.length,0);assert.equal(result.closed,true);
+ });
+}
+test('unknown SDK strings never become trusted error codes or leak details',async()=>{
+ const secret='fixture-credential-should-not-appear';
+ const result=await fakeRun(basic,[{sdk:{type:'assistant',error:secret}}]);
+ assert.deepEqual(result.header,{status:502,error_code:'unknown'});
+ assert.ok(!result.content.includes(secret));assert.equal(errorStatus('__proto__'),502);
+});
+test('raw API error before message_start has an HTTP failure status',async()=>{
+ const result=await fakeRun(basic,[{type:'error',error:{type:'authentication_error',message:'secret-body'}}]);
+ assert.deepEqual(result.header,{status:401});assert.equal(result.events.length,0);
+ assert.ok(!result.content.includes('secret-body'));
+});
+test('post-start failure remains SSE and never advertises account failover',async()=>{
+ const result=await fakeRun(basic,[start(),{sdk:{type:'assistant',error:'oauth_org_not_allowed'}}]);
+ assert.deepEqual(result.header,{status:200});assert.equal(result.events.at(-1).type,'error');
+ assert.ok(!result.events.some(e=>e.type==='message_stop'));
+});
+test('synthetic max_output_tokens diagnostic preserves real partial stream',async()=>{
+ const result=await fakeRun(basic,[start(),...text,{sdk:{type:'assistant',error:'max_output_tokens'}},...finish('max_tokens')]);
+ assert.deepEqual(result.header,{status:200});assert.equal(result.events.at(-1).type,'message_stop');
+ assert.equal(result.events.find(e=>e.type==='message_delta').delta.stop_reason,'max_tokens');
+ assert.ok(!result.events.some(e=>e.type==='error'));
 });

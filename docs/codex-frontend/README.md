@@ -57,6 +57,12 @@ reported, as with `max_tokens` on the Claude Code frontend; it is not a token ca
 `X-Llmux-Compatibility: strict` rejects these reported losses before refresh or
 upstream traffic. See [provider compatibility](../provider-compatibility.md).
 
+Claude account restrictions reported by the SDK (organization access, account hold,
+verification or billing) exclude that credential and retry the request on another
+eligible account before streaming. Expired authentication still uses llmux's normal
+refresh path. Request errors do not disable accounts; see the
+[error mapping](../provider-compatibility.md#claude-agent-sdk-account-errors).
+
 ## HTTP and activity
 
 - `POST /v1/responses` (also `/responses`): text, images, tools, streaming or JSON.
