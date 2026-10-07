@@ -1,6 +1,6 @@
 # Activity endpoint origin
 
-Status: in-progress
+Status: shipped
 
 User requirement (2026-10-07):
 > (추가로) activity에 배경색으로 claude 엔드포인트 요청인지, codex 요청인지 처리 (openai endpoint 요청은 배경을 어두운 회색으로 표시)
@@ -27,4 +27,5 @@ The same endpoint field flows from `DashboardDoc` into shared-core `ActivityRece
 - All 349 TUI tests pass. Shared Islands core: 49 tests pass, including `activity_endpoint_origin_reaches_native_receipts_independently_of_provider` and schema checks.
 - Native macOS app builds; all 104 Swift tests pass, including `testActivityEndpointBackgroundDoesNotFollowProvider`. This is build/projection evidence, not native screen-pixel evidence.
 - Linux `statistics_surface` contract suite: 9 tests pass without default GUI features. Linux graphical runtime was not executed on this macOS host.
-- Session receipts: `/tmp/llmux-activity-render.log`, `/tmp/llmux-activity-tui-suite.log`, `/tmp/llmux-activity-core.log`, `/tmp/llmux-activity-xcode.log`, `/tmp/llmux-activity-linux.log`. Overall feature release verification remains owned by the feature workstream.
+- Session receipts: `/tmp/llmux-activity-render.log`, `/tmp/llmux-activity-tui-suite.log`, `/tmp/llmux-activity-core.log`, `/tmp/llmux-activity-xcode.log`, `/tmp/llmux-activity-linux.log`. Published-preview and installed-client receipts are recorded in the
+  [feature convergence loop](../../.prd/codex-frontend/loop.md#round-6--corrected-preview-and-installed-client).

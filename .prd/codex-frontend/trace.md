@@ -1,5 +1,5 @@
 # Codex frontend vertical traces
-Status: in-progress
+Status: shipped
 Date: 2026-10-07
 
 ## T1 — launch and native Codex roundtrip
@@ -82,3 +82,7 @@ mark and bounded same-request failover apply without rotating OAuth tokens.
 Refreshable auth, request errors, transient failures and output-limit stops keep
 their separate lifecycle. Actual installed full-pool failure, focused subprocess
 regressions and the correction's release receipts are tracked in loop.md.
+
+Published-preview and installed-client verification is complete; see the
+[final convergence round](loop.md#round-6--corrected-preview-and-installed-client)
+for the exact released source, client/server build and model/tool receipts.

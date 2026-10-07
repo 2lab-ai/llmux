@@ -1,12 +1,14 @@
 # Codex frontend
-Status: in-progress
+Status: shipped
 Date: 2026-10-07
 
 ## Problem and contract
 
-`llmux run` currently launches Claude Code against Anthropic Messages. Add
-`llmux run --codex` and an OpenAI Responses ingress, preserving the existing
-Claude launch as the default. The original scope is in [SSOT](codex-frontend/ssot.md).
+This is the implemented contract, not a future target. `llmux run` launches
+Claude Code by default; `llmux run --codex` launches Codex against the OpenAI
+Responses ingress. The original scope is in [SSOT](codex-frontend/ssot.md).
+Published-preview and installed-client evidence is in the final round of
+[the convergence loop](codex-frontend/loop.md#round-6--corrected-preview-and-installed-client).
 
 ## Acceptance scenarios
 

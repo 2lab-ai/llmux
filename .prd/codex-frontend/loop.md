@@ -1,5 +1,5 @@
 # Codex frontend convergence loop
-Status: in-progress
+Status: shipped
 Date: 2026-10-07
 
 ## Work units
@@ -21,13 +21,13 @@ Date: 2026-10-07
 
 | Gate | Evidence | State |
 |---|---|---|
-| protocol contract RED | baseline /v1/responses absent → actual HTTP regression | implemented and passing |
-| native Codex model text/tool | actual CLI native-tool.out | verified pre-integration |
-| Claude SDK model text/tool | actual CLI claude-tool.out / claude-patch.out | verified pre-integration |
-| activity origin | docs/codex-frontend/activity.md | implementation gates pass |
-| just check | /private/tmp/llmux-codex-just-check.log | final feature source passed (exit 0) |
-| independent review / CI | none | pending |
-| preview / installed smoke | none | pending |
+| protocol contract RED → GREEN | Responses HTTP and SDK transcript regressions | passed |
+| native Codex model text/tool | Installed-client receipt below | passed |
+| Claude SDK model text/tool | Installed-client receipt below | passed |
+| activity origin | docs/codex-frontend/activity.md; Islands CI | passed within documented visual evidence limits |
+| local complete gate | root independently reran just check on integrated source; correction gate passed | passed |
+| independent review / CI | reviewer approved feature and CI correction; [both OS checks](https://github.com/2lab-ai/llmux/actions/runs/37631245560), [all three Islands checks](https://github.com/2lab-ai/llmux/actions/runs/37631245544) | passed at 8e90683 |
+| preview / installed smoke | [preview-2026-10-07-1404-f85b26bb2b81](https://github.com/2lab-ai/llmux/releases/tag/preview-2026-10-07-1404-f85b26bb2b81); installed receipts below | passed |
 
 
 ## Round 2 — actual protocol and runtime receipts (2026-10-07)
@@ -55,8 +55,9 @@ Date: 2026-10-07
   Preserve that classifier change by integrating latest main after feature commit,
   then rerun the full gate and external review.
 
-Remaining: main integration and its full gate, integrated-head review, CI, preview
-publication, installed-binary smoke. Status remains in-progress.
+At Round 2, the remaining gates were main integration, its full gate,
+independent review, CI, preview publication and installed-binary smoke. These
+historical gaps are closed by the final round below.
 
 - SDK final gate: 23/23 actual-SDK+unit tests pass, including structured JSON
   object/scalar/array/null/local references and external tools. SDK native child
@@ -103,8 +104,8 @@ the remote CI gate, rather than being inferred from the smaller context check.
 All five checks passed on d4ac07a, merged as 8029d95 in PR #188. The first installed
 preview passed the native Codex tool smoke but failed the Claude SDK smoke: SDK
 `oauth_org_not_allowed` was mapped to transient 502, so client retries selected
-the same unusable account. This is a failed release acceptance gate; status stays
-in-progress and no user accounts are manually changed as a workaround.
+the same unusable account. At this round the release acceptance gate failed, so status stayed
+in-progress. No user accounts were manually changed as a workaround.
 
 Root reproduced RED using an isolated two-account configuration with the same
 bad-first/healthy-second credentials, idle probes disabled and no token refresh:
@@ -147,3 +148,63 @@ fixtures now set refresh_ahead_secs=0 so their counts measure request-owned
 refreshes. Exact counts, bearer order and persistence assertions are unchanged;
 the separate background-refresh acceptance test remains active. Complete just
 check passed afterward, /private/tmp/llmux-sdk-refresh-fixture-check.log.
+
+## Round 6 — corrected preview and installed client
+
+- Initial feature: [PR #188](https://github.com/2lab-ai/llmux/pull/188), tested
+  head `d4ac07aaff690b23722373d2d1a2fffc99248075`, merged as `8029d95`.
+  [Initial Rust CI](https://github.com/2lab-ai/llmux/actions/runs/37623111739)
+  and [initial Islands CI](https://github.com/2lab-ai/llmux/actions/runs/37623111832)
+  passed, but its first installed Claude smoke failed as preserved in Round 5.
+- Runtime correction: [PR #189](https://github.com/2lab-ai/llmux/pull/189), reviewed
+  and tested head `8e906830f30b23c0e9a18df7888f7c5dc90efb59`, merged as
+  `f85b26bb2b81a49fd285497e2905aff3ad7c155f`. Both changes are included in the corrected preview.
+- Final CI: [macOS and Ubuntu checks](https://github.com/2lab-ai/llmux/actions/runs/37631245560) and [semantic core, Arch KDE,
+  macOS parity](https://github.com/2lab-ai/llmux/actions/runs/37631245544) all passed on the correction's exact PR head. Arch
+  exercised the complete Qt/package path, including the makepkg Git clone.
+  Root independently reran the full local gate successfully; receipt
+  `/private/tmp/llmux-sdk-account-root-final-check.log`.
+- Actual isolated regression: the old binary returned 502 for a restricted
+  first account; the corrected binary rejected that account with SDK 403 and
+  completed the same HTTP request on the healthy second account with 200 and
+  `LLMUX_AUTH_FAILOVER_OK`. Native Messages also rejected the same restricted
+  credential with 403. The root account configuration was not modified.
+- Published preview: [preview-2026-10-07-1404-f85b26bb2b81](https://github.com/2lab-ai/llmux/releases/tag/preview-2026-10-07-1404-f85b26bb2b81);
+  [build workflow](https://github.com/2lab-ai/llmux/actions/runs/37633633708).
+- Installed client/server both report `llmux 0.2.23 (preview 2026-10-07-1404-f85b26bb2b81)`.
+  Installed artifact SHA-256: `dd4663d1c3a1416df73b3995638b89b0447e18967827ea8faf8cfa7c6cd1e320`.
+- Shared-daemon Activity recorded four successful `/v1/responses` turns with
+  `endpoint: open_ai` across both provider families; receipt
+  `/private/tmp/llmux-codex-release/corrected/installed-activity.json`.
+  Those shared-pool smokes selected a healthy Claude account directly.
+- The installed preview binary was separately exercised with an isolated
+  restricted-first/healthy-second pool, using the normal packaged SDK cache:
+  SDK 403 excluded the first account and the same HTTP request id 1 completed
+  on the second account with 200 in 3.15 seconds and exact text
+  `LLMUX_INSTALLED_FAILOVER_OK`. Receipts:
+  `/private/tmp/llmux-sdk-failover-live/installed-green.json` and
+  `/private/tmp/llmux-sdk-failover-live/installed-daemon.log`.
+  This isolated failover proof is distinct from the successful shared-pool
+  tool smokes; user account configuration was unchanged.
+- Native Codex model `gpt-5.6-sol`: `CODEX_HOME=/private/tmp/llmux-codex-release/corrected/installed-smoke/codex-home /opt/homebrew/bin/llmux run --codex -- exec --ignore-user-config --ephemeral --skip-git-repo-check -C /private/tmp/llmux-codex-release/corrected/installed-smoke/work --sandbox read-only -m gpt-5.6-sol -c model_reasoning_effort="low" --json "Use exec_command to run printf LLMUX_INSTALLED_NATIVE_TOOL_OK and reply with that output."`.
+  Observed: Actual client command_execution exit 0/output LLMUX_INSTALLED_NATIVE_TOOL_OK; exact same final agent message; turn.completed; llmux/Codex exit 0; 6.56 seconds.
+  Raw receipt: `/private/tmp/llmux-codex-release/corrected/installed-smoke/native.out`.
+- Claude model `claude-haiku-4-5-20251001` through official Claude Agent SDK:
+  `CODEX_HOME=/private/tmp/llmux-codex-release/corrected/installed-smoke/codex-home /opt/homebrew/bin/llmux run --codex -- exec --ignore-user-config --ephemeral --skip-git-repo-check -C /private/tmp/llmux-codex-release/corrected/installed-smoke/work --sandbox read-only -m claude-haiku-4-5-20251001 -c model_reasoning_effort="low" --json "Use exec_command to run printf LLMUX_INSTALLED_CLAUDE_TOOL_OK and reply with that output."`.
+  Observed: Actual client command_execution exit 0/output LLMUX_INSTALLED_CLAUDE_TOOL_OK; exact same final agent message; turn.completed; llmux/Codex exit 0; 5.63 seconds.
+  Raw receipt: `/private/tmp/llmux-codex-release/corrected/installed-smoke/claude.out`.
+- Final integrated-source probes additionally verified native nonstream text,
+  a fresh HOME installing packaged SDK 0.3.292 without a repository checkout,
+  private cache mode 0700, and actual Codex output-schema + external-tool output
+  as valid JSON. SDK unit/actual-SDK suite: 45 tests passed. Pre-header and
+  midstream cancellation observed both Node and SDK child processes terminate.
+- Activity rendering has direct ratatui buffer evidence, native macOS build and
+  projection tests, and Linux source-contract plus CI coverage. The feature
+  does not claim a local Linux graphical-runtime or native screen-pixel probe;
+  these evidence boundaries remain explicit in the activity guide.
+
+All seven acceptance scenarios are closed. The original request remains verbatim
+in SSOT. This documentation-only closure does not change released runtime code.
+
+Documentation closure also passed the mandatory complete `just check` before
+commit; receipt `/private/tmp/llmux-codex-docclosure-check.log` (exit 0).
