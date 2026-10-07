@@ -10,6 +10,7 @@ pub mod keys;
 pub mod logging;
 pub mod login;
 pub mod raw_io;
+pub mod responses;
 pub mod server;
 pub mod sse;
 pub mod usage_controls;

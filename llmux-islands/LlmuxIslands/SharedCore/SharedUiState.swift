@@ -376,6 +376,7 @@ struct SharedHeatmapCell: Decodable, Equatable {
 }
 
 struct SharedActivityReceipt: Decodable, Equatable, Identifiable {
+    var endpoint: String? = nil
     let receiptId, kind: String
     let occurredAtMs: UInt64
     let status: Int?
@@ -396,7 +397,7 @@ struct SharedActivityReceipt: Decodable, Equatable, Identifiable {
     var id: String { receiptId }
 
     enum CodingKeys: String, CodingKey {
-        case kind, status, method, path, provider, model, effort, fast, tokens, cache, message, error,
+        case kind, status, method, path, provider, model, effort, fast, tokens, cache, message, error, endpoint,
              tenant
         case receiptId = "receipt_id"
         case occurredAtMs = "occurred_at_ms"

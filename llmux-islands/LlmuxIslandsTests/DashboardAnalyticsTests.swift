@@ -275,4 +275,23 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(labels.cost, "server says C")
         XCTAssertEqual(labels.cache, "server says D")
     }
+
+    func testActivityEndpointBackgroundDoesNotFollowProvider() throws {
+        let now = Date(timeIntervalSince1970: 10)
+        for endpoint in ["open_ai", "anthropic", ""] {
+            let field = endpoint.isEmpty ? "" : ",\"endpoint\":\"\(endpoint)\""
+            let completedJSON = "{\"kind\":\"request\",\"at_ms\":1000,\"group\":\"claude\",\"status\":502\(field)}"
+            let completed = try JSONDecoder().decode(LlmuxDashboardCompleted.self, from: Data(completedJSON.utf8))
+            XCTAssertEqual(ActivityRowModel.completed(completed, now: now).isOpenAIEndpoint, endpoint == "open_ai")
+            let flightJSON = "{\"id\":1,\"method\":\"POST\",\"path\":\"/v1/responses\",\"started_at_ms\":1000,\"group\":\"claude\"\(field)}"
+            let flight = try JSONDecoder().decode(LlmuxDashboardInFlight.self, from: Data(flightJSON.utf8))
+            XCTAssertEqual(flight.endpoint == "open_ai", endpoint == "open_ai")
+            for kind in ["request", "in_flight", "note"] {
+                let receiptJSON = "{\"receipt_id\":\"r1\",\"kind\":\"\(kind)\",\"occurred_at_ms\":1000,\"fast\":false,\"error\":false,\"provider\":\"claude\"\(field)}"
+                let receipt = try JSONDecoder().decode(SharedActivityReceipt.self, from: Data(receiptJSON.utf8))
+                XCTAssertEqual(ActivityRowModel.receipt(receipt, now: now).isOpenAIEndpoint, endpoint == "open_ai" && kind != "note")
+            }
+        }
+    }
+
 }

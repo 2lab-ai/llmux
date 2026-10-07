@@ -174,6 +174,30 @@ Any provider/model integration or semantics mapping change must audit these axes
 this page **in the same PR** — the rule and its checklist are in
 [`rules/documents.md`](../rules/documents.md).
 
+
+## OpenAI Responses frontend (2026-10-07)
+
+The matrix above describes **Anthropic Messages ingress**. With `llmux run --codex`,
+Codex sends Responses and the following additional contracts apply:
+
+| Axis | Codex subscription backend | Claude Agent SDK backend |
+|---|---|---|
+| Endpoint/auth | Native gateway Responses, leased Codex token; ingress Bearer is a llmux key | Official SDK 0.3.292, isolated leased Claude OAuth/API key; no direct HTTP fallback |
+| Output cap | `max_output_tokens` omitted + headers; strict policy rejects | Mapped to SDK `CLAUDE_CODE_MAX_OUTPUT_TOKENS` |
+| Reasoning | Native items/encrypted content preserved; existing model effort policy applies | SDK effort mapped; foreign reasoning history omitted + headers; private signatures are not fabricated |
+| Structured output | Native `text.format` reaches the gateway | SDK outputFormat validates the supplied JSON Schema; object and scalar/array/null results return as JSON text |
+| Tools/images | Native function/custom/namespace/additional-tools payloads preserved | Structured transcript and MCP definitions; caller executes tools in Codex; string custom inputs and namespaces restored; user/tool-result images retained |
+| Controls | Native fields reach gateway except reported cap omission | `temperature`, `top_p`, forced tool choice and `parallel_tool_calls:false` rejected400; verbosity omitted+reported |
+| Streaming/errors | Native SSE; nonstream aggregates completed output items, including gateway terminals with empty output | SDK Messages SSE converts to Responses; malformed tools/truncated streams fail, never become successful executable calls |
+| Usage/counting | Gateway input/output/cache counters; output includes reasoning | Real SDK usage, including internally completed web-search rounds; no token-count endpoint or synthetic tokenizer claim |
+
+Evidence: `tests/e2e.rs::responses_*`, `src/proxy/responses.rs::tests`,
+`src/proxy/sse.rs::tests::sdk_internal_round_totals_replace_initial_usage`, and
+`bridge/*.test.mjs` (actual pinned SDK against localhost mock), 2026-10-07.
+[Codex frontend guide](codex-frontend/README.md) explains installation, client
+configuration and unsupported stored/background response features. Claude SDK
+adds its own identity/reminders: role/content preservation is not byte-identity.
+
 ## Claude Code auto-mode monitors
 
 **2026-10-07 compatibility exception:** a recognized Claude Code security monitor

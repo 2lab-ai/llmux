@@ -885,8 +885,11 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
         probe.local_addr().expect("probe addr").port()
     };
+    // This test measures local connection drain only. The default immediate
+    // idle sweep would send this fake key to the real upstream and can leave
+    // blocking DNS work running during Tokio runtime teardown.
     h.seed_config(&format!(
-        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey"}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
+        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey","idle_probe":{{"enabled":false}}}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
     ));
 
     let mut cmd = h.cmd();
@@ -951,7 +954,9 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         }
         if Instant::now() >= exit_deadline {
             let _ = child.kill();
-            panic!("server still alive 15s after shutdown with a hung connection open");
+            let _ = child.wait();
+            let joined = stderr_lines.join().expect("stderr thread").join("\n");
+            panic!("server still alive 15s after shutdown with a hung connection open\n{joined}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -980,4 +985,69 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Codex subcommand configuration replaces clap's parent config list. All
+/// provider settings must be inside exec, before user overrides.
+#[test]
+fn run_codex_scopes_provider_to_exec_and_propagates_exit() {
+    let h = Harness::new();
+    h.seed_config(
+        r#"{"version":1,"remote":{"host":"127.0.0.1","port":45678,"api_key":"remote-key"},"accounts":[]}"#,
+    );
+    let bindir = h.dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let stub = bindir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'KEY=%s\\n' \"$LLMUX_CODEX_API_KEY\"\nexit 7\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = h
+        .cmd()
+        .args([
+            "run",
+            "--codex",
+            "--no-model-picker",
+            "--",
+            "exec",
+            "--ignore-user-config",
+            "-c",
+            "model_reasoning_effort=low",
+            "hello",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bindir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("OPENAI_API_KEY", "unrelated-key")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        out.starts_with("exec\n-c\nmodel_provider=\"llmux\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("base_url=\"http://127.0.0.1:45678/v1\""),
+        "{out}"
+    );
+    assert!(out.contains("KEY=remote-key"));
+    assert!(!out.contains("unrelated-key"));
+    assert!(out.contains("--ignore-user-config\n-c\nmodel_reasoning_effort=low\nhello"));
 }

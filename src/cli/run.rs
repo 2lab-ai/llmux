@@ -370,6 +370,16 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
         claude_args = &claude_args[1..];
     }
 
+    if args.codex {
+        return run_codex(
+            &endpoint,
+            claude_args,
+            args.no_model_picker,
+            &config.codex.default_model,
+        )
+        .await;
+    }
+
     // The picker lineup goes FIRST so the user's pass-through args still have
     // the last word on every other flag.
     let (picker, alias_exports) = catalog_args(&endpoint, claude_args, args.no_model_picker).await;
@@ -398,6 +408,181 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
         }
     })?;
 
+    std::process::exit(exit_code(&status));
+}
+
+/// Codex owns its model-specific coding prompts. Reuse its local catalog
+/// metadata when available and overlay only llmux's model identity/capacity.
+/// Only the models array is read; cache identity/account fields never leave it.
+fn codex_catalog(models: &[CatalogRow], cached: Option<&serde_json::Value>) -> serde_json::Value {
+    use serde_json::json;
+    let native = cached.and_then(|v| v["models"].as_array());
+    let fallback = native.and_then(|a| a.iter().find(|m| m["slug"] == "gpt-5.5"));
+    let mut entries = Vec::new();
+    for (priority, row) in models.iter().enumerate() {
+        let base_id = row.id.strip_suffix("[1m]").unwrap_or(&row.id);
+        let template = native
+            .and_then(|a| a.iter().find(|m| m["slug"] == base_id))
+            .or(fallback);
+        let mut entry=template.cloned().unwrap_or(json!({
+            "shell_type":"unified_exec","visibility":"list","supported_in_api":true,"upgrade":null,
+            "model_messages":{"instructions_template":"You are Codex, a coding assistant working with the user in their workspace. Read repository instructions before changes. Use the provided tools to inspect the actual state, make focused changes, and verify results. Preserve unrelated user work. Keep tool execution in the client sandbox and obey its permission decisions. Explain outcomes and remaining limitations clearly."},
+            "support_verbosity":false,"default_verbosity":null,"apply_patch_tool_type":"freeform",
+            "truncation_policy":{"mode":"bytes","limit":10000},"experimental_supported_tools":[],
+            "tool_mode":"direct","supports_search_tool":false,"use_responses_lite":false
+        }));
+        entry["slug"] = json!(row.id);
+        entry["display_name"] = json!(row.name);
+        entry["description"] = json!(row_description(row));
+        entry["priority"] = json!(priority);
+        entry["visibility"] = json!("list");
+        entry["supported_in_api"] = json!(true);
+        entry["context_window"] = json!(row.max_context);
+        entry["max_context_window"] = json!(row.max_context);
+        entry["supported_reasoning_levels"] = json!(row
+            .efforts
+            .iter()
+            .map(|effort| json!({"effort":effort,"description":effort}))
+            .collect::<Vec<_>>());
+        entry["default_reasoning_level"] = json!(row
+            .efforts
+            .iter()
+            .find(|e| e.as_str() == "medium")
+            .or(row.efforts.first()));
+        if row.group != "codex" {
+            entry["additional_speed_tiers"] = json!([]);
+            entry["service_tiers"] = json!([]);
+            entry["default_service_tier"] = serde_json::Value::Null;
+            entry["tool_mode"] = json!("direct");
+            entry["supports_search_tool"] = json!(false);
+            entry["use_responses_lite"] = json!(false);
+            entry["supports_reasoning_effort_updates"] = json!(false);
+            entry["supports_experimental_context"] = json!(false);
+        }
+        entries.push(entry.clone());
+        for alias in &row.aliases {
+            let mut alias_entry = entry.clone();
+            alias_entry["slug"] = json!(alias);
+            alias_entry["visibility"] = json!("hide");
+            entries.push(alias_entry);
+        }
+    }
+    json!({"models":entries})
+}
+
+fn user_codex_catalog(args: &[String]) -> bool {
+    args.iter().any(|a| a.contains("model_catalog_json="))
+}
+
+async fn codex_catalog_file(
+    endpoint: &Endpoint,
+    args: &[String],
+    no_picker: bool,
+) -> Option<std::path::PathBuf> {
+    if no_picker || user_codex_catalog(args) {
+        return None;
+    }
+    let rows = match fetch_catalog(&endpoint.base_url, endpoint.api_key.as_deref()).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => return None,
+        Err(reason) => {
+            eprintln!("warning: model picker not injected: {reason}");
+            return None;
+        }
+    };
+    let cache_path = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".codex")))
+        .map(|p| p.join("models_cache.json"));
+    let cached = cache_path
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let path = std::env::temp_dir().join(format!("llmux-codex-models-{}.json", ulid::Ulid::new()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        use std::io::Write as _;
+        let mut f = options.open(&path)?;
+        f.write_all(codex_catalog(&rows, cached.as_ref()).to_string().as_bytes())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("warning: could not create Codex model catalog");
+        return None;
+    }
+    Some(path)
+}
+
+/// Session-scoped provider flags keep the user's Codex config/auth untouched.
+async fn run_codex(
+    endpoint: &Endpoint,
+    args: &[String],
+    no_picker: bool,
+    default_model: &str,
+) -> Result<(), CliError> {
+    let mut command = tokio::process::Command::new("codex");
+    // clap's subcommand config list replaces its parent's list. Put the
+    // provider flags in the actual client command's argument scope.
+    let args = if args.first().is_some_and(|a| {
+        matches!(
+            a.as_str(),
+            "exec" | "e" | "review" | "resume" | "fork" | "app-server" | "mcp-server"
+        )
+    }) {
+        command.arg(&args[0]);
+        &args[1..]
+    } else {
+        args
+    };
+
+    let q = |value: &str| serde_json::Value::String(value.to_string()).to_string();
+    let settings = [
+        "model_provider=\"llmux\"".to_string(),
+        format!("model={}", q(default_model)),
+        "model_providers.llmux.name=\"llmux\"".into(),
+        format!(
+            "model_providers.llmux.base_url={}",
+            q(&format!("{}/v1", endpoint.base_url.trim_end_matches('/')))
+        ),
+        "model_providers.llmux.wire_api=\"responses\"".into(),
+        "model_providers.llmux.requires_openai_auth=false".into(),
+        "model_providers.llmux.supports_websockets=false".into(),
+    ];
+    for setting in settings {
+        command.arg("-c").arg(setting);
+    }
+    let catalog = codex_catalog_file(endpoint, args, no_picker).await;
+    if let Some(path) = &catalog {
+        command
+            .arg("-c")
+            .arg(format!("model_catalog_json={}", q(&path.to_string_lossy())));
+    }
+    // This key belongs only to the selected llmux endpoint.
+    if let Some(key) = &endpoint.api_key {
+        command.env("LLMUX_CODEX_API_KEY", key);
+        command
+            .arg("-c")
+            .arg("model_providers.llmux.env_key=\"LLMUX_CODEX_API_KEY\"");
+    } else {
+        command.env_remove("LLMUX_CODEX_API_KEY");
+    }
+    command.args(args);
+    let status = command.status().await;
+    if let Some(path) = catalog {
+        let _ = std::fs::remove_file(path);
+    }
+    let status = status.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CliError::Message("codex not found in PATH — install Codex CLI first".into())
+        } else {
+            CliError::Message(format!("failed to start codex: {err}"))
+        }
+    })?;
     std::process::exit(exit_code(&status));
 }
 

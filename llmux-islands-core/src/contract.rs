@@ -384,6 +384,9 @@ pub enum ReceiptKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityReceipt {
+    /// Incoming API protocol, independent of the selected provider.
+    #[serde(default)]
+    pub endpoint: llmux::tui::Endpoint,
     pub receipt_id: String,
     pub kind: ReceiptKind,
     pub occurred_at_ms: u64,

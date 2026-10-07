@@ -12,6 +12,8 @@
 
 **One agent harness, every model.** llmux is a local Anthropic-compatible proxy for [Claude Code](https://www.anthropic.com/claude-code): `claude` talks to `http://localhost:3456`, llmux decides which account/backend serves the request. Your subagents, slash commands, MCP servers, hooks, and `CLAUDE.md` conventions stay put while frontier models and subscription limits keep moving — `/model fable`, `/model gpt-5.6-sol`, `/model grok-4.7` are routing signals, not migrations.
 
+- **Claude Code or Codex frontend** — `llmux run --codex` adds an OpenAI Responses endpoint, catalog picker and Claude Agent SDK routing ([Codex guide →](docs/codex-frontend/README.md)). Claude-through-Codex requires Node.js/npm on the daemon; SDK controls differ from native Messages.
+
 - **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and a Claude Code launcher (`llmux run`)
 - **four backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), OpenRouter (`or-*` / free models on an OpenRouter key), routed by model name ([models →](docs/models.md))
 - **multi-account scheduling** — quota-aware perishability scoring or sticky round-robin, 429 cooldown parking, Fable weekly ceilings ([schedulers →](docs/schedulers.md))

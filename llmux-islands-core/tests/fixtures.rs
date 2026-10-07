@@ -262,3 +262,39 @@ fn anonymous_masks_email_bearing_client_names() {
         serde_json::to_string(&state.statistics.activity_receipts).expect("receipts JSON");
     assert!(!serialized.contains("alice@example.com"));
 }
+
+#[test]
+fn activity_endpoint_origin_reaches_native_receipts_independently_of_provider() {
+    use llmux::tui::Endpoint;
+    use llmux_islands_core::{ActivityReceipt, ReceiptKind};
+    let mut doc = read_fixture("current");
+    doc.activity.in_flight[0].endpoint = Endpoint::OpenAi;
+    doc.activity.in_flight[0].group = Some("claude".into());
+    for row in &mut doc.activity.completed {
+        if let llmux::dashboard::CompletedDoc::Request {
+            endpoint, group, ..
+        } = row
+        {
+            *endpoint = Endpoint::OpenAi;
+            *group = Some("claude".into());
+        }
+    }
+    let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
+    let receipts = &state.statistics.activity_receipts;
+    assert_eq!(receipts[0].endpoint, Endpoint::OpenAi);
+    assert_eq!(receipts[0].provider, Some(Provider::Claude));
+    for row in receipts.iter().filter(|r| r.kind == ReceiptKind::Request) {
+        assert_eq!(row.endpoint, Endpoint::OpenAi);
+        let mut wire = serde_json::to_value(row).unwrap();
+        assert_eq!(wire["endpoint"], "open_ai");
+        let decoded: ActivityReceipt = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.endpoint, Endpoint::OpenAi);
+        wire.as_object_mut().unwrap().remove("endpoint");
+        let legacy: ActivityReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.endpoint, Endpoint::Anthropic);
+    }
+    assert!(receipts
+        .iter()
+        .filter(|r| r.kind == ReceiptKind::Note)
+        .all(|r| r.endpoint == Endpoint::Anthropic));
+}

@@ -8,6 +8,8 @@ features: [rules/documents.md](../rules/documents.md).
 
 ## Guides
 
+- [Codex frontend](codex-frontend/README.md) — `llmux run --codex`, Responses API, model picker, Agent SDK prerequisites and limits. [Activity origin](codex-frontend/activity.md) covers endpoint coloring.
+
 - [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
 - [What ships today](features.md) — the complete feature list, with dates on behavior changes.
 - [The accidental AI debugger](ai-debugger.md) — per-request receipts, DevTools-style raw viewer, copy-as-curl, email masking.

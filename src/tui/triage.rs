@@ -401,6 +401,7 @@ pub(crate) enum ActivityRow {
 /// completed entries with 2xx status and this exact key collapse into one
 /// counted row.
 type FoldKey<'a> = (
+    crate::tui::Endpoint,
     &'a str,
     &'a str,
     Option<&'a str>,
@@ -416,6 +417,7 @@ type FoldKey<'a> = (
 fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
     match &entry.body {
         CompletedBody::Request {
+            endpoint,
             method,
             path,
             account,
@@ -425,6 +427,7 @@ fn fold_key(entry: &Completed) -> Option<FoldKey<'_>> {
             kind,
             ..
         } if (200..300).contains(status) && kind.as_deref() == Some("count") => Some((
+            *endpoint,
             method.as_str(),
             path.as_str(),
             account.as_deref(),
@@ -928,6 +931,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: path.into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a@x".into()),
                 status,
                 duration: Duration::from_secs(1),
@@ -1079,5 +1083,25 @@ mod tests {
         ];
         let rows = collapse_completed(&entries);
         assert!(rows.iter().all(|r| matches!(r, ActivityRow::Single(_))));
+    }
+
+    #[test]
+    fn count_runs_never_mix_endpoint_origins() {
+        let mut entries = vec![
+            request(200, "/same", 30),
+            request(200, "/same", 20),
+            request(200, "/same", 10),
+        ];
+        if let CompletedBody::Request { endpoint, .. } = &mut entries[1].body {
+            *endpoint = crate::tui::Endpoint::OpenAi;
+        }
+        assert_eq!(
+            collapse_completed(&entries),
+            vec![
+                ActivityRow::Single(0),
+                ActivityRow::Single(1),
+                ActivityRow::Single(2)
+            ]
+        );
     }
 }

@@ -6653,7 +6653,7 @@ fn draw_activity(
                     )));
                 }
             }
-            lines.push(Line::from(spans));
+            lines.push(endpoint_line(Line::from(spans), request.endpoint));
         }
     }
     // Completed entries, newest first, windowed by the scroll offset (req6:
@@ -6809,8 +6809,33 @@ fn draw_activity(
         format!(" activity — {} in flight ", in_flight.len())
     };
     let block = Block::new().borders(Borders::TOP).title(title);
+    // Paragraph styles graphemes, but resets wide-glyph continuation cells.
+    // Apply the row background to the final buffer so both those cells and
+    // the unused trailing width share the endpoint color.
+    let openai_rows: Vec<u16> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.style.bg == Some(OPENAI_ACTIVITY_BG))
+        .map(|(index, _)| body_top.saturating_add(index as u16))
+        .filter(|y| *y < area.bottom())
+        .collect();
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    for y in openai_rows {
+        frame.buffer_mut().set_style(
+            Rect::new(area.x, y, area.width, 1),
+            Style::new().bg(OPENAI_ACTIVITY_BG),
+        );
+    }
     ActivityChrome { area, hits }
+}
+
+const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
+
+fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
+    match endpoint {
+        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(OPENAI_ACTIVITY_BG)),
+        crate::tui::Endpoint::Anthropic => line,
+    }
 }
 
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
@@ -6865,6 +6890,7 @@ fn folded_run_line(
     );
     let newest = &run[0];
     let CompletedBody::Request {
+        endpoint,
         account,
         group,
         model,
@@ -6913,7 +6939,7 @@ fn folded_run_line(
     )));
     spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
     spans.push(Span::raw(")"));
-    Line::from(spans)
+    endpoint_line(Line::from(spans), *endpoint)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6933,6 +6959,7 @@ fn completed_line(
             id: _,
             method,
             path,
+            endpoint,
             account,
             status,
             duration,
@@ -7076,7 +7103,7 @@ fn completed_line(
                     )));
                 }
             }
-            Line::from(spans)
+            endpoint_line(Line::from(spans), *endpoint)
         }
         CompletedBody::Note { text, error } => {
             let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
@@ -7104,6 +7131,7 @@ fn completed_detail_lines(
         id: _,
         method,
         path,
+        endpoint,
         account,
         status,
         duration,
@@ -7293,6 +7321,9 @@ fn completed_detail_lines(
         None => lines.push(indent("tokens", "—".to_string())),
     }
     lines
+        .into_iter()
+        .map(|line| endpoint_line(line, *endpoint))
+        .collect()
 }
 
 /// Row offset (0-based, within [`completed_detail_lines`]) of the clickable
@@ -9831,6 +9862,7 @@ mod tests {
             id: 7,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11099,6 +11131,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11131,6 +11164,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("codex:me@example.com".into()),
             group: Some("codex".into()),
             model: Some("gpt-5.6-sol".into()),
@@ -11165,6 +11199,7 @@ mod tests {
             id: 3,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11202,6 +11237,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11297,6 +11333,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11315,6 +11352,7 @@ mod tests {
                 id: 2,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:me@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(1_200),
@@ -11408,6 +11446,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("codex:me@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -11775,6 +11814,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages?beta=true".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:someone@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(3_100),
@@ -11903,6 +11943,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a@x.com".into()),
                 status,
                 duration: Duration::from_millis(1_400),
@@ -14251,6 +14292,7 @@ mod tests {
             id: 7,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some(LEAK.into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -14270,6 +14312,7 @@ mod tests {
                     id: 1,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some(LEAK.into()),
                     status: 200,
                     duration: Duration::from_millis(10),
@@ -14466,5 +14509,111 @@ mod tests {
                 "narrow header must not carry `{gone}`:\n{header}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_origin_colors_rendered_activity_rows_and_expanded_errors() {
+        use crate::tui::Endpoint;
+        let mut view = view_with(Vec::new());
+        let mut openai = completed_request(2000, Some("claude"), Some("sonnet"), 10, 5, 502);
+        if let CompletedBody::Request { endpoint, .. } = &mut openai.body {
+            *endpoint = Endpoint::OpenAi;
+        }
+        let anthropic = completed_request(1000, Some("codex"), Some("gpt-5.5"), 10, 5, 200);
+        view.completed = vec![openai.clone(), anthropic];
+        view.in_flight.push(InFlight {
+            id: 3,
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            endpoint: Endpoint::OpenAi,
+            account: Some("claude-account".into()),
+            group: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: None,
+            fast: false,
+            kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
+            started_at: UNIX_EPOCH,
+        });
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded_activity = openai.activity_key();
+        let mut terminal = Terminal::new(TestBackend::new(160, 28)).unwrap();
+        let mut hit = None;
+        let rendered = terminal
+            .draw(|f| {
+                hit = Some(draw_activity(f, f.area(), &view, &chrome, UNIX_EPOCH));
+            })
+            .unwrap();
+        // Inspect the completed render buffer: TestBackend receives a diff
+        // that skips hidden wide-glyph continuation cells by design.
+        let buffer = rendered.buffer;
+        let hit = hit.unwrap();
+        let openai_hit = hit
+            .hits
+            .iter()
+            .find(|h| {
+                h.key == openai.activity_key().unwrap() && matches!(h.kind, ActivityHitKind::Entry)
+            })
+            .unwrap();
+        for y in 1..openai_hit.y_start + openai_hit.height {
+            for x in 0..160 {
+                assert_eq!(buffer[(x, y)].bg, OPENAI_ACTIVITY_BG, "cell ({x},{y})");
+            }
+        }
+        let anthropic_y = openai_hit.y_start + openai_hit.height;
+        assert_eq!(
+            buffer[(159, anthropic_y)].bg,
+            Color::Reset,
+            "Anthropic endpoint routed to Codex keeps original background"
+        );
+        let red_status = buffer
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "5" && c.fg == Color::Red && c.bg == OPENAI_ACTIVITY_BG);
+        assert!(red_status, "error foreground remains red on dark gray");
+        for y in 0..=anthropic_y {
+            let text: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
+            println!(
+                "activity-render row={y} bg={:?} {}",
+                buffer[(159, y)].bg,
+                text.trim_end()
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_origin_colors_folded_count_header() {
+        let mut view = view_with(Vec::new());
+        view.completed = (1..=3)
+            .map(|id| {
+                let mut row = completed_request(id, Some("claude"), Some("sonnet"), 1, 1, 200);
+                if let CompletedBody::Request { endpoint, kind, .. } = &mut row.body {
+                    *endpoint = crate::tui::Endpoint::OpenAi;
+                    *kind = Some("count".into());
+                }
+                row
+            })
+            .collect();
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, UNIX_EPOCH);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 0..160 {
+            assert_eq!(buffer[(x, 1)].bg, OPENAI_ACTIVITY_BG);
+        }
+        let text: String = (0..160).map(|x| buffer[(x, 1)].symbol()).collect();
+        assert!(text.contains("3×"), "{text}");
+        println!(
+            "activity-render folded bg={:?} {}",
+            buffer[(159, 1)].bg,
+            text.trim_end()
+        );
     }
 }

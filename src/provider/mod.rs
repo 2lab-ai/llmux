@@ -10,6 +10,7 @@
 //! [`stubs`].
 
 pub mod anthropic;
+pub mod claude_sdk;
 pub mod codex;
 pub mod grok;
 pub mod openrouter;

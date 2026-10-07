@@ -324,6 +324,8 @@ Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex
 
 ## Activity feed
 
+Requests received on the OpenAI Responses endpoint have a dark gray activity-row background. Anthropic endpoint requests keep the normal background, including when a Codex model serves them. This follows the incoming endpoint, not the model or account; running, failed, expanded, attached-dashboard, and replayed historical rows keep the same distinction. Older records without endpoint metadata retain the normal background.
+
 The dashboard's activity panel shows one row per request — running requests
 pinned on top, then completed ones newest first
 (2026-07-15 layout):

@@ -142,6 +142,9 @@ pub struct ServerArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Launch Codex against llmux Responses instead of Claude Code.
+    #[arg(long)]
+    pub codex: bool,
     /// Restart the daemon even when it already runs this binary's version
     /// (by default a same-version daemon is reused; a different version is
     /// always restarted).
@@ -155,7 +158,7 @@ pub struct RunArgs {
     /// aliases (a var you already set is left alone).
     #[arg(long)]
     pub no_model_picker: bool,
-    /// Arguments passed through to `claude` after `--`.
+    /// Arguments passed through to the selected client after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }

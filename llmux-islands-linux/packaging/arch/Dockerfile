@@ -27,6 +27,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY LICENSE ./LICENSE
 COPY src ./src
+# Rust embeds these assets; include them in both direct and makepkg builds.
+COPY bridge/claude-agent.mjs bridge/package.json bridge/package-lock.json ./bridge/
 COPY llmux-islands-core ./llmux-islands-core
 COPY llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json ./llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json
 COPY llmux-islands-linux ./llmux-islands-linux
@@ -95,7 +97,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # user before installing the resulting package back into the verification image.
 WORKDIR /src
 RUN git init \
-    && git add Cargo.toml Cargo.lock LICENSE src llmux-islands-core llmux-islands-linux \
+    && git add Cargo.toml Cargo.lock LICENSE src bridge llmux-islands-core llmux-islands-linux \
        llmux-islands/LlmuxIslands/Resources/snapshot-dashboard.json \
     && git -c user.name='llmux CI' -c user.email='ci@invalid.example' \
        commit -m 'package fixture'

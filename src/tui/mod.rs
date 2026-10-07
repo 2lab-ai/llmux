@@ -40,7 +40,7 @@ pub(crate) mod triage;
 mod ui;
 pub(crate) mod view;
 
-pub use event::{ActivityEvent, TokenCounts};
+pub use event::{ActivityEvent, Endpoint, TokenCounts};
 
 /// Bound for the proxy→dashboard activity channel (`try_send` +
 /// drop-on-full on the sender side, so a stalled dashboard never
@@ -7671,6 +7671,7 @@ mod tests {
                 client_name: None,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -7892,6 +7893,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages/count_tokens".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8003,6 +8005,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8107,6 +8110,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),

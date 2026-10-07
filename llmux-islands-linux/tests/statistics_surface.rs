@@ -245,3 +245,10 @@ fn test_contract_tracks_the_checked_in_schema_names() {
         );
     }
 }
+
+#[test]
+fn activity_endpoint_background_is_independent_of_backend_provider() {
+    let qml = read("qml/Statistics.qml");
+    assert!(qml.contains("receipt.kind !== \"note\" && receipt.endpoint === \"open_ai\""));
+    assert!(qml.contains("? \"#282828\" : IslandTheme.surface"));
+}
