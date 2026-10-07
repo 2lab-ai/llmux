@@ -44,3 +44,24 @@ Limits: Terminal app-context Automation/dispatch has not yet been observed; shel
 quoting alone is not that receipt. Videos must label fixture data and cannot claim
 an actual live click/login/model session. Publication, paired installation and
 media drafts remain parent-owned acceptance before marking shipped.
+
+## Round 2 — CI shared-fixture correction
+
+PR #196 macOS shared-core job 112993452057 caught an omitted local gate: the app
+bundle's dashboard fixture must be byte-identical to the core fixture. The initial
+change updated only the app copy. Restore its exact bytes and construct the mixed
+endpoint capture scenario only in SnapshotMode memory before the existing Rust
+decoder/reducer. The parity test remains unchanged. Root `just check` does not run
+subcrate tests; core and macOS-bridge gates are now explicit for this correction.
+No production HTTP/auth/launcher behavior changes. Native capture comparison and
+full gate results are recorded below after execution.
+
+Correction validation: core 49 tests and macOS bridge 12 tests passed (including
+unchanged fixture-byte assertion); root `just check` and native app build exited 0.
+Logs: `/private/tmp/llmux-islands-fixture-{core,bridge,check,native}.log`.
+All six regenerated statistics/Activity PNG files are byte-identical to the approved
+be60c47 captures, including both OpenAI dark-gray rows. SHA-256 comparison receipt:
+`/private/tmp/llmux-islands-fixture-capture-comparison.json` (`all_identical: true`).
+Independent root review approved the three-file correction and independently proved
+that the augmented JSON matches the earlier capture data. Existing videos need no
+visual replacement; their original capture provenance remains be60c47.

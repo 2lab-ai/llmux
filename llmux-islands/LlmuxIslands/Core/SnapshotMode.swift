@@ -417,12 +417,36 @@ enum SnapshotMode {
         guard let url = Bundle.main.url(forResource: resource, withExtension: "json") else {
             throw SnapshotError.missingFixture("\(resource).json")
         }
+        // Keep the bundled resource byte-identical to the validated shared
+        // fixture. The mixed-origin capture is an explicit, in-memory scenario;
+        // it still passes through the real Rust dashboard decoder and reducer.
+        let source = try Data(contentsOf: url)
+        guard var document = try JSONSerialization.jsonObject(with: source) as? [String: Any],
+              var activity = document["activity"] as? [String: Any],
+              var completed = activity["completed"] as? [[String: Any]],
+              var anthropic = completed.first,
+              anthropic["kind"] as? String == "request"
+        else { throw SharedUiCoreError.invalidOutput }
+        anthropic["endpoint"] = "anthropic"
+        anthropic["path"] = "/v1/messages"
+        completed[0] = anthropic
+        var openAIClaude = anthropic
+        openAIClaude["endpoint"] = "open_ai"
+        openAIClaude["path"] = "/v1/responses"
+        openAIClaude["at_ms"] = 1_700_000_001_500 as UInt64
+        var openAICodex = openAIClaude
+        openAICodex["group"] = "codex"
+        openAICodex["model"] = "gpt-6.1-sol"
+        openAICodex["at_ms"] = 1_700_000_001_750 as UInt64
+        completed.insert(contentsOf: [openAIClaude, openAICodex], at: 1)
+        activity["completed"] = completed
+        document["activity"] = activity
         let nowMs: UInt64 = 1_700_000_010_000
         let now = Date(timeIntervalSince1970: TimeInterval(nowMs) / 1000)
         return StatsFixture(
             now: now,
             nowMs: nowMs,
-            dashboardJSON: try Data(contentsOf: url)
+            dashboardJSON: try JSONSerialization.data(withJSONObject: document)
         )
     }
 

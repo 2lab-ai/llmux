@@ -55,18 +55,8 @@
       "token_expires_at_ms": 1700003600000,
       "last_refresh_ms": 1700000000000,
       "paused": false,
-      "totals": {
-        "requests": 10,
-        "input_tokens": 100,
-        "output_tokens": 40
-      },
-      "session": {
-        "requests": 2,
-        "ok": 2,
-        "errors": 0,
-        "tokens_in": 20,
-        "tokens_out": 8
-      },
+      "totals": { "requests": 10, "input_tokens": 100, "output_tokens": 40 },
+      "session": { "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 },
       "future_account_field": "ignored"
     },
     {
@@ -84,18 +74,8 @@
       "token_expires_at_ms": null,
       "last_refresh_ms": null,
       "paused": true,
-      "totals": {
-        "requests": 5,
-        "input_tokens": 50,
-        "output_tokens": 20
-      },
-      "session": {
-        "requests": 1,
-        "ok": 0,
-        "errors": 1,
-        "tokens_in": 10,
-        "tokens_out": 4
-      }
+      "totals": { "requests": 5, "input_tokens": 50, "output_tokens": 20 },
+      "session": { "requests": 1, "ok": 0, "errors": 1, "tokens_in": 10, "tokens_out": 4 }
     }
   ],
   "scheduler": {
@@ -126,14 +106,7 @@
       "last_used_ms": 1700000000000,
       "in_flight": 1,
       "accounts": [
-        {
-          "name": "alice@example.com",
-          "requests": 2,
-          "ok": 2,
-          "errors": 0,
-          "tokens_in": 20,
-          "tokens_out": 8
-        }
+        { "name": "alice@example.com", "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 }
       ],
       "efforts": [],
       "endpoints": [],
@@ -141,14 +114,7 @@
     }
   ],
   "client_usage": [
-    {
-      "client": "codex-client",
-      "requests": 2,
-      "ok": 2,
-      "errors": 0,
-      "tokens_in": 20,
-      "tokens_out": 8
-    }
+    { "client": "codex-client", "requests": 2, "ok": 2, "errors": 0, "tokens_in": 20, "tokens_out": 8 }
   ],
   "windowed": [
     {
@@ -188,61 +154,16 @@
         "kind": "request",
         "at_ms": 1700000001000,
         "method": "POST",
-        "path": "/v1/messages",
+        "path": "/v1/messages?authorization=Bearer-secret",
         "account": "alice@example.com",
         "status": 200,
         "duration_ms": 1200,
-        "tokens": {
-          "input": 10,
-          "output": 4,
-          "cache_read": 3
-        },
+        "tokens": { "input": 10, "output": 4, "cache_read": 3 },
         "cost_usd": 0.02,
         "group": "claude",
         "model": "claude-sonnet-4-5",
         "effort": "high",
-        "fast": false,
-        "endpoint": "anthropic"
-      },
-      {
-        "kind": "request",
-        "at_ms": 1700000001500,
-        "method": "POST",
-        "path": "/v1/responses",
-        "account": "alice@example.com",
-        "status": 200,
-        "duration_ms": 1200,
-        "tokens": {
-          "input": 10,
-          "output": 4,
-          "cache_read": 3
-        },
-        "cost_usd": 0.02,
-        "group": "claude",
-        "model": "claude-sonnet-4-5",
-        "effort": "high",
-        "fast": false,
-        "endpoint": "open_ai"
-      },
-      {
-        "kind": "request",
-        "at_ms": 1700000001750,
-        "method": "POST",
-        "path": "/v1/responses",
-        "account": "alice@example.com",
-        "status": 200,
-        "duration_ms": 1200,
-        "tokens": {
-          "input": 10,
-          "output": 4,
-          "cache_read": 3
-        },
-        "cost_usd": 0.02,
-        "group": "codex",
-        "model": "gpt-6.1-sol",
-        "effort": "high",
-        "fast": false,
-        "endpoint": "open_ai"
+        "fast": false
       },
       {
         "kind": "note",
@@ -261,7 +182,5 @@
     "cost": "API-equivalent estimate",
     "cache": "missing fields shown as unavailable"
   },
-  "future_top_level": {
-    "ignored": true
-  }
+  "future_top_level": { "ignored": true }
 }
