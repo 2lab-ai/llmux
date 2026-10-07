@@ -10,6 +10,7 @@ pub mod claude_context;
 pub mod daemon;
 pub mod env;
 pub mod import;
+pub mod islands;
 pub mod keys;
 pub mod login;
 pub mod run;
@@ -97,6 +98,9 @@ pub enum Command {
     Import(ImportArgs),
     /// Print the env exports for pointing Claude Code at the proxy.
     Env(EnvArgs),
+    /// Private local-control handoff for the native Islands executor.
+    #[command(hide = true)]
+    IslandsConnection(islands::ConnectionArgs),
     /// Attach to a running daemon and render its dashboard (read-only except
     /// manual switch). Polls `GET /llmux/dashboard` over HTTP.
     Dashboard(DashboardArgs),
@@ -398,6 +402,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Login(args) => login::run(args).await,
         Command::Import(args) => import::run(args).await,
         Command::Env(args) => env::run(args, remote).await,
+        Command::IslandsConnection(args) => islands::connection(args, remote),
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::run(args, remote).await,

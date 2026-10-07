@@ -75,7 +75,7 @@ struct NotchMenuView: View {
                 Task { await IslandUsageModel.shared.setShowFableWeekly(!showFableWeekly) }
             }
 
-            LlmuxConnectionSection()
+            LlmuxConnectionSection(expanded: $viewModel.connectionSettingsExpanded)
 
             Divider()
                 .background(Color.white.opacity(0.08))
@@ -339,7 +339,7 @@ private struct LlmuxConnectionSection: View {
     @State private var apiKey = ""
     @State private var storedKeyConfigured = !LlmuxSettings.apiKey.isEmpty
     @State private var clearStoredKey = false
-    @State private var expanded = false
+    @Binding var expanded: Bool
     @State private var isHovered = false
 
     var body: some View {

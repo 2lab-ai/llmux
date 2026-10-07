@@ -1051,3 +1051,79 @@ fn run_codex_scopes_provider_to_exec_and_propagates_exit() {
     assert!(!out.contains("unrelated-key"));
     assert!(out.contains("--ignore-user-config\n-c\nmodel_reasoning_effort=low\nhello"));
 }
+
+// Native first-run ordering: read-only handoff cannot create a config/key;
+// starting the daemon initializes its admin key before the next handoff.
+#[test]
+fn islands_connection_cold_start_reads_only_then_authenticates_dashboard() {
+    use std::io::Read as _;
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let h = Harness::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let handoff = || {
+        h.cmd()
+            .args(["islands-connection", "--port", &port.to_string()])
+            .output()
+            .unwrap()
+    };
+    assert!(!handoff().status.success());
+    assert!(
+        !h.config_path.exists(),
+        "handoff must not initialize configuration"
+    );
+    h.seed_config(&format!(r#"{{"version":1,"proxy":{{"port":{port},"idle_probe":{{"enabled":false}}}},"accounts":[]}}"#));
+    assert!(!handoff().status.success(), "missing key must fail closed");
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = ChildGuard(
+        h.cmd()
+            .args(["server", "--no-tui"])
+            .env("HOME", h.dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "isolated cold-start daemon did not bind"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let before = std::fs::read(&h.config_path).unwrap();
+    let output = handoff();
+    assert!(output.status.success(), "handoff failed after bootstrap");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt.as_object().unwrap().len(), 2);
+    assert_eq!(receipt["endpoint"], format!("http://127.0.0.1:{port}"));
+    let key = receipt["api_key"].as_str().expect("control key");
+    assert!(!key.is_empty());
+    assert_eq!(std::fs::read(&h.config_path).unwrap(), before);
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(socket, "GET /llmux/dashboard HTTP/1.1\r\nHost: localhost\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut reply = String::new();
+    socket.read_to_string(&mut reply).unwrap();
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "authenticated empty dashboard must succeed"
+    );
+}

@@ -397,3 +397,10 @@ Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
 Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
 clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
 restart inside that short window can reuse launch context until a main turn is observed.
+
+## Islands local connection and get-started amendment
+
+The macOS app remains a control-API consumer and never reads provider config. The
+[get-started contract](22-islands-get-started.md) adds a narrow CLI-owned handoff
+for the local proxy control key: endpoint/port-bound, private process pipes,
+executor-only memory, no remote-key reuse. Server authorization stays unchanged.
