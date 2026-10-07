@@ -217,6 +217,8 @@ struct StatsSectionContent: View {
 
 /// Rust-owned activity receipts. Paths, account labels and notes have already
 /// passed the shared privacy filter before reaching this renderer.
+private let openAIActivityBackground = Color(red: 40 / 255, green: 40 / 255, blue: 40 / 255)
+
 struct UsageCanonicalActivityReceiptList: View {
     let receipts: [SharedActivityReceipt]
     let now: Date
@@ -249,6 +251,7 @@ struct UsageCanonicalActivityReceiptList: View {
                         .foregroundColor(.white.opacity(0.45))
                         .lineLimit(1)
                 }
+                .background(model.isOpenAIEndpoint ? openAIActivityBackground : Color.clear)
             }
         }
         .padding(8)
@@ -569,7 +572,8 @@ struct UsageActivityList: View {
                     time: DashFormat.ago(ms: flight.startedAtMs, now: now),
                     status: Text("···").foregroundColor(TerminalColors.amber),
                     label: flight.model ?? flight.path,
-                    trailing: "in flight"
+                    trailing: "in flight",
+                    isOpenAIEndpoint: flight.endpoint == "open_ai"
                 )
             }
             ForEach(Array(activity.completed.prefix(completedLimit).enumerated()), id: \.offset) { _, entry in
@@ -611,11 +615,12 @@ struct UsageActivityList: View {
             status: model.marker.map { Text($0).foregroundColor(TerminalColors.amber) }
                 ?? statusText(model.status),
             label: model.label,
-            trailing: model.trailing
+            trailing: model.trailing,
+            isOpenAIEndpoint: model.isOpenAIEndpoint
         )
     }
 
-    private func row(time: String, status: Text, label: String, trailing: String) -> some View {
+    private func row(time: String, status: Text, label: String, trailing: String, isOpenAIEndpoint: Bool) -> some View {
         HStack(spacing: 6) {
             timeText(time)
             status.font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -631,6 +636,7 @@ struct UsageActivityList: View {
                 .foregroundColor(.white.opacity(0.45))
                 .lineLimit(1)
         }
+        .background(isOpenAIEndpoint ? openAIActivityBackground : Color.clear)
     }
 
     private func timeText(_ value: String) -> some View {

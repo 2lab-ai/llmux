@@ -229,6 +229,11 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// original request (headers/body are reused on every retry) plus the
 /// request-log accumulator and the activity-event correlation handle.
 struct ForwardContext {
+    endpoint_origin: crate::tui::Endpoint,
+    responses_input: Option<serde_json::Value>,
+    ingress_body: Bytes,
+    responses_account: Option<String>,
+    responses_upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
     method: Method,
     path_query: String,
     headers: HeaderMap,
@@ -364,6 +369,10 @@ impl ForwardContext {
     /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
     /// and no record is built — so capture is genuinely off the hot path.
     fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
+        // Responses boundary captures both sides after the return transform.
+        if self.responses_input.is_some() {
+            return None;
+        }
         if state
             .settings_live
             .raw_io_enabled
@@ -404,7 +413,7 @@ impl ForwardContext {
             account.map(|a| a.0.clone()),
             Some(status.as_u16()),
             Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            &self.body,
+            &self.ingress_body,
             response,
             state.config.raw_io.max_body_bytes,
             Some(redacted_header_pairs(&self.headers)),
@@ -445,6 +454,7 @@ impl ForwardContext {
         } = self.finished_meta(state);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
+            endpoint: self.endpoint_origin,
             method: self.method.to_string(),
             path: self.path_query.clone(),
             account: account.map(|a| a.0.clone()),
@@ -924,6 +934,11 @@ fn transient_response(detail: &str) -> Response {
 /// streaming back, the account is pinned and errors propagate to the client
 /// (never switch mid-stream).
 pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response {
+    let endpoint_origin = if super::responses::is_responses_path(req.uri().path()) {
+        crate::tui::Endpoint::OpenAi
+    } else {
+        crate::tui::Endpoint::Anthropic
+    };
     let started = std::time::Instant::now();
     let activity_id = state.next_request_id();
     // Tenant attribution id resolved by the auth gate (multi-tenant #22),
@@ -969,6 +984,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             };
             state.emit(ActivityEvent::RequestFinished {
                 id: activity_id,
+                endpoint: endpoint_origin,
                 method: parts.method.to_string(),
                 path: path_query,
                 account: None,
@@ -992,6 +1008,47 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             return error_response(status, error_type, &message);
         }
     };
+    let early_error = |status: StatusCode, detail: &str| {
+        state.emit(ActivityEvent::RequestFinished {
+            id: activity_id,
+            endpoint: endpoint_origin,
+            method: parts.method.to_string(),
+            path: path_query.clone(),
+            account: None,
+            status: status.as_u16(),
+            duration: started.elapsed(),
+            tokens: None,
+            group: None,
+            model: crate::routing::model_from_body(&body),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: tenant.clone(),
+        });
+        super::responses::error(status, detail)
+    };
+    let ingress_body = body.clone();
+    let responses_input = if endpoint_origin == crate::tui::Endpoint::OpenAi {
+        if parts.method != Method::POST {
+            return early_error(StatusCode::METHOD_NOT_ALLOWED, "Responses requires POST");
+        }
+        match super::responses::validate(&body) {
+            Ok(value) => Some(value),
+            Err(detail) => return early_error(StatusCode::BAD_REQUEST, &detail),
+        }
+    } else {
+        None
+    };
+    let body = responses_input
+        .as_ref()
+        .map(super::responses::metadata_request)
+        .unwrap_or(body);
     let log_enabled = state.logger.is_some();
     // Parse the model once (body is buffered) and classify to a backend group.
     // Routing disabled ⇒ group = None (legacy single-slot path); the
@@ -1016,6 +1073,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // so its `kind` column aligns with the completed rows (TUI UI-6 item 1).
     state.emit(ActivityEvent::RequestStarted {
         id: activity_id,
+        endpoint: endpoint_origin,
         method: parts.method.to_string(),
         path: path_query.clone(),
         kind: Some(classified.kind.to_string()),
@@ -1029,6 +1087,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         excerpt: classified.excerpt.clone(),
     });
     let mut ctx = ForwardContext {
+        endpoint_origin,
+        responses_input: responses_input.clone(),
+        ingress_body,
+        responses_account: None,
+        responses_upstream: None,
         method: parts.method,
         path_query,
         headers: parts.headers,
@@ -1056,10 +1119,40 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         ctx.log(format!(
             "=== REQUEST BODY ({} bytes) ===\n{}",
             ctx.body.len(),
-            body_excerpt(&ctx.body)
+            body_excerpt(&ctx.ingress_body)
         ));
     }
-    run_taxonomy_loop(state, &mut ctx).await
+    let mut response = run_taxonomy_loop(state, &mut ctx).await;
+    apply_compatibility_headers(response.headers_mut(), ctx.compatibility.as_ref());
+    if let Some(input) = responses_input {
+        let meta = ctx.finished_meta(state);
+        let capture = if state
+            .settings_live
+            .raw_io_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state
+                .raw_io_path
+                .clone()
+                .map(|path| super::responses::Capture {
+                    path,
+                    id: ctx.activity_id,
+                    group: meta.group,
+                    model: meta.model,
+                    account: ctx.responses_account.clone(),
+                    started: ctx.started,
+                    request: ctx.ingress_body.clone(),
+                    request_headers: redacted_header_pairs(&ctx.headers),
+                    max_body: state.config.raw_io.max_body_bytes,
+                    upstream: ctx.responses_upstream.clone(),
+                })
+        } else {
+            None
+        };
+        super::responses::adapt(response, input, capture).await
+    } else {
+        response
+    }
 }
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
@@ -1325,6 +1418,135 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
+        if let Some(input) = &ctx.responses_input {
+            let mode = match compatibility_mode(&ctx.headers) {
+                Ok(mode) => mode,
+                Err(detail) => return invalid_request_response(state, ctx, &account, &detail),
+            };
+            let mut report = responses_request::CompatibilityReport::default();
+            if served == BackendGroup::Codex {
+                if input.get("max_output_tokens").is_some_and(|v| !v.is_null()) {
+                    if !input["max_output_tokens"].as_u64().is_some_and(|n| n > 0) {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "max_output_tokens must be a positive integer",
+                        );
+                    }
+                    report.omitted_fields.push("max_output_tokens");
+                    report.warnings.push("max_output_tokens");
+                }
+            } else {
+                if let Err(detail) = super::responses::messages_request(input) {
+                    return invalid_request_response(state, ctx, &account, &detail);
+                }
+                if served == BackendGroup::Grok {
+                    let normalized = match super::responses::messages_request(input) {
+                        Ok(body) => body,
+                        Err(detail) => {
+                            return invalid_request_response(state, ctx, &account, &detail)
+                        }
+                    };
+                    report = match responses_request::validate_request(
+                        &normalized,
+                        responses_request::ResponsesFlavor::Grok,
+                        false,
+                    ) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            return invalid_request_response(state, ctx, &account, &err.to_string())
+                        }
+                    };
+                }
+                if served == BackendGroup::Claude {
+                    if matches!(
+                        input
+                            .pointer("/reasoning/effort")
+                            .and_then(serde_json::Value::as_str),
+                        Some("minimal" | "ultra")
+                    ) {
+                        report.warnings.push("reasoning.effort");
+                    }
+                    if input.get("max_output_tokens").is_some()
+                        && (input
+                            .pointer("/text/format")
+                            .is_some_and(|f| f["type"] != "text")
+                            || input["tools"].as_array().is_some_and(|tools| {
+                                tools.iter().any(|t| {
+                                    matches!(
+                                        t["type"].as_str(),
+                                        Some("web_search" | "web_search_preview")
+                                    )
+                                })
+                            }))
+                    {
+                        report.warnings.push("max_output_tokens_semantics");
+                    }
+                    if input
+                        .get("service_tier")
+                        .is_some_and(|v| !v.is_null() && v != "auto" && v != "default")
+                    {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK does not expose service_tier",
+                        );
+                    }
+                    if input.pointer("/text/verbosity").is_some() {
+                        report.omitted_fields.push("text.verbosity");
+                        report.warnings.push("text.verbosity");
+                    }
+                    if input["parallel_tool_calls"] == false {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK cannot enforce parallel_tool_calls:false",
+                        );
+                    }
+                    for field in ["temperature", "top_p"] {
+                        if input.get(field).is_some_and(|v| !v.is_null()) {
+                            return invalid_request_response(
+                                state,
+                                ctx,
+                                &account,
+                                &format!("Claude Agent SDK does not expose {field}"),
+                            );
+                        }
+                    }
+                    if input
+                        .get("tool_choice")
+                        .is_some_and(|v| !matches!(v.as_str(), Some("auto" | "none")))
+                    {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK supports tool_choice auto or none",
+                        );
+                    }
+                    if input["input"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|i| i["type"] == "reasoning"))
+                    {
+                        report.omitted_fields.push("reasoning_history");
+                        report.warnings.push("reasoning_history");
+                    }
+                }
+            }
+            if mode == CompatibilityMode::Strict && !report.is_empty() {
+                return invalid_request_response(
+                    state,
+                    ctx,
+                    &account,
+                    &format!("backend cannot preserve: {}", report.warnings.join(",")),
+                );
+            }
+            ctx.compatibility = Some(report);
+        }
+
         // 3. Proactive refresh: oauth-style tokens (anthropic oauth AND
         // codex chatgpt tokens) expiring within 5 minutes.
         if let Some(expires_at_ms) = refreshable_expiry(&credential) {
@@ -1408,7 +1630,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
-        if messages_only {
+        if messages_only && ctx.responses_input.is_none() {
             let path = request_path.as_str();
             if path == "/v1/messages/count_tokens" {
                 // OpenRouter only: the Responses flavors already answered
@@ -1447,7 +1669,89 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // `Some(client_stream)` marks the translate (codex/grok) transform
         // path; `None` is the untouched byte-identity passthrough.
         let mut translate_stream: Option<bool> = None;
-        let (upstream_req, endpoint) = if is_translate {
+        let (upstream_req, endpoint) = if let Some(input) = &ctx.responses_input {
+            if served == BackendGroup::Codex {
+                match state.codex.build_responses_request(input, &credential) {
+                    Ok(req) => (req, state.codex.endpoint().to_string()),
+                    Err(err) => {
+                        ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &err.to_string(),
+                        );
+                    }
+                }
+            } else {
+                let body = match super::responses::messages_request(input) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &err,
+                        );
+                    }
+                };
+                if served == BackendGroup::Claude {
+                    let mut body = body;
+                    match body
+                        .pointer("/output_config/effort")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("none") => {
+                            body["output_config"] = serde_json::json!({});
+                            body["thinking"] = serde_json::json!({"type":"disabled"});
+                        }
+                        Some("minimal") => {
+                            body["output_config"]["effort"] = serde_json::json!("low")
+                        }
+                        Some("ultra") => body["output_config"]["effort"] = serde_json::json!("max"),
+                        _ => {}
+                    }
+                    if let Some(model) = body["model"].as_str() {
+                        let resolved = crate::catalog::resolve_claude_alias(model).unwrap_or(model);
+                        body["model"] = serde_json::json!(resolved);
+                    }
+                    (
+                        ProviderRequest {
+                            method: Method::POST,
+                            path: "/v1/messages".into(),
+                            headers: HeaderMap::new(),
+                            body: Bytes::from(body.to_string()),
+                        },
+                        "claude-agent-sdk".into(),
+                    )
+                } else if served == BackendGroup::Grok {
+                    match state
+                        .grok
+                        .build_request(body.to_string().as_bytes(), &credential)
+                    {
+                        Ok((req, _)) => {
+                            translate_stream = Some(true);
+                            (req, state.grok.endpoint().to_string())
+                        }
+                        Err(err) => {
+                            return invalid_request_response(
+                                state,
+                                ctx,
+                                &account,
+                                &err.to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    let original = std::mem::replace(&mut ctx.body, Bytes::from(body.to_string()));
+                    let built = build_openrouter_request(state, ctx, &credential).await;
+                    ctx.body = original;
+                    match built {
+                        Ok(req) => (req, state.openrouter.endpoint().to_string()),
+                        Err(err) => return rewrite_error(state, ctx, err.to_string()),
+                    }
+                }
+            }
+        } else if is_translate {
             let built = match served {
                 BackendGroup::Codex => state
                     .codex
@@ -1518,10 +1822,42 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
+        if ctx.responses_input.is_some() {
+            ctx.responses_account = Some(account.0.clone());
+            ctx.responses_upstream = Some(crate::proxy::raw_io::UpstreamRaw {
+                url: Some(format!(
+                    "{}{}",
+                    endpoint.trim_end_matches('/'),
+                    upstream_req.path
+                )),
+                request_body: Some(crate::proxy::raw_io::bounded_body(
+                    &upstream_req.body,
+                    state.config.raw_io.max_body_bytes,
+                )),
+                request_headers: Some(redacted_header_pairs(&upstream_req.headers)),
+                ..Default::default()
+            });
+        }
         ctx.dispatched = Some(std::time::Instant::now());
-        let send_result = send_upstream(state, &endpoint, &upstream_req).await;
+        let send_result = if endpoint == "claude-agent-sdk" {
+            match crate::provider::claude_sdk::send(
+                &upstream_req.body,
+                &credential,
+                state.provider.endpoint(),
+            )
+            .await
+            {
+                Ok(response) => Ok(response),
+                Err(detail) => {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return error_response(StatusCode::BAD_GATEWAY, "proxy_error", &detail);
+                }
+            }
+        } else {
+            send_upstream(state, &endpoint, &upstream_req).await
+        };
 
-        let response = match send_result {
+        let mut response = match send_result {
             Ok(response) => response,
             Err(err) => match classify_send_error(&err) {
                 UpstreamSignal::Transient => {
@@ -1563,6 +1899,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             },
         };
 
+        if ctx.responses_input.is_some()
+            && served == BackendGroup::Codex
+            && response.status().is_success()
+        {
+            // Subscription gateway streams Responses even when content-type is absent.
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+                .headers_mut()
+                .insert("x-llmux-native-responses", HeaderValue::from_static("1"));
+        }
         // 4. Feed rate-limit evidence to the scheduler. If this evidence
         // just pushed the CURRENT account over a threshold, re-evaluate NOW
         // (FR3: selection runs when the current account becomes ineligible,
@@ -2520,6 +2869,7 @@ async fn relay(
         let activity_id = ctx.activity_id;
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
+        let endpoint_origin = ctx.endpoint_origin;
         let started = ctx.started;
         let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
@@ -2543,7 +2893,7 @@ async fn relay(
         let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
         let raw_io_request = raw_io_path
             .as_ref()
-            .map(|_| ctx.body.clone())
+            .map(|_| ctx.ingress_body.clone())
             .unwrap_or_default();
         let raw_io_req_headers = raw_io_path
             .as_ref()
@@ -2619,6 +2969,7 @@ async fn relay(
                 if let Some(events) = events {
                     let _ = events.try_send(ActivityEvent::RequestFinished {
                         id: activity_id,
+                        endpoint: endpoint_origin,
                         method,
                         path,
                         account: Some(account.0.clone()),
@@ -2888,6 +3239,7 @@ async fn relay_translate(
         let activity_id = ctx.activity_id;
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
+        let endpoint_origin = ctx.endpoint_origin;
         let started = ctx.started;
         let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
@@ -2910,7 +3262,7 @@ async fn relay_translate(
         let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
         let raw_io_request = raw_io_path
             .as_ref()
-            .map(|_| ctx.body.clone())
+            .map(|_| ctx.ingress_body.clone())
             .unwrap_or_default();
         let raw_io_req_headers = raw_io_path
             .as_ref()
@@ -3036,6 +3388,7 @@ async fn relay_translate(
                 if let Some(events) = events {
                     let _ = events.try_send(ActivityEvent::RequestFinished {
                         id: activity_id,
+                        endpoint: endpoint_origin,
                         method,
                         path,
                         account: Some(account.0.clone()),
@@ -3461,6 +3814,11 @@ mod tests {
 
     fn ctx_for_group(model: &str, group: BackendGroup) -> ForwardContext {
         ForwardContext {
+            endpoint_origin: crate::tui::Endpoint::Anthropic,
+            responses_input: None,
+            ingress_body: Bytes::new(),
+            responses_account: None,
+            responses_upstream: None,
             method: Method::POST,
             path_query: "/v1/messages".to_string(),
             headers: HeaderMap::new(),

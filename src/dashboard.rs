@@ -417,6 +417,7 @@ fn trace_event(event: &ActivityEvent) {
             id,
             method,
             path,
+            endpoint,
             account,
             status,
             duration,
@@ -445,7 +446,7 @@ fn trace_event(event: &ActivityEvent) {
                 _ => 0.0,
             };
             tracing::info!(
-                id, %method, %path,
+                id, %method, %path, ?endpoint,
                 account = account.as_deref().unwrap_or("-"),
                 status,
                 duration_ms = duration.as_millis() as u64,
@@ -1304,6 +1305,8 @@ pub struct InFlightDoc {
     pub id: u64,
     pub method: String,
     pub path: String,
+    #[serde(default)]
+    pub endpoint: crate::tui::Endpoint,
     pub account: Option<String>,
     pub started_at_ms: u64,
     /// Backend group / served model / per-request effort / fast, filled at
@@ -1354,6 +1357,8 @@ pub enum CompletedDoc {
         at_ms: u64,
         method: String,
         path: String,
+        #[serde(default)]
+        endpoint: crate::tui::Endpoint,
         account: Option<String>,
         status: u16,
         duration_ms: u64,
@@ -1831,6 +1836,7 @@ pub(crate) fn dashboard_doc(
                 id: r.id,
                 method: r.method.clone(),
                 path: r.path.clone(),
+                endpoint: r.endpoint,
                 account: r.account.clone(),
                 started_at_ms: epoch_ms(r.started_at),
                 group: r.group.clone(),
@@ -1858,6 +1864,7 @@ pub(crate) fn dashboard_doc(
                     id,
                     method,
                     path,
+                    endpoint,
                     account,
                     status,
                     duration,
@@ -1882,6 +1889,7 @@ pub(crate) fn dashboard_doc(
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
                     path: path.clone(),
+                    endpoint: *endpoint,
                     account: account.clone(),
                     status: *status,
                     duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -2391,6 +2399,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 kind: None,
                 user_id: None,
                 tenant: None,
@@ -2403,6 +2412,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a".into()),
                 status: 200,
                 duration: Duration::from_millis(1_400),
@@ -2432,6 +2442,7 @@ mod tests {
                 id: 2,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 kind: None,
                 user_id: None,
                 tenant: None,
@@ -2516,6 +2527,7 @@ mod tests {
                     id,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(900),
@@ -2609,6 +2621,7 @@ mod tests {
                     id,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(900),
@@ -2695,6 +2708,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             kind: Some("user".into()),
             user_id: Some("u1".into()),
             tenant: tenant.map(str::to_string),
@@ -3473,6 +3487,7 @@ mod tests {
                     id: i,
                     method: "POST".into(),
                     path: format!("/v1/messages/{i}"),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(10),
@@ -3519,6 +3534,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some(account.into()),
             status: 200,
             duration: Duration::from_millis(10),
@@ -3649,5 +3665,45 @@ mod tests {
         let view = hub.view(now());
         assert_eq!(view.global_totals.requests, 0);
         assert!(view.completed.is_empty(), "no notes, no rows");
+    }
+    #[test]
+    fn endpoint_origin_reaches_dashboard_document_from_live_events() {
+        use crate::tui::Endpoint;
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let hub = DashboardHub::default();
+        hub.apply_event(
+            ActivityEvent::RequestStarted {
+                id: 21,
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                endpoint: Endpoint::OpenAi,
+                kind: None,
+                user_id: None,
+                tenant: None,
+                excerpt: None,
+            },
+            now(),
+        );
+        let mut finish = finished_for(22, "a");
+        if let ActivityEvent::RequestFinished { endpoint, .. } = &mut finish {
+            *endpoint = Endpoint::OpenAi;
+        }
+        hub.apply_event(finish, now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        assert_eq!(doc.activity.in_flight[0].endpoint, Endpoint::OpenAi);
+        assert!(matches!(
+            doc.activity.completed[0],
+            CompletedDoc::Request {
+                endpoint: Endpoint::OpenAi,
+                ..
+            }
+        ));
     }
 }

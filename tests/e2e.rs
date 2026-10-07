@@ -1487,7 +1487,7 @@ async fn codex_count_tokens_is_estimated_locally() {
     );
 
     let response = client
-        .get(proxy.url("/v1/models"))
+        .get(proxy.url("/v1/unsupported"))
         .send()
         .await
         .expect("reachable");
@@ -1498,8 +1498,8 @@ async fn codex_count_tokens_is_estimated_locally() {
     );
 }
 
-/// PROXY-17 / PROV-19: a codex account only serves `/v1/messages`. Any other
-/// path (here `/v1/models`) is refused locally with HTTP 501 and never reaches
+/// PROXY-17 / PROV-19: the legacy Codex Messages adapter accepts only its supported data routes. Any other
+/// path (here `/v1/unsupported`) is refused locally with HTTP 501 and never reaches
 /// the codex upstream. Focused regression anchor for the `path != "/v1/messages"`
 /// branch (forward.rs), independent of the count_tokens path.
 #[tokio::test]
@@ -1510,7 +1510,7 @@ async fn codex_non_messages_endpoint_is_501_without_upstream_call() {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(proxy.url("/v1/models"))
+        .get(proxy.url("/v1/unsupported"))
         .send()
         .await
         .expect("reachable");
@@ -4830,4 +4830,166 @@ async fn compatibility_codex_strict_mode_rejects_thinking_config() {
 #[tokio::test]
 async fn compatibility_grok_strict_mode_rejects_thinking_config() {
     compat_strict_rejects_thinking_config(CompatFlavor::Grok).await;
+}
+
+// .prd/codex-frontend/trace.md T1: full native protocol survives the real HTTP boundary.
+#[tokio::test]
+async fn responses_native_preserves_custom_tools_reasoning_and_usage() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 7, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let body = serde_json::json!({"model":"gpt-6-astra","stream":true,"store":false,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]},{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"hi"},{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}],"tools":[{"type":"custom","name":"apply_patch"}],"reasoning":{"effort":"high"}});
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("x-llmux-native-responses"));
+    assert_eq!(response.text().await.unwrap(), CODEX_RESPONSES_SSE);
+    let requests = mock.seen();
+    assert_eq!(requests.len(), 1);
+    let upstream: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(upstream["input"], body["input"]);
+    assert_eq!(upstream["tools"], body["tools"]);
+    assert_eq!(upstream["reasoning"], body["reasoning"]);
+    assert_eq!(
+        requests[0].authorization.as_deref().unwrap(),
+        "Bearer at-codex"
+    );
+}
+
+#[tokio::test]
+async fn responses_rejects_bad_bearer_and_invalid_stored_history_without_upstream() {
+    let mock = MockUpstream::spawn().await;
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    for authorization in ["Basic invalid", "Bearer invalid", "Bearer "] {
+        let r = client
+            .post(proxy.url("/v1/responses"))
+            .header("authorization", authorization)
+            .json(&serde_json::json!({"model":"sol","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{authorization}");
+    }
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .header("x-api-key", "different")
+        .json(&serde_json::json!({"model":"sol","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","previous_response_id":"r1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(mock.seen().is_empty());
+}
+
+#[tokio::test]
+async fn responses_nonstream_aggregates_real_terminal_envelope() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 3, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let value: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(value["id"], "resp_e2e");
+    assert_eq!(value["usage"]["output_tokens"], 11);
+}
+
+#[tokio::test]
+async fn responses_disconnect_releases_lease_without_waiting_for_idle_timeout() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::SseThenStall{prefix:"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n".into()});
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(proxy.pool.snapshot().accounts[0].in_flight, 1);
+    drop(r);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxy.pool.snapshot().accounts[0].in_flight != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disconnect releases the account before the 120s idle timer");
+}
+
+#[tokio::test]
+async fn responses_native_cap_is_reported_or_rejected_under_strict() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 7, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"model":"sol","input":"hi","max_output_tokens":20});
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .header("x-llmux-compatibility", "strict")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(mock.seen().is_empty());
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-llmux-omitted-fields"], "max_output_tokens");
+    let _ = r.bytes().await.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&mock.seen()[0].body).unwrap();
+    assert!(sent.get("max_output_tokens").is_none());
+    assert_eq!(sent["input"][0]["content"][0]["text"], "hi");
+}
+
+#[tokio::test]
+async fn responses_native_aggregate_uses_done_items_when_terminal_output_is_empty() {
+    let mock = MockUpstream::spawn().await;
+    let events=concat!("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"real answer\"}]}}\n\n","data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n");
+    mock.push(ScriptedResponse::sse_codex(events, 5, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let response: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(response["output"][0]["content"][0]["text"], "real answer");
 }

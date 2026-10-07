@@ -233,6 +233,7 @@ extension SharedActivityReceipt {
         guard kind == "in_flight" else { return nil }
         let suffix = receiptId.split(separator: ":").last.flatMap { UInt64($0) }
         return LlmuxDashboardInFlight(
+            endpoint: endpoint,
             id: suffix ?? Self.stableIdentifier(receiptId),
             method: method ?? "", path: path ?? "", account: accountDisplay,
             startedAtMs: occurredAtMs, group: provider?.rawValue, model: model
@@ -254,6 +255,7 @@ extension SharedActivityReceipt {
         // (llmux-islands-core/src/receipts.rs) — pass it through so the
         // canonical activity path shows the same name as the dashboard DTO.
         return LlmuxDashboardCompleted(
+            endpoint: endpoint,
             kind: "request", atMs: occurredAtMs,
             method: method, path: path, account: accountDisplay, status: status,
             durationMs: durationMs,

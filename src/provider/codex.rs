@@ -222,6 +222,51 @@ impl CodexProvider {
         ))
     }
 
+    /// Native Responses frontend: retain conversation/reasoning/custom tools.
+    /// Reuse the existing auth and model/effort/priority policy.
+    pub fn build_responses_request(
+        &self,
+        input: &Value,
+        credential: &AccountCredential,
+    ) -> Result<ProviderRequest, ProviderError> {
+        let metadata = crate::proxy::responses::metadata_request(input);
+        let (model, effort, fast) = self.request_meta(&metadata);
+        let seed = serde_json::json!({"model":model,"messages":[{"role":"user","content":""}],"stream":true});
+        let (mut request, _) = self.build_request(seed.to_string().as_bytes(), credential)?;
+        let mut body = input.clone();
+        body["model"] = Value::String(model);
+        body["stream"] = Value::Bool(true);
+        body["store"] = Value::Bool(false);
+        if let Some(text) = body["input"].as_str() {
+            body["input"] =
+                serde_json::json!([{"role":"user","content":[{"type":"input_text","text":text}]}]);
+        }
+        if body.get("instructions").is_none()
+            && !body["input"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|i| i["type"] == "additional_tools"))
+        {
+            body["instructions"] = Value::String(String::new());
+        }
+
+        if let Some(effort) = effort {
+            if !body["reasoning"].is_object() {
+                body["reasoning"] = serde_json::json!({});
+            }
+            body["reasoning"]["effort"] = Value::String(effort);
+        }
+        if fast {
+            body["service_tier"] = Value::String("priority".into());
+        }
+        // Codex subscription rejects the public API output cap; match the
+        // established Messages-side omission policy, documented at ingress.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("max_output_tokens");
+        }
+        request.body = Bytes::from(body.to_string());
+        Ok(request)
+    }
+
     /// Fresh per-request stream converter, stamping responses with this
     /// provider's configured model slug — or the `client_model` override when
     /// set (what Claude Code sees; routing/dashboard/trace keep the real model).
@@ -433,7 +478,9 @@ pub fn effective_request_meta(body: &Value, shape: &CodexShape) -> (String, Opti
     let requested_model = body.get("model").and_then(Value::as_str);
     let upstream_model = resolve_upstream_model(requested_model, &shape.model);
     let effort = resolve_reasoning_effort(body, shape.effort.as_deref(), &upstream_model);
-    (upstream_model, effort, shape.fast)
+    let fast = shape.fast
+        || (body["_llmux_native_responses"] == true && body["service_tier"] == "priority");
+    (upstream_model, effort, fast)
 }
 
 /// Like [`translate_request`] but with an explicit request [`CodexShape`]

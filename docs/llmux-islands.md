@@ -33,6 +33,8 @@ does carry OpenRouter); the daemon, CLI, and TUI serve it normally. The
 Swift shell needs tolerant provider decoding plus an icon before Islands can
 carry the fourth backend group.
 
+Recent-activity rows use a dark gray background for requests received through the OpenAI Responses endpoint, including when served by a Claude model. Anthropic endpoint requests retain their existing background, regardless of backend. This distinction is shared by macOS and Linux; historical records without endpoint metadata retain the original background.
+
 ## Native presentation boundaries
 
 The shells share semantic state and behavior, not a cross-platform widget tree.

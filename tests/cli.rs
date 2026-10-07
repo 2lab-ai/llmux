@@ -981,3 +981,68 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Codex subcommand configuration replaces clap's parent config list. All
+/// provider settings must be inside exec, before user overrides.
+#[test]
+fn run_codex_scopes_provider_to_exec_and_propagates_exit() {
+    let h = Harness::new();
+    h.seed_config(
+        r#"{"version":1,"remote":{"host":"127.0.0.1","port":45678,"api_key":"remote-key"},"accounts":[]}"#,
+    );
+    let bindir = h.dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let stub = bindir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'KEY=%s\\n' \"$LLMUX_CODEX_API_KEY\"\nexit 7\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = h
+        .cmd()
+        .args([
+            "run",
+            "--codex",
+            "--no-model-picker",
+            "--",
+            "exec",
+            "--ignore-user-config",
+            "-c",
+            "model_reasoning_effort=low",
+            "hello",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bindir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("OPENAI_API_KEY", "unrelated-key")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        out.starts_with("exec\n-c\nmodel_provider=\"llmux\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("base_url=\"http://127.0.0.1:45678/v1\""),
+        "{out}"
+    );
+    assert!(out.contains("KEY=remote-key"));
+    assert!(!out.contains("unrelated-key"));
+    assert!(out.contains("--ignore-user-config\n-c\nmodel_reasoning_effort=low\nhello"));
+}

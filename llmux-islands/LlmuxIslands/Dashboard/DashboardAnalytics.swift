@@ -300,6 +300,8 @@ enum ClientNameLabel {
 /// is no per-view label/trailing expression left at the call sites, so the
 /// factory tests cover exactly what renders.
 struct ActivityRowModel: Equatable {
+    /// Incoming API protocol; provider/model do not decide row background.
+    let isOpenAIEndpoint: Bool
     /// Relative age ("5m").
     let time: String
     /// Raw HTTP status for the view's color mapping; `nil` renders blank.
@@ -314,6 +316,7 @@ struct ActivityRowModel: Equatable {
 
     static func completed(_ entry: LlmuxDashboardCompleted, now: Date) -> ActivityRowModel {
         ActivityRowModel(
+            isOpenAIEndpoint: entry.endpoint == "open_ai",
             time: DashFormat.ago(ms: entry.atMs, now: now),
             status: entry.status,
             marker: nil,
@@ -330,6 +333,7 @@ struct ActivityRowModel: Equatable {
 
     static func receipt(_ receipt: SharedActivityReceipt, now: Date) -> ActivityRowModel {
         ActivityRowModel(
+            isOpenAIEndpoint: receipt.kind != "note" && receipt.endpoint == "open_ai",
             time: DashFormat.ago(ms: receipt.occurredAtMs, now: now),
             status: receipt.status,
             marker: receipt.kind == "in_flight" ? "···" : receipt.kind == "note" ? "note" : nil,

@@ -8,6 +8,16 @@
 
 use std::time::Duration;
 
+/// Client-facing protocol, independent of the selected backend/model.
+/// Missing persisted fields predate the OpenAI endpoint and are Anthropic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Endpoint {
+    #[default]
+    Anthropic,
+    OpenAi,
+}
+
 /// Input/output token counts for one completed request, when the upstream
 /// response carried usage. `input`/`output` are the fresh (non-cached) prompt
 /// and completion counts; the optional cache counters feed the model-usage
@@ -58,6 +68,7 @@ pub enum ActivityEvent {
         id: u64,
         method: String,
         path: String,
+        endpoint: Endpoint,
         /// Message-kind classification (TUI UI-6 item 1), so the in-flight row
         /// can render the same `kind` column as its eventual completed row and
         /// the columns line up. Emitted after the body is buffered + classified
@@ -108,6 +119,7 @@ pub enum ActivityEvent {
         id: u64,
         method: String,
         path: String,
+        endpoint: Endpoint,
         /// Account that served it; `None` if it failed before routing.
         account: Option<String>,
         /// HTTP status returned to the client.

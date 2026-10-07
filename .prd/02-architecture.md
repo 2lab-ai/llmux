@@ -311,3 +311,12 @@ derives an isolated sibling directory, which is also what keeps tests off the re
 - Mask credentials in logs; request logging is opt-in and capped.
 - TTY detection: bind/probe happens before TUI init so bind errors never corrupt the terminal.
 - Config writes must preserve concurrently refreshed tokens.
+
+
+## Codex frontend
+
+The Responses ingress and Claude Agent SDK transport share the scheduler, leases,
+refresh/retry taxonomy and accounting with Messages. The client protocol remains
+separate from the backend group. See [feature contract](21-codex-frontend.md) and
+[vertical traces](codex-frontend/trace.md); implementation is tracked there until
+preview verification closes the feature.
