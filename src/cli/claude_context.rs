@@ -190,6 +190,16 @@ fn native_alias(model: String, lookup: impl Fn(&str) -> Option<String>) -> Optio
     }
 }
 
+fn nonstandard_oauth_profile(
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> bool {
+    // Claude Code 2.1.292's native profile selector uses this URL to choose
+    // .claude-custom-oauth.json. Normal CLAUDE_CODE_OAUTH_TOKEN authentication
+    // does not change settings provenance and must retain bootstrap context.
+    env.into_iter()
+        .any(|(key, value)| key == "CLAUDE_CODE_CUSTOM_OAUTH_URL" && !value.is_empty())
+}
+
 pub(super) fn launch_model(args: &[String], exports: &[(&str, String)]) -> Option<String> {
     let user_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
@@ -200,10 +210,8 @@ pub(super) fn launch_model(args: &[String], exports: &[(&str, String)]) -> Optio
         dirs::home_dir()?.join(".claude.json")
     };
     // Nonstandard OAuth profiles can select a different global config carrier.
-    if std::env::vars_os().any(|(key, _)| {
-        let key = key.to_string_lossy();
-        key.starts_with("CLAUDE_CODE_") && key.contains("OAUTH")
-    }) || global_env_uncertain(&user_dir, &global_fallback)
+    if nonstandard_oauth_profile(std::env::vars_os())
+        || global_env_uncertain(&user_dir, &global_fallback)
     {
         return None;
     }
@@ -344,6 +352,30 @@ mod tests {
         .unwrap();
         assert!(!global_env_uncertain(&dir.join("user"), &global));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn launch_model_oauth_token_keeps_gpt_bootstrap_custom_profile_does_not() {
+        let settings = [json!({"model":"sol"})];
+        for name in ["CLAUDE_CODE_OAUTH_TOKEN", "UNRELATED_VARIABLE"] {
+            let uncertain = nonstandard_oauth_profile([(name.into(), "synthetic-fixture".into())]);
+            let model = select(&[], None, &settings, uncertain);
+            assert_eq!(
+                model.as_deref(),
+                Some("sol"),
+                "ordinary auth must preserve launch context: {name}"
+            );
+            assert!(custom_headers(None, model.as_deref(), 1000)
+                .contains("x-llmux-claude-launch-model: sol"));
+        }
+        assert!(!nonstandard_oauth_profile([(
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL".into(),
+            "".into()
+        )]));
+        let uncertain = nonstandard_oauth_profile([(
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL".into(),
+            "https://example.invalid".into(),
+        )]);
+        assert!(select(&[], None, &settings, uncertain).is_none());
     }
     #[test]
     fn launch_model_native_alias_exports() {
