@@ -521,7 +521,7 @@ These are **subscription gateways**, not the public OpenAI or xAI API: Codex use
 | Positive-integer `max_tokens` | Omitted upstream; omission/warning `max_tokens`; strict mode returns 400 | Forwarded unchanged as `max_output_tokens`; warning `max_tokens_semantics`; strict mode returns 400 |
 | Prior assistant `thinking` / `redacted_thinking` | Omitted with matching omission/warning names; strict mode returns 400 | Same |
 | Top-level `thinking` configuration | Validate shape, then omit with `thinking_config` omission/warning; strict mode returns 400 | Same |
-| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; subscription support is unverified | Same |
+| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; scoped monitor exception below | Same, without the monitor exception |
 | Text/tool-only `count_tokens` | Local heuristic, including serialized tool schemas/property names; `X-Llmux-Token-Count: estimate` | Same |
 | Image `count_tokens` (top-level or nested) | Local HTTP 400: no reliable image-token estimate | Same |
 | Process-wide `prompt_cache_key` | Retained | Omitted; routing scope of a shared key is unproven |
@@ -536,7 +536,35 @@ Image validation requires `source.type: "base64"`, nonempty valid base64, a deco
 
 Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **before upstream traffic or credential refresh**. Other header values and invalid/nonpositive/noninteger limits also return 400. Since normal Messages clients send `max_tokens`, strict mode will reject those Codex/Grok requests rather than pretend to enforce an equivalent budget.
 
-**Other generation controls.** Non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
+**Claude Code auto-mode monitors.** With routing enabled, llmux remembers the main
+CLI model for each tenant/device/session (at most 4096 entries, six hours, cleared
+on daemon restart). After a GPT main turn, its auto-mode security monitor uses
+`luna` (currently `gpt-6-luna`) with **medium** effort, independent of the main
+model's effort/fast settings. Main model changes update this context; subagents,
+quota/count probes, compact/summary and other control calls do not. Unknown
+sessions, other endpoints, routing-disabled traffic and Claude main sessions keep
+normal routing. The monitor does not fall back to Claude when Codex is unavailable.
+
+The adapter recognizes the monitor system contract, supports Stage 1 severity and
+Stage 2 thinking/severity/category, and retains historical block verdict support.
+Only its single closing-tag `</severity>` or `</block>` stop is handled locally:
+llmux validates the actual completed model output, removes that closing delimiter
+and reports `stop_reason: stop_sequence`. No-stop Stage 2 retains the full output,
+including optional category. Both JSON and SSE clients receive a validated answer;
+SSE is buffered for these short control calls. No approval is manufactured on
+timeout, malformed output, truncated completion, or provider failure. The total
+deadline is 60 seconds; a successful upstream stream over 1 MiB is refused.
+
+Original requested Sonnet model/stop remain in raw-io; the upstream half and
+activity model show Luna/medium. The route trace includes
+`reason=gpt_main_session_auto_classifier`. `classifier_local_stop` appears in
+compatibility warnings when the local adapter is used. **Strict mode still rejects
+unsupported original controls**, and ordinary stop requests still return 400.
+This local output boundary is not a generation or billing cap; Codex still omits
+`max_tokens` and top-level thinking configuration with existing diagnostics.
+See [provider contract and dated tests](provider-compatibility.md#claude-code-auto-mode-monitors).
+
+**Other generation controls.** Outside the monitor exception above, non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
 
 **Limits are not billing caps.** Codex's subscription endpoint rejected `max_output_tokens: 16` in the dated probe below; llmux does not send it, clamp it, or fake truncation. Grok accepted that field and stopped at an observed 16 non-reasoning output tokens, but reported **302 output tokens including 286 reasoning tokens**. That is evidence of a visible-output cap for that fixture, not an Anthropic-equivalent total-generation budget or a billing guarantee. Reasoning usage can be additional to the requested visible output. A `response.incomplete` (or a `response.completed` envelope with `status: "incomplete"`) whose reason is `max_output_tokens` maps to Messages `stop_reason: "max_tokens"`, retaining partial text and usage. Other incomplete reasons become an Anthropic error event for SSE or HTTP 502 for aggregate JSON. Truncated tool arguments must never be repaired to an executable `{}` call; clients must not execute incomplete tool calls.
 
