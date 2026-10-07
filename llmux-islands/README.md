@@ -1,5 +1,10 @@
 # llmux-islands
 
+Activity receipts distinguish incoming OpenAI requests with dark gray backgrounds,
+including Claude models served through the SDK; see [endpoint activity](../docs/codex-frontend/activity.md).
+Node.js/npm are required only on a daemon serving Claude-through-Codex, not by the
+native Islands UI itself.
+
 A native macOS notch app that shows per-account **llmux** usage at a
 glance and lets you manage subscriptions — driven entirely by the llmux daemon's
 HTTP API. Raw dashboard JSON is reduced by the same Rust semantic core as the

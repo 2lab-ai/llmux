@@ -28,6 +28,7 @@ routes through it.
 | Command | Behavior in remote mode |
 |---|---|
 | `run` | Point `claude` at the remote proxy (`ANTHROPIC_BASE_URL`) and export `ANTHROPIC_API_KEY` = `remote.api_key` (off-loopback proxy gate). **Never auto-starts a local daemon.** Warn (don't fail) when `remote.api_key` is unset. |
+| `run --codex` | Launch local Codex with remote `/v1/responses`, Bearer client key and temporary catalog. No local start/restart, including `--force`. Node/npm for Claude SDK are required on the remote daemon host. See [frontend contract](21-codex-frontend.md). |
 | `server` | Never binds locally — attaches to the remote dashboard (CLI twin of llmux-islands). Non-TTY prints a reachability one-liner. |
 | `dashboard` | Attach to the remote dashboard. |
 | `status` | Probe + render the remote daemon. |

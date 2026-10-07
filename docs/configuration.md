@@ -71,10 +71,26 @@ whatever `activity.jsonl` still holds); everything else keeps working.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `proxy.port` | `3456` | Local daemon port. Claude Code reaches llmux through `ANTHROPIC_BASE_URL=http://localhost:3456`. |
-| `proxy.api_key` | generated | The shared ADMIN credential (`lm-…`): non-loopback clients must present it (or an issued client key) as `x-api-key`, and `/llmux/*` control endpoints require it (or an admin-kind client key) even from localhost. Keyless data-plane requests are loopback-only. |
+| `proxy.port` | `3456` | Daemon port for both Messages and Responses. Claude Code uses `ANTHROPIC_BASE_URL=http://localhost:3456`; Codex uses the session provider at `http://localhost:3456/v1`. |
+| `proxy.api_key` | generated | The shared ADMIN credential (`lm-…`): non-loopback clients must present it (or an issued client key) as `x-api-key` (or Bearer on OpenAI endpoints), and `/llmux/*` control endpoints require it (or an admin-kind client key) even from localhost. Keyless data-plane requests are loopback-only. Malformed, conflicting or unknown explicit OpenAI credentials are rejected even there. |
 | `client_keys` | `[]` | Issued downstream client keys (multi-tenant). Managed via `llmux key …` / `POST /llmux/keys/*` — each entry stores id, name, email, kind (`default`\|`admin`), key prefix, SHA-256 digest, suspended flag, and timestamps. The secret itself is never stored; edit this section by hand only for disaster recovery. |
 | `upstream` | `https://api.anthropic.com` | Anthropic-compatible upstream base URL for Claude accounts. |
+
+## Frontend launch and SDK runtime
+
+`llmux run` selects Claude Code; `llmux run --codex` selects Codex CLI without a
+persistent frontend toggle. `codex.default_model` provides the Codex launcher
+default; explicit client `-m`/`-c` options override injected launch defaults.
+Daemon-side routing and configured provider effort overrides still apply.
+`--no-model-picker` disables the selected client’s catalog injection.
+
+Claude-through-Codex needs Node.js 18+ and npm on the daemon host. The binary embeds
+the pinned bridge program, manifest and lockfile and lazily installs the SDK into
+a private OS cache. `LLMUX_NODE` selects Node; `LLMUX_CLAUDE_SDK_DIR` optionally
+selects a preinstalled pinned bridge. Normal installs need neither override nor
+a source checkout. The SDK receives the selected account and isolated settings,
+not the daemon user’s Claude/Codex authentication environment. See
+[bridge runtime](../bridge/README.md) and [remote mode](remote.md).
 
 ## Scheduler knobs
 
@@ -175,7 +191,7 @@ Grok settings are configurable in the config file and adjustable live from the d
 
 ## OpenRouter backend
 
-OpenRouter serves the **Anthropic Messages** format natively, so llmux forwards the request body unchanged and only rewrites its `model` field — there is no request shaping to configure, and therefore no `fast` / `reasoning_effort` knob here (effort rides through as client metadata, as it does on the Claude passthrough).
+OpenRouter serves **Anthropic Messages** natively. For incoming Messages, llmux normalizes the model and removes unsigned foreign thinking before forwarding; there is no `fast` / `reasoning_effort` configuration knob here. Incoming Responses first converts to Messages, so it is not native Responses passthrough. See [provider compatibility](provider-compatibility.md#frontend-transport-matrix).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -187,6 +203,19 @@ Model selection is the `or-` prefix: `or-ox-alpha` and the other curated ids res
 ## Claude reset grants
 
 `claude_cli_version` (optional, default = the version built into the binary) is the Claude Code version llmux identifies as — `User-Agent: claude-cli/<version> (external, cli)` — when it reads or redeems Claude usage-limit reset grants (`GET /api/oauth/usage?cedar_ember=1`, `POST …/reset_rate_limits`). Anthropic gates those on the client surface and version; when Claude accounts start showing `n/e` with reason `cli_version` in the `rst` column, set this to the currently released Claude Code version. Read at daemon startup; see [operational-reference.md](operational-reference.md#usage-controls-refresh--resets).
+
+## Raw request/response capture
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `raw_io.enabled` | `true` | Capture bounded request/response payloads to `raw-io.jsonl`; disable to stop capture. |
+| `raw_io.retention_days` | `90` | Prune older records at startup; `0` keeps all history. |
+| `raw_io.max_body_bytes` | `8388608` | Per-body capture limit for requests/responses, streaming or JSON. |
+
+Credential headers are redacted; prompt/response bodies may still contain private
+content. The SDK upstream legs are labeled `claude-agent-sdk` and contain bridge
+Messages input/output, not the SDK’s private vendor HTTP. Incoming and returned
+Responses bodies are recorded separately. See [raw viewer](operational-reference.md#raw-requestresponse-viewer).
 
 ## Email anonymous mode
 

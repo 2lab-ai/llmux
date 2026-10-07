@@ -3,8 +3,9 @@
 The intended topology is **one** central llmux daemon (say `llmux-host:3456`)
 with every other machine running the CLI as a **pure client** of it — the CLI
 analogue of what llmux Islands already does. A client never starts a local
-daemon; it points `claude` at the remote proxy and presents a credential as
-`x-api-key` — normally that machine's own issued client key.
+daemon; `run` points Claude Code at the remote Messages endpoint and `run --codex`
+points Codex at remote Responses. Claude Code uses `x-api-key`; Codex uses Bearer
+authentication with the same issued client key.
 
 Remote mode is turned on, in this precedence, by:
 
@@ -16,11 +17,12 @@ Neither → local mode, unchanged. One-off via the flag:
 
 ```bash
 llmux --remote llmux-host:3456 run     # claude → remote proxy
+llmux --remote llmux-host:3456 run --codex  # codex → remote Responses
 llmux --remote llmux-host:3456 status  # probe the remote daemon
 ```
 
 Persistently, in `~/.config/llmux.json`. The `api_key` is what the client
-presents as `x-api-key`. **The standard client credential is a per-machine
+presents as `x-api-key` (Claude/control API) or Bearer (Codex Responses). **The standard client credential is a per-machine
 issued key**: on the server run `llmux key new --name <pc> [--email …]` and
 paste the `lmk-…` secret here, so usage is metered per tenant and each machine
 can be suspended/rotated independently (see
@@ -49,8 +51,15 @@ loudly** — it never silently acts on a local daemon.
 | Commands | Behavior |
 |---|---|
 | `run`, `server`, `dashboard`, `status`, `env`, `accounts` | Target the REMOTE daemon (read/attach only). `run` exports `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` (the remote key) so the off-loopback client-auth gate passes; no local daemon is started, and the proxy still swaps in the real upstream account so subscription mode is preserved at the account layer. `accounts` shows the remote's shared account pool. |
+| `run --codex` | Launch the local Codex CLI against remote `/v1/responses`, using the configured remote key. Picker metadata comes from that daemon; user Codex configuration files are not changed. No local daemon is started or restarted, including with `--force`. |
 | `stop`, `restart`, `remove`, `login`, `import` | **Refused** with an error naming the remote — lifecycle and account mutation belong to the daemon's own host. Run them there, or drop `--remote` / unset `remote.host`. The one browser-login path that does work from here is the attached dashboard's `n` picker: the OAuth flow runs in THIS client and the minted credential is relayed to the remote daemon over `POST /llmux/inject-account`, which needs an admin credential. |
 | `channel`, `update` | LOCAL and allowed — they manage THIS machine's binary install, not the daemon. |
+
+Install Codex CLI on each client that uses `run --codex`. Claude models on this
+frontend require Node.js 18+ and npm on the **remote daemon host**, where the pinned
+SDK is installed on first request. `llmux env` remains a Claude Code shell-export
+command. Invalid explicit OpenAI credentials are rejected even on loopback; remote
+requests require a valid key. See [Codex frontend](codex-frontend/README.md).
 
 ## Transport security
 

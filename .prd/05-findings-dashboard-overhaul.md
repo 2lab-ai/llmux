@@ -1,5 +1,9 @@
 # Findings — dashboard overhaul + codex settings + routing (2026-06-13)
 
+Historical research snapshot: retain the dated findings below. Current dual-frontend
+routing and model endpoints are defined in [the current spec](01-spec.md) and
+[Codex frontend](21-codex-frontend.md).
+
 Evidence-anchored notes from the dashboard/codex/routing work. Where a claim
 rests on a live capture or external source, it is cited.
 

@@ -10,14 +10,14 @@
 
 ![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
 
-**One agent harness, every model.** llmux is a local Anthropic-compatible proxy for [Claude Code](https://www.anthropic.com/claude-code): `claude` talks to `http://localhost:3456`, llmux decides which account/backend serves the request. Your subagents, slash commands, MCP servers, hooks, and `CLAUDE.md` conventions stay put while frontier models and subscription limits keep moving — `/model fable`, `/model gpt-5.6-sol`, `/model grok-4.7` are routing signals, not migrations.
+**Keep your harness, change your model.** llmux is a local proxy for Claude Code and Codex CLI, with Anthropic Messages and OpenAI Responses endpoints. The selected client talks to `http://localhost:3456`; llmux chooses the account/backend. Your client keeps its own tools, permissions and project conventions while `/model fable`, `/model gpt-5.6-sol` and `/model grok-4.7` select the backend. llmux does not synchronize settings between the two clients.
 
-- **Claude Code or Codex frontend** — `llmux run --codex` adds an OpenAI Responses endpoint, catalog picker and Claude Agent SDK routing ([Codex guide →](docs/codex-frontend/README.md)). Claude-through-Codex requires Node.js/npm on the daemon; SDK controls differ from native Messages.
+- **Claude Code or Codex frontend** — `llmux run --codex` launches Codex against the OpenAI Responses endpoint, with a catalog picker and Claude Agent SDK routing ([Codex guide →](docs/codex-frontend/README.md)). Claude-through-Codex requires Node.js/npm on the daemon; SDK controls differ from native Messages.
 
-- **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and a Claude Code launcher (`llmux run`)
+- **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and launchers for Claude Code (`llmux run`) and Codex (`llmux run --codex`)
 - **four backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), OpenRouter (`or-*` / free models on an OpenRouter key), routed by model name ([models →](docs/models.md))
 - **multi-account scheduling** — quota-aware perishability scoring or sticky round-robin, 429 cooldown parking, Fable weekly ceilings ([schedulers →](docs/schedulers.md))
-- **DevTools for your agent's model traffic** — live per-request receipts, a raw request/response viewer over all four wire legs, copy-as-curl ([the accidental AI debugger →](docs/ai-debugger.md))
+- **DevTools for your agent's model traffic** — live per-request receipts, a raw request/response viewer with explicit SDK transport boundaries, copy-as-curl ([the accidental AI debugger →](docs/ai-debugger.md))
 - **remote-first** — one central daemon, every other machine a pure client, with per-machine multi-tenant keys ([remote daemon →](docs/remote.md))
 - **llmux Islands** — native macOS menu-bar/notch companion, plus a KDE/Qt port ([islands →](docs/llmux-islands.md))
 
@@ -72,6 +72,15 @@ alias lx='llmux run'  # a convenient alias; args after -- pass through to claude
 
 Inside that session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
 
+Or run Codex CLI through the same daemon (install Codex on the client):
+
+```bash
+llmux run --codex
+llmux run --codex -- exec -m haiku 'Run the tests and explain failures'
+```
+
+Claude models through Codex require Node.js 18+ and npm on the **daemon host**; the first request installs the pinned SDK automatically. `login --codex` adds a ChatGPT account; `run --codex` chooses the client and also works with only Claude accounts. See the [Codex frontend guide](docs/codex-frontend/README.md).
+
 Want the foreground TUI dashboard instead:
 
 ```bash
@@ -82,7 +91,7 @@ Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`.
 
 ## switching models
 
-Claude Code's model name becomes the routing signal:
+The incoming model name selects the backend in either client. For example, inside Claude Code:
 
 ```text
 /model fable
@@ -101,7 +110,7 @@ Claude Code's model name becomes the routing signal:
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
-> **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** Claude and OpenRouter are passthrough; Codex and Grok are subscription gateways llmux translates onto, and they do not honor everything Claude Code sends.
+> **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** The following caveats describe **incoming Anthropic Messages**: Claude and OpenRouter use native Messages, while Codex and Grok require translation. Incoming **OpenAI Responses** uses native Codex Responses or the Claude Agent SDK, with different controls; see the [frontend transport matrix](docs/provider-compatibility.md#frontend-transport-matrix).
 >
 > - **`gpt-*` (Codex): no output-limit guarantee — your `max_tokens` is not sent upstream at all.** The gateway answered `400 Unsupported parameter: max_output_tokens` (live probe 2026-09-14), and no supported alternative cap field **was found** in the current official Codex client or its docs (read 2026-09-14), so llmux omits the cap rather than faking one. That is a search result, not an allowlist: other field names are untested, not proven absent.
 > - **`grok-*`: the cap is forwarded, but it is not the budget you asked for.** A `max_output_tokens: 1` probe (2026-09-14) came back `incomplete` with one visible token and 168 reported output tokens, 167 of them reasoning. What it bounds in general — and what it costs — is unmeasured.
@@ -130,6 +139,7 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 - [remote daemon](docs/remote.md) — one central daemon, remote-mode command matrix, transport security
 - [schedulers](docs/schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a mode
 - [operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, multi-tenant keys
+- [Codex frontend](docs/codex-frontend/README.md) — launch, SDK requirements, tools, HTTP and endpoint activity
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
 - [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok, diagnostic headers
@@ -141,8 +151,8 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 
 llmux is for **one human using their own accounts** — no credential pooling, no resale.
 
-- **Durable path:** Claude Code as the harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
-- **Convenience path:** routing third-party flat-rate subscription tokens through Claude Code depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
+- **Durable path:** keep your chosen client harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
+- **Convenience path:** routing third-party flat-rate subscription tokens through a different client depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
 - Anthropic quota headers and vendor subscription-token behavior may change.
 - llmux is not affiliated with Anthropic, OpenAI, xAI, or OpenRouter.
 

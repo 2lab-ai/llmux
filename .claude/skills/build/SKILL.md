@@ -17,12 +17,17 @@ Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-de
    user for a branch name (or propose `feat/<short-desc>`) and `git switch -c <branch>`.
    *(Decision point: branch name needs the user.)*
 2. **Gate.** `just check` (fmt + clippy -D warnings + tests) must be green before committing.
-   Fix failures; do not commit red.
+   Fix failures; do not commit red. For bridge/runtime changes also install locked
+   bridge dependencies and run `just check-bridge`; preserve all three embedded bridge
+   assets in filtered build contexts (shared reference).
 3. **Build + hot-deploy locally** — procedure A in the shared reference (`cargo build
    --release --locked`; `rm` the read-only Cellar file; `cp`; `chmod 755`;
    `llmux restart`). Autonomous — this is the whole point of `build`.
 4. **Smoke check.** `/opt/homebrew/bin/llmux status` — daemon back up on the new binary,
-   `in_flight` was 0 before restart.
+   `in_flight` was 0 before restart. Frontend/runtime changes additionally need the
+   shared reference’s actual native-Codex and Claude-SDK client-tool smokes. Node/npm
+   are required on the daemon only for Claude-through-Codex. Docs-only followups use
+   the shared documentation path without hot-deploying unchanged runtime.
 5. **Commit.** Conventional, lowercase, no emoji, no AI co-author line (AGENTS.md):
    `git add -A && git commit -m "<type>: <summary>"`.
 6. **Push to the branch** (never main): `git push -u origin <branch>`. On a stale `ghs_`

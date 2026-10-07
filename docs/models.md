@@ -15,16 +15,18 @@ out-of-catalog pin appears here as a **synthesized row** with null metadata (see
 - `GET /models`
 - `GET /llmux/models`
 
-Both return the **same** payload and sit behind the same loopback + proxy
-api-key gate as every other route:
+Both return the **same** llmux metadata payload under the data-plane `x-api-key`
+gate, with legacy keyless loopback access. `/llmux/models` is an explicit exception
+to the admin-only control routes:
 
 ```json
 { "models": [ /* ModelEntry, ... */ ] }
 ```
 
-Registering root `/models` reserves a path that previously fell through to the
-upstream proxy fallback. Anthropic exposes no root `/models`, and `/v1/models`
-is left untouched (still proxied upstream), so nothing regresses.
+`GET /v1/models` is a separate OpenAI-shaped catalog: `{ "object": "list",
+"data": [{ "id": "…", "object": "model", "created": 0, "owned_by": "claude" }] }`.
+It accepts Bearer or `x-api-key` llmux credentials and is served locally, not
+proxied upstream. Use `/llmux/models` for efforts, aliases and context metadata.
 
 ## Response schema
 
@@ -85,7 +87,10 @@ not that it is zero.
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
   same upstream slug.
-- **claude aliases** — the claude rows carry short user-curated aliases that
+- **claude aliases** — the following wire-ID table describes incoming Messages.
+  Incoming Responses uses the Claude Agent SDK and preserves the resolved `[1m]`
+  suffix so the SDK can apply its context beta; see [Codex frontend](codex-frontend/README.md).
+  For Messages, the claude rows carry short user-curated aliases that
   both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
   rewritten to its catalog id before the request leaves llmux, so the alias
   `GET /models` advertises is actually honored upstream.
@@ -332,6 +337,20 @@ sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
 and the `[1m]` twin is an explicit opt-in. models.json lists the same
 272,000 / 872,000 pair for all three, which llmux does not advertise.
 
+## Codex model picker
+
+`llmux run --codex` fetches `/llmux/models` and supplies a temporary Codex catalog
+with backend groups, effort menus and context windows. Native coding instructions
+come from the local Codex model cache when available; the fallback is an embedded
+coding prompt. Claude and other translated models use direct client tools.
+`--no-model-picker`, or an explicit `-c model_catalog_json=...`, preserves your
+client catalog; a fetch failure warns and does not block launch. User `-m` and
+`-c` arguments override injected launch defaults. No persistent Codex settings
+file is edited. See [Codex frontend](codex-frontend/README.md) for supported controls.
+
+The following Claude Code sections describe that client’s picker and context
+display workarounds; Codex gets context metadata from its injected catalog.
+
 ## Claude Code `/model` picker
 
 `llmux run` puts this catalog into Claude Code's `/model` picker. Before
@@ -379,8 +398,8 @@ Two opt-outs, plus one failure mode:
 
 Gateway model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) is NOT
 used: it keeps only ids containing `claude`/`anthropic` and needs a credential
-header, both of which defeat the purpose here. `/v1/models` stays proxied
-upstream, untouched.
+header, both of which defeat the purpose here. The separate `/v1/models` route
+now serves an OpenAI-shaped list; Claude Code picker injection uses `/llmux/models`.
 
 ### Alias exports
 
