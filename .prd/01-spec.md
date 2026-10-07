@@ -47,7 +47,9 @@ only a foreground process.
   Amended (keys-history K): one LOCAL SQLite file holds per-tenant keys usage metadata so the
   `keys` tab can answer windowed/filtered questions across restarts. Still no analytics service,
   no exporter, no browser UI — and no prompt/response content in it.
-- No request-content routing (claude-code-router task-type routing). Manual switch + scheduler only.
+- No general task-content routing (claude-code-router). Narrow compatibility exception:
+  Claude Code auto-mode monitors in an observed GPT main session use `luna`, with
+  session isolation and validated stop/output adaptation (see operational reference).
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary
   multimodal Messages parity. URL images, unknown blocks, and unsupported media return local 400.
@@ -152,7 +154,8 @@ observation happen.
   capped visible output at 16 but reported output 302 / reasoning 286. This is not a proven
   total-generation budget or billing cap. Invalid values return 400; no fabricated truncation,
   limit clamping, or subtraction of reasoning usage to appear within the requested cap.
-- Non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` return local 400;
+- Non-null `temperature`/`top_p`/`top_k` and nonempty `stop_sequences` return local 400
+  (except the scoped auto-mode monitor closing-tag adapter described above);
   public-API support is not subscription-gateway proof. Empty stop sequences are vacuous;
   malformed stop sequences return 400. Top-level `thinking` configuration is shape-validated
   then omitted with omission/warning `thinking_config` (strict: 400). Neither its `budget_tokens`

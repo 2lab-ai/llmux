@@ -251,7 +251,8 @@ struct ForwardContext {
     model: Option<String>,
     /// The keyless per-client metering identity (`metadata.user_id`) parsed
     /// from the request body once at entry (issue #32). `None` → the request is
-    /// attributed to the `unknown` bucket. Counting only; never gates routing.
+    /// attributed to the `unknown` bucket. The classifier adapter separately
+    /// normalizes the identity to scope its main-model context.
     user_id: Option<String>,
     /// KEYED tenant attribution id resolved by the auth gate (multi-tenant
     /// #22): client-key id / `legacy` / `local`. Counting only; the gate
@@ -259,7 +260,7 @@ struct ForwardContext {
     tenant: Option<String>,
     /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
     /// at entry from the buffered body by [`crate::proxy::classify`]. Display
-    /// only; never gates routing.
+    /// classification; auto-mode routing uses a stricter monitor signature.
     kind: Option<String>,
     excerpt: Option<String>,
     /// The backend group this request routes to, OR `None` when routing is
@@ -278,9 +279,24 @@ struct ForwardContext {
     /// same losses. `None` on every non-Responses path: anthropic/openrouter
     /// requests go upstream verbatim and have nothing to report.
     compatibility: Option<responses_request::CompatibilityReport>,
+    auto_classifier: Option<super::auto_classifier::Route>,
 }
 
 impl ForwardContext {
+    fn codex_meta(&self, state: &AppState) -> (String, Option<String>, bool) {
+        self.auto_classifier
+            .as_ref()
+            .map(|r| r.meta())
+            .unwrap_or_else(|| state.codex.request_meta(&self.body))
+    }
+
+    fn translated_body(&self) -> &[u8] {
+        self.auto_classifier
+            .as_ref()
+            .map(|r| r.body.as_ref())
+            .unwrap_or(&self.body)
+    }
+
     fn log(&mut self, section: String) {
         if self.log_enabled {
             self.sections.push(section);
@@ -301,13 +317,23 @@ impl ForwardContext {
     /// the thinking budget, never fast. All `None`/`false` before the provider
     /// path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
+        // The override is known even on a pre-lease failure (Codex exhausted).
+        if let Some(route) = &self.auto_classifier {
+            let (model, effort, fast) = route.meta();
+            return FinishedMeta {
+                group: Some("codex".into()),
+                model: Some(model),
+                effort,
+                fast,
+            };
+        }
         match self.served_by {
             Some(BackendGroup::Codex) => {
                 // Per-request effective model + effort + fast (matches the
                 // wire), not the static shape defaults: a request for gpt-5.5
                 // under a gpt-5.6-sol pin records gpt-5.5, and a FAILED
                 // request still names the model that failed.
-                let (model, effort, fast) = state.codex.request_meta(&self.body);
+                let (model, effort, fast) = self.codex_meta(state);
                 FinishedMeta {
                     group: Some("codex".to_string()),
                     model: Some(model),
@@ -795,7 +821,14 @@ fn compatibility_gate(
     // A body that will not parse has no honest answer on either path: the
     // relay would 502 on it later, and the count path used to answer "1
     // token" — a fabricated number dressed as a count.
-    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&ctx.body) else {
+    // Strict clients validate the ORIGINAL controls, including stops. Compat
+    // alone permits the narrowly recognized local classifier-stop adapter.
+    let checked_body = if mode == CompatibilityMode::Strict {
+        &ctx.body[..]
+    } else {
+        ctx.translated_body()
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(checked_body) else {
         return Err(Box::new(invalid_request_response(
             state,
             ctx,
@@ -803,7 +836,7 @@ fn compatibility_gate(
             "request body is not valid JSON",
         )));
     };
-    let report = match responses_request::validate_request(&body, flavor, count_tokens) {
+    let mut report = match responses_request::validate_request(&body, flavor, count_tokens) {
         Ok(report) => report,
         Err(ProviderError::InvalidRequest(message)) => {
             return Err(Box::new(invalid_request_response(
@@ -824,6 +857,11 @@ fn compatibility_gate(
             )));
         }
     };
+    if ctx.auto_classifier.as_ref().is_some_and(|r| r.local_stop()) {
+        report.warnings.push("classifier_local_stop");
+        report.warnings.sort_unstable();
+        report.warnings.dedup();
+    }
     if mode == CompatibilityMode::Strict && !report.warnings.is_empty() {
         let message = format!(
             "{group} cannot serve this request without loss: {}",
@@ -998,12 +1036,13 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // classifier is not consulted on the forward path in that case.
     let model = crate::routing::model_from_body(&body);
     // Keyless per-client metering identity (issue #32): parsed once from the
-    // buffered body, same pattern as `model`. Counting only — never routes.
+    // buffered body, same pattern as `model`. The auto-mode adapter also uses
+    // its normalized session component to isolate the main-model context.
     let user_id = crate::routing::user_id_from_body(&body);
     // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
     // pattern; rides the RequestFinished event for the activity feed.
     let classified = crate::proxy::classify::classify(&path_query, &body);
-    let group = if state
+    let mut group = if state
         .settings_live
         .routing_enabled
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1012,6 +1051,48 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     } else {
         None
     };
+    let mut auto_classifier = None;
+    if let Some(request_group) =
+        group.filter(|_| parts.method == Method::POST && parts.uri.path() == "/v1/messages")
+    {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let mapped = state
+                .auto_classifier_sessions
+                .lock()
+                .map(|mut sessions| {
+                    sessions.observe(
+                        tenant.as_deref(),
+                        &value,
+                        classified.kind,
+                        request_group,
+                        started,
+                    )
+                })
+                .unwrap_or(false);
+            if mapped {
+                match super::auto_classifier::Route::new(&value) {
+                    Ok(route) => {
+                        tracing::info!(requested_model = model.as_deref().unwrap_or("<none>"),
+                            effective_model = %route.meta().0, reason = "gpt_main_session_auto_classifier",
+                            "routing auto classifier to luna");
+                        auto_classifier = Some(route);
+                        group = Some(BackendGroup::Codex);
+                    }
+                    Err(message) => {
+                        state.emit(ActivityEvent::Error {
+                            context: Some("auto_classifier".into()),
+                            message: message.into(),
+                        });
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            message,
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Now that the body is classified, announce the in-flight row WITH its kind
     // so its `kind` column aligns with the completed rows (TUI UI-6 item 1).
     state.emit(ActivityEvent::RequestStarted {
@@ -1051,6 +1132,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         group,
         served_by: None,
         compatibility: None,
+        auto_classifier,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -1059,7 +1141,28 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             body_excerpt(&ctx.body)
         ));
     }
-    run_taxonomy_loop(state, &mut ctx).await
+    if ctx.auto_classifier.is_some() {
+        // One wall-clock deadline covers queueing, retries, headers and body.
+        // Cancellation drops the lease; no partial verdict has been exposed.
+        match tokio::time::timeout(
+            super::auto_classifier::DEADLINE,
+            run_taxonomy_loop(state, &mut ctx),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                ctx.emit_finished(state, None, StatusCode::GATEWAY_TIMEOUT, None);
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "api_error",
+                    "auto classifier timed out without a verdict",
+                )
+            }
+        }
+    } else {
+        run_taxonomy_loop(state, &mut ctx).await
+    }
 }
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
@@ -1247,7 +1350,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         let (served_group, served_model, served_effort, served_fast) =
             match BackendGroup::from_kind(credential.kind()) {
                 BackendGroup::Codex => {
-                    let (model, effort, fast) = state.codex.request_meta(&ctx.body);
+                    let (model, effort, fast) = ctx.codex_meta(state);
                     (Some("codex".to_string()), Some(model), effort, fast)
                 }
                 BackendGroup::Grok => {
@@ -1449,10 +1552,16 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         let mut translate_stream: Option<bool> = None;
         let (upstream_req, endpoint) = if is_translate {
             let built = match served {
-                BackendGroup::Codex => state
-                    .codex
-                    .build_request(&ctx.body, &credential)
-                    .map(|out| (out, state.codex.endpoint().to_string())),
+                BackendGroup::Codex => {
+                    let request = if let Some(route) = &ctx.auto_classifier {
+                        state
+                            .codex
+                            .build_request_with_shape(&route.body, &credential, &route.shape)
+                    } else {
+                        state.codex.build_request(&ctx.body, &credential)
+                    };
+                    request.map(|out| (out, state.codex.endpoint().to_string()))
+                }
                 BackendGroup::Grok => state
                     .grok
                     .build_request(&ctx.body, &credential)
@@ -2012,11 +2121,12 @@ fn resolve_group(
     }
     // Matched group is empty — apply the policy.
     let model = ctx.model.as_deref().unwrap_or("<none>");
-    if state
-        .config
-        .routing
-        .on_empty_group
-        .eq_ignore_ascii_case("fallback")
+    if ctx.auto_classifier.is_none()
+        && state
+            .config
+            .routing
+            .on_empty_group
+            .eq_ignore_ascii_case("fallback")
     {
         // Fixed fallback scan order Claude → Codex → Grok (spec §R5, C2b):
         // the first OTHER group with ≥1 configured account serves the
@@ -2790,10 +2900,7 @@ async fn relay_translate(
             state.config.grok.trace,
             state.grok.request_meta(&ctx.body).0,
         ),
-        _ => (
-            state.config.codex.trace,
-            state.codex.request_meta(&ctx.body).0,
-        ),
+        _ => (state.config.codex.trace, ctx.codex_meta(state).0),
     };
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
         trace_enabled,
@@ -2870,7 +2977,7 @@ async fn relay_translate(
         return client_error;
     }
 
-    if client_stream {
+    if client_stream && ctx.auto_classifier.is_none() {
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
@@ -3094,9 +3201,21 @@ async fn relay_translate(
     let mut events = sse::EventBuffer::new();
     let mut timing = sse::StreamTiming::default();
     let mut stream = Box::pin(response.bytes_stream());
+    let mut classifier_bytes = 0usize;
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => {
+                classifier_bytes = classifier_bytes.saturating_add(chunk.len());
+                if ctx.auto_classifier.is_some()
+                    && classifier_bytes > super::auto_classifier::RESPONSE_LIMIT
+                {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "auto classifier response exceeded its buffer limit",
+                    );
+                }
                 timing.on_chunk();
                 if let Some(tee) = upstream_tee.as_mut() {
                     tee.push(&chunk);
@@ -3137,7 +3256,19 @@ async fn relay_translate(
     let trace_duration_ms = ctx.started.elapsed().as_millis();
     let error_message = converter.error_message().map(str::to_string);
     let result = match converter.into_message_json() {
-        Some(message) => {
+        Some(mut message) => {
+            if let Some(route) = &ctx.auto_classifier {
+                if let Err(detail) = route.finish(&mut message) {
+                    trace.write_error(detail, trace_events_seen, trace_duration_ms);
+                    ctx.emit_finished(
+                        state,
+                        Some(&account),
+                        StatusCode::BAD_GATEWAY,
+                        Some(token_counts(usage)),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "api_error", detail);
+                }
+            }
             ctx.log(format!(
                 "=== RESPONSE BODY (codex aggregate) ===\n{message}"
             ));
@@ -3150,11 +3281,20 @@ async fn relay_translate(
             // receives. Client response headers are the synthesized ones
             // (mirroring `out` below); the upstream's real headers + verbatim
             // pre-transform reply ride in the record's `upstream` half (UI-8).
-            let message_bytes = message.to_string();
+            let buffered_stream = client_stream && ctx.auto_classifier.is_some();
+            let message_bytes = if buffered_stream {
+                super::auto_classifier::message_sse(&message)
+            } else {
+                message.to_string()
+            };
             let mut client_headers = HeaderMap::new();
             client_headers.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
+                HeaderValue::from_static(if buffered_stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }),
             );
             // Same losses, same headers as the streamed leg — the aggregate
             // client must not have to ask twice to learn what was dropped.
@@ -3479,6 +3619,7 @@ mod tests {
             group: Some(group),
             served_by: None,
             compatibility: None,
+            auto_classifier: None,
         }
     }
 

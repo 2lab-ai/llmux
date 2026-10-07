@@ -1,6 +1,7 @@
 //! The proxy core (FR1): axum listener, request rewrite + upstream forward,
 //! SSE passthrough, optional request logging.
 
+pub mod auto_classifier;
 pub mod classify;
 pub mod codex_trace;
 pub mod forward;

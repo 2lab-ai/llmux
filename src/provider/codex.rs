@@ -170,6 +170,16 @@ impl CodexProvider {
         anthropic_body: &[u8],
         credential: &AccountCredential,
     ) -> Result<(ProviderRequest, bool), ProviderError> {
+        self.build_request_with_shape(anthropic_body, credential, &self.shape())
+    }
+
+    /// A request-owned shape (auto-mode monitor) must not mutate dashboard defaults.
+    pub fn build_request_with_shape(
+        &self,
+        anthropic_body: &[u8],
+        credential: &AccountCredential,
+        shape: &CodexShape,
+    ) -> Result<(ProviderRequest, bool), ProviderError> {
         let AccountCredential::Codex {
             account_id,
             access_token,
@@ -187,7 +197,7 @@ impl CodexProvider {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
         let (upstream_body, client_stream) =
-            translate_request_with(&body, &self.session_id, &self.shape())?;
+            translate_request_with(&body, &self.session_id, shape)?;
 
         let mut headers = HeaderMap::new();
         let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))

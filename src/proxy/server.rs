@@ -284,6 +284,8 @@ pub struct AppState {
     /// for routing (forward passes `group = None`); it is still held so the
     /// status/eval paths can ask whether routing is on.
     pub classifier: Arc<crate::routing::Classifier>,
+    /// Ephemeral, tenant-isolated main-model context for auto-mode monitors.
+    pub auto_classifier_sessions: Arc<Mutex<super::auto_classifier::Sessions>>,
     /// Coalesces concurrent OAuth refreshes per account.
     pub refresher: Arc<RefreshCoalescer>,
     /// Per-account relayed-traffic totals for `/llmux/status`.
@@ -471,6 +473,9 @@ impl AppState {
             openrouter,
             idle_prober,
             classifier,
+            auto_classifier_sessions: Arc::new(Mutex::new(
+                super::auto_classifier::Sessions::default(),
+            )),
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
