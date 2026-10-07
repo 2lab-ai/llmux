@@ -1,5 +1,5 @@
 # Islands get started — fixed target
-Status: in-progress
+Status: shipped
 Date: 2026-10-08
 
 ## User request (verbatim)
@@ -16,8 +16,10 @@ local control-key handoff is an explicit amendment to the original no-config-rea
 GUI boundary: the app still never reads the daemon config or provider credentials.
 Keys remain executor-only memory. Remote keys never flow to loopback or another endpoint.
 
-A 30–45 second vertical Korean demo uses actual rendered app states with disclosed
-synthetic fixture data. A separate media work unit creates the video and saves a
-Threads draft, never publishes the post. Do not quit the user's running app or
+The initial media plan was one 30–45 second Korean demo. Subsequent user steering
+expanded delivery to five distinct vertical videos and five separate Threads
+drafts. All use actual rendered app states with disclosed synthetic fixture data;
+two include Korean narration, and lengths vary with each concept. Drafts are saved
+without publishing or scheduling posts. Do not quit the user's running app or
 change real accounts for a capture. The frozen v0.2.24 release is separate; do not
 merge this feature before its tag exists.
