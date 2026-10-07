@@ -639,6 +639,9 @@ selection, resumed sessions, nonstandard settings-source/safe/restricted modes a
 known managed policy/available-model restrictions suppress implicit inference.
 Model-changing `settings.env` or global `.claude.json`/legacy `.config.json` environment overrides also suppress inference, because native
 trust/merge rules can apply them after the launcher reads its own environment.
+Normal `CLAUDE_CODE_OAUTH_TOKEN` authentication preserves launch-model inference;
+a nonempty `CLAUDE_CODE_CUSTOM_OAUTH_URL` suppresses it because native Claude Code
+selects a different global settings profile (2.1.292 profile selector, 2026-10-07).
 Explicit `--model` still works with safe mode and settings-source flags unless a
 known policy restriction makes it uncertain. Remote-only policy, worktree-specific
 settings or native selection overrides not visible at launch cannot be inferred;
