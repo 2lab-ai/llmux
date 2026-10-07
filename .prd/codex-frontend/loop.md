@@ -97,3 +97,41 @@ Docker build using the same COPY and fixture git-add lines cloned the resulting
 Git repository and byte-compared all three bridge assets successfully; receipt
 /private/tmp/llmux-codex-packaging-context.log. The full Arch Qt/package job remains
 the remote CI gate, rather than being inferred from the smaller context check.
+
+## Round 5 — installed-preview account failure (reopened)
+
+All five checks passed on d4ac07a, merged as 8029d95 in PR #188. The first installed
+preview passed the native Codex tool smoke but failed the Claude SDK smoke: SDK
+`oauth_org_not_allowed` was mapped to transient 502, so client retries selected
+the same unusable account. This is a failed release acceptance gate; status stays
+in-progress and no user accounts are manually changed as a workaround.
+
+Root reproduced RED using an isolated two-account configuration with the same
+bad-first/healthy-second credentials, idle probes disabled and no token refresh:
+/private/tmp/llmux-sdk-failover-live/old-red.json returned 502 in 1.9 seconds. The
+original user's account configuration is untouched. Correction branch
+fix/codex-sdk-account-errors owns bridge typed-error mapping, explicit Rust
+account disposition, shared failover and regression/document updates. Gates and
+new live/release receipts are recorded before completion.
+
+Root also sent the same rejected credential through native `/v1/messages` and
+observed HTTP 403 with `OAuth authentication is currently not allowed for this
+organization.` and `oauth_not_allowed_for_organization` in the response details.
+Receipt: /private/tmp/llmux-sdk-failover-live/native-policy.json. This establishes
+that marking this shared credential unusable does not disable a working native
+Claude route because of an SDK-only local configuration assumption.
+
+Correction gates: full just check passed (1,363 library tests, 24 CLI tests,
+101 e2e tests plus the remaining suites), receipt
+/private/tmp/llmux-sdk-account-just-check.log; bridge SDK suite passed 45/45.
+Focused Rust subprocess tests cover four permanent account errors, same-request
+healthy failover, zero refresh for policy failures, unchanged request/transient
+health and one refresh for expired authentication.
+
+Observed live GREEN with the exact isolated bad-first/healthy-second setup:
+/private/tmp/llmux-sdk-failover-live/fixed-green.json returned HTTP 200 in 2.75
+seconds with exact text `LLMUX_AUTH_FAILOVER_OK`. The daemon log shows the first
+account rejected with SDK organization HTTP 403, then request id 1 completed
+using the healthy second account at `/v1/responses`, endpoint OpenAi. The old
+binary returned HTTP 502 for that same setup. Corrected prerelease installation
+and actual installed-client tool smokes remain required before shipped status.

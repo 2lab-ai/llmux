@@ -5532,3 +5532,198 @@ async fn auto_classifier_silent_stream_errors_without_success_verdict() {
     assert_eq!(body["type"], "error");
     assert!(body.get("content").is_none());
 }
+
+/// Exercise Rust's real subprocess boundary without requiring npm or a paid
+/// account. The bridge's own tests separately verify SDK enums produce these
+/// envelopes; this fixture verifies lease/refresh/account semantics over HTTP.
+#[cfg(unix)]
+struct SdkProcessFixture {
+    dir: TempDir,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(unix)]
+impl SdkProcessFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let package = dir
+            .path()
+            .join("node_modules/@anthropic-ai/claude-agent-sdk");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"version":"0.3.292"}"#).unwrap();
+        std::fs::write(package.join("sdk.mjs"), "// fixture only").unwrap();
+        let node = dir.path().join("fixture-node");
+        std::fs::write(
+            &node,
+            r#"#!/bin/sh
+base="$(dirname "$0")"
+payload=$(cat)
+case "$payload" in
+  *at-sdk-rejected*) printf '%s\n' rejected >> "$base/calls"; cat "$base/error" ;;
+  *) printf '%s\n' healthy >> "$base/calls"; cat "$base/success" ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let frames = [
+            serde_json::json!({"type":"message_start","message":{"id":"msg_fixture","role":"assistant","content":[],"model":"claude-haiku-4-5","usage":{"input_tokens":7,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"healthy SDK account"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":7,"output_tokens":3}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let mut success = "{\"status\":200}\n".to_string();
+        for frame in frames {
+            success += &format!(
+                "event: {}\ndata: {frame}\n\n",
+                frame["type"].as_str().unwrap()
+            );
+        }
+        std::fs::write(dir.path().join("success"), success).unwrap();
+        let previous = ["LLMUX_NODE", "LLMUX_CLAUDE_SDK_DIR"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("LLMUX_NODE", node);
+        std::env::set_var("LLMUX_CLAUDE_SDK_DIR", dir.path());
+        Self { dir, previous }
+    }
+
+    fn rejection(&self, code: &str, status: u16) {
+        let head = serde_json::json!({"status":status,"error_code":code});
+        let body = serde_json::json!({"type":"error","error":{"type":"api_error","message":format!("Claude Agent SDK request failed ({code}).")}});
+        std::fs::write(self.dir.path().join("error"), format!("{head}\n{body}")).unwrap();
+        std::fs::write(self.dir.path().join("calls"), "").unwrap();
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("calls")).unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SdkProcessFixture {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_sdk_account_rejections_fail_over_without_refresh() {
+    let _lock = ENV_LOCK.lock().await;
+    let fixture = SdkProcessFixture::new();
+    for (code, status) in [
+        ("oauth_org_not_allowed", 403),
+        ("account_on_hold", 403),
+        ("verification_required", 403),
+        ("billing_error", 402),
+    ] {
+        fixture.rejection(code, status);
+        let mock = MockUpstream::spawn().await;
+        let proxy = Proxy::spawn(
+            &mock.base_url(),
+            vec![
+                oauth_account("a-rejected", "at-sdk-rejected"),
+                oauth_account("b-healthy", "at-sdk-healthy"),
+            ],
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&serde_json::json!({"model":"claude-haiku-4-5","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{code}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["output"][0]["content"][0]["text"], "healthy SDK account",
+            "{code}"
+        );
+        assert_eq!(
+            fixture.calls(),
+            "rejected\nhealthy\n",
+            "same request must fail over exactly once: {code}"
+        );
+        assert_eq!(
+            mock.token_hits(),
+            0,
+            "account restrictions cannot be fixed by rotating OAuth tokens: {code}"
+        );
+        let accounts = proxy.pool.snapshot().accounts;
+        assert!(
+            !accounts[0].healthy,
+            "rejected credential is excluded: {code}"
+        );
+        assert!(
+            accounts[1].healthy,
+            "healthy credential remains usable: {code}"
+        );
+        assert!(
+            accounts.iter().all(|a| a.in_flight == 0),
+            "leases released: {code}"
+        );
+        let persisted = config::load_path(&proxy.config_path).unwrap();
+        assert!(
+            matches!(&persisted.accounts[0].credential, AccountCredential::Oauth { access_token, .. } if access_token == "at-sdk-rejected")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_sdk_other_errors_keep_request_and_refresh_semantics() {
+    let _lock = ENV_LOCK.lock().await;
+    let fixture = SdkProcessFixture::new();
+    for (code, status, expected) in [
+        ("invalid_request", 400, 400),
+        ("model_not_found", 404, 404),
+        ("unknown", 502, 502),
+        ("cloud_credential_error", 503, 502),
+        // An unrecognized SDK code must not turn a generic 403 into a ban.
+        ("unknown", 403, 403),
+        ("authentication_failed", 401, 200),
+    ] {
+        fixture.rejection(code, status);
+        let mock = MockUpstream::spawn().await;
+        let proxy = Proxy::spawn(
+            &mock.base_url(),
+            vec![oauth_account("a", "at-sdk-rejected")],
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&serde_json::json!({"model":"claude-haiku-4-5","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{code}/{status}");
+        let _ = response.bytes().await.unwrap();
+        let refreshed = code == "authentication_failed";
+        assert_eq!(mock.token_hits(), usize::from(refreshed), "{code}");
+        assert_eq!(
+            fixture.calls(),
+            if refreshed {
+                "rejected\nhealthy\n"
+            } else {
+                "rejected\n"
+            },
+            "{code}"
+        );
+        assert!(
+            proxy.pool.snapshot().accounts[0].healthy,
+            "do not bench a credential for request/transient failure: {code}"
+        );
+    }
+}

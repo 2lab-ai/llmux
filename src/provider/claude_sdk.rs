@@ -165,13 +165,34 @@ pub async fn ensure_installed() -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// A bridge response carries account rejection separately from its HTTP status.
+/// Generic upstream 403/402 responses are not sufficient evidence to bench an
+/// account; these codes come only from the isolated, pinned SDK transport.
+pub struct SdkResponse {
+    pub response: reqwest::Response,
+    pub account_rejected: bool,
+}
+
+fn account_rejected(header: &serde_json::Value, status: http::StatusCode) -> bool {
+    matches!(
+        (
+            header.get("error_code").and_then(|v| v.as_str()),
+            status.as_u16()
+        ),
+        (
+            Some("oauth_org_not_allowed" | "account_on_hold" | "verification_required"),
+            403
+        ) | (Some("billing_error"), 402)
+    )
+}
+
 /// The response fits the shared Anthropic relay/taxonomy, including pre-stream
 /// auth/rate-limit status. Credentials cross only the child's stdin boundary.
 pub async fn send(
     body: &[u8],
     credential: &AccountCredential,
     upstream: &str,
-) -> Result<reqwest::Response, String> {
+) -> Result<SdkResponse, String> {
     let credential = match credential {
         AccountCredential::Oauth { access_token, .. } => {
             json!({"type":"oauth", "token":access_token})
@@ -277,5 +298,8 @@ pub async fn send(
         )
         .body(reqwest::Body::wrap_stream(ReceiverStream::new(rx)))
         .map_err(|_| "Cannot construct Claude SDK response")?;
-    Ok(reqwest::Response::from(response))
+    Ok(SdkResponse {
+        response: reqwest::Response::from(response),
+        account_rejected: account_rejected(&header, status),
+    })
 }
