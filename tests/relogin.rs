@@ -173,7 +173,7 @@ async fn relogin_replaces_credential_and_revives_the_failed_account() {
         oauth_account("b", "at-b"),
     ])
     .await;
-    proxy.pool.record_auth_failure(&AccountId("a".into()));
+    proxy.pool.record_auth_failure(&AccountId("a".into()), None);
     assert!(!proxy.healthy("a"), "precondition: a is benched on auth");
 
     let (status, body) = proxy.inject(&oauth_account("a", "at-a-relogin")).await;
@@ -212,7 +212,7 @@ async fn relogin_replaces_credential_and_revives_the_failed_account() {
 async fn reinjecting_an_unchanged_credential_keeps_the_auth_failure() {
     let unchanged = oauth_account("a", "at-a");
     let proxy = Proxy::spawn(vec![unchanged.clone()]).await;
-    proxy.pool.record_auth_failure(&AccountId("a".into()));
+    proxy.pool.record_auth_failure(&AccountId("a".into()), None);
 
     let (status, body) = proxy.inject(&unchanged).await;
 
@@ -398,7 +398,7 @@ async fn relogin_under_a_new_label_reports_the_established_name() {
     .await;
     proxy
         .pool
-        .record_auth_failure(&AccountId("claude:old@x.com".into()));
+        .record_auth_failure(&AccountId("claude:old@x.com".into()), None);
 
     let (status, body) = proxy
         .inject(&oauth_account_with_uuid(

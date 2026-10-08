@@ -1,25 +1,20 @@
-//! API-equivalent USD pricing for token usage (Feature D).
+//! API-equivalent USD reference pricing for token usage (Feature D).
 //!
-//! The dashboard tracks tokens per model and per request; this module turns
-//! those token counts into the **API-equivalent USD cost** so the dashboard
-//! can always show "$" alongside tokens. The proxy itself bills nothing — these
-//! are *reference* prices: what the same traffic would cost on the provider's
-//! pay-as-you-go API.
-//!
-//! ## The four-rate model
-//! Anthropic and OpenAI both have cache tiers, but they price them differently:
-//! Anthropic bills `cache_read` at 0.1× input and `cache_creation` at 1.25×
-//! input; OpenAI/codex bills cached input at a flat discounted rate and has no
-//! cache-creation charge. A per-model [`ModelPrice`] with four independent
-//! rates (input / output / cache_read / cache_creation) expresses both
-//! providers uniformly — codex models simply carry `cache_creation: 0.0`.
+//! The proxy bills nothing. Four independent USD/MTok rates describe fresh
+//! input, output, cache reads and cache writes; provider/model-specific rates
+//! must not be inferred from a universal multiplier. These are static reference
+//! rates applied to both individual requests and aggregated token counts.
+//! Request-length tiers, cache-write TTLs, service tiers and historical price
+//! changes are not reconstructed from those aggregates. See docs/models.md.
 //!
 //! All rates are **USD per 1,000,000 tokens**. Rates sourced: claude-api skill
 //! cached 2026-06-04; OpenAI gpt-5.5 pricing 2026-04-23; Opus 5.5 from
 //! anthropic.com/claude-opus-5-5, 2026-09-22; Sonnet 5 / 5.5 and the gpt-6 /
 //! gpt-6.1 family from platform.claude.com/docs/en/about-claude/pricing and
 //! developers.openai.com/api/docs/pricing, both read 2026-10-06 (that read
-//! also corrected the stale gpt-5.6-sol / gpt-5.6-luna rows below).
+//! also corrected the stale gpt-5.6-sol / gpt-5.6-luna rows below). Haiku 5.5,
+//! Sonnet 5.5 and Fable 5.1 cache rates re-read 2026-10-08 at
+//! https://platform.claude.com/docs/en/about-claude/pricing.
 
 use std::collections::HashMap;
 
@@ -68,17 +63,21 @@ const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0);
 /// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75} — the 4.x generation
 /// (`claude-sonnet-4-6` / `-4-5`) and the `claude-sonnet-` prefix fallback.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
-/// Sonnet 5 and Sonnet 5.5 (platform.claude.com pricing, read 2026-10-06):
-/// $2 in / $10 out / cache read 0.20 / cache write (5m) 2.50. Sonnet 5's
-/// planned 2026-09-01 increase to the $3/$15 tier was cancelled (pricing-page
-/// footnote), so both generations share this row; it is CHEAPER than
-/// `SONNET_TIER`, so the exact matches below must catch them before the
-/// `claude-sonnet-` prefix fallback overcharges them.
+/// Sonnet 5 (pricing page, read 2026-10-08): $2 / $10 / $0.20 / $2.50.
 const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
-/// Haiku-tier rates {1.0, 5.0, 0.1, 1.25}.
+/// Sonnet 5.5 cache reads fell to $0.10 on 2026-10-07. Other rates unchanged.
+const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
+/// Haiku 4.5 rates; also the unknown Haiku family fallback.
 const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
-/// Fable-family rates (Fable 5 and 5.1 share the tier) {10.0, 50.0, 1.0, 12.5}.
+/// Haiku 5.5: <=100,000 prompt tokens, 5m cache writes (official pricing,
+/// read 2026-10-08). >100,000 prompt tokens cost 5x ALL these rates;
+/// 1h writes cost $0.20 / $1 below/above that boundary. Those request/TTL
+/// tiers are not modeled: aggregate counts cannot recover request lengths.
+const HAIKU_5_5: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
+/// Fable 5 rates; also the unknown Fable family fallback.
 const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
+/// Fable 5.1 cache reads are $0.25 (official pricing, read 2026-10-08).
+const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
 /// `group == "codex"` unknown-model fallback.
@@ -148,10 +147,13 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-opus-5-5" => Some(OPUS_5_5),
         "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
         | "claude-opus-4-5" => Some(OPUS_TIER),
-        "claude-sonnet-5-5" | "claude-sonnet-5" => Some(SONNET_5),
+        "claude-sonnet-5-5" => Some(SONNET_5_5),
+        "claude-sonnet-5" => Some(SONNET_5),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
+        "claude-haiku-5-5" => Some(HAIKU_5_5),
         "claude-haiku-4-5" => Some(HAIKU_TIER),
-        "claude-fable-5" | "claude-fable-5-1" => Some(FABLE_TIER),
+        "claude-fable-5-1" => Some(FABLE_5_1),
+        "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
@@ -190,17 +192,21 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(OPUS_5_5)
     } else if model_norm_lower.starts_with("claude-opus-") {
         Some(OPUS_TIER)
-    } else if model_norm_lower.starts_with("claude-sonnet-5-5-")
-        || model_norm_lower.starts_with("claude-sonnet-5-")
-    {
+    } else if model_norm_lower.starts_with("claude-sonnet-5-5-") {
+        Some(SONNET_5_5)
+    } else if model_norm_lower.starts_with("claude-sonnet-5-") {
         // Sonnet 5 / 5.5 are CHEAPER than the sonnet tier — same ordering
         // argument as `claude-opus-5-5-` above. The trailing `-` is the
         // version boundary (`claude-sonnet-50-*` must miss this branch).
         Some(SONNET_5)
     } else if model_norm_lower.starts_with("claude-sonnet-") {
         Some(SONNET_TIER)
+    } else if model_norm_lower.starts_with("claude-haiku-5-5-") {
+        Some(HAIKU_5_5)
     } else if model_norm_lower.starts_with("claude-haiku-") {
         Some(HAIKU_TIER)
+    } else if model_norm_lower.starts_with("claude-fable-5-1-") {
+        Some(FABLE_5_1)
     } else if model_norm_lower.starts_with("claude-fable-") {
         Some(FABLE_TIER)
     } else if model_norm_lower.starts_with("gpt-5.5-") {
@@ -364,6 +370,56 @@ pub fn priced_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn october_2026_claude_reference_rates_and_override_precedence() {
+        // Official pricing, checked 2026-10-08: Haiku <=100k prompt / 5m writes.
+        let haiku = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
+        for model in [
+            "haiku",
+            "haiku[1m]",
+            "haiku-5-5",
+            "claude-haiku-5-5",
+            "claude-haiku-5-5[1m]",
+            "claude-haiku-5-5-20261007",
+        ] {
+            assert_eq!(price_for("claude", model, &empty()), Some(haiku), "{model}");
+        }
+        assert_eq!(
+            price_for("claude", "claude-haiku-4-5", &empty()),
+            Some(HAIKU_TIER)
+        );
+        assert_eq!(
+            builtin_price("claude-haiku-5-50-20261007"),
+            Some(HAIKU_TIER)
+        );
+        assert_eq!(builtin_price("claude-haiku-5-5x"), Some(HAIKU_TIER));
+        for (model, expected) in [
+            ("sonnet", 0.10),
+            ("claude-sonnet-5-5-20260928", 0.10),
+            ("claude-sonnet-5", 0.20),
+            ("claude-sonnet-5-20260701", 0.20),
+            ("claude-sonnet-5-50-20261007", 0.20),
+            ("fable", 0.25),
+            ("claude-fable-5-1-20260901", 0.25),
+            ("claude-fable-5", 1.0),
+            ("claude-fable-5-10-20261007", 1.0),
+        ] {
+            approx(
+                cost_usd("claude", model, &tc(0, 0, Some(1_000_000), None), &empty()),
+                expected,
+            );
+        }
+        let custom = ModelPrice::new(9.0, 8.0, 7.0, 6.0);
+        let overrides = HashMap::from([("CLAUDE-HAIKU-5-5[1m]".to_string(), custom)]);
+        assert_eq!(price_for("claude", "haiku", &overrides), Some(custom));
+        // Aggregates lack per-request prompt lengths: never infer a long-context
+        // tier by comparing a month's summed input to a request threshold.
+        approx(
+            cost_usd("claude", "haiku", &tc(1_000_000, 0, None, None), &empty()),
+            0.10,
+        );
+    }
 
     // ---- openrouter pricing (docs/openrouter/spec.md §R6) ----
     #[test]
@@ -701,8 +757,8 @@ mod tests {
 
     #[test]
     fn sonnet_5_and_5_5_take_the_two_dollar_row_not_the_sonnet_tier() {
-        // Both generations are $2 / $10 / 0.20 / 2.50 (platform.claude.com
-        // pricing, 2026-10-06); the 4.x ids keep the $3 / $15 tier and the
+        // Both generations are $2 / $10 / $2.50 writes; Sonnet 5.5 cache
+        // reads are now $0.10 vs Sonnet 5 $0.20. The 4.x ids keep $3 / $15; the
         // generic prefix fallback still lands there.
         for model in [
             "claude-sonnet-5-5",
@@ -714,7 +770,14 @@ mod tests {
             let out = cost_usd("claude", model, &tc(0, 1_000_000, None, None), &empty());
             approx(out, 10.00);
             let cr = cost_usd("claude", model, &tc(0, 0, Some(1_000_000), None), &empty());
-            approx(cr, 0.20);
+            approx(
+                cr,
+                if model == "claude-sonnet-5" {
+                    0.20
+                } else {
+                    0.10
+                },
+            );
             let cw = cost_usd("claude", model, &tc(0, 0, None, Some(1_000_000)), &empty());
             approx(cw, 2.50);
         }

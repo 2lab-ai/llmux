@@ -1561,11 +1561,14 @@ pub async fn background_refresh_pass(state: &AppState) {
                 );
             }
         }
-        forward::RefreshOutcome::Permanent { detail } => {
+        forward::RefreshOutcome::Permanent { detail, status } => {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
-            if state.pool.record_auth_failure_if(&account_id, &fingerprint) {
+            if state
+                .pool
+                .record_auth_failure_if(&account_id, &fingerprint, Some(status))
+            {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
                     message: format!(
@@ -1577,7 +1580,7 @@ pub async fn background_refresh_pass(state: &AppState) {
         // The account was re-credentialed mid-refresh; nothing was written and
         // nothing is wrong — the next tick sees the new token's expiry.
         forward::RefreshOutcome::Superseded => {}
-        forward::RefreshOutcome::Failed => {} // transient — next tick retries
+        forward::RefreshOutcome::Failed { .. } => {} // transient — next tick retries
     }
 }
 
@@ -2170,6 +2173,7 @@ pub fn status_json(
                     "status": status,
                     "order": order + 1,
                     "blocked": blocked,
+                    "auth_failure_status": account.auth_failure_status,
                     "five_hour": window(&account.five_hour),
                     "seven_day": window(&account.seven_day),
                     // Model-scoped weekly windows (additive; null / empty when
@@ -4244,7 +4248,7 @@ mod tests {
     fn status_json_marks_auth_failed_accounts() {
         let now = SystemTime::now();
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&AccountId("a".into()));
+        pool.record_auth_failure(&AccountId("a".into()), None);
         let meta = ServerMeta {
             pid: 1,
             uptime_secs: 0,
@@ -4260,7 +4264,7 @@ mod tests {
             &meta,
         );
         assert_eq!(doc["accounts"][0]["status"], "auth_failed");
-        assert_eq!(doc["accounts"][0]["blocked"], "auth failed");
+        assert_eq!(doc["accounts"][0]["blocked"], "! auth X");
         assert_eq!(doc["current"], serde_json::Value::Null);
     }
 
@@ -4505,9 +4509,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 41 curated (13 claude + 14 codex + 4 grok + 10 openrouter) + 1
+        // 43 curated (15 claude + 14 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 42);
+        assert_eq!(models.len(), 44);
 
         let by_id = |id: &str| {
             models
@@ -4542,9 +4546,17 @@ mod tests {
         );
         assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
         assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
-        assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(by_id(id)["max_context"], 272_000);
+        }
+        assert_eq!(
+            by_id("claude-haiku-5-5[1m]")["aliases"],
+            serde_json::json!(["haiku", "haiku-5-5"])
+        );
+        assert_eq!(by_id("claude-haiku-5-5[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("claude-haiku-4-5")["aliases"], serde_json::json!([]));
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
-        // no aliases (those stay on the base rows), base sol unchanged.
+        // no aliases (the version alias stays on the base row).
         for id in ["gpt-5.6-sol[1m]", "gpt-5.6-terra[1m]"] {
             assert_eq!(by_id(id)["max_context"], 1_000_000, "{id}");
             assert_eq!(by_id(id)["aliases"], serde_json::json!([]), "{id}");

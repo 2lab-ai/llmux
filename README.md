@@ -88,6 +88,8 @@ llmux server
 ```
 
 Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`.
+For Codex, `llmux env --codex` prints OpenAI-compatible exports and the explicit
+provider command required after `eval`; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
 
 ## switching models
 
@@ -107,6 +109,8 @@ The incoming model name selects the backend in either client. For example, insid
 | `gpt-*` / `codex` / aliases (`sol`, `terra`, `luna`) | Codex accounts |
 | `grok` / `grok-*` | Grok accounts |
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
+
+`haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
