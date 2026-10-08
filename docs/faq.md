@@ -41,7 +41,7 @@ Stable 0.2.24 has `llmux run`, `llmux run --codex`, schedulers, the raw viewer a
 
 ## Is this a trinity / consensus feature?
 
-llmux ships no review command. Three-model review is project configuration: three agent files plus a prompt that asks the parent to collect the disagreements. See [multi-model-agents.md](multi-model-agents.md).
+llmux ships no review command. Three-model review is project configuration: two agent files (`gpt-reviewer`, `grok-reviewer`) plus a prompt that asks the parent Claude session, the third model, to collect the disagreements. See [multi-model-agents.md](multi-model-agents.md).
 
 ## Does llmux replace Claude Code?
 

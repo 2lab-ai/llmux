@@ -88,9 +88,25 @@ agent file.
 
 ## Step 3 — three models, one change
 
-Measured setup: a project directory with `sample.py` (an `average()` that
-divides by `len(values)` and a `find_user()` that returns `users[0]` when
-nothing matches) and the two agent files above. The parent ran on Claude Fable:
+Measured setup: Claude Code 2.1.294, a project directory with the two agent
+files above, and this `sample.py` (use your own file instead; the defects below
+are specific to this one):
+
+```python
+def average(values):
+    total = 0
+    for v in values:
+        total += v
+    return total / len(values)
+
+def find_user(users, name):
+    for u in users:
+        if u["name"] == name:
+            return u
+    return users[0]
+```
+
+The parent ran on Claude Fable:
 
 ```bash
 llmux run -- --model fable -p "Delegate a review of sample.py to the gpt-reviewer subagent AND separately to the grok-reviewer subagent (use the Agent tool for each; do not review the file yourself). Then output a short synthesis: for each reviewer, quote its MODEL: line and VERDICT: line verbatim, then list which defects only one of them found."
@@ -98,20 +114,30 @@ llmux run -- --model fable -p "Delegate a review of sample.py to the gpt-reviewe
 
 Interactively, start `llmux run` and type the same prompt. Claude Code reported
 success after 7 turns and 183 s, parent model `claude-fable-5-1[1m]`. The
-parent's final text (verbatim excerpt):
+parent's final text, verbatim from its first reviewer heading to the end (one
+opening sentence about where it saved its notes is omitted):
 
-```text
-gpt-reviewer
-MODEL: gpt-6-astra[1m]
+```markdown
+**gpt-reviewer**
+```
+MODEL: gpt-6-astra[1m] (as identified by the runtime instructions)
 VERDICT: REQUEST_CHANGES
+```
 
-grok-reviewer
+**grok-reviewer**
+```
 MODEL: grok-4.7
 VERDICT: REQUEST CHANGES — empty-input crashes and a silent wrong-user fallback make both functions unsafe to call as written.
+```
 
-Shared findings. Both reviewers flagged the same three defects: average divides by zero on empty input, find_user silently returns the first user when no name matches, and find_user raises IndexError on an empty list.
-Found only by grok-reviewer: Line 9: u["name"] assumes every element is a mapping with a "name" key. A missing key raises KeyError and a non-mapping element raises TypeError.
-Found only by gpt-reviewer: None.
+**Shared findings.** Both reviewers flagged the same three defects: `average` divides by zero on empty input, `find_user` silently returns the first user when no name matches, and `find_user` raises IndexError on an empty list.
+
+**Found only by grok-reviewer**
+- Line 9: `u["name"]` assumes every element is a mapping with a `"name"` key. A missing key raises KeyError and a non-mapping element raises TypeError, aborting the search before later matches are considered.
+
+**Found only by gpt-reviewer**
+- None.
+
 PARENT MODEL: claude-fable-5-1[1m]
 ```
 
@@ -162,8 +188,8 @@ rounds (disagreements sent back to each reviewer) are more prompts in the same p
 
 ## Receipt
 
-- 2026-10-08, llmux 0.2.24 preview `2026-10-08-0306-f95dcb75dd51`, parent
-  `claude-fable-5-1[1m]`, agents `gpt-6-astra[1m]` and `grok-4.7`.
+- 2026-10-08, llmux 0.2.24 preview `2026-10-08-0306-f95dcb75dd51`, Claude Code
+  2.1.294, parent `claude-fable-5-1[1m]`, agents `gpt-6-astra[1m]` and `grok-4.7`.
 - Command, transcript excerpt, activity rows: [Step 3](#step-3--three-models-one-change);
   Claude Code result: success, 7 turns, 183 s.
 - A headless `-p` run of the same Claude Code client; GUI clicks were not recorded.

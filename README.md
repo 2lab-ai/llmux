@@ -69,20 +69,29 @@ Then ask, for example:
 Have gpt-reviewer review sample.py, then summarize what it found.
 ```
 
-Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim excerpt:
+Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim from its first reviewer heading to the end (one opening sentence about where it saved its notes is omitted):
 
-```text
-gpt-reviewer
-MODEL: gpt-6-astra[1m]
+```markdown
+**gpt-reviewer**
+```
+MODEL: gpt-6-astra[1m] (as identified by the runtime instructions)
 VERDICT: REQUEST_CHANGES
+```
 
-grok-reviewer
+**grok-reviewer**
+```
 MODEL: grok-4.7
 VERDICT: REQUEST CHANGES — empty-input crashes and a silent wrong-user fallback make both functions unsafe to call as written.
+```
 
-Shared findings. Both reviewers flagged the same three defects: average divides by zero on empty input, find_user silently returns the first user when no name matches, and find_user raises IndexError on an empty list.
-Found only by grok-reviewer: Line 9: u["name"] assumes every element is a mapping with a "name" key. A missing key raises KeyError and a non-mapping element raises TypeError.
-Found only by gpt-reviewer: None.
+**Shared findings.** Both reviewers flagged the same three defects: `average` divides by zero on empty input, `find_user` silently returns the first user when no name matches, and `find_user` raises IndexError on an empty list.
+
+**Found only by grok-reviewer**
+- Line 9: `u["name"]` assumes every element is a mapping with a `"name"` key. A missing key raises KeyError and a non-mapping element raises TypeError, aborting the search before later matches are considered.
+
+**Found only by gpt-reviewer**
+- None.
+
 PARENT MODEL: claude-fable-5-1[1m]
 ```
 
@@ -122,7 +131,7 @@ This is project configuration (two agent files and a prompt), not a bundled llmu
 
 Did the field I set reach the model? Which leg returned the error? What did the provider say before translation?
 
-The raw request viewer records four legs for each request: the client request, the rewritten upstream request, the verbatim upstream response, and the response delivered to the client. You can copy a request as curl with credentials redacted; bodies may still contain prompts. For Claude through Codex, the upstream legs record the SDK bridge transport, not private Anthropic HTTP.
+For a translated Codex or Grok exchange the raw request viewer records four legs: the client request, the rewritten upstream request, the verbatim upstream response, and the response delivered to the client. A byte-identical Claude passthrough shows two. You can copy a request as curl with credentials redacted; bodies may still contain prompts. For Claude through Codex, the upstream legs record the SDK bridge transport, not private Anthropic HTTP.
 
 Guide: [the accidental AI debugger](docs/ai-debugger.md).
 

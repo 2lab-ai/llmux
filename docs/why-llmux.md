@@ -26,11 +26,13 @@ None of this changes your Claude Code setup. Tools, permissions, hooks, project 
 
 `llmux run --codex` points Codex CLI at the same accounts. llmux does not synchronize settings, hooks or skills between Claude Code and Codex CLI. A shared configuration across CLIs is an idea under consideration, not a shipped feature.
 
-## 7. Bonus: one daemon for several computers, and a raw request view
+## 7. Bonus: one daemon for several computers
 
 You can run one central daemon on a main computer and use your other computers as clients. Each client gets an issued key, so usage is attributed per computer. See [remote.md](remote.md).
 
-For experts, the raw request viewer shows exactly what reached each model. See [ai-debugger.md](ai-debugger.md).
+## 8. For experts: see exactly what reached each model
+
+The raw request viewer shows each request as it left the client, as llmux rewrote it, as the provider answered, and as the client received it. It is its own entry point; you do not need the rest of this ladder to use it. See [ai-debugger.md](ai-debugger.md).
 
 ## The bet
 
