@@ -77,8 +77,8 @@ tracked for stable.
 Additions to the command matrix and the probe/auth rules above. The text above is unchanged.
 
 - `env --codex`: prints `OPENAI_BASE_URL` / `OPENAI_API_KEY` for the selected endpoint
-  (local or remote) and the explicit Codex provider command. As of 2026-10-08 it is only
-  on the preview channel; stable 0.2.24 does not have it.
+  (local or remote) and the explicit Codex provider command. On stable since v0.2.25
+  (2026-10-08); stable 0.2.24 did not have it.
 - `channel` / `update`: still LOCAL in remote mode. They manage this machine's binary.
 - Scopes: an issued `default` key reaches the data plane only (`/v1/*`, `/models`).
   `dashboard`, `status` and `accounts` read `/llmux/*`, so they need an admin-scope
