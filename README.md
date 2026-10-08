@@ -1,104 +1,176 @@
 # llmux
 
-**Models change every month. Your harness shouldn't.**
+**Several Claude subscriptions. How much is left, at a glance.**
+
+Then let Claude, GPT and Grok work in the same Claude Code session.
 
 <p align="center">
-  <a href="#install">install</a> · <a href="#quick-start">quick start</a> · <a href="#switching-models">models</a> · <a href="docs/README.md">docs</a> · <a href="docs/remote.md">remote daemon</a> · <a href="docs/llmux-islands.md">islands</a>
+  <a href="#start-with-islands">islands</a> · <a href="#claude-implements-gpt-reviews--inside-the-same-claude-code">claude + gpt</a> · <a href="#see-what-was-actually-sent-to-the-model">raw traffic</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
 </p>
 
 ---
 
-![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
+![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with 5h/7d usage bars and reset timers](screenshots/llmux-islands-workspace.png)
 
-**Keep your harness, change your model.** llmux is a local proxy for Claude Code and Codex CLI, with Anthropic Messages and OpenAI Responses endpoints. The selected client talks to `http://localhost:3456`; llmux chooses the account/backend. Your client keeps its own tools, permissions and project conventions while `/model fable`, `/model gpt-5.6-sol` and `/model grok-4.7` select the backend. llmux does not synchronize settings between the two clients.
+<sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
-- **Claude Code or Codex frontend** — `llmux run --codex` launches Codex against the OpenAI Responses endpoint, with a catalog picker and Claude Agent SDK routing ([Codex guide →](docs/codex-frontend/README.md)). Claude-through-Codex requires Node.js/npm on the daemon; SDK controls differ from native Messages.
+llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts.
 
-- **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and launchers for Claude Code (`llmux run`) and Codex (`llmux run --codex`)
-- **four backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), OpenRouter (`or-*` / free models on an OpenRouter key), routed by model name ([models →](docs/models.md))
-- **multi-account scheduling** — quota-aware perishability scoring or sticky round-robin, 429 cooldown parking, Fable weekly ceilings ([schedulers →](docs/schedulers.md))
-- **DevTools for your agent's model traffic** — live per-request receipts, a raw request/response viewer with explicit SDK transport boundaries, copy-as-curl ([the accidental AI debugger →](docs/ai-debugger.md))
-- **remote-first** — one central daemon, every other machine a pure client, with per-machine multi-tenant keys ([remote daemon →](docs/remote.md))
-- **llmux Islands** — native macOS menu-bar/notch companion, plus a KDE/Qt port ([islands →](docs/llmux-islands.md))
-
-The bet behind it — the model is a consumable, the harness is capital — is in [why llmux exists](docs/why-llmux.md). The complete feature list lives in [what ships today](docs/features.md).
-
-## install
+## Start with Islands
 
 ```bash
-brew install 2lab-ai/tap/llmux
+brew install --cask 2lab-ai/tap/llmux-islands-preview   # installs the app and the preview CLI
 ```
 
-Rolling preview channel:
+1. Open **llmux Islands**.
+2. Choose **Connect your first account** and sign in. Repeat for each subscription.
+3. See the remaining usage and reset time for each account.
+
+Optional: under **Start coding**, pick Claude Code or Codex, choose a project folder, then **Open in Terminal** (or **Copy command**).
+
+Guide: [llmux Islands](docs/llmux-islands.md).
+
+Use the preview cask for now: the first-run screens and the Start coding launcher are preview-only, and the stable 0.2.24 app sends local control requests without the admin credential the stable daemon requires, so the stable app cannot read a stable daemon on the same machine ([release availability](docs/operational-reference.md#release-availability)).
+
+Already on stable? Run `llmux channel preview`; the switch is mirrored onto the Islands cask.
+
+## Claude implements, GPT reviews — inside the same Claude Code
+
+Claude Code can delegate to custom agents, and a custom agent accepts a full model ID in its `model:` field ([Claude Code docs: choose a model](https://code.claude.com/docs/en/sub-agents#choose-a-model)). llmux routes that ID by name. Point an agent at a GPT model and its requests go to your Codex (ChatGPT) account while the parent session stays on Claude.
+
+Add a Codex account:
 
 ```bash
-brew install 2lab-ai/tap/llmux-preview
+llmux login --codex
 ```
 
-Optional native macOS companion (the KDE port is a [source build](llmux-islands-linux/README.md)):
+Add `.claude/agents/gpt-reviewer.md` to your project:
 
-```bash
-brew install 2lab-ai/tap/llmux-islands
+```markdown
+---
+name: gpt-reviewer
+description: Independent code reviewer running on GPT. Use for a second-opinion review of a file or diff.
+model: gpt-6-astra[1m]
+tools: Read
+---
+Read the file you are given, list concrete defects with line numbers, and end with
+one line: VERDICT: <APPROVE|REQUEST_CHANGES>.
 ```
 
-Build from source:
+Start Claude Code through llmux:
 
 ```bash
-git clone https://github.com/2lab-ai/llmux && cd llmux
-just build    # cargo build --release --locked
+llmux run -- --model fable
 ```
 
-## quick start
+Then ask, for example:
 
-Add accounts:
+```text
+Have gpt-reviewer review sample.py, then summarize what it found.
+```
+
+Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim from its first reviewer heading to the end (the opening lines before that heading are omitted):
+
+```markdown
+**gpt-reviewer**
+```
+MODEL: gpt-6-astra[1m] (as identified by the runtime instructions)
+VERDICT: REQUEST_CHANGES
+```
+
+**grok-reviewer**
+```
+MODEL: grok-4.7
+VERDICT: REQUEST CHANGES — empty-input crashes and a silent wrong-user fallback make both functions unsafe to call as written.
+```
+
+**Shared findings.** Both reviewers flagged the same three defects: `average` divides by zero on empty input, `find_user` silently returns the first user when no name matches, and `find_user` raises IndexError on an empty list.
+
+**Found only by grok-reviewer**
+- Line 9: `u["name"]` assumes every element is a mapping with a `"name"` key. A missing key raises KeyError and a non-mapping element raises TypeError, aborting the search before later matches are considered.
+
+**Found only by gpt-reviewer**
+- None.
+
+PARENT MODEL: claude-fable-5-1[1m]
+```
+
+In the Activity feed the review is a `subagent` row: model `gpt-6-astra`, group `codex`, served by your Codex account, HTTP 200. The parent turns stay in group `claude`. Claude Code prints an `unrecognized_model` warning for IDs it does not know, then sends the request anyway.
+
+Details: [multi-model agents](docs/multi-model-agents.md).
+
+## Add Grok: three models review the same change
 
 ```bash
-llmux login           # Claude subscription OAuth; repeat once per account
-llmux login --api     # optional: Anthropic API key
-llmux login --codex   # optional: Codex / ChatGPT subscription
-llmux login --grok    # optional: Grok / xAI (device-code flow)
+llmux login --grok
+```
+
+Add `.claude/agents/grok-reviewer.md` with the same body as `gpt-reviewer`:
+
+```markdown
+---
+name: grok-reviewer
+description: Independent code reviewer running on Grok. Use for a third-opinion review of a file or diff.
+model: grok-4.7
+tools: Read
+---
+```
+
+Ask Claude to send the same change to both reviewers and collect where they disagree. Claude writes the code, GPT and Grok review it, and the disagreements tell you where to look. In the receipt above, only `grok-reviewer` flagged the unguarded `u["name"]` lookup on line 9. Its request appeared as a `subagent` row with model `grok-4.7`, group `grok`, served by a Grok account.
+
+This is project configuration (two agent files and a prompt), not a bundled llmux command.
+
+## What makes it work
+
+- **Account choice before reset.** Within one provider group, an account must pass eligibility gates first (auth, pause, 429 cooldown, 5h ≤ 0.90, 7d ≤ 0.99, fresh usage). The `default` mode then scores servable headroom × urgency (urgency rises up to 4× as the 7-day reset nears) and switches only when another account scores more than 25% higher, so it prefers quota that would otherwise expire unused. `round-robin` never switches proactively. [Schedulers](docs/schedulers.md).
+- **Keep your harness, change the model.** Claude Code keeps its own tools, permissions and project conventions. `/model fable`, `/model gpt-6-astra[1m]` or `/model grok-4.7` selects the backend. [Why llmux exists](docs/why-llmux.md).
+- **Codex CLI too.** `llmux run --codex` launches Codex against the same account pool and routing. Claude models on that path need Node.js 18+ and npm on the daemon host. llmux does not synchronize settings, hooks or skills between Claude Code and Codex. [Codex frontend](docs/codex-frontend/README.md).
+- **One daemon for several computers (optional).** Manage accounts on one computer and connect other computers over a trusted overlay such as Tailscale or WireGuard. Issued per-computer keys attribute usage to each computer. The CLI uses plain HTTP; the Islands app requires HTTPS for non-loopback endpoints. [Remote daemon](docs/remote.md).
+
+## See what was actually sent to the model
+
+Did the field I set reach the model? Which leg returned the error? What did the provider say before translation?
+
+For a translated Codex or Grok exchange the raw request viewer records four legs: the client request, the rewritten upstream request, the verbatim upstream response, and the response delivered to the client. A byte-identical Claude passthrough shows two. You can copy a request as curl with credentials redacted; bodies may still contain prompts. For Claude through Codex, the upstream legs record the SDK bridge transport, not private Anthropic HTTP.
+
+Guide: [the accidental AI debugger](docs/ai-debugger.md).
+
+## Install
+
+| You want | Command | Channel |
+| --- | --- | --- |
+| Islands app + CLI | `brew install --cask 2lab-ai/tap/llmux-islands-preview` | preview (rolling) |
+| CLI only | `brew install 2lab-ai/tap/llmux` | stable (0.2.24, 2026-10-07) |
+| CLI only, latest | `brew install 2lab-ai/tap/llmux-preview` | preview (rolling) |
+| Build from source | `git clone https://github.com/2lab-ai/llmux && cd llmux && just build` | your checkout |
+
+The preview cask depends on the preview formula and conflicts with the stable `llmux-islands` cask. Switch an existing install with `llmux channel preview` or `llmux channel stable`; the switch is mirrored onto the Islands cask. What ships on which channel: [release availability](docs/operational-reference.md#release-availability). The KDE port of Islands is a [source build](llmux-islands-linux/README.md). `just build` runs `cargo build --release --locked`.
+
+From the terminal:
+
+```bash
+llmux login               # Claude subscription OAuth; repeat once per account
+llmux login --api         # optional: Anthropic API key
+llmux login --codex       # optional: Codex / ChatGPT subscription
+llmux login --grok        # optional: Grok / xAI (device-code flow)
 llmux login --openrouter  # optional: OpenRouter (browser PKCE; --paste for an existing key)
-llmux import          # or import supported local credential stores
+llmux import              # or import supported local credential stores
+
+llmux run                 # starts/reuses the daemon, then launches claude; args after -- pass through
+llmux run --codex         # same daemon, Codex CLI (install Codex on the client)
+llmux server              # foreground TUI dashboard
 ```
 
-Already looking at the dashboard? `n` opens a provider picker for the same four browser logins (Claude / Codex / Grok / OpenRouter) — the flow runs in the client and the credential is injected into the daemon, so it works attached to a remote one too.
+In the dashboard, `n` opens a provider picker for the same four browser logins. Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` (preview) prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
 
-Run Claude Code through llmux:
-
-```bash
-llmux run             # starts/reuses the daemon, then launches claude
-alias lx='llmux run'  # a convenient alias; args after -- pass through to claude
-```
-
-Inside that session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
-
-Or run Codex CLI through the same daemon (install Codex on the client):
-
-```bash
-llmux run --codex
-llmux run --codex -- exec -m haiku 'Run the tests and explain failures'
-```
-
-Claude models through Codex require Node.js 18+ and npm on the **daemon host**; the first request installs the pinned SDK automatically. `login --codex` adds a ChatGPT account; `run --codex` chooses the client and also works with only Claude accounts. See the [Codex frontend guide](docs/codex-frontend/README.md).
-
-Want the foreground TUI dashboard instead:
-
-```bash
-llmux server
-```
-
-Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`.
-For Codex, `llmux env --codex` prints OpenAI-compatible exports and the explicit
-provider command required after `eval`; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
-
-## switching models
+## Switching models
 
 The incoming model name selects the backend in either client. For example, inside Claude Code:
 
 ```text
 /model fable
 /model opus[1m]
-/model gpt-5.6-sol[1m]
+/model gpt-6-astra[1m]
 /model grok-4.7
 /model or-ox-alpha
 ```
@@ -110,7 +182,11 @@ The incoming model name selects the backend in either client. For example, insid
 | `grok` / `grok-*` | Grok accounts |
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
 
-`haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
+Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or).
+
+Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
+
+Preview: `haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
@@ -124,7 +200,7 @@ Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [doc
 >
 > A translated response that lost something names it in `X-Llmux-Omitted-Fields` / `X-Llmux-Compatibility-Warnings` (a faithful one carries neither header); send `X-Llmux-Compatibility: strict` to turn any such loss into a 400 instead. Full matrix, receipts and known unknowns: [docs/provider-compatibility.md](docs/provider-compatibility.md).
 
-## update
+## Update
 
 ```bash
 llmux channel            # print the current channel (stable | preview)
@@ -134,24 +210,25 @@ llmux channel preview    # switch channels (mirrored onto the llmux-islands cask
 
 Details: [channels and updating](docs/operational-reference.md#channels-and-updating).
 
-## docs
+## Docs
 
+- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion
+- [multi-model agents](docs/multi-model-agents.md) — Claude Code custom agents on GPT and Grok models, with a live receipt
+- [the accidental AI debugger](docs/ai-debugger.md) — per-request receipts, raw request/response viewer, copy-as-curl, email masking
 - [docs index](docs/README.md) — map of all guides
 - [why llmux exists](docs/why-llmux.md) — the harness-is-capital bet
 - [what ships today](docs/features.md) — the complete feature list
-- [the accidental AI debugger](docs/ai-debugger.md) — per-request receipts, raw request/response viewer, copy-as-curl, email masking
 - [remote daemon](docs/remote.md) — one central daemon, remote-mode command matrix, transport security
 - [schedulers](docs/schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a mode
-- [operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, multi-tenant keys
+- [operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, release availability, per-computer client keys
 - [Codex frontend](docs/codex-frontend/README.md) — launch, SDK requirements, tools, HTTP and endpoint activity
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
 - [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok, diagnostic headers
-- [FAQ](docs/faq.md) — context-window workarounds (`gpt-*` → Claude 1M `/compact` → back)
-- [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion
+- [FAQ](docs/faq.md) — seeing what is left per account, subagents on GPT or Grok, what needs preview, context-window workarounds
 - [system prompts (multi-model)](docs/system-prompts/README.md) — real captured wire system prompts
 
-## compliance & caveats
+## Compliance & caveats
 
 llmux is for **one human using their own accounts** — no credential pooling, no resale.
 
@@ -162,10 +239,10 @@ llmux is for **one human using their own accounts** — no credential pooling, n
 
 Product intent — what llmux is, what it bets on, and what it refuses — is fixed in [`.prd/`](.prd/).
 
-## agent instructions
+## Agent instructions
 
 If you are an AI agent working on this repository, read [`AGENTS.md`](AGENTS.md) before making changes.
 
-## license
+## License
 
 MIT.

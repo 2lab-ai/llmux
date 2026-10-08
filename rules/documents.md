@@ -15,16 +15,22 @@ feature is incomplete.
 | --- | --- |
 | Product story, install, quick start, high-level “what ships” | [`README.md`](../README.md) |
 | Commands, TUI keys, daemon/dashboard, scheduling policy, Codex backend behavior | [`docs/operational-reference.md`](../docs/operational-reference.md) |
+| Which user-visible features are on stable vs preview (release availability) | [`docs/operational-reference.md#release-availability`](../docs/operational-reference.md#release-availability) (+ the README install table when a channel changes) |
 | Config file keys, proxy/scheduler/routing/account types | [`docs/configuration.md`](../docs/configuration.md) |
 | Context-window / common usage Q&A | [`docs/faq.md`](../docs/faq.md) |
 | Model catalog / aliases / `max_context` | [`docs/models.md`](../docs/models.md) |
 | **Provider/model integration, or any change to what a backend honors / drops / refuses** | [`docs/provider-compatibility.md`](../docs/provider-compatibility.md) (+ a [`README.md`](../README.md) caveat when the difference is material to a user picking a model) |
-| Islands menu-bar app behavior | [`docs/llmux-islands.md`](../docs/llmux-islands.md) |
+| Islands app behavior, install channel and first-launch onboarding | [`docs/llmux-islands.md`](../docs/llmux-islands.md) |
+| Native multi-model agents in Claude Code (per-agent `model:` recipe, verification, limits) | [`docs/multi-model-agents.md`](../docs/multi-model-agents.md) |
+| Remote daemon scope: transport, key scopes, Islands HTTPS rule, per-computer attribution | [`docs/remote.md`](../docs/remote.md) |
+| Raw request viewer as the expert entry (what reached the model, copy as curl, boundaries) | [`docs/ai-debugger.md`](../docs/ai-debugger.md) |
 | Captured Claude Code / multi-model **system prompt** wire text | [`docs/system-prompts/`](../docs/system-prompts/) — especially [`samples/`](../docs/system-prompts/samples/); never replace real samples with meta-only prose |
 | Product/architecture *decisions* (not how-to) | [`.prd/`](../.prd/) |
 | Grok provider STV design notes | [`docs/grok/`](../docs/grok/) (design artifact; not a user how-to) |
 | OpenRouter provider STV design notes | [`docs/openrouter/`](../docs/openrouter/) (design artifact; not a user how-to) |
 | Agent architecture rules / conventions / runbooks | [`AGENTS.md`](../AGENTS.md) |
+
+A feature that ships on one channel only must say so in its owning doc and in the release-availability table in the same PR.
 
 When unsure, update the narrowest row that a new user would open to understand
 the change. Prefer one owning doc over shotgun edits.

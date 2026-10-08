@@ -4,15 +4,18 @@
 
 The app does not read `~/.config/llmux.json` or provider credentials. It asks the installed llmux CLI for an endpoint-bound local control key through a private pipe, keeps it only in the HTTP executor, and reads usage from the daemon. Remote connections use their explicitly configured control key.
 
-![llmux Islands demo](../screenshots/llmux-islands-demo.gif)
+![llmux Islands workspace with four accounts, 5-hour and 7-day usage bars, reset timers, and the Start coding row](../screenshots/llmux-islands-workspace.png)
 
-[Original llmux Islands screen recording](../screenshots/llmux-islands-demo.mov)
+*Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.*
+
+Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-demo.gif), [original MOV](../screenshots/llmux-islands-demo.mov)
 
 ## What it shows
 
 - Per-account Claude / Codex / Grok / API-key usage from the llmux daemon.
 - 5-hour and 7-day quota windows with reset timing.
 - Token/auth health and degraded accounts.
+- A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
 - A closed floating island label:
 
 ```text
@@ -59,6 +62,7 @@ daemon, or persist state.
 ## Requirements
 
 - macOS 14 or later and llmux installed on the same computer.
+- llmux CLI from the same release channel as the app (the preview cask installs it).
 - Claude Code or Codex installed to launch that coding app from Islands.
 - An existing Claude, ChatGPT, Grok or API-key account to connect.
 
@@ -72,12 +76,30 @@ Agent SDK; see [Codex frontend prerequisites](codex-frontend/README.md).
 ## Install
 
 ```bash
-brew install 2lab-ai/tap/llmux-islands
+brew install --cask 2lab-ai/tap/llmux-islands-preview
 ```
+
+Use the preview channel: the setup screens and launcher below shipped on preview
+on 2026-10-07; stable 0.2.24 predates them. The preview cask depends on the
+`llmux-preview` formula, so it installs the matching CLI. Preview versions are
+rolling date versions that change with every main push (2026-10-08.0306 as of
+2026-10-08).
+
+Already on stable? Run `llmux channel preview`. It switches the CLI formula and
+mirrors the Islands cask. Do not install both casks; the preview cask conflicts
+with the stable `llmux-islands` cask.
 
 Then launch `LlmuxIslands.app` from Applications, Spotlight, or Finder.
 
+### Stable channel
+
+Stable 0.2.24 (`brew install 2lab-ai/tap/llmux-islands`) shows the UI from before the renewal and cannot authenticate local control: the app adds `x-api-key` only to remote requests, while the daemon requires an admin credential on `/llmux/*` even from loopback.
+A stable install therefore does not reach the screens described below. This is confirmed from the 0.2.24 source, not reproduced in a running app.
+Per-channel status: [Release availability](operational-reference.md#release-availability).
+
 ## First launch
+
+These steps apply to the preview channel.
 
 Open the floating notch at the top of your screen by clicking or hovering over it.
 An empty or unavailable workspace opens setup once at launch. The screen separates
@@ -89,6 +111,8 @@ connecting, ready with no accounts, connection failure, and connected accounts.
    project folder**. Folder selection starts no process.
 3. Choose **Open in Terminal**. A new Terminal session runs `llmux run` or
    `llmux run --codex` in that folder. **Copy command** is an alternative.
+
+After the first account appears, the tiles show each account's 5-hour and 7-day usage with reset timers — this is the view most people install Islands for.
 
 The app reports Terminal dispatch, not a completed model request. Missing tools
 have a copyable installation command. A Terminal permission refusal leaves the
@@ -177,9 +201,16 @@ The app capture needs a one-time macOS **Screen Recording** grant for the termin
 
 ## Remote daemon
 
-Local control requests are authenticated too. The private CLI handoff returns only the control key for the matching configured proxy port; it refuses a remote CLI configuration. The key never enters view state, saved app preferences, logs, or clipboard. HTTP 401/403 means the daemon is already running and does not trigger a spawn/restart.
+Local control requests are authenticated too. The private CLI handoff returns only the control key for the matching configured proxy port; it refuses a remote CLI configuration. Both the app and the CLI must come from the preview channel for this handoff. The key never enters view state, saved app preferences, logs, or clipboard. HTTP 401/403 means the daemon is already running and does not trigger a spawn/restart.
 
-For a remote daemon, configure HTTPS host/port and its control `x-api-key` in **Connection settings**. A stored remote key is bound to that endpoint: changing host/port requires an explicit replacement, and switching to local discards it. Redirects remain denied.
+A remote connection needs two things you provide:
+
+- **An HTTPS endpoint.** This is the app's own rule: any non-loopback endpoint must use HTTPS, HTTP is allowed only for loopback, and redirects are denied. llmux does not terminate TLS; the CLI's remote mode is plain HTTP over a trusted overlay. Put an HTTPS reverse proxy in front of the remote daemon.
+- **An admin-scope key.** Control reads such as dashboard and status require admin scope; keys issued by default are data-plane only and fail here.
+
+Configure the HTTPS host/port and that control `x-api-key` in **Connection settings**. A stored remote key is bound to that endpoint: changing host/port requires an explicit replacement, and switching to local discards it.
+
+Project launch is local only. Remote users launch their existing CLI with their configured remote connection.
 
 Do not expose mutating llmux endpoints to an untrusted network without the API key.
 
@@ -187,12 +218,16 @@ Do not expose mutating llmux endpoints to an untrusted network without the API k
 
 ### The island cannot connect
 
-Use **Retry** or **Connection settings**. If the private local helper is missing,
-use **Copy update command** to update both llmux and Islands on the app’s release
-channel (preview date version or stable version). Source builds require rebuilding
-the matching CLI too. Keep the app port
-equal to `proxy.port` in the CLI configuration; a mismatch fails closed. Do not
-restart merely because the daemon returned 401/403. For manual diagnosis:
+- Installed the stable cask? Local control needs the preview app and CLI; run `llmux channel preview`.
+- Use **Retry** or **Connection settings**.
+- If the private local helper is missing, use **Copy update command** to update
+  both llmux and Islands on the app’s release channel (preview date version or
+  stable version). Source builds require rebuilding the matching CLI too.
+- Keep the app port equal to `proxy.port` in the CLI configuration; a mismatch
+  fails closed.
+- Do not restart merely because the daemon returned 401/403.
+
+For manual diagnosis:
 
 ```bash
 llmux restart

@@ -71,3 +71,23 @@ tracked for stable.
   docs bundled by the old branch (review MUST-FIX #3); left on `feat/cli-remote-daemon`.
 - Kept from the old branch: the src changes, README section (rewritten), preview.yml tap
   auto-dispatch, `.gitignore` dist-backup line.
+
+## Delta 2026-10-08 — commands and scopes since this PRD
+
+Additions to the command matrix and the probe/auth rules above. The text above is unchanged.
+
+- `env --codex`: prints `OPENAI_BASE_URL` / `OPENAI_API_KEY` for the selected endpoint
+  (local or remote) and the explicit Codex provider command. As of 2026-10-08 it is only
+  on the preview channel; stable 0.2.24 does not have it.
+- `channel` / `update`: still LOCAL in remote mode. They manage this machine's binary.
+- Scopes: an issued `default` key reaches the data plane only (`/v1/*`, `/models`).
+  `dashboard`, `status` and `accounts` read `/llmux/*`, so they need an admin-scope
+  credential: an issued key created with `--admin`, or the daemon's `proxy.api_key`.
+  Loopback is not a privilege.
+- Islands: the app requires HTTPS for non-loopback endpoints and denies redirects. This is
+  an app rule; llmux does not terminate TLS. A remote Islands connection therefore needs an
+  HTTPS reverse proxy in front of the daemon plus an admin-scope key. CLI remote mode stays
+  plain HTTP over a trusted overlay (see Transport constraint).
+- Positioning: the one-daemon/many-clients topology is documented as an optional bonus,
+  with usage attributed per computer. It is not the default setup and not a marketing
+  claim (user steering 2026-10-08).

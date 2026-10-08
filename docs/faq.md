@@ -1,39 +1,47 @@
 # FAQ
 
-## `gpt-5.5` stops around 265k context. What should I do?
+## I have several Claude subscriptions. How do I see what is left on each?
 
-Use a Claude 1M-context model for compaction, then switch back to `gpt-5.5[1m]`.
+Run `llmux login` once per account. Islands, the macOS notch app, then shows each account's 5-hour and 7-day windows with their reset timers. As of 2026-10-08, Islands is on the preview channel:
 
-A practical sequence inside Claude Code:
-
-```text
-/model opus[1m]      # or /model sonnet[1m]
-/compact
-/model gpt-5.5[1m]
+```bash
+brew install --cask 2lab-ai/tap/llmux-islands-preview
 ```
 
-Why this helps:
+The TUI (`llmux dashboard`) shows the same windows. See [llmux-islands.md](llmux-islands.md).
 
-- `gpt-5.5` routing is handled by llmux, but Claude Code still owns local context accounting and compaction behavior.
-- In long sessions, Claude Code can block a `gpt-5.5` session around the mid-200k range, even when `gpt-5.5[1m]` is selected.
-- Switching temporarily to a Claude model with a 1M context window gives Claude Code a known large-window model for `/compact`.
-- After compaction reduces the active transcript, switching back to `gpt-5.5[1m]` continues routing through llmux to the Codex group.
+## Can a Claude Code subagent run on GPT or Grok?
 
-The ~265k cutoff is empirical client behavior, not an llmux routing limit. The `[1m]` suffix improves Claude Code's context-window display, but it does not guarantee every un-compacted long transcript will be accepted unchanged.
+Yes. Set `model: gpt-6-astra[1m]` (or `model: grok-4.7`) in a `.claude/agents/<name>.md` file. When Claude Code runs under `llmux run`, that agent's requests are routed by the model id to your Codex or Grok account, and the result returns to the parent. Measured 2026-10-08.
 
-This does not change your llmux account configuration. It is a Claude Code session-management workaround.
+Claude Code prints an `unrecognized_model` warning for non-Claude ids. The request is still sent.
 
-## Why does `[1m]` matter in `/model gpt-5.5[1m]`?
+See [multi-model-agents.md](multi-model-agents.md).
 
-Claude Code derives its displayed context window from the model-name string. Bare `gpt-5.5` can be treated as an unknown or smaller-window model by the client. The `[1m]` suffix tells Claude Code to use a 1M context display while llmux still routes the request by the `gpt-` prefix.
+## Does llmux switch me to GPT when my Claude quota runs out?
 
-llmux strips one trailing `[1m]` before resolving the codex model, so the suffix never reaches upstream and works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`). `gpt-5.6-sol[1m]` and `gpt-5.6-terra[1m]` are also catalog rows advertising a 1000000 window — probed 2026-08-21 at 910,229 input tokens accepted / ~936k rejected against the ChatGPT-account backend (OpenAI publishes 1,050,000 total for the gpt-5.6 family). `gpt-5.5` is a 272k model, so `gpt-5.5[1m]` remains a display-only workaround.
+No. The scheduler chooses among accounts in the same provider group: for a Claude model, that means your Claude accounts. Within that group it prefers quota that would otherwise expire unused, and it stays sticky to an account for prompt-cache locality.
 
-See [operational-reference.md](operational-reference.md#context-window-display-for-codex-models) for the routing details, and [models.md](models.md#the-codex-1m-rows) for the catalog rows.
+Moving to another provider is always your explicit choice, through `/model` or an agent's `model:` line. See [schedulers.md](schedulers.md).
 
-## Does `gpt-5.5[1m]` still route to Codex?
+## Does llmux keep Claude Code and Codex settings, hooks or skills in sync?
 
-Yes. The `gpt-` prefix still matches the Codex group. llmux strips the display suffix for routing and usage attribution.
+No. Each client keeps its own configuration; llmux routes model traffic only. A shared cross-CLI configuration is an idea, not a shipped feature.
+
+## Which features need the preview channel?
+
+As of 2026-10-08, these need the preview channel:
+
+- Islands setup screens and launcher
+- authenticated local control between the Islands app and the daemon
+- `llmux env --codex`
+- the Haiku 5.5 row
+
+Stable 0.2.24 has `llmux run`, `llmux run --codex`, schedulers, the raw viewer and remote mode. See [operational-reference.md](operational-reference.md#release-availability).
+
+## Is this a trinity / consensus feature?
+
+llmux ships no review command. Three-model review is project configuration: two agent files (`gpt-reviewer`, `grok-reviewer`) plus a prompt that asks the parent Claude session, the third model, to collect the disagreements. See [multi-model-agents.md](multi-model-agents.md).
 
 ## Does llmux replace Claude Code?
 
@@ -54,3 +62,38 @@ Known SDK organization, account-hold, verification and billing restrictions excl
 ## Is llmux for sharing accounts across a team?
 
 No. llmux is for one human using their own accounts. It is not for credential pooling, resale, or shared subscription brokerage.
+
+## `gpt-5.5` stops around 265k context. What should I do?
+
+Observed 2026-08. Use a Claude 1M-context model for compaction, then switch back to `gpt-5.5[1m]`.
+
+A practical sequence inside Claude Code:
+
+```text
+/model opus[1m]      # or /model sonnet[1m]
+/compact
+/model gpt-5.5[1m]
+```
+
+Why this helps:
+
+- `gpt-5.5` routing is handled by llmux, but Claude Code still owns local context accounting and compaction behavior.
+- In long sessions, Claude Code can block a `gpt-5.5` session around the mid-200k range, even when `gpt-5.5[1m]` is selected.
+- Switching temporarily to a Claude model with a 1M context window gives Claude Code a known large-window model for `/compact`.
+- After compaction reduces the active transcript, switching back to `gpt-5.5[1m]` continues routing through llmux to the Codex group.
+
+The ~265k cutoff is empirical client behavior, not an llmux routing limit. `gpt-5.5` is a 272k model, and the `[1m]` suffix is display-only for it. The `[1m]` suffix improves Claude Code's context-window display, but it does not guarantee every un-compacted long transcript will be accepted unchanged.
+
+This does not change your llmux account configuration. It is a Claude Code session-management workaround.
+
+## Why does `[1m]` matter in `/model gpt-5.5[1m]`?
+
+Claude Code derives its displayed context window from the model-name string. Bare `gpt-5.5` can be treated as an unknown or smaller-window model by the client. The `[1m]` suffix tells Claude Code to use a 1M context display while llmux still routes the request by the `gpt-` prefix.
+
+llmux strips one trailing `[1m]` before resolving the codex model, so the suffix never reaches upstream and works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`). `gpt-5.6-sol[1m]` and `gpt-5.6-terra[1m]` are also catalog rows advertising a 1000000 window — probed 2026-08-21 at 910,229 input tokens accepted / ~936k rejected against the ChatGPT-account backend (OpenAI publishes 1,050,000 total for the gpt-5.6 family). `gpt-5.5` is a 272k model, so `gpt-5.5[1m]` remains a display-only workaround.
+
+See [operational-reference.md](operational-reference.md#context-window-display-for-codex-models) for the routing details, and [models.md](models.md#the-codex-1m-rows) for the catalog rows.
+
+## Does `gpt-5.5[1m]` still route to Codex?
+
+Yes. The `gpt-` prefix still matches the Codex group. llmux strips the display suffix for routing and usage attribution.

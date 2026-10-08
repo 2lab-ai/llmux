@@ -9,6 +9,14 @@ llmux run --codex -- exec -m haiku 'Run the tests and explain failures'
 llmux --remote server:3456 run --codex
 ```
 
+Codex is a second client of the same daemon: the same account pool, model routing,
+schedulers and usage history that serve Claude Code serve Codex. `llmux run --codex`
+is available on both release channels; `llmux env --codex` (manual shell wiring) is
+preview-only as of 2026-10-08 — see
+[release availability](../operational-reference.md#release-availability). llmux does
+not synchronize Codex and Claude Code settings, hooks or skills; a shared cross-CLI
+configuration is an idea under consideration, not a shipped feature.
+
 The default `llmux run` still launches Claude Code. Both launchers share daemon
 readiness/version handling, `--force`, remote configuration, account scheduling,
 credential refresh, quota failover, tenant attribution and usage history. Arguments
@@ -68,6 +76,11 @@ verification or billing) exclude that credential and retry the request on anothe
 eligible account before streaming. Expired authentication still uses llmux's normal
 refresh path. Request errors do not disable accounts; see the
 [error mapping](../provider-compatibility.md#claude-agent-sdk-account-errors).
+
+Native cross-model subagents (an agent file with `model: gpt-6-astra[1m]` or
+`grok-4.7`) were measured on the Claude Code frontend — see
+[multi-model agents](../multi-model-agents.md). An equivalent on the Codex frontend
+has not been measured; this guide makes no claim about it.
 
 ## HTTP and activity
 
