@@ -4509,9 +4509,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 41 curated (13 claude + 14 codex + 4 grok + 10 openrouter) + 1
+        // 43 curated (15 claude + 14 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 42);
+        assert_eq!(models.len(), 44);
 
         let by_id = |id: &str| {
             models
@@ -4546,9 +4546,17 @@ mod tests {
         );
         assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
         assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
-        assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(by_id(id)["max_context"], 272_000);
+        }
+        assert_eq!(
+            by_id("claude-haiku-5-5[1m]")["aliases"],
+            serde_json::json!(["haiku", "haiku-5-5"])
+        );
+        assert_eq!(by_id("claude-haiku-5-5[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("claude-haiku-4-5")["aliases"], serde_json::json!([]));
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
-        // no aliases (those stay on the base rows), base sol unchanged.
+        // no aliases (the version alias stays on the base row).
         for id in ["gpt-5.6-sol[1m]", "gpt-5.6-terra[1m]"] {
             assert_eq!(by_id(id)["max_context"], 1_000_000, "{id}");
             assert_eq!(by_id(id)["aliases"], serde_json::json!([]), "{id}");

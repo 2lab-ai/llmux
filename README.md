@@ -110,6 +110,8 @@ The incoming model name selects the backend in either client. For example, insid
 | `grok` / `grok-*` | Grok accounts |
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
 
+`haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
+
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
 > **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** The following caveats describe **incoming Anthropic Messages**: Claude and OpenRouter use native Messages, while Codex and Grok require translation. Incoming **OpenAI Responses** uses native Codex Responses or the Claude Agent SDK, with different controls; see the [frontend transport matrix](docs/provider-compatibility.md#frontend-transport-matrix).

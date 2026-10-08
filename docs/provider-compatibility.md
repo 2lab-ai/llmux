@@ -30,6 +30,23 @@ SDK requests preserve `[1m]`, execute caller tools in the Codex client and rejec
 unsupported sampling/forced-tool controls. Native Codex Responses retains reasoning
 continuity; the Messages translation losses below do not apply universally.
 
+## Haiku 5.5 catalog update
+
+Checked 2026-10-08: `haiku` / `haiku-5-5` resolve to `claude-haiku-5-5[1m]`.
+Native Messages strips `[1m]` on the wire; Responses keeps it for the SDK.
+The [official model page](https://platform.claude.com/docs/en/models/haiku-5-5/overview)
+lists 1M context, 128K output, adaptive thinking, text/image input and tools.
+Native Messages still forwards output caps, thinking, tools/images and sampling
+parameters under the matrix below; Haiku rejects non-default sampling values.
+The Responses SDK path keeps its existing control validation and caller-tool
+execution. Streaming/error handling, usage observation and upstream counting are
+unchanged. Evidence: `provider::anthropic::tests::normalize_body_resolves_haiku_5_5_and_preserves_4_5`,
+`catalog::tests::claude_entries_carry_curated_efforts_and_context` and the
+frontend matrix's implementation paths. These code tests do not establish
+Haiku-specific subscription availability, tool/streaming behavior or its full
+context ceiling; those remain untested by this catalog change. Public API prices
+are references, with [request-tier/TTL limitations](models.md#current-claude-reference-prices).
+
 ## Wire paths (incoming Messages)
 
 | Group | Upstream | Path |
