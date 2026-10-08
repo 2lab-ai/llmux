@@ -191,6 +191,7 @@ impl DashboardView {
             .map(|a| AccountSnapshot {
                 id: AccountId(a.name.clone()),
                 healthy: a.healthy,
+                auth_failure_status: a.auth_failure_status,
                 credential_kind: kind_static(&a.kind),
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
@@ -770,6 +771,30 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn auth_failure_status_survives_attached_dashboard_projection() {
+        for code in [None, Some(404), Some(503)] {
+            let mut json = doc_json();
+            json["accounts"][0]["healthy"] = serde_json::json!(false);
+            if let Some(code) = code {
+                json["accounts"][0]["auth_failure_status"] = serde_json::json!(code);
+            }
+            let doc: DashboardDoc = serde_json::from_value(json).expect("decode old or new daemon");
+            let view = DashboardView::from_doc(&doc);
+            let account = &view.snapshot.accounts[0];
+            assert_eq!(account.auth_failure_status, code);
+            assert_eq!(
+                crate::scheduler::select::blocking_reason(
+                    account,
+                    crate::scheduler::select::IneligibleReason::AuthUnhealthy,
+                    &SelectParams::from(&crate::config::SchedulerConfig::default()),
+                    SystemTime::now()
+                ),
+                code.map_or_else(|| "auth failed".to_string(), |c| format!("{c} auth failed"))
+            );
+        }
     }
 
     #[test]

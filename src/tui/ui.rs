@@ -9394,6 +9394,7 @@ mod tests {
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
@@ -12192,6 +12193,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId(name.clone()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -12371,6 +12373,7 @@ mod tests {
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
                 id: AccountId(name.into()),
                 healthy: true,
+                auth_failure_status: None,
                 credential_kind: kind,
                 group,
                 five_hour: five,
@@ -12477,6 +12480,7 @@ mod tests {
         let acct = |name: &str, kind: &'static str, group, park: Option<u64>| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
@@ -12860,6 +12864,7 @@ mod tests {
         let acct = |name: &str, paused: bool| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -13400,6 +13405,7 @@ mod tests {
         AccountSnapshot {
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -13650,6 +13656,7 @@ mod tests {
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
                 id: AccountId(name.into()),
                 healthy: true,
+                auth_failure_status: None,
                 credential_kind: kind,
                 group,
                 five_hour: five,
@@ -14037,6 +14044,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auth_failure_status_is_visible_in_rendered_account_table() {
+        for code in [404, 503] {
+            let mut view = view_with(Vec::new());
+            let mut account = fable_account();
+            account.healthy = false;
+            account.auth_failure_status = Some(code);
+            view.snapshot.accounts = vec![account];
+            let frame = render(&view, &chrome_overlay(Overlay::None), 160, 35);
+            assert!(frame.contains(&format!("{code} auth failed")), "{frame}");
+        }
+    }
+
     /// An account with NO Fable scope renders the neutral cold state in the Fbl
     /// slot (never a crash/blank), and does not disturb the 5h/7d columns.
     #[test]
@@ -14050,6 +14070,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:cold@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             // Both 5h and 7d populated, so the only cold cell in the row is the
@@ -14111,6 +14132,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -14183,6 +14205,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -14278,6 +14301,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId(LEAK.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,

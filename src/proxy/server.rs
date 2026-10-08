@@ -1561,11 +1561,14 @@ pub async fn background_refresh_pass(state: &AppState) {
                 );
             }
         }
-        forward::RefreshOutcome::Permanent { detail } => {
+        forward::RefreshOutcome::Permanent { detail, status } => {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
-            if state.pool.record_auth_failure_if(&account_id, &fingerprint) {
+            if state
+                .pool
+                .record_auth_failure_if(&account_id, &fingerprint, Some(status))
+            {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
                     message: format!(
@@ -1577,7 +1580,7 @@ pub async fn background_refresh_pass(state: &AppState) {
         // The account was re-credentialed mid-refresh; nothing was written and
         // nothing is wrong — the next tick sees the new token's expiry.
         forward::RefreshOutcome::Superseded => {}
-        forward::RefreshOutcome::Failed => {} // transient — next tick retries
+        forward::RefreshOutcome::Failed { .. } => {} // transient — next tick retries
     }
 }
 
@@ -2170,6 +2173,7 @@ pub fn status_json(
                     "status": status,
                     "order": order + 1,
                     "blocked": blocked,
+                    "auth_failure_status": account.auth_failure_status,
                     "five_hour": window(&account.five_hour),
                     "seven_day": window(&account.seven_day),
                     // Model-scoped weekly windows (additive; null / empty when
@@ -4244,7 +4248,7 @@ mod tests {
     fn status_json_marks_auth_failed_accounts() {
         let now = SystemTime::now();
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&AccountId("a".into()));
+        pool.record_auth_failure(&AccountId("a".into()), None);
         let meta = ServerMeta {
             pid: 1,
             uptime_secs: 0,

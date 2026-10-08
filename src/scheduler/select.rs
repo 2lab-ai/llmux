@@ -1020,7 +1020,10 @@ pub fn blocking_reason(
     now: SystemTime,
 ) -> String {
     match reason {
-        IneligibleReason::AuthUnhealthy => "auth failed".to_string(),
+        IneligibleReason::AuthUnhealthy => account.auth_failure_status.map_or_else(
+            || "auth failed".to_string(),
+            |status| format!("{status} auth failed"),
+        ),
         IneligibleReason::Paused => "paused".to_string(),
         IneligibleReason::CoolingDown => {
             match account
@@ -1265,6 +1268,7 @@ mod tests {
         AccountSnapshot {
             id: AccountId(id.to_string()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,

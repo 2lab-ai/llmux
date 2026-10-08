@@ -712,3 +712,23 @@ Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
 Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
 clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
 restart inside that short window can reuse launch context until a main turn is observed.
+
+### Account authentication failure status
+
+Accounts blocked by authentication or a persistent account error show the HTTP
+status actually observed, for example `401 auth failed`, `404 auth failed`, or
+`503 auth failed`. The same reason appears in `llmux status`, the local/attached
+dashboard, and Islands account details. `/llmux/status` and `/llmux/dashboard`
+retain `status: "auth_failed"` and add nullable `auth_failure_status`; `blocked`
+contains the readable reason. Older daemons and failures without an HTTP response
+continue to show `auth failed`, without an invented status.
+
+A permanent refresh rejection uses the refresh endpoint's status. When an upstream
+401 triggers refresh and that refresh fails, the last HTTP failure status is
+shown; a refresh failure without an HTTP status retains the observed 401. This
+display does not change retry policy: ordinary 404 responses still relay and
+ordinary 503 responses remain transient.
+A successful credential refresh or changed credentials on re-login clear the
+stored failure code; late failures from replaced credentials cannot restore it.
+Only the numeric status is added to account documents, never response bodies or
+credentials.

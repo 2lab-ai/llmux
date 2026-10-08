@@ -949,6 +949,9 @@ pub struct AccountDoc {
     pub order: u64,
     pub blocked: Option<String>,
     pub healthy: bool,
+    /// Optional for documents from older daemons.
+    #[serde(default)]
+    pub auth_failure_status: Option<u16>,
     pub five_hour: Option<WindowDoc>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
@@ -1756,6 +1759,7 @@ pub(crate) fn dashboard_doc(
                 order: pos as u64 + 1,
                 blocked,
                 healthy: account.healthy,
+                auth_failure_status: account.auth_failure_status,
                 five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
@@ -2513,6 +2517,60 @@ mod tests {
             now(),
             &meta(),
         )
+    }
+
+    #[test]
+    fn auth_failure_status_reaches_dashboard_and_status_without_details() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        for code in [
+            None,
+            Some(http::StatusCode::NOT_FOUND),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            pool.record_auth_failure(&AccountId("a".into()), code);
+            let doc = dashboard_doc(
+                &pool.snapshot(),
+                &seeded_hub().view(now()),
+                &UsageTotals::default(),
+                &params(),
+                now(),
+                &meta(),
+            );
+            let expected = code.map_or_else(
+                || "auth failed".to_string(),
+                |c| format!("{} auth failed", c.as_u16()),
+            );
+            let json = serde_json::to_value(&doc).expect("serialize");
+            assert_eq!(
+                json["accounts"][0]["auth_failure_status"],
+                serde_json::json!(code.map(|c| c.as_u16()))
+            );
+            assert_eq!(json["accounts"][0]["blocked"], expected);
+            let decoded: DashboardDoc = serde_json::from_value(json).expect("decode");
+            assert_eq!(
+                decoded.accounts[0].auth_failure_status,
+                code.map(|c| c.as_u16())
+            );
+            let status = crate::proxy::server::status_json(
+                &pool.snapshot(),
+                &UsageTotals::default(),
+                &params(),
+                now(),
+                &crate::proxy::server::ServerMeta {
+                    pid: 1,
+                    uptime_secs: 0,
+                    port: 3456,
+                    email_anonymous: false,
+                    usage_controls: Default::default(),
+                },
+            );
+            assert_eq!(status["accounts"][0]["blocked"], expected);
+            assert_eq!(status["accounts"][0]["status"], "auth_failed");
+            assert_eq!(
+                status["accounts"][0]["auth_failure_status"],
+                serde_json::json!(code.map(|c| c.as_u16()))
+            );
+        }
     }
 
     /// Multi-tenant #22: the doc's tenant rows join hub aggregates with key

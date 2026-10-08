@@ -56,3 +56,16 @@ pub enum AuthError {
     #[error("grok auth data invalid: {0}")]
     GrokAuth(&'static str),
 }
+
+impl AuthError {
+    /// HTTP evidence only; transport/parse failures must not invent a status.
+    pub fn http_status(&self) -> Option<http::StatusCode> {
+        match self {
+            Self::Http(err) => err.status(),
+            Self::TokenEndpoint { status, .. }
+            | Self::RefreshPermanent { status, .. }
+            | Self::ProfileEndpoint { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}

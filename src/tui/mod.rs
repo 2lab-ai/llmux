@@ -6308,6 +6308,7 @@ mod tests {
         let acct = |name: &str| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -6381,6 +6382,7 @@ mod tests {
         let acct = |name: &str| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -8200,6 +8202,7 @@ mod tests {
         v.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -8284,6 +8287,7 @@ mod tests {
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
