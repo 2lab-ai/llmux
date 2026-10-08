@@ -88,12 +88,12 @@ The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config 
 
 ```bash
 brew install 2lab-ai/tap/llmux
-brew install 2lab-ai/tap/llmux-islands           # stable 0.2.24 app: predates the setup screens; see Release availability
+brew install --cask 2lab-ai/tap/llmux-islands    # app + CLI, stable
 brew install 2lab-ai/tap/llmux-preview
 brew install --cask 2lab-ai/tap/llmux-islands-preview
 ```
 
-Use `llmux-preview` for the rolling preview channel. The stable `llmux` formula is fine for CLI work, but the Islands app currently needs the preview cask — see [release availability](#release-availability).
+Use `llmux-preview` (and the `llmux-islands-preview` cask) for the rolling preview channel; use the stable `llmux` formula and `llmux-islands` cask for normal daily work. Which features landed in which release: [release availability](#release-availability).
 
 ### Channels and updating
 
@@ -117,20 +117,20 @@ llmux channel stable
 
 ### Release availability
 
-Stable is v0.2.24 (2026-10-07). Preview is rolling; this table says which user-visible features need preview as of 2026-10-08.
+Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed on `main` after the last tag. This table says which release each user-visible feature needs.
 
-| Feature | Stable 0.2.24 | Preview |
-|---|---|---|
-| `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes |
-| Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | no | yes (shipped 2026-10-07, source `7fe64d1`) |
-| Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | no (see note below) | yes |
-| `llmux env --codex` | no — stable `env` prints Claude Code exports only | yes |
-| Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes |
-| Numeric combined auth states in `status` / Islands | no | yes |
+| Feature | Stable 0.2.24 (2026-10-07) | Stable 0.2.25 (2026-10-08) | Preview |
+|---|---|---|---|
+| `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
+| Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | no | yes (source `7fe64d1`) | yes |
+| Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | no (see note below) | yes | yes |
+| `llmux env --codex` | no — `env` prints Claude Code exports only | yes | yes |
+| Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes | yes |
+| Numeric combined auth states in `status` / Islands | no | yes | yes |
 
-Note on stable local control: the 0.2.24 Islands app sends loopback requests without a key, while the 0.2.24 daemon requires an admin credential on `/llmux/*`, so the stable app cannot read a stable daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI.
+Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
-Install per channel: `brew install --cask 2lab-ai/tap/llmux-islands-preview` installs the app plus the preview CLI; `brew install 2lab-ai/tap/llmux` installs the stable CLI; `llmux channel preview|stable` switches both.
+Install per channel: `brew install --cask 2lab-ai/tap/llmux-islands` installs the app plus the stable CLI; `brew install 2lab-ai/tap/llmux` installs the stable CLI only; `brew install --cask 2lab-ai/tap/llmux-islands-preview` / `brew install 2lab-ai/tap/llmux-preview` are the preview equivalents; `llmux channel preview|stable` switches both.
 
 The Islands cask and formula must be on the same channel; a new app with an old CLI shows an update instruction.
 
@@ -187,7 +187,7 @@ installs lazily from embedded assets. Caller tools execute in Codex. See the
 and [SDK account-error lifecycle](provider-compatibility.md#claude-agent-sdk-account-errors).
 For manual environment wiring:
 
-`env --codex` is on the preview channel only as of 2026-10-08 (see [release availability](#release-availability)).
+`env --codex` is on stable since v0.2.25 (see [release availability](#release-availability)).
 
 ```sh
 llmux env --codex          # inspect exports and the commented Codex command
@@ -325,7 +325,7 @@ The Islands app has the same masking via `--demo` or `LLMUX_ISLANDS_DEMO=1`; it 
 
 For persistent masking, `email_anonymous` in the config masks every email surface — TUI render and Islands mosaic — and can be flipped live from the Islands ☰ menu or `POST /llmux/settings`.
 
-Demo GIFs are attached to a release only when the recorders in `demo/` are run for that release; v0.2.24 has none. In-repo captures live in [`screenshots/`](../screenshots/) — `llmux-islands-workspace.png` (2026-10-08, preview UI, demo data) and the 2026-07 recordings.
+Demo GIFs are attached to a release only when the recorders in `demo/` are run for that release; v0.2.24 and v0.2.25 have none. In-repo captures live in [`screenshots/`](../screenshots/) — `llmux-islands-workspace.png` (2026-10-08, preview UI, demo data) and the 2026-07 recordings.
 
 - **CLI / TUI** — [`demo/llmux.tape`](../demo/llmux.tape) (vhs) → release asset `llmux-demo.gif`
 - **Islands app** — `--demo` capture → release asset `llmux-islands-demo.gif`

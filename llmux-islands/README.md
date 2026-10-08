@@ -20,12 +20,12 @@ User guide: [`../docs/llmux-islands.md`](../docs/llmux-islands.md).
 
 ## Get started
 
-The setup screens and Start coding launcher described here are on the
-**preview channel** as of 2026-10-08 (shipped 2026-10-07). Install
-`brew install --cask 2lab-ai/tap/llmux-islands-preview`, which also installs the
-matching preview CLI; existing stable users run `llmux channel preview`. The
-stable 0.2.24 app predates these screens and cannot authenticate local control
-against the daemon — see [release availability](../docs/operational-reference.md#release-availability).
+The setup screens and Start coding launcher described here ship on stable since
+v0.2.25 (2026-10-08; first on preview 2026-10-07). Install
+`brew install --cask 2lab-ai/tap/llmux-islands`, which also installs the matching
+CLI; a 0.2.24 install upgrades with `llmux update`. The 0.2.24 app predates these
+screens and cannot authenticate local control against the daemon — see
+[release availability](../docs/operational-reference.md#release-availability).
 
 Installed users do not need Xcode: open Islands, connect an account, then choose
 Claude Code/Codex and a project folder. **Open in Terminal** launches the existing

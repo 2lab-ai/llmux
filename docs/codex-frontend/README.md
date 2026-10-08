@@ -11,8 +11,8 @@ llmux --remote server:3456 run --codex
 
 Codex is a second client of the same daemon: the same account pool, model routing,
 schedulers and usage history that serve Claude Code serve Codex. `llmux run --codex`
-is available on both release channels; `llmux env --codex` (manual shell wiring) is
-preview-only as of 2026-10-08 — see
+remains available on both channels; `llmux env --codex` (manual shell wiring)
+joined stable in v0.2.25 — see
 [release availability](../operational-reference.md#release-availability). llmux does
 not synchronize Codex and Claude Code settings, hooks or skills; a shared cross-CLI
 configuration is an idea under consideration, not a shipped feature.

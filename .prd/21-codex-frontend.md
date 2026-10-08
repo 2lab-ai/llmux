@@ -15,8 +15,8 @@ schedulers with the Claude Code frontend; it does not synchronize Codex and
 Claude Code settings, hooks or skills, and no cross-CLI configuration sync is
 promised here. Native cross-model subagent delegation was measured on the
 Claude Code frontend only (`docs/multi-model-agents.md`); no equivalent claim
-is made for Codex. `llmux run --codex` is on both release channels;
-`llmux env --codex` is preview-only as of 2026-10-08
+is made for Codex. `llmux run --codex` and `llmux env --codex` are both on
+stable since v0.2.25 (2026-10-08; `env --codex` was preview-only on 0.2.24)
 (`docs/operational-reference.md#release-availability`).
 
 ## Acceptance scenarios

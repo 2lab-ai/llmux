@@ -9,14 +9,14 @@ features: [rules/documents.md](../rules/documents.md).
 
 Pick the thing you want to do.
 
-- **See how much of each subscription you have left** → [llmux Islands](llmux-islands.md) — install, add your first account, and read remaining usage from the macOS menu bar or notch. Privacy modes and recording are covered there too. The setup screens and launcher are on the preview channel.
+- **See how much of each subscription you have left** → [llmux Islands](llmux-islands.md) — install, add your first account, and read remaining usage from the macOS menu bar or notch. Privacy modes and recording are covered there too.
 - **Make models work together inside Claude Code** → [Multi-model agents in Claude Code](multi-model-agents.md) — Claude implements, GPT reviews, add Grok, and collect where they disagree. Each agent names a model id on its `model:` line, and llmux routes it.
 - **Check what was actually sent to a model** → [The accidental AI debugger](ai-debugger.md) — a raw request/response viewer for every call: the four legs of the wire, copy as curl, email masking. Answers "did my field reach the model?"
 
 ## Reference
 
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex frontend/backend, SDK error lifecycle, install variants.
-- [Release availability](operational-reference.md#release-availability) — which features are on stable 0.2.24 vs the preview channel. The Islands setup screens and launcher are preview-only as of 2026-10-08.
+- [Release availability](operational-reference.md#release-availability) — which features are on stable 0.2.25 vs the rolling preview channel, and what changed per release.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, frontend/SDK runtime, Codex/Grok shaping, account types, email-anonymous mode.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
 - [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.

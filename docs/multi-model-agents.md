@@ -32,8 +32,8 @@ the reverse.
 ## Step 1 — Claude + GPT
 
 You need llmux, a Claude Code version that supports custom agents with
-`model:`, and two logins. The receipt below was measured on the preview channel;
-stable routes by the same model-name rule but was not measured:
+`model:`, and two logins. The receipt below was measured on preview build 2026-10-08-0306, the
+same source that became stable v0.2.25; a stable build was not measured separately:
 
 ```bash
 llmux login          # Claude account
@@ -81,7 +81,7 @@ You are an independent code reviewer. Read the file you are given, list concrete
 
 Model ids valid on 2026-10-08 (`GET /models`, see [models.md](models.md)):
 `claude-fable-5-1[1m]`, `claude-opus-5-5[1m]`, `claude-sonnet-5-5[1m]`,
-`claude-haiku-5-5[1m]` (preview), `gpt-6.1-sol`, `gpt-6-astra[1m]`,
+`claude-haiku-5-5[1m]`, `gpt-6.1-sol`, `gpt-6-astra[1m]`,
 `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `grok-4.7`,
 `grok-4.6`, `grok-4.5`, `or-ox-alpha`. Aliases such as `astra`, `sol` and
 `grok` also work in `model:`; explicit ids keep the routing readable in the

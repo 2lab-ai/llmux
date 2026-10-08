@@ -56,9 +56,9 @@ requires an admin credential on `/llmux/*` even from loopback (`server.rs`), so 
 stable app cannot read a stable daemon locally. Source-confirmed on 2026-10-08; not
 reproduced in a running stable GUI.
 
-Public docs therefore follow preview: README and `docs/llmux-islands.md` install
-the preview cask (`brew install --cask 2lab-ai/tap/llmux-islands-preview`) and
-label these screens as preview; stable users switch with `llmux channel preview`.
-A tested stable release containing this feature is a separate decision, not part
-of this record. The verification limits above are unchanged; no GUI click receipt
-is invented.
+Public docs followed preview until the same day: README and `docs/llmux-islands.md`
+installed the preview cask and labelled these screens as preview. Stable v0.2.25
+(tag 2f4312a, 2026-10-08, release.yml run 37743228884) then shipped the feature
+from `f95dcb7`; the docs were flipped back to the stable cask in the follow-up PR.
+The verification limits above are unchanged; no GUI click receipt is invented, and
+no clean-machine install of the 0.2.25 cask was measured before the tag.
