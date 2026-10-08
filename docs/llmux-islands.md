@@ -62,7 +62,7 @@ daemon, or persist state.
 ## Requirements
 
 - macOS 14 or later and llmux installed on the same computer.
-- llmux CLI from the same release channel as the app (the preview cask installs it).
+- llmux CLI from the same release as the app (the cask installs it).
 - Claude Code or Codex installed to launch that coding app from Islands.
 - An existing Claude, ChatGPT, Grok or API-key account to connect.
 
@@ -76,30 +76,28 @@ Agent SDK; see [Codex frontend prerequisites](codex-frontend/README.md).
 ## Install
 
 ```bash
-brew install --cask 2lab-ai/tap/llmux-islands-preview
+brew install --cask 2lab-ai/tap/llmux-islands
 ```
 
-Use the preview channel: the setup screens and launcher below shipped on preview
-on 2026-10-07; stable 0.2.24 predates them. The preview cask depends on the
-`llmux-preview` formula, so it installs the matching CLI. Preview versions are
-rolling date versions that change with every main push (2026-10-08.0306 as of
-2026-10-08).
+The cask depends on the `llmux` formula, so it installs the matching CLI. The
+setup screens and launcher below ship on stable since v0.2.25 (2026-10-08).
+Already on 0.2.24? Run `llmux update`; it upgrades both and relaunches the app.
 
-Already on stable? Run `llmux channel preview`. It switches the CLI formula and
-mirrors the Islands cask. Do not install both casks; the preview cask conflicts
-with the stable `llmux-islands` cask.
+The rolling preview channel has its own cask, `llmux-islands-preview`, which
+depends on `llmux-preview`. The two casks conflict; switch with
+`llmux channel preview` or `llmux channel stable`, which mirrors the cask.
 
 Then launch `LlmuxIslands.app` from Applications, Spotlight, or Finder.
 
-### Stable channel
+### Stable 0.2.24
 
-Stable 0.2.24 (`brew install 2lab-ai/tap/llmux-islands`) shows the UI from before the renewal and cannot authenticate local control: the app adds `x-api-key` only to remote requests, while the daemon requires an admin credential on `/llmux/*` even from loopback.
-A stable install therefore does not reach the screens described below. This is confirmed from the 0.2.24 source, not reproduced in a running app.
-Per-channel status: [Release availability](operational-reference.md#release-availability).
+The 0.2.24 app (2026-10-07) predates these screens and cannot authenticate local
+control: it adds `x-api-key` only to remote requests, while the daemon requires an
+admin credential on `/llmux/*` even from loopback (confirmed from source, not
+reproduced in a running app). Upgrade with `llmux update`.
+Per-release status: [Release availability](operational-reference.md#release-availability).
 
 ## First launch
-
-These steps apply to the preview channel.
 
 Open the floating notch at the top of your screen by clicking or hovering over it.
 An empty or unavailable workspace opens setup once at launch. The screen separates
@@ -201,7 +199,7 @@ The app capture needs a one-time macOS **Screen Recording** grant for the termin
 
 ## Remote daemon
 
-Local control requests are authenticated too. The private CLI handoff returns only the control key for the matching configured proxy port; it refuses a remote CLI configuration. Both the app and the CLI must come from the preview channel for this handoff. The key never enters view state, saved app preferences, logs, or clipboard. HTTP 401/403 means the daemon is already running and does not trigger a spawn/restart.
+Local control requests are authenticated too. The private CLI handoff returns only the control key for the matching configured proxy port; it refuses a remote CLI configuration. Both the app and the CLI must be 0.2.25 or later, from the same channel, for this handoff. The key never enters view state, saved app preferences, logs, or clipboard. HTTP 401/403 means the daemon is already running and does not trigger a spawn/restart.
 
 A remote connection needs two things you provide:
 
@@ -218,7 +216,7 @@ Do not expose mutating llmux endpoints to an untrusted network without the API k
 
 ### The island cannot connect
 
-- Installed the stable cask? Local control needs the preview app and CLI; run `llmux channel preview`.
+- Still on 0.2.24? Local control needs the 0.2.25 app and CLI together; run `llmux update`.
 - Use **Retry** or **Connection settings**.
 - If the private local helper is missing, use **Copy update command** to update
   both llmux and Islands on the app’s release channel (preview date version or

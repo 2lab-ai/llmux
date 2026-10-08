@@ -19,7 +19,7 @@ llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port
 ## Start with Islands
 
 ```bash
-brew install --cask 2lab-ai/tap/llmux-islands-preview   # installs the app and the preview CLI
+brew install --cask 2lab-ai/tap/llmux-islands   # installs the app and the llmux CLI (stable 0.2.25)
 ```
 
 1. Open **llmux Islands**.
@@ -30,9 +30,7 @@ Optional: under **Start coding**, pick Claude Code or Codex, choose a project fo
 
 Guide: [llmux Islands](docs/llmux-islands.md).
 
-Use the preview cask for now: the first-run screens and the Start coding launcher are preview-only, and the stable 0.2.24 app sends local control requests without the admin credential the stable daemon requires, so the stable app cannot read a stable daemon on the same machine ([release availability](docs/operational-reference.md#release-availability)).
-
-Already on stable? Run `llmux channel preview`; the switch is mirrored onto the Islands cask.
+The first-run screens and the Start coding launcher ship on stable since v0.2.25 (2026-10-08). Already on 0.2.24? Run `llmux update`; the app and the CLI must come from the same release ([release availability](docs/operational-reference.md#release-availability)).
 
 ## Claude implements, GPT reviews — inside the same Claude Code
 
@@ -139,12 +137,12 @@ Guide: [the accidental AI debugger](docs/ai-debugger.md).
 
 | You want | Command | Channel |
 | --- | --- | --- |
-| Islands app + CLI | `brew install --cask 2lab-ai/tap/llmux-islands-preview` | preview (rolling) |
-| CLI only | `brew install 2lab-ai/tap/llmux` | stable (0.2.24, 2026-10-07) |
-| CLI only, latest | `brew install 2lab-ai/tap/llmux-preview` | preview (rolling) |
+| Islands app + CLI | `brew install --cask 2lab-ai/tap/llmux-islands` | stable (0.2.25, 2026-10-08) |
+| CLI only | `brew install 2lab-ai/tap/llmux` | stable (0.2.25, 2026-10-08) |
+| Rolling preview (CLI, or `--cask 2lab-ai/tap/llmux-islands-preview` for the app) | `brew install 2lab-ai/tap/llmux-preview` | preview |
 | Build from source | `git clone https://github.com/2lab-ai/llmux && cd llmux && just build` | your checkout |
 
-The preview cask depends on the preview formula and conflicts with the stable `llmux-islands` cask. Switch an existing install with `llmux channel preview` or `llmux channel stable`; the switch is mirrored onto the Islands cask. What ships on which channel: [release availability](docs/operational-reference.md#release-availability). The KDE port of Islands is a [source build](llmux-islands-linux/README.md). `just build` runs `cargo build --release --locked`.
+Each Islands cask depends on its channel's formula, and the two casks conflict. Switch an existing install with `llmux channel preview` or `llmux channel stable`; the switch is mirrored onto the Islands cask. What ships on which channel: [release availability](docs/operational-reference.md#release-availability). The KDE port of Islands is a [source build](llmux-islands-linux/README.md). `just build` runs `cargo build --release --locked`.
 
 From the terminal:
 
@@ -161,7 +159,7 @@ llmux run --codex         # same daemon, Codex CLI (install Codex on the client)
 llmux server              # foreground TUI dashboard
 ```
 
-In the dashboard, `n` opens a provider picker for the same four browser logins. Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` (preview) prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
+In the dashboard, `n` opens a provider picker for the same four browser logins. Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
 
 ## Switching models
 
@@ -186,7 +184,7 @@ Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-o
 
 Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
 
-Preview: `haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
+`haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 

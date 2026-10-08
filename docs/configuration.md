@@ -92,7 +92,7 @@ a source checkout. The SDK receives the selected account and isolated settings,
 not the daemon user’s Claude/Codex authentication environment. See
 [bridge runtime](../bridge/README.md) and [remote mode](remote.md).
 
-Ownership: the daemon host owns accounts, routing, scheduling and the SDK runtime; each client machine owns its own Claude Code or Codex settings, hooks, permissions and skills — llmux does not synchronize them between clients (a shared cross-CLI configuration is not a shipped feature). Per-agent models are a client-side setting too: a `.claude/agents/*.md` `model:` field is routed like any request ([multi-model agents](multi-model-agents.md)). `llmux env --codex` is preview-only as of 2026-10-08 ([release availability](operational-reference.md#release-availability)).
+Ownership: the daemon host owns accounts, routing, scheduling and the SDK runtime; each client machine owns its own Claude Code or Codex settings, hooks, permissions and skills — llmux does not synchronize them between clients (a shared cross-CLI configuration is not a shipped feature). Per-agent models are a client-side setting too: a `.claude/agents/*.md` `model:` field is routed like any request ([multi-model agents](multi-model-agents.md)). `llmux env --codex` is on stable since v0.2.25 ([release availability](operational-reference.md#release-availability)).
 
 ## Scheduler knobs
 

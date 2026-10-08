@@ -2,10 +2,10 @@
 
 ## I have several Claude subscriptions. How do I see what is left on each?
 
-Run `llmux login` once per account. Islands, the macOS notch app, then shows each account's 5-hour and 7-day windows with their reset timers. As of 2026-10-08, Islands is on the preview channel:
+Run `llmux login` once per account. Islands, the macOS notch app, then shows each account's 5-hour and 7-day windows with their reset timers:
 
 ```bash
-brew install --cask 2lab-ai/tap/llmux-islands-preview
+brew install --cask 2lab-ai/tap/llmux-islands
 ```
 
 The TUI (`llmux dashboard`) shows the same windows. See [llmux-islands.md](llmux-islands.md).
@@ -30,14 +30,7 @@ No. Each client keeps its own configuration; llmux routes model traffic only. A 
 
 ## Which features need the preview channel?
 
-As of 2026-10-08, these need the preview channel:
-
-- Islands setup screens and launcher
-- authenticated local control between the Islands app and the daemon
-- `llmux env --codex`
-- the Haiku 5.5 row
-
-Stable 0.2.24 has `llmux run`, `llmux run --codex`, schedulers, the raw viewer and remote mode. See [operational-reference.md](operational-reference.md#release-availability).
+None as of 2026-10-08: stable v0.2.25 contains the Islands setup screens and launcher, authenticated local control between the app and the daemon, `llmux env --codex` and the Haiku 5.5 row. Stable 0.2.24 lacked all four; run `llmux update`. The rolling preview channel carries whatever landed on `main` after the last tag. See [operational-reference.md](operational-reference.md#release-availability).
 
 ## Is this a trinity / consensus feature?
 
