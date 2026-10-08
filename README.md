@@ -69,7 +69,7 @@ Then ask, for example:
 Have gpt-reviewer review sample.py, then summarize what it found.
 ```
 
-Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim from its first reviewer heading to the end (one opening sentence about where it saved its notes is omitted):
+Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim from its first reviewer heading to the end (the opening lines before that heading are omitted):
 
 ```markdown
 **gpt-reviewer**

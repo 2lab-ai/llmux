@@ -115,13 +115,13 @@ llmux run -- --model fable \
   --output-format stream-json --verbose --allowedTools Read,Agent,Task --max-turns 12
 ```
 
-This is the exact headless command that produced the receipt. The last line
-matters in headless mode: without `--allowedTools Read,Agent,Task` a `-p` run
-cannot delegate or read files. Interactively, start `llmux run` and type the
-same prompt; permissions are then granted in the session as usual. Claude Code reported
+This is the exact headless command that produced the receipt. The recorded run
+used `--allowedTools Read,Agent,Task`; the command above preserves those
+permission settings. Interactively, start `llmux run` and type the same prompt;
+permissions are granted in the session as usual. Claude Code reported
 success after 7 turns and 183 s, parent model `claude-fable-5-1[1m]`. The
-parent's final text, verbatim from its first reviewer heading to the end (one
-opening sentence about where it saved its notes is omitted):
+parent's final text, verbatim from its first reviewer heading to the end (the
+opening lines before that heading are omitted):
 
 ```markdown
 **gpt-reviewer**
@@ -151,9 +151,9 @@ The useful part is the difference: three defects both reviewers found, and one
 (the unchecked `"name"` key on line 9) that only Grok reported.
 
 Selected daemon activity rows during the run (5 of 26; emails masked), from
-`activity.jsonl` and the dashboard Activity feed. Omitted rows are the parent's
-other turns, Claude Code's own internal Opus/Sonnet subagent, security-monitor
-and token-count calls. Each `excerpt` is the start of the prompt the parent
+`activity.jsonl` and the dashboard Activity feed. Omitted rows are three further
+`gpt-6-astra` subagent turns, the parent's other turns, Claude Code's own
+internal Opus/Sonnet subagent, security-monitor and token-count calls. Each `excerpt` is the start of the prompt the parent
 wrote for that agent:
 
 ```text
