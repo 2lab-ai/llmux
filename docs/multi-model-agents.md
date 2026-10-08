@@ -115,10 +115,13 @@ llmux run -- --model fable \
   --output-format stream-json --verbose --allowedTools Read,Agent,Task --max-turns 12
 ```
 
-This is the exact headless command that produced the receipt. The recorded run
-used `--allowedTools Read,Agent,Task`; the command above preserves those
-permission settings. Interactively, start `llmux run` and type the same prompt;
-permissions are granted in the session as usual. Claude Code reported
+This is the exact headless command that produced the receipt. It passed
+`--allowedTools Read,Agent,Task` explicitly. A second headless run on the same
+day without that flag (same `gpt-reviewer` file, one agent, no `--allowedTools`)
+also delegated and returned `MODEL: gpt-6-astra[1m]` / `VERDICT: REQUEST_CHANGES`
+with zero permission denials in 3 turns, so the flag is not required for
+delegation; it is shown because it is what the receipt used. Interactively,
+start `llmux run` and type the same prompt. Claude Code reported
 success after 7 turns and 183 s, parent model `claude-fable-5-1[1m]`. The
 parent's final text, verbatim from its first reviewer heading to the end (the
 opening lines before that heading are omitted):
