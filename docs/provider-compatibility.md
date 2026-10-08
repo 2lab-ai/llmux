@@ -30,6 +30,22 @@ SDK requests preserve `[1m]`, execute caller tools in the Codex client and rejec
 unsupported sampling/forced-tool controls. Native Codex Responses retains reasoning
 continuity; the Messages translation losses below do not apply universally.
 
+## Collaboration is not wire parity
+
+When Claude Code delegates to an agent whose `model:` is `gpt-6-astra[1m]` or
+`grok-4.7` ([multi-model agents](multi-model-agents.md)), that agent's requests
+take the **incoming Anthropic Messages → Codex/Grok** rows of the matrices below,
+with the same drops and refusals: `max_tokens` is not sent to Codex at all;
+non-null `temperature`/`top_p`/`top_k` and non-empty `stop_sequences` are refused
+with a local 400; prior `thinking` blocks are dropped and there is no reasoning
+continuity across turns. The parent (Claude) keeps the native Messages path.
+
+- Supported here means measured on the dated receipt in the row — not every agent
+  prompt shape has been probed.
+- Open the agent's row in the raw viewer ([ai-debugger](ai-debugger.md)) to see
+  exactly which fields reached the provider.
+- Nothing in this page changes the Codex frontend's SDK boundary described above.
+
 ## Haiku 5.5 catalog update
 
 Checked 2026-10-08: `haiku` / `haiku-5-5` resolve to `claude-haiku-5-5[1m]`.

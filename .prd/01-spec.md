@@ -18,6 +18,8 @@ subscription OAuth access tokens expire around 8h. If the proxy is not kept aliv
 idle accounts, users are forced to re-login. Therefore v0.1 is a **daemon-first** local proxy, not
 only a foreground process.
 
+**Amendment 2026-10-08 — positioning, not behavior.** A three-engine documentation review restated the user-facing order in which llmux's value is discovered: (1) several Claude subscriptions visible at once (Islands); (2) a Codex subscription makes GPT a native Claude Code agent — a `.claude/agents/*.md` `model:` id is routed per request, and the result returns to the parent (measured 2026-10-08); (3) Grok makes a three-model review of one change possible — project configuration, not a bundled command; (4) account choice within a provider group before quota expires; (5) the emergent property: the harness stays, the model is a setting; (6) the same pool serves Codex CLI; (7) one central daemon with per-computer attribution is a bonus, not a marketing claim; (8) the raw request viewer is an expert entry in its own right. Implementation and non-goals are unchanged; cross-CLI configuration sync remains a non-goal until specified.
+
 ## Goals (implemented)
 
 1. **Two unmodified client frontends** — Claude Code uses `ANTHROPIC_BASE_URL=http://localhost:<port>`;

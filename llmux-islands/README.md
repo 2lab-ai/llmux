@@ -1,10 +1,5 @@
 # llmux-islands
 
-Activity receipts distinguish incoming OpenAI requests with dark gray backgrounds,
-including Claude models served through the SDK; see [endpoint activity](../docs/codex-frontend/activity.md).
-Node.js/npm are required only on a daemon serving Claude-through-Codex, not by the
-native Islands UI itself.
-
 A native macOS notch app that shows per-account **llmux** usage at a
 glance and lets you manage subscriptions — driven entirely by the llmux daemon's
 HTTP API. Raw dashboard JSON is reduced by the same Rust semantic core as the
@@ -25,6 +20,13 @@ User guide: [`../docs/llmux-islands.md`](../docs/llmux-islands.md).
 
 ## Get started
 
+The setup screens and Start coding launcher described here are on the
+**preview channel** as of 2026-10-08 (shipped 2026-10-07). Install
+`brew install --cask 2lab-ai/tap/llmux-islands-preview`, which also installs the
+matching preview CLI; existing stable users run `llmux channel preview`. The
+stable 0.2.24 app predates these screens and cannot authenticate local control
+against the daemon — see [release availability](../docs/operational-reference.md#release-availability).
+
 Installed users do not need Xcode: open Islands, connect an account, then choose
 Claude Code/Codex and a project folder. **Open in Terminal** launches the existing
 llmux frontend only after a click. See the [user guide](../docs/llmux-islands.md#first-launch)
@@ -34,7 +36,18 @@ The new macOS setup and launcher are native executor UI; shared dashboard state,
 provider selection, scheduler and Linux semantics are unchanged. See the active
 [get-started contract](../.prd/22-islands-get-started.md).
 
+### Notes for operators
+
+- Activity receipts distinguish incoming OpenAI requests with dark gray
+  backgrounds, including Claude models served through the SDK; see
+  [endpoint activity](../docs/codex-frontend/activity.md).
+- Node.js/npm are required only on a daemon serving Claude-through-Codex, not by
+  the native Islands UI itself.
+
 ## Build & run
+
+**Build from source (developers).** Ordinary users do not need Xcode; install
+the preview cask described in [Get started](#get-started) instead.
 
 Requires Xcode 15+, XcodeGen (`brew install xcodegen`), and the stable Rust
 toolchain installed through rustup. The Xcode build phase compiles and links the
@@ -65,7 +78,7 @@ hide it.
 | Pause/resume an account | `POST /llmux/pause-account` |
 | Email anonymity and operator events | `POST /llmux/settings`, `POST /llmux/events` |
 
-Remote daemons require HTTPS and an `x-api-key`; redirects are denied. Loopback may use HTTP and authenticates through the private `llmux islands-connection --port N` handoff. The CLI reads only its owned config; the native executor receives only a matching local endpoint/control key through bounded Process pipes. It never receives provider credentials, persists the key, or sends a configured remote key to loopback. HTTP 401/403 prevents daemon spawning. Remote-key reuse is restricted to the same endpoint.
+Remote daemons require HTTPS and an `x-api-key`; redirects are denied. llmux itself does not terminate TLS; put an HTTPS reverse proxy in front of a remote daemon. Loopback may use HTTP and authenticates through the private `llmux islands-connection --port N` handoff. The CLI reads only its owned config; the native executor receives only a matching local endpoint/control key through bounded Process pipes. It never receives provider credentials, persists the key, or sends a configured remote key to loopback. HTTP 401/403 prevents daemon spawning. Remote-key reuse is restricted to the same endpoint.
 
 ## Layout
 

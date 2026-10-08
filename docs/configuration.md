@@ -73,7 +73,7 @@ whatever `activity.jsonl` still holds); everything else keeps working.
 |---|---:|---|
 | `proxy.port` | `3456` | Daemon port for both Messages and Responses. Claude Code uses `ANTHROPIC_BASE_URL=http://localhost:3456`; Codex uses the session provider at `http://localhost:3456/v1`. |
 | `proxy.api_key` | generated | The shared ADMIN credential (`lm-…`): non-loopback clients must present it (or an issued client key) as `x-api-key` (or Bearer on OpenAI endpoints), and `/llmux/*` control endpoints require it (or an admin-kind client key) even from localhost. Keyless data-plane requests are loopback-only. Malformed, conflicting or unknown explicit OpenAI credentials are rejected even there. |
-| `client_keys` | `[]` | Issued downstream client keys (multi-tenant). Managed via `llmux key …` / `POST /llmux/keys/*` — each entry stores id, name, email, kind (`default`\|`admin`), key prefix, SHA-256 digest, suspended flag, and timestamps. The secret itself is never stored; edit this section by hand only for disaster recovery. |
+| `client_keys` | `[]` | Issued downstream client keys — per-computer attribution for one person's machines (see [remote daemon](remote.md)). Managed via `llmux key …` / `POST /llmux/keys/*` — each entry stores id, name, email, kind (`default`\|`admin`), key prefix, SHA-256 digest, suspended flag, and timestamps. The secret itself is never stored; edit this section by hand only for disaster recovery. |
 | `upstream` | `https://api.anthropic.com` | Anthropic-compatible upstream base URL for Claude accounts. |
 
 ## Frontend launch and SDK runtime
@@ -91,6 +91,8 @@ selects a preinstalled pinned bridge. Normal installs need neither override nor
 a source checkout. The SDK receives the selected account and isolated settings,
 not the daemon user’s Claude/Codex authentication environment. See
 [bridge runtime](../bridge/README.md) and [remote mode](remote.md).
+
+Ownership: the daemon host owns accounts, routing, scheduling and the SDK runtime; each client machine owns its own Claude Code or Codex settings, hooks, permissions and skills — llmux does not synchronize them between clients (a shared cross-CLI configuration is not a shipped feature). Per-agent models are a client-side setting too: a `.claude/agents/*.md` `model:` field is routed like any request ([multi-model agents](multi-model-agents.md)). `llmux env --codex` is preview-only as of 2026-10-08 ([release availability](operational-reference.md#release-availability)).
 
 ## Scheduler knobs
 

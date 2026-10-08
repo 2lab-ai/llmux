@@ -41,3 +41,24 @@ Actual GUI connection state and Finder/Terminal Automation dispatch were not
 observed. The app process/payload, native HTTP path, command quoting and installed
 CLI tool roundtrips were verified separately; fixture footage does not imply a
 live login or button-click recording.
+
+## Release availability (2026-10-08)
+
+Shipped on the preview channel only: preview `2026-10-07-2040` and later (current
+at writing: `preview-2026-10-08-0306-f95dcb75dd51`). Stable v0.2.24 (tag 34eb955,
+released 2026-10-07) does not contain `StartCodingView.swift`,
+`CodingLaunchPlan.swift`, `LocalControlAuth.swift` or this PRD
+(`git diff --name-status v0.2.24..HEAD`).
+
+Stable 0.2.24 Islands sends loopback control requests without a key
+(`LlmuxClient.swift` adds `x-api-key` only for remote requests), while the daemon
+requires an admin credential on `/llmux/*` even from loopback (`server.rs`), so the
+stable app cannot read a stable daemon locally. Source-confirmed on 2026-10-08; not
+reproduced in a running stable GUI.
+
+Public docs therefore follow preview: README and `docs/llmux-islands.md` install
+the preview cask (`brew install --cask 2lab-ai/tap/llmux-islands-preview`) and
+label these screens as preview; stable users switch with `llmux channel preview`.
+A tested stable release containing this feature is a separate decision, not part
+of this record. The verification limits above are unchanged; no GUI click receipt
+is invented.
