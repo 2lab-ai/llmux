@@ -429,4 +429,4 @@ Claude Code (parent, claude-fable-5-1[1m])
 Evidence: measured 2026-10-08 on preview 2026-10-08-0306 — activity rows
 `kind=subagent model=gpt-6-astra group=codex status=200` and
 `kind=subagent model=grok-4.7 group=grok status=200` alongside parent rows in group
-`claude` (receipt in the zbrain workflow ledger; user guide: `docs/multi-model-agents.md`).
+`claude` (command, transcript excerpt and selected rows are reproduced in the user guide `docs/multi-model-agents.md`; the full activity log is kept outside this repository).

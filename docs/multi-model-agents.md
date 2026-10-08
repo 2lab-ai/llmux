@@ -31,8 +31,9 @@ the reverse.
 
 ## Step 1 — Claude + GPT
 
-You need llmux (stable or preview; the receipt below is a preview build), a
-Claude Code version that supports custom agents with `model:`, and two logins:
+You need llmux, a Claude Code version that supports custom agents with
+`model:`, and two logins. The receipt below was measured on the preview channel;
+stable routes by the same model-name rule but was not measured:
 
 ```bash
 llmux login          # Claude account
@@ -109,10 +110,15 @@ def find_user(users, name):
 The parent ran on Claude Fable:
 
 ```bash
-llmux run -- --model fable -p "Delegate a review of sample.py to the gpt-reviewer subagent AND separately to the grok-reviewer subagent (use the Agent tool for each; do not review the file yourself). Then output a short synthesis: for each reviewer, quote its MODEL: line and VERDICT: line verbatim, then list which defects only one of them found."
+llmux run -- --model fable \
+  -p "Delegate a review of sample.py to the gpt-reviewer subagent AND separately to the grok-reviewer subagent (use the Agent tool for each; do not review the file yourself). Then output a short synthesis: for each reviewer, quote its MODEL: line and VERDICT: line verbatim, then list which defects only one of them found." \
+  --output-format stream-json --verbose --allowedTools Read,Agent,Task --max-turns 12
 ```
 
-Interactively, start `llmux run` and type the same prompt. Claude Code reported
+This is the exact headless command that produced the receipt. The last line
+matters in headless mode: without `--allowedTools Read,Agent,Task` a `-p` run
+cannot delegate or read files. Interactively, start `llmux run` and type the
+same prompt; permissions are then granted in the session as usual. Claude Code reported
 success after 7 turns and 183 s, parent model `claude-fable-5-1[1m]`. The
 parent's final text, verbatim from its first reviewer heading to the end (one
 opening sentence about where it saved its notes is omitted):
@@ -144,8 +150,10 @@ PARENT MODEL: claude-fable-5-1[1m]
 The useful part is the difference: three defects both reviewers found, and one
 (the unchecked `"name"` key on line 9) that only Grok reported.
 
-Daemon activity rows during the run (emails masked), from `activity.jsonl` and
-the dashboard Activity feed. Each `excerpt` is the start of the prompt the parent
+Selected daemon activity rows during the run (5 of 26; emails masked), from
+`activity.jsonl` and the dashboard Activity feed. Omitted rows are the parent's
+other turns, Claude Code's own internal Opus/Sonnet subagent, security-monitor
+and token-count calls. Each `excerpt` is the start of the prompt the parent
 wrote for that agent:
 
 ```text

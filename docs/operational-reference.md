@@ -88,7 +88,7 @@ The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config 
 
 ```bash
 brew install 2lab-ai/tap/llmux
-brew install 2lab-ai/tap/llmux-islands
+brew install 2lab-ai/tap/llmux-islands           # stable 0.2.24 app: predates the setup screens; see Release availability
 brew install 2lab-ai/tap/llmux-preview
 brew install --cask 2lab-ai/tap/llmux-islands-preview
 ```
