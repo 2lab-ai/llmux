@@ -88,6 +88,8 @@ llmux server
 ```
 
 Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`.
+For Codex, `llmux env --codex` prints OpenAI-compatible exports and the explicit
+provider command required after `eval`; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
 
 ## switching models
 

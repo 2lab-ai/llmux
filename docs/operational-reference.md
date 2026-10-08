@@ -13,7 +13,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `login [--api \| --codex \| --grok \| --openrouter [--paste]]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account; `--grok` runs the xAI device-code flow; `--openrouter` runs the OpenRouter OAuth PKCE flow in the browser and mints a long-lived `sk-or-v1-…` key. `--paste` (only with `--openrouter`) prompts for an existing key instead of opening a browser — and is also the automatic fallback when the browser flow cannot complete locally. |
 | `import [--from PATH \| --json JSON]` | Import credentials from a teamclaude config, `~/.claude/.credentials.json`, a Codex `~/.codex/auth.json`, or inline JSON. |
 | `dashboard` | Attach to a running daemon and render its dashboard over HTTP. Read-only except manual account switch. |
-| `env` | Print shell exports for pointing Claude Code at the proxy. |
+| `env [--codex]` | Print shell exports for Claude Code, or OpenAI-compatible exports plus a Codex provider command. |
 | `status [--json]` | Show client/server/update sections plus per-account quota; exits 1 when no server is running. |
 | `accounts [-v]` | List configured accounts; `-v` adds quota/cooldown detail. |
 | `accounts refresh [ACCOUNT]` | Re-read usage from the provider NOW, on the target daemon, for one account or every supported subscription account. Per-account failures stay visible and the command exits nonzero if any requested account failed. |
@@ -163,7 +163,33 @@ Claude-through-Codex needs Node.js 18+ and npm on the daemon host; the pinned SD
 installs lazily from embedded assets. Caller tools execute in Codex. See the
 [frontend guide](codex-frontend/README.md), [model picker](models.md#codex-model-picker)
 and [SDK account-error lifecycle](provider-compatibility.md#claude-agent-sdk-account-errors).
-`llmux env` remains a Claude Code export command.
+For manual environment wiring:
+
+```sh
+llmux env --codex          # inspect exports and the commented Codex command
+# Apply the exports to this shell:
+eval "$(llmux env --codex)"
+# Run the `codex -c ...` command printed above, adding --model as needed.
+```
+
+This prints `OPENAI_BASE_URL` (the selected endpoint plus `/v1`) and
+`OPENAI_API_KEY` (that endpoint's llmux key). Values are shell-quoted for POSIX
+shells such as bash and zsh. The commented command selects the `llmux_env`
+Responses provider with `env_key="OPENAI_API_KEY"` and
+`requires_openai_auth=false`; **exports alone do not override an existing
+Codex ChatGPT login or selected provider/profile**. For `codex exec`, place
+`exec` immediately after `codex`, before the printed `-c` overrides.
+The printed provider URL is fixed to the selected endpoint at generation time;
+regenerate the command when changing endpoints.
+
+`--remote` and `remote.host` select the remote URL and `remote.api_key`; local
+mode uses `proxy.port` and `proxy.api_key`. A missing or empty selected key
+fails before emitting exports, so an inherited OpenAI key cannot be reused by
+accident. As with plain `env`, local config initialization can create its admin
+key. The command does not launch a client or daemon, fetch the model catalog,
+or write Codex configuration/login files; `llmux run --codex` handles startup
+and the model picker. Output contains the selected key: treat it as a secret.
+Plain `llmux env` continues to emit Claude Code exports.
 
 ## Multi-tenant client keys
 

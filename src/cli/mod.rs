@@ -96,7 +96,7 @@ pub enum Command {
     /// Import accounts from teamclaude config, ~/.claude/.credentials.json,
     /// or inline JSON.
     Import(ImportArgs),
-    /// Print the env exports for pointing Claude Code at the proxy.
+    /// Print shell exports for Claude Code (or Codex with --codex).
     Env(EnvArgs),
     /// Private local-control handoff for the native Islands executor.
     #[command(hide = true)]
@@ -212,7 +212,12 @@ pub struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct EnvArgs {}
+pub struct EnvArgs {
+    /// Export OpenAI-compatible variables and print a Codex provider command.
+    /// Use `llmux run --codex` to launch directly instead.
+    #[arg(long)]
+    pub codex: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct DashboardArgs {}
@@ -925,7 +930,10 @@ mod tests {
             })),
             None
         );
-        assert_eq!(remote_refused_command(&Command::Env(EnvArgs {})), None);
+        assert_eq!(
+            remote_refused_command(&Command::Env(EnvArgs { codex: false })),
+            None
+        );
         assert_eq!(
             remote_refused_command(&Command::ResetUsage(ResetUsageArgs {})),
             None,

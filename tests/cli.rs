@@ -247,6 +247,145 @@ fn env_prints_api_key_export_when_proxy_key_set() {
     );
 }
 
+#[test]
+fn env_codex_exports_selected_remote_key_and_responses_url() {
+    let h = Harness::new();
+    h.seed_config(r#"{"version":1,"proxy":{"port":39103,"api_key":"lm-local-admin"},"remote":{"host":"gateway.example","port":4567,"api_key":"lmk-remote-client"},"accounts":[]}"#);
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["--remote", "override.example:5678", "env", "--codex"]);
+        c
+    });
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert!(out
+        .stdout
+        .contains("export OPENAI_BASE_URL=http://override.example:5678/v1\n"));
+    assert!(out
+        .stdout
+        .contains("export OPENAI_API_KEY=lmk-remote-client\n"));
+    assert!(out
+        .stdout
+        .contains("model_providers.llmux_env.requires_openai_auth=false"));
+    assert!(out
+        .stdout
+        .contains("model_providers.llmux_env.env_key=\"OPENAI_API_KEY\""));
+    assert!(!out.stdout.contains("lm-local-admin"));
+    assert!(!out.stdout.contains("ANTHROPIC_"));
+}
+
+#[test]
+fn env_codex_initializes_local_key_and_refuses_missing_remote_key_without_exports() {
+    let h = Harness::new();
+    h.seed_config(&config_json(39104, "[]"));
+    let local = Output::run({
+        let mut c = h.cmd();
+        c.args(["env", "--codex"]);
+        c
+    });
+    assert_eq!(local.code, Some(0), "{}", local.stderr);
+    assert!(local
+        .stdout
+        .contains("export OPENAI_BASE_URL=http://localhost:39104/v1\n"));
+    assert!(local.stdout.contains("export OPENAI_API_KEY=lm-"));
+    for key in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("  "),
+    ] {
+        h.seed_config(
+            &serde_json::json!({
+                "version": 1,
+                "proxy": {"api_key": "lm-local-admin"},
+                "remote": {"host": "gateway.example", "api_key": key},
+                "accounts": []
+            })
+            .to_string(),
+        );
+        let out = Output::run({
+            let mut c = h.cmd();
+            c.args(["env", "--codex"])
+                .env("OPENAI_API_KEY", "unrelated-inherited-key");
+            c
+        });
+        assert_ne!(out.code, Some(0));
+        assert_eq!(out.stdout, "");
+        assert!(out.stderr.contains("remote.api_key"));
+        assert!(!out.stderr.contains("lm-local-admin"));
+        assert!(!out.stderr.contains("unrelated-inherited-key"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_exports_round_trip_shell_metacharacters_without_executing_them() {
+    let h = Harness::new();
+    let host = "gateway'$(touch should-not-exist)`touch also-not`;\\\"\n.example";
+    let key = "lmk-quote'$(touch should-not-exist)`touch also-not`;\\\"\nsecret";
+    h.seed_config(
+        &serde_json::json!({
+            "version": 1,
+            "proxy": {"api_key": "lm-local-admin"},
+            "remote": {"host": host, "port": 4567, "api_key": key},
+            "accounts": []
+        })
+        .to_string(),
+    );
+    for codex in [false, true] {
+        let out = Output::run({
+            let mut c = h.cmd();
+            c.arg("env");
+            if codex {
+                c.arg("--codex");
+            }
+            c
+        });
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+        let prefix = if codex { "OPENAI" } else { "ANTHROPIC" };
+        let script = format!(
+            "{}\nprintf '%s\\0%s' \"${prefix}_BASE_URL\" \"${prefix}_API_KEY\"",
+            out.stdout
+        );
+        let shell = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(h.dir.path())
+            .output()
+            .expect("shell");
+        assert!(shell.status.success(), "{:?}", shell.stderr);
+        let suffix = if codex { "/v1" } else { "" };
+        assert_eq!(
+            shell.stdout,
+            format!("http://{host}:4567{suffix}\0{key}").into_bytes()
+        );
+        assert!(!h.dir.path().join("should-not-exist").exists());
+        assert!(!h.dir.path().join("also-not").exists());
+        if codex {
+            // Un-comment the suggested command and capture its argv instead of
+            // launching a client. TOML then shell quoting must survive together.
+            let command = out
+                .stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("# codex "))
+                .expect("Codex hint");
+            let capture = format!("set -- {command}; printf '%s\\0' \"$@\"");
+            let argv = Command::new("sh")
+                .args(["-c", &capture])
+                .current_dir(h.dir.path())
+                .output()
+                .expect("argv capture");
+            assert!(argv.status.success());
+            let expected = format!(
+                "model_providers.llmux_env.base_url={}\0",
+                serde_json::json!(format!("http://{host}:4567/v1"))
+            );
+            assert!(String::from_utf8(argv.stdout)
+                .expect("utf8")
+                .contains(&expected));
+            assert!(!h.dir.path().join("should-not-exist").exists());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI-14 / CLI-15 — `status` with no server.
 // ---------------------------------------------------------------------------
