@@ -1,27 +1,32 @@
 # llmux docs
 
-User-facing guides that are too detailed for the repository front page.
+The product story and quick start are in the root [README](../README.md). This folder holds the guides that go further.
 
-Start at the root [README](../README.md) for the product story and quick start.
 Agent/contributor rules: [AGENTS.md](../AGENTS.md) (SSOT). Doc ownership after
 features: [rules/documents.md](../rules/documents.md).
 
-## Guides
+## Start here
 
-- [Codex frontend](codex-frontend/README.md) — `llmux run --codex`, Responses API, model picker, Agent SDK prerequisites and limits. [Activity origin](codex-frontend/activity.md) covers endpoint coloring.
+Pick the thing you want to do.
 
-- [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
-- [What ships today](features.md) — the complete feature list, with dates on behavior changes.
-- [The accidental AI debugger](ai-debugger.md) — per-request receipts, DevTools-style raw viewer, copy-as-curl, email masking.
-- [Remote daemon](remote.md) — one central daemon topology, remote-mode command matrix, transport security.
-- [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
-- [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
+- **See how much of each subscription you have left** → [llmux Islands](llmux-islands.md) — install, add your first account, and read remaining usage from the macOS menu bar or notch. Privacy modes and recording are covered there too. The setup screens and launcher are on the preview channel.
+- **Make models work together inside Claude Code** → [Multi-model agents in Claude Code](multi-model-agents.md) — Claude implements, GPT reviews, add Grok, and collect where they disagree. Each agent names a model id on its `model:` line, and llmux routes it.
+- **Check what was actually sent to a model** → [The accidental AI debugger](ai-debugger.md) — a raw request/response viewer for every call: the four legs of the wire, copy as curl, email masking. Answers "did my field reach the model?"
+
+## Reference
+
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex frontend/backend, SDK error lifecycle, install variants.
+- [Release availability](operational-reference.md#release-availability) — which features are on stable 0.2.24 vs the preview channel. The Islands setup screens and launcher are preview-only as of 2026-10-08.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, frontend/SDK runtime, Codex/Grok shaping, account types, email-anonymous mode.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
+- [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
+- [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
 - [Provider compatibility](provider-compatibility.md) — what each backend group actually honors: forwarded vs dropped vs refused request fields, the Codex/Grok `max_tokens` receipts, diagnostic headers, known unknowns.
+- [Codex frontend](codex-frontend/README.md) — `llmux run --codex`, Responses API, model picker, Agent SDK prerequisites and limits. [Activity origin](codex-frontend/activity.md) covers endpoint coloring.
+- [Remote daemon](remote.md) — one central daemon, other computers connect to it as clients, and usage is attributed per computer. A bonus, not the default setup. Also covers the remote-mode command matrix and transport security.
+- [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
+- [What ships today](features.md) — the complete feature list, with dates on behavior changes.
 - [FAQ](faq.md) — context-window workarounds (including `gpt-*` → Claude 1M `/compact` → back).
-- [llmux Islands](llmux-islands.md) — macOS menu-bar/notch companion, privacy modes, recording.
 - [System prompts (multi-model)](system-prompts/README.md) — **real captured system-prompt bodies** under [`system-prompts/samples/`](system-prompts/samples/) (CLI agent, 106k monitor, gpt SDK bot, compact, reviewer, auditor). Not a taxonomy essay.
 
 ## Design notes (not how-to)

@@ -404,3 +404,29 @@ The macOS app remains a control-API consumer and never reads provider config. Th
 [get-started contract](22-islands-get-started.md) adds a narrow CLI-owned handoff
 for the local proxy control key: endpoint/port-bound, private process pipes,
 executor-only memory, no remote-key reuse. Server authorization stays unchanged.
+
+## Native multi-model agents — ownership boundary (2026-10-08)
+
+The client (Claude Code) owns Agent delegation, tool execution, permissions and
+context. Each custom agent's request arrives at llmux as an ordinary Messages
+request whose `model` is the agent's `model:` id; llmux resolves the backend group
+per request (`resolve_group` in `src/proxy/forward.rs`) and the scheduler picks an
+account within that group. llmux has no consensus, review-round or "trinity"
+feature; those are the project's agent files and prompts.
+
+```text
+Claude Code (parent, claude-fable-5-1[1m])
+  ├─ Agent gpt-reviewer   model: gpt-6-astra[1m] ─┐
+  ├─ Agent grok-reviewer  model: grok-4.7        ─┤  POST /v1/messages (x per agent turn)
+  └─ own turns            model: claude-*       ─┤
+                                                  ▼
+                               llmux :3456  resolve_group(model) → scheduler(group)
+                                   ├─ claude group → Claude account (native Messages)
+                                   ├─ codex  group → Codex account  (Messages→Responses→Messages)
+                                   └─ grok   group → Grok account   (Messages→Grok Responses→Messages)
+```
+
+Evidence: measured 2026-10-08 on preview 2026-10-08-0306 — activity rows
+`kind=subagent model=gpt-6-astra group=codex status=200` and
+`kind=subagent model=grok-4.7 group=grok status=200` alongside parent rows in group
+`claude` (receipt in the zbrain workflow ledger; user guide: `docs/multi-model-agents.md`).

@@ -4,6 +4,16 @@ Both client frontends use the same account pool, leases and quota accounting.
 The Claude Agent SDK additionally supplies typed account-restriction errors to
 this lifecycle; see [SDK error mapping](provider-compatibility.md#claude-agent-sdk-account-errors).
 
+## What you experience
+
+- **Selection stays within a provider group.** A Claude model is served by one of your Claude accounts, a `gpt-*` model by one of your Codex accounts. llmux never substitutes a different provider when one is exhausted; crossing providers is your explicit choice (`/model`, or a per-agent `model:` — see [multi-model-agents.md](multi-model-agents.md)).
+- **Quota is finite and perishable.** Each account has a 5-hour and a 7-day window that reset on fixed timestamps; quota left unspent at a reset is gone.
+- **`default` spends perishable quota first.** It prefers an eligible account whose soon-to-reset quota would otherwise expire unused, but stays on the current account unless another scores clearly higher (>25%), so prompt caches survive. This is a scoring preference, not a promise to always use the soonest-expiring account.
+- **`round-robin` never switches proactively.** Fewest switches and best cache locality, at the cost of letting other accounts' quota expire.
+- **You can pin or pause an account manually** (`p` in the TUI switcher; context menu in llmux-islands). Paused accounts are never selected.
+
+## How selection works
+
 Which account serves the next request is decided by the scheduler. Two algorithms ship; switch live with `S` in the TUI (persisted to `scheduler.mode`), or `POST /llmux/scheduler-mode {"mode": "default" | "round-robin"}`.
 
 **Why switching matters:** the upstream prompt cache is scoped per account — every account switch invalidates it, and the next request re-reads the full conversation context uncached (token cost + latency). Both schedulers are therefore sticky on the current account; they differ in *when* they move and *who* is next.

@@ -10,6 +10,15 @@ Responses ingress. The original scope is in [SSOT](codex-frontend/ssot.md).
 Published-preview and installed-client evidence is in the final round of
 [the convergence loop](codex-frontend/loop.md#round-6--corrected-preview-and-installed-client).
 
+**Scope note 2026-10-08.** This frontend shares the account pool, routing and
+schedulers with the Claude Code frontend; it does not synchronize Codex and
+Claude Code settings, hooks or skills, and no cross-CLI configuration sync is
+promised here. Native cross-model subagent delegation was measured on the
+Claude Code frontend only (`docs/multi-model-agents.md`); no equivalent claim
+is made for Codex. `llmux run --codex` is on both release channels;
+`llmux env --codex` is preview-only as of 2026-10-08
+(`docs/operational-reference.md#release-availability`).
+
 ## Acceptance scenarios
 
 1. Run `llmux run --codex -- exec ...`: daemon readiness/version rules, remote

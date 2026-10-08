@@ -341,6 +341,27 @@ sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
 and the `[1m]` twin is an explicit opt-in. models.json lists the same
 272,000 / 872,000 pair for all three, which llmux does not advertise.
 
+## Selecting a model
+
+There are three ways to select a catalog model:
+
+- **Claude Code**: `/model <id>` (the [picker below](#claude-code-model-picker)
+  lists this catalog), or `--model <id>` at launch.
+- **Per agent**: `model: <id>` in `.claude/agents/<name>.md`. The agent's
+  requests carry that id and llmux routes them by name, so one Claude Code
+  session can run Claude, GPT and Grok workers natively (measured 2026-10-08;
+  see [multi-model agents](multi-model-agents.md)).
+- **Codex**: `-m <id>`, or the injected [catalog picker](#codex-model-picker).
+
+The `/model` picker is a convenience for typing; agent delegation does not
+depend on it. Prefer explicit ids such as `gpt-6-astra[1m]` or `grok-4.7` in
+agent files so routing is readable; aliases (`astra`, `grok`) also work. Claude
+Code logs an `unrecognized_model` warning for non-Claude ids and still sends the
+request.
+
+Channel note: `haiku` → `claude-haiku-5-5[1m]` is on the preview channel only as
+of 2026-10-08 ([release availability](operational-reference.md#release-availability)).
+
 ## Codex model picker
 
 `llmux run --codex` fetches `/llmux/models` and supplies a temporary Codex catalog
@@ -457,7 +478,7 @@ Checked all three subscription providers against their current primary sources:
 
 | Provider | Result | Sources checked |
 | --- | --- | --- |
-| Claude | Added `claude-haiku-5-5` (released 2026-10-07), 1M context / 128K max output; floated `haiku`. Both base and `[1m]` rows publish 1M; the suffix additionally selects Claude Code's context display. | [Haiku specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview), [current lineup](https://platform.claude.com/docs/en/models/overview) |
+| Claude | Added `claude-haiku-5-5` (released 2026-10-07), 1M context / 128K max output; floated `haiku`. Both base and `[1m]` rows publish 1M; the suffix additionally selects Claude Code's context display. Preview channel only until the next stable release. | [Haiku specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview), [current lineup](https://platform.claude.com/docs/en/models/overview) |
 | Codex / OpenAI | Current listed coding IDs are already present: GPT-6.1 Sol, GPT-6 Astra/Sol/Luna and GPT-5.6 Sol/Terra/Luna, GPT-5.5. Corrected the three 5.6 base rows from older 372K metadata to the current catalog's 272K; existing 1M twins remain. Hidden specialty/auto-review IDs and non-text APIs are not ordinary picker additions. | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json), [API model index](https://developers.openai.com/api/docs/models), [current guidance](https://developers.openai.com/api/docs/guides/latest-model) |
 | Grok / xAI | Latest general-purpose text model remains `grok-4.7` (released 2026-09-21), already present. Grok 4.7 Fast is a service variant limited to Cursor/Grok Build, not a newly documented public API model ID; recent voice/image releases do not belong in this catalog. | [Release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models) |
 
