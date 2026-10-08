@@ -191,6 +191,7 @@ impl DashboardView {
             .map(|a| AccountSnapshot {
                 id: AccountId(a.name.clone()),
                 healthy: a.healthy,
+                auth_failure_status: a.auth_failure_status,
                 credential_kind: kind_static(&a.kind),
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
@@ -770,6 +771,37 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn account_state_line_survives_attached_dashboard_projection() {
+        for (healthy, paused, code, expected) in [
+            (false, false, None, "! auth X"),
+            (false, false, Some(404), "! 404 auth X"),
+            (true, true, None, "paused"),
+            (false, true, None, "paused + auth X"),
+            (false, true, Some(503), "paused + 503 auth X"),
+        ] {
+            let mut json = doc_json();
+            json["accounts"][0]["healthy"] = serde_json::json!(healthy);
+            json["accounts"][0]["paused"] = serde_json::json!(paused);
+            if let Some(code) = code {
+                json["accounts"][0]["auth_failure_status"] = serde_json::json!(code);
+            }
+            let doc: DashboardDoc = serde_json::from_value(json).expect("decode old or new daemon");
+            let view = DashboardView::from_doc(&doc);
+            let account = &view.snapshot.accounts[0];
+            assert_eq!(account.auth_failure_status, code);
+            assert_eq!(account.paused, paused);
+            let params = SelectParams::from(&crate::config::SchedulerConfig::default());
+            let now = SystemTime::now();
+            let reason = crate::scheduler::select::eligibility(account, &params, now, true)
+                .expect("auth or pause gate");
+            assert_eq!(
+                crate::scheduler::select::blocking_reason(account, reason, &params, now),
+                expected
+            );
+        }
     }
 
     #[test]

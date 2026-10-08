@@ -361,11 +361,13 @@ mod tests {
         assert_eq!(normalized_model("opus[1m]"), "claude-opus-5-5");
     }
 
-    /// `haiku`'s catalog row carries NO `[1m]` suffix — proof the two steps
-    /// compose rather than both always firing.
+    /// Floating Haiku aliases use the new wire id; explicit old ids stay pinned.
     #[test]
-    fn normalize_body_resolves_an_alias_whose_id_has_no_context_suffix() {
-        assert_eq!(normalized_model("haiku"), "claude-haiku-4-5");
+    fn normalize_body_resolves_haiku_5_5_and_preserves_4_5() {
+        for model in ["haiku", "haiku[1m]", "haiku-5-5", "claude-haiku-5-5[1m]"] {
+            assert_eq!(normalized_model(model), "claude-haiku-5-5");
+        }
+        assert_eq!(normalized_model("claude-haiku-4-5"), "claude-haiku-4-5");
     }
 
     #[test]

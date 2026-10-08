@@ -5665,6 +5665,26 @@ async fn responses_sdk_account_rejections_fail_over_without_refresh() {
             "account restrictions cannot be fixed by rotating OAuth tokens: {code}"
         );
         let accounts = proxy.pool.snapshot().accounts;
+        assert_eq!(accounts[0].auth_failure_status, Some(status));
+        for endpoint in ["/llmux/status", "/llmux/dashboard"] {
+            let doc: serde_json::Value = reqwest::Client::new()
+                .get(proxy.url(endpoint))
+                .header("x-api-key", E2E_ADMIN_KEY)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let rejected = doc["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == "a-rejected")
+                .unwrap();
+            assert_eq!(rejected["auth_failure_status"], status);
+            assert_eq!(rejected["blocked"], format!("! {status} auth X"));
+        }
         assert!(
             !accounts[0].healthy,
             "rejected credential is excluded: {code}"

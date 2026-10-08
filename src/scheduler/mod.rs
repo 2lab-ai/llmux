@@ -164,6 +164,8 @@ pub struct AccountState {
     pub id: AccountId,
     pub credential: AccountCredential,
     pub health: AccountHealth,
+    /// HTTP status observed when this credential was marked unhealthy.
+    pub auth_failure_status: Option<u16>,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
     /// Model-scoped weekly limits from the usage poll's `limits[]` (e.g. the
@@ -207,6 +209,7 @@ impl AccountState {
             credential: config.credential.clone(),
             generation: next_generation(),
             health: AccountHealth::Healthy,
+            auth_failure_status: None,
             five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
@@ -757,10 +760,11 @@ impl PoolState {
     /// Record an auth failure (second 401 after a forced refresh, or a
     /// failed refresh). Marks the account `AuthFailed` until re-login. An
     /// auth failure on a manually pinned account ends the pin (issue #122).
-    pub fn record_auth_failure(&mut self, account: &AccountId) {
+    pub fn record_auth_failure(&mut self, account: &AccountId, status: Option<http::StatusCode>) {
         self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
             acct.health = AccountHealth::AuthFailed;
+            acct.auth_failure_status = status.map(|code| code.as_u16());
         }
     }
 
@@ -771,6 +775,7 @@ impl PoolState {
             acct.credential = credential;
             if acct.health == AccountHealth::AuthFailed {
                 acct.health = AccountHealth::Healthy;
+                acct.auth_failure_status = None;
             }
         }
     }
@@ -877,6 +882,7 @@ impl PoolState {
                 .map(|a| AccountSnapshot {
                     id: a.id.clone(),
                     healthy: a.health == AccountHealth::Healthy,
+                    auth_failure_status: a.auth_failure_status,
                     credential_kind: a.credential.kind(),
                     group: BackendGroup::from_kind(a.credential.kind()),
                     five_hour: a.five_hour,
@@ -981,6 +987,7 @@ impl PoolSnapshot {
 pub struct AccountSnapshot {
     pub id: AccountId,
     pub healthy: bool,
+    pub auth_failure_status: Option<u16>,
     pub credential_kind: &'static str,
     /// Backend group this account belongs to, derived from `credential_kind`
     /// (codex credential → Codex, oauth/apikey → Claude). The selector's
@@ -1460,8 +1467,8 @@ impl AccountPool {
             .record_429_classified(account, retry_after, model, now)
     }
 
-    pub fn record_auth_failure(&self, account: &AccountId) {
-        self.write().record_auth_failure(account);
+    pub fn record_auth_failure(&self, account: &AccountId, status: Option<http::StatusCode>) {
+        self.write().record_auth_failure(account, status);
     }
 
     pub fn update_credential(&self, account: &AccountId, credential: AccountCredential) {
@@ -1478,12 +1485,13 @@ impl AccountPool {
         &self,
         account: &AccountId,
         expected: &AccountFingerprint,
+        status: Option<http::StatusCode>,
     ) -> bool {
         let mut state = self.write();
         if !state.matches_fingerprint(account, expected) {
             return false;
         }
-        state.record_auth_failure(account);
+        state.record_auth_failure(account, status);
         true
     }
 
@@ -1576,6 +1584,7 @@ impl AccountPool {
                             // something a credential can answer either.
                             if kept.health == AccountHealth::AuthFailed {
                                 kept.health = AccountHealth::Healthy;
+                                kept.auth_failure_status = None;
                                 // Usage read under the RETIRED credential is
                                 // evidence about a dead login. Re-enter COLD
                                 // (cold is eligible, stale is not) or the
@@ -2508,7 +2517,7 @@ mod tests {
     #[test]
     fn auth_failure_marks_and_credential_update_heals() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
-        state.record_auth_failure(&id("a"));
+        state.record_auth_failure(&id("a"), None);
         assert_eq!(state.accounts[0].health, AccountHealth::AuthFailed);
         state.update_credential(
             &id("a"),
@@ -2832,7 +2841,7 @@ mod tests {
     #[test]
     fn reload_with_changed_credential_clears_auth_failure() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
         assert!(!pool.snapshot().accounts[0].healthy, "precondition");
 
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
@@ -2849,7 +2858,7 @@ mod tests {
     #[test]
     fn reload_with_unchanged_credential_keeps_auth_failure() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
 
         pool.reload_accounts(&[oauth_account("a")]);
 
@@ -2885,7 +2894,7 @@ mod tests {
         let pool = AccountPool::new(&[oauth_account("a")]);
         pool.record_429(&id("a"), Some(Duration::from_secs(600)), now());
         pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
 
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
 
@@ -2916,7 +2925,7 @@ mod tests {
             ),
             at(NOW_SECS - 200_000),
         );
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
 
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
 
@@ -2981,7 +2990,7 @@ mod tests {
             ),
             at(NOW_SECS - 200_000),
         );
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
 
         pool.reload_accounts(&[oauth_account("a")]);
 
@@ -3008,7 +3017,7 @@ mod tests {
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
 
         assert!(
-            !pool.record_auth_failure_if(&id("a"), &stale),
+            !pool.record_auth_failure_if(&id("a"), &stale, None),
             "the guard reports the stale result was discarded"
         );
         assert!(
@@ -3024,8 +3033,48 @@ mod tests {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let live = pool.fingerprint(&id("a")).expect("fingerprint");
 
-        assert!(pool.record_auth_failure_if(&id("a"), &live));
+        assert!(pool.record_auth_failure_if(&id("a"), &live, None));
         assert!(!pool.snapshot().accounts[0].healthy);
+    }
+
+    #[test]
+    fn auth_failure_status_is_credential_scoped_and_cleared_on_healing() {
+        let account = oauth_account("a");
+        let pool = AccountPool::new(std::slice::from_ref(&account));
+        let old = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert!(pool.record_auth_failure_if(&id("a"), &old, Some(http::StatusCode::NOT_FOUND)));
+        assert_eq!(pool.snapshot().accounts[0].auth_failure_status, Some(404));
+        // Unrelated reload retains the known status; changed credentials clear it.
+        pool.reload_accounts(&[account]);
+        assert_eq!(pool.snapshot().accounts[0].auth_failure_status, Some(404));
+        pool.reload_accounts(&[oauth_account_with_token("a", "new-token")]);
+        assert!(pool.snapshot().accounts[0].healthy);
+        assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
+        assert!(!pool.record_auth_failure_if(
+            &id("a"),
+            &old,
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        ));
+        assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
+        let current = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &current,
+            Some(http::StatusCode::UNAUTHORIZED)
+        ));
+        pool.update_credential(
+            &id("a"),
+            oauth_account_with_token("a", "refreshed-token").credential,
+        );
+        assert!(pool.snapshot().accounts[0].healthy);
+        assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
+        pool.record_auth_failure(&id("a"), Some(http::StatusCode::FORBIDDEN));
+        pool.record_auth_failure(&id("a"), None);
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure_status,
+            None,
+            "no status must not reuse an earlier code"
+        );
     }
 
     /// B2: a refresh started from the retired credential must not overwrite the
@@ -3058,7 +3107,7 @@ mod tests {
     #[test]
     fn update_credential_if_accepts_the_live_credential_and_heals() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
         let live = pool.fingerprint(&id("a")).expect("fingerprint");
 
         assert!(pool.update_credential_if(
@@ -3100,7 +3149,7 @@ mod tests {
             other => panic!("unexpected credential {other:?}"),
         }
         assert!(
-            !pool.record_auth_failure_if(&id("a"), lease.fingerprint()),
+            !pool.record_auth_failure_if(&id("a"), lease.fingerprint(), None),
             "a result from this lease can no longer bench the account"
         );
     }
@@ -3128,7 +3177,7 @@ mod tests {
         pool.evaluate(None, &params(), now());
         let lease = pool.lease_for(None, &params()).expect("lease");
         let before = pool.fingerprint(&id("a")).expect("fingerprint");
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
 
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
 

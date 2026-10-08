@@ -570,7 +570,11 @@ impl<F: UsageFetcher> UsagePoller<F> {
                     UsageError::Status { status } if *status == http::StatusCode::FORBIDDEN
                 );
                 if bench_on_forbidden && forbidden {
-                    self.pool.record_auth_failure_if(account, &fingerprint);
+                    self.pool.record_auth_failure_if(
+                        account,
+                        &fingerprint,
+                        Some(http::StatusCode::FORBIDDEN),
+                    );
                 }
                 Err(err)
             }
@@ -1082,6 +1086,7 @@ mod tests {
         let a = snapshot.accounts.iter().find(|x| x.id == id("a")).unwrap();
         let b = snapshot.accounts.iter().find(|x| x.id == id("b")).unwrap();
         assert!(!a.healthy, "403 = revoked → auth failure");
+        assert_eq!(a.auth_failure_status, Some(403));
         assert!(b.healthy, "401 = expired token → refresh path owns it");
     }
 
@@ -1137,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn forbidden_from_a_retired_credential_does_not_bench_the_relogin() {
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&id("a"));
+        pool.record_auth_failure(&id("a"), None);
         let fetcher = ReloginFetcher {
             pool: pool.clone(),
             result: Mutex::new(Some(Err(status_err(403)))),

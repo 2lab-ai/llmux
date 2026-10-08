@@ -13,7 +13,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `login [--api \| --codex \| --grok \| --openrouter [--paste]]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account; `--grok` runs the xAI device-code flow; `--openrouter` runs the OpenRouter OAuth PKCE flow in the browser and mints a long-lived `sk-or-v1-…` key. `--paste` (only with `--openrouter`) prompts for an existing key instead of opening a browser — and is also the automatic fallback when the browser flow cannot complete locally. |
 | `import [--from PATH \| --json JSON]` | Import credentials from a teamclaude config, `~/.claude/.credentials.json`, a Codex `~/.codex/auth.json`, or inline JSON. |
 | `dashboard` | Attach to a running daemon and render its dashboard over HTTP. Read-only except manual account switch. |
-| `env` | Print shell exports for pointing Claude Code at the proxy. |
+| `env [--codex]` | Print shell exports for Claude Code, or OpenAI-compatible exports plus a Codex provider command. |
 | `status [--json]` | Show client/server/update sections plus per-account quota; exits 1 when no server is running. |
 | `accounts [-v]` | List configured accounts; `-v` adds quota/cooldown detail. |
 | `accounts refresh [ACCOUNT]` | Re-read usage from the provider NOW, on the target daemon, for one account or every supported subscription account. Per-account failures stay visible and the command exits nonzero if any requested account failed. |
@@ -163,7 +163,33 @@ Claude-through-Codex needs Node.js 18+ and npm on the daemon host; the pinned SD
 installs lazily from embedded assets. Caller tools execute in Codex. See the
 [frontend guide](codex-frontend/README.md), [model picker](models.md#codex-model-picker)
 and [SDK account-error lifecycle](provider-compatibility.md#claude-agent-sdk-account-errors).
-`llmux env` remains a Claude Code export command.
+For manual environment wiring:
+
+```sh
+llmux env --codex          # inspect exports and the commented Codex command
+# Apply the exports to this shell:
+eval "$(llmux env --codex)"
+# Run the `codex -c ...` command printed above, adding --model as needed.
+```
+
+This prints `OPENAI_BASE_URL` (the selected endpoint plus `/v1`) and
+`OPENAI_API_KEY` (that endpoint's llmux key). Values are shell-quoted for POSIX
+shells such as bash and zsh. The commented command selects the `llmux_env`
+Responses provider with `env_key="OPENAI_API_KEY"` and
+`requires_openai_auth=false`; **exports alone do not override an existing
+Codex ChatGPT login or selected provider/profile**. For `codex exec`, place
+`exec` immediately after `codex`, before the printed `-c` overrides.
+The printed provider URL is fixed to the selected endpoint at generation time;
+regenerate the command when changing endpoints.
+
+`--remote` and `remote.host` select the remote URL and `remote.api_key`; local
+mode uses `proxy.port` and `proxy.api_key`. A missing or empty selected key
+fails before emitting exports, so an inherited OpenAI key cannot be reused by
+accident. As with plain `env`, local config initialization can create its admin
+key. The command does not launch a client or daemon, fetch the model catalog,
+or write Codex configuration/login files; `llmux run --codex` handles startup
+and the model picker. Output contains the selected key: treat it as a secret.
+Plain `llmux env` continues to emit Claude Code exports.
 
 ## Multi-tenant client keys
 
@@ -686,3 +712,27 @@ Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
 Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
 clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
 restart inside that short window can reuse launch context until a main turn is observed.
+
+### Account authentication failure status
+
+Accounts blocked by authentication or a persistent account error show the HTTP
+status actually observed, for example `! 401 auth X`, `! 404 auth X`, or
+`! 503 auth X`. A paused account shows `paused`; when authentication also fails,
+the same line shows `paused + 404 auth X` (using its observed code). The same
+reason appears in `llmux status`, the local/attached
+dashboard, and Islands account details. `/llmux/status` and `/llmux/dashboard`
+retain `status: "auth_failed"` and add nullable `auth_failure_status`; `blocked`
+contains the readable reason. Failures without an HTTP response
+show `! auth X`, or `paused + auth X` when also paused, without an invented status.
+Pause and authentication health remain independent; this combined label changes
+only the display, not scheduling priority or retry policy.
+
+A permanent refresh rejection uses the refresh endpoint's status. When an upstream
+401 triggers refresh and that refresh fails, the last HTTP failure status is
+shown; a refresh failure without an HTTP status retains the observed 401. This
+display does not change retry policy: ordinary 404 responses still relay and
+ordinary 503 responses remain transient.
+A successful credential refresh or changed credentials on re-login clear the
+stored failure code; late failures from replaced credentials cannot restore it.
+Only the numeric status is added to account documents, never response bodies or
+credentials.

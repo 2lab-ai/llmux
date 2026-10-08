@@ -56,16 +56,6 @@ pub fn shade_breathe(frame: usize) -> char {
     at(&['░', '▒', '▓', '█', '▓', '▒'], frame, 2)
 }
 
-/// Slow on/off blink for alerts (auth failure): `glyph` on, a space off,
-/// toggling about every ~3 ticks so it pulses rather than strobes.
-pub fn blink(frame: usize, glyph: char) -> char {
-    if (frame / 3).is_multiple_of(2) {
-        glyph
-    } else {
-        ' '
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,13 +78,6 @@ mod tests {
     }
 
     #[test]
-    fn blink_pulses_on_a_slow_cadence() {
-        assert_eq!(blink(0, '!'), '!');
-        assert_eq!(blink(3, '!'), ' ');
-        assert_eq!(blink(6, '!'), '!');
-    }
-
-    #[test]
     fn all_glyphs_are_braille_or_block_elements() {
         // Guard the CJK-width invariant: every glyph stays in the braille or
         // block-elements range (both East-Asian Narrow).
@@ -110,7 +93,6 @@ mod tests {
                 bar_pulse(f),
                 idle_drift(f),
                 shade_breathe(f),
-                blink(f, '!'),
             ] {
                 if g == '!' {
                     continue; // ASCII alert glyph, also narrow

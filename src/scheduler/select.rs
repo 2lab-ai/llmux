@@ -1011,7 +1011,7 @@ pub fn group_selection_order(
 
 /// Human-readable blocking reason for an ineligible account, with the
 /// concrete numbers an operator acts on: "cooldown 3m12s",
-/// "7d 99.4% > 99%", "usage stale 14m03s", "auth failed". Shared by the TUI
+/// "7d 99.4% > 99%", "usage stale 14m03s", "! 404 auth X". Shared by the TUI
 /// status column and `/llmux/status` so the wording never drifts.
 pub fn blocking_reason(
     account: &AccountSnapshot,
@@ -1020,7 +1020,18 @@ pub fn blocking_reason(
     now: SystemTime,
 ) -> String {
     match reason {
-        IneligibleReason::AuthUnhealthy => "auth failed".to_string(),
+        IneligibleReason::AuthUnhealthy => {
+            // Pause and failed auth coexist; compose their display without changing
+            // which eligibility gate wins or whether the scheduler selects the account.
+            let auth = account
+                .auth_failure_status
+                .map_or_else(|| "auth X".to_string(), |status| format!("{status} auth X"));
+            if account.paused {
+                format!("paused + {auth}")
+            } else {
+                format!("! {auth}")
+            }
+        }
         IneligibleReason::Paused => "paused".to_string(),
         IneligibleReason::CoolingDown => {
             match account
@@ -1265,6 +1276,7 @@ mod tests {
         AccountSnapshot {
             id: AccountId(id.to_string()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -2296,8 +2308,38 @@ mod tests {
         dead.healthy = false;
         assert_eq!(
             blocking_reason(&dead, IneligibleReason::AuthUnhealthy, &params(), now()),
-            "auth failed"
+            "! auth X"
         );
+    }
+
+    #[test]
+    fn account_state_line_composes_pause_without_changing_eligibility() {
+        for (healthy, paused, code, expected) in [
+            (true, false, None, None),
+            (false, false, Some(404), Some("! 404 auth X")),
+            (false, false, None, Some("! auth X")),
+            (true, true, None, Some("paused")),
+            (false, true, Some(503), Some("paused + 503 auth X")),
+            (false, true, None, Some("paused + auth X")),
+        ] {
+            let mut a = account("state");
+            a.healthy = healthy;
+            a.paused = paused;
+            a.auth_failure_status = code;
+            let gate = eligibility(&a, &params(), now(), true);
+            assert_eq!(
+                gate,
+                if !healthy {
+                    Some(IneligibleReason::AuthUnhealthy)
+                } else if paused {
+                    Some(IneligibleReason::Paused)
+                } else {
+                    None
+                }
+            );
+            let label = gate.map(|reason| blocking_reason(&a, reason, &params(), now()));
+            assert_eq!(label.as_deref(), expected);
+        }
     }
 
     #[test]

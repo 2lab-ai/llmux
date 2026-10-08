@@ -212,6 +212,21 @@ fn format_uptime(secs: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn account_lines_show_actual_auth_failure_status() {
+        let doc = serde_json::json!({"accounts":[
+            {"name":"a", "status":"auth_failed", "blocked":"! 404 auth X"},
+            {"name":"b", "status":"auth_failed", "blocked":"! 503 auth X"},
+            {"name":"c", "status":"ok", "blocked":"paused"},
+            {"name":"d", "status":"auth_failed", "blocked":"paused + 503 auth X"}
+        ]});
+        let lines = account_lines(&doc, SystemTime::now());
+        assert!(lines[0].contains("! 404 auth X"));
+        assert!(lines[1].contains("! 503 auth X"));
+        assert!(lines[2].contains("paused"));
+        assert!(lines[3].contains("paused + 503 auth X"));
+    }
+
     /// Fixed test clock: 2026-06-13 00:00:00 UTC.
     fn test_now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_308_800)

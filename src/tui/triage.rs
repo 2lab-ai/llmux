@@ -514,6 +514,7 @@ mod tests {
         AccountSnapshot {
             id: AccountId(id.to_string()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(window(0.10)),

@@ -2933,7 +2933,7 @@ mod tests {
         assert_eq!(normalize_model("fable"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable-5-1"), "claude-fable-5-1");
-        assert_eq!(normalize_model("haiku"), "claude-haiku-4-5");
+        assert_eq!(normalize_model("haiku"), "claude-haiku-5-5");
     }
 
     #[test]

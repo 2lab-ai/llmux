@@ -102,13 +102,13 @@ not that it is zero.
   | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
   | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
   | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
-  | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
+  | `haiku`, `haiku-5-5` | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
   alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
   exactly like `fable`, because alias resolution runs before the suffix strip.
-  That strip is syntactic only — it does not promise a 1M-capable target
-  (`haiku[1m]` resolves to the ordinary `claude-haiku-4-5` row).
+  The strip is syntactic; the resolved model's context limit still applies.
+  `haiku[1m]` now resolves to `claude-haiku-5-5[1m]` (1M published context).
   Only aliases are rewritten: a real catalog id is not an alias and passes
   through untouched — the `[1m]` suffix strip is a separate, subsequent step,
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
@@ -165,7 +165,9 @@ not that it is zero.
   aliases `opus-5` / `sonnet-5` and the bare generation id `gpt-5.6` did NOT
   move — they stay on their generation, because floating a version-pinned
   alias onto a new model would be silent substitution. Anyone who needs one specific model must send
-  its full catalog id — that is the stable handle. Usage and pricing are booked against the
+  its full catalog id — that is the stable handle. On 2026-10-08, `haiku`
+  moved from `claude-haiku-4-5` to `claude-haiku-5-5[1m]`; the explicit 4.5 id
+  remains available. Usage and pricing are booked against the
   resolved id, not the alias, so alias traffic lands on the same row as id
   traffic.
 
@@ -211,7 +213,9 @@ model it does not curate.
 | claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
-| claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-haiku-5-5[1m] | haiku, haiku-5-5 | Claude Haiku 5.5 [1M] | low, medium, high, xhigh, max | 1000000 | claude |
+| claude-haiku-5-5 | — | Claude Haiku 5.5 | low, medium, high, xhigh, max | 1000000 | claude |
+| claude-haiku-4-5    | —            | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6.1-sol         | sol, gpt-6.1 | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -221,10 +225,10 @@ model it does not curate.
 | gpt-6-luna[1m]      | —            | GPT-6-Luna [1M]     | low, medium, high, xhigh, max        | 1000000     | codex  |
 | gpt-6-luna          | luna         | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-5.6-sol         | gpt-5.6      | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-sol         | gpt-5.6      | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
-| gpt-5.6-luna        | —            | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
+| gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-5.6-luna        | —            | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
@@ -310,8 +314,8 @@ backend accepted 555,029 / ~801k / ~869k / 910,229 input tokens on
 `gpt-5.6-sol` and were rejected at ~936k with `Your input exceeds the context
 window of this model` (`gpt-5.6-terra` accepted 555,029). OpenAI publishes
 1,050,000 total for the gpt-5.6 family. The base rows keep the openai/codex
-catalog's 372000 — the window a client gets without opting in — exactly as the
-claude base rows keep 200000 next to their `[1m]` twins. There is deliberately
+catalog's current 272000 (re-read 2026-10-08), client metadata rather than a
+newly measured upstream limit. The `[1m]` twins keep their published 1M metadata. There is deliberately
 no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 `gpt-5.5[1m]` row (272k family).
 
@@ -417,8 +421,8 @@ So the same fetch that builds the lineup also exports, for the same launch:
 | -------------------------------- | --------------------------------------- |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
 | `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5[1m]`)  |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-5-5[1m]`)      |
 
 The values are DERIVED from the catalog alias owners at launch, never
 hardcoded: re-curating an alias onto a new row moves the export with it, and an
@@ -446,6 +450,45 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
+
+## Model sweep: 2026-10-08
+
+Checked all three subscription providers against their current primary sources:
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | Added `claude-haiku-5-5` (released 2026-10-07), 1M context / 128K max output; floated `haiku`. Both base and `[1m]` rows publish 1M; the suffix additionally selects Claude Code's context display. | [Haiku specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview), [current lineup](https://platform.claude.com/docs/en/models/overview) |
+| Codex / OpenAI | Current listed coding IDs are already present: GPT-6.1 Sol, GPT-6 Astra/Sol/Luna and GPT-5.6 Sol/Terra/Luna, GPT-5.5. Corrected the three 5.6 base rows from older 372K metadata to the current catalog's 272K; existing 1M twins remain. Hidden specialty/auto-review IDs and non-text APIs are not ordinary picker additions. | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json), [API model index](https://developers.openai.com/api/docs/models), [current guidance](https://developers.openai.com/api/docs/guides/latest-model) |
+| Grok / xAI | Latest general-purpose text model remains `grok-4.7` (released 2026-09-21), already present. Grok 4.7 Fast is a service variant limited to Cursor/Grok Build, not a newly documented public API model ID; recent voice/image releases do not belong in this catalog. | [Release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models) |
+
+### Current Claude reference prices
+
+USD per million tokens, verified 2026-10-08 against [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview):
+
+| Model / prompt length | Input | Output | Cache read | Cache write, 5m | Cache write, 1h |
+| --- | --- | --- | --- | --- | --- |
+| Haiku 5.5, ≤100,000 tokens | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
+| Haiku 5.5, >100,000 tokens | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
+| Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
+| Fable 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
+
+Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
+[2026-10-07](https://www.anthropic.com/claude-haiku-5-5). Fable 5.1 now has its
+own $0.25 cache-read reference rate. Explicit older Sonnet 5, Fable 5 and
+Haiku 4.5 keep their own prices.
+
+**Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
+≤100K tier and 5-minute cache writes. It does **not** apply Haiku's >100K tier
+(5× all rates), 1-hour write rates, service-tier premiums or historical prices.
+Aggregated counters do not retain the request-length/TTL detail needed to
+reconstruct these charges; crossing 100K in accumulated monthly usage does not
+mean any individual request crossed it. Displayed costs can therefore understate
+long-context/1h-cache API cost. These are API-equivalent estimates, never a
+subscription invoice. Existing config price overrides still take precedence.
+
+Haiku 5.5's published API limits are metadata, not a new live subscription
+compatibility claim. See the [provider contract](provider-compatibility.md#haiku-55-catalog-update).
 
 ## Sources
 
