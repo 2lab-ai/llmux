@@ -81,7 +81,8 @@ brew install --cask 2lab-ai/tap/llmux-islands
 
 The cask depends on the `llmux` formula, so it installs the matching CLI. The
 setup screens and launcher below ship on stable since v0.2.25 (2026-10-08).
-Already on 0.2.24? Run `llmux update`; it upgrades both and relaunches the app.
+Already on 0.2.24? Run `llmux update`; it upgrades the formula and the cask on
+the current channel (and relaunches the app only if it was running).
 
 The rolling preview channel has its own cask, `llmux-islands-preview`, which
 depends on `llmux-preview`. The two casks conflict; switch with
