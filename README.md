@@ -12,7 +12,7 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 ![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with 5h/7d usage bars and reset timers](screenshots/llmux-islands-workspace.png)
 
-<sub>Real app UI with demo data. Preview-channel build, captured 2026-10-08.</sub>
+<sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
 llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts.
 
@@ -69,14 +69,20 @@ Then ask, for example:
 Have gpt-reviewer review sample.py, then summarize what it found.
 ```
 
-Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's summary names both agents:
+Receipt from 2026-10-08 (llmux preview 2026-10-08-0306). That run also defined the Grok reviewer from the next section, so the parent's final text names both agents. Verbatim excerpt:
 
 ```text
-gpt-reviewer   MODEL: gpt-6-astra[1m]   VERDICT: REQUEST_CHANGES
-grok-reviewer  MODEL: grok-4.7          VERDICT: REQUEST_CHANGES
-Shared: average() divides by zero on empty input; find_user() silently returns
-the first user when no name matches; empty list raises IndexError.
-Found only by grok-reviewer: u["name"] on line 9 raises KeyError when a dict has no "name".
+gpt-reviewer
+MODEL: gpt-6-astra[1m]
+VERDICT: REQUEST_CHANGES
+
+grok-reviewer
+MODEL: grok-4.7
+VERDICT: REQUEST CHANGES — empty-input crashes and a silent wrong-user fallback make both functions unsafe to call as written.
+
+Shared findings. Both reviewers flagged the same three defects: average divides by zero on empty input, find_user silently returns the first user when no name matches, and find_user raises IndexError on an empty list.
+Found only by grok-reviewer: Line 9: u["name"] assumes every element is a mapping with a "name" key. A missing key raises KeyError and a non-mapping element raises TypeError.
+Found only by gpt-reviewer: None.
 PARENT MODEL: claude-fable-5-1[1m]
 ```
 
@@ -101,7 +107,7 @@ tools: Read
 ---
 ```
 
-Ask Claude to send the same change to both reviewers and collect where they disagree. Claude writes the code, GPT and Grok review it, and the disagreements tell you where to look. In the receipt above, only `grok-reviewer` flagged the unguarded `u["name"]` KeyError. Its request appeared as a `subagent` row with model `grok-4.7`, group `grok`, served by a Grok account.
+Ask Claude to send the same change to both reviewers and collect where they disagree. Claude writes the code, GPT and Grok review it, and the disagreements tell you where to look. In the receipt above, only `grok-reviewer` flagged the unguarded `u["name"]` lookup on line 9. Its request appeared as a `subagent` row with model `grok-4.7`, group `grok`, served by a Grok account.
 
 This is project configuration (two agent files and a prompt), not a bundled llmux command.
 
@@ -210,7 +216,7 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
 - [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok, diagnostic headers
-- [FAQ](docs/faq.md) — context-window workarounds (`gpt-*` → Claude 1M `/compact` → back)
+- [FAQ](docs/faq.md) — seeing what is left per account, subagents on GPT or Grok, what needs preview, context-window workarounds
 - [system prompts (multi-model)](docs/system-prompts/README.md) — real captured wire system prompts
 
 ## Compliance & caveats

@@ -26,7 +26,7 @@ Pick the thing you want to do.
 - [Remote daemon](remote.md) — one central daemon, other computers connect to it as clients, and usage is attributed per computer. A bonus, not the default setup. Also covers the remote-mode command matrix and transport security.
 - [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
 - [What ships today](features.md) — the complete feature list, with dates on behavior changes.
-- [FAQ](faq.md) — context-window workarounds (including `gpt-*` → Claude 1M `/compact` → back).
+- [FAQ](faq.md) — what is left per account, subagents on GPT or Grok, no cross-provider substitution, which features need preview, and the dated `gpt-5.5` context-window workaround.
 - [System prompts (multi-model)](system-prompts/README.md) — **real captured system-prompt bodies** under [`system-prompts/samples/`](system-prompts/samples/) (CLI agent, 106k monitor, gpt SDK bot, compact, reviewer, auditor). Not a taxonomy essay.
 
 ## Design notes (not how-to)

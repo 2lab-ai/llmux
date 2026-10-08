@@ -6,7 +6,7 @@ The app does not read `~/.config/llmux.json` or provider credentials. It asks th
 
 ![llmux Islands workspace with four accounts, 5-hour and 7-day usage bars, reset timers, and the Start coding row](../screenshots/llmux-islands-workspace.png)
 
-*Real app UI with demo data. Preview channel, captured 2026-10-08.*
+*Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.*
 
 Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-demo.gif), [original MOV](../screenshots/llmux-islands-demo.mov)
 
