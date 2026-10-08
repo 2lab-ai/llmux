@@ -716,12 +716,16 @@ restart inside that short window can reuse launch context until a main turn is o
 ### Account authentication failure status
 
 Accounts blocked by authentication or a persistent account error show the HTTP
-status actually observed, for example `401 auth failed`, `404 auth failed`, or
-`503 auth failed`. The same reason appears in `llmux status`, the local/attached
+status actually observed, for example `! 401 auth X`, `! 404 auth X`, or
+`! 503 auth X`. A paused account shows `paused`; when authentication also fails,
+the same line shows `paused + 404 auth X` (using its observed code). The same
+reason appears in `llmux status`, the local/attached
 dashboard, and Islands account details. `/llmux/status` and `/llmux/dashboard`
 retain `status: "auth_failed"` and add nullable `auth_failure_status`; `blocked`
-contains the readable reason. Older daemons and failures without an HTTP response
-continue to show `auth failed`, without an invented status.
+contains the readable reason. Failures without an HTTP response
+show `! auth X`, or `paused + auth X` when also paused, without an invented status.
+Pause and authentication health remain independent; this combined label changes
+only the display, not scheduling priority or retry policy.
 
 A permanent refresh rejection uses the refresh endpoint's status. When an upstream
 401 triggers refresh and that refresh fails, the last HTTP failure status is

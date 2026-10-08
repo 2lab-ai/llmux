@@ -5182,7 +5182,7 @@ fn account_row<'a>(
 
 /// Status column: active (green) / ready (default) / the concrete blocking
 /// reason from the scheduler's own gate ("cooldown 3m12s", "7d 99.4% > 99%",
-/// "usage stale 14m", "auth failed") so the TUI never disagrees with the
+/// "usage stale 14m", "! 404 auth X") so the TUI never disagrees with the
 /// selector about WHY an account is parked.
 fn status_span(
     account: &AccountSnapshot,
@@ -5226,29 +5226,35 @@ fn status_span(
         );
     }
     let text = select::blocking_reason(account, reason, params, now);
-    // Each blocked state gets its own animated glyph so the WHY reads at a
-    // glance: blinking alert (auth), shade filling up (over quota), a rotating
-    // timer (cooldown), a faint drift (stale data), a steady held block
-    // (operator pause).
+    // Auth/pause labels already contain exactly the requested state markers.
+    // Other blocked states keep their existing animated glyphs.
     let (glyph, style) = match reason {
         IneligibleReason::AuthUnhealthy => (
-            anim::blink(frame, '!'),
+            None,
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        IneligibleReason::Paused => ('⠿', Style::new().fg(Color::Yellow)),
-        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => {
-            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
-        }
+        IneligibleReason::Paused => (None, Style::new().fg(Color::Yellow)),
+        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
+            Some(anim::shade_breathe(frame)),
+            Style::new().fg(Color::Red),
+        ),
         IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
-            anim::half_block_clock(frame),
+            Some(anim::half_block_clock(frame)),
             Style::new().fg(Color::Yellow),
         ),
-        IneligibleReason::FableWeeklyExhausted => {
-            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
-        }
-        IneligibleReason::UsageStale => (anim::idle_drift(frame), dim()),
+        IneligibleReason::FableWeeklyExhausted => (
+            Some(anim::shade_breathe(frame)),
+            Style::new().fg(Color::Red),
+        ),
+        IneligibleReason::UsageStale => (Some(anim::idle_drift(frame)), dim()),
     };
-    Span::styled(format!("{glyph} {text}"), style)
+    Span::styled(
+        match glyph {
+            Some(glyph) => format!("{glyph} {text}"),
+            None => text,
+        },
+        style,
+    )
 }
 
 fn in_flight_span(in_flight: u32) -> Span<'static> {
@@ -14045,15 +14051,46 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_status_is_visible_in_rendered_account_table() {
-        for code in [404, 503] {
+    fn account_state_line_is_visible_in_rendered_account_table() {
+        for (healthy, paused, code, expected) in [
+            (true, false, None, "ready"),
+            (false, false, Some(404), "! 404 auth X"),
+            (false, false, None, "! auth X"),
+            (true, true, None, "paused"),
+            (false, true, Some(503), "paused + 503 auth X"),
+            (false, true, None, "paused + auth X"),
+        ] {
             let mut view = view_with(Vec::new());
             let mut account = fable_account();
-            account.healthy = false;
-            account.auth_failure_status = Some(code);
+            account.healthy = healthy;
+            account.paused = paused;
+            account.auth_failure_status = code;
             view.snapshot.accounts = vec![account];
-            let frame = render(&view, &chrome_overlay(Overlay::None), 160, 35);
-            assert!(frame.contains(&format!("{code} auth failed")), "{frame}");
+            for width in [120, 160] {
+                let rows = render_rows(&view, &chrome_overlay(Overlay::None), width, 35);
+                let row = rows
+                    .iter()
+                    .find(|row| row.contains("me@example.com") && row.contains("CLAUDE"))
+                    .expect("rendered account table row");
+                assert!(row.contains(expected), "{width} columns: {row}");
+                println!("{width} columns: {row}");
+            }
+            if !healthy || paused {
+                let account = &view.snapshot.accounts[0];
+                let gate =
+                    select::eligibility(account, &view.select_params, SystemTime::now(), false);
+                for frame in [0, 1, 30, 60] {
+                    let span = status_span(
+                        account,
+                        gate,
+                        false,
+                        &view.select_params,
+                        SystemTime::now(),
+                        frame,
+                    );
+                    assert_eq!(span.content, expected, "no extra or blinking status glyph");
+                }
+            }
         }
     }
 

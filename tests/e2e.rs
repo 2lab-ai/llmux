@@ -5683,7 +5683,7 @@ async fn responses_sdk_account_rejections_fail_over_without_refresh() {
                 .find(|a| a["name"] == "a-rejected")
                 .unwrap();
             assert_eq!(rejected["auth_failure_status"], status);
-            assert_eq!(rejected["blocked"], format!("{status} auth failed"));
+            assert_eq!(rejected["blocked"], format!("! {status} auth X"));
         }
         assert!(
             !accounts[0].healthy,

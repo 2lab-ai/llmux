@@ -4264,7 +4264,7 @@ mod tests {
             &meta,
         );
         assert_eq!(doc["accounts"][0]["status"], "auth_failed");
-        assert_eq!(doc["accounts"][0]["blocked"], "auth failed");
+        assert_eq!(doc["accounts"][0]["blocked"], "! auth X");
         assert_eq!(doc["current"], serde_json::Value::Null);
     }
 

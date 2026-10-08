@@ -774,10 +774,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_status_survives_attached_dashboard_projection() {
-        for code in [None, Some(404), Some(503)] {
+    fn account_state_line_survives_attached_dashboard_projection() {
+        for (healthy, paused, code, expected) in [
+            (false, false, None, "! auth X"),
+            (false, false, Some(404), "! 404 auth X"),
+            (true, true, None, "paused"),
+            (false, true, None, "paused + auth X"),
+            (false, true, Some(503), "paused + 503 auth X"),
+        ] {
             let mut json = doc_json();
-            json["accounts"][0]["healthy"] = serde_json::json!(false);
+            json["accounts"][0]["healthy"] = serde_json::json!(healthy);
+            json["accounts"][0]["paused"] = serde_json::json!(paused);
             if let Some(code) = code {
                 json["accounts"][0]["auth_failure_status"] = serde_json::json!(code);
             }
@@ -785,14 +792,14 @@ mod tests {
             let view = DashboardView::from_doc(&doc);
             let account = &view.snapshot.accounts[0];
             assert_eq!(account.auth_failure_status, code);
+            assert_eq!(account.paused, paused);
+            let params = SelectParams::from(&crate::config::SchedulerConfig::default());
+            let now = SystemTime::now();
+            let reason = crate::scheduler::select::eligibility(account, &params, now, true)
+                .expect("auth or pause gate");
             assert_eq!(
-                crate::scheduler::select::blocking_reason(
-                    account,
-                    crate::scheduler::select::IneligibleReason::AuthUnhealthy,
-                    &SelectParams::from(&crate::config::SchedulerConfig::default()),
-                    SystemTime::now()
-                ),
-                code.map_or_else(|| "auth failed".to_string(), |c| format!("{c} auth failed"))
+                crate::scheduler::select::blocking_reason(account, reason, &params, now),
+                expected
             );
         }
     }

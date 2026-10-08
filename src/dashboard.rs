@@ -2520,14 +2520,31 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_status_reaches_dashboard_and_status_without_details() {
-        let pool = AccountPool::new(&[oauth_account("a")]);
-        for code in [
-            None,
-            Some(http::StatusCode::NOT_FOUND),
-            Some(http::StatusCode::SERVICE_UNAVAILABLE),
+    fn account_state_line_reaches_dashboard_and_status_without_details() {
+        for (healthy, paused, code, expected) in [
+            (false, false, None, "! auth X"),
+            (
+                false,
+                false,
+                Some(http::StatusCode::NOT_FOUND),
+                "! 404 auth X",
+            ),
+            (true, true, None, "paused"),
+            (false, true, None, "paused + auth X"),
+            (
+                false,
+                true,
+                Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                "paused + 503 auth X",
+            ),
         ] {
-            pool.record_auth_failure(&AccountId("a".into()), code);
+            let pool = AccountPool::new(&[oauth_account("a")]);
+            if !healthy {
+                pool.record_auth_failure(&AccountId("a".into()), code);
+            }
+            if paused {
+                pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
+            }
             let doc = dashboard_doc(
                 &pool.snapshot(),
                 &seeded_hub().view(now()),
@@ -2536,16 +2553,13 @@ mod tests {
                 now(),
                 &meta(),
             );
-            let expected = code.map_or_else(
-                || "auth failed".to_string(),
-                |c| format!("{} auth failed", c.as_u16()),
-            );
             let json = serde_json::to_value(&doc).expect("serialize");
             assert_eq!(
                 json["accounts"][0]["auth_failure_status"],
                 serde_json::json!(code.map(|c| c.as_u16()))
             );
             assert_eq!(json["accounts"][0]["blocked"], expected);
+            assert_eq!(json["accounts"][0]["paused"], paused);
             let decoded: DashboardDoc = serde_json::from_value(json).expect("decode");
             assert_eq!(
                 decoded.accounts[0].auth_failure_status,
@@ -2565,7 +2579,9 @@ mod tests {
                 },
             );
             assert_eq!(status["accounts"][0]["blocked"], expected);
-            assert_eq!(status["accounts"][0]["status"], "auth_failed");
+            if !healthy {
+                assert_eq!(status["accounts"][0]["status"], "auth_failed");
+            }
             assert_eq!(
                 status["accounts"][0]["auth_failure_status"],
                 serde_json::json!(code.map(|c| c.as_u16()))

@@ -5230,7 +5230,7 @@ mod tests {
                 &state.select_params(),
                 SystemTime::now(),
             ),
-            "401 auth failed"
+            "! 401 auth X"
         );
         assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
     }
@@ -5296,7 +5296,7 @@ mod tests {
                         &state.select_params(),
                         SystemTime::now(),
                     ),
-                    format!("{} auth failed", status.as_u16())
+                    format!("! {} auth X", status.as_u16())
                 );
                 assert_eq!(
                     classify(status, &HeaderMap::new()),
