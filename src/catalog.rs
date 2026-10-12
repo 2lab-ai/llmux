@@ -45,7 +45,14 @@
 //!   probe — `grok-4.5` ctx 500000 (2026-07-14), `grok-4.6` ctx 500000, name
 //!   "Grok 4.6" (2026-08-13), `grok-4.7` ctx 500000, name "Grok 4.7"
 //!   (2026-09-23; the same response also lists `grok-4.7-build-fast`, which is
-//!   NOT curated). Grok effort menus come from
+//!   NOT curated). Re-probed 2026-10-12: same ids and menus, but the response
+//!   now carries `context_window` 256000 on all four ids next to
+//!   `context_windows` [256000, 500000]. The rows keep 500000, the upper
+//!   `context_windows` entry; a 306,103-input-token `grok-4.7` request through
+//!   the daemon was accepted that day, so the 256000 default is not enforced
+//!   for `grok-4.7` (the 500000 ceiling itself and `grok-4.6` / `grok-4.5`
+//!   above 256000 were not re-probed; `docs/models.md`, sweep 2026-10-12).
+//!   Grok effort menus come from
 //!   [`crate::provider::grok::thinking_levels_catalog`] (models with no
 //!   thinking support get an empty menu). The curated grok set is `grok-4.7`
 //!   (plus its opt-in `grok-4.7[1m]` picker twin), `grok-4.6` and `grok-4.5`;

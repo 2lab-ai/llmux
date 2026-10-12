@@ -46,8 +46,11 @@ pub(crate) const GROK_USER_AGENT: &str = concat!("xai-grok-workspace/", "1.0.34"
 /// context_window 500000 — note NO `none`; source for `grok-4.7` /
 /// `grok-4.7-build-fast`: the live cli-chat-proxy `GET /v1/models` response
 /// (2026-09-23), reasoning_efforts xhigh/high/medium/low, default high,
-/// context_window 500000 — again NO `none`). Models NOT listed here get no
-/// `reasoning` field at all — omission is the only universally-accepted
+/// context_window 500000 — again NO `none`; re-read 2026-10-12: menus
+/// unchanged, `context_window` now 256000 on all four ids next to
+/// `context_windows` [256000, 500000] — see `docs/models.md`). Models NOT
+/// listed here get no `reasoning` field at all — omission is the only
+/// universally-accepted
 /// wire form (e.g. `grok-build-0.1` has no thinking support).
 const GROK_THINKING_LEVELS: &[(&str, &[&str])] = &[
     ("grok-4.7", &["low", "medium", "high", "xhigh"]),
