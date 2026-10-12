@@ -263,7 +263,13 @@ rate and is reported unpriced, never as a free `$0`).
 
 `grok-4.7[1m]` and `grok-4.7` are the SAME upstream model — the provider strips
 one trailing `[1m]` before the request leaves llmux — which is why both rows
-advertise **500000**, xAI's real window from the live `/v1/models` probe. The
+advertise **500000**, the upper entry of xAI's window list from the live
+`/v1/models` probe. As of 2026-10-12 (first seen that day; the 2026-09-23 read
+still reported 500000) that endpoint publishes `context_window: 256000` next to
+`context_windows: [256000, 500000]`; llmux sends no window selector, and a
+306,103-input-token `grok-4.7` request through the daemon was still accepted
+that day, so the rows keep the 500000 upper entry — the ceiling itself was not
+re-probed (see [Model sweep: 2026-10-12](#model-sweep-2026-10-12)). The
 twin exists only because of how Claude Code sizes its own readout: for an id it
 does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
 1M window (800k usable). Measured 2026-09-28 with Claude Code 2.1.283:
@@ -472,6 +478,18 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
 
+## Model sweep: 2026-10-12
+
+Checked all three subscription providers against their current primary sources.
+No provider lists a new model id, and no catalog row or reference price changed
+(one live availability finding on Codex, recorded in its row).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | Current lineup unchanged: Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 are all present. There is no `claude-fable-5-5` on the platform (Claude Code 2.1.296 carries no such id either); Mythos 5.1 is limited availability (Claude Code 2.1.296 knows `claude-mythos-5-1`) and is not a catalog row. Pricing re-read: every reference rate in `src/pricing.rs` still matches (cache read: Fable 5.1 $0.25, Opus 5.5 $0.20, Sonnet 5.5 $0.10, Haiku 5.5 $0.01 in the ≤100K tier). | [current lineup](https://platform.claude.com/docs/en/models/overview), [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Codex / OpenAI | `models.json` @ `a9b0815167c2` lists the same picker ids as on 2026-10-08 (GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, GPT-5.6 Sol/Terra/Luna, GPT-5.5; 272K / 872K metadata unchanged, GPT-5.5 272K / 272K). The hidden `gpt-daybreak-*` and `codex-auto-review` ids remain non-picker. Live probe through the daemon the same day: every picker id tried (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-5.6-sol`) returned HTTP 400 `The '<model>' model is not supported when using Codex with a ChatGPT account.` — all on the scheduler's active codex account, whose token (refreshed 01:30Z that day; last 200 on that account 2026-10-10) now carries plan `free` (the other codex accounts carry `pro`; official Codex CLI 0.160.1 on a pro account answers normally). After pausing that account, `gpt-6.1-sol` and `gpt-6-astra` returned 200 on a pro account (`gpt-6-sol` / `gpt-5.6-sol` not re-tried after the pause). An account-eligibility problem, not a catalog change; llmux's missing failover is [#204](https://github.com/2lab-ai/llmux/issues/204). | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json) |
+| Grok / xAI | No new text model beyond the `grok-4.7` family (September: `grok-4.7` on the public API, Grok 4.7 Fast for Cursor/Grok Build only — the uncurated `grok-4.7-build-fast` — and `grok-voice-transcribe-2.0`; October: only the `grok-voice-transcribe-1.0` EOL on 2026-10-02). Live `cli-chat-proxy` `/v1/models` with a real subscription token: the same four ids (`grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`) and the same effort menus, but the response shape changed — `context_window` now reads **256000** on every id, next to a new `context_windows: [256000, 500000]` list and a compaction hint (`auto_compact_threshold_percent: 80`). llmux sends no window selector, so the row figure was re-checked by an acceptance probe through the daemon: a `grok-4.7` request with `usage.input_tokens` 306103 (+1152 cache read) returned HTTP 200, i.e. `grok-4.7` still takes prompts well above the published 256k default (only `grok-4.7` was probed; the 500000 ceiling itself was not). The rows keep **500000**, the upper `context_windows` entry that the 2026-07-14 … 2026-09-23 reads reported as `context_window`; the selectable-window / compaction fields are a feature question ([#203](https://github.com/2lab-ai/llmux/issues/203)), not a catalog fact. See [The grok `[1m]` twin](#the-grok-1m-twin). | [Release notes](https://docs.x.ai/developers/release-notes), live `/v1/models` and daemon probe (2026-10-12) |
+
 ## Model sweep: 2026-10-08
 
 Checked all three subscription providers against their current primary sources:
@@ -583,7 +601,14 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   grok set is `grok-4.7` (the default pin, plus its `[1m]` twin), `grok-4.6`
   and `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
-  synthesize a null-metadata row when pinned.
+  synthesize a null-metadata row when pinned. Re-probed 2026-10-12 with a real
+  subscription token: the same four ids and effort menus, but `context_window`
+  now reads 256000 on every id next to `context_windows: [256000, 500000]` and
+  `auto_compact_threshold_percent: 80`. The rows keep 500000, the upper
+  `context_windows` entry; a 306,103-input-token `grok-4.7` request through the
+  daemon was accepted (HTTP 200), so the 256000 default is not enforced for
+  `grok-4.7`. Neither the 500000 ceiling nor `grok-4.6` / `grok-4.5` above
+  256000 was re-probed.
 - **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
   is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
   also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
