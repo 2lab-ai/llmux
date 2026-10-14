@@ -755,14 +755,18 @@ impl ResponsesSseConverter {
                 });
             // OpenAI carries the cache-WRITE subset in the same details object.
             // It is 0 on today's wire, but map it to `cache_creation_input_tokens`
-            // so the dashboard's cache split stays correct if it ever isn't.
-            // Codex bills nothing for cache creation, so pricing scores it at 0.
+            // so the dashboard's cache split and pricing (1.25x input, per
+            // developers.openai.com/api/docs/pricing) stay correct if it isn't.
             let cache_write = details
                 .and_then(|d| d.get("cache_write_tokens"))
                 .and_then(Value::as_u64);
             self.cached_input_tokens = cached.unwrap_or(0);
             self.usage = StreamUsage {
-                input_tokens: total_input.saturating_sub(self.cached_input_tokens),
+                // `input_tokens` is cache-inclusive: it contains both the cached
+                // and the cache-write subsets, which are priced separately.
+                input_tokens: total_input
+                    .saturating_sub(self.cached_input_tokens)
+                    .saturating_sub(cache_write.unwrap_or(0)),
                 output_tokens: usage
                     .get("output_tokens")
                     .and_then(Value::as_u64)
