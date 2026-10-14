@@ -190,8 +190,9 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// Human-readable table: name, type, logged-in, 7d used/left, the pace
-/// columns (window elapsed + burn-rate multiplier), reset ETA.
+/// Human-readable table: name, 7d used, window elapsed, burn-rate
+/// multiplier, reset ETA — kept narrow enough for an 80-column terminal.
+/// (`--json` still carries type, logged-in and remaining percent.)
 /// `n/a` for accounts with no weekly-quota source or no reading yet.
 fn print_table(accounts: &[AccountUsage]) {
     if accounts.is_empty() {
@@ -205,21 +206,17 @@ fn print_table(accounts: &[AccountUsage]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  {:>8}  {:>6}  RESETS",
+        "{:<name_width$}  {:>7}  {:>7}  {:>6}  RESETS",
         "NAME",
-        "TYPE",
-        "LOGGED IN",
         "7D USED",
-        "7D LEFT",
         "ELAPSED",
         "RATE",
         name_width = name_width
     );
     for account in accounts {
-        let (used, left, elapsed, rate, resets) = match &account.seven_day {
+        let (used, elapsed, rate, resets) = match &account.seven_day {
             Some(w) => (
                 format!("{:.1}%", w.used_percent),
-                format!("{:.1}%", w.remaining_percent),
                 format!("{:.1}%", w.elapsed_percent),
                 w.rate.map_or_else(|| "n/a".into(), |r| format!("{r:.2}x")),
                 format!(
@@ -229,21 +226,12 @@ fn print_table(accounts: &[AccountUsage]) {
                     ))
                 ),
             ),
-            None => (
-                "n/a".into(),
-                "n/a".into(),
-                "n/a".into(),
-                "n/a".into(),
-                "n/a".into(),
-            ),
+            None => ("n/a".into(), "n/a".into(), "n/a".into(), "n/a".into()),
         };
         println!(
-            "{:<name_width$}  {:<10}  {:<9}  {:>7}  {:>7}  {:>8}  {:>6}  {resets}",
+            "{:<name_width$}  {:>7}  {:>7}  {:>6}  {resets}",
             account.name,
-            account.kind,
-            if account.logged_in { "yes" } else { "no" },
             used,
-            left,
             elapsed,
             rate,
             name_width = name_width
