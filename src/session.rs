@@ -139,6 +139,42 @@ fn tokens_from_response_body(body: &str) -> (u64, u64) {
     (input.unwrap_or(0), output.unwrap_or(0))
 }
 
+/// The metadata one [`RawIoRecord`] contributes to the fold — and nothing
+/// else. Projecting a record into this (parsing `user_id` out of the request
+/// body and the token counters out of the response body) lets the caller drop
+/// the verbatim bodies immediately: a streaming reader buffers a chunk of these
+/// small structs, never a chunk of full records whose request bodies can be
+/// megabytes each (see [`SessionFolder`]).
+#[derive(Debug, Clone)]
+pub struct RecordMeta {
+    ts_ms: u64,
+    id: u64,
+    user_id: Option<String>,
+    model: Option<String>,
+    account: Option<String>,
+    tokens_in: u64,
+    tokens_out: u64,
+    duration_ms: Option<u64>,
+}
+
+impl RecordMeta {
+    /// Extract the fold's metadata from a persisted record. Metadata only —
+    /// the request/response body text is parsed here and not retained.
+    pub fn from_record(rec: &RawIoRecord) -> Self {
+        let (tokens_in, tokens_out) = tokens_from_response_body(&rec.response_body);
+        Self {
+            ts_ms: rec.ts_ms,
+            id: rec.id,
+            user_id: user_id_from_request_body(&rec.request_body),
+            model: rec.model.clone(),
+            account: rec.account.clone(),
+            tokens_in,
+            tokens_out,
+            duration_ms: rec.duration_ms,
+        }
+    }
+}
+
 /// Mutable accumulator while folding; finalized into a [`Session`].
 struct Acc {
     user_id: Option<String>,
@@ -152,7 +188,8 @@ struct Acc {
     last_ms: u64,
     /// The account of the chronologically last record folded so far, to detect a
     /// change on the next record. `None` until a record with a known account is
-    /// seen.
+    /// seen. Carried across [`SessionFolder::add`] calls, so rotation detection
+    /// continues seamlessly from one batch into the next.
     prev_account: Option<String>,
     /// Whether any record in this group lacked a `user_id` (forces `Low`).
     any_missing_user_id: bool,
@@ -181,7 +218,44 @@ impl Acc {
         }
     }
 
-    fn into_session(self) -> Session {
+    /// Fold one record into this accumulator. Callers must feed a key's
+    /// records in ascending `(ts_ms, id)` order for `account_rotations` to be
+    /// chronological; every other field is order-independent.
+    fn fold_record(&mut self, rec: &RecordMeta) {
+        self.requests = self.requests.saturating_add(1);
+        self.tokens_in = self.tokens_in.saturating_add(rec.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(rec.tokens_out);
+        // Timed rate sums (perf telemetry v1): only records that recorded a
+        // duration contribute — numerator and denominator stay paired,
+        // pre-field history contributes nothing.
+        if let Some(ms) = rec.duration_ms {
+            self.duration_ms_sum = self.duration_ms_sum.saturating_add(ms);
+            self.timed_requests = self.timed_requests.saturating_add(1);
+            self.tokens_out_timed = self.tokens_out_timed.saturating_add(rec.tokens_out);
+        }
+        if let Some(model) = &rec.model {
+            self.models.insert(model.clone());
+        }
+        if let Some(account) = &rec.account {
+            self.accounts.insert(account.clone());
+            // A rotation is a change from the previous record's account.
+            if self
+                .prev_account
+                .as_ref()
+                .is_some_and(|prev| prev != account)
+            {
+                self.account_rotations = self.account_rotations.saturating_add(1);
+            }
+            self.prev_account = Some(account.clone());
+        }
+        self.first_ms = self.first_ms.min(rec.ts_ms);
+        self.last_ms = self.last_ms.max(rec.ts_ms);
+        if rec.user_id.is_none() {
+            self.any_missing_user_id = true;
+        }
+    }
+
+    fn to_session(&self) -> Session {
         // High only when the group is keyed by an explicit user_id AND no record
         // in it was missing one; the ungrouped bucket (and any group that somehow
         // mixed in a missing key) is Low.
@@ -191,12 +265,12 @@ impl Acc {
             Confidence::Low
         };
         Session {
-            user_id: self.user_id,
+            user_id: self.user_id.clone(),
             requests: self.requests,
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
-            models: self.models.into_iter().collect(),
-            accounts: self.accounts.into_iter().collect(),
+            models: self.models.iter().cloned().collect(),
+            accounts: self.accounts.iter().cloned().collect(),
             account_rotations: self.account_rotations,
             first_ms: self.first_ms,
             last_ms: self.last_ms,
@@ -205,6 +279,77 @@ impl Acc {
             tokens_out_timed: self.tokens_out_timed,
             confidence,
         }
+    }
+}
+
+/// Incremental session fold: feed records in batches, read the timeline at any
+/// point. State is one small [`Acc`] per `user_id` — O(sessions), independent
+/// of how many records have been folded — so a streaming reader can fold an
+/// arbitrarily large raw-io log while holding only one batch at a time.
+///
+/// # Ordering
+///
+/// Every aggregate except `account_rotations` (sums, set unions, min/max) is
+/// order-independent, so batches merge exactly. `account_rotations` counts
+/// account changes in chronological order: each batch is sorted by
+/// `(ts_ms, id)` before folding and each key's last-seen account carries over
+/// into the next batch. The result therefore equals a one-shot
+/// [`fold_sessions`] over all records whenever no record's timestamp precedes
+/// (for its own key) a record already folded in an EARLIER batch. raw-io.jsonl
+/// is appended in near-chronological order — disorder comes only from
+/// overlapping concurrent requests — so with batches of thousands of records
+/// that condition holds in practice; if it is violated, only
+/// `account_rotations` can differ (the late record is folded as if it came
+/// after the previous batch).
+#[derive(Default)]
+pub struct SessionFolder {
+    groups: BTreeMap<Option<String>, Acc>,
+}
+
+impl SessionFolder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a batch of full records. Projects each to its [`RecordMeta`] and
+    /// folds via [`Self::add_meta`]; nothing from `records` is retained.
+    pub fn add(&mut self, records: &[RawIoRecord]) {
+        self.add_meta(records.iter().map(RecordMeta::from_record).collect());
+    }
+
+    /// Fold a batch of already-projected records. The batch is sorted by
+    /// `(ts_ms, id)` (stable, so exact ties keep their input order) and each
+    /// record is routed to its own key's accumulator, created on first sight.
+    /// The batch is consumed and dropped on return.
+    pub fn add_meta(&mut self, mut batch: Vec<RecordMeta>) {
+        // Process in timestamp order (then by id) so rotation detection and
+        // the span are independent of file/append order within the batch.
+        batch.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then(a.id.cmp(&b.id)));
+        for rec in &batch {
+            let acc = self
+                .groups
+                .entry(rec.user_id.clone())
+                .or_insert_with(|| Acc::new(rec.user_id.clone(), rec.ts_ms));
+            acc.fold_record(rec);
+        }
+    }
+
+    /// The session timeline for everything folded so far, without consuming
+    /// the folder (so a streaming caller can deliver progressive partials).
+    ///
+    /// Sorted by `last_ms` descending (most recent session first), with the
+    /// `ungrouped` bucket — if present — always last so the confident sessions
+    /// lead the timeline.
+    pub fn snapshot(&self) -> Vec<Session> {
+        let mut sessions: Vec<Session> = self.groups.values().map(Acc::to_session).collect();
+        // Most-recent session first; the ungrouped (None) bucket always sinks to
+        // the bottom so the confident rows lead.
+        sessions.sort_by(|a, b| match (a.user_id.is_none(), b.user_id.is_none()) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.last_ms.cmp(&a.last_ms).then(a.user_id.cmp(&b.user_id)),
+        });
+        sessions
     }
 }
 
@@ -221,71 +366,16 @@ impl Acc {
 /// first), with the `ungrouped` bucket — if present — always last so the
 /// confident sessions lead the timeline.
 ///
+/// A one-shot [`SessionFolder`] pass: sorting the whole slice by `(ts_ms, id)`
+/// (stable) and then splitting by key yields each key's records in exactly the
+/// order that sorting that key's records alone would, so this is equivalent to
+/// grouping first and sorting per group.
+///
 /// Pure: no IO, no clock, no panics.
 pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
-    // Stable per-key grouping. The BTreeMap key is the user_id (or a sentinel for
-    // the ungrouped bucket) so iteration order is deterministic before the final
-    // sort.
-    let mut groups: BTreeMap<Option<String>, Vec<&RawIoRecord>> = BTreeMap::new();
-    for rec in records {
-        let key = user_id_from_request_body(&rec.request_body);
-        groups.entry(key).or_default().push(rec);
-    }
-
-    let mut sessions: Vec<Session> = groups
-        .into_iter()
-        .map(|(user_id, mut recs)| {
-            // Process in timestamp order (then by id) so rotation detection and
-            // the span are independent of file/append order.
-            recs.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then(a.id.cmp(&b.id)));
-            let first_ts = recs.first().map(|r| r.ts_ms).unwrap_or(0);
-            let mut acc = Acc::new(user_id, first_ts);
-            for rec in recs {
-                acc.requests = acc.requests.saturating_add(1);
-                let (tin, tout) = tokens_from_response_body(&rec.response_body);
-                acc.tokens_in = acc.tokens_in.saturating_add(tin);
-                acc.tokens_out = acc.tokens_out.saturating_add(tout);
-                // Timed rate sums (perf telemetry v1): only records that
-                // recorded a duration contribute — numerator and denominator
-                // stay paired, pre-field history contributes nothing.
-                if let Some(ms) = rec.duration_ms {
-                    acc.duration_ms_sum = acc.duration_ms_sum.saturating_add(ms);
-                    acc.timed_requests = acc.timed_requests.saturating_add(1);
-                    acc.tokens_out_timed = acc.tokens_out_timed.saturating_add(tout);
-                }
-                if let Some(model) = &rec.model {
-                    acc.models.insert(model.clone());
-                }
-                if let Some(account) = &rec.account {
-                    acc.accounts.insert(account.clone());
-                    // A rotation is a change from the previous record's account.
-                    if acc
-                        .prev_account
-                        .as_ref()
-                        .is_some_and(|prev| prev != account)
-                    {
-                        acc.account_rotations = acc.account_rotations.saturating_add(1);
-                    }
-                    acc.prev_account = Some(account.clone());
-                }
-                acc.first_ms = acc.first_ms.min(rec.ts_ms);
-                acc.last_ms = acc.last_ms.max(rec.ts_ms);
-                if user_id_from_request_body(&rec.request_body).is_none() {
-                    acc.any_missing_user_id = true;
-                }
-            }
-            acc.into_session()
-        })
-        .collect();
-
-    // Most-recent session first; the ungrouped (None) bucket always sinks to the
-    // bottom so the confident rows lead.
-    sessions.sort_by(|a, b| match (a.user_id.is_none(), b.user_id.is_none()) {
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        _ => b.last_ms.cmp(&a.last_ms).then(a.user_id.cmp(&b.user_id)),
-    });
-    sessions
+    let mut folder = SessionFolder::new();
+    folder.add(records);
+    folder.snapshot()
 }
 
 #[cfg(test)]
@@ -493,5 +583,107 @@ mod tests {
         assert_eq!(sessions[0].tokens_out, 0);
         // Cap constant is in scope (silences unused-import on the test module).
         let _ = RESPONSE_CAP_BYTES;
+    }
+
+    /// A varied synthetic log in APPEND order: many interleaved keys, ~1% with
+    /// no user_id, some records with no account or no duration, rotating
+    /// accounts and models. Timestamps are disordered only within aligned
+    /// blocks of 8 (each block is written newest-first), modelling concurrent
+    /// requests completing out of start order — so any batching whose
+    /// boundaries fall on a multiple of 8 never splits a disordered run.
+    fn varied_log(n: u64) -> Vec<RawIoRecord> {
+        (0..n)
+            .map(|i| {
+                let block = i / 8;
+                let within = 7 - (i % 8); // newest-first inside each block
+                let ts = 1_000_000 + block * 800 + within * 100;
+                let uid = if i % 97 == 13 {
+                    None
+                } else {
+                    Some(format!("u-{}", (i * 7 + i / 50) % 23))
+                };
+                let acct = format!("acct-{}", (i / 3 + i % 5) % 3);
+                let model = if i % 4 == 0 { "opus" } else { "sonnet" };
+                let mut r = record(i + 1, ts, uid.as_deref(), model, &acct, i % 1000, i % 37);
+                if i % 11 == 0 {
+                    r.account = None;
+                }
+                if i % 13 == 0 {
+                    r.duration_ms = None;
+                } else {
+                    r.duration_ms = Some(100 + i % 900);
+                }
+                if i % 29 == 0 {
+                    r.model = None;
+                }
+                r
+            })
+            .collect()
+    }
+
+    /// The main correctness proof for the incremental folder: a log larger
+    /// than the TUI's 4096-record batch, folded in batches, produces EXACTLY
+    /// the one-shot `fold_sessions` timeline — every field, every session, in
+    /// the same order. Covers several batch sizes including the TUI's.
+    #[test]
+    fn chunked_folder_matches_one_shot_fold() {
+        let records = varied_log(3 * 4096 + 520);
+        let expected = fold_sessions(&records);
+        assert!(expected.len() > 10, "fixture should produce many sessions");
+        assert!(
+            expected.iter().any(|s| s.account_rotations > 0),
+            "fixture should exercise rotations"
+        );
+        assert!(expected.iter().any(|s| s.user_id.is_none()));
+        for batch in [4096usize, 1000, 8] {
+            let mut folder = SessionFolder::new();
+            for chunk in records.chunks(batch) {
+                folder.add(chunk);
+            }
+            assert_eq!(folder.snapshot(), expected, "batch size {batch}");
+        }
+    }
+
+    /// Progressive partials are correct mid-stream: after N batches, the
+    /// snapshot equals a one-shot fold over exactly the records added so far,
+    /// and `snapshot` does not disturb subsequent folding.
+    #[test]
+    fn partial_snapshot_matches_fold_of_prefix() {
+        let records = varied_log(2 * 4096 + 300);
+        let mut folder = SessionFolder::new();
+        let mut added = 0;
+        for chunk in records.chunks(4096) {
+            folder.add(chunk);
+            added += chunk.len();
+            assert_eq!(folder.snapshot(), fold_sessions(&records[..added]));
+        }
+        assert_eq!(added, records.len());
+    }
+
+    /// Documents the batch-boundary tradeoff: a record older than one already
+    /// folded in an EARLIER batch (for the same key) is folded as if it came
+    /// last. Only `account_rotations` can differ from the one-shot fold; the
+    /// span, sums, and sets are exact.
+    #[test]
+    fn cross_batch_disorder_only_affects_rotations() {
+        let early = vec![
+            record(1, 100, Some("u-1"), "m", "acct-a", 1, 1),
+            record(3, 300, Some("u-1"), "m", "acct-a", 1, 1),
+        ];
+        // Arrives in a later batch but predates id 3: true order is a,b,a
+        // (2 rotations); the folder sees a,a,b (1 rotation).
+        let late = vec![record(2, 200, Some("u-1"), "m", "acct-b", 1, 1)];
+        let mut folder = SessionFolder::new();
+        folder.add(&early);
+        folder.add(&late);
+        let got = folder.snapshot();
+        let mut all = early.clone();
+        all.extend(late);
+        let want = fold_sessions(&all);
+        assert_eq!(want[0].account_rotations, 2);
+        assert_eq!(got[0].account_rotations, 1);
+        let mut got0 = got[0].clone();
+        got0.account_rotations = want[0].account_rotations;
+        assert_eq!(got0, want[0], "everything else is exact");
     }
 }
