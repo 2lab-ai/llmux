@@ -6870,6 +6870,7 @@ mod tests {
             cost_usd: 0.1,
             priced: true,
             long: Default::default(),
+            cache_creation_1h: 0,
         };
         let mut view = empty_view();
         view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets
@@ -7034,6 +7035,7 @@ mod tests {
                     cache_read: 0,
                     cache_creation: 0,
                     cost_usd: 0.0,
+                    cache_creation_1h: 0,
                 }],
             }],
             ..Default::default()
@@ -8192,6 +8194,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            cache_creation_1h: None,
         }];
         v
     }
