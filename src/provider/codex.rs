@@ -1477,6 +1477,7 @@ mod tests {
                 // No cached_tokens key in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1516,6 +1517,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1555,8 +1557,34 @@ mod tests {
                 cache_read_input_tokens: Some(100_864),
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
+                cache_creation_1h_input_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn nonzero_cache_write_is_not_double_counted_as_fresh_input() {
+        // `input_tokens` is cache-inclusive (cached + write subsets), so a
+        // nonzero `cache_write_tokens` must come out of fresh input too —
+        // otherwise those tokens bill at the full input rate AND the
+        // cache-write rate.
+        let (converter, events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 10_000,
+                "input_tokens_details": {"cache_write_tokens": 3_000, "cached_tokens": 2_000},
+                "output_tokens": 5
+            }}}),
+        ]);
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        assert_eq!(message_delta["usage"]["input_tokens"], 5_000);
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 2_000);
+        assert_eq!(message_delta["usage"]["cache_creation_input_tokens"], 3_000);
+        assert_eq!(converter.usage().input_tokens, 5_000);
     }
 
     #[test]
@@ -1586,6 +1614,7 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -1613,6 +1642,7 @@ mod tests {
                 output_tokens: 9,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }
@@ -2008,6 +2038,7 @@ mod tests {
                 // so cache-read is an explicit Some(0), not unavailable.
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_1h_input_tokens: None,
             }
         );
     }

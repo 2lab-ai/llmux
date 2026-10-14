@@ -549,6 +549,25 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   cache read $0.20/M, cache write $5/M); the Claude Code 2.1.280 binary model
   record lists `claude-opus-5-5` with `supports_1m_suffix` (and the literal
   string `claude-opus-5-5[1m]`), which is why the `[1m]` row exists.
+- **Claude pricing** — the Anthropic pricing page
+  (platform.claude.com/docs/en/about-claude/pricing), read 2026-09-28, per 1M
+  tokens as input / 5-minute cache write / 1-hour cache write / cache read /
+  output: Fable 5.1 $10 / $12.50 / $20 / $0.25 / $50; Fable 5 $10 / $12.50 /
+  $20 / $1.00 / $50; Opus 5.5 $4 / $5 / $8 / $0.20 / $20; Opus 5, 4.8, 4.7,
+  4.6, 4.5 $5 / $6.25 / $10 / $0.50 / $25; Opus 4.1 and 4 (retired) $15 /
+  $18.75 / $30 / $1.50 / $75; Sonnet 5.5 and 5 $2 / $2.50 / $4 / $0.20 / $10;
+  Sonnet 4.6, 4.5, 4 $3 / $3.75 / $6 / $0.30 / $15; Haiku 4.5 $1 / $1.25 / $2 /
+  $0.10 / $5; Haiku 3.5 (retired, `claude-3-5-haiku-*`) $0.80 / $1 / $1.60 /
+  $0.08 / $4. Both write rates are modeled: each request's 1-hour share of its
+  cache writes (Anthropic's `cache_creation.ephemeral_1h_input_tokens`) is
+  billed at the 1-hour rate and the rest at the 5-minute rate; a request that
+  reports no split is billed entirely at the 5-minute rate. Dated snapshots
+  price like their bare id: llmux parses the
+  version out of the id, so `claude-opus-4-20250514` is Opus 4 while
+  `claude-opus-4-5-20251101` is Opus 4.5. An unlisted version of a known family
+  takes that family's default row (Opus 5, Sonnet 4.x, Haiku 4.5, Fable 5);
+  any other claude id, including other Claude 3.x models, takes the Opus 5
+  rates. The Mythos models are not in the catalog and have no row.
 - **Codex effort menus and base context windows** — the openai/codex model
   catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
@@ -609,8 +628,22 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   daemon was accepted (HTTP 200), so the 256000 default is not enforced for
   `grok-4.7`. Neither the 500000 ceiling nor `grok-4.6` / `grok-4.5` above
   256000 was re-probed.
-- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
-  is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
-  also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
-  grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
-  long-context tier.
+- **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-28: `grok-4.7`
+  and `grok-4.6` are $2.00 in / $6.00 out / $0.50 cached input per 1M tokens,
+  `grok-4.5` $2.00 / $6.00 / $0.30. A request whose prompt (fresh input + cached
+  input + cache writes) is **≥ 200,000 tokens** is billed ALL of its tokens at
+  the long-context rates: $4.00 / $12.00 / $1.00 cached (grok-4.5: $0.60
+  cached). llmux models that tier per request, and every aggregate (model rows,
+  Usage tab, keys panel) keeps long-context requests separate so its cost is
+  the sum of its requests' costs. Unknown grok ids take the grok-4.5 row, tier
+  included. OpenAI models carry the same kind of tier at a **272,000**-token
+  prompt: gpt-6-astra $10 / $50 / $1 cached becomes $20 / $75 / $2, gpt-6-sol
+  $2 / $10 / $0.20 becomes $4 / $15 / $0.40, gpt-6-luna $0.10 / $0.50 / $0.01
+  becomes $0.20 / $0.75 / $0.02, gpt-5.6-sol $4 / $20 / $0.40 becomes $8 / $30 /
+  $0.80, gpt-5.6-terra $2 / $12 / $0.20 becomes $4 / $18 / $0.40, gpt-5.6-luna
+  $0.20 / $1.20 / $0.02 becomes $0.40 / $1.80 / $0.04, gpt-5.5 $5 / $30 / $0.50
+  becomes $10 / $45 / $1 (OpenAI pricing page, read 2026-09-28; the whole request
+  reprices; gpt-6.1-sol $2 / $10 / $0.10 becomes $4 / $15 / $0.20). Every gpt-5.6 / gpt-6 / gpt-6.1 row also carries OpenAI's cache-write rate (1.25× input; 2× that in the long tier), e.g. gpt-6-sol $2.50 / $5.00. `gpt-5.5-codex` and unknown codex ids are not on that page, so they
+  stay flat. Claude rows carry no tier: Claude 4.6 and later bill the full 1M
+  window at standard rates. These are API-list-price equivalents; codex traffic
+  is subscription-billed.
