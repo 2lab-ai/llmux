@@ -1030,17 +1030,17 @@ mod tests {
     fn gpt_6_sol_and_luna_have_their_own_rates() {
         // Exact slugs and dated snapshots take the sol / luna rows, NOT the
         // `gpt-6-` astra default ($10 / $50 / $1).
-        for (model, input, output, cached) in [
-            ("gpt-6-sol", 2.00, 10.00, 0.20),
-            ("gpt-6-sol-20260922", 2.00, 10.00, 0.20),
-            ("gpt-6-luna", 0.10, 0.50, 0.01),
-            ("gpt-6-luna-20260922", 0.10, 0.50, 0.01),
+        for (model, input, output, cached, write) in [
+            ("gpt-6-sol", 2.00, 10.00, 0.20, 2.50),
+            ("gpt-6-sol-20260922", 2.00, 10.00, 0.20, 2.50),
+            ("gpt-6-luna", 0.10, 0.50, 0.01, 0.125),
+            ("gpt-6-luna-20260922", 0.10, 0.50, 0.01, 0.125),
         ] {
             approx(per_m("codex", model, 0), input);
             approx(per_m("codex", model, 1), output);
             approx(per_m("codex", model, 2), cached);
-            // Codex convention: no cache-creation charge.
-            approx(per_m("codex", model, 3), 0.0);
+            // OpenAI lists a cache-write rate (1.25x input).
+            approx(per_m("codex", model, 3), write);
         }
         // A future gpt-6 tier we have no row for still takes the astra default.
         assert_eq!(builtin_price("gpt-6-terra"), Some(GPT_6_ASTRA));

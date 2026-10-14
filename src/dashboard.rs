@@ -2734,6 +2734,7 @@ mod tests {
                     id: i as u64 + 1,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(100),
