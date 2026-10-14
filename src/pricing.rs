@@ -49,7 +49,7 @@
 //! overrides — the activity fold and the SQLite query classify requests with
 //! no config in hand.
 //!
-//! Tiered today: grok-4.5 / grok-4.6 / grok-4.7 (xAI, `>= 200k`, every rate
+//! Tiered today: claude-haiku-5-5 (`> 100k`, i.e. threshold 100_001), grok-4.5 / grok-4.6 / grok-4.7 (xAI, `>= 200k`, every rate
 //! doubles; docs.x.ai read 2026-09-28) — and therefore the `grok` group
 //! fallback — and the OpenAI rows gpt-5.5, gpt-5.6-{sol,terra,luna} and
 //! gpt-6-{astra,sol,luna} and gpt-6.1-sol (`>= 272k`, input and cache double, output x1.5; the
@@ -192,6 +192,21 @@ impl ModelPrice {
                 threshold,
             }),
             ..self
+        }
+    }
+
+    /// Set the long-context tier's own 1-hour cache-write rate (without it the
+    /// tier's `cache_creation` also prices 1-hour writes). No-op without a tier.
+    const fn with_long_context_cache_1h(self, rate: f64) -> Self {
+        match self.long_context {
+            Some(l) => Self {
+                long_context: Some(LongContextRates {
+                    cache_creation_1h: Some(rate),
+                    ..l
+                }),
+                ..self
+            },
+            None => self,
         }
     }
 
@@ -360,11 +375,17 @@ const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_cache_c
 /// Claude Sonnet 4.6, 4.5, 4: 3 / 3.75 / 6 / 0.30 / 15. Also the default for a
 /// Sonnet version this table does not list.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75).with_cache_creation_1h(6.0);
-/// Claude Haiku 5.5 (pricing page, read 2026-10-08), prompts <=100,000 tokens:
-/// 0.10 / 0.125 5m write / 0.20 1h write / 0.01 read / 0.50 out. The >100,000
-/// prompt tier (5x every rate) is not modeled: aggregate counts cannot recover
-/// request lengths.
-const HAIKU_5_5: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.125).with_cache_creation_1h(0.2);
+/// Claude Haiku 5.5 (platform.claude.com pricing, read 2026-10-08), priced by
+/// prompt length. Prompts up to 100,000 tokens: 0.10 in / 0.125 5m write /
+/// 0.20 1h write / 0.01 read / 0.50 out. Prompts OVER 100,000 tokens bill the
+/// whole request at 0.50 / 0.625 / 1.00 / 0.05 / 2.50. The tier boundary is
+/// `>=` in llmux, so the threshold is 100,001 to mean "over 100,000".
+const HAIKU_5_5: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.125)
+    .with_cache_creation_1h(0.2)
+    .with_long_context_at(HAIKU_5_5_LONG_CONTEXT_THRESHOLD, 0.5, 2.5, 0.05, 0.625)
+    .with_long_context_cache_1h(1.0);
+/// Claude Haiku 5.5's long-context boundary: prompts OVER 100,000 tokens.
+const HAIKU_5_5_LONG_CONTEXT_THRESHOLD: u64 = 100_001;
 /// Claude Haiku 4.5: 1 / 1.25 / 2 / 0.10 / 5. Also the default for a Haiku
 /// version this table does not list.
 const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25).with_cache_creation_1h(2.0);
@@ -493,8 +514,9 @@ const GROK_4_6: ModelPrice =
 /// API-list-price equivalent for subscription traffic.
 const GROK_4_7: ModelPrice =
     ModelPrice::new(2.0, 6.0, 0.5, 0.0).with_long_context(4.0, 12.0, 1.0, 0.0);
-// No long-context tier on the Claude rows: Anthropic bills Claude 4.6+ at
-// standard rates across the full 1M window (pricing page, read 2026-09-28).
+// No long-context tier on the other Claude rows: Anthropic bills Claude 4.6+
+// at standard rates across the full 1M window (pricing page, read 2026-09-28)
+// — the one exception is Haiku 5.5 (over 100K), above.
 
 /// Every built-in row that carries a long-context tier — the source of
 /// [`long_context_thresholds`]. Adding a tiered row means listing it here (a
@@ -511,6 +533,7 @@ const BUILTIN_TIERED_ROWS: &[ModelPrice] = &[
     GROK_4_5,
     GROK_4_6,
     GROK_4_7,
+    HAIKU_5_5,
 ];
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
@@ -875,8 +898,9 @@ mod tests {
 
     #[test]
     fn october_2026_claude_reference_rates_and_override_precedence() {
-        // Official pricing, checked 2026-10-08: Haiku <=100k prompt / 5m writes.
-        let haiku = ModelPrice::new(0.10, 0.50, 0.01, 0.125).with_cache_creation_1h(0.2);
+        // Official pricing, checked 2026-10-08: Haiku <=100k prompt / 5m writes
+        // (the over-100k tier is covered by `haiku_5_5_over_100k_tier`).
+        let haiku = HAIKU_5_5;
         for model in [
             "haiku",
             "haiku[1m]",
@@ -912,11 +936,15 @@ mod tests {
         let custom = ModelPrice::new(9.0, 8.0, 7.0, 6.0);
         let overrides = HashMap::from([("CLAUDE-HAIKU-5-5[1m]".to_string(), custom)]);
         assert_eq!(price_for("claude", "haiku", &overrides), Some(custom));
-        // Aggregates lack per-request prompt lengths: never infer a long-context
-        // tier by comparing a month's summed input to a request threshold.
+        // Haiku 5.5 tiers per REQUEST: one 1M-token request is over 100K and
+        // bills at the long rate; a 50K one stays on the short rate.
         approx(
             cost_usd("claude", "haiku", &tc(1_000_000, 0, None, None), &empty()),
-            0.10,
+            0.50,
+        );
+        approx(
+            cost_usd("claude", "haiku", &tc(50_000, 0, None, None), &empty()),
+            0.005,
         );
     }
 
@@ -1411,9 +1439,13 @@ mod tests {
     /// (input, output, cache_read, cache_creation) of a resolved Claude row.
     fn claude_rates(model: &str) -> (f64, f64, f64, f64) {
         let p = price_for("claude", model, &empty()).expect("claude priced");
-        assert!(
-            p.long_context.is_none(),
-            "{model}: Claude rows are untiered"
+        // Haiku 5.5 is the one tiered Claude row (prompts over 100K); its
+        // `(input, output, cache_read, cache_creation)` here are the short-tier
+        // rates, and the tier itself is tested in `haiku_5_5_over_100k_tier`.
+        assert_eq!(
+            p.long_context.is_some(),
+            model.contains("haiku-5-5") || model == "haiku",
+            "{model}: only Haiku 5.5 is tiered"
         );
         (p.input, p.output, p.cache_read, p.cache_creation)
     }
@@ -1444,6 +1476,7 @@ mod tests {
             ("claude-sonnet-4-5", sonnet_4),
             ("claude-sonnet-4", sonnet_4),
             ("claude-sonnet-4-0", sonnet_4),
+            ("claude-haiku-5-5", (0.1, 0.5, 0.01, 0.125)),
             ("claude-haiku-4-5", (1.0, 5.0, 0.1, 1.25)),
             ("claude-3-5-haiku-20241022", (0.8, 4.0, 0.08, 1.0)),
         ] {
@@ -1965,6 +1998,61 @@ mod tests {
                 (2_000.0 * long.0 + 1_000.0 * long.1 + 270_000.0 * long.2) / 1e6,
             );
         }
+    }
+
+    /// Haiku 5.5: prompts over 100,000 tokens reprice the WHOLE request
+    /// (platform.claude.com pricing, read 2026-10-08).
+    #[test]
+    fn haiku_5_5_over_100k_tier() {
+        for model in ["claude-haiku-5-5", "claude-haiku-5-5[1m]", "haiku"] {
+            assert_eq!(long_context_threshold(model), 100_001, "{model}");
+            // 100_000 prompt tokens is still the short tier ...
+            approx(
+                cost_usd(
+                    "claude",
+                    model,
+                    &tc(10_000, 1_000, Some(90_000), None),
+                    &empty(),
+                ),
+                (10_000.0 * 0.10 + 1_000.0 * 0.50 + 90_000.0 * 0.01) / 1e6,
+            );
+            // ... one more token and every component reprices.
+            approx(
+                cost_usd(
+                    "claude",
+                    model,
+                    &tc(10_001, 1_000, Some(90_000), None),
+                    &empty(),
+                ),
+                (10_001.0 * 0.50 + 1_000.0 * 2.50 + 90_000.0 * 0.05) / 1e6,
+            );
+            // Cache writes: 0.125 (5m) / 0.20 (1h) short, 0.625 / 1.00 long.
+            let w = |input, cc, cc1h| TokenCounts {
+                input,
+                output: 0,
+                cache_read: None,
+                cache_creation: Some(cc),
+                cache_creation_1h: Some(cc1h),
+            };
+            approx(
+                cost_usd("claude", model, &w(0, 50_000, 20_000), &empty()),
+                (30_000.0 * 0.125 + 20_000.0 * 0.20) / 1e6,
+            );
+            approx(
+                cost_usd("claude", model, &w(0, 200_000, 100_000), &empty()),
+                (100_000.0 * 0.625 + 100_000.0 * 1.00) / 1e6,
+            );
+        }
+        // Haiku 4.5 stays flat.
+        approx(
+            cost_usd(
+                "claude",
+                "claude-haiku-4-5",
+                &tc(500_000, 0, None, None),
+                &empty(),
+            ),
+            0.5,
+        );
     }
 
     #[test]
