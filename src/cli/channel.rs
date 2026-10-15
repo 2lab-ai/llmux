@@ -2,9 +2,10 @@
 //!
 //! The channel is DERIVED from what brew has installed (see [`super::brew`]);
 //! there is no config field. With no argument this prints the current channel;
-//! with `stable`/`preview` it performs the switch (brew uninstall old + install
-//! new, mirrored onto the Islands cask), then restarts a running daemon and
-//! prints old→new versions.
+//! with `stable`/`preview` it performs the switch (brew uninstall old — or only
+//! unlink it when other formulae depend on it — then install, or upgrade and
+//! relink, new; mirrored onto the Islands cask), then restarts a running
+//! daemon and prints old→new versions.
 
 use super::brew::{self, Channel, DetectSource, Host, RealHost};
 use super::{daemon, ChannelArgs, ChannelName, CliError};
@@ -42,11 +43,16 @@ fn print_current(host: &dyn Host) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Shared detection: brew formulae are authoritative, the build marker is the
-/// fallback.
+/// Shared detection: brew formulae are authoritative (the linked one when
+/// both are installed), the build marker is the fallback.
 fn detect(host: &dyn Host) -> Result<brew::Detected, CliError> {
     let formulae = host.brew_formulae();
-    brew::detect_channel(formulae.as_deref(), host.binary_channel())
+    let linked = host.linked_formulae();
+    brew::detect_channel(
+        formulae.as_deref(),
+        linked.as_deref(),
+        host.binary_channel(),
+    )
 }
 
 /// `llmux channel <target>` — switch NOW.
@@ -54,23 +60,17 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
     let current = detect(host)?.channel;
     let islands = brew::installed_islands_channel(host.brew_casks().as_deref());
     if current == target {
-        // Both installed? "nothing to do" would leave the stray formula (and
-        // its every-command warning) in place forever — consolidate instead,
-        // mirroring a stray-channel Islands cask too (it blocks the formula
-        // uninstall). The serving daemon already runs the target binary; the
-        // relink only restores the symlink, so no restart is needed.
-        let other = target.other();
-        if host.installed_version(other.formula(), false).is_some() {
-            println!(
-                "already on the {} channel — consolidating: removing {}",
-                target.label(),
-                other.formula()
-            );
-            for cmd in brew::consolidate_plan(target, islands) {
-                host.run_brew(&cmd.args())?;
-            }
-        } else {
-            println!("already on the {} channel — nothing to do", target.label());
+        // Already on it, but the machine may not be converged: a stray
+        // other-channel formula (consolidate it, mirroring a stray-channel
+        // Islands cask too), or #202's aftermath — `bin/llmux` not the
+        // target's binary (relink it). A stray kept for its dependents and
+        // already unlinked is converged: nothing runs. No daemon restart:
+        // relinking only restores the symlink to the binary already serving.
+        let (action, cmds) = brew::plan_same_channel(host, target, islands)?;
+        println!("{}", action.headline(target));
+        brew::run_plan(host, &cmds)?;
+        if let Some(outcome) = action.outcome(target) {
+            println!("{outcome}");
         }
         return Ok(());
     }
@@ -94,6 +94,9 @@ async fn switch(host: &dyn Host, target: Channel) -> Result<(), CliError> {
         target.label()
     );
     let report = brew::execute_switch(host, current, target, islands, daemon_running)?;
+    if let Some(kept) = &report.kept {
+        println!("{}", kept.summary());
+    }
 
     // Restart the daemon so the freshly installed binary is the one serving.
     // NEVER current_exe(): this process runs from the keg the switch just
