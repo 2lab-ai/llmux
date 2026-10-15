@@ -105,14 +105,40 @@ fn should_park_exhausted(min_expiry: Duration, already_parked: Duration) -> bool
 /// exhausted`'s trigger never fires — the request instead hammers all in-group
 /// accounts 429→switch→429 with no sleep and 502s in seconds, while the upstream
 /// burst clears ~20-30s later (measured: 1 opus-4-8 request, 8 accounts, 13 hops
-/// in ~8s). Once the forward loop detects the completed sweep it paces on the
-/// full [`DEFAULT_HEURISTIC_COOLDOWN`] (the soonest a heuristic park lifts).
+/// in ~8s). Once the forward loop detects the completed sweep it paces for
+/// [`sweep_park_duration`]: the full [`DEFAULT_HEURISTIC_COOLDOWN`] (the soonest
+/// a heuristic park lifts) plus a clock margin.
 /// Same budget philosophy as [`should_park_exhausted`]: park only while the
 /// accumulated parked time stays within [`EXHAUST_PARK_BUDGET`], and REFUSE
 /// (never clamp) past it — a shorter sleep would just wake into a still-bursting
-/// pool. Pure, so the budget cutoff is unit-testable without an 8-second sleep.
+/// pool. The check adds the full [`sweep_park_duration`] (the park actually
+/// taken), not the bare cooldown: the budget is shared with the grace parks
+/// above, so `already_parked` can sit anywhere and the cap must hold exactly.
+/// Pure, so the budget cutoff is unit-testable without an 8-second sleep.
 fn should_park_swept(already_parked: Duration) -> bool {
-    already_parked + DEFAULT_HEURISTIC_COOLDOWN <= EXHAUST_PARK_BUDGET
+    already_parked + sweep_park_duration() <= EXHAUST_PARK_BUDGET
+}
+
+/// Extra time a completed-sweep park waits past the heuristic cooldown it is
+/// pacing on (issue #199). The cooldown is recorded and checked on the WALL
+/// clock (`cooldown_until = SystemTime::now() + DEFAULT_HEURISTIC_COOLDOWN`,
+/// then `cooldown_until > SystemTime::now()` in the eligibility gate), but the
+/// park sleeps on tokio's MONOTONIC clock. The two drift: on the dev Mac
+/// (2026-10-14, six 8s windows) the wall clock advanced 107-109us LESS than the
+/// monotonic clock per 8s (~13.5 ppm), so a park of exactly the cooldown could
+/// wake while the wall clock still read the account as cooling, and the reprobe
+/// re-detected the sweep after one hop instead of two. 50ms sits far above
+/// that lag and above the NTP slew bound (500 ppm x 8s = 4ms), and is noise
+/// against an 8s pace. A wall-clock STEP (manual set, NTP step) is not covered;
+/// no finite margin could be.
+const SWEEP_PARK_CLOCK_MARGIN: Duration = Duration::from_millis(50);
+
+/// Length of one completed-sweep park: [`DEFAULT_HEURISTIC_COOLDOWN`] plus
+/// [`SWEEP_PARK_CLOCK_MARGIN`], so the wall-clock cooldowns the sweep recorded
+/// have expired when the monotonic sleep ends. Pure, so the invariant is
+/// unit-testable without an 8-second sleep.
+fn sweep_park_duration() -> Duration {
+    DEFAULT_HEURISTIC_COOLDOWN + SWEEP_PARK_CLOCK_MARGIN
 }
 
 /// Classification of an upstream response/failure, driving the retry
@@ -2277,7 +2303,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         ) && swept.len() >= candidates.max(1);
                         if swept_whole_pool {
                             if should_park_swept(exhaust_parked) {
-                                let park = DEFAULT_HEURISTIC_COOLDOWN;
+                                let park = sweep_park_duration();
                                 exhaust_parked += park;
                                 exhaust_parks += 1;
                                 // Reset the switch counter: the post-park reprobe
@@ -5588,28 +5614,106 @@ mod tests {
     #[test]
     fn swept_park_policy_paces_within_budget_then_refuses() {
         // 2026-07-13T23:01Z incident: a completed retry-after-less 429 sweep
-        // paces on the full DEFAULT_HEURISTIC_COOLDOWN (8s). The budget cutoff
-        // is unit-tested here so the 20s EXHAUST_PARK_BUDGET reject is proven
-        // WITHOUT three real 8s sleeps in an e2e test.
-        // First two parks fit (0+8=8, 8+8=16 ≤ 20).
+        // paces for `sweep_park_duration()` — the 8s DEFAULT_HEURISTIC_COOLDOWN
+        // plus the 50ms SWEEP_PARK_CLOCK_MARGIN (issue #199) = 8.05s. The budget
+        // cutoff is unit-tested here so the 20s EXHAUST_PARK_BUDGET reject is
+        // proven WITHOUT three real 8s sleeps in an e2e test.
+        // First two parks fit (0+8.05 = 8.05, 8.05+8.05 = 16.1 ≤ 20).
         assert!(should_park_swept(Duration::ZERO));
-        assert!(should_park_swept(DEFAULT_HEURISTIC_COOLDOWN));
+        assert!(should_park_swept(sweep_park_duration()));
         // Boundary: a park landing the total EXACTLY on the budget is allowed
-        // (12s + 8s == 20s).
+        // (11.95s + 8.05s == 20s).
         assert!(should_park_swept(
-            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN
+            EXHAUST_PARK_BUDGET - sweep_park_duration()
         ));
         // 1ms of overshoot is refused — the budget is a hard, pre-checked cap
         // on TOTAL parked time (not clamped): starting this park would push the
         // total past 20s.
         assert!(!should_park_swept(
-            EXHAUST_PARK_BUDGET - DEFAULT_HEURISTIC_COOLDOWN + Duration::from_millis(1)
+            EXHAUST_PARK_BUDGET - sweep_park_duration() + Duration::from_millis(1)
         ));
-        // A third 8s park (16s already parked → 24s) overshoots → transient 502.
-        assert!(!should_park_swept(
-            DEFAULT_HEURISTIC_COOLDOWN + DEFAULT_HEURISTIC_COOLDOWN
-        ));
+        // A third park (16.1s already parked → 24.15s) overshoots → transient 502.
+        assert!(!should_park_swept(sweep_park_duration() * 2));
         assert!(!should_park_swept(EXHAUST_PARK_BUDGET));
+    }
+
+    #[test]
+    fn swept_park_refuses_when_mixed_parks_leave_less_than_a_full_sweep_park() {
+        // Issue #199 follow-up: `exhaust_parked` is SHARED by the cooldown-blocked
+        // grace parks (`should_park_exhausted`, any length up to MAX_EXHAUST_PARK)
+        // and the completed-sweep parks, so `already` can land anywhere — here
+        // in (11.95s, 12s]. A sweep park lasts `sweep_park_duration()` (8.05s),
+        // so starting one from there would end at 20.001s-20.05s, past the 20s
+        // hard cap. A check against the bare 8s cooldown admitted it.
+        //   sweep park (8.05s) + grace park (3s) + grace park (0.901s) = 11.951s
+        let just_inside = sweep_park_duration() + MAX_EXHAUST_PARK + Duration::from_millis(901);
+        assert!(
+            just_inside + sweep_park_duration() > EXHAUST_PARK_BUDGET,
+            "precondition: this park would overshoot the budget"
+        );
+        assert!(
+            !should_park_swept(just_inside),
+            "already={just_inside:?}: a {:?} park would end past the {EXHAUST_PARK_BUDGET:?} cap",
+            sweep_park_duration()
+        );
+        //   sweep park (8.05s) + grace park (3s) + grace park (0.95s) = 12s
+        let upper_edge = sweep_park_duration() + MAX_EXHAUST_PARK + Duration::from_millis(950);
+        assert_eq!(upper_edge, Duration::from_secs(12));
+        assert!(
+            !should_park_swept(upper_edge),
+            "already={upper_edge:?}: a {:?} park would end past the {EXHAUST_PARK_BUDGET:?} cap",
+            sweep_park_duration()
+        );
+    }
+
+    #[test]
+    fn sweep_park_outlasts_heuristic_cooldown_despite_wall_clock_lag() {
+        // Issue #199: the heuristic cooldown a 429 records expires on the WALL
+        // clock (`cooldown_until = now + DEFAULT_HEURISTIC_COOLDOWN`, compared
+        // against `SystemTime::now()` after the park), but the sweep park
+        // sleeps on the MONOTONIC clock. Measured on the dev Mac 2026-10-14 the
+        // wall clock advanced ~108us LESS than the monotonic clock per 8s, so a
+        // park of exactly the cooldown woke into a still-cooling account and
+        // `non_fable_429_sweep_exhausts_park_budget_then_transient_502` saw 4
+        // upstream attempts instead of 6. Invariant: after a sweep park, even a
+        // wall clock that lags by 500us (~4x the measured lag) has passed the
+        // cooldown the park was waiting for.
+        let state = test_state(
+            "http://127.0.0.1:9", // never reached: no request is forwarded
+            vec![oauth_account("a", "at-a")],
+        );
+        let params = state.select_params();
+        let recorded_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        // The exact call the sweep path makes on a retry-after-less 429.
+        state.pool.record_429_classified(
+            &AccountId("a".into()),
+            None,
+            Some("claude-opus-4-8"),
+            recorded_at,
+        );
+        let park = sweep_park_duration();
+        let wall_at_wake = recorded_at + park - Duration::from_micros(500);
+        let snapshot = state.pool.snapshot();
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id == AccountId("a".into()))
+            .expect("account a");
+        // Negative control: 1ms before the cooldown expires the same account
+        // is still cooling, so the assertion below cannot pass merely because
+        // the 429 was never recorded or the cooldown gate never fires.
+        let before_expiry = recorded_at + DEFAULT_HEURISTIC_COOLDOWN - Duration::from_millis(1);
+        assert_eq!(
+            select::eligibility(account, &params, before_expiry, false),
+            Some(select::IneligibleReason::CoolingDown),
+            "the recorded heuristic cooldown must still gate 1ms before it expires"
+        );
+        assert_eq!(
+            select::eligibility(account, &params, wall_at_wake, false),
+            None,
+            "a sweep park of {park:?} must outlast the {DEFAULT_HEURISTIC_COOLDOWN:?} \
+             heuristic cooldown even when the wall clock lags the monotonic clock by 500us"
+        );
     }
 
     #[tokio::test]
@@ -5699,12 +5803,13 @@ mod tests {
         // burst cleared ~20-30s later (a wait would have returned 200).
         //
         // The fix: once the request has 429-swept every in-scope candidate
-        // (here both accounts) it paces on DEFAULT_HEURISTIC_COOLDOWN (8s)
+        // (here both accounts) it paces for `sweep_park_duration()` — the 8s
+        // DEFAULT_HEURISTIC_COOLDOWN plus the 50ms SWEEP_PARK_CLOCK_MARGIN —
         // instead of hammering, then reprobes into the recovered pool → 200.
         //   attempt 1: a → 429 (heuristic cooldown), swept={a}, b still free
         //   attempt 2: b → 429 (heuristic cooldown), swept={a,b} == whole pool
-        //              → pace 8s (switch counter reset so the reprobe isn't
-        //              cap-killed)
+        //              → pace 8s + 50ms margin (switch counter reset so the
+        //              reprobe isn't cap-killed)
         //   attempt 3: script empty → default 200 (burst cleared). Stickiness
         //              keeps the reprobe on b (the last-leased, now-eligible
         //              account) — the load-bearing facts are that both were
@@ -5829,15 +5934,20 @@ mod tests {
     async fn non_fable_429_sweep_exhausts_park_budget_then_transient_502() {
         // gpt56 nice-to-have: the second-park → budget-reject state machine for
         // a single non-Fable request whose burst OUTLASTS the park budget.
-        //   att1,2:  a→429, b→429  → whole pool swept  → park #1 (+8s, 0+8≤20)
-        //   att3,4:  b→429, a→429  → whole pool swept  → park #2 (+8s, 8+8≤20)
+        //   att1,2:  a→429, b→429  → whole pool swept  → park #1 (+8.05s,
+        //            check 0+8.05≤20)
+        //   att3,4:  b→429, a→429  → whole pool swept  → park #2 (+8.05s,
+        //            check 8.05+8.05≤20)
         //   att5,6:  a→429, b→429  → whole pool swept  → park #3 REFUSED
-        //            (16+8 = 24 > 20 budget) → deliberate transient 502.
+        //            (16.1+8.05 = 24.15 > 20 budget) → deliberate transient 502.
         //
-        // NB: a park lasts DEFAULT_HEURISTIC_COOLDOWN (8s) — exactly the cooldown
-        // it records — so BOTH accounts' cooldowns expire during the park. The
-        // post-park reprobe therefore re-cools ONE account (still eligible), then
-        // must switch to re-cool the OTHER before `heuristic_degraded_mode`
+        // NB: a park lasts `sweep_park_duration()` — the 8s cooldown it records
+        // plus SWEEP_PARK_CLOCK_MARGIN (50ms) — so BOTH accounts' wall-clock
+        // cooldowns expire during the monotonic sleep even though the wall
+        // clock lags it (issue #199: an exact-8s park sometimes woke with the
+        // second account still cooling, and this test saw 4 attempts). The
+        // post-park reprobe therefore re-cools ONE account (still eligible),
+        // then must switch to re-cool the OTHER before `heuristic_degraded_mode`
         // re-engages and the sweep is re-detected. So each re-establishment is
         // TWO upstream attempts, not one → 6 total attempts across 2 real parks,
         // not the 4 a "one-probe-per-park" model would predict.
