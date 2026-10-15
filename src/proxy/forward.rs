@@ -5699,6 +5699,15 @@ mod tests {
             .iter()
             .find(|a| a.id == AccountId("a".into()))
             .expect("account a");
+        // Negative control: 1ms before the cooldown expires the same account
+        // is still cooling, so the assertion below cannot pass merely because
+        // the 429 was never recorded or the cooldown gate never fires.
+        let before_expiry = recorded_at + DEFAULT_HEURISTIC_COOLDOWN - Duration::from_millis(1);
+        assert_eq!(
+            select::eligibility(account, &params, before_expiry, false),
+            Some(select::IneligibleReason::CoolingDown),
+            "the recorded heuristic cooldown must still gate 1ms before it expires"
+        );
         assert_eq!(
             select::eligibility(account, &params, wall_at_wake, false),
             None,
