@@ -97,7 +97,7 @@ Use `llmux-preview` (and the `llmux-islands-preview` cask) for the rolling previ
 
 ### Channels and updating
 
-llmux is distributed through the [Homebrew tap](https://github.com/2lab-ai/homebrew-tap) on two channels: `stable` (formula `llmux`) and `preview` (formula `llmux-preview`). The active channel is derived from what brew has installed — there is no config field.
+llmux is distributed through the [Homebrew tap](https://github.com/2lab-ai/homebrew-tap) on two channels: `stable` (formula `llmux`) and `preview` (formula `llmux-preview`). The active channel is derived from what brew has installed — with both formulae installed, the one linked as the `llmux` command is the channel — and there is no config field.
 
 ```bash
 # Print the current channel
@@ -107,8 +107,9 @@ llmux channel
 # daemon if the binary changed or the running one is a different build
 llmux update
 
-# Switch channels now (brew uninstall old + install new, mirrored onto the
-# llmux-islands cask; restarts a running daemon)
+# Switch channels now: the old formula is uninstalled (or kept but unlinked
+# when other formulae need it), the new one installed or upgraded and
+# relinked, the llmux-islands cask mirrored, and a running daemon restarted.
 llmux channel preview
 llmux channel stable
 ```

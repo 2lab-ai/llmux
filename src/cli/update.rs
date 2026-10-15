@@ -17,7 +17,12 @@ pub async fn run(args: UpdateArgs) -> Result<(), CliError> {
     let host = RealHost;
 
     let formulae = host.brew_formulae();
-    let detected = brew::detect_channel(formulae.as_deref(), host.binary_channel())?;
+    let linked = host.linked_formulae();
+    let detected = brew::detect_channel(
+        formulae.as_deref(),
+        linked.as_deref(),
+        host.binary_channel(),
+    )?;
     let channel = detected.channel;
     if let Some(warning) = &detected.warning {
         eprintln!("warning: {warning}");
