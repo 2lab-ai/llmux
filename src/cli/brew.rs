@@ -123,12 +123,14 @@ pub trait Host {
     /// `var/homebrew/linked/<formula>` record resolves to a keg directory
     /// (Homebrew's `Keg#linked?`) AND `bin/llmux` resolves inside that keg
     /// (a surviving record with `bin/llmux` gone is #202's "Already linked"
-    /// trap, not a link). `None` when brew can't answer. Decides the channel
-    /// when both formulae are installed.
+    /// trap, not a link). `None` when brew can't answer or a record can't be
+    /// read — only "not found" counts as absent. Decides the channel when
+    /// both formulae are installed.
     fn linked_formulae(&self) -> Option<Vec<String>>;
     /// The llmux formulae brew has PINNED: those with a
     /// `<brew --prefix>/var/homebrew/pinned/<formula>` symlink (Homebrew's
-    /// `FormulaPin#pinned?`). `None` when brew can't answer.
+    /// `FormulaPin#pinned?`). `None` when brew can't answer or a record
+    /// can't be read — only "not found" counts as unpinned.
     fn pinned_formulae(&self) -> Option<Vec<String>>;
     /// Run `brew <args>`, streaming stdio to the user. Errs on non-zero exit.
     fn run_brew(&self, args: &[&str]) -> Result<(), CliError>;
@@ -278,25 +280,31 @@ fn relink_formula(formula: &str) -> [BrewCmd; 2] {
     ]
 }
 
-/// PURE: the ordered `brew` commands to switch from `current` to `target`.
-/// Each Islands cask DEPENDS on its channel's formula, so the ordering is
-/// dependency-driven: the outgoing cask is uninstalled FIRST (brew refuses to
-/// uninstall a formula something depends on — live-verified: `brew uninstall
-/// llmux` fails with "required by llmux-islands"), the outgoing formula next
-/// (that removes the shared `bin/llmux` symlink and sidesteps a link conflict;
-/// the running process keeps its open file), then the target formula, and the
-/// target cask LAST so its formula dependency is already present.
+/// PURE: the ordered `brew` commands to switch from `current` to `target` —
+/// the target made ready FIRST, so a failure leaves the old channel whole:
 ///
-/// `outgoing_dependents` is the `brew uses --installed` answer for the
-/// outgoing formula, queried before anything ran: if another formula needs
-/// it, it is unlinked instead of uninstalled (see [`retire_formula`]). When
-/// the target formula is ALREADY installed (the both-installed state
-/// `detect_channel` warns about), `brew install` is a no-op on a possibly
-/// stale keg — so the plan upgrades it (exit 0 when already current) and
-/// relinks it via `unlink` + `link --overwrite`. The cask is mirrored only
-/// when one is installed and not already on the target channel. Assumes
-/// `current != target` (the no-op case is handled by the command, not the
-/// plan).
+/// 1. `update`;
+/// 2. the target: `install` it, or `upgrade` it when ALREADY installed (the
+///    both-installed state `detect_channel` warns about, where `brew
+///    install` would no-op on a possibly stale keg; exit 0 when already
+///    current). Nothing is unlinked first: a failure here — download/build,
+///    before brew links anything — leaves the outgoing channel untouched;
+/// 3. the outgoing cask — it DEPENDS on the outgoing formula, and brew
+///    refuses to uninstall a formula something depends on (live-verified:
+///    "required by llmux-islands");
+/// 4. the outgoing formula, retired by [`retire_formula`]: uninstalled, or
+///    only unlinked when `outgoing_dependents` (its `brew uses --installed`
+///    answer, queried before anything ran) names a formula that needs it;
+/// 5. `unlink` + `link --overwrite` the target ([`relink_formula`]): step 2
+///    usually linked it over `bin/llmux` already (llmux is not keg-only, so
+///    install AND upgrade link the new keg; both formulae declare
+///    `link_overwrite "bin/llmux"`) — this makes the end state certain;
+/// 6. the target cask LAST — its formula is in place, and the two casks
+///    conflict, so it follows step 3.
+///
+/// The cask is mirrored only when one is installed and not already on the
+/// target channel. Assumes `current != target` (the no-op case is handled
+/// by the command, not the plan).
 pub fn switch_plan(
     current: Channel,
     target: Channel,
@@ -306,7 +314,13 @@ pub fn switch_plan(
 ) -> Vec<BrewCmd> {
     let mirror_islands = islands.is_some_and(|installed| installed != target);
     let mut cmds = vec![BrewCmd::new(["update"])];
-    // Outgoing cask first — it depends on the outgoing formula.
+    // Target first: a failure here leaves the outgoing channel whole.
+    if target_installed {
+        cmds.push(BrewCmd::new(["upgrade", target.formula()]));
+    } else {
+        cmds.push(BrewCmd::new(["install", target.formula()]));
+    }
+    // Outgoing cask before the outgoing formula it depends on.
     if mirror_islands {
         if let Some(installed) = islands {
             cmds.push(BrewCmd::new([
@@ -316,15 +330,8 @@ pub fn switch_plan(
             ]));
         }
     }
-    // Formula: retire the outgoing channel, then install (or upgrade and
-    // relink) the target.
     cmds.push(retire_formula(current.formula(), outgoing_dependents));
-    if target_installed {
-        cmds.push(BrewCmd::new(["upgrade", target.formula()]));
-        cmds.extend(relink_formula(target.formula()));
-    } else {
-        cmds.push(BrewCmd::new(["install", target.formula()]));
-    }
+    cmds.extend(relink_formula(target.formula()));
     // Target cask last — its formula dependency is in place now.
     if mirror_islands {
         cmds.push(BrewCmd::new(["install", "--cask", target.islands_cask()]));
@@ -403,7 +410,7 @@ fn check_not_pinned(host: &dyn Host, formula: &str) -> Result<(), CliError> {
     let pinned = host.pinned_formulae().ok_or_else(|| {
         CliError::Message(format!(
             "could not read brew's pin records before upgrading {formula} \
-             (`brew --prefix` failed) — nothing was changed"
+             — nothing was changed"
         ))
     })?;
     if pinned.iter().any(|p| p == formula) {
@@ -531,7 +538,7 @@ pub struct SwitchReport {
 /// mutating command — capture the outgoing version, refuse a pinned target
 /// when the plan will upgrade it (target already installed), query the
 /// outgoing formula's dependents (either failing errs with nothing changed)
-/// — then run every planned `brew` command in order and capture the
+/// — then run [`switch_plan`] (target first) in order and capture the
 /// incoming version. The daemon restart itself
 /// is async and lives in the command handler; this returns whether one is
 /// warranted via `daemon_running`.
@@ -583,6 +590,12 @@ pub enum SameChannel {
 }
 
 impl SameChannel {
+    /// Does this action change brew state? Only then may the daemon need
+    /// reconciling ([`should_reconcile_daemon`]).
+    pub fn mutates(&self) -> bool {
+        matches!(self, SameChannel::Relink | SameChannel::Consolidate { .. })
+    }
+
     /// The line printed before any command runs — the only line when none
     /// runs.
     pub fn headline(&self, target: Channel) -> String {
@@ -622,21 +635,42 @@ impl SameChannel {
     }
 }
 
+/// PURE: after a same-channel action, restart a running daemon onto the
+/// target's installed binary only when the action changed brew state
+/// ([`SameChannel::mutates`]) AND the daemon serves a different build —
+/// `llmux update`'s server-vs-installed rule
+/// ([`should_restart_for_version_mismatch`]). The genuine no-op and the
+/// converged no-churn case never touch the daemon.
+pub fn should_reconcile_daemon(
+    action: &SameChannel,
+    daemon_running: bool,
+    server_version: Option<&str>,
+    installed_version: Option<&str>,
+) -> bool {
+    action.mutates()
+        && should_restart_for_version_mismatch(daemon_running, server_version, installed_version)
+}
+
 /// PURE: decide [`SameChannel`] from the read-only preflight: whether the
-/// other formula is installed, its `brew uses --installed` answer (empty
-/// when not installed), the linked formulae (`None` = unknown) and the
-/// installed Islands cask's channel. Converged = the other formula is kept
-/// for its dependents, the target is the sole linked formula, and no
-/// stray-channel Islands cask is left (only [`consolidate_plan`] mirrors
-/// it).
+/// target and the other formula are installed, the other's `brew uses
+/// --installed` answer (empty when not queried), the linked formulae
+/// (`None` = unknown) and the installed Islands cask's channel. No target
+/// keg (channel from the build marker) = nothing to relink or consolidate
+/// onto. Converged = the other formula is kept for its dependents, the
+/// target is the sole linked formula, and no stray-channel Islands cask is
+/// left (only [`consolidate_plan`] mirrors it).
 pub fn same_channel_decision(
     target: Channel,
     islands: Option<Channel>,
+    target_installed: bool,
     other_installed: bool,
     other_dependents: &[String],
     linked: Option<&[String]>,
 ) -> SameChannel {
     let other = target.other();
+    if !target_installed {
+        return SameChannel::NothingToDo;
+    }
     if !other_installed {
         let target_linked = linked.map(|names| names.iter().any(|f| f == target.formula()));
         return match target_linked {
@@ -666,8 +700,9 @@ pub fn plan_same_channel(
     islands: Option<Channel>,
 ) -> Result<(SameChannel, Vec<BrewCmd>), CliError> {
     let other = target.other();
+    let target_installed = host.installed_version(target.formula(), false).is_some();
     let other_installed = host.installed_version(other.formula(), false).is_some();
-    let dependents = if other_installed {
+    let dependents = if target_installed && other_installed {
         query_dependents(host, other.formula())?
     } else {
         Vec::new()
@@ -676,6 +711,7 @@ pub fn plan_same_channel(
     let action = same_channel_decision(
         target,
         islands,
+        target_installed,
         other_installed,
         &dependents,
         linked.as_deref(),
@@ -748,34 +784,77 @@ pub fn execute_update(host: &dyn Host, channel: Channel) -> Result<UpdateReport,
 /// keg directory (Homebrew's `Keg#linked?`) AND `bin/llmux` must resolve
 /// inside that keg. The record alone is not enough: #202 left a surviving
 /// record with `bin/llmux` gone, which brew reports as "Already linked". A
-/// missing `dir` or `bin/llmux` = nothing linked.
-fn linked_records(dir: &std::path::Path, bin_llmux: &std::path::Path) -> Vec<String> {
-    let Ok(binary) = std::fs::canonicalize(bin_llmux) else {
-        return Vec::new();
+/// missing `dir` or `bin/llmux` = nothing linked; any other read error =
+/// `None` (unknown), never "not linked".
+fn linked_records(dir: &std::path::Path, bin_llmux: &std::path::Path) -> Option<Vec<String>> {
+    let binary = match probe(std::fs::canonicalize(bin_llmux)) {
+        Probe::Present(binary) => binary,
+        Probe::Absent => return Some(Vec::new()),
+        Probe::Unknown => return None,
     };
     llmux_formulae_where(|formula| {
         let record = dir.join(formula);
-        record.is_symlink()
-            && std::fs::canonicalize(&record)
-                .is_ok_and(|keg| keg.is_dir() && binary.starts_with(&keg))
+        if !is_symlink_record(&record)? {
+            return Some(false);
+        }
+        // A record whose keg was removed (dangling) is not a link.
+        match probe(std::fs::canonicalize(&record)) {
+            Probe::Present(keg) => match probe(std::fs::metadata(&keg)) {
+                Probe::Present(meta) => Some(meta.is_dir() && binary.starts_with(&keg)),
+                Probe::Absent => Some(false),
+                Probe::Unknown => None,
+            },
+            Probe::Absent => Some(false),
+            Probe::Unknown => None,
+        }
     })
 }
 
 /// The llmux formulae with a pin record in `dir`
 /// (`<prefix>/var/homebrew/pinned`). Homebrew's `FormulaPin#pinned?` is the
 /// symlink's existence alone. A missing `dir` (brew removes it when the last
-/// pin goes) = nothing pinned.
-fn pinned_records(dir: &std::path::Path) -> Vec<String> {
-    llmux_formulae_where(|formula| dir.join(formula).is_symlink())
+/// pin goes) = nothing pinned; any other read error = `None` (unknown).
+fn pinned_records(dir: &std::path::Path) -> Option<Vec<String>> {
+    llmux_formulae_where(|formula| is_symlink_record(&dir.join(formula)))
 }
 
-fn llmux_formulae_where(keep: impl Fn(&str) -> bool) -> Vec<String> {
-    [Channel::Stable, Channel::Preview]
-        .into_iter()
-        .map(Channel::formula)
-        .filter(|formula| keep(formula))
-        .map(str::to_string)
-        .collect()
+/// Is `path` a symlink? `Some(false)` when it is absent (not found), `None`
+/// when it can't be read.
+fn is_symlink_record(path: &std::path::Path) -> Option<bool> {
+    match probe(std::fs::symlink_metadata(path)) {
+        Probe::Present(meta) => Some(meta.file_type().is_symlink()),
+        Probe::Absent => Some(false),
+        Probe::Unknown => None,
+    }
+}
+
+/// The llmux formulae `keep` accepts; `None` as soon as `keep` can't tell.
+fn llmux_formulae_where(keep: impl Fn(&str) -> Option<bool>) -> Option<Vec<String>> {
+    let mut kept = Vec::new();
+    for formula in [Channel::Stable, Channel::Preview].map(Channel::formula) {
+        if keep(formula)? {
+            kept.push(formula.to_string());
+        }
+    }
+    Some(kept)
+}
+
+/// A filesystem read, tri-state: "not found" is the only `Absent`; any
+/// other error (permission, I/O) is `Unknown`, never silently absent.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe<T> {
+    Present(T),
+    Absent,
+    Unknown,
+}
+
+/// PURE: classify an I/O result as a [`Probe`].
+fn probe<T>(result: std::io::Result<T>) -> Probe<T> {
+    match result {
+        Ok(value) => Probe::Present(value),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Probe::Absent,
+        Err(_) => Probe::Unknown,
+    }
 }
 
 /// PURE: a formula's installed version by precedence — the keg its opt link
@@ -948,15 +1027,15 @@ impl Host for RealHost {
 
     fn linked_formulae(&self) -> Option<Vec<String>> {
         let prefix = self.brew_prefix(None)?;
-        Some(linked_records(
+        linked_records(
             &records_dir(&prefix, "linked"),
             &prefix.join("bin").join("llmux"),
-        ))
+        )
     }
 
     fn pinned_formulae(&self) -> Option<Vec<String>> {
         let prefix = self.brew_prefix(None)?;
-        Some(pinned_records(&records_dir(&prefix, "pinned")))
+        pinned_records(&records_dir(&prefix, "pinned"))
     }
 
     fn run_brew(&self, args: &[&str]) -> Result<(), CliError> {
@@ -1059,6 +1138,9 @@ pub(crate) mod testing {
         pub linked: Option<Vec<String>>,
         /// `pinned_formulae` answer (default: nothing pinned).
         pub pinned: Option<Vec<String>>,
+        /// `run_brew` fails for exactly this `"brew <args>"` (still logged),
+        /// modelling a download/build failure mid-plan.
+        pub fail_on: Option<String>,
         /// Ordered log: `"brew <args>"`, `"uses <formula>"` (the dependents
         /// query, logged so tests can pin it before any brew command) and
         /// `"relaunch-islands"`.
@@ -1081,6 +1163,7 @@ pub(crate) mod testing {
                 dependents: Vec::new(),
                 linked: None,
                 pinned: Some(Vec::new()),
+                fail_on: None,
                 calls: RefCell::new(Vec::new()),
                 on_run: None,
             }
@@ -1128,9 +1211,11 @@ pub(crate) mod testing {
             self.pinned.clone()
         }
         fn run_brew(&self, args: &[&str]) -> Result<(), CliError> {
-            self.calls
-                .borrow_mut()
-                .push(format!("brew {}", args.join(" ")));
+            let call = format!("brew {}", args.join(" "));
+            self.calls.borrow_mut().push(call.clone());
+            if self.fail_on.as_deref() == Some(call.as_str()) {
+                return Err(CliError::Message(format!("`{call}` failed (injected)")));
+            }
             if let Some(hook) = &self.on_run {
                 hook(args, &self.versions);
             }
@@ -1239,17 +1324,21 @@ mod tests {
     }
 
     #[test]
-    fn switch_plan_uninstalls_old_before_installing_new() {
+    fn switch_plan_installs_the_target_before_retiring_the_outgoing_formula() {
+        // Target first: a failed download/build stops the plan while the old
+        // channel is still whole.
         let plan = switch_plan(Channel::Stable, Channel::Preview, None, false, &[]);
         assert_eq!(
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
+                BrewCmd(strs(&["install", "llmux-preview"])),
                 // `--force`: a plain uninstall removes only the current keg,
                 // leaving the rack listed by `brew list --formula` — and so
                 // `detect_channel` still seeing both formulae.
                 BrewCmd(strs(&["uninstall", "--force", "llmux"])),
-                BrewCmd(strs(&["install", "llmux-preview"])),
+                BrewCmd(strs(&["unlink", "llmux-preview"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
             ]
         );
     }
@@ -1258,16 +1347,16 @@ mod tests {
     fn switch_plan_upgrades_and_relinks_when_target_already_installed() {
         // Both-installed state (issue #202): `brew install` would no-op, and
         // a bare `brew link` answers "Already linked" (exit 0, nothing done)
-        // while the keg's LinkedKegs record survives the outgoing uninstall
-        // that removed the shared `bin/llmux` symlink. So: upgrade the stale
-        // target keg, clear its link record, then link it for real.
+        // while the keg's LinkedKegs record survives. So: upgrade the stale
+        // target keg BEFORE touching the outgoing channel, then link it for
+        // real (unlink clears the record) once the outgoing one is retired.
         let plan = switch_plan(Channel::Preview, Channel::Stable, None, true, &[]);
         assert_eq!(
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
-                BrewCmd(strs(&["uninstall", "--force", "llmux-preview"])),
                 BrewCmd(strs(&["upgrade", "llmux"])),
+                BrewCmd(strs(&["uninstall", "--force", "llmux-preview"])),
                 BrewCmd(strs(&["unlink", "llmux"])),
                 BrewCmd(strs(&["link", "--overwrite", "llmux"])),
             ]
@@ -1353,11 +1442,13 @@ mod tests {
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
-                // Outgoing cask FIRST: it depends on the outgoing formula, so
-                // brew would refuse the formula uninstall while it exists.
+                BrewCmd(strs(&["install", "llmux"])),
+                // Outgoing cask before the outgoing formula: it depends on it,
+                // so brew would refuse the formula uninstall while it exists.
                 BrewCmd(strs(&["uninstall", "--cask", "llmux-islands-preview"])),
                 BrewCmd(strs(&["uninstall", "--force", "llmux-preview"])),
-                BrewCmd(strs(&["install", "llmux"])),
+                BrewCmd(strs(&["unlink", "llmux"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux"])),
                 BrewCmd(strs(&["install", "--cask", "llmux-islands"])),
             ]
         );
@@ -1502,8 +1593,10 @@ mod tests {
             vec![
                 "uses llmux",
                 "brew update",
-                "brew uninstall --force llmux",
                 "brew install llmux-preview",
+                "brew uninstall --force llmux",
+                "brew unlink llmux-preview",
+                "brew link --overwrite llmux-preview",
             ]
         );
     }
@@ -1538,8 +1631,8 @@ mod tests {
             vec![
                 "uses llmux-preview",
                 "brew update",
-                "brew uninstall --force llmux-preview",
                 "brew upgrade llmux",
+                "brew uninstall --force llmux-preview",
                 "brew unlink llmux",
                 "brew link --overwrite llmux",
             ]
@@ -1641,9 +1734,11 @@ mod tests {
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
+                BrewCmd(strs(&["install", "llmux-preview"])),
                 BrewCmd(strs(&["uninstall", "--cask", "llmux-islands"])),
                 BrewCmd(strs(&["unlink", "llmux"])),
-                BrewCmd(strs(&["install", "llmux-preview"])),
+                BrewCmd(strs(&["unlink", "llmux-preview"])),
+                BrewCmd(strs(&["link", "--overwrite", "llmux-preview"])),
                 BrewCmd(strs(&["install", "--cask", "llmux-islands-preview"])),
             ]
         );
@@ -1664,9 +1759,9 @@ mod tests {
             plan,
             vec![
                 BrewCmd(strs(&["update"])),
+                BrewCmd(strs(&["upgrade", "llmux"])),
                 BrewCmd(strs(&["uninstall", "--cask", "llmux-islands-preview"])),
                 BrewCmd(strs(&["uninstall", "--force", "llmux-preview"])),
-                BrewCmd(strs(&["upgrade", "llmux"])),
                 BrewCmd(strs(&["unlink", "llmux"])),
                 BrewCmd(strs(&["link", "--overwrite", "llmux"])),
                 BrewCmd(strs(&["install", "--cask", "llmux-islands"])),
@@ -1708,8 +1803,10 @@ mod tests {
             vec![
                 "uses llmux",
                 "brew update",
-                "brew unlink llmux",
                 "brew install llmux-preview",
+                "brew unlink llmux",
+                "brew unlink llmux-preview",
+                "brew link --overwrite llmux-preview",
             ]
         );
         assert_eq!(
@@ -1942,8 +2039,8 @@ mod tests {
             vec![
                 "uses llmux-preview",
                 "brew update",
-                "brew uninstall --force llmux-preview",
                 "brew upgrade llmux",
+                "brew uninstall --force llmux-preview",
                 "brew unlink llmux",
                 "brew link --overwrite llmux",
             ]
@@ -1961,8 +2058,10 @@ mod tests {
                 vec![
                     "uses llmux-preview",
                     "brew update",
-                    "brew uninstall --force llmux-preview",
                     "brew install llmux",
+                    "brew uninstall --force llmux-preview",
+                    "brew unlink llmux",
+                    "brew link --overwrite llmux",
                 ]
             );
         }
@@ -1992,18 +2091,18 @@ mod tests {
         symlink(&stable_keg, linked.join("llmux")).unwrap();
         assert_eq!(
             linked_records(&linked, &bin_llmux),
-            strs(&["llmux-preview"])
+            Some(strs(&["llmux-preview"]))
         );
 
         // #202's aftermath: the record survives, `bin/llmux` is gone —
         // brew calls that "Already linked"; it is not.
         std::fs::remove_file(&bin_llmux).unwrap();
-        assert!(linked_records(&linked, &bin_llmux).is_empty());
+        assert_eq!(linked_records(&linked, &bin_llmux), Some(vec![]));
 
         // A record whose keg was removed does not count either.
         symlink(stable_keg.join("bin/llmux"), &bin_llmux).unwrap();
         std::fs::remove_dir_all(&stable_keg).unwrap();
-        assert!(linked_records(&linked, &bin_llmux).is_empty());
+        assert_eq!(linked_records(&linked, &bin_llmux), Some(vec![]));
 
         // `FormulaPin#pinned?`: any symlink record, dangling or not; a plain
         // file is not a pin.
@@ -2011,12 +2110,12 @@ mod tests {
         std::fs::create_dir_all(&pinned).unwrap();
         symlink(&stable_keg, pinned.join("llmux")).unwrap();
         std::fs::write(pinned.join("llmux-preview"), b"").unwrap();
-        assert_eq!(pinned_records(&pinned), strs(&["llmux"]));
+        assert_eq!(pinned_records(&pinned), Some(strs(&["llmux"])));
 
         // No record dir at all (this machine has no `pinned/`) = none.
         let absent = tmp.0.join("var/homebrew/absent");
-        assert!(linked_records(&absent, &bin_llmux).is_empty());
-        assert!(pinned_records(&absent).is_empty());
+        assert_eq!(linked_records(&absent, &bin_llmux), Some(vec![]));
+        assert_eq!(pinned_records(&absent), Some(vec![]));
     }
 
     #[test]
@@ -2073,11 +2172,30 @@ mod tests {
             same_channel_decision(
                 Channel::Preview,
                 islands,
+                true,
                 installed,
                 deps,
                 linked.as_deref(),
             )
         };
+
+        // The target formula itself not installed (channel from the build
+        // marker): there is no keg to relink or consolidate onto.
+        for (other_installed, linked) in
+            [(false, Some(vec![])), (true, Some(vec![])), (false, None)]
+        {
+            assert_eq!(
+                same_channel_decision(
+                    Channel::Preview,
+                    None,
+                    false,
+                    other_installed,
+                    &[],
+                    linked.as_deref(),
+                ),
+                SameChannel::NothingToDo
+            );
+        }
 
         // Only the target installed.
         assert_eq!(
@@ -2262,5 +2380,148 @@ mod tests {
             vec!["uses llmux"],
             "no brew command ran"
         );
+    }
+
+    #[test]
+    fn same_channel_without_the_target_installed_runs_nothing() {
+        // Channel from the build marker (brew lists neither formula): there
+        // is no keg to relink — `brew unlink llmux` would just fail.
+        let mut host = FakeHost::new();
+        host.linked = Some(vec![]);
+        let (action, cmds) = plan_same_channel(&host, Channel::Stable, None).unwrap();
+        assert_eq!(action, SameChannel::NothingToDo);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        run_plan(&host, &cmds).unwrap();
+        assert!(host.calls.borrow().is_empty(), "{:?}", host.calls.borrow());
+    }
+
+    #[test]
+    fn execute_switch_failing_target_step_leaves_the_old_channel_intact() {
+        // `brew install` fails (download/build — before brew links
+        // anything): neither the outgoing cask nor the outgoing formula has
+        // been touched.
+        let mut host =
+            FakeHost::new().with_versions(&[("llmux-preview", false, "2026.10.08.0724")]);
+        host.fail_on = Some("brew install llmux".into());
+        let err = execute_switch(
+            &host,
+            Channel::Preview,
+            Channel::Stable,
+            Some(Channel::Preview),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("brew install llmux"), "{err}");
+        assert_eq!(
+            *host.calls.borrow(),
+            vec!["uses llmux-preview", "brew update", "brew install llmux"]
+        );
+
+        // Upgrading an installed target fails: same — the old channel is
+        // whole, and nothing was unlinked before the upgrade.
+        let mut host = FakeHost::new().with_versions(&[
+            ("llmux", false, "0.2.24"),
+            ("llmux-preview", false, "2026.10.08.0724"),
+        ]);
+        host.fail_on = Some("brew upgrade llmux".into());
+        execute_switch(
+            &host,
+            Channel::Preview,
+            Channel::Stable,
+            Some(Channel::Preview),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            *host.calls.borrow(),
+            vec!["uses llmux-preview", "brew update", "brew upgrade llmux",]
+        );
+    }
+
+    #[test]
+    fn reconcile_daemon_only_after_a_mutating_same_channel_action() {
+        let mutating = [
+            SameChannel::Relink,
+            SameChannel::Consolidate { kept: None },
+            SameChannel::Consolidate {
+                kept: Some(kept_llmux()),
+            },
+        ];
+        for action in &mutating {
+            assert!(action.mutates(), "{action:?}");
+            assert!(
+                should_reconcile_daemon(action, true, Some(STALE_A), Some(FRESH_B)),
+                "{action:?}: a daemon on another build converges"
+            );
+            assert!(!should_reconcile_daemon(
+                action,
+                true,
+                Some(FRESH_B),
+                Some(FRESH_B)
+            ));
+            assert!(!should_reconcile_daemon(
+                action,
+                false,
+                Some(STALE_A),
+                Some(FRESH_B)
+            ));
+            assert!(!should_reconcile_daemon(action, true, None, Some(FRESH_B)));
+            assert!(!should_reconcile_daemon(action, true, Some(STALE_A), None));
+        }
+        // The genuine no-op and the converged no-churn case never touch the
+        // daemon, whatever it serves.
+        for action in [
+            SameChannel::NothingToDo,
+            SameChannel::KeptUnlinked(kept_llmux()),
+        ] {
+            assert!(!action.mutates(), "{action:?}");
+            assert!(!should_reconcile_daemon(
+                &action,
+                true,
+                Some(STALE_A),
+                Some(FRESH_B)
+            ));
+        }
+    }
+
+    #[test]
+    fn record_probe_is_absent_only_on_not_found() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(probe(Ok(7)), Probe::Present(7));
+        assert_eq!(
+            probe::<()>(Err(Error::from(ErrorKind::NotFound))),
+            Probe::Absent
+        );
+        assert_eq!(
+            probe::<()>(Err(Error::from(ErrorKind::PermissionDenied))),
+            Probe::Unknown,
+            "an unreadable record is not an absent one"
+        );
+        assert_eq!(probe::<()>(Err(Error::other("io"))), Probe::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_record_dirs_read_as_unknown_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new();
+        let records = tmp.0.join("var/homebrew/records");
+        std::fs::create_dir_all(&records).unwrap();
+        let bin_llmux = tmp.0.join("bin/llmux");
+        std::fs::create_dir_all(tmp.0.join("bin")).unwrap();
+        std::fs::write(&bin_llmux, b"").unwrap();
+
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::symlink_metadata(records.join("llmux"))
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied);
+        let pinned = pinned_records(&records);
+        let linked = linked_records(&records, &bin_llmux);
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root ignores directory permissions — the state can't be built.
+        if denied {
+            assert_eq!(pinned, None, "permission denied is not 'not pinned'");
+            assert_eq!(linked, None, "permission denied is not 'not linked'");
+        }
     }
 }
