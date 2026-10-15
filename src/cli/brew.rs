@@ -651,6 +651,69 @@ pub fn should_reconcile_daemon(
         && should_restart_for_version_mismatch(daemon_running, server_version, installed_version)
 }
 
+/// What a same-channel action owes the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonReconcile {
+    /// Nothing to do, silently: no daemon, a non-mutating action, an
+    /// unknown server version, or it already serves the installed build.
+    Leave,
+    /// It serves another build than the target's installed binary: restart
+    /// onto that binary.
+    Restart,
+    /// It runs, but the target's installed binary or its version could not
+    /// be resolved — not checked, so no restart; the user is told why.
+    Unchecked { reason: String },
+}
+
+impl DaemonReconcile {
+    /// The stderr line for [`DaemonReconcile::Unchecked`]; `None` otherwise.
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            DaemonReconcile::Unchecked { reason } => Some(format!(
+                "{reason} — the running daemon was not checked; once that \
+                 resolves, run: llmux restart"
+            )),
+            DaemonReconcile::Leave | DaemonReconcile::Restart => None,
+        }
+    }
+}
+
+/// PURE: [`should_reconcile_daemon`] plus the unknown case. Unknown still
+/// never restarts, but a RUNNING daemon left unchecked because the target's
+/// installed binary (`installed_exe`, via `brew --prefix`) or its version
+/// (`installed_version`, `<exe> --version`) could not be resolved is
+/// [`DaemonReconcile::Unchecked`], not silence.
+pub fn daemon_reconcile(
+    action: &SameChannel,
+    target: Channel,
+    daemon_running: bool,
+    server_version: Option<&str>,
+    installed_exe: Option<&std::path::Path>,
+    installed_version: Option<&str>,
+) -> DaemonReconcile {
+    if !action.mutates() || !daemon_running {
+        return DaemonReconcile::Leave;
+    }
+    let Some(exe) = installed_exe else {
+        return DaemonReconcile::Unchecked {
+            reason: format!(
+                "could not locate the {formula} binary (brew --prefix {formula})",
+                formula = target.formula()
+            ),
+        };
+    };
+    if installed_version.is_none() {
+        return DaemonReconcile::Unchecked {
+            reason: format!("could not read the version of {}", exe.display()),
+        };
+    }
+    if should_reconcile_daemon(action, daemon_running, server_version, installed_version) {
+        DaemonReconcile::Restart
+    } else {
+        DaemonReconcile::Leave
+    }
+}
+
 /// PURE: decide [`SameChannel`] from the read-only preflight: whether the
 /// target and the other formula are installed, the other's `brew uses
 /// --installed` answer (empty when not queried), the linked formulae
@@ -2523,5 +2586,69 @@ mod tests {
             assert_eq!(pinned, None, "permission denied is not 'not pinned'");
             assert_eq!(linked, None, "permission denied is not 'not linked'");
         }
+    }
+
+    #[test]
+    fn daemon_reconcile_is_silent_on_match_restarts_on_mismatch_warns_on_unknown() {
+        let exe = std::path::Path::new("/opt/homebrew/opt/llmux/bin/llmux");
+        let relink = SameChannel::Relink;
+        let decide = |running, server, exe, installed| {
+            daemon_reconcile(&relink, Channel::Stable, running, server, exe, installed)
+        };
+
+        // Already on the installed build: leave it, say nothing.
+        let matched = decide(true, Some(FRESH_B), Some(exe), Some(FRESH_B));
+        assert_eq!(matched, DaemonReconcile::Leave);
+        assert_eq!(matched.warning(), None);
+
+        // Another build: restart onto the installed binary.
+        let mismatch = decide(true, Some(STALE_A), Some(exe), Some(FRESH_B));
+        assert_eq!(mismatch, DaemonReconcile::Restart);
+        assert_eq!(mismatch.warning(), None);
+
+        // Running, but the installed binary can't be located: no restart
+        // (unknown is not a mismatch), and say so.
+        let no_binary = decide(true, Some(STALE_A), None, None);
+        assert!(
+            matches!(no_binary, DaemonReconcile::Unchecked { .. }),
+            "{no_binary:?}"
+        );
+        let warning = no_binary.warning().unwrap();
+        assert!(
+            warning.contains("could not locate the llmux binary"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("running daemon was not checked"),
+            "{warning}"
+        );
+        assert!(warning.contains("llmux restart"), "{warning}");
+
+        // …or its version can't be read: same, naming the binary.
+        let no_version = decide(true, Some(STALE_A), Some(exe), None);
+        assert!(
+            matches!(no_version, DaemonReconcile::Unchecked { .. }),
+            "{no_version:?}"
+        );
+        let warning = no_version.warning().unwrap();
+        assert!(
+            warning.contains("/opt/homebrew/opt/llmux/bin/llmux"),
+            "{warning}"
+        );
+        assert!(warning.contains("llmux restart"), "{warning}");
+
+        // Nothing to check: no daemon, or a non-mutating action.
+        assert_eq!(decide(false, None, None, None), DaemonReconcile::Leave);
+        assert_eq!(
+            daemon_reconcile(
+                &SameChannel::NothingToDo,
+                Channel::Stable,
+                true,
+                Some(STALE_A),
+                None,
+                None
+            ),
+            DaemonReconcile::Leave
+        );
     }
 }

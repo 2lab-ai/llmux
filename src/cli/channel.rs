@@ -151,7 +151,7 @@ async fn snapshot_daemon() -> Result<DaemonSnapshot, CliError> {
 /// build than the target's installed binary restarts onto it, through
 /// `installed_binary` (never `current_exe()`) — `llmux update`'s
 /// server-vs-installed rule. An unresolvable binary or version is missing
-/// data: no restart.
+/// data: no restart, but a warning on stderr ([`brew::daemon_reconcile`]).
 async fn reconcile_daemon(
     host: &dyn Host,
     target: Channel,
@@ -166,13 +166,18 @@ async fn reconcile_daemon(
     let installed_version = installed_exe
         .as_deref()
         .and_then(|exe| host.binary_version(exe));
-    let restart = brew::should_reconcile_daemon(
+    let decision = brew::daemon_reconcile(
         action,
+        target,
         snapshot.running,
         snapshot.version.as_deref(),
+        installed_exe.as_deref(),
         installed_version.as_deref(),
     );
-    if let (true, Some(exe)) = (restart, installed_exe) {
+    if let Some(warning) = decision.warning() {
+        eprintln!("warning: {warning}");
+    }
+    if let (brew::DaemonReconcile::Restart, Some(exe)) = (decision, installed_exe) {
         println!(
             "server on {} ≠ installed {} — restarting the daemon…",
             display_version(snapshot.version.as_deref().unwrap_or("unknown")),
