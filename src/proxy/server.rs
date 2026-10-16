@@ -40,6 +40,15 @@ pub const EVALUATE_TICK: Duration = Duration::from_secs(60);
 /// as defense in depth). The first tick fires immediately at startup.
 const REFRESH_TICK: Duration = Duration::from_secs(600);
 
+/// Background refresh-ahead window for GEMINI tokens, replacing
+/// `scheduler.refresh_ahead_secs` (default 7h) for that kind only. Google
+/// access tokens live ~1h, so under the 7h window every gemini token is
+/// permanently "due" and — one refresh per pass, soonest expiry first — would
+/// win every pass and starve the other accounts' background refresh. Two
+/// ticks ahead (milliseconds) still guarantees a pass sees each gemini token
+/// before it expires.
+const GEMINI_REFRESH_AHEAD_MS: u64 = 2 * 600 * 1000;
+
 /// Hard deadline for hyper's graceful drain after `/llmux/shutdown`: once it
 /// passes, the daemon exits even with connections still open.
 ///
@@ -269,6 +278,11 @@ pub struct AppState {
     /// xAI grok provider (docs/grok/spec.md): live-mutable shape behind
     /// `POST /llmux/grok`, same contract as `codex`.
     pub grok: Arc<crate::provider::grok::GrokProvider>,
+    /// Google Antigravity provider (docs/gemini/spec.md §R3): Messages ↔
+    /// Cloud Code translation. ONE shared instance because it owns the
+    /// thought-signature cache that turn N's converter fills and turn N+1's
+    /// request replays.
+    pub gemini: Arc<crate::provider::gemini::GeminiProvider>,
     /// OpenRouter provider (docs/openrouter/spec.md). A PASSTHROUGH like
     /// [`Self::provider`] — not a translator — differing only in base URL,
     /// credential shape, and the `or-…` → upstream-slug `model` rewrite.
@@ -293,6 +307,13 @@ pub struct AppState {
     /// Where refreshed tokens are persisted (read-merge-write). `None`
     /// disables persistence (tests).
     pub config_path: Option<PathBuf>,
+    /// The gemini Google OAuth client ([`crate::config::GeminiConfig::
+    /// oauth_client`]: environment over `config.gemini`), resolved once in
+    /// [`Self::new`] — `config` never changes for the daemon's lifetime, so
+    /// this is the same answer every call would give. `None` = not
+    /// configured; read through [`Self::gemini_oauth_client`]. Tests set it
+    /// directly so they never depend on the developer's environment.
+    pub gemini_oauth: Option<crate::auth::gemini::GeminiOAuthClient>,
     /// Where finished requests are appended + replayed from on startup
     /// (req-persist A/C: stats survive restart, activity records kept with no
     /// retention). `None` disables activity persistence (unit tests; or no
@@ -427,6 +448,10 @@ impl AppState {
             config.grok.upstream.clone(),
             crate::provider::grok::GrokShape::from_config(&config.grok),
         ));
+        let gemini = Arc::new(crate::provider::gemini::GeminiProvider::with_shape(
+            config.gemini.upstream.clone(),
+            crate::provider::gemini::GeminiShape::from_config(&config.gemini),
+        ));
         let openrouter = Arc::new(crate::provider::openrouter::OpenRouterProvider::new(
             config.openrouter.upstream.clone(),
             config.openrouter.default_model.clone(),
@@ -451,6 +476,7 @@ impl AppState {
             &config.routing.codex_models,
             &config.routing.grok_models,
             &config.routing.openrouter_models,
+            &config.routing.gemini_models,
             &config.routing.default_group,
         ));
         // A non-default upstream (staging, e2e mock) must also receive the
@@ -471,6 +497,7 @@ impl AppState {
             provider,
             codex,
             grok,
+            gemini,
             openrouter,
             idle_prober,
             classifier,
@@ -480,6 +507,7 @@ impl AppState {
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
+            gemini_oauth: config.gemini.oauth_client().ok(),
             activity_log_path: crate::cli::daemon::activity_log_path(),
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
@@ -507,6 +535,16 @@ impl AppState {
             usage_control_state_path: crate::cli::daemon::activity_log_path()
                 .map(|p| p.with_file_name("usage-resets.json")),
         })
+    }
+
+    /// The configured gemini OAuth client, or the one operator-facing
+    /// "not configured" error every gemini login / refresh surfaces.
+    pub fn gemini_oauth_client(
+        &self,
+    ) -> Result<&crate::auth::gemini::GeminiOAuthClient, crate::auth::AuthError> {
+        self.gemini_oauth
+            .as_ref()
+            .ok_or(crate::auth::AuthError::GeminiClientNotConfigured)
     }
 
     pub fn select_params(&self) -> SelectParams {
@@ -1145,6 +1183,18 @@ pub async fn serve(
         state.config.grok.upstream.clone(),
         state.config.scheduler,
     )
+    // The quota read goes to the CONFIGURED Cloud Code base (an e2e mock,
+    // staging) with the configured Antigravity identity — never the default
+    // Google host while everything else is redirected.
+    .with_gemini(
+        state.config.gemini.upstream.clone(),
+        state.config.gemini.user_agent.clone(),
+    )
+    // A gemini account imported without its project resolves it on a
+    // scheduled poll — never in `prime` below, which holds readiness —
+    // persisted to THIS state's config file, so usage shows up for an
+    // operator who never sends a model request.
+    .with_gemini_projects(state.client.clone(), state.config_path.clone())
     .with_events(state.events.clone());
     poller.prime(SystemTime::now()).await;
 
@@ -1489,10 +1539,11 @@ pub fn eval_groups(
 }
 
 /// One background-refresh pass (A2): refresh every HEALTHY oauth-style
-/// account (anthropic oauth AND codex) whose access token expires within
-/// `scheduler.refresh_ahead_secs`. Reuses the request-time path
+/// account (anthropic oauth, codex, grok, gemini) whose access token expires
+/// within `scheduler.refresh_ahead_secs` (gemini:
+/// [`GEMINI_REFRESH_AHEAD_MS`]). Reuses the request-time path
 /// ([`forward::refresh_credential`]: coalescer for anthropic, direct token
-/// grant for codex, pool update, persistence). Auth-failed accounts are
+/// grant for the others, pool update, persistence). Auth-failed accounts are
 /// skipped — a dead refresh token must not be retried every tick (re-login
 /// heals via `update_credential`); transient failures are simply retried on
 /// the next tick.
@@ -1518,6 +1569,28 @@ pub async fn background_refresh_pass(state: &AppState) {
         crate::scheduler::AccountFingerprint,
         u64,
     )> = None;
+    // Without the gemini OAuth client no gemini token can be refreshed: skip
+    // those accounts, or an expired gemini token would stay the soonest
+    // expiry and starve every other account's refresh, every pass.
+    let gemini_refreshable = match state.gemini_oauth_client() {
+        Ok(_) => true,
+        Err(err) => {
+            let has_gemini = state
+                .pool
+                .snapshot()
+                .accounts
+                .iter()
+                .any(|a| a.credential_kind == "gemini");
+            // Once per process: the client is resolved at startup, so the
+            // answer cannot change before a restart — repeating it every pass
+            // would only flood the log.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if has_gemini && !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(error = %err, "gemini accounts skipped by the background refresh");
+            }
+            false
+        }
+    };
     for account in state.pool.snapshot().accounts {
         if !account.healthy {
             continue;
@@ -1529,14 +1602,20 @@ pub async fn background_refresh_pass(state: &AppState) {
         else {
             continue;
         };
-        let expires_at_ms = match &credential {
+        let (expires_at_ms, account_ahead_ms) = match &credential {
             AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. }
-            | AccountCredential::Grok { expires_at_ms, .. } => *expires_at_ms,
+            | AccountCredential::Grok { expires_at_ms, .. } => (*expires_at_ms, ahead_ms),
+            // ~1h Google tokens: a short window of their own (see
+            // `GEMINI_REFRESH_AHEAD_MS`), never wider than the configured one.
+            AccountCredential::Gemini { .. } if !gemini_refreshable => continue,
+            AccountCredential::Gemini { expires_at_ms, .. } => {
+                (*expires_at_ms, ahead_ms.min(GEMINI_REFRESH_AHEAD_MS))
+            }
             // Neither an anthropic API key nor an OpenRouter key expires.
             AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => continue,
         };
-        if expires_at_ms.saturating_sub(now_ms) >= ahead_ms {
+        if expires_at_ms.saturating_sub(now_ms) >= account_ahead_ms {
             continue;
         }
         if candidate
@@ -1552,7 +1631,8 @@ pub async fn background_refresh_pass(state: &AppState) {
     match forward::refresh_credential(state, &account_id, &credential, &fingerprint).await {
         forward::RefreshOutcome::Refreshed(fresh) => {
             if let AccountCredential::Oauth { expires_at_ms, .. }
-            | AccountCredential::Codex { expires_at_ms, .. } = fresh
+            | AccountCredential::Codex { expires_at_ms, .. }
+            | AccountCredential::Gemini { expires_at_ms, .. } = fresh
             {
                 let hours = expires_at_ms.saturating_sub(now_ms) as f64 / 3_600_000.0;
                 tracing::info!(
@@ -1581,6 +1661,9 @@ pub async fn background_refresh_pass(state: &AppState) {
         // nothing is wrong — the next tick sees the new token's expiry.
         forward::RefreshOutcome::Superseded => {}
         forward::RefreshOutcome::Failed { .. } => {} // transient — next tick retries
+        // Unreachable for gemini (skipped above while unconfigured); a
+        // configuration failure never benches either way.
+        forward::RefreshOutcome::Misconfigured { .. } => {}
     }
 }
 
@@ -2630,7 +2713,8 @@ pub struct SettingsRequest {
     // ---- persisted-only (effective on next daemon start) ----
     pub raw_io_retention_days: Option<u64>,
     pub raw_io_max_body_bytes: Option<u64>,
-    /// `"claude"` | `"codex"` | `"grok"`.
+    /// A [`crate::routing::BackendGroup`] label: `"claude"` | `"codex"` |
+    /// `"grok"` | `"openrouter"` | `"gemini"`.
     pub routing_default_group: Option<String>,
     /// `"error"` | `"fallback"`.
     pub routing_on_empty_group: Option<String>,
@@ -2705,7 +2789,10 @@ pub fn apply_settings(
         }
     }
     if let Some(group) = req.routing_default_group.as_deref() {
-        if !["claude", "codex", "grok", "openrouter"].contains(&group) {
+        if !crate::routing::BackendGroup::ALL
+            .iter()
+            .any(|g| g.as_str() == group)
+        {
             return Err(format!("routing_default_group: unknown group {group:?}"));
         }
     }
@@ -3059,7 +3146,8 @@ async fn inject_account_endpoint(
     let access_token_masked = match &account.credential {
         AccountCredential::Oauth { access_token, .. }
         | AccountCredential::Codex { access_token, .. }
-        | AccountCredential::Grok { access_token, .. } => {
+        | AccountCredential::Grok { access_token, .. }
+        | AccountCredential::Gemini { access_token, .. } => {
             Some(crate::proxy::logging::mask_credentials(access_token))
         }
         AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
@@ -3095,7 +3183,8 @@ async fn inject_account_endpoint(
 /// Request body for `POST /llmux/login/start`.
 #[derive(serde::Deserialize)]
 struct LoginStartRequest {
-    /// `"claude"` or `"codex"` (aliases accepted, see [`LoginProvider::parse`]).
+    /// `"claude"`, `"codex"`, `"grok"`, `"openrouter"` or `"gemini"` (aliases
+    /// accepted, see [`LoginProvider::parse`]).
     provider: String,
 }
 
@@ -3111,13 +3200,17 @@ struct LoginCancelRequest {
     state: String,
 }
 
-/// `POST /llmux/login/start` `{"provider":"claude"|"codex"}` — begin a
+/// `POST /llmux/login/start`
+/// `{"provider":"claude"|"codex"|"grok"|"openrouter"|"gemini"}` — begin a
 /// GUI-initiated OAuth login (FR4, `.prd/11-llmux-islands-spec.md`). Unlike
 /// `/llmux/inject-account` (where the CLIENT runs the browser flow and relays
-/// the token), here the DAEMON runs the same PKCE browser flow the CLI uses —
+/// the token), here the DAEMON runs the same browser flow the CLI uses —
 /// `cli::login::oauth_login_to_account` (Claude) /
-/// `auth::codex::login_codex_interactive` (Codex) — on the daemon host, then
-/// [`AppState::inject_account`]s the result into the live pool with no restart.
+/// `auth::codex::login_codex_interactive` (Codex) / the grok device-code flow /
+/// `auth::openrouter::login_interactive` (OpenRouter) /
+/// `auth::gemini::login_gemini_interactive` (Gemini) — on the daemon host,
+/// then [`AppState::inject_account`]s the result into the live pool with no
+/// restart.
 ///
 /// Single in-flight login: the OAuth callback binds a fixed localhost port, so
 /// a second `start` while one is pending is a `409`. Returns `{"state":"…"}`;
@@ -3131,7 +3224,7 @@ async fn login_start_endpoint(
     let Some(provider) = super::login::LoginProvider::parse(&body.provider) else {
         return relay_error(
             StatusCode::BAD_REQUEST,
-            "provider must be 'claude', 'codex', or 'grok'",
+            "provider must be 'claude', 'codex', 'grok', 'openrouter', or 'gemini'",
         );
     };
     if state.config_path.is_none() {
@@ -3194,6 +3287,17 @@ async fn run_login(
         LoginProvider::Codex => crate::auth::codex::login_codex_interactive(
             &state.client,
             &state.config.codex.token_url,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+        LoginProvider::Gemini => crate::auth::gemini::login_gemini_interactive(
+            &state.client,
+            // Unconfigured: the exact "not configured" sentence, before any
+            // port is bound or browser opened.
+            state.gemini_oauth_client().map_err(|e| e.to_string())?,
+            &state.config.gemini.token_url,
+            &state.config.gemini.upstream,
+            &state.config.gemini.user_agent,
         )
         .await
         .map_err(|e| e.to_string())?,
@@ -4509,9 +4613,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 43 curated (15 claude + 14 codex + 4 grok + 10 openrouter) + 1
-        // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 44);
+        // 51 curated (15 claude + 14 codex + 4 grok + 10 openrouter + 8
+        // gemini) + 1 synthesized (grok-4.3 is out-of-catalog now).
+        assert_eq!(models.len(), 52);
 
         let by_id = |id: &str| {
             models
@@ -5825,5 +5929,105 @@ mod tests {
             .expect("reload")
             .events
             .is_empty());
+    }
+
+    // ---- gemini OAuth client not configured (llmux ships none) ----
+
+    const GEMINI_NO_CLIENT: &str = "gemini OAuth client not configured: set gemini.client_id and \
+        gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / \
+        LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux after \
+        setting them";
+
+    /// The daemon-side Google login (the GUI/Islands path) refuses with the
+    /// exact fix before any port is bound or browser opened.
+    #[tokio::test]
+    async fn gemini_login_without_an_oauth_client_fails_before_any_io() {
+        let config = Config::default();
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.gemini_oauth = None;
+
+        let result = run_login(&state, crate::proxy::login::LoginProvider::Gemini, "st-1").await;
+
+        assert_eq!(result.err().as_deref(), Some(GEMINI_NO_CLIENT));
+    }
+
+    /// Without the OAuth client an expired gemini token can never be
+    /// refreshed — so the background pass skips gemini accounts instead of
+    /// picking that soonest expiry every pass and starving everyone else.
+    /// The anthropic account due for a refresh gets it; the gemini account is
+    /// left untouched and healthy.
+    #[tokio::test]
+    async fn background_refresh_skips_gemini_without_an_oauth_client() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/oauth/token",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let upstream = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let gemini = AccountConfig {
+            name: "gemini:g@example.com".into(),
+            credential: AccountCredential::Gemini {
+                email: "g@example.com".into(),
+                access_token: "at-g".into(),
+                refresh_token: "rt-g".into(),
+                expires_at_ms: 1,
+                project_id: "proj-1".into(),
+                last_refresh_ms: None,
+            },
+        };
+        let mut claude = oauth_account("a");
+        if let AccountCredential::Oauth { expires_at_ms, .. } = &mut claude.credential {
+            *expires_at_ms = now_ms + 3_600_000;
+        }
+        let mut config = Config {
+            upstream: upstream.clone(),
+            accounts: vec![gemini.clone(), claude],
+            ..Default::default()
+        };
+        config.gemini.token_url = format!("{upstream}/gemini-token");
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool.clone(), None, None).expect("state");
+        state.config_path = None;
+        state.gemini_oauth = None;
+
+        background_refresh_pass(&state).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the anthropic account was refreshed"
+        );
+        assert!(matches!(
+            pool.credential(&AccountId("a".into())),
+            Some(AccountCredential::Oauth { access_token, .. }) if access_token == "at-new"
+        ));
+        assert_eq!(
+            pool.credential(&AccountId("gemini:g@example.com".into())),
+            Some(gemini.credential),
+            "the gemini account is left as it was"
+        );
+        assert!(pool.snapshot().accounts.iter().all(|a| a.healthy));
     }
 }

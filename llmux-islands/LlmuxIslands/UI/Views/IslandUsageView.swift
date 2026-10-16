@@ -45,7 +45,7 @@ struct IslandUsageView: View {
             Button(effectiveAdding ? "Done" : "Connect account") { adding.toggle() }
                 .font(.system(size: 11, weight: .medium))
                 .disabled(loginInProgress)
-                .help("Connect an existing Claude, ChatGPT, Grok or API account")
+                .help("Connect an existing Claude, ChatGPT, Grok, Gemini or API account")
             iconButton("arrow.clockwise") { Task { await model.refresh() } }
                 .accessibilityLabel("Refresh accounts")
         }
@@ -208,8 +208,8 @@ private struct NeedsAttentionSection: View {
 }
 
 /// Inline add-account form (rendered in-panel; sheets are unreliable in the
-/// borderless island). Mirrors llmux `a → n`: a new OAuth login for Claude or
-/// Codex, plus an API-key path.
+/// borderless island). Mirrors llmux `a → n`: a new OAuth login for Claude,
+/// Codex, Grok or Gemini, plus an API-key path.
 private struct AddAccountInline: View {
     @ObservedObject var model: IslandUsageModel
     let onDone: () -> Void
@@ -218,6 +218,7 @@ private struct AddAccountInline: View {
         case claude = "Claude"
         case codex = "Codex"
         case grok = "Grok"
+        case gemini = "Gemini"
         case apiKey = "API Key"
         var id: String { rawValue }
     }
@@ -237,7 +238,7 @@ private struct AddAccountInline: View {
             .labelsHidden()
 
             switch kind {
-            case .claude, .codex, .grok:
+            case .claude, .codex, .grok, .gemini:
                 Text(loginBlurb)
                     .font(.system(size: 11))
                     .foregroundColor(.white.opacity(0.5))
@@ -269,6 +270,7 @@ private struct AddAccountInline: View {
         case .claude: "claude"
         case .codex: "codex"
         case .grok: "grok"
+        case .gemini: "gemini"
         case .apiKey: ""
         }
     }
@@ -278,6 +280,7 @@ private struct AddAccountInline: View {
         case .claude: "Sign in to Claude"
         case .codex: "Sign in to ChatGPT"
         case .grok: "Sign in to Grok"
+        case .gemini: "Sign in to Google (Gemini)"
         case .apiKey: ""
         }
     }
@@ -288,6 +291,11 @@ private struct AddAccountInline: View {
             // Device-code flow: the daemon polls while the user approves on
             // the opened x.ai page (docs/grok/spec.md T2).
             "Sign in to Grok in your browser and approve the verification code."
+        case .gemini:
+            // Browser OAuth with a localhost callback, like Codex. The ToS
+            // warning mirrors the note the CLI prints before this login.
+            "Sign in in your browser with the Google account that has Antigravity access. "
+                + "Google may suspend accounts that use Antigravity through third-party tools."
         default:
             "Sign in to your \(kind == .claude ? "Claude" : "ChatGPT") account in your browser."
         }
@@ -379,6 +387,7 @@ private struct LoginProgressView: View {
         switch login.provider {
         case "codex": "ChatGPT"
         case "grok": "Grok"
+        case "gemini": "Gemini"
         default: "Claude"
         }
     }

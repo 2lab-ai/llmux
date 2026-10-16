@@ -175,7 +175,7 @@ fn account_actions_are_semantic_scoped_and_remove_is_confirmation_gated() {
 fn add_and_device_login_surfaces_do_not_retain_or_echo_secrets() {
     let qml = read("qml/Usage.qml");
 
-    for provider in ["claude", "codex", "grok", "api"] {
+    for provider in ["claude", "codex", "grok", "gemini", "api"] {
         assert!(qml.contains(&format!("\"key\": \"{provider}\"")));
     }
     for field in [
@@ -314,4 +314,27 @@ fn test_contract_tracks_the_checked_in_schema_names() {
             "schema must still expose {field}"
         );
     }
+}
+
+#[test]
+fn gemini_provider_has_its_own_label_icon_and_browser_login_entry() {
+    let usage = read("qml/Usage.qml");
+    assert!(usage.contains("case \"gemini\": return qsTr(\"Gemini\")"));
+    assert!(usage.contains("case \"gemini\": return \"internet-services\""));
+    assert!(
+        !usage.contains("case \"gemini\": return \"network-connect\""),
+        "gemini must not reuse the grok icon"
+    );
+    assert!(usage.contains("\"label\": qsTr(\"Gemini (Google)\")"));
+    assert!(
+        usage.contains(
+            "qsTr(\"Sign in in your browser with the Google account that has Antigravity access. \
+             Google may suspend accounts that use Antigravity through third-party tools.\")"
+        ),
+        "the gemini login entry must carry the Terms-of-Service warning"
+    );
+    assert!(usage.contains("Add Claude, Codex, Grok, Gemini, or an Anthropic API key."));
+
+    let main = read("qml/Main.qml");
+    assert!(main.contains("case \"gemini\": return qsTr(\"Gemini\")"));
 }

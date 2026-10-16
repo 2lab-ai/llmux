@@ -8,15 +8,18 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
 use super::headers::{parse_epoch_seconds, parse_rfc3339, WindowReading};
 use super::window::LimitSeverity;
-use super::{AccountId, AccountPool};
+use super::{AccountFingerprint, AccountId, AccountPool};
+use crate::auth::gemini_usage::{self, GeminiUsageError};
 use crate::auth::grok_usage::{self, GrokUsageError};
-use crate::config::{AccountCredential, SchedulerConfig};
+use crate::config::{AccountCredential, GeminiConfig, SchedulerConfig};
+use crate::proxy::gemini_project::{self, GeminiProject};
 
 /// Parsed body of `GET /api/oauth/usage` (Bearer auth): per-window
 /// utilization + resets_at, same shape soma-work polls every 5 minutes.
@@ -55,6 +58,10 @@ pub enum UsageError {
     /// module's SANITIZED phrase only — never a url, body or token.
     #[error("grok billing read failed: {0}")]
     GrokBilling(GrokUsageError),
+    /// Gemini quota read (`POST /v1internal:fetchAvailableModels`) failed.
+    /// Carries the module's SANITIZED phrase only — never a url, body or token.
+    #[error("gemini quota read failed: {0}")]
+    GeminiQuota(GeminiUsageError),
 }
 
 /// A grok billing failure becomes a poll failure. An HTTP status is lifted into
@@ -66,6 +73,19 @@ impl From<GrokUsageError> for UsageError {
         match err {
             GrokUsageError::Status { status } => UsageError::Status { status },
             other => UsageError::GrokBilling(other),
+        }
+    }
+}
+
+/// A gemini quota failure becomes a poll failure, exactly like grok's: an HTTP
+/// status is lifted into [`UsageError::Status`], everything else keeps its
+/// sanitized phrase. No gemini quota status benches (docs/gemini/spec.md §R6);
+/// see [`UsagePoller::poll_account`].
+impl From<GeminiUsageError> for UsageError {
+    fn from(err: GeminiUsageError) -> Self {
+        match err {
+            GeminiUsageError::Status { status } => UsageError::Status { status },
+            other => UsageError::GeminiQuota(other),
         }
     }
 }
@@ -241,8 +261,9 @@ pub async fn fetch_usage(
 
 /// Injectable transport for the usage endpoints, so the poller is testable
 /// without a network. One method per usage SOURCE: anthropic oauth's
-/// `/api/oauth/usage` and grok's billing endpoint are different documents on
-/// different hosts with different identity headers.
+/// `/api/oauth/usage`, grok's billing endpoint and gemini's Cloud Code model
+/// catalog are different documents on different hosts with different identity
+/// headers.
 pub trait UsageFetcher: Send + Sync {
     fn fetch(
         &self,
@@ -258,6 +279,17 @@ pub trait UsageFetcher: Send + Sync {
         upstream: &str,
         access_token: &str,
         subject: &str,
+    ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send;
+
+    /// `POST {upstream}/v1internal:fetchAvailableModels {"project"}` for one
+    /// gemini account (`crate::auth::gemini_usage`), sent with the configured
+    /// Antigravity `user_agent`. Only the quota's usage windows are returned.
+    fn fetch_gemini(
+        &self,
+        upstream: &str,
+        user_agent: &str,
+        access_token: &str,
+        project: &str,
     ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send;
 }
 
@@ -296,6 +328,26 @@ impl UsageFetcher for ReqwestFetcher {
                 .map_err(UsageError::from)
         }
     }
+
+    fn fetch_gemini(
+        &self,
+        upstream: &str,
+        user_agent: &str,
+        access_token: &str,
+        project: &str,
+    ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+        let client = self.client.clone();
+        let upstream = upstream.to_owned();
+        let user_agent = user_agent.to_owned();
+        let access_token = access_token.to_owned();
+        let project = project.to_owned();
+        async move {
+            gemini_usage::fetch_quota(&client, &upstream, &user_agent, &access_token, &project)
+                .await
+                .map(|quota| quota.usage)
+                .map_err(UsageError::from)
+        }
+    }
 }
 
 /// Failure backoff ladder (task spec): 2m → 5m → 10m → 15m cap. Zero
@@ -313,6 +365,15 @@ const POLL_TICK: Duration = Duration::from_secs(5);
 /// request-rate limit and make llmux rate-limit its own traffic.
 const MIN_POLL_GAP: Duration = Duration::from_secs(10);
 
+/// What the poller needs to resolve a gemini account's missing Cloud Code
+/// project beyond what it already holds (pool, Cloud Code base, identity):
+/// the HTTP client (the fetcher is injectable and may not have one) and the
+/// config file the project is persisted in.
+struct GeminiProjects {
+    client: reqwest::Client,
+    config_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PollSchedule {
     next_at: SystemTime,
@@ -320,11 +381,12 @@ struct PollSchedule {
 }
 
 /// Background poller: polls every account that HAS a usage source (anthropic
-/// oauth via `/api/oauth/usage`, grok via the billing endpoint) at
-/// `usage_poll_secs` cadence with jitter; failures climb the backoff ladder and
-/// recover on first success. Each account has its own next-allowed-at; API-key
-/// / codex / openrouter accounts are skipped (no poller usage source — codex
-/// refreshes through the explicit usage-control path).
+/// oauth via `/api/oauth/usage`, grok via the billing endpoint, gemini via the
+/// Cloud Code model catalog) at `usage_poll_secs` cadence with jitter; failures
+/// climb the backoff ladder and recover on first success. Each account has its
+/// own next-allowed-at; API-key / codex / openrouter accounts are skipped (no
+/// poller usage source — codex refreshes through the explicit usage-control
+/// path).
 pub struct UsagePoller<F = ReqwestFetcher> {
     pool: AccountPool,
     fetcher: F,
@@ -333,6 +395,17 @@ pub struct UsagePoller<F = ReqwestFetcher> {
     /// unusable value is REFUSED by `grok_usage::billing_url`, never replaced
     /// with the production default.
     grok_upstream: String,
+    /// `config.gemini.upstream` — the Cloud Code base the quota read is posted
+    /// to. [`GeminiConfig::default`] until [`Self::with_gemini`] sets it.
+    gemini_upstream: String,
+    /// `config.gemini.user_agent` — the Antigravity identity the quota read
+    /// carries. [`GeminiConfig::default`] until [`Self::with_gemini`] sets it.
+    gemini_user_agent: String,
+    /// The handle a missing gemini project is resolved through (the HTTP
+    /// client + the config file it is persisted in), set by
+    /// [`Self::with_gemini_projects`]. `None` keeps the skip: an account
+    /// without a project has no usage source.
+    gemini_projects: Option<GeminiProjects>,
     config: SchedulerConfig,
     schedule: HashMap<AccountId, PollSchedule>,
     /// Wall-clock time of the last poll, for the global [`MIN_POLL_GAP`] throttle.
@@ -369,11 +442,15 @@ impl<F: UsageFetcher> UsagePoller<F> {
         grok_upstream: String,
         config: SchedulerConfig,
     ) -> Self {
+        let gemini = GeminiConfig::default();
         Self {
             pool,
             fetcher,
             base_url,
             grok_upstream,
+            gemini_upstream: gemini.upstream,
+            gemini_user_agent: gemini.user_agent,
+            gemini_projects: None,
             config,
             schedule: HashMap::new(),
             last_poll_at: None,
@@ -388,6 +465,32 @@ impl<F: UsageFetcher> UsagePoller<F> {
         events: Option<tokio::sync::mpsc::Sender<crate::tui::ActivityEvent>>,
     ) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Read gemini quota from the CONFIGURED Cloud Code base with the
+    /// configured Antigravity user agent (`config.gemini.upstream` /
+    /// `.user_agent`) instead of the [`GeminiConfig::default`] values.
+    pub fn with_gemini(mut self, upstream: String, user_agent: String) -> Self {
+        self.gemini_upstream = upstream;
+        self.gemini_user_agent = user_agent;
+        self
+    }
+
+    /// Resolve a gemini account's missing Cloud Code project before its
+    /// quota read (an operator who only watches usage never sends the request
+    /// that would resolve it), through `client`, persisting it in
+    /// `config_path` — the same guarded write + persist as the request path.
+    /// Scheduled polls only: the startup [`Self::prime`] pass never looks up.
+    pub fn with_gemini_projects(
+        mut self,
+        client: reqwest::Client,
+        config_path: Option<PathBuf>,
+    ) -> Self {
+        self.gemini_projects = Some(GeminiProjects {
+            client,
+            config_path,
+        });
         self
     }
 
@@ -408,7 +511,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
             .snapshot()
             .accounts
             .iter()
-            .filter(|a| matches!(a.credential_kind, "oauth" | "grok"))
+            .filter(|a| matches!(a.credential_kind, "oauth" | "grok" | "gemini"))
             .map(|a| a.id.clone())
             .collect();
         self.schedule.retain(|id, _| pollable.contains(id));
@@ -422,10 +525,16 @@ impl<F: UsageFetcher> UsagePoller<F> {
     }
 
     /// Poll one account and reschedule it (jittered interval on success, backoff
-    /// ladder on failure), emitting a poller-health event.
-    async fn poll_and_reschedule(&mut self, id: AccountId, now: SystemTime) {
+    /// ladder on failure), emitting a poller-health event. `resolve_projects`
+    /// as in [`Self::poll`].
+    async fn poll_and_reschedule(
+        &mut self,
+        id: AccountId,
+        now: SystemTime,
+        resolve_projects: bool,
+    ) {
         let prev_failures = self.schedule.get(&id).map_or(0, |e| e.consecutive_failures);
-        let failures = match self.poll_account(&id, now).await {
+        let failures = match self.poll(&id, now, resolve_projects).await {
             Ok(()) => 0,
             Err(err) => {
                 tracing::warn!(account = %id, error = %err, "usage poll failed");
@@ -455,10 +564,15 @@ impl<F: UsageFetcher> UsagePoller<F> {
     /// [`Self::tick`] throttles to one poll per [`MIN_POLL_GAP`] so the poller
     /// never *continuously* bursts a call per account (which can trip the
     /// upstream's org/IP request-rate limit).
+    ///
+    /// The daemon reports ready only after this pass, so it never runs a
+    /// gemini project lookup (`loadCodeAssist`/`onboardUser` can take tens of
+    /// seconds): a project-less account is skipped here exactly as before and
+    /// resolves on its next scheduled poll ([`Self::tick`]).
     pub async fn prime(&mut self, now: SystemTime) {
         for id in self.refresh_schedule(now) {
             if self.schedule.get(&id).is_some_and(|e| e.next_at <= now) {
-                self.poll_and_reschedule(id, now).await;
+                self.poll_and_reschedule(id, now, false).await;
             }
         }
         self.last_poll_at = Some(now);
@@ -490,7 +604,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
             return;
         };
         self.last_poll_at = Some(now);
-        self.poll_and_reschedule(id, now).await;
+        self.poll_and_reschedule(id, now, true).await;
     }
 
     /// Compute the next delay after `consecutive_failures` for one account —
@@ -522,6 +636,15 @@ impl<F: UsageFetcher> UsagePoller<F> {
     /// `classify` hop, so the grok billing read stays informational: 403/5xx
     /// climb the backoff ladder like any other poll failure.
     ///
+    /// The gemini quota read is informational for the same reason: no status
+    /// it answers ever benches (docs/gemini/spec.md §R6) — the ToS-suspension
+    /// 403 is a request-path verdict. A gemini account whose Cloud Code
+    /// project is not resolved yet (offline import) resolves it first when
+    /// its token is usable ([`Self::with_gemini_projects`]; never in the
+    /// startup [`Self::prime`] pass); until then it has no usage source: the
+    /// poll is skipped as a success, recording no window and climbing no
+    /// ladder.
+    ///
     /// Both outcomes are applied through the FINGERPRINT-GUARDED pool calls,
     /// so a verdict earned by a credential that was replaced mid-poll (a
     /// re-login) is discarded instead of landing on its successor.
@@ -530,13 +653,40 @@ impl<F: UsageFetcher> UsagePoller<F> {
         account: &AccountId,
         now: SystemTime,
     ) -> Result<(), UsageError> {
+        self.poll(account, now, true).await
+    }
+
+    /// [`Self::poll_account`]; `resolve_projects = false` (the startup
+    /// [`Self::prime`] pass) skips the gemini project lookup and keeps the
+    /// no-project skip.
+    async fn poll(
+        &self,
+        account: &AccountId,
+        now: SystemTime,
+        resolve_projects: bool,
+    ) -> Result<(), UsageError> {
         // Credential AND fingerprint in ONE capture: everything below is
         // applied only if the account still IS what was read here
         // (`docs/keys-history/relogin-trace.md` B4). A re-login that lands
         // during the fetch must not receive this poll's verdict.
-        let Some((credential, fingerprint)) = self.pool.credential_with_fingerprint(account) else {
+        let Some((mut credential, mut fingerprint)) =
+            self.pool.credential_with_fingerprint(account)
+        else {
             return Ok(());
         };
+        // A gemini account still waiting for its project resolves it here,
+        // at most once per poll of this account (never in `prime`); the
+        // reading then belongs to the resolved credential (its post-write
+        // fingerprint).
+        let resolved = if resolve_projects {
+            self.resolve_gemini_project(account, &credential).await
+        } else {
+            None
+        };
+        if let Some((resolved, resolved_fingerprint)) = resolved {
+            credential = resolved;
+            fingerprint = resolved_fingerprint;
+        }
         // One usage SOURCE per credential kind. A grok snapshot carries only
         // the weekly window, and `PoolState::record_usage` merges `Some`
         // windows only, so the header-fed 5h burst gauge stays intact.
@@ -556,6 +706,29 @@ impl<F: UsageFetcher> UsagePoller<F> {
                     .await,
                 false,
             ),
+            AccountCredential::Gemini {
+                access_token,
+                project_id,
+                ..
+            } => {
+                // Still no project (the startup pass, no resolver wired, the
+                // token not usable for the lookup, or the lookup failed): no
+                // usage source yet — never a fabricated window.
+                if project_id.is_empty() {
+                    return Ok(());
+                }
+                (
+                    self.fetcher
+                        .fetch_gemini(
+                            &self.gemini_upstream,
+                            &self.gemini_user_agent,
+                            access_token,
+                            project_id,
+                        )
+                        .await,
+                    false,
+                )
+            }
             _ => return Ok(()),
         };
         match outcome {
@@ -577,6 +750,44 @@ impl<F: UsageFetcher> UsagePoller<F> {
                     );
                 }
                 Err(err)
+            }
+        }
+    }
+
+    /// [`crate::proxy::gemini_project::ensure_project`] for a gemini account
+    /// that [awaits a lookup](crate::proxy::gemini_project::awaits_lookup),
+    /// when [`Self::with_gemini_projects`] wired the handle. `None` = keep
+    /// today's skip: not such an account, no handle, a re-login in flight
+    /// (its successor is polled next), or the lookup failed — logged, never
+    /// retried before this account's next scheduled poll, and never an
+    /// error: a missing usage source does not climb the backoff ladder.
+    async fn resolve_gemini_project(
+        &self,
+        account: &AccountId,
+        credential: &AccountCredential,
+    ) -> Option<(AccountCredential, AccountFingerprint)> {
+        let projects = self.gemini_projects.as_ref()?;
+        if !gemini_project::awaits_lookup(credential) {
+            return None;
+        }
+        let lookup = gemini_project::ProjectLookup {
+            client: &projects.client,
+            upstream: &self.gemini_upstream,
+            user_agent: &self.gemini_user_agent,
+            pool: &self.pool,
+            config_path: projects.config_path.as_deref(),
+        };
+        match gemini_project::ensure_project(&lookup, account, credential).await {
+            GeminiProject::Resolved {
+                credential,
+                fingerprint,
+            } => Some((credential, fingerprint)),
+            GeminiProject::Ready | GeminiProject::Superseded => None,
+            GeminiProject::Failed(err) => {
+                tracing::warn!(account = %account,
+                    error = %gemini_project::usage_failure_message(&err),
+                    "gemini usage poll skipped: project not resolved");
+                None
             }
         }
     }
@@ -656,18 +867,39 @@ mod tests {
     /// not dial, but the value is what `poll_account` forwards.
     const GROK_UPSTREAM: &str = "http://grok.invalid/v1";
 
+    /// A gemini account; `project` empty = not yet resolved (offline import).
+    fn gemini_account(name: &str, project: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Gemini {
+                email: format!("{name}@example.com"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
+                project_id: project.to_string(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    /// Never the production Cloud Code host — same rule as [`GROK_UPSTREAM`].
+    const GEMINI_UPSTREAM: &str = "http://gemini.invalid";
+    const GEMINI_USER_AGENT: &str = "antigravity/test";
+
     fn config() -> SchedulerConfig {
         SchedulerConfig::default() // poll 300s, max age 600s
     }
 
     /// Scripted fetcher: pops the next queued result per call and records
-    /// the tokens it was called with. Both usage sources share the `results`
-    /// queue; the grok calls are recorded separately so a test can prove WHICH
-    /// endpoint an account was read through.
+    /// the tokens it was called with. Every usage source shares the `results`
+    /// queue; the grok and gemini calls are recorded separately so a test can
+    /// prove WHICH endpoint an account was read through.
     struct MockFetcher {
         results: Mutex<Vec<Result<UsageSnapshot, UsageError>>>,
         calls: Mutex<Vec<String>>,
         grok_calls: Mutex<Vec<(String, String, String)>>,
+        /// `(upstream, user_agent, access_token, project)` per gemini read.
+        gemini_calls: Mutex<Vec<(String, String, String, String)>>,
     }
 
     impl MockFetcher {
@@ -676,6 +908,7 @@ mod tests {
                 results: Mutex::new(results),
                 calls: Mutex::new(Vec::new()),
                 grok_calls: Mutex::new(Vec::new()),
+                gemini_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -714,6 +947,23 @@ mod tests {
                 upstream.to_string(),
                 access_token.to_string(),
                 subject.to_string(),
+            ));
+            let result = self.next_result();
+            async move { result }
+        }
+
+        fn fetch_gemini(
+            &self,
+            upstream: &str,
+            user_agent: &str,
+            access_token: &str,
+            project: &str,
+        ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+            self.gemini_calls.lock().unwrap().push((
+                upstream.to_string(),
+                user_agent.to_string(),
+                access_token.to_string(),
+                project.to_string(),
             ));
             let result = self.next_result();
             async move { result }
@@ -1135,6 +1385,17 @@ mod tests {
             let result = self.relogin();
             async move { result }
         }
+
+        fn fetch_gemini(
+            &self,
+            _upstream: &str,
+            _user_agent: &str,
+            _access_token: &str,
+            _project: &str,
+        ) -> impl Future<Output = Result<UsageSnapshot, UsageError>> + Send {
+            let result = self.relogin();
+            async move { result }
+        }
     }
 
     /// B4: a 403 earned by the credential the re-login retired must not bench
@@ -1321,6 +1582,391 @@ mod tests {
         let account = pool.snapshot().accounts[0].clone();
         assert!(account.healthy, "a bad body is not an auth verdict");
         assert!(account.seven_day.is_none(), "unknown is never zero");
+    }
+
+    // ---- gemini quota source (docs/gemini/spec.md §R6) ----
+
+    /// A gemini account WITH a resolved project is read through the Cloud Code
+    /// quota catalog — with the configured upstream and user agent, the
+    /// account's own token and its project — and the default model's quota
+    /// lands on `seven_day`.
+    #[tokio::test]
+    async fn gemini_accounts_are_polled_via_the_quota_catalog() {
+        let pool = AccountPool::new(&[gemini_account("m", "proj-m")]);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(GEMINI_UPSTREAM.into(), GEMINI_USER_AGENT.into());
+
+        poller.tick(now()).await;
+
+        assert_eq!(
+            fetcher.call_count(),
+            0,
+            "a gemini account never hits the anthropic usage endpoint"
+        );
+        assert!(fetcher.grok_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            fetcher.gemini_calls.lock().unwrap().clone(),
+            vec![(
+                GEMINI_UPSTREAM.to_string(),
+                GEMINI_USER_AGENT.to_string(),
+                "at-m".to_string(),
+                "proj-m".to_string()
+            )],
+            "quota read carries the configured upstream + user agent, the token and the project"
+        );
+        let account = pool.snapshot().accounts[0].clone();
+        assert!(
+            (account.seven_day.expect("7d gauge").utilization - 0.4).abs() < 1e-9,
+            "the default model's quota fills the 7d gauge"
+        );
+        assert_eq!(poller.schedule[&id("m")].consecutive_failures, 0);
+    }
+
+    /// Without `with_gemini` the poller reads from the `GeminiConfig` defaults,
+    /// so a construction site that never wires the config still polls the
+    /// documented host rather than nothing.
+    #[tokio::test]
+    async fn gemini_quota_read_defaults_to_the_gemini_config_defaults() {
+        let pool = AccountPool::new(&[gemini_account("m", "proj-m")]);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool,
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+
+        poller.tick(now()).await;
+
+        let defaults = GeminiConfig::default();
+        let calls = fetcher.gemini_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, defaults.upstream);
+        assert_eq!(calls[0].1, defaults.user_agent);
+    }
+
+    /// An offline-imported gemini account has no project until its first
+    /// request resolves one: there is no usage source yet. The poll is a
+    /// SKIP — no call, no fabricated window, no failure on the ladder.
+    #[tokio::test]
+    async fn gemini_account_without_a_project_is_skipped_not_failed() {
+        let pool = AccountPool::new(&[gemini_account("m", "")]);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(GEMINI_UPSTREAM.into(), GEMINI_USER_AGENT.into());
+
+        poller.tick(now()).await;
+
+        assert_eq!(fetcher.call_count(), 0);
+        assert!(fetcher.grok_calls.lock().unwrap().is_empty());
+        assert!(
+            fetcher.gemini_calls.lock().unwrap().is_empty(),
+            "no project → no quota read"
+        );
+        assert_eq!(
+            poller.schedule[&id("m")].consecutive_failures,
+            0,
+            "a missing usage source is not a poll failure"
+        );
+        let account = pool.snapshot().accounts[0].clone();
+        assert!(account.seven_day.is_none(), "unknown is never zero");
+        assert!(account.five_hour.is_none(), "unknown is never zero");
+        assert!(account.healthy);
+    }
+
+    /// Self-cleaning unique temp dir (no tempfile dev-dependency).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "llmux-usage-poller-test-{}-{}",
+                std::process::id(),
+                ulid::Ulid::new()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// [`gemini_account`] whose access token is valid for another WALL-CLOCK
+    /// hour (token expiry is wall-clock; the poller's `now` is synthetic).
+    fn live_gemini_account(name: &str) -> AccountConfig {
+        let mut account = gemini_account(name, "");
+        if let AccountCredential::Gemini { expires_at_ms, .. } = &mut account.credential {
+            *expires_at_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0)
+                + 3_600_000;
+        }
+        account
+    }
+
+    /// A Cloud Code stand-in for the project lookup: every request is
+    /// answered `(status, reply)` and its `authorization` recorded.
+    async fn spawn_lookup_mock(
+        status: u16,
+        reply: &'static str,
+    ) -> (String, std::sync::Arc<Mutex<Vec<Option<String>>>>) {
+        let seen: std::sync::Arc<Mutex<Vec<Option<String>>>> = std::sync::Arc::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(move |headers: http::HeaderMap| {
+            let recorder = recorder.clone();
+            async move {
+                recorder.lock().unwrap().push(
+                    headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                );
+                (http::StatusCode::from_u16(status).unwrap(), reply)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// The pool + a config file seeded with the same live, project-less
+    /// gemini account `m`.
+    fn persisted_live_gemini(dir: &TempDir) -> (AccountPool, PathBuf) {
+        let accounts = vec![live_gemini_account("m")];
+        let path = dir.0.join("llmux.json");
+        let config = crate::config::Config {
+            accounts: accounts.clone(),
+            ..Default::default()
+        };
+        crate::config::save_path(&path, &config).expect("seed config");
+        (AccountPool::new(&accounts), path)
+    }
+
+    fn project_on_disk(path: &std::path::Path) -> String {
+        let config = crate::config::load_path(path).expect("config");
+        match &config.accounts[0].credential {
+            AccountCredential::Gemini { project_id, .. } => project_id.clone(),
+            other => panic!("expected a gemini credential, got {other:?}"),
+        }
+    }
+
+    /// An imported account whose project was never resolved (the operator
+    /// only watches usage): the poll resolves it ONCE with the account's own
+    /// token, applies + persists it, and reads the quota on it — the reading
+    /// lands (it carries the post-write fingerprint). The next poll reads the
+    /// quota straight away.
+    #[tokio::test]
+    async fn gemini_account_without_a_project_resolves_it_then_reads_quota() {
+        let (upstream, lookups) =
+            spawn_lookup_mock(200, r#"{"cloudaicompanionProject":"proj-lazy"}"#).await;
+        let dir = TempDir::new();
+        let (pool, path) = persisted_live_gemini(&dir);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4)), Ok(grok_weekly(0.5))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(upstream.clone(), GEMINI_USER_AGENT.into())
+        .with_gemini_projects(reqwest::Client::new(), Some(path.clone()));
+
+        poller.tick(now()).await;
+
+        assert_eq!(
+            lookups.lock().unwrap().clone(),
+            vec![Some("Bearer at-m".to_string())],
+            "one lookup, with the account's token"
+        );
+        assert_eq!(
+            fetcher.gemini_calls.lock().unwrap().clone(),
+            vec![(
+                upstream.clone(),
+                GEMINI_USER_AGENT.to_string(),
+                "at-m".to_string(),
+                "proj-lazy".to_string()
+            )],
+            "the quota read addresses the resolved project"
+        );
+        let account = pool.snapshot().accounts[0].clone();
+        assert!(
+            (account.seven_day.expect("7d gauge").utilization - 0.4).abs() < 1e-9,
+            "the reading landed on the resolved credential"
+        );
+        assert_eq!(poller.schedule[&id("m")].consecutive_failures, 0);
+        assert!(matches!(
+            pool.credential(&id("m")),
+            Some(AccountCredential::Gemini { project_id, .. }) if project_id == "proj-lazy"
+        ));
+        assert_eq!(project_on_disk(&path), "proj-lazy", "persisted");
+
+        poller.tick(at(NOW_SECS + 400)).await;
+        assert_eq!(lookups.lock().unwrap().len(), 1, "resolved once");
+        assert_eq!(fetcher.gemini_calls.lock().unwrap().len(), 2);
+    }
+
+    /// The startup pass holds the daemon's readiness, so it never looks a
+    /// project up: the project-less account is skipped there exactly as
+    /// before (no lookup, no quota read, no failure), and its next scheduled
+    /// poll resolves the project and reads the quota.
+    #[tokio::test]
+    async fn gemini_project_lookup_waits_for_a_scheduled_poll_never_prime() {
+        let (upstream, lookups) =
+            spawn_lookup_mock(200, r#"{"cloudaicompanionProject":"proj-lazy"}"#).await;
+        let dir = TempDir::new();
+        let (pool, path) = persisted_live_gemini(&dir);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(upstream.clone(), GEMINI_USER_AGENT.into())
+        .with_gemini_projects(reqwest::Client::new(), Some(path.clone()));
+
+        poller.prime(now()).await;
+
+        assert!(lookups.lock().unwrap().is_empty(), "prime never looks up");
+        assert!(fetcher.gemini_calls.lock().unwrap().is_empty());
+        assert_eq!(poller.schedule[&id("m")].consecutive_failures, 0);
+        assert!(pool.snapshot().accounts[0].seven_day.is_none());
+        assert_eq!(project_on_disk(&path), "");
+
+        poller.tick(at(NOW_SECS + 400)).await;
+
+        assert_eq!(
+            lookups.lock().unwrap().len(),
+            1,
+            "the scheduled poll looks up"
+        );
+        assert_eq!(
+            fetcher.gemini_calls.lock().unwrap().clone(),
+            vec![(
+                upstream,
+                GEMINI_USER_AGENT.to_string(),
+                "at-m".to_string(),
+                "proj-lazy".to_string()
+            )]
+        );
+        assert!(pool.snapshot().accounts[0].seven_day.is_some());
+        assert_eq!(project_on_disk(&path), "proj-lazy");
+    }
+
+    /// The lookup failing keeps today's skip: no quota read, no window, no
+    /// failure on the ladder (the next attempt is the next scheduled poll,
+    /// never a tight retry), no bench, nothing persisted.
+    #[tokio::test]
+    async fn gemini_project_lookup_failure_on_the_poll_is_a_skip() {
+        let (upstream, lookups) = spawn_lookup_mock(403, r#"{"error":{"code":403}}"#).await;
+        let dir = TempDir::new();
+        let (pool, path) = persisted_live_gemini(&dir);
+        let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.4))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(upstream, GEMINI_USER_AGENT.into())
+        .with_gemini_projects(reqwest::Client::new(), Some(path.clone()));
+
+        poller.tick(now()).await;
+        // Inside the poll interval: the account is not due, no second lookup.
+        poller.tick(at(NOW_SECS + 60)).await;
+
+        assert_eq!(lookups.lock().unwrap().len(), 1, "once per poll");
+        assert!(fetcher.gemini_calls.lock().unwrap().is_empty());
+        assert_eq!(poller.schedule[&id("m")].consecutive_failures, 0);
+        let account = pool.snapshot().accounts[0].clone();
+        assert!(account.seven_day.is_none(), "unknown is never zero");
+        assert!(account.healthy, "never benched");
+        assert_eq!(project_on_disk(&path), "");
+    }
+
+    /// No gemini quota status benches (spec §R6): a 403 from the quota read is
+    /// a plain poll failure that climbs the ladder and keeps the last reading.
+    /// The ToS-suspension 403 is a REQUEST-path verdict, not this read's.
+    #[tokio::test]
+    async fn gemini_quota_forbidden_is_a_poll_failure_not_an_auth_failure() {
+        let pool = AccountPool::new(&[gemini_account("m", "proj-m")]);
+        pool.record_usage(&id("m"), &grok_weekly(0.4), now());
+        let fetcher = MockFetcher::new(vec![Err(UsageError::from(GeminiUsageError::Status {
+            status: http::StatusCode::FORBIDDEN,
+        }))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_gemini(GEMINI_UPSTREAM.into(), GEMINI_USER_AGENT.into());
+
+        poller.tick(now()).await;
+
+        assert_eq!(fetcher.gemini_calls.lock().unwrap().len(), 1);
+        let account = pool.snapshot().accounts[0].clone();
+        assert!(account.healthy, "a quota read never benches");
+        assert_eq!(account.auth_failure_status, None);
+        assert_eq!(
+            poller.schedule[&id("m")].consecutive_failures,
+            1,
+            "403 climbs the backoff ladder like any other poll failure"
+        );
+        assert!(
+            (account.seven_day.expect("7d gauge retained").utilization - 0.4).abs() < 1e-9,
+            "a failed quota read never clears the last reading"
+        );
+    }
+
+    /// A status lifts into the shared status-shaped failure; every other gemini
+    /// failure keeps only the module's sanitized phrase.
+    #[test]
+    fn gemini_usage_errors_lift_like_grok_billing_errors() {
+        let status = UsageError::from(GeminiUsageError::Status {
+            status: http::StatusCode::UNAUTHORIZED,
+        });
+        assert!(matches!(
+            status,
+            UsageError::Status { status } if status == http::StatusCode::UNAUTHORIZED
+        ));
+        let malformed = UsageError::from(GeminiUsageError::Malformed);
+        assert!(matches!(malformed, UsageError::GeminiQuota(_)));
+        assert_eq!(
+            malformed.to_string(),
+            format!(
+                "gemini quota read failed: {}",
+                GeminiUsageError::Malformed.sanitized()
+            )
+        );
     }
 
     #[tokio::test]

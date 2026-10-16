@@ -69,6 +69,8 @@ targets:
       # Events DTO + pure time parsing/rendering + echo-list decoding
       # (LlmuxEvent / LlmuxEventTime / LlmuxEventList). No networking in tests.
       - path: LlmuxIslands/Llmux/LlmuxEvents.swift
+      # Foundation-only demo switches (`LLMUX_ISLANDS_DEMO_INFLIGHT` parsing).
+      - path: LlmuxIslands/Core/DemoMode.swift
       # Security policy for daemon connections (HTTPS remote, strict loopback,
       # redirect denial) plus its UserDefaults-backed configuration.
       - path: LlmuxIslands/Llmux/LlmuxClient.swift

@@ -3679,6 +3679,1146 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
 }
 
 // ---------------------------------------------------------------------------
+// 14b. Gemini provider end to end (docs/gemini/spec.md §R5/§R6, trace S1-S3,
+// S7): Claude Code (Messages) and Codex (Responses) ingress against a mock
+// Cloud Code upstream.
+// ---------------------------------------------------------------------------
+
+/// Path of the usage poller's gemini quota read: `serve` primes it BEFORE
+/// `ready`, and it lands on the same mock catch-all, so request-path
+/// assertions filter it out. Scripts are pushed only AFTER the proxy is up,
+/// so the prime never consumes a scripted response.
+const GEMINI_QUOTA_PATH: &str = "/v1internal:fetchAvailableModels";
+/// The one Cloud Code stream path every gemini request uses.
+const GEMINI_STREAM_PATH: &str = "/v1internal:streamGenerateContent";
+
+/// A gemini account: `project` empty = an offline import (resolved lazily).
+fn gemini_account(project: &str, expires_at_ms: u64) -> AccountConfig {
+    AccountConfig {
+        name: "gemini:g@example.com".to_string(),
+        credential: AccountCredential::Gemini {
+            email: "g@example.com".to_string(),
+            access_token: "at-gemini".to_string(),
+            refresh_token: "rt-gemini".to_string(),
+            expires_at_ms,
+            project_id: project.to_string(),
+            last_refresh_ms: None,
+        },
+    }
+}
+
+/// Config whose only account is `account` (gemini). EVERY upstream — the
+/// Cloud Code base, the Google token endpoint and the other providers —
+/// points at the mock, so no test ever reaches Google and a request that
+/// leaked into another provider path would be SEEN there.
+fn gemini_config_with(mock: &MockUpstream, account: AccountConfig) -> Config {
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![account],
+        ..Default::default()
+    };
+    config.openrouter.upstream = mock.base_url();
+    config.codex.upstream = mock.base_url();
+    config.grok.upstream = mock.base_url();
+    config.gemini.upstream = mock.base_url();
+    config.gemini.token_url = format!("{}/v1/oauth/token", mock.base_url());
+    // llmux ships no Google OAuth client: the operator configures one.
+    // Neutral values — the mock token endpoint never checks them.
+    config.gemini.client_id = Some("test-client-id".to_string());
+    config.gemini.client_secret = Some("test-client-secret".to_string());
+    config
+}
+
+/// The usual fixture: project known, token far from expiry.
+fn gemini_only_config(mock: &MockUpstream) -> Config {
+    gemini_config_with(mock, gemini_account("proj-1", far_future_ms()))
+}
+
+/// Requests the mock saw on the request path (the poller's quota read
+/// excluded).
+fn gemini_requests(mock: &MockUpstream) -> Vec<mock_upstream::SeenRequest> {
+    mock.seen()
+        .into_iter()
+        .filter(|r| r.path != GEMINI_QUOTA_PATH)
+        .collect()
+}
+
+/// One Cloud Code SSE event per `response` value, in the captured wire
+/// shape (`data: {"response": …, "traceId": …}`), `\n\n`-terminated.
+fn gemini_sse(responses: &[serde_json::Value]) -> String {
+    responses
+        .iter()
+        .map(|response| {
+            let event = serde_json::json!({"response": response, "traceId": "trace-e2e"});
+            format!("data: {event}\n\n")
+        })
+        .collect()
+}
+
+/// A complete one-candidate text turn.
+fn gemini_text_turn(text: &str) -> String {
+    gemini_sse(&[
+        serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}],
+            "responseId": "resp-e2e",
+        }),
+        serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": ""}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3,
+                              "thoughtsTokenCount": 2, "totalTokenCount": 14},
+            "responseId": "resp-e2e",
+        }),
+    ])
+}
+
+/// Assert the mock request is the Cloud Code stream call for `upstream_model`
+/// on `project`, sent with the Antigravity identity and `bearer`.
+fn assert_gemini_stream_call(
+    seen: &mock_upstream::SeenRequest,
+    upstream_model: &str,
+    project: &str,
+    bearer: &str,
+) -> serde_json::Value {
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, GEMINI_STREAM_PATH);
+    assert_eq!(seen.query.as_deref(), Some("alt=sse"));
+    assert_eq!(seen.authorization.as_deref(), Some(bearer));
+    assert_eq!(seen.x_api_key, None, "client x-api-key never leaks");
+    assert!(
+        seen.user_agent
+            .as_deref()
+            .is_some_and(|ua| ua.starts_with("antigravity/hub/")),
+        "Antigravity user agent: {:?}",
+        seen.user_agent
+    );
+    let body: serde_json::Value = serde_json::from_slice(&seen.body).expect("upstream json");
+    assert_eq!(body["model"], upstream_model);
+    assert_eq!(body["project"], project);
+    body
+}
+
+/// S1 (G1-G4 through the real HTTP boundary): Claude Code's `/model argon`
+/// and the `[1m]` flash id both reach Cloud Code as their resolved upstream
+/// ids, and the client gets Anthropic SSE stamped with the client-facing
+/// `[1m]` model.
+#[tokio::test]
+async fn gemini_messages_ingress_streams_text_for_alias_and_window_ids() {
+    for (model, upstream, stamp) in [
+        ("argon", "gemini-4-argon", "gemini-4-argon[1m]"),
+        (
+            "gemini-3.8-flash-high[1m]",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-high[1m]",
+        ),
+    ] {
+        let mock = MockUpstream::spawn().await;
+        let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+        mock.push(ScriptedResponse::sse_plain(
+            &gemini_text_turn("Hello from gemini"),
+            11,
+        ));
+        let client = reqwest::Client::new();
+        let body = format!(
+            r#"{{"model":"{model}","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let response = post_messages(&client, &proxy, &body).await;
+        assert_eq!(response.status(), 200, "{model}");
+        let text = response.text().await.expect("body");
+        let events = parse_anthropic_sse(&text);
+        let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "{model}: {text}"
+        );
+        assert_eq!(events[0].1["message"]["model"], stamp, "{model}");
+        assert_eq!(events[2].1["delta"]["text"], "Hello from gemini");
+        assert_eq!(events[4].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            events[4].1["usage"]["output_tokens"], 5,
+            "candidates + thoughts"
+        );
+
+        let seen = gemini_requests(&mock);
+        assert_eq!(seen.len(), 1, "{model}: exactly one upstream call");
+        let upstream_body =
+            assert_gemini_stream_call(&seen[0], upstream, "proj-1", "Bearer at-gemini");
+        assert_eq!(
+            upstream_body["request"]["contents"][0]["parts"][0]["text"], "hi",
+            "{model}"
+        );
+    }
+}
+
+/// The SSE spec allows CRLF framing (WHATWG HTML §9.2.6): a Cloud Code
+/// stream terminated `\r\n\r\n` — fragmented so a terminator splits across
+/// chunks — still streams text end to end on both client legs.
+#[tokio::test]
+async fn gemini_crlf_framed_stream_serves_text_end_to_end() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    let crlf_turn = gemini_text_turn("Hello over CRLF").replace("\n", "\r\n");
+    assert!(crlf_turn.contains("\r\n\r\n"));
+    mock.push(ScriptedResponse::sse_plain(&crlf_turn, 7));
+    mock.push(ScriptedResponse::sse_plain(&crlf_turn, 5));
+    let client = reqwest::Client::new();
+
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("body");
+    let events = parse_anthropic_sse(&text);
+    let delta = events
+        .iter()
+        .find(|(t, _)| t == "content_block_delta")
+        .map(|(_, v)| v["delta"]["text"].clone());
+    assert_eq!(delta, Some(serde_json::json!("Hello over CRLF")), "{text}");
+    assert_eq!(events.last().map(|(t, _)| t.as_str()), Some("message_stop"));
+
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let message: serde_json::Value = response.json().await.expect("aggregate json");
+    assert_eq!(
+        message["content"][0]["text"], "Hello over CRLF",
+        "{message}"
+    );
+    assert_eq!(message["usage"]["output_tokens"], 5);
+}
+
+/// POST `body` to `/v1/messages?beta=true` the way Claude Code does (its
+/// SDK-mode `User-Agent` and `x-app`, captured from Claude Code 2.1.300).
+async fn post_claude_code(
+    client: &reqwest::Client,
+    proxy: &Proxy,
+    body: &str,
+) -> reqwest::Response {
+    client
+        .post(proxy.url("/v1/messages?beta=true"))
+        .header("content-type", "application/json")
+        .header("x-api-key", "client-supplied-key")
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.300 (external, sdk-cli)")
+        .header("x-app", "cli")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("proxy reachable")
+}
+
+/// Assert `response` is llmux's local Claude Code → gemini refusal for
+/// `requested` and that the mock saw ZERO requests besides the poller's
+/// quota read (no stream call, no project lookup, no token refresh).
+async fn assert_claude_code_gemini_refused(
+    response: reqwest::Response,
+    requested: &str,
+    mock: &MockUpstream,
+) {
+    assert_eq!(response.status(), 400);
+    let error: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+    let message = error["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with(&format!("{requested}: ")), "{message}");
+    assert!(
+        message.contains("not available from Claude Code"),
+        "{message}"
+    );
+    let seen = gemini_requests(mock);
+    assert!(
+        seen.is_empty(),
+        "refused request reached the upstream: {seen:?}"
+    );
+}
+
+/// Claude Code never reaches Antigravity: a `claude-cli/` client asking for a
+/// gemini model gets a local 400 `invalid_request_error` (Claude Code does not
+/// retry a 400) and the Cloud Code mock sees ZERO requests. The same body
+/// without the Claude Code User-Agent is still served — the gate is keyed on
+/// the client, not on the model.
+#[tokio::test]
+async fn gemini_refuses_claude_code_without_an_upstream_call() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"gemini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    let response = post_claude_code(&client, &proxy, body).await;
+    assert_claude_code_gemini_refused(response, "gemini", &mock).await;
+
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("Hello from gemini"),
+        11,
+    ));
+    let response = post_messages(&client, &proxy, body).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(gemini_requests(&mock).len(), 1);
+}
+
+/// The post-lease backstop, `on_empty_group="fallback"` leg: Claude Code asks
+/// for a CLAUDE model, the claude group has no account, and the fallback scan
+/// lands on the only (gemini) account — the group the early gate saw was
+/// `claude`, so only the backstop can refuse it. A scripted turn is queued so
+/// a leak would come back 200 instead of the refusal.
+#[tokio::test]
+async fn gemini_refuses_claude_code_landing_on_gemini_via_fallback() {
+    let mock = MockUpstream::spawn().await;
+    let mut config = gemini_only_config(&mock);
+    config.routing.on_empty_group = "fallback".to_string();
+    let proxy = Proxy::spawn_config(config).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("leaked to gemini"),
+        11,
+    ));
+    let client = reqwest::Client::new();
+    let response = post_claude_code(
+        &client,
+        &proxy,
+        r#"{"model":"claude-opus-5-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_claude_code_gemini_refused(response, "claude-opus-5-5", &mock).await;
+}
+
+/// The post-lease backstop, routing-off leg: with routing disabled there is no
+/// group before the lease (legacy single-slot path), so the served group comes
+/// from the leased gemini credential and only the backstop can refuse it.
+#[tokio::test]
+async fn gemini_refuses_claude_code_landing_on_gemini_with_routing_off() {
+    let mock = MockUpstream::spawn().await;
+    let mut config = gemini_only_config(&mock);
+    config.routing.enabled = false;
+    let proxy = Proxy::spawn_config(config).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("leaked to gemini"),
+        11,
+    ));
+    let client = reqwest::Client::new();
+    let response = post_claude_code(
+        &client,
+        &proxy,
+        r#"{"model":"claude-opus-5-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_claude_code_gemini_refused(response, "claude-opus-5-5", &mock).await;
+}
+
+/// The gate is keyed on the client, not the endpoint: a `claude-cli/` client
+/// on the Responses ingress (`POST /v1/responses`, model `gemini`) is refused
+/// locally in the OpenAI error shape its client parses, with ZERO Cloud Code
+/// calls. A scripted turn is queued so a leak would come back 200. The same
+/// body from Codex (its own User-Agent, or none) is still served.
+#[tokio::test]
+async fn gemini_refuses_claude_code_on_the_responses_ingress() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("leaked to gemini"),
+        7,
+    ));
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"model": "gemini", "input": "hi", "stream": false});
+    let send = |user_agent: Option<&'static str>| {
+        let mut request = client
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&body);
+        if let Some(user_agent) = user_agent {
+            request = request.header("user-agent", user_agent);
+        }
+        request.send()
+    };
+
+    let response = send(Some("claude-cli/2.1.300 (external, sdk-cli)"))
+        .await
+        .expect("proxy reachable");
+    assert_eq!(response.status(), 400);
+    let error: serde_json::Value = response.json().await.expect("error json");
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+    let message = error["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("gemini: "), "{message}");
+    assert!(
+        message.contains("not available from Claude Code"),
+        "{message}"
+    );
+    let seen = gemini_requests(&mock);
+    assert!(
+        seen.is_empty(),
+        "refused request reached the upstream: {seen:?}"
+    );
+
+    // The queued turn is still there: Codex is served by it.
+    let response = send(Some("codex_cli_rs/0.50.0 (Mac OS 26.0.0; arm64)"))
+        .await
+        .expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    assert!(response
+        .text()
+        .await
+        .expect("body")
+        .contains("leaked to gemini"));
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("Hello from gemini"),
+        7,
+    ));
+    let response = send(None).await.expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    assert!(response
+        .text()
+        .await
+        .expect("body")
+        .contains("Hello from gemini"));
+    assert_eq!(gemini_requests(&mock).len(), 2);
+}
+
+/// S2 (G5/G7 through the relay): turn 1's streamed `functionCall` signature is
+/// cached by the relay's converter, and turn 2 replays it on the model turn —
+/// the converter and `build_request` agree on the session id.
+#[tokio::test]
+async fn gemini_tool_round_trip_replays_the_streamed_signature() {
+    const SIGNATURE: &str = "sig-e2e-0123456789";
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_sse(&[serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{
+                "thoughtSignature": SIGNATURE,
+                "functionCall": {"name": "get_weather", "args": {"city": "Seoul"}, "id": "call_7"},
+            }]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 4,
+                              "totalTokenCount": 24},
+            "responseId": "resp-tool",
+        })]),
+        13,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("Sunny, 21C"),
+        13,
+    ));
+    let client = reqwest::Client::new();
+    let tools = serde_json::json!([{"name": "get_weather", "description": "Get weather",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]);
+    let turn1 = serde_json::json!({
+        "model": "gemini", "max_tokens": 256, "stream": true, "tools": tools,
+        "messages": [{"role": "user", "content": "Weather in Seoul?"}],
+    });
+    let response = post_messages(&client, &proxy, &turn1.to_string()).await;
+    assert_eq!(response.status(), 200);
+    let events = parse_anthropic_sse(&response.text().await.expect("body"));
+    let tool_use = events
+        .iter()
+        .find(|(t, v)| t == "content_block_start" && v["content_block"]["type"] == "tool_use")
+        .map(|(_, v)| v["content_block"].clone())
+        .expect("tool_use block");
+    let client_id = tool_use["id"].as_str().expect("tool id").to_string();
+    assert!(
+        client_id.starts_with("toolu_gemini_"),
+        "minted, never Google's call id: {client_id}"
+    );
+    assert_eq!(tool_use["name"], "get_weather");
+    let stop = events
+        .iter()
+        .find(|(t, _)| t == "message_delta")
+        .map(|(_, v)| v["delta"]["stop_reason"].clone());
+    assert_eq!(stop, Some(serde_json::json!("tool_use")));
+
+    let turn2 = serde_json::json!({
+        "model": "gemini", "max_tokens": 256, "stream": true, "tools": tools,
+        "messages": [
+            {"role": "user", "content": "Weather in Seoul?"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": client_id,
+                "name": "get_weather", "input": {"city": "Seoul"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": client_id,
+                "content": "Sunny, 21C"}]},
+        ],
+    });
+    let response = post_messages(&client, &proxy, &turn2.to_string()).await;
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("body");
+    assert!(text.contains("Sunny, 21C"), "{text}");
+
+    let seen = gemini_requests(&mock);
+    assert_eq!(seen.len(), 2);
+    let first = assert_gemini_stream_call(
+        &seen[0],
+        "gemini-3.8-flash-high",
+        "proj-1",
+        "Bearer at-gemini",
+    );
+    let second = assert_gemini_stream_call(
+        &seen[1],
+        "gemini-3.8-flash-high",
+        "proj-1",
+        "Bearer at-gemini",
+    );
+    assert_eq!(
+        first["request"]["sessionId"], second["request"]["sessionId"],
+        "same conversation, same session"
+    );
+    let model_turn = &second["request"]["contents"][1];
+    assert_eq!(model_turn["role"], "model");
+    assert_eq!(
+        model_turn["parts"][0]["thoughtSignature"], SIGNATURE,
+        "the REAL streamed signature is replayed, not the dummy: {model_turn}"
+    );
+    assert_eq!(model_turn["parts"][0]["functionCall"]["id"], "call_7");
+    assert_eq!(
+        second["request"]["contents"][2]["parts"][0]["functionResponse"]["id"],
+        "call_7"
+    );
+}
+
+/// S3 / G9: Codex (`/v1/responses`) reaches the gemini adapter — Responses →
+/// Messages → Cloud Code → Messages → Responses — never the openrouter arm.
+#[tokio::test]
+async fn gemini_responses_ingress_reaches_the_gemini_adapter() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("Hello from gemini"),
+        7,
+    ));
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model": "argon", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("body");
+    assert!(text.contains("Hello from gemini"), "{text}");
+
+    let seen = gemini_requests(&mock);
+    assert_eq!(seen.len(), 1, "one upstream call: {seen:?}");
+    let body = assert_gemini_stream_call(&seen[0], "gemini-4-argon", "proj-1", "Bearer at-gemini");
+    assert_eq!(body["request"]["contents"][0]["parts"][0]["text"], "hi");
+}
+
+/// S3 + S2: Codex's two-turn tool round trip through `/v1/responses`. The
+/// conversation's FIRST user text differs from its LAST, so the session id
+/// must come from the translated Messages body `build_request` saw — not
+/// from the ingress metadata summary (last user text) — for turn 2 to find
+/// the streamed signature instead of the dummy.
+#[tokio::test]
+async fn gemini_responses_tool_round_trip_replays_the_streamed_signature() {
+    const SIGNATURE: &str = "sig-codex-0123456789";
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_sse(&[serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{
+                "thoughtSignature": SIGNATURE,
+                "functionCall": {"name": "get_weather", "args": {"city": "Seoul"}, "id": "call_7"},
+            }]}, "finishReason": "STOP"}],
+            "responseId": "resp-tool",
+        })]),
+        13,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("Sunny, 21C"),
+        13,
+    ));
+    let tools = serde_json::json!([{"type": "function", "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]);
+    let mut input = vec![
+        serde_json::json!({"role": "user", "content": "You are a weather bot."}),
+        serde_json::json!({"role": "assistant", "content": "Ready."}),
+        serde_json::json!({"role": "user", "content": "Weather in Seoul?"}),
+    ];
+    let client = reqwest::Client::new();
+    let send = |input: &Vec<serde_json::Value>| {
+        client
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&serde_json::json!({"model": "gemini", "stream": false,
+                                      "tools": tools, "input": input}))
+            .send()
+    };
+    let response = send(&input).await.expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.expect("body");
+    let turn1: serde_json::Value = serde_json::from_str(&text).expect("turn 1 json");
+    let call_id = turn1["output"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["type"] == "function_call"))
+        .and_then(|item| item["call_id"].as_str())
+        .unwrap_or_else(|| panic!("turn 1 surfaces the call: {text}"))
+        .to_string();
+    assert!(
+        call_id.starts_with("toolu_gemini_"),
+        "minted, never Google's call id: {call_id}"
+    );
+
+    input.push(
+        serde_json::json!({"type": "function_call", "call_id": call_id,
+        "name": "get_weather", "arguments": "{\"city\":\"Seoul\"}"}),
+    );
+    input.push(
+        serde_json::json!({"type": "function_call_output", "call_id": call_id,
+        "output": "Sunny, 21C"}),
+    );
+    let response = send(&input).await.expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.expect("body").contains("Sunny, 21C"));
+
+    let seen = gemini_requests(&mock);
+    assert_eq!(seen.len(), 2);
+    let second = assert_gemini_stream_call(
+        &seen[1],
+        "gemini-3.8-flash-high",
+        "proj-1",
+        "Bearer at-gemini",
+    );
+    let call_part = second["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .flat_map(|turn| turn["parts"].as_array().cloned().unwrap_or_default())
+        .find(|part| part.get("functionCall").is_some())
+        .expect("replayed functionCall part");
+    assert_eq!(
+        call_part["thoughtSignature"], SIGNATURE,
+        "the REAL streamed signature is replayed, not the dummy: {call_part}"
+    );
+    assert_eq!(
+        call_part["functionCall"]["id"], "call_7",
+        "Google's own call id goes back upstream: {call_part}"
+    );
+}
+
+/// A Claude-Code-shaped gemini turn: an output cap, a thinking config, a
+/// prior signed `thinking` block, and a server tool (no `input_schema`) next
+/// to a real one — each something the gemini translator leaves out.
+fn gemini_lossy_request(stream: bool) -> String {
+    serde_json::json!({
+        "model": "gemini",
+        "max_tokens": 32000,
+        "stream": stream,
+        "thinking": {"type": "enabled", "budget_tokens": 16000},
+        "tools": [
+            {"name": "get_weather", "input_schema": {"type": "object"}},
+            {"type": "web_search_20250305", "name": "web_search"},
+        ],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "sig-anthropic"},
+                {"type": "text", "text": "hello"},
+            ]},
+            {"role": "user", "content": "again"},
+        ],
+    })
+    .to_string()
+}
+
+/// Compatibility parity with codex/grok: a gemini request reports what the
+/// translator left out in the same two headers, on both client legs.
+#[tokio::test]
+async fn gemini_compat_reports_omitted_fields_in_headers() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(&gemini_text_turn("ok"), 11));
+    mock.push(ScriptedResponse::sse_plain(&gemini_text_turn("ok"), 11));
+    let client = reqwest::Client::new();
+    let expected: Vec<String> = ["max_tokens", "server_tools", "thinking", "thinking_config"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for stream in [true, false] {
+        let response = post_compat(&client, &proxy, &gemini_lossy_request(stream), None).await;
+        assert_eq!(response.status(), 200, "stream={stream}: compat serves it");
+        assert_eq!(
+            header_list(&response, "x-llmux-omitted-fields"),
+            expected,
+            "stream={stream}"
+        );
+        assert_eq!(
+            header_list(&response, "x-llmux-compatibility-warnings"),
+            expected,
+            "stream={stream}"
+        );
+    }
+    let streams: Vec<_> = gemini_requests(&mock)
+        .into_iter()
+        .filter(|r| r.path == GEMINI_STREAM_PATH)
+        .collect();
+    assert_eq!(streams.len(), 2);
+}
+
+/// `X-Llmux-Compatibility: strict` refuses the lossy gemini request locally:
+/// the same 400 shape codex answers, before any upstream call (and before
+/// any refresh or project lookup).
+#[tokio::test]
+async fn gemini_strict_mode_refuses_a_lossy_request_without_upstream() {
+    let mock = MockUpstream::spawn().await;
+    // Expired token, no project: anything past the gate would refresh and
+    // look the project up. The startup background refresh is switched off
+    // so `token_hits` measures the request path alone.
+    let mut config = gemini_config_with(&mock, gemini_account("", 0));
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let response = post_compat(&client, &proxy, &gemini_lossy_request(true), Some("strict")).await;
+    assert_eq!(response.status(), 400);
+    let error: serde_json::Value = response.json().await.expect("json error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "gemini cannot serve this request without loss: \
+         max_tokens, server_tools, thinking, thinking_config"
+    );
+    // A body the translator refuses is a 400 at the same gate — also before
+    // the (expired-token) refresh and the (empty) project lookup.
+    let response = post_compat(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}"#,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let error: serde_json::Value = response.json().await.expect("json error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("messages[0].content[0].source.type")),
+        "{error}"
+    );
+    assert!(
+        gemini_requests(&mock).is_empty(),
+        "no upstream call: {:?}",
+        gemini_requests(&mock)
+    );
+    assert_eq!(mock.token_hits(), 0, "no refresh");
+}
+
+/// A faithful gemini request (nothing left out) carries neither header, in
+/// compat or strict mode.
+#[tokio::test]
+async fn gemini_faithful_request_carries_no_compatibility_headers() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::sse_plain(&gemini_text_turn("ok"), 11));
+    mock.push(ScriptedResponse::sse_plain(&gemini_text_turn("ok"), 11));
+    let client = reqwest::Client::new();
+    let faithful = r#"{"model":"gemini","stream":true,"temperature":0.2,"messages":[{"role":"user","content":"hi"}]}"#;
+    for mode in [None, Some("strict")] {
+        let response = post_compat(&client, &proxy, faithful, mode).await;
+        assert_eq!(response.status(), 200, "{mode:?}");
+        assert!(
+            response.headers().get("x-llmux-omitted-fields").is_none()
+                && response
+                    .headers()
+                    .get("x-llmux-compatibility-warnings")
+                    .is_none(),
+            "{mode:?}: {:?}",
+            response.headers()
+        );
+    }
+}
+
+/// S1 step 6: a Plus account asking for Argon gets 404 NOT_FOUND from Cloud
+/// Code. The client sees an Anthropic error with the upstream status naming
+/// `gemini upstream`, and the account is NOT benched (a model gate is not an
+/// account fault).
+#[tokio::test]
+async fn gemini_404_surfaces_as_anthropic_error_without_benching() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 404,
+        body: r#"{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#
+            .to_string(),
+    });
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"argon","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 404);
+    let error: serde_json::Value = response.json().await.expect("json error");
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    let message = error["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("gemini upstream: ") && message.contains("NOT_FOUND"),
+        "{message}"
+    );
+    assert_eq!(gemini_requests(&mock).len(), 1);
+    assert!(
+        proxy.pool.snapshot().accounts[0].healthy,
+        "404 never benches"
+    );
+}
+
+/// S1 step 4 + S5 (G8 through the relay): an imported account — no project,
+/// token about to expire — refreshes first, then resolves its project with
+/// ONE `loadCodeAssist` (carrying the refreshed token), persists it, and the
+/// request goes out on that project.
+#[tokio::test]
+async fn gemini_empty_project_refreshes_then_resolves_and_persists_once() {
+    let mock = MockUpstream::spawn().await;
+    let mut config = gemini_config_with(&mock, gemini_account("", epoch_ms_now() + 60_000));
+    // Request-time refresh only: the startup background-refresh tick would
+    // otherwise race the request for the same expiring token (both paths
+    // converge, but the test pins the request path's ordering).
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
+    mock.push(ScriptedResponse::ok(
+        r#"{"cloudaicompanionProject":"proj-lazy","currentTier":{"id":"standard-tier"}}"#,
+    ));
+    mock.push(ScriptedResponse::sse_plain(&gemini_text_turn("ok"), 9));
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.expect("body").contains("ok"));
+
+    assert_eq!(
+        mock.token_hits(),
+        1,
+        "the expiring token was refreshed once"
+    );
+    let seen = gemini_requests(&mock);
+    let lookups: Vec<_> = seen
+        .iter()
+        .filter(|r| r.path == "/v1internal:loadCodeAssist")
+        .collect();
+    assert_eq!(lookups.len(), 1, "exactly one project lookup: {seen:?}");
+    assert_eq!(
+        lookups[0].authorization.as_deref(),
+        Some("Bearer at-refreshed"),
+        "the lookup runs AFTER the refresh"
+    );
+    let streams: Vec<_> = seen
+        .iter()
+        .filter(|r| r.path == GEMINI_STREAM_PATH)
+        .collect();
+    assert_eq!(streams.len(), 1);
+    assert_gemini_stream_call(
+        streams[0],
+        "gemini-3.8-flash-high",
+        "proj-lazy",
+        "Bearer at-refreshed",
+    );
+
+    // Persisted: the next daemon start does not look it up again.
+    let on_disk = config::load_path(&proxy.config_path).expect("config");
+    match &on_disk.accounts[0].credential {
+        AccountCredential::Gemini {
+            project_id,
+            access_token,
+            email,
+            ..
+        } => {
+            assert_eq!(project_id, "proj-lazy");
+            assert_eq!(access_token, MockUpstream::REFRESHED_ACCESS_TOKEN);
+            assert_eq!(email, "g@example.com", "identity survives");
+        }
+        other => panic!("expected a gemini credential, got {other:?}"),
+    }
+}
+
+/// A gemini 401 gets ONE forced refresh and a retry (Google access tokens
+/// live ~1h), instead of a sticky bench until re-login.
+#[tokio::test]
+async fn gemini_401_refreshes_once_and_retries() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::AuthRejected);
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("refreshed"),
+        9,
+    ));
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.expect("body").contains("refreshed"));
+    assert_eq!(mock.token_hits(), 1, "exactly one forced refresh");
+    let streams: Vec<_> = gemini_requests(&mock)
+        .into_iter()
+        .filter(|r| r.path == GEMINI_STREAM_PATH)
+        .collect();
+    assert_eq!(streams.len(), 2);
+    assert_eq!(
+        streams[0].authorization.as_deref(),
+        Some("Bearer at-gemini")
+    );
+    assert_eq!(
+        streams[1].authorization.as_deref(),
+        Some("Bearer at-refreshed"),
+        "the retry carries the refreshed token"
+    );
+    assert!(proxy.pool.snapshot().accounts[0].healthy);
+    let on_disk = config::load_path(&proxy.config_path).expect("config");
+    match &on_disk.accounts[0].credential {
+        AccountCredential::Gemini {
+            access_token,
+            project_id,
+            email,
+            ..
+        } => {
+            assert_eq!(access_token, MockUpstream::REFRESHED_ACCESS_TOKEN);
+            assert_eq!(project_id, "proj-1", "project survives a refresh");
+            assert_eq!(email, "g@example.com", "identity survives a refresh");
+        }
+        other => panic!("expected a gemini credential, got {other:?}"),
+    }
+}
+
+/// Background refresh: a gemini token with ~1h left sits inside the 7h
+/// window but outside the gemini one (20 min), so the anthropic account that
+/// IS due gets the pass instead of being starved by the shorter-lived token.
+#[tokio::test]
+async fn background_refresh_gemini_window_does_not_starve_other_accounts() {
+    let mock = MockUpstream::spawn().await;
+    let now = epoch_ms_now();
+    let mut config = gemini_config_with(&mock, gemini_account("proj-1", now + 3_600_000));
+    config
+        .accounts
+        .push(oauth_account_expiring("a", "at-old", now + 3 * 3_600_000));
+    let proxy = Proxy::spawn_config(config).await;
+
+    let mut refreshed = false;
+    for _ in 0..200 {
+        let on_disk = config::load_path(&proxy.config_path).expect("config");
+        if matches!(
+            &on_disk.accounts[1].credential,
+            AccountCredential::Oauth { access_token, .. }
+                if access_token == MockUpstream::REFRESHED_ACCESS_TOKEN
+        ) {
+            refreshed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refreshed, "the anthropic account got the background pass");
+    assert_eq!(mock.token_hits(), 1, "one refresh per pass");
+    let on_disk = config::load_path(&proxy.config_path).expect("config");
+    match &on_disk.accounts[0].credential {
+        AccountCredential::Gemini { access_token, .. } => {
+            assert_eq!(access_token, "at-gemini", "gemini outside its window");
+        }
+        other => panic!("expected a gemini credential, got {other:?}"),
+    }
+}
+
+/// The project lookup failing is a 502 naming the step, never a bench; a
+/// count_tokens request (local estimate) never triggers the lookup.
+#[tokio::test]
+async fn gemini_project_lookup_failure_is_502_naming_the_step() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_config_with(
+        &mock,
+        gemini_account("", far_future_ms()),
+    ))
+    .await;
+    // count_tokens is a local estimate: no project lookup for it.
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gemini","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(response.status(), 200);
+    assert!(
+        gemini_requests(&mock).is_empty(),
+        "count_tokens never looks the project up"
+    );
+    mock.push(ScriptedResponse::ClientError {
+        status: 403,
+        body: r#"{"error":{"code":403,"message":"denied","status":"PERMISSION_DENIED"}}"#
+            .to_string(),
+    });
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 502);
+    let error: serde_json::Value = response.json().await.expect("json error");
+    assert_eq!(
+        error["error"]["message"],
+        "gemini project lookup (loadCodeAssist) failed: 403 Forbidden"
+    );
+    let seen = gemini_requests(&mock);
+    assert!(
+        seen.iter().all(|r| r.path != GEMINI_STREAM_PATH),
+        "no stream call without a project: {seen:?}"
+    );
+    assert!(proxy.pool.snapshot().accounts[0].healthy, "never benched");
+}
+
+/// S7.1 (G13): a 429 whose wait is stated ONLY in `RetryInfo.retryDelay`
+/// (no `retry-after` header, no "after Ns" text) waits that long on the same
+/// account — rounded up to 1s — and the retry is served. Without the body
+/// parse this would take the no-retry-after path (8s heuristic park).
+#[tokio::test]
+async fn gemini_429_retry_info_waits_the_stated_delay_then_serves() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 429,
+        body: serde_json::json!({"error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Resource has been exhausted.",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0.2s"},
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason": "RATE_LIMIT_EXCEEDED", "domain": "cloudcode-pa.googleapis.com"},
+            ],
+        }})
+        .to_string(),
+    });
+    mock.push(ScriptedResponse::sse_plain(
+        &gemini_text_turn("after wait"),
+        9,
+    ));
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.expect("body").contains("after wait"));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "0.2s rounds UP to a 1s wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the stated delay, not the 8s heuristic park: {elapsed:?}"
+    );
+    let streams: Vec<_> = gemini_requests(&mock)
+        .into_iter()
+        .filter(|r| r.path == GEMINI_STREAM_PATH)
+        .collect();
+    assert_eq!(streams.len(), 2, "429, then the served retry");
+}
+
+/// S7.2 (G13b): QUOTA_EXHAUSTED with no delay parks the account ~1h
+/// (estimated); with no other gemini account the client is told to come
+/// back in about an hour.
+#[tokio::test]
+async fn gemini_429_quota_exhausted_parks_an_estimated_hour() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    mock.push(ScriptedResponse::ClientError {
+        status: 429,
+        body: serde_json::json!({"error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Resource has been exhausted.",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                         "reason": "QUOTA_EXHAUSTED", "domain": "cloudcode-pa.googleapis.com"}],
+        }})
+        .to_string(),
+    });
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"gemini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 429);
+    let retry_after: u64 = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("retry-after header");
+    assert!(
+        (3_500..=3_600).contains(&retry_after),
+        "estimated ~1h park: {retry_after}"
+    );
+    let streams: Vec<_> = gemini_requests(&mock)
+        .into_iter()
+        .filter(|r| r.path == GEMINI_STREAM_PATH)
+        .collect();
+    assert_eq!(streams.len(), 1, "parked, not retried");
+}
+
+/// S7.3 (G14): a 403 naming the Terms of Service benches the account; the
+/// client still gets the wrapped upstream error. A plain 403 does not bench.
+#[tokio::test]
+async fn gemini_403_tos_benches_but_plain_403_does_not() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
+    let client = reqwest::Client::new();
+    let body = r#"{"model":"gemini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    mock.push(ScriptedResponse::ClientError {
+        status: 403,
+        body: r#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#
+            .to_string(),
+    });
+    let response = post_messages(&client, &proxy, body).await;
+    assert_eq!(response.status(), 403);
+    assert!(
+        proxy.pool.snapshot().accounts[0].healthy,
+        "a plain 403 is a relayed error, not a bench"
+    );
+
+    mock.push(ScriptedResponse::ClientError {
+        status: 403,
+        body: r#"{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service.","status":"PERMISSION_DENIED"}}"#
+            .to_string(),
+    });
+    let response = post_messages(&client, &proxy, body).await;
+    assert_eq!(response.status(), 403);
+    let error: serde_json::Value = response.json().await.expect("json error");
+    let message = error["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("gemini upstream: ") && message.contains("Terms of Service"),
+        "{message}"
+    );
+    assert!(
+        !proxy.pool.snapshot().accounts[0].healthy,
+        "a ToS suspension benches the account"
+    );
+    let account = status_account(&proxy, "gemini:g@example.com").await;
+    assert_eq!(account["status"], "auth_failed", "{account}");
+    assert_eq!(account["auth_failure_status"], 403, "{account}");
+}
+
+// ---------------------------------------------------------------------------
 // 15. Responses compatibility policy (codex + grok)
 // ---------------------------------------------------------------------------
 //

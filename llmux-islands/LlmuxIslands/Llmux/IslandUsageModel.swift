@@ -34,6 +34,7 @@ final class IslandUsageModel: ObservableObject {
     @Published var claudeInFlight: Int = DemoMode.forcedInFlight?.claude ?? 0
     @Published var codexInFlight: Int = DemoMode.forcedInFlight?.codex ?? 0
     @Published var grokInFlight: Int = DemoMode.forcedInFlight?.grok ?? 0
+    @Published var geminiInFlight: Int = DemoMode.forcedInFlight?.gemini ?? 0
 
     // Dashboard analytics (issue #62 S3): published for the analytics UI
     // (Phase 2). A status-only daemon retains the last Rust-accepted analytics
@@ -77,7 +78,7 @@ final class IslandUsageModel: ObservableObject {
     }
 
     struct LoginFlow: Equatable {
-        var provider: String       // "claude" | "codex" | "grok"
+        var provider: String       // "claude" | "codex" | "grok" | "gemini"
         var phase: String          // "starting" | "pending" | "done" | "error"
         var message: String?
         var state: String?
@@ -215,6 +216,7 @@ final class IslandUsageModel: ObservableObject {
         claudeInFlight = DemoMode.forcedInFlight?.claude ?? Int(state.usage.providerInFlight["claude"] ?? 0)
         codexInFlight = DemoMode.forcedInFlight?.codex ?? Int(state.usage.providerInFlight["codex"] ?? 0)
         grokInFlight = DemoMode.forcedInFlight?.grok ?? Int(state.usage.providerInFlight["grok"] ?? 0)
+        geminiInFlight = DemoMode.forcedInFlight?.gemini ?? Int(state.usage.providerInFlight["gemini"] ?? 0)
         healthWarningCount = state.healthWarningCount
         let dash = state.dashboardProjection
         dashboard = dash

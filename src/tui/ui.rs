@@ -473,6 +473,7 @@ fn draw_main(
 /// group's live settings; clicking a highlighted segment ROTATES that
 /// setting (scheduler mode, codex model / effort / fast, grok effort).
 /// Effort `bypass` = the client's own value rides through (UI-3 U12).
+/// Claude and gemini have no live settings, so they show an account count.
 fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
     if area.height == 0 {
         return Vec::new();
@@ -586,6 +587,17 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
             view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
             SettingAction::GrokEffort,
         );
+    }
+    let gemini_n = count(BackendGroup::Gemini);
+    if gemini_n > 0 {
+        sep(&mut spans, &mut x);
+        push_plain(
+            &mut spans,
+            &mut x,
+            "gemini ".into(),
+            group_color(Some("gemini")).add_modifier(Modifier::BOLD),
+        );
+        push_plain(&mut spans, &mut x, format!("{gemini_n} acc"), dim());
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     hits
@@ -2604,7 +2616,9 @@ impl ConfigAction {
             }
             ConfigAction::UsageMaxAge => Some("seconds 5-3600"),
             ConfigAction::GradientSpeed => Some("0.01-10.0"),
-            ConfigAction::RoutingDefaultGroup => Some("claude | codex | grok"),
+            ConfigAction::RoutingDefaultGroup => {
+                Some("claude | codex | grok | openrouter | gemini")
+            }
             ConfigAction::RoutingOnEmptyGroup => Some("error | fallback"),
             ConfigAction::RawIoRetention => Some("days 0-3650 (0 = keep forever)"),
             ConfigAction::RawIoMaxBody | ConfigAction::ProxyMaxBody => Some("bytes"),
@@ -2783,6 +2797,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             value: "config file".into(),
             state: CfgState::ReadOnly,
             note: "openrouter.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
+            section: "gemini",
+            label: "upstream / model / user agent / token url / oauth client / trace",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "gemini.* plumbing in config",
             action: None,
         },
         CfgRow {
@@ -6569,6 +6591,7 @@ fn draw_activity(
                 Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
                 Some(BackendGroup::Grok) => (anim::block_spin(anim_frame), Color::Yellow),
                 Some(BackendGroup::OpenRouter) => (anim::block_spin(anim_frame), Color::Green),
+                Some(BackendGroup::Gemini) => (anim::block_spin(anim_frame), Color::LightBlue),
                 None => (anim::braille_spin(anim_frame), Color::DarkGray),
             };
             let mut spans = vec![
@@ -7439,14 +7462,15 @@ fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
-/// Color a backend-group label: codex = cyan, claude = magenta, unknown = gray.
-/// Shared by the account table (req5) and the activity log (req7) so the group
-/// reads the same everywhere.
+/// Color a backend-group label: codex = cyan, claude = magenta, grok =
+/// yellow, gemini = light blue, unknown = gray. Shared by the account table
+/// (req5) and the activity log (req7) so the group reads the same everywhere.
 fn group_color(group: Option<&str>) -> Style {
     match group {
         Some("codex") => Style::new().fg(Color::Cyan),
         Some("claude") => Style::new().fg(Color::Magenta),
         Some("grok") => Style::new().fg(Color::Yellow),
+        Some("gemini") => Style::new().fg(Color::LightBlue),
         _ => dim(),
     }
 }
@@ -12864,6 +12888,50 @@ mod tests {
     }
 
     #[test]
+    fn group_settings_bar_counts_gemini_accounts_only_when_present() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let gemini = AccountSnapshot {
+            id: AccountId("gemini:g@x.com".into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: "gemini",
+            group: BackendGroup::Gemini,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let bar_row = |text: &str| {
+            text.lines()
+                .find(|line| line.contains("sched"))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let mut view = view_with(Vec::new());
+        let without = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(
+            !bar_row(&without).contains("gemini"),
+            "no gemini account, no gemini segment:\n{without}"
+        );
+
+        view.snapshot.accounts = vec![gemini];
+        let with = render(&view, &chrome_overlay(Overlay::None), 200, 40);
+        assert!(
+            bar_row(&with).contains("gemini 1 acc"),
+            "gemini shows its account count like claude:\n{with}"
+        );
+    }
+
+    #[test]
     fn context_menu_renders_from_pinned_identity_not_row_occupant() {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
@@ -13018,6 +13086,9 @@ mod tests {
         config.codex.reasoning_effort = Some("high".into());
         config.grok.reasoning_effort = Some("high".into());
         config.grok.client_model = Some("grok-4".into());
+        config.gemini.client_model = Some("gemini-3.8-flash-high".into());
+        config.gemini.client_id = Some("test-client-id".into());
+        config.gemini.client_secret = Some("test-client-secret".into());
         config.tui_gradient.max_effort = Some("#ffffff".into());
         config.remote.host = Some("example.com".into());
         config.remote.port = Some(3456);
@@ -13072,6 +13143,7 @@ mod tests {
                 codex,
                 grok,
                 openrouter,
+                gemini,
                 scheduler,
                 routing,
                 claude_code,
@@ -13133,6 +13205,16 @@ mod tests {
                 upstream: _,
                 default_model: _,
             } = openrouter;
+            let crate::config::GeminiConfig {
+                upstream: _,
+                default_model: _,
+                client_model: _,
+                user_agent: _,
+                token_url: _,
+                client_id: _,
+                client_secret: _,
+                trace: _,
+            } = gemini;
             let crate::config::SchedulerConfig {
                 five_hour_max: _,
                 seven_day_max: _,
@@ -13148,6 +13230,7 @@ mod tests {
                 codex_models: _,
                 grok_models: _,
                 openrouter_models: _,
+                gemini_models: _,
                 default_group: _,
                 on_empty_group: _,
             } = routing;
@@ -13205,6 +13288,14 @@ mod tests {
             "grok.trace",
             "openrouter.upstream",
             "openrouter.default_model",
+            "gemini.upstream",
+            "gemini.default_model",
+            "gemini.client_model",
+            "gemini.user_agent",
+            "gemini.token_url",
+            "gemini.client_id",
+            "gemini.client_secret",
+            "gemini.trace",
             "scheduler.mode",
             "scheduler.five_hour_max",
             "scheduler.seven_day_max",
@@ -13221,6 +13312,7 @@ mod tests {
             "routing.codex_models",
             "routing.grok_models",
             "routing.openrouter_models",
+            "routing.gemini_models",
             "routing.default_group",
             "routing.on_empty_group",
             "raw_io.enabled",

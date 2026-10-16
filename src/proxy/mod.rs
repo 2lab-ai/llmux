@@ -5,6 +5,7 @@ pub mod auto_classifier;
 pub mod classify;
 pub mod codex_trace;
 pub mod forward;
+pub(crate) mod gemini_project;
 pub mod idle_probe;
 pub mod internal_requests;
 pub mod keys;

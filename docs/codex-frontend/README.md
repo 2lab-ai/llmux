@@ -36,7 +36,7 @@ variable. A remote daemon needs a configured `remote.api_key` or client key.
 The `/model` picker uses llmux's catalog, effort menus and context windows. Native
 Codex coding instructions are reused from the local Codex model cache when present;
 a self-contained coding prompt is used otherwise. Claude models use direct client
-tools. Catalog aliases such as `opus`, `haiku`, `sol` and `astra` also work with `-m`.
+tools. Catalog aliases such as `opus`, `haiku`, `sol`, `astra`, `gemini` and `argon` also work with `-m`.
 `--no-model-picker` skips the catalog fetch/injection; an explicit
 `-c model_catalog_json=...` keeps the user's catalog. User model/config options
 follow the injected defaults and win.
@@ -50,10 +50,15 @@ hooks and unrelated inherited credentials disabled. SDK-owned web search runs
 inside the SDK when the caller enables server web search. SDK identity and
 continuation reminders are additional to the caller's conversation.
 
-Grok and OpenRouter models use Responses-to-Messages conversion followed by their
+Grok, OpenRouter and Gemini models use Responses-to-Messages conversion followed by their
 existing provider adapters; they do not use the Claude SDK. These are bounded
 translated paths, not full native Responses parity. The installed native-Codex/Claude
-release smoke receipts do not establish live Grok/OpenRouter parity. See the
+release smoke receipts do not establish live Grok/OpenRouter/Gemini parity. Gemini rows
+have an empty effort menu (the thinking level is the `-high` / `-medium` / `-low` id),
+and the Gemini adapter replays each tool call's thought signature on the next turn.
+Known limit: a Responses request served by Gemini carries no compatibility headers, and
+`X-Llmux-Compatibility: strict` does not refuse it, although `max_output_tokens`, a
+structured `text.format` and web_search tools are left out on that path. See the
 [frontend transport matrix](../provider-compatibility.md#frontend-transport-matrix).
 
 Claude's SDK cannot enforce `parallel_tool_calls:false`, non-auto/non-none

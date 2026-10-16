@@ -528,6 +528,26 @@ async fn add_account_false_is_a_verified_no_change() {
 }
 
 #[tokio::test]
+async fn gemini_login_start_posts_the_gemini_provider() {
+    // Gemini signs in through a browser OAuth flow on the daemon; the client
+    // only has to name the provider and accept the daemon's echo.
+    let (address, seen) = spawn_mock(MockMode::Normal).await;
+    let client = remote_client(address, Duration::from_secs(1));
+
+    let start = client
+        .start_login(Provider::Gemini)
+        .await
+        .expect("gemini login start");
+
+    assert_eq!(start.state, "daemon-state-1");
+    let requests = seen.lock().expect("seen lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+    assert_eq!(requests[0].uri, "/llmux/login/start");
+    assert_eq!(requests[0].body, json!({ "provider": "gemini" }));
+}
+
+#[tokio::test]
 async fn transient_login_poll_failures_remain_pending_for_bounded_platform_retry() {
     let (address, _) = spawn_mock(MockMode::TransientLoginFailure).await;
     let client = remote_client(address, Duration::from_secs(1));

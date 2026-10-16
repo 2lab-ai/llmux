@@ -182,6 +182,30 @@ fn schema_rejects_missing_statistics_platform_and_about_contract_fields() {
         .any(|error| error.contains("missing required key reason")));
 }
 
+#[test]
+fn gemini_account_and_receipt_providers_validate_against_the_checked_in_schema() {
+    let schema: Value = serde_json::from_str(include_str!("../contract/ui-contract.schema.json"))
+        .expect("schema JSON");
+    let mut doc: DashboardDoc =
+        serde_json::from_str(include_str!("../fixtures/dashboard-current.json")).expect("fixture");
+    doc.accounts[1].kind = "gemini".into();
+    doc.activity.in_flight[0].group = Some("gemini".into());
+    let state = serde_json::to_value(derive_ui_state(
+        &doc,
+        &DeriveOptions::default(),
+        1_700_000_003_000,
+    ))
+    .expect("UiState must serialize");
+
+    assert_eq!(state["usage"]["accounts"][1]["provider"], "gemini");
+    assert_eq!(
+        state["statistics"]["activity_receipts"][0]["provider"],
+        "gemini"
+    );
+    let errors = schema_errors(&schema, &state);
+    assert!(errors.is_empty(), "schema errors:\n{}", errors.join("\n"));
+}
+
 fn schema_errors(schema: &Value, state: &Value) -> Vec<String> {
     let mut errors = Vec::new();
     validate(schema, schema, state, "$", &mut errors);

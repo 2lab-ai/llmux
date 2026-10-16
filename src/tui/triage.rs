@@ -9,7 +9,7 @@
 //!    poller-stale / auth-broken, then 429·5xx storm, then exhausted, then
 //!    healthy.
 //! 2. [`display_order`] — the accounts table in backend-group blocks (Claude,
-//!    Codex, Grok, OpenRouter), ordered within a block by [`AccountSort`]:
+//!    Codex, Grok, OpenRouter, Gemini), ordered within a block by [`AccountSort`]:
 //!    account name in natural order ([`natural_key`], the default) or the
 //!    scheduler's own next-pick order. in-flight
 //!    is deliberately NOT a sort key anywhere (it toggles per request and
@@ -348,7 +348,7 @@ pub(crate) fn natural_key(name: &str) -> Vec<NatChunk> {
 }
 
 /// THE display order: indices into `snapshot.accounts` in backend-group blocks
-/// ([`BackendGroup::ALL`] — Claude, Codex, Grok, OpenRouter) as the primary
+/// ([`BackendGroup::ALL`] — Claude, Codex, Grok, OpenRouter, Gemini) as the primary
 /// key in both modes, ordered within each block by `sort`. The old
 /// intervention order is retired (it reshuffled rows as usage moved); the `!`
 /// urgency marker ([`urgent`]) carries the "act on this" signal instead.
@@ -566,6 +566,7 @@ mod tests {
             BackendGroup::Codex => "codex",
             BackendGroup::Grok => "grok",
             BackendGroup::OpenRouter => "openrouter",
+            BackendGroup::Gemini => "gemini",
         };
         a.group = group;
         a
@@ -629,9 +630,10 @@ mod tests {
     // ---- display order ----
 
     #[test]
-    fn display_order_groups_claude_codex_grok_openrouter() {
+    fn display_order_groups_claude_codex_grok_openrouter_gemini() {
         // Registration order deliberately interleaves the groups.
         let snapshot = pool(vec![
+            grouped("gm-1", BackendGroup::Gemini),
             grouped("or-1", BackendGroup::OpenRouter),
             grouped("cx-1", BackendGroup::Codex),
             grouped("cl-1", BackendGroup::Claude),
@@ -655,6 +657,7 @@ mod tests {
                     BackendGroup::Codex,
                     BackendGroup::Grok,
                     BackendGroup::OpenRouter,
+                    BackendGroup::Gemini,
                 ],
                 "{sort:?} blocks: {ids:?}"
             );

@@ -473,6 +473,7 @@ impl ControllerModel {
             Some("claude") => Provider::Claude,
             Some("codex") => Provider::Codex,
             Some("grok") => Provider::Grok,
+            Some("gemini") => Provider::Gemini,
             _ => return DispatchOutcome::error("invalid login provider"),
         };
         let operation_id = self.operation_id("login", payload);

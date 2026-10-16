@@ -3,12 +3,14 @@
 llmux exposes the **known** models — a curated set plus the live grok and
 openrouter pins — as a machine-readable catalog. This is deliberately not an
 exhaustive list of everything routable: at request time the grok provider
-forwards ANY `grok-*` id verbatim and the openrouter provider forwards any
-`or-<vendor>/<slug>` verbatim (see [alias semantics](#alias-semantics)), so a
+forwards ANY `grok-*` id verbatim, the openrouter provider forwards any
+`or-<vendor>/<slug>` verbatim and the gemini provider forwards any `gemini-*`
+id verbatim (see [alias semantics](#alias-semantics)), so a
 request or config pin naming an id outside the curated set still works. Such an
 out-of-catalog pin appears here as a **synthesized row** with null metadata (see
 [out-of-catalog grok pin](#out-of-catalog-grok-pin) and
-[out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)).
+[out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)). Gemini has no
+pin, so it never synthesizes a row: its aliases are static (see [Gemini](#gemini)).
 
 ## Endpoints
 
@@ -39,7 +41,7 @@ Each element of `models` is a `ModelEntry`:
 | `name`        | string              | Human-facing display name.                                    |
 | `efforts`     | array of strings    | Accepted `reasoning.effort` values, low→high (may be empty).  |
 | `max_context` | integer or `null`   | Context window in tokens; `null` when unpublished.            |
-| `group`       | string              | Backend group: `claude`, `codex`, `grok`, or `openrouter`.    |
+| `group`       | string              | Backend group: `claude`, `codex`, `grok`, `openrouter`, or `gemini`. |
 
 `max_context: null` means the context window is not published for that id —
 not that it is zero.
@@ -154,6 +156,21 @@ not that it is zero.
 
   Matching is trimmed and case-insensitive, and one trailing `[1m]` is stripped
   first, exactly as on the claude and codex paths.
+- **gemini aliases** — static, not a pin: `gemini` and `gemini-3.8-flash`
+  resolve to `gemini-3.8-flash-high[1m]`, and `argon` to `gemini-4-argon[1m]`
+  (the `GEMINI_MODELS` const in `src/catalog.rs`). Unlike `grok` and `or`, no
+  config key moves them: `gemini.default_model` only names the model used when a
+  non-gemini name (or a request that names no model) lands on the gemini group. One
+  trailing `[1m]` is stripped (case-insensitively) before the request leaves
+  llmux, so `-m gemini` and `-m gemini-3.8-flash-high[1m]` both reach the
+  backend as `gemini-3.8-flash-high`, and `-m argon` as `gemini-4-argon`. Any
+  other `gemini-*` id passes through verbatim. Claude Code is the exception:
+  its request is refused locally (see [Gemini](#gemini)). The
+  thinking level is part of the id, so every gemini name ignores the client's
+  effort, with one exception: a bare `gemini-3.8-flash` sent by the client
+  picks its variant from `output_config.effort` (`none` / `minimal` / `low` →
+  `-low`, `medium` → `-medium`, anything else or no effort → `-high`). Source:
+  [`gemini/spec.md`](gemini/spec.md) §R3.
 - **alias stability** — aliases float to the current generation, ids do not.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
@@ -244,6 +261,14 @@ model it does not curate.
 | or-north-mini-code  | —            | Cohere North Mini Code (free) | —                          | 256000      | openrouter |
 | or-gemma-4-31b      | —            | Google Gemma 4 31B (free) | —                              | 262144      | openrouter |
 | or-gpt-oss-20b      | —            | OpenAI gpt-oss-20b (free) | low, medium, high              | 131072      | openrouter |
+| gemini-3.8-flash-high[1m] | gemini, gemini-3.8-flash | Gemini 3.8 Flash (High) [1M] | — | 1048576  | gemini |
+| gemini-3.8-flash-high | —          | Gemini 3.8 Flash (High) | —                                | 1048576     | gemini |
+| gemini-3.8-flash-medium[1m] | —    | Gemini 3.8 Flash (Medium) [1M] | —                         | 1048576     | gemini |
+| gemini-3.8-flash-medium | —        | Gemini 3.8 Flash (Medium) | —                              | 1048576     | gemini |
+| gemini-3.8-flash-low[1m] | —       | Gemini 3.8 Flash (Low) [1M] | —                            | 1048576     | gemini |
+| gemini-3.8-flash-low | —           | Gemini 3.8 Flash (Low) | —                                 | 1048576     | gemini |
+| gemini-4-argon[1m]  | argon        | Gemini 4 Argon [1M] | —                                    | 1048576     | gemini |
+| gemini-4-argon      | —            | Gemini 4 Argon      | —                                    | 1048576     | gemini |
 
 "grok (pinned)" means the `grok` alias appears on that row only while
 `grok-4.7` is the live grok pin; any other pinned `grok-*` id takes the alias
@@ -257,7 +282,8 @@ default pin it sits on `or-ox-alpha`. The openrouter ids are what a client
 sends — the slug that reaches OpenRouter is the one in the
 [alias table](#alias-semantics), and every curated openrouter row is a free
 model (priced `$0` in and out; an UNCURATED openrouter model has no known
-rate and is reported unpriced, never as a free `$0`).
+rate and is reported unpriced, never as a free `$0`). The gemini aliases carry
+no "(pinned)": they are fixed on their `[1m]` rows (see [Gemini](#gemini)).
 
 ### The grok `[1m]` twin
 
@@ -347,12 +373,58 @@ sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
 and the `[1m]` twin is an explicit opt-in. models.json lists the same
 272,000 / 872,000 pair for all three, which llmux does not advertise.
 
+### Gemini
+
+Added 2026-10-15. The eight gemini rows are four upstream models, each with a
+`[1m]` twin: Gemini 3.8 Flash at three thinking levels and Gemini 4 Argon. The
+thinking level is part of the id (`-high` / `-medium` / `-low`), so every row
+has an empty effort menu. As on astra, and unlike
+[the grok twin](#the-grok-1m-twin), the family aliases sit on the `[1m]` rows:
+the backend's real window is 1,048,576 tokens, so the 1M the suffix advertises
+is honest here. The suffix is display metadata only; a twin and its base row
+reach the backend as the same id.
+
+These ids are served by the **Antigravity subscription backend** (Google Cloud
+Code `v1internal`, reached with an account added by `llmux login --gemini`),
+not by the public Gemini API. Google decides per account which ids it may use:
+
+- **Argon needs Google AI Ultra or Enterprise.** Google lists Argon for
+  Ultra/Enterprise only ([Antigravity models](https://antigravity.google/docs/models/),
+  fetched 2026-10-15). On a Google AI Plus account `gemini-4-argon` returns
+  404 NOT_FOUND, and llmux relays that to the client as an Anthropic error
+  with status 404. It does not substitute Flash. The row exists so that an
+  Ultra account can serve it.
+- **Flash** — the live `fetchAvailableModels` read on 2026-10-15 listed
+  `gemini-3.8-flash-high`, `-medium` and `-low` with a 1,048,576-token context
+  and 65,536 output tokens.
+
+**Claude Code cannot select gemini models (2026-10-15).** The Antigravity
+backend refused Claude Code requests (429 `RESOURCE_EXHAUSTED`) while the same
+account served Codex with 200 in the same minute, so llmux does not forward
+Claude Code traffic to the gemini group. `llmux run` leaves gemini rows out of
+the [Claude Code `/model` picker](#claude-code-model-picker), and a Claude Code
+request that routes to the gemini group (typed `/model`, `--model` or an
+agent's `model:` line) gets a local `400 invalid_request_error`. Its message is
+the requested model, `: `, and then:
+
+> `gemini models are not available from Claude Code: Google's Antigravity backend refuses Claude Code requests, so llmux does not forward them. Use gemini from Codex: llmux run --codex -- -m gemini`
+
+No request reaches Google. Use gemini from Codex
+(`llmux run --codex -- -m gemini`, `-m argon`, or any gemini id); gemini usage
+stays visible in the TUI and `llmux status`. Other Anthropic-Messages clients
+are not affected by this gate. Details:
+[`gemini/spec.md`](gemini/spec.md#claude-code-2026-10-15).
+
+Costs shown for gemini rows use the public API list prices (see
+[Sources](#sources)) for display only; subscription traffic is not billed per
+token.
+
 ## Selecting a model
 
 There are three ways to select a catalog model:
 
 - **Claude Code**: `/model <id>` (the [picker below](#claude-code-model-picker)
-  lists this catalog), or `--model <id>` at launch.
+  lists this catalog except the gemini rows), or `--model <id>` at launch.
 - **Per agent**: `model: <id>` in `.claude/agents/<name>.md`. The agent's
   requests carry that id and llmux routes them by name, so one Claude Code
   session can run Claude, GPT and Grok workers natively (measured 2026-10-08;
@@ -365,13 +437,20 @@ agent files so routing is readable; aliases (`astra`, `grok`) also work. Claude
 Code logs an `unrecognized_model` warning for non-Claude ids and still sends the
 request.
 
+Gemini is the exception: it is selectable from Codex only. In Codex,
+`-m gemini` selects `gemini-3.8-flash-high[1m]` and `-m argon` selects
+`gemini-4-argon[1m]` (`llmux run --codex -- exec -m gemini '…'`). Claude Code,
+including a per-agent `model:` line, gets a local 400 for a gemini model (see
+[Gemini](#gemini)).
+
 Channel note: `haiku` → `claude-haiku-5-5[1m]` is on stable since v0.2.25
 (2026-10-08; [release availability](operational-reference.md#release-availability)).
 
 ## Codex model picker
 
 `llmux run --codex` fetches `/llmux/models` and supplies a temporary Codex catalog
-with backend groups, effort menus and context windows. Native coding instructions
+with backend groups, effort menus and context windows (gemini rows have an empty
+effort menu: pick the `-high`, `-medium` or `-low` id instead). Native coding instructions
 come from the local Codex model cache when available; the fallback is an embedded
 coding prompt. Claude and other translated models use direct client tools.
 `--no-model-picker`, or an explicit `-c model_catalog_json=...`, preserves your
@@ -396,14 +475,18 @@ to any settings file:
 ] } }
 ```
 
-One row per catalog entry, in catalog order:
+One row per catalog entry, in catalog order, except the gemini rows: llmux
+does not forward Claude Code traffic to the gemini group (see [Gemini](#gemini)),
+so the picker does not offer them. The [Codex picker](#codex-model-picker) keeps
+them.
 
 - `model` — the entry `id` **verbatim**, including a `[1m]` suffix (Claude Code
   takes the string as-is, and the providers strip the suffix upstream). It is
   the string llmux routes on, so selecting a row equals typing `/model <id>`.
 - `label` — the entry `name`.
 - `description` — `<group> · efforts <first…last> · ctx <max_context>`, dropping
-  the efforts part for an empty menu and the ctx part for an unpublished window.
+  the efforts part for an empty menu and the ctx part for an unpublished window
+  (`or-free`, with no effort menu, therefore reads `openrouter · ctx 200000`).
   The effort part is a RANGE (the menu's ends), not the whole menu.
 
 `replaceBuiltInOptions` is deliberately left unset: the built-in Anthropic rows
@@ -477,6 +560,15 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
+
+## Model sweep: 2026-10-15
+
+Added Gemini as the fifth backend group. Claude, Codex and Grok were not
+re-swept that day; their latest check is [2026-10-12](#model-sweep-2026-10-12).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Gemini / Google (Antigravity) | Added eight rows: `gemini-3.8-flash-high`, `-medium`, `-low` and `gemini-4-argon`, each with a `[1m]` twin. Aliases: `gemini` / `gemini-3.8-flash` → `gemini-3.8-flash-high[1m]`, `argon` → `gemini-4-argon[1m]`. Context 1,048,576 on every row (3.8 Flash: 1,048,576 in / 65,536 out; Argon: 1,048,576 unified, 65,536 out by default). The live `fetchAvailableModels` read on a Google AI Plus account listed the three Flash ids (ctx 1,048,576 / out 65,536); Argon is Ultra/Enterprise only and returned 404 NOT_FOUND on that account. Reference prices per 1M tokens: 3.8 Flash $0.75 in / $3.75 out / $0.075 cached input (through 2026-12-31), Argon $2.00 / $10.00 / $0.10 (through 2026-11-30); both then double, which llmux's static rates do not model. | [Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) (updated 2026-09-02), [Gemini 4 Argon](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon) (updated 2026-10-14), [pricing](https://ai.google.dev/gemini-api/docs/pricing) (updated 2026-10-14), [Antigravity models](https://antigravity.google/docs/models/) (fetched 2026-10-15), live `fetchAvailableModels` (2026-10-15) |
 
 ## Model sweep: 2026-10-12
 
@@ -614,3 +706,19 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
   grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
   long-context tier.
+- **Gemini rows** — added 2026-10-15 as the `GEMINI_MODELS` const in
+  `src/catalog.rs`. Ids, context and output: the live `fetchAvailableModels`
+  read on 2026-10-15 (`gemini-3.8-flash-high`, `-medium`, `-low`; ctx
+  1,048,576 / out 65,536), the
+  [Gemini 3.8 Flash page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
+  (updated 2026-09-02) and the
+  [Gemini 4 Argon page](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon)
+  (updated 2026-10-14). Argon's tier: the
+  [Antigravity models page](https://antigravity.google/docs/models/) (fetched
+  2026-10-15). Design record, including the live wire probes:
+  [`gemini/spec.md`](gemini/spec.md).
+- **Gemini pricing** — [ai.google.dev pricing](https://ai.google.dev/gemini-api/docs/pricing),
+  updated 2026-10-14: 3.8 Flash $0.75 in / $3.75 out / $0.075 cached input per
+  1M tokens through 2026-12-31, Argon $2.00 / $10.00 / $0.10 through
+  2026-11-30 (both then double). llmux uses these for cost display only;
+  Antigravity subscription traffic is not billed per token.
