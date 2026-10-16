@@ -12,14 +12,14 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
 
 ## What it shows
 
-- Per-account Claude / Codex / Grok / API-key usage from the llmux daemon.
+- Per-account Claude / Codex / Grok / Gemini / API-key usage from the llmux daemon.
 - 5-hour and 7-day quota windows with reset timing.
 - Token/auth health and degraded accounts.
 - A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
 - A closed floating island label:
 
 ```text
-Llmux Islands [mascot] [Claude activity] [Codex activity] [Grok activity]
+Llmux Islands [mascot] [Claude activity] [Codex activity] [Grok activity] [Gemini activity]
 ```
 
 Activity counters are hidden when the count is zero. When one or more sessions
@@ -33,6 +33,14 @@ shared core rejects that provider. Add the account elsewhere instead
 does carry OpenRouter); the daemon, CLI, and TUI serve it normally. The
 Swift shell needs tolerant provider decoding plus an icon before Islands can
 carry the fourth backend group.
+
+**Gemini accounts** (2026-10-15, preview channel) use the same account tiles.
+Google reports one 7-day quota window for them; there is no 5-hour window. The
+account provider list includes **Sign in to Google (Gemini)**, which runs the
+daemon-owned Google login like the other sign-ins. Google states that using
+Antigravity through third-party tools or proxies violates its terms and has
+suspended accounts for it; read [Gemini accounts](configuration.md#gemini-accounts)
+before you connect one.
 
 Recent-activity rows use a dark gray background for requests received through the OpenAI Responses endpoint, including when served by a Claude model. Anthropic endpoint requests retain their existing background, regardless of backend. This distinction is shared by macOS and Linux; historical records without endpoint metadata retain the original background.
 
@@ -64,7 +72,7 @@ daemon, or persist state.
 - macOS 14 or later and llmux installed on the same computer.
 - llmux CLI from the same release as the app (the cask installs it).
 - Claude Code or Codex installed to launch that coding app from Islands.
-- An existing Claude, ChatGPT, Grok or API-key account to connect.
+- An existing Claude, ChatGPT, Grok, Google (Gemini) or API-key account to connect.
 
 No Xcode or manual daemon command is needed for the installed app. Islands starts
 its configured local daemon when necessary. Local control authentication requires

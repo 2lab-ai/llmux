@@ -18,7 +18,7 @@ Run `llmux dashboard` (or the foreground `llmux server`), expand a row in the
 Activity feed, and choose `🔍 request`. The raw viewer opens as a modal over the
 dashboard.
 
-- A translated Codex or Grok exchange shows four legs: `Request` (what the client
+- A translated Codex, Grok or Gemini exchange shows four legs: `Request` (what the client
   sent) → `Upstream Req` (what llmux rewrote it into) → `Upstream Resp` (the
   provider's verbatim reply) → `Response` (what your client received).
 - A byte-identical Claude passthrough shows two legs.

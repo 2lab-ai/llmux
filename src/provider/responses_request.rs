@@ -156,7 +156,7 @@ impl CompatibilityReport {
     }
 
     /// Record a field that is dropped: it is both an omission and a warning.
-    fn omit(&mut self, field: &'static str) {
+    pub(crate) fn omit(&mut self, field: &'static str) {
         self.omitted_fields.push(field);
         self.warnings.push(field);
     }
@@ -167,7 +167,8 @@ impl CompatibilityReport {
         self.warnings.push(warning);
     }
 
-    fn finish(mut self) -> Self {
+    /// Sort + dedup both lists so the header value is stable.
+    pub(crate) fn finish(mut self) -> Self {
         self.omitted_fields.sort_unstable();
         self.omitted_fields.dedup();
         self.warnings.sort_unstable();

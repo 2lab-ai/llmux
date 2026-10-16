@@ -89,6 +89,8 @@ Curated rows are a **convenience layer, not a gate**: any `or-<slug>` passes thr
 - `BackendGroup` gains `OpenRouter` (`src/routing.rs`), ordered LAST
   (`Claude < Codex < Grok < OpenRouter`) so existing `Ord`-dependent behavior
   (representative group = Claude, `on_empty_group` fallback scan order) is unchanged.
+  Later, on 2026-10-15, `Gemini` was appended after it for the same reason; the order is
+  now `Claude < Codex < Grok < OpenRouter < Gemini` ([`../gemini/spec.md`](../gemini/spec.md) §R1).
 - `from_kind("openrouter") → OpenRouter`; `as_str`/`from_label` → `"openrouter"`.
 - `AccountCredential::OpenRouter { api_key, label, created_ms }`, `kind() == "openrouter"`.
   No refresh path (the key does not expire) — `needs_refresh()` is always false.

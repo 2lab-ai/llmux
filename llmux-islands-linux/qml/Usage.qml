@@ -109,6 +109,7 @@ Kirigami.ScrollablePage {
         case "claude": return qsTr("Claude")
         case "codex": return qsTr("Codex")
         case "grok": return qsTr("Grok")
+        case "gemini": return qsTr("Gemini")
         case "api": return qsTr("API key")
         default: return qsTr("Unknown provider")
         }
@@ -119,6 +120,7 @@ Kirigami.ScrollablePage {
         case "claude": return "draw-spiral"
         case "codex": return "code-context"
         case "grok": return "network-connect"
+        case "gemini": return "internet-services"
         case "api": return "password-show-off"
         default: return "dialog-question"
         }
@@ -629,7 +631,7 @@ Kirigami.ScrollablePage {
             }
             Label {
                 Layout.alignment: Qt.AlignHCenter
-                text: qsTr("Add Claude, Codex, Grok, or an Anthropic API key.")
+                text: qsTr("Add Claude, Codex, Grok, Gemini, or an Anthropic API key.")
                 color: IslandTheme.secondaryText
             }
             IslandButton {
@@ -1086,6 +1088,11 @@ Kirigami.ScrollablePage {
                 "key": "grok",
                 "label": qsTr("Grok"),
                 "description": qsTr("Use the device verification link and code.")
+            },
+            {
+                "key": "gemini",
+                "label": qsTr("Gemini (Google)"),
+                "description": qsTr("Sign in in your browser with the Google account that has Antigravity access. Google may suspend accounts that use Antigravity through third-party tools.")
             },
             {
                 "key": "api",

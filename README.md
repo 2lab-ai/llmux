@@ -14,7 +14,7 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 <sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
-llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts.
+llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
 
 ## Start with Islands
 
@@ -129,7 +129,7 @@ This is project configuration (two agent files and a prompt), not a bundled llmu
 
 Did the field I set reach the model? Which leg returned the error? What did the provider say before translation?
 
-For a translated Codex or Grok exchange the raw request viewer records four legs: the client request, the rewritten upstream request, the verbatim upstream response, and the response delivered to the client. A byte-identical Claude passthrough shows two. You can copy a request as curl with credentials redacted; bodies may still contain prompts. For Claude through Codex, the upstream legs record the SDK bridge transport, not private Anthropic HTTP.
+For a translated Codex, Grok or Gemini exchange the raw request viewer records four legs: the client request, the rewritten upstream request, the verbatim upstream response, and the response delivered to the client. A byte-identical Claude passthrough shows two. You can copy a request as curl with credentials redacted; bodies may still contain prompts. For Claude through Codex, the upstream legs record the SDK bridge transport, not private Anthropic HTTP.
 
 Guide: [the accidental AI debugger](docs/ai-debugger.md).
 
@@ -152,6 +152,7 @@ llmux login --api         # optional: Anthropic API key
 llmux login --codex       # optional: Codex / ChatGPT subscription
 llmux login --grok        # optional: Grok / xAI (device-code flow)
 llmux login --openrouter  # optional: OpenRouter (browser PKCE; --paste for an existing key)
+llmux login --gemini      # optional: Google Antigravity / Gemini (browser OAuth; read the note below)
 llmux import              # or import supported local credential stores
 
 llmux run                 # starts/reuses the daemon, then launches claude; args after -- pass through
@@ -159,7 +160,9 @@ llmux run --codex         # same daemon, Codex CLI (install Codex on the client)
 llmux server              # foreground TUI dashboard
 ```
 
-In the dashboard, `n` opens a provider picker for the same four browser logins. Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
+**Gemini terms of service.** Google states that using Antigravity through third-party tools or proxies violates the Antigravity Terms of Service, and it has suspended accounts for it ([gemini-cli discussion #20632](https://github.com/google-gemini/gemini-cli/discussions/20632); [report, 2026-09-03](https://enterprisedna.co/resources/ai-pulse/ai-pulse-2026-09-03-google-suspends-paying-antigravity-subscribers-for-using-thi/)). llmux is such a tool, and `llmux login --gemini` prints this warning before it starts. llmux does not ship Antigravity's Google OAuth client: set `gemini.client_id` and `gemini.client_secret` in `llmux.json` (or `LLMUX_GEMINI_CLIENT_ID` / `LLMUX_GEMINI_CLIENT_SECRET`) before logging in or refreshing; see [Gemini backend](docs/configuration.md#gemini-backend). `llmux import` also picks up an existing Antigravity CLI login. **Argon** (`argon`, `gemini-4-argon`) needs a Google AI Ultra or Enterprise account; on Plus it returns 404, while Gemini 3.8 Flash works. Details: [Gemini accounts](docs/configuration.md#gemini-accounts).
+
+In the dashboard, `n` opens a provider picker for the same five browser logins (the Gemini row prints the same terms-of-service note first). Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
 
 ## Switching models
 
@@ -179,24 +182,26 @@ The incoming model name selects the backend in either client. For example, insid
 | `gpt-*` / `codex` / aliases (`sol`, `terra`, `luna`) | Codex accounts |
 | `grok` / `grok-*` | Grok accounts |
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
+| `gemini` / `gemini-*` / `argon` | Gemini accounts (Codex only; Claude Code gets a local 400) |
 
-Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or).
+Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or). Added 2026-10-15: `gemini-3.8-flash-high[1m]` (gemini), `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-low[1m]` and `gemini-4-argon[1m]` (argon), each with its base row.
 
-Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
+Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. Gemini rows are left out: Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux does not forward them and answers a Claude Code request for a gemini model with a local 400. Use gemini from Codex: `llmux run --codex -- -m gemini` ([details](docs/models.md#gemini)). The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
 
 `haiku` now selects Haiku 5.5 (published 1M context); the explicit `claude-haiku-4-5` ID stays available. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
 
-> **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** The following caveats describe **incoming Anthropic Messages**: Claude and OpenRouter use native Messages, while Codex and Grok require translation. Incoming **OpenAI Responses** uses native Codex Responses or the Claude Agent SDK, with different controls; see the [frontend transport matrix](docs/provider-compatibility.md#frontend-transport-matrix).
+> **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** The following caveats describe **incoming Anthropic Messages**: Claude and OpenRouter use native Messages, while Codex, Grok and Gemini require translation. Incoming **OpenAI Responses** uses native Codex Responses or the Claude Agent SDK, with different controls (Grok, OpenRouter and Gemini convert it to Messages first); see the [frontend transport matrix](docs/provider-compatibility.md#frontend-transport-matrix).
 >
 > - **`gpt-*` (Codex): no output-limit guarantee — your `max_tokens` is not sent upstream at all.** The gateway answered `400 Unsupported parameter: max_output_tokens` (live probe 2026-09-14), and no supported alternative cap field **was found** in the current official Codex client or its docs (read 2026-09-14), so llmux omits the cap rather than faking one. That is a search result, not an allowlist: other field names are untested, not proven absent.
 > - **`grok-*`: the cap is forwarded, but it is not the budget you asked for.** A `max_output_tokens: 1` probe (2026-09-14) came back `incomplete` with one visible token and 168 reported output tokens, 167 of them reasoning. What it bounds in general — and what it costs — is unmeasured.
 > - **Both:** non-null `temperature` / `top_p` / `top_k` and **non-empty** `stop_sequences` are refused with a local 400 (except [scoped monitor/title adapters](docs/provider-compatibility.md#claude-code-internal-tasks)), prior `thinking` blocks are dropped, and there is no reasoning continuity across turns.
+> - **`gemini*` / `argon`: not available from Claude Code, and `max_tokens` is dropped too — the backend applies the model's own cap.** A Claude Code request for a gemini model gets a local 400 and nothing is forwarded; other Messages clients and Codex are served. Sampling and stop controls are forwarded, prior `thinking` blocks are dropped, and tool-call thought signatures are replayed across turns. `argon` needs a Google AI Ultra or Enterprise account (404 on Plus). [Details](docs/provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
 > - **Claude Code auto mode:** after an observed GPT main turn, the same session's safety monitor defaults to `luna` with medium effort. Both severity stages are supported; unknown sessions keep normal routing. This changes the reviewer model, not the requested safety policy.
 > - **Claude Code internal models:** in GPT sessions, implicit Opus/Sonnet/Haiku requests use configurable `sol`/`terra`/`luna` aliases. Titles preserve their JSON schema; initial titles and quota use proven launch context before the first main turn. Quota checks Codex availability without inventing Claude quota percentages. Explicit main Claude switches remain authoritative. [Configuration](docs/configuration.md#claude-code-internal-models-claude_code).
 >
-> A translated response that lost something names it in `X-Llmux-Omitted-Fields` / `X-Llmux-Compatibility-Warnings` (a faithful one carries neither header); send `X-Llmux-Compatibility: strict` to turn any such loss into a 400 instead. Full matrix, receipts and known unknowns: [docs/provider-compatibility.md](docs/provider-compatibility.md).
+> A translated Codex, Grok or Gemini response that lost something names it in `X-Llmux-Omitted-Fields` / `X-Llmux-Compatibility-Warnings` (a faithful one carries neither header); send `X-Llmux-Compatibility: strict` to turn any such loss into a 400 instead. Exception: a Codex CLI (Responses) request served by Gemini carries no such headers and strict mode does not refuse it, although `max_output_tokens`, a structured `text.format` and web_search tools are left out there. Full matrix, receipts and known unknowns: [docs/provider-compatibility.md](docs/provider-compatibility.md).
 
 ## Update
 
@@ -222,7 +227,7 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 - [Codex frontend](docs/codex-frontend/README.md) — launch, SDK requirements, tools, HTTP and endpoint activity
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
-- [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok, diagnostic headers
+- [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok/Gemini, diagnostic headers
 - [FAQ](docs/faq.md) — seeing what is left per account, subagents on GPT or Grok, what needs preview, context-window workarounds
 - [system prompts (multi-model)](docs/system-prompts/README.md) — real captured wire system prompts
 
@@ -233,7 +238,7 @@ llmux is for **one human using their own accounts** — no credential pooling, n
 - **Durable path:** keep your chosen client harness; Claude through Claude Code/subscription or Anthropic API keys; other models through supported API keys.
 - **Convenience path:** routing third-party flat-rate subscription tokens through a different client depends on that vendor's current policy and can change without notice. Use it opt-in, with your own accounts only, and keep an API-key fallback configured.
 - Anthropic quota headers and vendor subscription-token behavior may change.
-- llmux is not affiliated with Anthropic, OpenAI, xAI, or OpenRouter.
+- llmux is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
 
 Product intent — what llmux is, what it bets on, and what it refuses — is fixed in [`.prd/`](.prd/).
 

@@ -159,6 +159,7 @@ fn kind_static(kind: &str) -> &'static str {
         "codex" => "codex",
         "grok" => "grok",
         "openrouter" => "openrouter",
+        "gemini" => "gemini",
         _ => "unknown",
     }
 }
@@ -1417,10 +1418,25 @@ mod tests {
 
     #[test]
     fn unknown_credential_kind_degrades_without_special_casing() {
+        // `gemini` was the sample unknown kind until it became a real group
+        // (docs/gemini/spec.md); any kind this build has never heard of
+        // still degrades.
+        let mut doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
+        doc.accounts[0].kind = "mistral".into();
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(view.snapshot.accounts[0].credential_kind, "unknown");
+    }
+
+    #[test]
+    fn gemini_credential_kind_maps_to_gemini_group() {
         let mut doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
         doc.accounts[0].kind = "gemini".into();
         let view = DashboardView::from_doc(&doc);
-        assert_eq!(view.snapshot.accounts[0].credential_kind, "unknown");
+        assert_eq!(view.snapshot.accounts[0].credential_kind, "gemini");
+        assert_eq!(
+            view.snapshot.accounts[0].group,
+            crate::routing::BackendGroup::Gemini
+        );
     }
 
     #[test]

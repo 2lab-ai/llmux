@@ -85,6 +85,40 @@ final class LegacyStatusDashboardAdapterTests: XCTestCase {
         XCTAssertEqual(dashboard["email_anonymous"] as? Bool, true)
     }
 
+    func testGeminiStatusWithoutGroupKeepsItsOwnCurrentGroup() throws {
+        let status = Data(#"""
+        {
+          "version": "llmux 0.1.9",
+          "current": "gemini:user@example.com",
+          "accounts": [{
+            "name": "gemini:user@example.com",
+            "type": "gemini",
+            "status": "active",
+            "five_hour": null,
+            "seven_day": {"utilization": 0.4, "resets_in_secs": 600},
+            "in_flight": 1
+          }]
+        }
+        """#.utf8)
+
+        let data = try LegacyStatusDashboardAdapter.dashboardData(
+            from: status,
+            previousDashboardData: nil,
+            endpointPort: 3456,
+            receivedAtMs: 1_000_000,
+            emailAnonymous: false,
+            showFableWeekly: true
+        )
+        let dashboard = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            dashboard["current_by_group"] as? [String: String],
+            ["gemini": "gemini:user@example.com"]
+        )
+    }
+
     func testMalformedStatusIsRejectedInsteadOfBypassingRust() {
         XCTAssertThrowsError(try LegacyStatusDashboardAdapter.dashboardData(
             from: Data(#"{"accounts":[{"name":"secret@example.com"}]}"#.utf8),

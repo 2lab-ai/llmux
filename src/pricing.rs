@@ -14,7 +14,9 @@
 //! developers.openai.com/api/docs/pricing, both read 2026-10-06 (that read
 //! also corrected the stale gpt-5.6-sol / gpt-5.6-luna rows below). Haiku 5.5,
 //! Sonnet 5.5 and Fable 5.1 cache rates re-read 2026-10-08 at
-//! https://platform.claude.com/docs/en/about-claude/pricing.
+//! https://platform.claude.com/docs/en/about-claude/pricing. Gemini 3.8 Flash
+//! and Gemini 4 Argon from https://ai.google.dev/gemini-api/docs/pricing
+//! (updated 2026-10-14).
 
 use std::collections::HashMap;
 
@@ -136,6 +138,20 @@ const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 /// `or-<vendor>/<slug>` escape hatch, and asserting $0 for those would be an
 /// invented number.
 const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
+/// Gemini 3.8 Flash (ai.google.dev/gemini-api/docs/pricing, updated
+/// 2026-10-14): $0.75 in / $3.75 out / $0.075 cached input, no cache-write
+/// rate. These are the INTRODUCTORY rates, published as valid through
+/// 2026-12-31 (they double after). One price for all three thinking variants
+/// (`-high` / `-medium` / `-low` are one API model at different thinking
+/// levels). An API-list-price-equivalent estimate for Antigravity
+/// subscription traffic, not a billed amount. Also the `group == "gemini"`
+/// unknown-model fallback.
+const GEMINI_3_8_FLASH: ModelPrice = ModelPrice::new(0.75, 3.75, 0.075, 0.0);
+/// Gemini 4 Argon (same page, updated 2026-10-14): $2 in / $10 out / $0.10
+/// cached input, no cache-write rate — introductory rates valid through
+/// 2026-11-30 (they double after). API-list-price-equivalent estimate, like
+/// the Flash row.
+const GEMINI_4_ARGON: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -165,6 +181,17 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
+        // `[1m]` ids arrive here already stripped by `normalize_model`. The
+        // bare family aliases are listed too: unlike the claude aliases they
+        // are not resolved by `normalize_model`, and without its own row an
+        // `argon` booked under the client's name would fall to the group
+        // fallback and be priced as Flash.
+        "gemini"
+        | "gemini-3.8-flash"
+        | "gemini-3.8-flash-high"
+        | "gemini-3.8-flash-medium"
+        | "gemini-3.8-flash-low" => Some(GEMINI_3_8_FLASH),
+        "argon" | "gemini-4-argon" => Some(GEMINI_4_ARGON),
         _ => None,
     };
     if exact.is_some() {
@@ -233,6 +260,12 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(GPT_6_SOL)
     } else if model_norm_lower.starts_with("gpt-6-luna-") {
         Some(GPT_6_LUNA)
+    } else if model_norm_lower.starts_with("gemini-4-argon-") {
+        // Argon is PRICIER than the gemini group fallback (Flash), so a
+        // dated / suffixed Argon id must be caught here rather than
+        // underpriced. The trailing `-` is the version boundary
+        // (`gemini-4-argonx` must miss this branch).
+        Some(GEMINI_4_ARGON)
     } else if model_norm_lower.starts_with("gpt-6-") {
         // Astra is generation 6's flagship, so it is the `gpt-6-` default
         // exactly as sol is for `gpt-5.6-` (sol/luna have their own exact and
@@ -253,7 +286,8 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
 ///    in config, but matched case-insensitively against the normalized model).
 /// 2. The built-in default table (exact then prefix), case-insensitive.
 /// 3. Group fallback: `group == "claude"` → opus-tier rates; `group ==
-///    "codex"` → gpt-5.5 rates; any other group → `None` (all-zero cost).
+///    "codex"` → gpt-5.5 rates; `"grok"` → grok-4.5 rates; `"gemini"` →
+///    Gemini 3.8 Flash rates; any other group → `None` (all-zero cost).
 ///
 /// `overrides` keys are normalized + lowercased on read, so a config can use
 /// either the display slug (`claude-opus-4-8[1m]`) or the bare slug.
@@ -291,6 +325,7 @@ pub fn price_for(
         "claude" => Some(OPUS_TIER),
         "codex" => Some(GPT_5_5),
         "grok" => Some(GROK_4_5),
+        "gemini" => Some(GEMINI_3_8_FLASH),
         _ => None,
     }
 }
@@ -486,6 +521,88 @@ mod tests {
             (2.0, 6.0),
             "unknown grok model → grok fallback"
         );
+    }
+
+    // ---- G16: gemini pricing (docs/gemini/spec.md §R7) ----
+    #[test]
+    fn g16_gemini_flash_variants_and_1m_ids_price_at_flash() {
+        let flash = (0.75, 3.75, 0.075, 0.0);
+        for model in [
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-high[1m]",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-medium[1m]",
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-low[1m]",
+            "GEMINI-3.8-FLASH-HIGH",
+            "gemini",
+            "gemini[1m]",
+            "gemini-3.8-flash",
+        ] {
+            let p = price_for("gemini", model, &empty()).unwrap_or_else(|| panic!("{model}"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_creation),
+                flash,
+                "{model}"
+            );
+            // A model-id match, not the group fallback: the rate holds even
+            // when the group is unknown.
+            assert_eq!(
+                builtin_price(&normalize_model(model).to_ascii_lowercase()),
+                Some(GEMINI_3_8_FLASH),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn g16_gemini_argon_ids_and_alias_price_at_argon() {
+        let argon = (2.0, 10.0, 0.10, 0.0);
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-argon[1m]",
+            "argon",
+            "argon[1m]",
+            "gemini-4-argon-20261014",
+        ] {
+            let p = price_for("gemini", model, &empty()).unwrap_or_else(|| panic!("{model}"));
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_creation),
+                argon,
+                "{model}"
+            );
+        }
+        // Version boundary: a different model id must not take Argon rates.
+        assert_eq!(builtin_price("gemini-4-argonx"), None);
+    }
+
+    #[test]
+    fn g16_unknown_gemini_model_falls_back_to_flash() {
+        let p = price_for("gemini", "gemini-9-mystery", &empty()).expect("group fallback");
+        assert_eq!(p, GEMINI_3_8_FLASH);
+        // One million output tokens at the Flash list rate.
+        approx(
+            cost_usd(
+                "gemini",
+                "gemini-9-mystery",
+                &tc(0, 1_000_000, None, None),
+                &empty(),
+            ),
+            3.75,
+        );
+        // The fallback is group-scoped: an unknown model in an unknown group
+        // stays unpriced.
+        assert!(price_for("weirdgroup", "gemini-9-mystery", &empty()).is_none());
+    }
+
+    #[test]
+    fn g16_every_curated_gemini_row_is_priced_by_id() {
+        for &(id, ..) in crate::catalog::GEMINI_MODELS {
+            assert!(
+                builtin_price(&normalize_model(id).to_ascii_lowercase()).is_some(),
+                "catalog row {id} has no model-id price"
+            );
+        }
     }
 
     const EPS: f64 = 1e-9;

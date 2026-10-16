@@ -182,7 +182,7 @@ struct SharedAccountTile: Decodable, Equatable {
 }
 
 enum SharedProvider: String, Decodable, Equatable {
-    case claude, codex, grok, api, unknown
+    case claude, codex, grok, gemini, api, unknown
 }
 
 struct SharedTokenExpiry: Decodable, Equatable {

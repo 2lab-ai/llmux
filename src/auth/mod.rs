@@ -5,6 +5,8 @@ pub mod claude_resets;
 pub mod codex;
 pub mod codex_usage;
 pub mod credentials;
+pub mod gemini;
+pub mod gemini_usage;
 pub mod grok;
 pub mod grok_usage;
 pub mod oauth;
@@ -55,6 +57,23 @@ pub enum AuthError {
     /// the grok flow cannot work without.
     #[error("grok auth data invalid: {0}")]
     GrokAuth(&'static str),
+    /// A Google token/userinfo/loadCodeAssist response or the Antigravity
+    /// CLI token store lacked or malformed a field the gemini flow cannot
+    /// work without.
+    #[error("gemini auth data invalid: {0}")]
+    GeminiAuth(&'static str),
+    /// No Google OAuth client for the gemini login / token refresh: llmux
+    /// ships none, the operator configures it
+    /// (`crate::config::GeminiConfig::oauth_client`). A CONFIGURATION
+    /// failure — never a verdict on any account's refresh token.
+    /// The daemon resolves the client once at startup, hence the restart
+    /// hint: keys added while it runs take effect after a restart.
+    #[error(
+        "gemini OAuth client not configured: set gemini.client_id and gemini.client_secret \
+         in llmux.json (or LLMUX_GEMINI_CLIENT_ID / LLMUX_GEMINI_CLIENT_SECRET) \
+         — the daemon reads them at startup, so restart llmux after setting them"
+    )]
+    GeminiClientNotConfigured,
 }
 
 impl AuthError {

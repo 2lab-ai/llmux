@@ -1,6 +1,6 @@
 # Provider compatibility
 
-Two client frontends share four backend groups. What survives depends on both the
+Two client frontends share five backend groups. What survives depends on both the
 incoming protocol and the selected backend. The detailed legacy matrix below
 describes **incoming Anthropic Messages**; Responses has its own transport and controls. This page is the readable difference matrix: what llmux forwards, what it drops (and
 reports), and what it refuses outright, with the code line or dated receipt behind each row.
@@ -18,10 +18,12 @@ user-facing contract) and the [responses compatibility spec](responses-compatibi
 | Codex | Messages → Responses → Messages | Native Responses history/tools/encrypted reasoning preserved |
 | Grok | Messages → Grok Responses → Messages | Responses → Messages → existing Grok adapter → Responses |
 | OpenRouter | Native Messages with model/thinking normalization | Responses → Messages → OpenRouter Messages → Responses |
+| Gemini | Messages → Cloud Code `streamGenerateContent` → Messages; Claude Code requests get a local 400 ([below](#gemini-no-cap-sent-thought-signatures-replayed)) | Responses → Messages → existing Gemini adapter → Responses; a Claude Code client gets the same local 400 in the OpenAI error shape |
 
 Transport source checked 2026-10-07: [`src/proxy/forward.rs`](../src/proxy/forward.rs)
 (`run_taxonomy_loop`) and [`src/proxy/responses.rs`](../src/proxy/responses.rs)
-(`messages_request`). This table describes implementation paths, not live parity
+(`messages_request`); the Gemini row (2026-10-15) is [`gemini/spec.md`](gemini/spec.md)
+§R5 and `src/provider/gemini.rs`. This table describes implementation paths, not live parity
 proof for every backend; installed release smokes cover native Codex and Claude SDK.
 
 The [Codex frontend guide](codex-frontend/README.md) owns Responses controls,
@@ -39,6 +41,9 @@ with the same drops and refusals: `max_tokens` is not sent to Codex at all;
 non-null `temperature`/`top_p`/`top_k` and non-empty `stop_sequences` are refused
 with a local 400; prior `thinking` blocks are dropped and there is no reasoning
 continuity across turns. The parent (Claude) keeps the native Messages path.
+An agent on `gemini` / `argon` gets a local 400 instead: since 2026-10-15 llmux does not
+forward Claude Code traffic, subagents included, to the gemini group
+([Gemini](#gemini-no-cap-sent-thought-signatures-replayed)).
 
 - Supported here means measured on the dated receipt in the row — not every agent
   prompt shape has been probed.
@@ -71,9 +76,12 @@ are references, with [request-tier/TTL limitations](models.md#current-claude-ref
 | OpenRouter (`or-*`) | `https://openrouter.ai/api/v1/messages` — a native Anthropic Messages endpoint (`src/config/schema.rs:1191-1205`) | **native Messages, no translation**, but the body IS rewritten: `model` → wire slug, and the SAME unsigned-`thinking` strip as the Claude path (`src/provider/openrouter.rs:143-167`, which calls `anthropic::strip_foreign_thinking` at `:147`); the `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers are dropped (`:300-314`) |
 | Codex (`gpt-*`, `sol`, `terra`, `luna`) | `https://chatgpt.com/backend-api/codex/responses` — the **ChatGPT subscription gateway**, not the public OpenAI API | **translation** Messages → Responses (`src/provider/responses_request.rs`) |
 | Grok (`grok-*`) | `https://cli-chat-proxy.grok.com/v1/responses` — the **Grok subscription gateway**, not api.x.ai | **translation** Messages → Responses |
+| Gemini (`gemini*`, `argon`) | `https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` (config `gemini.upstream`) — the **Antigravity subscription backend** (Google Cloud Code), not the public Gemini API | **translation** Messages → Cloud Code `contents` envelope carrying the account's GCP project (`src/provider/gemini.rs`, [`gemini/spec.md`](gemini/spec.md) §R3) |
 
 The two gateways share Responses *syntax* with the vendors' public APIs; that does not make
 their *capabilities* the same. Public API docs are a hypothesis about them, not a receipt.
+The same holds for Gemini: the ai.google.dev model and pricing pages describe the public
+Gemini API, not the Antigravity backend llmux talks to.
 
 ## Difference matrix (incoming Messages)
 
@@ -81,23 +89,23 @@ their *capabilities* the same. Public API docs are a hypothesis about them, not 
 `400` = refused locally by llmux before any upstream call or credential refresh ·
 `untested` = nobody has measured it here (not a claim that it fails).
 
-| What you send | Claude | OpenRouter | Codex | Grok |
-| --- | --- | --- | --- | --- |
-| `max_tokens` (output cap) | forwarded | forwarded (`src/provider/openrouter.rs:563-577`) | **not sent at all** — the one cap field measured there is refused | forwarded as `max_output_tokens`, **meaning unproven** |
-| `temperature` / `top_p` / `top_k` | forwarded | forwarded | **400**, except recognized session-title default temperature [below](#claude-code-internal-tasks) | **400** |
-| non-empty `stop_sequences` | forwarded | forwarded | **400**, except [scoped monitor adapter](#claude-code-auto-mode-monitors) | **400** |
-| assistant `thinking` history | forwarded when **signed**; a block with a missing/empty `signature` is stripped¹ | same¹ | **dropped** | **dropped** |
-| assistant `redacted_thinking` | forwarded untouched (it carries no `signature` field by design) | same | **dropped** | **dropped** |
-| `model` field | rewritten: alias resolved, `[1m]` client suffix stripped | rewritten to the OpenRouter wire slug (`or-ox-alpha` → `stealth/ox-alpha`) | replaced by the served upstream model (`src/provider/responses_request.rs:134`) | same |
-| top-level `thinking` config (`budget_tokens`, `disabled`) | forwarded | forwarded | **dropped** (shape validated first) | **dropped** |
-| base64 PNG/JPEG image on a user message | forwarded | forwarded | converted to `input_image` | converted |
-| image by URL, other media types, unknown blocks | forwarded | forwarded | **400** (never fetched) | **400** |
-| tools / `tool_choice` / `disable_parallel_tool_use` | forwarded | forwarded | converted; unnamed or undeclared tool → **400** | same |
-| `/v1/messages/count_tokens` | upstream count | **local chars/4 estimate** (upstream 404s) | local estimate; images → **400** | local estimate; images → **400** |
-| `prompt_cache_key` | n/a | n/a | sent | not sent |
+| What you send | Claude | OpenRouter | Codex | Grok | Gemini |
+| --- | --- | --- | --- | --- | --- |
+| `max_tokens` (output cap) | forwarded | forwarded (`src/provider/openrouter.rs:563-577`) | **not sent at all** — the one cap field measured there is refused | forwarded as `max_output_tokens`, **meaning unproven** | **dropped** — the backend applies the model's own cap ([below](#gemini-no-cap-sent-thought-signatures-replayed)) |
+| `temperature` / `top_p` / `top_k` | forwarded | forwarded | **400**, except recognized session-title default temperature [below](#claude-code-internal-tasks) | **400** | forwarded as `temperature` / `topP` / `topK` |
+| non-empty `stop_sequences` | forwarded | forwarded | **400**, except [scoped monitor adapter](#claude-code-auto-mode-monitors) | **400** | forwarded as `stopSequences` |
+| assistant `thinking` history | forwarded when **signed**; a block with a missing/empty `signature` is stripped¹ | same¹ | **dropped** | **dropped** | **dropped**; tool-call thought signatures are replayed instead |
+| assistant `redacted_thinking` | forwarded untouched (it carries no `signature` field by design) | same | **dropped** | **dropped** | **dropped** |
+| `model` field | rewritten: alias resolved, `[1m]` client suffix stripped | rewritten to the OpenRouter wire slug (`or-ox-alpha` → `stealth/ox-alpha`) | replaced by the served upstream model (`src/provider/responses_request.rs:134`) | same | rewritten: alias resolved, `[1m]` client suffix stripped |
+| top-level `thinking` config (`budget_tokens`, `disabled`) | forwarded | forwarded | **dropped** (shape validated first) | **dropped** | **dropped** (`thinking_config`); every request asks for thoughts (`includeThoughts: true`) |
+| base64 PNG/JPEG image on a user message | forwarded | forwarded | converted to `input_image` | converted | converted to `inlineData` (also WebP, HEIC, HEIF and base64 PDF) |
+| image by URL, other media types, unknown blocks | forwarded | forwarded | **400** (never fetched) | **400** | **400** (never fetched), before any credential refresh |
+| tools / `tool_choice` / `disable_parallel_tool_use` | forwarded | forwarded | converted; unnamed or undeclared tool → **400** | same | converted to `functionDeclarations`, `tool_choice` → `AUTO` / `ANY` / `NONE`; a tool without `input_schema` is **dropped** (`server_tools`); `disable_parallel_tool_use: true` is **dropped** when tools are sent (Gemini cannot forbid parallel calls) |
+| `/v1/messages/count_tokens` | upstream count | **local chars/4 estimate** (upstream 404s) | local estimate; images → **400** | local estimate; images → **400** | local chars/4 estimate (no upstream count); Claude Code → the local **400** ([below](#gemini-no-cap-sent-thought-signatures-replayed)) |
+| `prompt_cache_key` | n/a | n/a | sent | not sent | n/a |
 
-¹ A `thinking` block with a missing or empty `signature` — what the Codex/Grok translator
-synthesizes, since it has nothing to sign with — is refused by the real Anthropic API with
+¹ A `thinking` block with a missing or empty `signature` — what the Codex/Grok/Gemini translators
+synthesize, since they have nothing to sign with — is refused by the real Anthropic API with
 `Invalid signature in thinking block`, and OpenRouter's Messages schema requires the signature
 too. So on **both** native-Messages groups those blocks are removed before relay, signed
 blocks and `redacted_thinking` pass untouched, and a message left with an EMPTY content array
@@ -107,7 +115,10 @@ This is what makes a mid-session `/model` switch back to a native-Messages group
 
 Sources: matrix rows and their refusal reasons are enumerated in
 [responses-compatibility/spec.md §2](responses-compatibility/spec.md#2-compatibility-matrix);
-the local-estimate behavior is `src/proxy/forward.rs:2595-2611`.
+the local-estimate behavior is `src/proxy/forward.rs:2595-2611`. The Gemini column is
+[`gemini/spec.md`](gemini/spec.md) §R3–§R4 and `src/provider/gemini.rs` (`translate_request`,
+`generation_config`, and `validate_request` for the omission names), with the `/v1/messages`
+compatibility gate in `src/proxy/forward.rs` (`CompatTarget::Gemini`), 2026-10-15.
 
 ## Codex: no output-limit guarantee — `max_tokens` is not sent at all
 
@@ -171,6 +182,78 @@ llmux maps `incomplete_details.reason: "max_output_tokens"` to Anthropic `stop_r
 "max_tokens"`, keeping the partial text and the true upstream usage — the reported
 `output_tokens` is never reduced to the number you asked for (`src/provider/responses.rs:725-743`).
 
+## Gemini: no cap sent, thought signatures replayed
+
+Gemini is the Antigravity subscription backend, translated Messages ↔ Cloud Code
+`streamGenerateContent` ([`gemini/spec.md`](gemini/spec.md); wire facts from live probes on
+2026-10-15).
+
+- **Claude Code is refused locally (2026-10-15).** The backend answered Claude Code requests
+  with 429 `RESOURCE_EXHAUSTED` while the same account served Codex with 200 in the same
+  minute (observation 2026-10-15). By owner decision, any request whose `User-Agent` starts
+  with `claude-cli/` (Claude Code and its subagents) and that routes to the gemini group
+  gets a local 400 `invalid_request_error` from the gate in `src/proxy/forward.rs`, on every
+  method and path — `/v1/messages`, its `count_tokens` calls and `/v1/responses`; no
+  request reaches Google. The message is the requested model,
+  `: `, and then `gemini models are not available from Claude Code: Google's Antigravity backend refuses Claude Code requests, so llmux does not forward them. Use gemini from Codex: llmux run --codex -- -m gemini`.
+  On `/v1/responses` it comes in the OpenAI error shape, elsewhere in the Anthropic one.
+  `llmux run` also leaves gemini rows out of the Claude Code picker
+  ([models](models.md#gemini)). Codex (`/v1/responses`) and other Anthropic-Messages
+  clients are not affected; the rest of this section describes them.
+- **No output cap is sent.** `max_tokens` is left out of the request (parity with the
+  reference implementation named in `gemini/spec.md`) and named in the response headers; the
+  backend applies the model's own cap (65,536 output tokens on 3.8 Flash in the live
+  `fetchAvailableModels` read, 2026-10-15). A `MAX_TOKENS` finish maps to
+  `stop_reason: "max_tokens"`. As on Codex, your `max_tokens` bounds nothing on this path.
+- **Losses are named (incoming Messages).** On `/v1/messages`, Gemini reports what it leaves
+  out exactly as Codex and Grok do: `X-Llmux-Omitted-Fields` and
+  `X-Llmux-Compatibility-Warnings` list `max_tokens`, `thinking_config` (any non-null
+  top-level `thinking`), `thinking`, `redacted_thinking`, `server_tools` (a tool without
+  `input_schema`) and `disable_parallel_tool_use` (when it is `true` and a tool is sent), on
+  streamed and aggregated responses alike. A request that sends `max_tokens` and a
+  top-level `thinking` reports `max_tokens,thinking_config`. With
+  `X-Llmux-Compatibility: strict`, any omission is a local 400 `invalid_request_error`
+  (`gemini cannot serve this request without loss: …`) before any credential refresh,
+  project lookup or upstream call.
+- **Incoming Responses is not covered yet.** A Codex CLI request (`/v1/responses`) served by
+  Gemini carries no compatibility headers, and strict mode does not refuse it. On that path
+  `max_output_tokens`, a structured `text.format` and web_search tools are left out silently.
+- **Thought signatures are the only reasoning carried across turns.** Tool calls Gemini emits
+  carry a thought signature. llmux gives every call its own tool id (`toolu_gemini_…`, never
+  Google's call id, which repeats across conversations) and caches the signature and
+  Google's id under (session, that tool id) in a bounded in-memory cache. When the next turn
+  replays the history, the call and its result go back upstream under Google's id (when
+  Google sent one), with the signature attached (`src/provider/gemini.rs` `push_call` /
+  `attach_signatures`; test `g7_conversations_sharing_a_session_replay_their_own_signatures`,
+  2026-10-16). The backend refuses a replayed tool call that has no signature (400,
+  live probe 2026-10-15). On a cache miss — for example after a daemon restart — the tool id
+  goes up as sent and the first call of the turn gets the
+  `skip_thought_signature_validator` placeholder instead (measured 200), so multi-turn tool
+  use keeps working. Prior `thinking` text and the client's top-level `thinking` config are
+  dropped (and named, see above). Thoughts stream back as unsigned `thinking` blocks, which the
+  Claude and OpenRouter paths strip after a model switch (footnote ¹ above).
+- **Sampling is forwarded, effort is the model id.** `temperature`, `top_p`, `top_k` and
+  `stop_sequences` become `generationConfig.temperature` / `topP` / `topK` / `stopSequences`.
+  The thinking level is chosen by the id (`-high` / `-medium` / `-low`); client effort does
+  not reach the backend ([models](models.md#gemini)).
+- **Content.** Base64 images (PNG, JPEG, WebP, HEIC, HEIF) and base64 PDFs become
+  `inlineData`, including images inside `tool_result` content. URL sources, other media types
+  and unknown content blocks are a local 400 that names the JSON path, before any credential
+  refresh or upstream call.
+- **Usage.** `output_tokens` includes Gemini's thought tokens; cached prompt tokens are
+  reported as `cache_read_input_tokens` and excluded from `input_tokens`. `count_tokens` is a
+  local estimate.
+- **Account errors.** A 429 `RESOURCE_EXHAUSTED` parks the account for the `RetryInfo` delay;
+  `QUOTA_EXHAUSTED` without a delay parks it until the known quota reset, else for an
+  estimated hour. A 403 that names the Terms of Service or a suspension benches the account
+  with an explicit message instead of rotating past it as a transient error.
+- **Argon tier.** On a Google AI Plus account `gemini-4-argon` returns 404 NOT_FOUND (live
+  probe 2026-10-15), relayed to the client as an Anthropic error with status 404. Argon needs
+  Ultra or Enterprise ([models](models.md#gemini)).
+- **Terms of service.** Google states that using Antigravity through third-party tools or
+  proxies violates the Antigravity ToS, and it has suspended accounts for it; see
+  [account types](configuration.md#account-types) before you add one.
+
 ## No reasoning continuity on Codex/Grok
 
 This section applies to **incoming Messages**. Native Codex Responses preserves
@@ -181,17 +264,20 @@ is stored or replayed by llmux. Multi-turn text and tool transcripts are unaffec
 `thinking` config is validated and then dropped: `budget_tokens` bounds nothing upstream and
 `{"type":"disabled"}` does not stop these models from reasoning. Reasoning effort on these
 groups comes from llmux's own resolution (`config.codex` / `config.grok`, `/effort`), not
-from the Messages body — see [models](models.md) for the per-model effort menus.
+from the Messages body — see [models](models.md) for the per-model effort menus. Gemini's
+tool-call thought signatures are the one form of carried reasoning; see
+[Gemini](#gemini-no-cap-sent-thought-signatures-replayed).
 
 ## How to check any request yourself
 
-When a translated request loses something, the response you receive names it
+When a translated request (Codex, Grok, or Gemini on incoming Messages) loses something, the
+response you receive names it
 (`src/proxy/forward.rs:695-710`, `:851-882`). A faithful request carries none of these
 headers at all, so their **presence** is the signal:
 
 | Header | Meaning |
 | --- | --- |
-| `X-Llmux-Omitted-Fields` | fields that were **not** sent upstream (e.g. `max_tokens` on Codex, `thinking`, `thinking_config`) |
+| `X-Llmux-Omitted-Fields` | fields that were **not** sent upstream (e.g. `max_tokens` on Codex and Gemini, `thinking`, `thinking_config`) |
 | `X-Llmux-Compatibility-Warnings` | the omissions plus semantic caveats (e.g. `max_tokens_semantics` on Grok) |
 | `X-Llmux-Token-Count: estimate` | this count came from a local heuristic, not a tokenizer |
 
@@ -201,7 +287,11 @@ Two ways to act on them:
   ([AI debugger](ai-debugger.md)) and read the headers and the actual upstream body.
 - **Refuse** — send `X-Llmux-Compatibility: strict` and any of the losses above becomes an
   HTTP 400 *before* upstream traffic. Since normal clients always send `max_tokens`, strict
-  mode rejects Codex requests rather than pretending to enforce a budget.
+  mode rejects Codex and Gemini requests rather than pretending to enforce a budget.
+
+Not covered: Gemini requests that arrive as OpenAI Responses (Codex CLI) carry none of these
+headers, and strict mode does not refuse them
+([Gemini](#gemini-no-cap-sent-thought-signatures-replayed)).
 
 The headers are stamped on both terminal legs of a served request — streamed SSE and
 aggregated JSON — so the same request reports the same losses either way. They ride a
@@ -219,6 +309,11 @@ Stated so nobody reads a gap as a guarantee:
   one visible token alongside 167 reasoning tokens; that is a single observation, not a rule.
 - Whether the gateways accept `temperature` / `top_p` / `top_k` / `stop_sequences` at all —
   **untested**; llmux refuses them locally rather than forwarding on a public-API assumption.
+- Whether the Antigravity backend honors any output-cap field — **untested**; llmux sends none.
+- Whether the Antigravity backend applies the forwarded `temperature` / `top_p` / `top_k` /
+  `stop_sequences` as the public Gemini API documents — **untested**.
+- Argon on a Google AI Ultra or Enterprise account — **untested**; the only probe is the Plus
+  account's 404 (2026-10-15).
 - Billing: none of the probes above establish what a subscription is charged.
 - Every probe is a single fixture on a single model on a dated snapshot of a gateway that can
   change without notice.

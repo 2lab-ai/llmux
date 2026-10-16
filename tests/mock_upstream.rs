@@ -124,6 +124,11 @@ pub struct SeenRequest {
     pub chatgpt_account_id: Option<String>,
     pub originator: Option<String>,
     pub launch_model_hint: Option<String>,
+    /// `User-Agent` (gemini's Antigravity identity assertions).
+    pub user_agent: Option<String>,
+    /// Raw query string (`alt=sse` on the gemini stream path); `path` alone
+    /// drops it.
+    pub query: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -304,6 +309,8 @@ async fn catch_all(
         chatgpt_account_id: header("chatgpt-account-id"),
         originator: header("originator"),
         launch_model_hint: header("x-llmux-claude-launch-model"),
+        user_agent: header("user-agent"),
+        query: parts.uri.query().map(str::to_string),
         body: body.to_vec(),
     });
 
@@ -437,6 +444,8 @@ async fn token_endpoint(
             chatgpt_account_id: header("chatgpt-account-id"),
             originator: header("originator"),
             launch_model_hint: header("x-llmux-claude-launch-model"),
+            user_agent: header("user-agent"),
+            query: parts.uri.query().map(str::to_string),
             body: body.to_vec(),
         });
     shared.token_hits.fetch_add(1, Ordering::SeqCst);

@@ -28,6 +28,7 @@ feature is incomplete.
 | Product/architecture *decisions* (not how-to) | [`.prd/`](../.prd/) |
 | Grok provider STV design notes | [`docs/grok/`](../docs/grok/) (design artifact; not a user how-to) |
 | OpenRouter provider STV design notes | [`docs/openrouter/`](../docs/openrouter/) (design artifact; not a user how-to) |
+| Gemini provider STV design notes | [`docs/gemini/`](../docs/gemini/) (design artifact; not a user how-to) |
 | Agent architecture rules / conventions / runbooks | [`AGENTS.md`](../AGENTS.md) |
 
 A feature that ships on one channel only must say so in its owning doc and in the release-availability table in the same PR.

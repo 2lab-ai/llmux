@@ -683,6 +683,34 @@ fn login_api_and_codex_conflict_exits_2() {
     );
 }
 
+#[test]
+fn login_gemini_and_codex_conflict_exits_2() {
+    // docs/gemini/spec.md §R2: `--gemini` is one more mutually exclusive
+    // provider flag. clap rejects the pair before any login runs (no port
+    // bind, no browser), with usage error exit code 2.
+    let h = Harness::new();
+    h.seed_config(&config_json(39124, "[]"));
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["login", "--gemini", "--codex"]);
+        c
+    });
+    assert_eq!(
+        out.code,
+        Some(2),
+        "stdout: {} stderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("cannot be used with"),
+        "stderr: {}",
+        out.stderr
+    );
+    let cfg = h.read_config();
+    assert!(cfg["accounts"].as_array().unwrap().is_empty(), "{cfg}");
+}
+
 // ---------------------------------------------------------------------------
 // CLI-10 / CLI-11 — `import`.
 // ---------------------------------------------------------------------------
@@ -774,6 +802,138 @@ fn import_from_and_json_conflict_exits_2() {
         "stderr: {}",
         out.stderr
     );
+}
+
+/// Write an Antigravity CLI token store under `home`
+/// (`.gemini/antigravity-cli/antigravity-oauth-token`) whose `id_token`
+/// carries `email`.
+fn write_antigravity_store(home: &Path, email: &str) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    let dir = home.join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&dir).expect("create store dir");
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::json!({ "email": email }).to_string());
+    let store = serde_json::json!({
+        "token": {
+            "access_token": "ya29.CLI-STORE-AT",
+            "token_type": "Bearer",
+            "refresh_token": "1//CLI-STORE-RT",
+            // Long expired: the import never looks the project up (no
+            // network call from a test; eager lookup is unit-tested with a
+            // local mock in `src/cli/login.rs`).
+            "expiry": "2000-01-01T00:00:00Z"
+        },
+        "auth_method": "oauth",
+        "id_token": format!("{header}.{body}.sig")
+    });
+    std::fs::write(dir.join("antigravity-oauth-token"), store.to_string()).expect("write store");
+}
+
+#[test]
+fn import_probes_the_antigravity_store_under_home() {
+    // docs/gemini/spec.md §R2 / trace S5: a bare `llmux import` probes the
+    // Antigravity CLI store and upserts `gemini:{email}`; with an expired
+    // stored token the project stays empty (resolved on the first request,
+    // no lookup at import). `HOME` points into the
+    // tempdir, so the real ~/.claude / ~/.codex / ~/.gemini are never read.
+    let h = Harness::new();
+    h.seed_config(&config_json(39125, "[]"));
+    write_antigravity_store(h.dir.path(), "agy@example.com");
+
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.arg("import").env("HOME", h.dir.path());
+        c
+    });
+    assert_eq!(
+        out.code,
+        Some(0),
+        "stdout: {} stderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("Found Antigravity credentials at")
+            && out
+                .stdout
+                .contains(r#"Added account "gemini:agy@example.com""#),
+        "{}",
+        out.stdout
+    );
+    for secret in ["CLI-STORE-AT", "CLI-STORE-RT"] {
+        assert!(
+            !out.stdout.contains(secret) && !out.stderr.contains(secret),
+            "token value printed: stdout {} stderr {}",
+            out.stdout,
+            out.stderr
+        );
+    }
+
+    let cfg = h.read_config();
+    let accounts = cfg["accounts"].as_array().expect("accounts");
+    assert_eq!(accounts.len(), 1, "{cfg}");
+    assert_eq!(accounts[0]["name"], "gemini:agy@example.com", "{cfg}");
+    assert_eq!(accounts[0]["type"], "gemini", "{cfg}");
+    assert_eq!(accounts[0]["email"], "agy@example.com", "{cfg}");
+    assert_eq!(accounts[0]["refresh_token"], "1//CLI-STORE-RT", "{cfg}");
+    assert_eq!(accounts[0]["project_id"], "", "{cfg}");
+
+    // Re-import of the same store updates in place (dedup by email).
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.arg("import").env("HOME", h.dir.path());
+        c
+    });
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stdout
+            .contains(r#"Updated account "gemini:agy@example.com""#),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(h.read_config()["accounts"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn import_skips_a_malformed_antigravity_store_with_a_warning() {
+    // Same rule as the codex probe: a malformed store is a warning, never a
+    // crash; with nothing else to import the command fails cleanly and
+    // names the probed store path.
+    let h = Harness::new();
+    h.seed_config(&config_json(39126, "[]"));
+    let dir = h.dir.path().join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&dir).expect("create store dir");
+    std::fs::write(
+        dir.join("antigravity-oauth-token"),
+        r#"{"token":{"access_token":"ya29.BROKEN-AT"}}"#,
+    )
+    .expect("write store");
+
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.arg("import").env("HOME", h.dir.path());
+        c
+    });
+    assert_eq!(
+        out.code,
+        Some(1),
+        "stdout: {} stderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("antigravity-oauth-token: skipped"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("nothing to import"),
+        "stderr: {}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("BROKEN-AT"), "stderr: {}", out.stderr);
+    assert!(h.read_config()["accounts"].as_array().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------

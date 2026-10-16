@@ -12,6 +12,7 @@
 pub mod anthropic;
 pub mod claude_sdk;
 pub mod codex;
+pub mod gemini;
 pub mod grok;
 pub mod openrouter;
 pub mod responses;

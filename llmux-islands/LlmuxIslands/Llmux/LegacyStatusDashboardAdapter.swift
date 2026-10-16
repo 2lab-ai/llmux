@@ -350,6 +350,7 @@ enum LegacyStatusDashboardAdapter {
         switch nonemptyString(rawKind)?.lowercased() {
         case "codex": return "codex"
         case "grok": return "grok"
+        case "gemini": return "gemini"
         default: return "claude"
         }
     }

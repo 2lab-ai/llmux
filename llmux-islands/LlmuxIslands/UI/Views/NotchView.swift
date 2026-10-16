@@ -194,6 +194,7 @@ struct NotchView: View {
                     claudeCount: usageModel.claudeInFlight,
                     codexCount: usageModel.codexInFlight,
                     grokCount: usageModel.grokInFlight,
+                    geminiCount: usageModel.geminiInFlight,
                     signal: usageModel.glance,
                     active: isVisible
                 )

@@ -30,8 +30,10 @@ use crate::auth::claude_resets;
 use crate::auth::codex_usage::{
     self, CodexUsage, CodexUsageError, ResetCredit, ResetCredits, ResetEligibility,
 };
+use crate::auth::gemini_usage;
 use crate::auth::grok_usage::{self, GrokUsageError};
 use crate::config::{AccountCredential, Config};
+use crate::proxy::gemini_project::{self, GeminiProject};
 use crate::proxy::server::AppState;
 use crate::scheduler::{credential_identity, AccountFingerprint, AccountId};
 use crate::tui::ActivityEvent;
@@ -45,6 +47,13 @@ pub use crate::auth::codex_usage::ResetOutcome;
 const RESET_STATUS_UNKNOWN: &str =
     "reset-grant status unknown on this read (upstream throttled?); \
      the reset inventory shown is from the previous successful read";
+
+/// The refusal kind for a gemini account whose Cloud Code project is not
+/// resolved yet (offline import) and whose token cannot look it up right now
+/// (expired or inside the refresh-ahead margin): its quota read has nothing
+/// to address.
+const GEMINI_NO_PROJECT: &str =
+    "gemini: no usage source until its project is resolved (needs a fresh access token)";
 
 // ---------------------------------------------------------------------------
 // Wire types (shared by the HTTP handlers, the CLI and the TUI)
@@ -96,7 +105,8 @@ pub struct UsageControlDoc {
 pub struct RefreshResult {
     pub account: String,
     pub ok: bool,
-    /// `"codex"` / `"oauth"` — the usage source actually used.
+    /// `"codex"` / `"oauth"` / `"grok"` / `"gemini"` — the usage source
+    /// actually used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Sanitized failure text; never a credential, URL or raw body.
@@ -658,6 +668,10 @@ fn provider_of(credential: &AccountCredential) -> Option<&'static str> {
         // usage READ only — grok has no reset credits, so the redemption paths
         // keep refusing it via [`AppState::reset_target`].
         AccountCredential::Grok { .. } => Some("grok"),
+        // Gemini reads the Cloud Code model catalog (docs/gemini/spec.md
+        // §R6). A usage READ only, exactly like grok: no reset credits, so
+        // [`AppState::reset_target`] keeps refusing it.
+        AccountCredential::Gemini { .. } => Some("gemini"),
         _ => None,
     }
 }
@@ -877,7 +891,7 @@ impl AppState {
                 .snapshot()
                 .accounts
                 .iter()
-                .filter(|a| matches!(a.credential_kind, "codex" | "oauth" | "grok"))
+                .filter(|a| matches!(a.credential_kind, "codex" | "oauth" | "grok" | "gemini"))
                 .map(|a| a.id.0.clone())
                 .collect(),
         };
@@ -905,15 +919,56 @@ impl AppState {
     }
 
     async fn refresh_one(&self, account: &str) -> Result<RefreshResult, UsageControlError> {
-        let (target, provider) = self.supported_target(account)?;
+        let (mut target, provider) = self.supported_target(account)?;
         let _guard = self
             .usage_controls
             .try_lock(account)
             .ok_or_else(|| UsageControlError::Busy(account.to_string()))?;
-        let outcome = self.read_usage(&target).await;
+        let outcome = match self.resolve_gemini_project(&mut target).await {
+            Ok(()) => self.read_usage(&target).await,
+            Err(err) => Err(err),
+        };
         Ok(self
             .commit_refresh(account, provider, &target, outcome)
             .await)
+    }
+
+    /// A gemini account imported without its Cloud Code project but holding
+    /// a usable token gets the project resolved HERE, once — the shared
+    /// guarded write + persist the request path uses — so an operator who
+    /// only watches usage (and never sends a model request) still gets a
+    /// quota read. On success `target` carries the resolved credential and
+    /// its post-write fingerprint, so the reading lands on it. A lookup
+    /// failure or a re-login in flight writes nothing and becomes this
+    /// refresh's failure. No-op for every other account.
+    async fn resolve_gemini_project(&self, target: &mut Target) -> Result<(), UsageControlError> {
+        if !gemini_project::awaits_lookup(&target.credential) {
+            return Ok(());
+        }
+        let lookup = gemini_project::ProjectLookup {
+            client: &self.client,
+            upstream: &self.config.gemini.upstream,
+            user_agent: &self.config.gemini.user_agent,
+            pool: &self.pool,
+            config_path: self.config_path.as_deref(),
+        };
+        match gemini_project::ensure_project(&lookup, &target.id, &target.credential).await {
+            GeminiProject::Ready => Ok(()),
+            GeminiProject::Resolved {
+                credential,
+                fingerprint,
+            } => {
+                target.credential = credential;
+                target.fingerprint = fingerprint;
+                Ok(())
+            }
+            GeminiProject::Superseded => {
+                Err(UsageControlError::AccountChanged(target.id.0.clone()))
+            }
+            GeminiProject::Failed(err) => Err(UsageControlError::Upstream(
+                gemini_project::usage_failure_message(&err),
+            )),
+        }
     }
 
     /// [`Self::apply_refresh`] plus the persisted consequence of a DISCARDED
@@ -941,7 +996,9 @@ impl AppState {
 
     /// The provider-specific GET. Codex reads WHAM (which also carries the
     /// reset counters); Anthropic oauth reuses the existing usage helper; grok
-    /// reads the xAI CLI billing endpoint (weekly allowance → the 7d gauge).
+    /// reads the xAI CLI billing endpoint (weekly allowance → the 7d gauge);
+    /// gemini reads the Cloud Code model catalog (default model's quota → the
+    /// 7d gauge).
     async fn read_usage(&self, target: &Target) -> Result<CodexUsage, UsageControlError> {
         match &target.credential {
             AccountCredential::Codex {
@@ -1020,6 +1077,39 @@ impl AppState {
                 },
                 _ => UsageControlError::Upstream(err.sanitized()),
             }),
+            AccountCredential::Gemini {
+                access_token,
+                project_id,
+                ..
+            } => {
+                // Still no Cloud Code project: the token was not usable for
+                // the lookup in `resolve_gemini_project` (expired or about
+                // to be refreshed — a usage read never refreshes). No usage
+                // source to read: refused before any IO, like an underivable
+                // grok upstream — the failure envelope retains every previous
+                // observation, so an unread quota is never reported as 0%.
+                if project_id.is_empty() {
+                    return Err(UsageControlError::Unsupported {
+                        account: target.id.0.clone(),
+                        kind: GEMINI_NO_PROJECT.into(),
+                    });
+                }
+                gemini_usage::fetch_quota(
+                    &self.client,
+                    &self.config.gemini.upstream,
+                    &self.config.gemini.user_agent,
+                    access_token,
+                    project_id,
+                )
+                .await
+                .map(|quota| CodexUsage {
+                    // No reset credits on gemini either: the counters stay
+                    // UNKNOWN (never 0).
+                    usage: quota.usage,
+                    ..Default::default()
+                })
+                .map_err(|err| UsageControlError::Upstream(err.sanitized()))
+            }
             other => Err(UsageControlError::Unsupported {
                 account: target.id.0.clone(),
                 kind: other.kind().to_string(),
@@ -1163,7 +1253,7 @@ impl AppState {
 
     /// An account whose provider has reset entitlements: codex (WHAM reset
     /// credits) or Claude oauth (usage-limit reset grants). Everything else
-    /// (api key, grok, openrouter) is refused with 422 before any IO.
+    /// (api key, grok, gemini, openrouter) is refused with 422 before any IO.
     fn reset_target(&self, account: &str) -> Result<Target, UsageControlError> {
         let target = self.target(account)?;
         if !matches!(
@@ -1776,5 +1866,514 @@ mod tests {
         assert_eq!(uncertain.status(), http::StatusCode::BAD_GATEWAY);
         assert_eq!(uncertain.body()["request_id"], "rid-2");
         assert!(uncertain.to_string().contains("rid-2"));
+    }
+
+    // ---- gemini usage source (docs/gemini/spec.md §R6) ----
+    //
+    // Driven on `AppState` directly, never through `serve`: `serve` primes the
+    // background poller, which is not this module's subject.
+
+    const GEMINI_USER_AGENT: &str = "antigravity/test";
+
+    /// `fetchAvailableModels` in its live shape (2026-10-15) with synthetic
+    /// values: the default agent model is 25% spent.
+    const GEMINI_QUOTA: &str = r#"{"models":{"gemini-3.8-flash-high":{"displayName":"Gemini 3.8 Flash","quotaInfo":{"remainingFraction":0.75,"resetTime":"2099-10-22T01:50:24Z"}}},"defaultAgentModelId":"gemini-3.8-flash-high"}"#;
+
+    /// What the quota mock saw per request: `(path, authorization,
+    /// user-agent, body)`.
+    type GeminiSeen = (String, Option<String>, Option<String>, String);
+
+    /// A local Cloud Code stand-in answering every request with `reply`.
+    async fn spawn_gemini_mock(
+        status: u16,
+        reply: &'static str,
+    ) -> (String, Arc<Mutex<Vec<GeminiSeen>>>) {
+        spawn_gemini_router(move |_path: &str| (status, reply)).await
+    }
+
+    /// A local Cloud Code stand-in answering each request with `route(path)`,
+    /// recording every request it saw.
+    async fn spawn_gemini_router<F>(route: F) -> (String, Arc<Mutex<Vec<GeminiSeen>>>)
+    where
+        F: Fn(&str) -> (u16, &'static str) + Clone + Send + Sync + 'static,
+    {
+        let seen: Arc<Mutex<Vec<GeminiSeen>>> = Arc::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |uri: http::Uri, headers: http::HeaderMap, body: String| {
+                let recorder = recorder.clone();
+                let route = route.clone();
+                async move {
+                    let header = |name: http::header::HeaderName| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    recorder.lock().unwrap().push((
+                        uri.path().to_string(),
+                        header(http::header::AUTHORIZATION),
+                        header(http::header::USER_AGENT),
+                        body,
+                    ));
+                    let (status, reply) = route(uri.path());
+                    (http::StatusCode::from_u16(status).unwrap(), reply)
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// A gemini account; `project` empty = not yet resolved (offline import).
+    fn gemini_account(name: &str, project: &str) -> crate::config::AccountConfig {
+        crate::config::AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Gemini {
+                email: "m@example.com".into(),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms: 0,
+                project_id: project.to_string(),
+                last_refresh_ms: None,
+            },
+        }
+    }
+
+    /// [`gemini_account`] whose access token is valid for another hour — the
+    /// request path would use it as-is, so a usage read may too.
+    fn live_gemini_account(name: &str, project: &str) -> crate::config::AccountConfig {
+        let mut account = gemini_account(name, project);
+        if let AccountCredential::Gemini { expires_at_ms, .. } = &mut account.credential {
+            *expires_at_ms = now_ms() + 3_600_000;
+        }
+        account
+    }
+
+    fn apikey_account(name: &str) -> crate::config::AccountConfig {
+        crate::config::AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Apikey {
+                api_key: format!("sk-ant-{name}"),
+            },
+        }
+    }
+
+    /// A daemon state whose gemini upstream is the mock. The receipt file is
+    /// unset so no test can reach the operator's real state directory.
+    fn gemini_state(
+        upstream: &str,
+        accounts: Vec<crate::config::AccountConfig>,
+    ) -> (AppState, crate::scheduler::AccountPool) {
+        let mut config = Config {
+            accounts,
+            ..Default::default()
+        };
+        config.gemini.upstream = upstream.to_string();
+        config.gemini.user_agent = GEMINI_USER_AGENT.to_string();
+        let pool = crate::scheduler::AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool.clone(), None, None).expect("state");
+        state.usage_control_state_path = None;
+        // `AppState::new` defaults to the operator's live config file: a
+        // resolved project must never be persisted there from a test.
+        state.config_path = None;
+        (state, pool)
+    }
+
+    /// Self-cleaning unique temp dir (no tempfile dev-dependency).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "llmux-usage-controls-test-{}-{}",
+                std::process::id(),
+                ulid::Ulid::new()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// [`gemini_state`] persisting into `dir/llmux.json`, seeded with the
+    /// same accounts — the read-merge-write target of a resolved project.
+    fn persisted_gemini_state(
+        upstream: &str,
+        accounts: Vec<crate::config::AccountConfig>,
+        dir: &TempDir,
+    ) -> (AppState, crate::scheduler::AccountPool, std::path::PathBuf) {
+        let (mut state, pool) = gemini_state(upstream, accounts);
+        let path = dir.path().join("llmux.json");
+        crate::config::save_path(&path, &state.config).expect("seed config");
+        state.config_path = Some(path.clone());
+        (state, pool, path)
+    }
+
+    /// The `project_id` a gemini credential carries.
+    fn project_of(credential: &AccountCredential) -> String {
+        match credential {
+            AccountCredential::Gemini { project_id, .. } => project_id.clone(),
+            other => panic!("expected a gemini credential, got {other:?}"),
+        }
+    }
+
+    /// The project persisted for account `name` in the config at `path`.
+    fn persisted_project(path: &std::path::Path, name: &str) -> String {
+        let config = crate::config::load_path(path).expect("config");
+        let row = config
+            .accounts
+            .iter()
+            .find(|a| a.name == name)
+            .expect("account row");
+        project_of(&row.credential)
+    }
+
+    fn seven_day(pool: &crate::scheduler::AccountPool, name: &str) -> Option<f64> {
+        pool.snapshot()
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == name)
+            .and_then(|a| a.seven_day)
+            .map(|w| w.utilization)
+    }
+
+    fn weekly(utilization: f64) -> crate::scheduler::usage::UsageSnapshot {
+        crate::scheduler::usage::UsageSnapshot {
+            seven_day: Some(crate::scheduler::headers::WindowReading {
+                utilization,
+                resets_at: SystemTime::now() + std::time::Duration::from_secs(3_600),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// An explicit refresh reads the Cloud Code model catalog with the
+    /// configured user agent, the account's token and its project, and the
+    /// default model's quota lands on the 7d gauge (1 − 0.75 = 0.25).
+    #[tokio::test]
+    async fn gemini_refresh_reads_the_quota_catalog_into_the_seven_day_gauge() {
+        let (upstream, seen) = spawn_gemini_mock(200, GEMINI_QUOTA).await;
+        let (state, pool) = gemini_state(&upstream, vec![gemini_account("gemini:m", "proj-m")]);
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("refresh accepted");
+
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.results[0].provider.as_deref(), Some("gemini"));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (path, authorization, user_agent, body) = &seen[0];
+        assert_eq!(path, "/v1internal:fetchAvailableModels");
+        assert_eq!(authorization.as_deref(), Some("Bearer at-gemini:m"));
+        assert_eq!(user_agent.as_deref(), Some(GEMINI_USER_AGENT));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).expect("json body"),
+            serde_json::json!({"project": "proj-m"})
+        );
+        let utilization = seven_day(&pool, "gemini:m").expect("7d gauge");
+        assert!((utilization - 0.25).abs() < 1e-9, "{utilization}");
+    }
+
+    /// The all-accounts refresh includes gemini; an apikey account (no usage
+    /// source) stays excluded.
+    #[tokio::test]
+    async fn refresh_without_an_account_includes_gemini() {
+        let (upstream, seen) = spawn_gemini_mock(200, GEMINI_QUOTA).await;
+        let (state, pool) = gemini_state(
+            &upstream,
+            vec![gemini_account("gemini:m", "proj-m"), apikey_account("k")],
+        );
+
+        let response = state.refresh_usage(None).await.expect("refresh accepted");
+
+        let accounts: Vec<&str> = response
+            .results
+            .iter()
+            .map(|r| r.account.as_str())
+            .collect();
+        assert_eq!(accounts, vec!["gemini:m"], "{response:?}");
+        assert!(response.ok, "{response:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seven_day(&pool, "gemini:m").is_some());
+    }
+
+    /// No project yet and no usable token to look one up with (expired —
+    /// a usage read never refreshes): no usage source yet. Refused BEFORE any
+    /// IO through the per-account failure envelope, and the previous reading
+    /// is kept — never replaced by a fabricated 0%.
+    #[tokio::test]
+    async fn gemini_refresh_without_a_project_is_refused_without_io() {
+        let (upstream, seen) = spawn_gemini_mock(200, GEMINI_QUOTA).await;
+        let (state, pool) = gemini_state(&upstream, vec![gemini_account("gemini:m", "")]);
+        pool.record_usage(
+            &AccountId("gemini:m".into()),
+            &weekly(0.4),
+            SystemTime::now(),
+        );
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("an envelope, not a hard error");
+
+        assert!(!response.ok, "{response:?}");
+        let result = &response.results[0];
+        assert_eq!(result.provider.as_deref(), Some("gemini"));
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("no usage source"), "{error}");
+        assert_eq!(
+            result
+                .usage_control
+                .as_ref()
+                .and_then(|doc| doc.last_error.as_deref()),
+            Some(error),
+            "the reason is retained on the control doc"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no request left the process"
+        );
+        assert_eq!(
+            seven_day(&pool, "gemini:m"),
+            Some(0.4),
+            "unknown is never zero"
+        );
+    }
+
+    /// `loadCodeAssist` naming the account's project (live shape).
+    const GEMINI_PROJECT: &str =
+        r#"{"cloudaicompanionProject":"proj-lazy","currentTier":{"id":"standard-tier"}}"#;
+
+    /// Routes `loadCodeAssist` to [`GEMINI_PROJECT`], everything else to
+    /// [`GEMINI_QUOTA`].
+    fn project_then_quota(path: &str) -> (u16, &'static str) {
+        if path == "/v1internal:loadCodeAssist" {
+            (200, GEMINI_PROJECT)
+        } else {
+            (200, GEMINI_QUOTA)
+        }
+    }
+
+    /// An account imported without a project but holding a usable token (the
+    /// operator never sends a model request, so the request path never
+    /// resolves it): the refresh resolves the project ONCE with the account's
+    /// token and identity, applies + persists it, and reads the quota on it.
+    /// A second refresh goes straight to the quota read.
+    #[tokio::test]
+    async fn gemini_refresh_resolves_a_missing_project_once_then_reads_quota() {
+        let (upstream, seen) = spawn_gemini_router(project_then_quota).await;
+        let dir = TempDir::new();
+        let (state, pool, path) =
+            persisted_gemini_state(&upstream, vec![live_gemini_account("gemini:m", "")], &dir);
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("refresh accepted");
+
+        assert!(response.ok, "{response:?}");
+        let calls = seen.lock().unwrap().clone();
+        let paths: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/v1internal:loadCodeAssist",
+                "/v1internal:fetchAvailableModels"
+            ],
+            "one lookup, then the quota read — no model traffic"
+        );
+        for (_, authorization, user_agent, _) in &calls {
+            assert_eq!(authorization.as_deref(), Some("Bearer at-gemini:m"));
+            assert_eq!(user_agent.as_deref(), Some(GEMINI_USER_AGENT));
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[1].3).expect("json body"),
+            serde_json::json!({"project": "proj-lazy"}),
+            "the quota read addresses the resolved project"
+        );
+        let utilization = seven_day(&pool, "gemini:m").expect("7d gauge");
+        assert!((utilization - 0.25).abs() < 1e-9, "{utilization}");
+        let live = pool
+            .credential(&AccountId("gemini:m".into()))
+            .expect("account");
+        assert_eq!(project_of(&live), "proj-lazy", "applied to the pool");
+        assert_eq!(
+            persisted_project(&path, "gemini:m"),
+            "proj-lazy",
+            "persisted"
+        );
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("refresh accepted");
+        assert!(response.ok, "{response:?}");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(
+            paths.last().map(String::as_str),
+            Some("/v1internal:fetchAvailableModels")
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| *p == "/v1internal:loadCodeAssist")
+                .count(),
+            1,
+            "resolved once: {paths:?}"
+        );
+    }
+
+    /// A re-login lands while the lookup is in flight: the resolved project
+    /// belongs to the RETIRED credential, so nothing is written — not to the
+    /// pool, not to disk — and no quota is read for it.
+    #[tokio::test]
+    async fn gemini_refresh_project_superseded_by_a_relogin_writes_nothing() {
+        let slot: Arc<Mutex<Option<crate::scheduler::AccountPool>>> = Arc::default();
+        let relogin = AccountCredential::Gemini {
+            email: "m@example.com".into(),
+            access_token: "at-relogin".into(),
+            refresh_token: "rt-relogin".into(),
+            expires_at_ms: now_ms() + 3_600_000,
+            project_id: String::new(),
+            last_refresh_ms: None,
+        };
+        let route = {
+            let slot = slot.clone();
+            let relogin = relogin.clone();
+            move |path: &str| {
+                if path == "/v1internal:loadCodeAssist" {
+                    if let Some(pool) = slot.lock().unwrap().as_ref() {
+                        pool.update_credential(&AccountId("gemini:m".into()), relogin.clone());
+                    }
+                    (200, GEMINI_PROJECT)
+                } else {
+                    (200, GEMINI_QUOTA)
+                }
+            }
+        };
+        let (upstream, seen) = spawn_gemini_router(route).await;
+        let dir = TempDir::new();
+        let (state, pool, path) =
+            persisted_gemini_state(&upstream, vec![live_gemini_account("gemini:m", "")], &dir);
+        *slot.lock().unwrap() = Some(pool.clone());
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("an envelope, not a hard error");
+
+        assert!(!response.ok, "{response:?}");
+        let error = response.results[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("replaced or removed"), "{error}");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(paths, ["/v1internal:loadCodeAssist"], "no quota read");
+        assert_eq!(
+            pool.credential(&AccountId("gemini:m".into())),
+            Some(relogin),
+            "the re-login's credential is untouched"
+        );
+        assert_eq!(persisted_project(&path, "gemini:m"), "", "disk untouched");
+        assert_eq!(seven_day(&pool, "gemini:m"), None, "unknown is never zero");
+    }
+
+    /// The lookup failing rides the sanitized failure envelope naming the
+    /// step: no quota read, no project, no bench, never the upstream body.
+    #[tokio::test]
+    async fn gemini_refresh_project_lookup_failure_is_sanitized_and_writes_nothing() {
+        let (upstream, seen) = spawn_gemini_router(|_path: &str| {
+            (403, r#"{"error":{"code":403,"message":"leak-me"}}"#)
+        })
+        .await;
+        let dir = TempDir::new();
+        let (state, pool, path) =
+            persisted_gemini_state(&upstream, vec![live_gemini_account("gemini:m", "")], &dir);
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("an envelope, not a hard error");
+
+        assert!(!response.ok, "{response:?}");
+        let error = response.results[0].error.as_deref().unwrap_or_default();
+        assert_eq!(
+            error,
+            "gemini project lookup (loadCodeAssist) failed: 403 Forbidden"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "one lookup, no quota read");
+        assert_eq!(persisted_project(&path, "gemini:m"), "");
+        assert_eq!(seven_day(&pool, "gemini:m"), None, "unknown is never zero");
+        assert!(pool.snapshot().accounts[0].healthy, "never benched");
+    }
+
+    /// A failed quota read rides the sanitized failure envelope: the status
+    /// phrase, never the upstream body or the bearer token.
+    #[tokio::test]
+    async fn gemini_refresh_failure_is_sanitized() {
+        let (upstream, _seen) =
+            spawn_gemini_mock(403, r#"{"error":{"code":403,"message":"leak-me"}}"#).await;
+        let (state, pool) = gemini_state(&upstream, vec![gemini_account("gemini:m", "proj-m")]);
+
+        let response = state
+            .refresh_usage(Some("gemini:m"))
+            .await
+            .expect("an envelope, not a hard error");
+
+        assert!(!response.ok);
+        let error = response.results[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(
+            !error.contains("leak-me") && !error.contains("at-gemini:m"),
+            "{error}"
+        );
+        assert_eq!(seven_day(&pool, "gemini:m"), None, "unknown is never zero");
+        assert!(
+            pool.snapshot().accounts[0].healthy,
+            "a quota read never benches"
+        );
+    }
+
+    /// Gemini is read-only: no reset credits to list or redeem. Both refuse
+    /// with 422 before any IO.
+    #[tokio::test]
+    async fn gemini_has_no_reset_credits_to_list_or_redeem() {
+        let (upstream, seen) = spawn_gemini_mock(200, GEMINI_QUOTA).await;
+        let (state, _pool) = gemini_state(&upstream, vec![gemini_account("gemini:m", "proj-m")]);
+
+        let listed = state.reset_credits("gemini:m").await;
+        assert_eq!(
+            listed.err().map(|e| e.status()),
+            Some(http::StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        let redeemed = state
+            .consume_reset(&ConsumeRequest {
+                account: "gemini:m".into(),
+                redeem_request_id: "rid-1".into(),
+                credit_id: None,
+                confirm: true,
+            })
+            .await;
+        assert_eq!(
+            redeemed.err().map(|e| e.status()),
+            Some(http::StatusCode::UNPROCESSABLE_ENTITY)
+        );
+        assert!(seen.lock().unwrap().is_empty(), "refused before any IO");
     }
 }

@@ -152,6 +152,26 @@ pub async fn list(args: AccountsArgs, remote: Option<String>) -> Result<(), CliE
                     );
                 }
             }
+            AccountCredential::Gemini {
+                email,
+                expires_at_ms,
+                project_id,
+                ..
+            } => {
+                println!("  [{}] {} (gemini)", i + 1, account.name);
+                if args.verbose {
+                    if !email.is_empty() {
+                        println!("       Email:   {email}");
+                    }
+                    if !project_id.is_empty() {
+                        println!("       Project: {project_id}");
+                    }
+                    println!(
+                        "       Token: {}",
+                        describe_expiry(*expires_at_ms, now_ms())
+                    );
+                }
+            }
         }
     }
     Ok(())

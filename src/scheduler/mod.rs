@@ -895,6 +895,7 @@ impl PoolState {
                     token_expires_at_ms: match &a.credential {
                         AccountCredential::Oauth { expires_at_ms, .. }
                         | AccountCredential::Codex { expires_at_ms, .. }
+                        | AccountCredential::Gemini { expires_at_ms, .. }
                             if *expires_at_ms > 0 =>
                         {
                             Some(*expires_at_ms)
@@ -1006,9 +1007,10 @@ pub struct AccountSnapshot {
     pub cooldown_until: Option<SystemTime>,
     pub cooldown_source: Option<CooldownSource>,
     pub in_flight: u32,
-    /// OAuth access-token expiry (epoch ms) for the dashboard's token-health
-    /// column; `None` for API-key accounts and for oauth accounts whose
-    /// expiry is unknown (`expires_at_ms == 0`).
+    /// Access-token expiry (epoch ms) for the dashboard's token-health
+    /// column — anthropic oauth, codex and gemini; `None` for API-key (and
+    /// grok/openrouter) accounts and when the expiry is unknown
+    /// (`expires_at_ms == 0`).
     pub token_expires_at_ms: Option<u64>,
     /// When the access token was last successfully refreshed (epoch ms);
     /// `None` for API-key accounts and never-refreshed oauth accounts —
@@ -1780,6 +1782,47 @@ mod tests {
             seven_day: seven,
             scoped: Vec::new(),
         }
+    }
+
+    /// Status / dashboard expiry column: gemini tokens (~1h) show their
+    /// expiry like oauth and codex; an unknown (`0`) expiry stays `None`, and
+    /// grok is unchanged (not reported).
+    #[test]
+    fn snapshot_reports_gemini_token_expiry_when_known() {
+        let gemini = |name: &str, expires_at_ms: u64| AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Gemini {
+                email: format!("{name}@example.com"),
+                access_token: format!("at-{name}"),
+                refresh_token: format!("rt-{name}"),
+                expires_at_ms,
+                project_id: "proj".to_string(),
+                last_refresh_ms: None,
+            },
+        };
+        let grok = AccountConfig {
+            name: "x".to_string(),
+            credential: AccountCredential::Grok {
+                subject: "sub-x".to_string(),
+                access_token: "at-x".to_string(),
+                refresh_token: "rt-x".to_string(),
+                expires_at_ms: 1_003_600_000,
+                token_endpoint: String::new(),
+                last_refresh_ms: None,
+            },
+        };
+        let pool = AccountPool::new(&[gemini("g", 1_003_600_000), gemini("u", 0), grok]);
+        let snapshot = pool.snapshot();
+        let expiry = |name: &str| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id.0 == name)
+                .map(|a| a.token_expires_at_ms)
+        };
+        assert_eq!(expiry("g"), Some(Some(1_003_600_000)));
+        assert_eq!(expiry("u"), Some(None), "unknown expiry is not zero");
+        assert_eq!(expiry("x"), Some(None), "grok unchanged");
     }
 
     /// `.prd/16-codex-usage-controls.md` §Account identity/generation safety.

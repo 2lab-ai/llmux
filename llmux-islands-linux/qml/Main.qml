@@ -254,6 +254,7 @@ Kirigami.ApplicationWindow {
         case "claude": return qsTr("Claude")
         case "codex": return qsTr("Codex")
         case "grok": return qsTr("Grok")
+        case "gemini": return qsTr("Gemini")
         case "api": return qsTr("API")
         default: return String(provider)
         }

@@ -94,7 +94,7 @@ pub enum Command {
     /// Add an account via browser OAuth (or paste an API key with --api).
     Login(LoginArgs),
     /// Import accounts from teamclaude config, ~/.claude/.credentials.json,
-    /// or inline JSON.
+    /// ~/.codex/auth.json, the Antigravity CLI token store, or inline JSON.
     Import(ImportArgs),
     /// Print shell exports for Claude Code (or Codex with --codex).
     Env(EnvArgs),
@@ -194,6 +194,11 @@ pub struct LoginArgs {
     /// exchange yields a long-lived `sk-or-v1-…` key (no refresh).
     #[arg(long, conflicts_with_all = ["api", "codex", "grok"])]
     pub openrouter: bool,
+    /// Add a Google Gemini (Antigravity subscription) account via the Google
+    /// OAuth browser flow (localhost:51121 callback); falls back to importing
+    /// the Antigravity CLI token store.
+    #[arg(long, conflicts_with_all = ["api", "codex", "grok", "openrouter"])]
+    pub gemini: bool,
     /// With `--openrouter`: paste an existing API key instead of opening a
     /// browser (also the automatic fallback when no browser is available).
     #[arg(long, requires = "openrouter")]
@@ -889,6 +894,7 @@ mod tests {
                 codex: false,
                 grok: false,
                 openrouter: false,
+                gemini: false,
                 paste: false,
             })),
             Some("login")
@@ -1031,5 +1037,30 @@ mod tests {
         assert!(msg.contains("llmux-host:3456"), "{msg}");
         assert!(msg.contains("--remote"), "{msg}");
         assert!(msg.contains("remote.host"), "{msg}");
+    }
+
+    /// `login --gemini` parses on its own and, like every other provider
+    /// flag, is mutually exclusive with the rest (docs/gemini/spec.md §R2).
+    #[test]
+    fn login_gemini_parses_and_conflicts_with_every_other_provider() {
+        use clap::Parser as _;
+        let Command::Login(args) = Cli::try_parse_from(["llmux", "login", "--gemini"])
+            .expect("parse")
+            .command
+        else {
+            panic!("expected login");
+        };
+        assert!(args.gemini);
+        assert!(!(args.api || args.codex || args.grok || args.openrouter || args.paste));
+
+        for other in ["--api", "--codex", "--grok", "--openrouter"] {
+            let err = Cli::try_parse_from(["llmux", "login", "--gemini", other])
+                .expect_err("--gemini must conflict");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "--gemini {other}: {err}"
+            );
+        }
     }
 }

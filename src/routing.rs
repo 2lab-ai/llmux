@@ -2,13 +2,16 @@
 //!
 //! An inbound Anthropic Messages request names a `model`; this module maps
 //! that name to a [`BackendGroup`] — the pool of accounts that can serve it.
-//! Four groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
+//! Five groups exist: [`BackendGroup::Claude`] (oauth + apikey accounts,
 //! served by the Anthropic provider), [`BackendGroup::Codex`] (chatgpt
 //! oauth accounts, served by the codex provider), [`BackendGroup::Grok`]
-//! (xAI grok oauth accounts, served by the grok provider), and
+//! (xAI grok oauth accounts, served by the grok provider),
 //! [`BackendGroup::OpenRouter`] (OpenRouter API-key accounts, served by the
 //! openrouter provider — a passthrough, NOT a translator, because OpenRouter
-//! exposes a native Anthropic Messages endpoint; docs/openrouter/spec.md).
+//! exposes a native Anthropic Messages endpoint; docs/openrouter/spec.md), and
+//! [`BackendGroup::Gemini`] (Google Antigravity oauth accounts, served by the
+//! gemini provider — a translator, Messages ↔ Cloud Code `v1internal`;
+//! docs/gemini/spec.md).
 //! The scheduler then picks the best eligible account *within* that group,
 //! sticky per group.
 //!
@@ -20,39 +23,48 @@
 /// Which backend pool an account belongs to / a model routes to.
 ///
 /// `Ord` is derived so the group can key a `BTreeMap` (per-group stickiness)
-/// with a stable, total order: `Claude < Codex < Grok < OpenRouter`. That
-/// order also makes `Claude` the representative group when a scalar must be
-/// chosen (status output picks the claude slot first) and fixes the
-/// `on_empty_group` fallback scan order (docs/grok/spec.md §R5). OpenRouter is
-/// appended LAST precisely so neither of those established behaviors moves.
+/// with a stable, total order: `Claude < Codex < Grok < OpenRouter < Gemini`.
+/// That order also makes `Claude` the representative group when a scalar must
+/// be chosen (status output picks the claude slot first) and fixes the
+/// `on_empty_group` fallback scan order (docs/grok/spec.md §R5). OpenRouter
+/// and then Gemini were each appended LAST precisely so neither of those
+/// established behaviors moves (docs/gemini/spec.md §R1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BackendGroup {
     Claude,
     Codex,
     Grok,
     OpenRouter,
+    Gemini,
 }
 
 impl BackendGroup {
     /// Group an account belongs to, derived from its credential `kind`
-    /// (`"oauth" | "apikey" | "codex" | "grok" | "openrouter"` — see
-    /// [`crate::config::AccountCredential::kind`]). Codex credentials are the
-    /// Codex group, grok credentials the Grok group, openrouter credentials
-    /// the OpenRouter group; everything else is Claude.
+    /// (`"oauth" | "apikey" | "codex" | "grok" | "openrouter" | "gemini"` —
+    /// see [`crate::config::AccountCredential::kind`]). Codex credentials are
+    /// the Codex group, grok credentials the Grok group, openrouter
+    /// credentials the OpenRouter group, gemini credentials the Gemini group;
+    /// everything else is Claude.
     pub fn from_kind(kind: &str) -> Self {
         match kind {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
             "openrouter" => Self::OpenRouter,
+            "gemini" => Self::Gemini,
             _ => Self::Claude,
         }
     }
 
     /// Every group, in the canonical `Ord` order
-    /// (`Claude < Codex < Grok < OpenRouter`). Single source for "scan all
-    /// groups" loops (fallback resolution, status rendering).
-    pub const ALL: &'static [BackendGroup] =
-        &[Self::Claude, Self::Codex, Self::Grok, Self::OpenRouter];
+    /// (`Claude < Codex < Grok < OpenRouter < Gemini`). Single source for
+    /// "scan all groups" loops (fallback resolution, status rendering).
+    pub const ALL: &'static [BackendGroup] = &[
+        Self::Claude,
+        Self::Codex,
+        Self::Grok,
+        Self::OpenRouter,
+        Self::Gemini,
+    ];
 
     /// Lowercase label for logs / status output.
     pub fn as_str(self) -> &'static str {
@@ -61,6 +73,7 @@ impl BackendGroup {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::OpenRouter => "openrouter",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -72,23 +85,25 @@ impl BackendGroup {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
             "openrouter" => Self::OpenRouter,
+            "gemini" => Self::Gemini,
             _ => Self::Claude,
         }
     }
 
     /// Whether this group's provider must TRANSLATE the Anthropic Messages
     /// body into a foreign wire format (and its stream back) — codex and grok
-    /// (Messages↔Responses + an SSE converter). Claude is the native upstream;
+    /// (Messages↔Responses + an SSE converter) and gemini (Messages ↔ the
+    /// Cloud Code `v1internal` envelope + its SSE). Claude is the native upstream;
     /// OpenRouter serves the Anthropic Messages format natively too
     /// (docs/openrouter/spec.md), so both are byte-level passthroughs.
     ///
-    /// Exhaustive on purpose: a fifth group is a COMPILE ERROR here rather
+    /// Exhaustive on purpose: a new group is a COMPILE ERROR here rather
     /// than a silent default. Getting this wrong is body corruption, not
     /// degradation — a native-Messages backend wrongly marked as translating
     /// would have its payload run through the Responses converter.
     pub fn needs_body_translation(self) -> bool {
         match self {
-            Self::Codex | Self::Grok => true,
+            Self::Codex | Self::Grok | Self::Gemini => true,
             Self::Claude | Self::OpenRouter => false,
         }
     }
@@ -106,7 +121,7 @@ impl BackendGroup {
     /// exhaustive.
     pub fn serves_messages_only(self) -> bool {
         match self {
-            Self::Codex | Self::Grok | Self::OpenRouter => true,
+            Self::Codex | Self::Grok | Self::OpenRouter | Self::Gemini => true,
             Self::Claude => false,
         }
     }
@@ -219,8 +234,27 @@ fn builtin_openrouter_rules() -> Vec<Rule> {
     ]
 }
 
-/// Compiled model→group classifier. First-match-wins over the codex rules
-/// then the claude rules; an unmatched (or absent) model falls back to
+/// Builtin gemini rules (docs/gemini/spec.md §R1): the `gemini` prefix covers
+/// the bare family alias (`gemini`) and every Antigravity id
+/// (`gemini-3.8-flash-high`, `gemini-4-argon`, …); the bare `argon` alias
+/// carries no `gemini` prefix and therefore NEEDS its exact rule (same reason
+/// as codex's bare `sol` / `astra`).
+///
+/// Disjoint from the other builtin families (pinned in the unit tests below):
+/// no codex/claude/grok/openrouter rule matches `gemini…` or `argon`, and
+/// neither gemini rule matches any of their ids. OpenRouter's own
+/// `or-google/gemini-…` slugs stay OpenRouter's — the `or-` anchor is checked
+/// first in [`Classifier::classify`].
+fn builtin_gemini_rules() -> Vec<Rule> {
+    vec![
+        Rule::Prefix("gemini".to_string()),
+        Rule::Exact("argon".to_string()),
+    ]
+}
+
+/// Compiled model→group classifier. First-match-wins over the openrouter,
+/// codex, claude, grok and gemini rules (in that order, see
+/// [`Self::classify`]); an unmatched (or absent) model falls back to
 /// `default_group`. Built from config overrides when present, else builtins.
 #[derive(Debug, Clone)]
 pub struct Classifier {
@@ -228,6 +262,7 @@ pub struct Classifier {
     claude_rules: Vec<Rule>,
     grok_rules: Vec<Rule>,
     openrouter_rules: Vec<Rule>,
+    gemini_rules: Vec<Rule>,
     default_group: BackendGroup,
 }
 
@@ -241,6 +276,7 @@ impl Default for Classifier {
             claude_rules: builtin_claude_rules(),
             grok_rules: builtin_grok_rules(),
             openrouter_rules: builtin_openrouter_rules(),
+            gemini_rules: builtin_gemini_rules(),
             default_group: BackendGroup::Claude,
         }
     }
@@ -257,6 +293,7 @@ impl Classifier {
         codex_models: &[String],
         grok_models: &[String],
         openrouter_models: &[String],
+        gemini_models: &[String],
         default_group: &str,
     ) -> Self {
         let claude_rules = if claude_models.is_empty() {
@@ -279,11 +316,17 @@ impl Classifier {
         } else {
             openrouter_models.iter().map(|m| Rule::parse(m)).collect()
         };
+        let gemini_rules = if gemini_models.is_empty() {
+            builtin_gemini_rules()
+        } else {
+            gemini_models.iter().map(|m| Rule::parse(m)).collect()
+        };
         Self {
             codex_rules,
             claude_rules,
             grok_rules,
             openrouter_rules,
+            gemini_rules,
             // One label→group parser for the whole crate
             // ([`BackendGroup::from_label`]): a second hand-rolled map here
             // means every new group must be added twice, and missing THIS one
@@ -313,11 +356,14 @@ impl Classifier {
     /// `default_group` (the wrong backend).
     ///
     /// `None` (no model in the body) routes to the configured default group.
-    /// Codex rules are checked first, then claude, then grok; an unrecognized
-    /// model falls back to `default_group`. (The rule families are disjoint by
-    /// construction — `gpt-`/`o*` vs Anthropic names vs `grok` — so the check
-    /// order only decides ties a user creates with overlapping config
-    /// overrides.)
+    /// OpenRouter rules are checked first (see the comment below), then codex,
+    /// claude, grok and gemini; an unrecognized model falls back to
+    /// `default_group`. (Apart from the openrouter/codex pair the rule
+    /// families are disjoint by construction — `gpt-`/`o*` vs Anthropic names
+    /// vs `grok` vs `gemini`/`argon` — so the check order only decides ties a
+    /// user creates with overlapping config overrides. Gemini is checked LAST,
+    /// appended like its group's `Ord` position, so no existing override's
+    /// tie-break moves.)
     pub fn classify(&self, model: Option<&str>) -> BackendGroup {
         let Some(model) = model else {
             return self.default_group;
@@ -345,6 +391,9 @@ impl Classifier {
         }
         if self.grok_rules.iter().any(|r| r.matches(&lower)) {
             return BackendGroup::Grok;
+        }
+        if self.gemini_rules.iter().any(|r| r.matches(&lower)) {
+            return BackendGroup::Gemini;
         }
         self.default_group
     }
@@ -441,7 +490,7 @@ mod tests {
 
     #[test]
     fn from_label_is_inverse_of_as_str() {
-        for g in [BackendGroup::Claude, BackendGroup::Codex] {
+        for &g in BackendGroup::ALL {
             assert_eq!(BackendGroup::from_label(g.as_str()), g);
         }
     }
@@ -601,7 +650,7 @@ mod tests {
         // The claude assertions above would also pass by luck of the default
         // group being claude. Re-run them with a non-claude default so the
         // padded alias must match the CLAUDE RULE, not the fallback.
-        let grok_default = Classifier::from_config(&[], &[], &[], &[], "grok");
+        let grok_default = Classifier::from_config(&[], &[], &[], &[], &[], "grok");
         assert_eq!(
             grok_default.classify(Some("  opus  ")),
             BackendGroup::Claude,
@@ -670,7 +719,8 @@ mod tests {
                 BackendGroup::Claude,
                 BackendGroup::Codex,
                 BackendGroup::Grok,
-                BackendGroup::OpenRouter
+                BackendGroup::OpenRouter,
+                BackendGroup::Gemini
             ]
         );
     }
@@ -789,7 +839,7 @@ mod tests {
 
     #[test]
     fn config_openrouter_list_replaces_builtin() {
-        let c = Classifier::from_config(&[], &[], &[], &["free-".to_string()], "claude");
+        let c = Classifier::from_config(&[], &[], &[], &["free-".to_string()], &[], "claude");
         assert_eq!(c.classify(Some("free-model-1")), BackendGroup::OpenRouter);
         assert_eq!(
             c.classify(Some("or-ox-alpha")),
@@ -800,7 +850,7 @@ mod tests {
 
     #[test]
     fn openrouter_can_be_the_default_group() {
-        let c = Classifier::from_config(&[], &[], &[], &[], "openrouter");
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "openrouter");
         assert_eq!(c.classify(None), BackendGroup::OpenRouter);
         assert_eq!(
             c.classify(Some("totally-unknown")),
@@ -814,9 +864,142 @@ mod tests {
         );
     }
 
+    // ---- G1: gemini routing (docs/gemini/spec.md §R1) ----
+
+    #[test]
+    fn g1_gemini_kind_label_and_order() {
+        assert_eq!(BackendGroup::from_kind("gemini"), BackendGroup::Gemini);
+        assert_eq!(BackendGroup::Gemini.as_str(), "gemini");
+        assert_eq!(BackendGroup::from_label("gemini"), BackendGroup::Gemini);
+        // Appended LAST: the representative group and the fallback scan order
+        // of the four older groups do not move.
+        assert!(BackendGroup::OpenRouter < BackendGroup::Gemini);
+        assert_eq!(BackendGroup::ALL.last(), Some(&BackendGroup::Gemini));
+        assert_eq!(BackendGroup::ALL.iter().min(), Some(&BackendGroup::Claude));
+        // A translator with no count_tokens sibling upstream.
+        assert!(BackendGroup::Gemini.needs_body_translation());
+        assert!(BackendGroup::Gemini.serves_messages_only());
+    }
+
+    #[test]
+    fn g1_gemini_builtin_rules_classify_the_family() {
+        let c = builtin();
+        for model in [
+            "gemini",
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-high[1m]",
+            "gemini-4-argon",
+            "gemini-4-argon[1m]",
+            "GEMINI-4-ARGON",
+            "argon",
+            "ARGON",
+            "argon[1m]",
+            "  gemini  ",
+        ] {
+            assert_eq!(
+                c.classify(Some(model)),
+                BackendGroup::Gemini,
+                "{model} must route to the gemini group"
+            );
+        }
+        // `argon` is EXACT, not a substring or prefix rule.
+        assert_eq!(c.classify(Some("argonaut")), BackendGroup::Claude);
+        assert_eq!(c.classify(Some("claude-argon")), BackendGroup::Claude);
+    }
+
+    #[test]
+    fn g1_gemini_rules_are_disjoint_from_the_other_builtin_families() {
+        // Neither direction may overlap: no other family's id lands on gemini,
+        // and no gemini id lands on another family. Checked with a NON-claude
+        // default group so an id that matched no rule cannot pass by luck of
+        // the fallback.
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "codex");
+        for (model, expected) in [
+            ("claude-opus-5-5", BackendGroup::Claude),
+            ("claude-haiku-5-5[1m]", BackendGroup::Claude),
+            ("opus", BackendGroup::Claude),
+            ("sonnet", BackendGroup::Claude),
+            ("haiku", BackendGroup::Claude),
+            ("fable", BackendGroup::Claude),
+            ("gpt-6.1-sol", BackendGroup::Codex),
+            ("gpt-6-astra[1m]", BackendGroup::Codex),
+            ("o3-mini", BackendGroup::Codex),
+            ("sol", BackendGroup::Codex),
+            ("astra", BackendGroup::Codex),
+            ("luna", BackendGroup::Codex),
+            ("terra", BackendGroup::Codex),
+            ("grok-4.7", BackendGroup::Grok),
+            ("grok", BackendGroup::Grok),
+            ("or-ox-alpha", BackendGroup::OpenRouter),
+            ("or", BackendGroup::OpenRouter),
+            ("openrouter/free", BackendGroup::OpenRouter),
+            // OpenRouter's Google slugs stay OpenRouter's: the `or-` anchor
+            // is checked first.
+            ("or-google/gemini-3-flash", BackendGroup::OpenRouter),
+            ("or-gemma-4-31b", BackendGroup::OpenRouter),
+        ] {
+            assert_eq!(
+                c.classify(Some(model)),
+                expected,
+                "{model} must NOT be captured by the gemini rules"
+            );
+        }
+
+        // Reverse direction, rule by rule: no other family's builtin rule
+        // matches a gemini id.
+        let others: Vec<Rule> = builtin_codex_rules()
+            .into_iter()
+            .chain(builtin_claude_rules())
+            .chain(builtin_grok_rules())
+            .chain(builtin_openrouter_rules())
+            .collect();
+        for model in [
+            "gemini",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "gemini-4-argon",
+            "argon",
+        ] {
+            assert!(
+                !others.iter().any(|r| r.matches(model)),
+                "{model} is matched by a non-gemini builtin rule"
+            );
+        }
+    }
+
+    #[test]
+    fn g1_config_gemini_list_replaces_builtin() {
+        let c = Classifier::from_config(&[], &[], &[], &[], &["=bard".to_string()], "claude");
+        assert_eq!(c.classify(Some("bard")), BackendGroup::Gemini);
+        assert_eq!(
+            c.classify(Some("gemini-3.8-flash-high")),
+            BackendGroup::Claude,
+            "builtin gemini prefix dropped when config provides its own gemini list"
+        );
+        assert_eq!(
+            c.classify(Some("argon")),
+            BackendGroup::Claude,
+            "builtin argon rule dropped too"
+        );
+        // An empty list keeps the builtins.
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "claude");
+        assert_eq!(c.classify(Some("argon")), BackendGroup::Gemini);
+    }
+
+    #[test]
+    fn g1_gemini_can_be_the_default_group() {
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "gemini");
+        assert_eq!(c.classify(None), BackendGroup::Gemini);
+        assert_eq!(c.classify(Some("mystery-model")), BackendGroup::Gemini);
+        assert_eq!(c.classify(Some("opus")), BackendGroup::Claude);
+    }
+
     #[test]
     fn c2_config_grok_list_replaces_builtin() {
-        let c = Classifier::from_config(&[], &[], &["mega-".to_string()], &[], "claude");
+        let c = Classifier::from_config(&[], &[], &["mega-".to_string()], &[], &[], "claude");
         assert_eq!(c.classify(Some("mega-1")), BackendGroup::Grok);
         assert_eq!(
             c.classify(Some("grok-4.5")),
@@ -827,14 +1010,14 @@ mod tests {
 
     #[test]
     fn c2_default_group_grok_parses() {
-        let c = Classifier::from_config(&[], &[], &[], &[], "grok");
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "grok");
         assert_eq!(c.classify(None), BackendGroup::Grok);
     }
 
     #[test]
     fn config_codex_list_replaces_builtin() {
         // Config says ONLY "wizard-" is codex; gpt-5.5 is no longer codex.
-        let c = Classifier::from_config(&[], &["wizard-".to_string()], &[], &[], "claude");
+        let c = Classifier::from_config(&[], &["wizard-".to_string()], &[], &[], &[], "claude");
         assert_eq!(c.classify(Some("wizard-7b")), BackendGroup::Codex);
         assert_eq!(
             c.classify(Some("gpt-5.5")),
@@ -845,7 +1028,7 @@ mod tests {
 
     #[test]
     fn config_claude_list_replaces_builtin() {
-        let c = Classifier::from_config(&["acme-".to_string()], &[], &[], &[], "claude");
+        let c = Classifier::from_config(&["acme-".to_string()], &[], &[], &[], &[], "claude");
         assert_eq!(c.classify(Some("acme-1")), BackendGroup::Claude);
         // opus is no longer a claude model under the override; with no codex
         // match it falls back to the default group (claude).
@@ -859,7 +1042,7 @@ mod tests {
     fn config_can_move_a_model_across_groups() {
         // Make "opus" a CODEX model via config — config override wins over
         // the builtin claude prefix.
-        let c = Classifier::from_config(&[], &["=opus".to_string()], &[], &[], "claude");
+        let c = Classifier::from_config(&[], &["=opus".to_string()], &[], &[], &[], "claude");
         assert_eq!(c.classify(Some("opus")), BackendGroup::Codex);
     }
 
@@ -868,6 +1051,7 @@ mod tests {
         let c = Classifier::from_config(
             &[],
             &["~special".to_string(), "=exact-model".to_string()],
+            &[],
             &[],
             &[],
             "claude",
@@ -883,7 +1067,7 @@ mod tests {
 
     #[test]
     fn config_default_group_codex_changes_fallback() {
-        let c = Classifier::from_config(&[], &[], &[], &[], "codex");
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "codex");
         assert_eq!(
             c.classify(None),
             BackendGroup::Codex,

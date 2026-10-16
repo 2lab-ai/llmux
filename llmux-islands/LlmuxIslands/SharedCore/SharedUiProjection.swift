@@ -121,6 +121,7 @@ extension SharedProvider {
         switch self {
         case .codex: .codex
         case .grok: .grok
+        case .gemini: .gemini
         case .claude, .api, .unknown: .claude
         }
     }
@@ -130,6 +131,7 @@ extension SharedProvider {
         case .claude: "oauth"
         case .codex: "codex"
         case .grok: "grok"
+        case .gemini: "gemini"
         case .api: "apikey"
         case .unknown: "unknown"
         }

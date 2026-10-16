@@ -74,7 +74,7 @@ hide it.
 | Display accounts, analytics, activity receipts | `GET /llmux/dashboard` (`/llmux/status` is used only when dashboard explicitly returns 404/405/501; its document is normalized and request-correlated through Rust) |
 | Add an Anthropic API-key account | `POST /llmux/add-account` |
 | Remove an account | `POST /llmux/remove-account` |
-| Add a Claude / Codex subscription (OAuth) | `POST /llmux/login/start` → `GET /llmux/login/status` (+ `POST /llmux/login/cancel`) |
+| Add a Claude / Codex / Gemini subscription (OAuth) | `POST /llmux/login/start` → `GET /llmux/login/status` (+ `POST /llmux/login/cancel`) |
 | Pause/resume an account | `POST /llmux/pause-account` |
 | Email anonymity and operator events | `POST /llmux/settings`, `POST /llmux/events` |
 

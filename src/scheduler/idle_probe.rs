@@ -200,9 +200,14 @@ impl<P: Prober> IdleProber<P> {
         // windowless, burns its cooldown every sweep, and logs one
         // `idle probe failed` warning forever (observed live 2026-08-21:
         // default sweep and cooldown are both 900s, so ~4/hour, indefinitely).
+        //
+        // Gemini likewise: no quota headers on the stream (its windows come
+        // from the usage poll, docs/gemini/spec.md §R6).
         if matches!(
             credential,
-            AccountCredential::Grok { .. } | AccountCredential::OpenRouter { .. }
+            AccountCredential::Grok { .. }
+                | AccountCredential::OpenRouter { .. }
+                | AccountCredential::Gemini { .. }
         ) {
             return false;
         }
@@ -585,8 +590,8 @@ mod tests {
         }
     }
 
-    /// Neither grok nor openrouter can EVER produce 5h/7d window data, and the
-    /// prober rejects both deterministically. Without this gate the account is
+    /// Neither grok, openrouter nor gemini can EVER produce 5h/7d window data
+    /// from a probe, and the prober rejects all three deterministically. Without this gate the account is
     /// permanently windowless, so `probe_eligible` keeps electing it: the
     /// cooldown is burned every sweep and an `idle probe failed` warning is
     /// logged forever (observed live: default sweep and cooldown are both
@@ -596,7 +601,7 @@ mod tests {
     /// in an edit and nothing caught it — a fix with no failing test can
     /// vanish silently.
     #[tokio::test]
-    async fn grok_and_openrouter_accounts_are_never_probed() {
+    async fn grok_openrouter_and_gemini_accounts_are_never_probed() {
         for (name, credential) in [
             (
                 "grok",
@@ -614,6 +619,17 @@ mod tests {
                 AccountCredential::OpenRouter {
                     api_key: "sk-or-v1-x".into(),
                     label: "l".into(),
+                },
+            ),
+            (
+                "gemini",
+                AccountCredential::Gemini {
+                    email: "g@example.com".into(),
+                    access_token: "at".into(),
+                    refresh_token: "rt".into(),
+                    expires_at_ms: 0,
+                    project_id: String::new(),
+                    last_refresh_ms: None,
                 },
             ),
         ] {

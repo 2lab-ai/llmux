@@ -120,6 +120,12 @@ impl ReqwestProber {
             AccountCredential::OpenRouter { .. } => Err(ProbeError::Build(
                 "openrouter accounts expose no 5h/7d quota windows; idle probe skipped".into(),
             )),
+            // Gemini streams carry no quota headers either; its windows come
+            // from the `fetchAvailableModels` usage poll instead
+            // (docs/gemini/spec.md §R6). Gated out alongside grok.
+            AccountCredential::Gemini { .. } => Err(ProbeError::Build(
+                "gemini accounts expose no quota headers; idle probe skipped".into(),
+            )),
             AccountCredential::Oauth { .. } | AccountCredential::Apikey { .. } => {
                 let mut headers = HeaderMap::new();
                 headers.insert(

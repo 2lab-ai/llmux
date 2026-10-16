@@ -155,7 +155,7 @@
         "id": { "type": "string" },
         "display_name": { "type": "string" },
         "provider": {
-          "enum": ["claude", "codex", "grok", "api", "unknown"]
+          "enum": ["claude", "codex", "grok", "gemini", "api", "unknown"]
         },
         "current": { "type": "boolean" },
         "paused": { "type": "boolean" },
@@ -508,7 +508,7 @@
         "path": { "type": ["string", "null"] },
         "account_display": { "type": ["string", "null"] },
         "provider": {
-          "enum": ["claude", "codex", "grok", "api", "unknown", null]
+          "enum": ["claude", "codex", "grok", "gemini", "api", "unknown", null]
         },
         "model": { "type": ["string", "null"] },
         "effort": { "type": ["string", "null"] },

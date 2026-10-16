@@ -39,6 +39,7 @@ whatever `activity.jsonl` still holds); everything else keeps working.
     "codex_models": [],
     "grok_models": [],
     "openrouter_models": [],
+    "gemini_models": [],
     "default_group": "claude",
     "on_empty_group": "error"
   },
@@ -110,7 +111,7 @@ See [the scheduler perishability design](../.prd/09-scheduler-perishability.md) 
 
 ## Idle probe (cold-account refresh)
 
-The OAuth usage poller covers Claude subscription accounts only. Codex and
+The usage poller covers Claude subscription (`oauth`), Grok and Gemini accounts: Claude through `/api/oauth/usage`, Grok through its billing endpoint, Gemini through Cloud Code `fetchAvailableModels` (`src/scheduler/usage.rs`, `refresh_schedule`). Codex and
 API-key accounts get their 5h/7d gauges from a gated `max_tokens = 1` probe
 through their own credential (`proxy.idle_probe`), delivered on demand (real
 traffic to the group) and by a background timer sweep. Since 2026-07-15 the
@@ -126,7 +127,9 @@ their first reading.
 | `proxy.idle_probe.stale_after_secs` | `900` | Window observations older than this make the account probe-eligible again; `0` reverts to windowless-only probing. |
 
 Steady-state cost: at most four 1-token probes per cold account per hour.
-Grok accounts are never probed (no quota surface). Operator-paused accounts
+Grok accounts are never probed (their streams carry no quota headers). Gemini
+accounts are never probed either, for the same reason: their 7-day window comes
+from the usage poller's `fetchAvailableModels` read (there is no 5-hour window). Operator-paused accounts
 are never probed. Configs still carrying an untouched pre-2026-07-15 default
 block (`3600/3600` or the old disabled triple) are migrated to these
 defaults on load; any other explicit combination is kept verbatim.
@@ -139,6 +142,7 @@ With `routing.enabled = true`, the inbound `model` string selects a backend grou
 - `gpt-*`, `gpt-5.5`, `codex`, `o1`/`o3`/`o4` route to the Codex group.
 - `grok`, `grok-*` route to the Grok group.
 - `or-*`, a bare `or`, and `openrouter/*` route to the OpenRouter group.
+- `gemini`, `gemini-*`, and a bare `argon` route to the Gemini group.
 
 Each group keeps its own sticky current account. If the model does not match a known group, llmux uses `routing.default_group`.
 
@@ -149,6 +153,7 @@ Each group keeps its own sticky current account. If the model does not match a k
   "codex_models": [],
   "grok_models": [],
   "openrouter_models": [],
+  "gemini_models": [],
   "default_group": "claude",
   "on_empty_group": "error"
 }
@@ -161,8 +166,9 @@ Each group keeps its own sticky current account. If the model does not match a k
 | `codex_models` | `[]` | Override tokens for Codex-group models. Empty keeps builtin rules. |
 | `grok_models` | `[]` | Override tokens for Grok-group models. Empty keeps builtin rules. |
 | `openrouter_models` | `[]` | Override tokens for OpenRouter-group models. Empty keeps the builtin `or-` prefix, exact `or`, and `openrouter/` prefix rules. |
-| `default_group` | `"claude"` | Group for unmatched or absent model names: `"claude"`, `"codex"`, `"grok"`, or `"openrouter"`. |
-| `on_empty_group` | `"error"` | `"error"` returns a 404 if the matched group has no account; `"fallback"` tries the remaining groups in `claude → codex → grok → openrouter` order. |
+| `gemini_models` | `[]` | Override tokens for Gemini-group models. Empty keeps the builtin `gemini` prefix and exact `argon` rules. |
+| `default_group` | `"claude"` | Group for unmatched or absent model names: `"claude"`, `"codex"`, `"grok"`, `"openrouter"`, or `"gemini"`. |
+| `on_empty_group` | `"error"` | `"error"` returns a 404 if the matched group has no account; `"fallback"` tries the remaining groups in `claude → codex → grok → openrouter → gemini` order. |
 
 Override tokens are matched in order, first-match-wins, case-insensitively:
 
@@ -201,6 +207,25 @@ OpenRouter serves **Anthropic Messages** natively. For incoming Messages, llmux 
 | `openrouter.default_model` | `stealth/ox-alpha` | The slug a bare `or` — or a request that names no model — resolves to. |
 
 Model selection is the `or-` prefix: `or-ox-alpha` and the other curated ids resolve to their OpenRouter slug, `or-<vendor>/<slug>` reaches any of the ~400 uncurated models verbatim, and an unknown bare name is passed through so OpenRouter's own 404 answers it. See [models.md](models.md#alias-semantics).
+
+## Gemini backend
+
+Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` and no `reasoning_effort` knob: the thinking level is part of the model id (`gemini-3.8-flash-high` / `-medium` / `-low`). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `gemini.upstream` | `https://daily-cloudcode-pa.googleapis.com` | Cloud Code base URL; chat requests go to `{upstream}/v1internal:streamGenerateContent?alt=sse`. |
+| `gemini.default_model` | `gemini-3.8-flash-high` | The model requested when a name that is not gemini-shaped (or a request that names no model) lands on the gemini group, e.g. through the empty-group fallback. It does not move the `gemini` / `argon` aliases. |
+| `gemini.client_model` | unset | When set, llmux reports this model name to the client instead of the real gemini model. |
+| `gemini.user_agent` | `antigravity/hub/2.23.1 darwin/arm64` | `User-Agent` sent upstream. Cloud Code rejects newer models for hub versions below 2.23.0. |
+| `gemini.token_url` | `https://oauth2.googleapis.com/token` | Google OAuth token endpoint for refresh-token grants. |
+| `gemini.client_id` | unset | Client id of Antigravity's Google OAuth client. The `LLMUX_GEMINI_CLIENT_ID` environment variable overrides it. |
+| `gemini.client_secret` | unset | That client's secret. The `LLMUX_GEMINI_CLIENT_SECRET` environment variable overrides it. The TUI never shows it. |
+| `gemini.trace` | `false` | Append a JSON-line trace of every gemini request and response, like `grok.trace`. Turn it on while diagnosing. |
+
+llmux does not ship Antigravity's OAuth client: you configure it, with the two `gemini.client_*` keys or the two environment variables (a non-empty environment value wins over the file). Google login and token refresh need both values. Without them, `llmux login --gemini`, the dashboard's Google login and the daemon's login API stop before opening a browser, with `gemini OAuth client not configured: set gemini.client_id and gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux after setting them`. A gemini account whose token needs a refresh gets that same message as a `502` and in the activity log; the account is not marked for re-login, and the background refresh skips gemini accounts until the client is configured. The daemon reads these settings at startup, so restart llmux after setting them. `llmux import` still imports an Antigravity CLI login without them, but warns that the account will stop working when its current token expires (about an hour).
+
+The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases and the Argon tier: [models.md](models.md#gemini).
 
 ## Claude reset grants
 
@@ -257,14 +282,25 @@ Like `tui_effects`, the resolved settings ride the dashboard document, so `llmux
 | `codex` | `llmux login --codex` or `llmux import --from ~/.codex/auth.json` | ChatGPT/Codex subscription token. |
 | `grok` | `llmux login --grok` | xAI Grok subscription token. |
 | `openrouter` | `llmux login --openrouter` | OpenRouter API key (`sk-or-v1-…`), stored with the key label it was minted under. Named `or:<label>` (or `or:key-N` when the label is unavailable). No refresh: the key does not expire. |
+| `gemini` | `llmux login --gemini` or `llmux import` (Antigravity CLI login) | Google Antigravity subscription (Gemini) via Google OAuth. Named `gemini:<email>`, with the account's GCP project stored alongside. Read [Gemini accounts](#gemini-accounts) first. |
 
-Every browser-login type in that table — `oauth`, `codex`, `grok`, `openrouter` — can also be added without leaving the dashboard: `n` opens the provider picker, the flow runs in the client, and the credential is injected into the running daemon (see [operational-reference.md](operational-reference.md#commands)). `apikey` accounts still come from `a` (paste) or `llmux login --api`.
+Every browser-login type in that table — `oauth`, `codex`, `grok`, `openrouter`, `gemini` — can also be added without leaving the dashboard: `n` opens the provider picker, the flow runs in the client, and the credential is injected into the running daemon (see [operational-reference.md](operational-reference.md#commands)). `apikey` accounts still come from `a` (paste) or `llmux login --api`. `gemini` accounts can also come from `llmux import` or the Islands sign-in menu.
 
-Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name (an OpenRouter label is not unique per key, so it is used for the name only).
+Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; Gemini accounts dedupe by email; API keys and OpenRouter accounts dedupe by name (an OpenRouter label is not unique per key, so it is used for the name only).
+
+### Gemini accounts
+
+> **Terms-of-service risk.** Google states that using Antigravity through third-party tools or proxies violates the Antigravity Terms of Service, and it has suspended accounts for it ([gemini-cli discussion #20632](https://github.com/google-gemini/gemini-cli/discussions/20632); [AI Pulse report, 2026-09-03](https://enterprisedna.co/resources/ai-pulse/ai-pulse-2026-09-03-google-suspends-paying-antigravity-subscribers-for-using-thi/)). llmux is such a tool. `llmux login --gemini` and the dashboard picker's Gemini row print this warning before they start. Weigh it before you add an account.
+
+- `llmux login --gemini` runs the Google OAuth flow in your browser, with the callback on `localhost:51121`. It needs the OAuth client configured first (`gemini.client_id` / `gemini.client_secret`, see [Gemini backend](#gemini-backend)); without it the command stops with the "not configured" message and imports nothing. If the flow itself fails (for example, the port is taken or there is no browser), it falls back to importing an existing Antigravity CLI login.
+- `llmux import` picks up an existing Antigravity CLI login from `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+- Each account is named `gemini:<email>`. Its GCP project is resolved through Cloud Code (`loadCodeAssist`, with `onboardUser` as the fallback) and saved with the account. An imported login (from `llmux import` or the `--gemini` fallback) looks the project up at import time with one `loadCodeAssist` call, using the stored token and `gemini.user_agent`, when that token is still valid for more than 60 s; it never refreshes the token. If the token is about to expire or the lookup fails, the account is saved with an empty project; a failed lookup prints `warning: Cloud Code project not resolved yet (<error>); llmux resolves it on the first request or the next usage refresh`. The daemon then resolves it on whichever comes first: the first model request (after its token refresh), a manual usage refresh, or a scheduled usage poll. The two usage paths never refresh a token, so they look the project up only while the stored token is valid for more than the 5-minute refresh-ahead margin, and the startup usage pass never looks it up. Until the project is resolved the account has no usage reading.
+- **Argon needs Google AI Ultra or Enterprise.** Google lists Gemini 4 Argon for those plans only; on a Google AI Plus account `argon` / `gemini-4-argon` returns 404. Gemini 3.8 Flash works on Plus. See [models.md](models.md#gemini).
+- Usage is one 7-day window, read from Cloud Code `fetchAvailableModels` (`quotaInfo.remainingFraction` and `resetTime`). A model row whose `remainingFraction` is unreadable is skipped and the other rows still count; the read fails only when every row is unreadable. There is no 5-hour window, and there are no resets to redeem.
 
 ### Downgrading past a new account type
 
-The account list is an internally-tagged enum, so a config carrying a `type` an older binary does not know makes that binary **fail to parse the whole file** — nothing is silently dropped. Before downgrading to a pre-openrouter binary, remove the `or:*` accounts (`llmux remove <name>`, run from the new binary); the same contract applies to `grok:*` accounts and pre-grok binaries. Everything else is additive in both directions: the `openrouter` block and `routing.openrouter_models` are ignored harmlessly by older binaries, and a config written by an older binary loads here with the new keys at their defaults.
+The account list is an internally-tagged enum, so a config carrying a `type` an older binary does not know makes that binary **fail to parse the whole file** — nothing is silently dropped. Before downgrading to a pre-openrouter binary, remove the `or:*` accounts (`llmux remove <name>`, run from the new binary); the same contract applies to `grok:*` accounts and pre-grok binaries, and to `gemini:*` accounts and pre-gemini binaries. Everything else is additive in both directions: the `openrouter` and `gemini` blocks and `routing.openrouter_models` / `routing.gemini_models` are ignored harmlessly by older binaries, and a config written by an older binary loads here with the new keys at their defaults.
 
 ## Claude Code internal models (`claude_code`)
 

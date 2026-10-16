@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner, GrokConfig,
-    IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig, RemoteConfig,
-    RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
+    AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner, GeminiConfig,
+    GrokConfig, IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig,
+    RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
+    DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
@@ -503,6 +503,269 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("round trip");
         assert_eq!(round, config);
+    }
+
+    fn gemini_account_fixture(name: &str, email: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_string(),
+            credential: AccountCredential::Gemini {
+                email: email.to_string(),
+                access_token: "at-gm".to_string(),
+                refresh_token: "rt-gm".to_string(),
+                expires_at_ms: 1_900_000_000_000,
+                project_id: "proj-123".to_string(),
+                last_refresh_ms: Some(1_750_000_000_000),
+            },
+        }
+    }
+
+    // ---- G15: gemini credential serde round-trip + upsert dedup ----
+    #[test]
+    fn g15_gemini_credential_round_trips_and_dedups_by_email() {
+        let account = gemini_account_fixture("gemini:a@b.c", "a@b.c");
+        let json = serde_json::to_string(&account).expect("serialize");
+        assert!(json.contains(r#""type":"gemini""#), "{json}");
+        let back: AccountConfig = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, account);
+        assert_eq!(account.credential.kind(), "gemini");
+        assert_eq!(account.credential.account_uuid(), Some("a@b.c"));
+        assert_eq!(
+            account.credential.last_refresh_ms(),
+            Some(1_750_000_000_000)
+        );
+
+        let mut config = Config::default();
+        assert_eq!(config.upsert_account(account.clone()), Upsert::Added);
+        // Same EMAIL under a different name → the identity match updates the
+        // existing row instead of adding a duplicate.
+        let renamed = gemini_account_fixture("gemini-renamed", "a@b.c");
+        assert_eq!(config.upsert_account(renamed), Upsert::Updated);
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(
+            config.accounts[0].name, "gemini:a@b.c",
+            "an identity match keeps the established name"
+        );
+        assert_eq!(config.accounts[0].credential.kind(), "gemini");
+        // A different email is a different account.
+        assert_eq!(
+            config.upsert_account(gemini_account_fixture("gemini:x@y.z", "x@y.z")),
+            Upsert::Added
+        );
+        assert_eq!(config.accounts.len(), 2);
+    }
+
+    /// The optional fields are optional on disk: an offline import writes no
+    /// `project_id` (resolved lazily) and no `last_refresh_ms`; an unknown
+    /// email is empty and is no dedup key.
+    #[test]
+    fn g15_gemini_credential_minimal_json_parses_with_defaults() {
+        let raw = r#"{
+  "name": "gemini:import",
+  "type": "gemini",
+  "access_token": "at",
+  "refresh_token": "rt",
+  "expires_at_ms": 0
+}"#;
+        let account: AccountConfig = serde_json::from_str(raw).expect("minimal gemini parses");
+        let AccountCredential::Gemini {
+            email,
+            project_id,
+            last_refresh_ms,
+            ..
+        } = &account.credential
+        else {
+            panic!("expected a gemini credential, got {:?}", account.credential);
+        };
+        assert!(email.is_empty());
+        assert!(project_id.is_empty());
+        assert_eq!(*last_refresh_ms, None);
+        assert_eq!(account.credential.account_uuid(), None);
+        // `None` stays off the wire.
+        let json = serde_json::to_string(&account).expect("serialize");
+        assert!(!json.contains("last_refresh_ms"), "{json}");
+    }
+
+    // ---- G15: pre-gemini config parses and round-trips VALUE-stable ----
+    #[test]
+    fn g15_pre_gemini_config_round_trips_without_gemini_fields() {
+        // A config written before gemini existed: no `gemini` section, no
+        // `routing.gemini_models`, accounts of every older kind.
+        let raw = r#"{
+  "version": 1,
+  "grok": { "default_model": "grok-4.7" },
+  "openrouter": { "default_model": "stealth/ox-alpha" },
+  "routing": {
+    "enabled": true,
+    "default_group": "claude",
+    "grok_models": [],
+    "openrouter_models": []
+  },
+  "accounts": [
+    { "name": "a", "type": "apikey", "api_key": "sk-1" },
+    { "name": "or:k", "type": "openrouter", "api_key": "sk-or-v1-x", "label": "k" }
+  ]
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("pre-gemini config parses");
+        assert_eq!(config.gemini, GeminiConfig::default(), "defaults fill in");
+        assert_eq!(
+            config.gemini.upstream,
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(config.gemini.default_model, "gemini-3.8-flash-high");
+        assert_eq!(config.gemini.client_model, None);
+        assert_eq!(
+            config.gemini.user_agent,
+            "antigravity/hub/2.23.1 darwin/arm64"
+        );
+        assert_eq!(
+            config.gemini.token_url,
+            "https://oauth2.googleapis.com/token"
+        );
+        assert!(!config.gemini.trace);
+        assert!(config.routing.gemini_models.is_empty());
+        // Round-trip: serialize → parse → identical value (additive-only).
+        let round: Config =
+            serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+                .expect("round trip");
+        assert_eq!(round, config);
+    }
+
+    /// `Debug` of the gemini section — and of the whole config, which embeds
+    /// it — never prints the client secret; the id and the other fields
+    /// still show.
+    #[test]
+    fn gemini_client_secret_never_reaches_debug_output() {
+        const SENTINEL: &str = "sentinel-secret-7f3a";
+        let mut config = Config::default();
+        config.gemini.client_id = Some("test-client-id".into());
+        config.gemini.client_secret = Some(SENTINEL.into());
+
+        for debug in [
+            format!("{:?}", config.gemini),
+            format!("{:#?}", config.gemini),
+            format!("{config:?}"),
+        ] {
+            assert!(!debug.contains(SENTINEL), "secret leaked into Debug");
+            assert!(debug.contains("test-client-id"), "{debug}");
+            assert!(debug.contains(r#""<redacted>""#), "{debug}");
+            assert!(debug.contains("token_url"), "{debug}");
+        }
+        assert!(
+            format!("{:?}", config.gemini).contains(r#"client_secret: Some("<redacted>")"#),
+            "the compact form reads Some(\"<redacted>\")"
+        );
+        config.gemini.client_secret = None;
+        assert!(format!("{:?}", config.gemini).contains("client_secret: None"));
+    }
+
+    /// The gemini OAuth client fields survive a save/load; unset they are
+    /// absent from the file (no key, no default value anywhere).
+    #[test]
+    fn gemini_oauth_client_fields_round_trip_and_stay_absent_when_unset() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let mut config = Config::default();
+        save_path(&path, &config).expect("save");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(
+            !raw.contains("client_id") && !raw.contains("client_secret"),
+            "unset fields are not written: {raw}"
+        );
+        assert_eq!(load_path(&path).expect("load").gemini.client_id, None);
+
+        config.gemini.client_id = Some("test-client-id".into());
+        config.gemini.client_secret = Some("test-client-secret".into());
+        save_path(&path, &config).expect("save");
+        let loaded = load_path(&path).expect("load");
+        assert_eq!(loaded.gemini.client_id.as_deref(), Some("test-client-id"));
+        assert_eq!(
+            loaded.gemini.client_secret.as_deref(),
+            Some("test-client-secret")
+        );
+        assert_eq!(loaded, config);
+    }
+
+    /// One resolver: a non-blank environment value wins over the config
+    /// field, a blank one is ignored, and either half missing is the one
+    /// operator-facing error.
+    #[test]
+    fn gemini_oauth_client_resolves_env_over_config_and_names_the_fix() {
+        use crate::config::schema::{GEMINI_CLIENT_ID_ENV, GEMINI_CLIENT_SECRET_ENV};
+        let no_env = |_: &str| None;
+        let configured = GeminiConfig {
+            client_id: Some("cfg-id".into()),
+            client_secret: Some("cfg-secret".into()),
+            ..GeminiConfig::default()
+        };
+
+        let from_config = configured.oauth_client_from(no_env).expect("configured");
+        assert_eq!(
+            (from_config.id.as_str(), from_config.secret.as_str()),
+            ("cfg-id", "cfg-secret")
+        );
+
+        let env = |name: &str| match name {
+            GEMINI_CLIENT_ID_ENV => Some("env-id".to_string()),
+            GEMINI_CLIENT_SECRET_ENV => Some("env-secret".to_string()),
+            _ => None,
+        };
+        let from_env = configured.oauth_client_from(env).expect("env");
+        assert_eq!(
+            (from_env.id.as_str(), from_env.secret.as_str()),
+            ("env-id", "env-secret")
+        );
+        // The environment alone is enough.
+        let env_only = GeminiConfig::default()
+            .oauth_client_from(env)
+            .expect("env only");
+        assert_eq!(env_only.id, "env-id");
+
+        // A blank environment value does not shadow the config.
+        let blank = |_: &str| Some("  ".to_string());
+        assert_eq!(
+            configured.oauth_client_from(blank).expect("blank env").id,
+            "cfg-id"
+        );
+
+        let expected = "gemini OAuth client not configured: set gemini.client_id and \
+             gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / \
+             LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux \
+             after setting them";
+        let half = |id: Option<&str>, secret: Option<&str>| GeminiConfig {
+            client_id: id.map(str::to_string),
+            client_secret: secret.map(str::to_string),
+            ..GeminiConfig::default()
+        };
+        for config in [
+            GeminiConfig::default(),
+            half(Some("cfg-id"), None),
+            half(None, Some("cfg-secret")),
+            half(Some(" "), Some("cfg-secret")),
+        ] {
+            let err = config
+                .oauth_client_from(no_env)
+                .expect_err("not configured");
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn g15_gemini_section_and_routing_list_parse() {
+        let raw = r#"{
+  "version": 1,
+  "gemini": { "default_model": "gemini-3.8-flash-low", "trace": true },
+  "routing": { "gemini_models": ["=bard"] },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(config.gemini.default_model, "gemini-3.8-flash-low");
+        assert!(config.gemini.trace);
+        // Omitted fields keep their defaults.
+        assert_eq!(
+            config.gemini.upstream,
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(config.routing.gemini_models, vec!["=bard".to_string()]);
     }
 
     /// The default-pin roll (`grok-4.6` → `grok-4.7`, 2026-09-23) must move

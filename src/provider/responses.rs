@@ -247,7 +247,7 @@ const SAFEGUARD_UNAVAILABLE_REASON: &str = "unsupported";
 /// equivalent — measured live on Claude Code 2.1.286/2.1.287, the client
 /// treats it as "gave no verdict" and denies the action. No reviewer ever
 /// saw these calls, so never fabricate an `evaluated` verdict.
-fn unavailable_safeguard_results<'a>(ids: impl IntoIterator<Item = &'a str>) -> Value {
+pub(crate) fn unavailable_safeguard_results<'a>(ids: impl IntoIterator<Item = &'a str>) -> Value {
     let tool_uses: serde_json::Map<String, Value> = ids
         .into_iter()
         .map(|id| {

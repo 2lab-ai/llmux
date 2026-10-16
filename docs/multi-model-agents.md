@@ -14,7 +14,9 @@ three-model run below was measured on 2026-10-08.
 field ([Claude Code docs](https://code.claude.com/docs/en/sub-agents#choose-a-model)).
 `llmux run` sets `ANTHROPIC_BASE_URL=http://localhost:3456`, so each agent's
 request reaches llmux carrying that id, and llmux routes by name: Claude ids to
-Claude accounts, `gpt-*` to Codex, `grok-*` to Grok, `or-*` to OpenRouter. One
+Claude accounts, `gpt-*` to Codex, `grok-*` to Grok, `or-*` to OpenRouter.
+Gemini ids are the exception: a Claude Code agent on `gemini-*` / `argon` gets
+a local 400 ([limits](#limits-and-honest-notes)). One
 trailing `[1m]` is stripped before the upstream id is resolved; the suffix only
 tells Claude Code to use a 1M-context display.
 
@@ -85,7 +87,8 @@ Model ids valid on 2026-10-08 (`GET /models`, see [models.md](models.md)):
 `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `grok-4.7`,
 `grok-4.6`, `grok-4.5`, `or-ox-alpha`. Aliases such as `astra`, `sol` and
 `grok` also work in `model:`; explicit ids keep the routing readable in the
-agent file.
+agent file. Gemini ids (`gemini`, `argon`, `gemini-*`) do not work in
+`model:`; see [limits](#limits-and-honest-notes).
 
 ## Step 3 — three models, one change
 
@@ -179,6 +182,13 @@ rounds (disagreements sent back to each reviewer) are more prompts in the same p
   Messages requests: `max_tokens` is not sent to Codex at all, sampling
   parameters are refused, and prior `thinking` blocks are dropped. See
   [provider-compatibility.md](provider-compatibility.md).
+- **No Gemini agents.** Google's Antigravity backend refused Claude Code
+  requests (2026-10-15), so llmux does not forward Claude Code traffic,
+  subagents included, to the gemini group. An agent with a gemini `model:` gets
+  a local `400 invalid_request_error` whose message starts with the model and
+  `gemini models are not available from Claude Code`, and nothing reaches
+  Google. Use gemini from Codex (`llmux run --codex -- -m gemini`); see
+  [models](models.md#gemini) for the full message.
 - **No shared memory.** Each agent gets the prompt the parent writes plus its
   own tool access. Name files, paths and constraints in that prompt.
 - **`unrecognized_model` warning.** Claude Code's stderr printed
@@ -193,6 +203,8 @@ rounds (disagreements sent back to each reviewer) are more prompts in the same p
 
 - **The agent answered as Claude.** Check its `model:` id against `GET /models`
   and confirm the `subagent` row in Activity shows group `codex` or `grok`.
+- **`gemini models are not available from Claude Code`.** The agent's `model:`
+  is a gemini id. Gemini is Codex-only; pick another model for the agent.
 - **429 or a parked account.** Activity shows the cooldown. The scheduler picks
   another eligible account in the same group, never another provider.
 - **`no eligible account for group codex`.** Run `llmux login --codex`.

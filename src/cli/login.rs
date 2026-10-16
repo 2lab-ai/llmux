@@ -1,7 +1,10 @@
-//! `llmux login [--api | --codex | --grok | --openrouter]` — add an account.
+//! `llmux login [--api | --codex | --grok | --openrouter | --gemini]` — add
+//! an account.
 
-use crate::auth::{codex, oauth, openrouter, profile, AuthError};
-use crate::config::{AccountConfig, AccountCredential, Config, Upsert};
+use std::path::Path;
+
+use crate::auth::{codex, gemini, oauth, openrouter, profile, AuthError};
+use crate::config::{AccountConfig, AccountCredential, Config, GeminiConfig, Upsert};
 
 use super::{prompt_line, CliError, LoginArgs};
 
@@ -12,8 +15,12 @@ use super::{prompt_line, CliError, LoginArgs};
 /// `--grok` path: xAI device-code flow → upsert a Grok account.
 /// `--openrouter` path: OpenRouter PKCE browser flow (or `--paste`) →
 /// upsert an `or:<label>` account.
+/// `--gemini` path: Google (Antigravity) OAuth browser flow → upsert a
+/// `gemini:{email}` account.
 pub async fn run(args: LoginArgs) -> Result<(), CliError> {
-    if args.openrouter {
+    if args.gemini {
+        login_gemini().await
+    } else if args.openrouter {
         login_openrouter(args.paste).await
     } else if args.grok {
         login_grok().await
@@ -199,6 +206,63 @@ async fn login_codex() -> Result<(), CliError> {
     match outcome {
         Upsert::Added => println!("Added codex account {final_name:?}"),
         Upsert::Updated => println!("Updated codex account {final_name:?}"),
+    }
+    println!("Saved to {}", crate::config::config_path()?.display());
+    Ok(())
+}
+
+/// `--gemini`: run the Google (Antigravity) OAuth browser flow and upsert a
+/// `gemini:{email}` account (docs/gemini/spec.md §R2, trace S4). Falls back
+/// to importing the Antigravity CLI token store when the interactive flow
+/// cannot run (port 51121 taken, headless) — codex parity.
+async fn login_gemini() -> Result<(), CliError> {
+    let config = crate::config::load_or_init()?;
+    let client = reqwest::Client::new();
+    // The operator-configured OAuth client, first: without it there is no
+    // login to run, and no fallback either — an imported account could not
+    // refresh its token without the same client.
+    let oauth = config.gemini.oauth_client()?;
+
+    // Shown BEFORE the browser opens: the user decides with the risk in view.
+    println!("{}", gemini::GEMINI_TOS_NOTE);
+    println!("Starting Google (Antigravity) OAuth login...");
+    let account = match gemini::login_gemini_interactive(
+        &client,
+        &oauth,
+        &config.gemini.token_url,
+        &config.gemini.upstream,
+        &config.gemini.user_agent,
+    )
+    .await
+    {
+        Ok(account) => account,
+        Err(err) => {
+            // Headless / no-browser / port-bind failures degrade to importing
+            // the Antigravity CLI's own token store (already named
+            // `gemini:{email}`, the same name an OAuth login produces).
+            eprintln!("warning: interactive Google login failed ({err})");
+            account_from_antigravity_import(&client, &config.gemini)
+                .await?
+                .ok_or_else(|| {
+                    CliError::Message(
+                        "interactive Google login failed and no Antigravity CLI token store \
+                     (~/.gemini/antigravity-cli/antigravity-oauth-token) was found to import \
+                     — run `agy` once to sign in, or retry with a browser available"
+                            .into(),
+                    )
+                })?
+        }
+    };
+
+    let final_name = account.name.clone();
+    let mut outcome = Upsert::Added;
+    crate::config::update(|config: &mut Config| {
+        outcome = config.upsert_account(account.clone());
+    })?;
+
+    match outcome {
+        Upsert::Added => println!("Added gemini account {final_name:?}"),
+        Upsert::Updated => println!("Updated gemini account {final_name:?}"),
     }
     println!("Saved to {}", crate::config::config_path()?.display());
     Ok(())
@@ -404,6 +468,116 @@ fn account_from_codex_import() -> Result<Option<AccountConfig>, CliError> {
     Ok(Some(account))
 }
 
+/// Import the Antigravity CLI token store (when present) as a
+/// `gemini:{email}` account. `Ok(None)` when no store exists.
+async fn account_from_antigravity_import(
+    client: &reqwest::Client,
+    gemini_config: &GeminiConfig,
+) -> Result<Option<AccountConfig>, CliError> {
+    let Some(path) = gemini::antigravity_store_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_antigravity_store(&path, client, gemini_config)
+        .await
+        .map(Some)
+}
+
+/// Read and parse one Antigravity CLI token store file
+/// ([`gemini::account_from_antigravity_store`]), then resolve its Cloud Code
+/// project eagerly when the stored access token is still valid
+/// ([`resolve_store_project`]). Shared by the login fallback and the
+/// `llmux import` probe so both build the identical account.
+pub(super) async fn read_antigravity_store(
+    path: &Path,
+    client: &reqwest::Client,
+    gemini_config: &GeminiConfig,
+) -> Result<AccountConfig, CliError> {
+    let bytes = std::fs::read(path)?;
+    let mut account = gemini::account_from_antigravity_store(&bytes)?;
+    if let Some(warning) = client_missing_warning(gemini_config.oauth_client()) {
+        eprintln!("{warning}");
+    }
+    if let Some(warning) =
+        resolve_store_project(&mut account, client, gemini_config, now_epoch_ms()).await
+    {
+        eprintln!("{warning}");
+    }
+    Ok(account)
+}
+
+/// The import-time warning for a store imported while no gemini OAuth client
+/// is configured: the import itself is offline and still succeeds, but the
+/// daemon cannot refresh the token it carries. `None` when the client
+/// resolves.
+fn client_missing_warning(
+    resolved: Result<gemini::GeminiOAuthClient, crate::auth::AuthError>,
+) -> Option<String> {
+    resolved.err().map(|err| {
+        format!(
+            "warning: {err}; this account will stop working when its current token expires (~1h)"
+        )
+    })
+}
+
+/// Remaining access-token lifetime below which an imported token is treated
+/// as expired: not worth a lookup that may outlive it.
+const STORE_TOKEN_MIN_REMAINING_MS: u64 = 60_000;
+
+/// Eager project lookup for an imported store account (trace S5): when the
+/// stored access token is still valid (`expires_at_ms` more than
+/// [`STORE_TOKEN_MIN_REMAINING_MS`] past `now_ms`), resolve the project with
+/// the same `loadCodeAssist` call an interactive login makes, against the
+/// CONFIGURED Cloud Code base and identity. Never refreshes: an expired or
+/// unknown-expiry token keeps the project empty for the daemon to resolve
+/// (the first model request, or the next usage refresh once the token is
+/// fresh). Returns the warning to print when the lookup failed (the project
+/// stays empty then too).
+async fn resolve_store_project(
+    account: &mut AccountConfig,
+    client: &reqwest::Client,
+    gemini_config: &GeminiConfig,
+    now_ms: u64,
+) -> Option<String> {
+    let AccountCredential::Gemini {
+        access_token,
+        expires_at_ms,
+        project_id,
+        ..
+    } = &mut account.credential
+    else {
+        return None;
+    };
+    if !project_id.is_empty()
+        || *expires_at_ms <= now_ms.saturating_add(STORE_TOKEN_MIN_REMAINING_MS)
+    {
+        return None;
+    }
+    match gemini::resolve_project(
+        client,
+        &gemini_config.upstream,
+        &gemini_config.user_agent,
+        access_token,
+    )
+    .await
+    {
+        Ok(project) => {
+            *project_id = project;
+            None
+        }
+        Err(err) => Some(gemini::project_unresolved_warning(&err)),
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +724,256 @@ mod tests {
             "label is trimmed"
         );
         assert_eq!(openrouter_account_name(&config, "", "sk-or-v1-x"), "or:key");
+    }
+
+    /// A `{"token":…, "id_token":<JWT with email>}` Antigravity CLI store
+    /// whose access token expires at `expiry` (RFC 3339).
+    fn antigravity_store_json(email: &str, expiry: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(serde_json::json!({ "email": email }).to_string());
+        serde_json::json!({
+            "token": {
+                "access_token": "ya29.STORE-AT",
+                "token_type": "Bearer",
+                "refresh_token": "1//STORE-RT",
+                "expiry": expiry,
+            },
+            "auth_method": "oauth",
+            "id_token": format!("{header}.{body}.sig"),
+        })
+        .to_string()
+    }
+
+    fn scratch_file(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmux-login-{tag}-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ))
+    }
+
+    /// A store whose access token expired long ago: never looked up.
+    const EXPIRED: &str = "2000-01-01T00:00:00Z";
+    /// A store whose access token is still valid.
+    const VALID: &str = "2999-01-01T00:00:00Z";
+
+    /// What a local `loadCodeAssist` mock saw: `(path, authorization,
+    /// user-agent)` per request.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// A local Cloud Code mock answering every POST with `status` + `body`.
+    async fn spawn_cloud_code(status: u16, body: &'static str) -> (GeminiConfig, Seen) {
+        let seen: Seen = Seen::default();
+        let recorder = seen.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let recorder = recorder.clone();
+            async move {
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                recorder.lock().expect("seen lock").push((
+                    req.uri().path().to_string(),
+                    header("authorization"),
+                    header("user-agent"),
+                ));
+                axum::http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .expect("mock response")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = GeminiConfig {
+            upstream: format!("http://{addr}"),
+            user_agent: "antigravity/hub/9.9.9 test/arm64".to_string(),
+            ..GeminiConfig::default()
+        };
+        (config, seen)
+    }
+
+    async fn read_store(expiry: &str, config: &GeminiConfig) -> AccountConfig {
+        let path = scratch_file("agy-store");
+        std::fs::write(&path, antigravity_store_json("me@example.com", expiry))
+            .expect("write store");
+        let account = read_antigravity_store(&path, &reqwest::Client::new(), config).await;
+        let _ = std::fs::remove_file(&path);
+        account.expect("store parses")
+    }
+
+    fn project_of(account: &AccountConfig) -> &str {
+        match &account.credential {
+            AccountCredential::Gemini { project_id, .. } => project_id,
+            other => panic!("gemini credential expected, got {other:?}"),
+        }
+    }
+
+    /// trace S5: a store whose access token is still valid gets its project
+    /// at import time — one `loadCodeAssist` with the stored token and the
+    /// configured Antigravity identity, the same call an interactive login
+    /// makes — instead of on the first request.
+    #[tokio::test]
+    async fn antigravity_store_with_a_valid_token_resolves_its_project() {
+        let (config, seen) =
+            spawn_cloud_code(200, r#"{"cloudaicompanionProject":"proj-eager"}"#).await;
+        let account = read_store(VALID, &config).await;
+        assert_eq!(project_of(&account), "proj-eager");
+        let seen = seen.lock().expect("seen lock").clone();
+        assert_eq!(
+            seen,
+            vec![(
+                "/v1internal:loadCodeAssist".to_string(),
+                "Bearer ya29.STORE-AT".to_string(),
+                "antigravity/hub/9.9.9 test/arm64".to_string(),
+            )]
+        );
+    }
+
+    /// A store imported without a configured OAuth client still imports, but
+    /// the operator is told up front that the daemon will not be able to
+    /// refresh its token; a configured client prints nothing.
+    #[test]
+    fn store_import_warns_when_no_oauth_client_is_configured() {
+        let warning = client_missing_warning(GeminiConfig::default().oauth_client_from(|_| None))
+            .expect("a warning");
+        assert!(
+            warning.starts_with("warning: gemini OAuth client not configured: "),
+            "{warning}"
+        );
+        assert!(
+            warning
+                .ends_with("; this account will stop working when its current token expires (~1h)"),
+            "{warning}"
+        );
+        let configured = GeminiConfig {
+            client_id: Some("test-client-id".into()),
+            client_secret: Some("test-client-secret".into()),
+            ..GeminiConfig::default()
+        };
+        assert_eq!(
+            client_missing_warning(configured.oauth_client_from(|_| None)),
+            None
+        );
+    }
+
+    /// An expired stored token is never used and never refreshed at import:
+    /// no call, project left for the first request.
+    #[tokio::test]
+    async fn antigravity_store_with_an_expired_token_makes_no_call() {
+        let (config, seen) =
+            spawn_cloud_code(200, r#"{"cloudaicompanionProject":"proj-eager"}"#).await;
+        let account = read_store(EXPIRED, &config).await;
+        assert_eq!(project_of(&account), "");
+        assert!(seen.lock().expect("seen lock").is_empty(), "no lookup");
+        // Inside the 60s margin counts as expired too.
+        let mut account = read_store(EXPIRED, &config).await;
+        if let AccountCredential::Gemini { expires_at_ms, .. } = &mut account.credential {
+            *expires_at_ms = 1_000_000 + 59_999;
+        }
+        let warning =
+            resolve_store_project(&mut account, &reqwest::Client::new(), &config, 1_000_000).await;
+        assert_eq!(warning, None);
+        assert!(seen.lock().expect("seen lock").is_empty(), "no lookup");
+    }
+
+    /// A failed lookup never fails the import: the project stays empty and
+    /// the login's own warning text is returned for printing.
+    #[tokio::test]
+    async fn antigravity_store_lookup_failure_keeps_the_project_empty_with_a_warning() {
+        let (config, seen) = spawn_cloud_code(500, r#"{"error":"boom"}"#).await;
+        let path = scratch_file("agy-store");
+        std::fs::write(&path, antigravity_store_json("me@example.com", VALID))
+            .expect("write store");
+        let bytes = std::fs::read(&path).expect("read store");
+        let _ = std::fs::remove_file(&path);
+        let mut account = gemini::account_from_antigravity_store(&bytes).expect("store parses");
+        let warning = resolve_store_project(
+            &mut account,
+            &reqwest::Client::new(),
+            &config,
+            now_epoch_ms(),
+        )
+        .await
+        .expect("a warning");
+        assert!(
+            warning.starts_with("warning: Cloud Code project not resolved yet (")
+                && warning.ends_with(
+                    "); llmux resolves it on the first request or the next usage refresh"
+                ),
+            "{warning}"
+        );
+        assert!(!warning.contains("STORE-AT"), "no token in it: {warning}");
+        assert_eq!(project_of(&account), "");
+        assert_eq!(seen.lock().expect("seen lock").len(), 1);
+        // And through the shared reader: still an account, project empty.
+        assert_eq!(project_of(&read_store(VALID, &config).await), "");
+    }
+
+    /// trace S5: the login fallback and `llmux import` read the store file
+    /// into the same `gemini:{email}` account an OAuth login produces; an
+    /// expired stored token leaves the project empty (resolved on the first
+    /// request).
+    #[tokio::test]
+    async fn antigravity_store_file_reads_as_a_gemini_account() {
+        let path = scratch_file("agy-store");
+        std::fs::write(&path, antigravity_store_json("me@example.com", EXPIRED))
+            .expect("write store");
+        let account =
+            read_antigravity_store(&path, &reqwest::Client::new(), &GeminiConfig::default()).await;
+        let _ = std::fs::remove_file(&path);
+
+        let account = account.expect("store parses");
+        assert_eq!(account.name, "gemini:me@example.com");
+        let AccountCredential::Gemini {
+            email,
+            access_token,
+            refresh_token,
+            project_id,
+            ..
+        } = account.credential
+        else {
+            panic!("gemini credential expected");
+        };
+        assert_eq!(email, "me@example.com");
+        assert_eq!(access_token, "ya29.STORE-AT");
+        assert_eq!(refresh_token, "1//STORE-RT");
+        assert!(project_id.is_empty());
+    }
+
+    /// A missing or malformed store is an error from the path helper (the
+    /// `llmux import` probe turns it into a warning) — and the error never
+    /// carries a token value.
+    #[tokio::test]
+    async fn antigravity_store_file_errors_are_token_free() {
+        let client = reqwest::Client::new();
+        let config = GeminiConfig::default();
+        let missing = scratch_file("agy-missing");
+        assert!(read_antigravity_store(&missing, &client, &config)
+            .await
+            .is_err());
+
+        let path = scratch_file("agy-no-refresh");
+        std::fs::write(
+            &path,
+            r#"{"token":{"access_token":"ya29.SECRET-AT"},"id_token":"x.e30.sig"}"#,
+        )
+        .expect("write store");
+        let err = read_antigravity_store(&path, &client, &config).await;
+        let _ = std::fs::remove_file(&path);
+        let err = err.expect_err("no refresh token => no account").to_string();
+        assert!(err.contains("refresh_token"), "says why: {err}");
+        assert!(!err.contains("SECRET"), "no token in the message: {err}");
     }
 }

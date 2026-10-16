@@ -1,6 +1,10 @@
 //! `llmux import [--from PATH | --json J]` — bring accounts in from
-//! teamclaude config, `~/.claude/.credentials.json`, or inline JSON.
-//! Works fully offline: profile enrichment is a TODO until `auth` lands.
+//! teamclaude config, `~/.claude/.credentials.json`, `~/.codex/auth.json`,
+//! the Antigravity CLI token store, or inline JSON.
+//! Works offline, with one exception: an Antigravity store whose access
+//! token is still valid gets its Cloud Code project resolved with one
+//! `loadCodeAssist` call (a failure only warns). Profile enrichment is a TODO
+//! until `auth` lands.
 
 use crate::config::migrate;
 use crate::config::{AccountCredential, Config, Upsert};
@@ -16,7 +20,7 @@ use super::{CliError, ImportArgs};
 /// tier). Until then imports still work offline — names default from file
 /// content or to `account-N`, and dedup falls back to name matching.
 pub async fn run(args: ImportArgs) -> Result<(), CliError> {
-    let imported = collect_accounts(&args)?;
+    let imported = collect_accounts(&args).await?;
     if imported.is_empty() {
         return Err(CliError::Message("no accounts found to import".into()));
     }
@@ -43,7 +47,9 @@ pub async fn run(args: ImportArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn collect_accounts(args: &ImportArgs) -> Result<Vec<crate::config::AccountConfig>, CliError> {
+async fn collect_accounts(
+    args: &ImportArgs,
+) -> Result<Vec<crate::config::AccountConfig>, CliError> {
     if let Some(json) = &args.json {
         return Ok(migrate::import_inline_json(json)?);
     }
@@ -51,7 +57,7 @@ fn collect_accounts(args: &ImportArgs) -> Result<Vec<crate::config::AccountConfi
         return Ok(migrate::import_file(path)?);
     }
 
-    // No source given: probe both well-known locations.
+    // No source given: probe the well-known locations.
     let mut accounts = Vec::new();
     let mut probed = Vec::new();
 
@@ -97,6 +103,29 @@ fn collect_accounts(args: &ImportArgs) -> Result<Vec<crate::config::AccountConfi
         probed.push(codex);
     }
 
+    // Antigravity CLI token store → a `gemini:{email}` account
+    // (docs/gemini/spec.md §R2, trace S5). Same warning-not-failure rule.
+    if let Some(store) = crate::auth::gemini::antigravity_store_path() {
+        if store.exists() {
+            // The configured Cloud Code base + identity for the eager project
+            // lookup (a still-valid stored token only; never a refresh).
+            let gemini_config = crate::config::load()?.gemini;
+            let client = reqwest::Client::new();
+            match super::login::read_antigravity_store(&store, &client, &gemini_config).await {
+                Ok(account) => {
+                    println!(
+                        "Found Antigravity credentials at {} (account {:?})",
+                        store.display(),
+                        account.name
+                    );
+                    accounts.push(account);
+                }
+                Err(err) => eprintln!("warning: {}: skipped ({err})", store.display()),
+            }
+        }
+        probed.push(store);
+    }
+
     if accounts.is_empty() {
         let probed: Vec<String> = probed.iter().map(|p| p.display().to_string()).collect();
         return Err(CliError::Message(format!(
@@ -123,6 +152,10 @@ fn default_name(config: &Config, credential: &AccountCredential) -> String {
         // pre-openrouter binary, and an off-convention `or-key-N` would slip
         // through that cleanup and then fail the older binary's config load.
         AccountCredential::OpenRouter { .. } => "or:key-",
+        // Same `gemini:` namespace as a logged-in account (`gemini:{email}`,
+        // docs/gemini/spec.md §R2), so the downgrade cleanup of `gemini:*`
+        // accounts also catches an unnamed import.
+        AccountCredential::Gemini { .. } => "gemini:account-",
     };
     let mut n = config
         .accounts
