@@ -27,13 +27,14 @@ use axum::response::Response;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 
+use super::gemini_project::{self, GeminiProject};
 use super::logging::BODY_LOG_LIMIT;
 use super::server::AppState;
 use super::sse::{self, SseTransform as _};
 use crate::config::AccountCredential;
 use crate::provider::{
-    anthropic, responses, responses_request, AnthropicRequest, Provider as _, ProviderError,
-    ProviderRequest,
+    anthropic, gemini, responses, responses_request, AnthropicRequest, Provider as _,
+    ProviderError, ProviderRequest,
 };
 use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
@@ -244,6 +245,132 @@ pub(crate) fn grok_free_usage_exhausted(detail: &str) -> bool {
     lower.contains("free-usage-exhausted") || lower.contains("included free usage")
 }
 
+/// Probe-not-before ESTIMATE for a gemini 429 whose body says the quota is
+/// exhausted but carries no retry delay (docs/gemini/spec.md §R6): the real
+/// reset is the served model's `quotaInfo.resetTime`, unknown on this path.
+pub(crate) const GEMINI_QUOTA_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+
+/// Operator message for a gemini account Google suspended (403 naming the
+/// Terms of Service). Benched, never rotated as a transient error.
+pub(crate) const GEMINI_TOS_MESSAGE: &str =
+    "Google suspended Antigravity access for this account (ToS); appeal before re-enabling";
+
+/// Local refusal for a Claude Code request routed to the gemini group.
+/// Google's Antigravity backend refuses Claude Code requests (429
+/// RESOURCE_EXHAUSTED on Claude Code bodies while the same account served
+/// Codex, 2026-10-15), and every refused call is logged against the user's
+/// Google account — so llmux answers locally and never forwards them.
+pub(crate) const GEMINI_CLAUDE_CODE_REFUSAL: &str = "gemini models are not available from Claude Code: Google's Antigravity backend refuses Claude Code requests, so llmux does not forward them. Use gemini from Codex: llmux run --codex -- -m gemini";
+
+/// Whether a request is Claude Code traffic routed to the gemini group — the
+/// client policy gate behind [`GEMINI_CLAUDE_CODE_REFUSAL`]. Keyed on the
+/// client identity only (a `claude-cli/` User-Agent: `claude-cli/<v>
+/// (external, cli)` interactive, `(external, sdk-cli)` from the SDK), never
+/// on prompt content — and never on the endpoint: Claude Code reaches the
+/// gemini group on ANY method and path (`/v1/messages`, its `count_tokens`,
+/// the Responses ingress), and none of it may.
+fn refuses_claude_code_gemini(group: Option<BackendGroup>, headers: &HeaderMap) -> bool {
+    group == Some(BackendGroup::Gemini)
+        && headers
+            .get(header::USER_AGENT)
+            .and_then(|ua| ua.to_str().ok())
+            .is_some_and(|ua| ua.starts_with("claude-cli/"))
+}
+
+/// Google RPC `details[]` entry types a gemini 429 carries.
+const GOOGLE_RETRY_INFO: &str = "type.googleapis.com/google.rpc.RetryInfo";
+const GOOGLE_ERROR_INFO: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+
+/// The wait a gemini 429 body asks for (docs/gemini/spec.md §R6, trace S7):
+/// the stated delay when there is one ([`gemini_stated_delay`]), else
+/// [`GEMINI_QUOTA_COOLDOWN`] when the body names quota exhaustion
+/// (`ErrorInfo.reason = QUOTA_EXHAUSTED`), else `None` — a
+/// `RATE_LIMIT_EXCEEDED` without a delay takes the ordinary
+/// no-retry-after path. `body` is the RAW upstream error body: the condensed
+/// activity detail drops `details[]`.
+pub(crate) fn gemini_retry_after(body: &str) -> Option<Duration> {
+    gemini_stated_delay(body)
+        .or_else(|| gemini_quota_exhausted(body).then_some(GEMINI_QUOTA_COOLDOWN))
+}
+
+/// The delay a gemini 429 body STATES: `RetryInfo.retryDelay`, else
+/// `ErrorInfo.metadata.quotaResetDelay` (CLIProxyAPI `ParseRetryDelay`),
+/// rounded UP to whole seconds. Accepts the RPC object or a one-element
+/// array of it.
+fn gemini_stated_delay(body: &str) -> Option<Duration> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = value
+        .get("error")
+        .or_else(|| value.get(0).and_then(|first| first.get("error")))?;
+    let details = error.get("details")?.as_array()?;
+    let field = |kind: &str, pointer: &str| {
+        details
+            .iter()
+            .filter(|detail| detail.get("@type").and_then(serde_json::Value::as_str) == Some(kind))
+            .filter_map(|detail| detail.pointer(pointer).and_then(serde_json::Value::as_str))
+            .find_map(parse_google_duration)
+    };
+    field(GOOGLE_RETRY_INFO, "/retryDelay")
+        .or_else(|| field(GOOGLE_ERROR_INFO, "/metadata/quotaResetDelay"))
+}
+
+/// Whether a gemini 429 body names quota exhaustion: the `QUOTA_EXHAUSTED`
+/// reason, or the same words in free text (CLIProxyAPI's keyword fallback).
+fn gemini_quota_exhausted(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("quota_exhausted") || lower.contains("quota exhausted")
+}
+
+/// A Google duration (`"3.2s"`, protobuf JSON form) or Go-style compound
+/// (`"1h2m3.5s"`, `"250ms"`) rounded UP to whole seconds. `None` for an
+/// unparseable or zero duration — no usable wait.
+fn parse_google_duration(text: &str) -> Option<Duration> {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut nanos: f64 = 0.0;
+    while !rest.is_empty() {
+        let number_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let number: f64 = rest[..number_len].parse().ok()?;
+        rest = &rest[number_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let scale = match &rest[..unit_len] {
+            "h" => 3_600e9,
+            "m" => 60e9,
+            "s" => 1e9,
+            "ms" => 1e6,
+            "us" | "µs" => 1e3,
+            "ns" => 1.0,
+            _ => return None,
+        };
+        rest = &rest[unit_len..];
+        nanos += number * scale;
+    }
+    if !nanos.is_finite() || nanos <= 0.0 {
+        return None;
+    }
+    let secs = (nanos / 1e9).ceil();
+    // Saturate absurd values instead of overflowing the cast.
+    Some(Duration::from_secs(if secs >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        secs as u64
+    }))
+}
+
+/// Whether a gemini 403 body names a Terms-of-Service suspension.
+fn gemini_tos_suspended(body: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    ["terms of service", "tos_violation", "suspended"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// Parse a `retry-after` header (delta-seconds form). The HTTP-date form is
 /// not parsed — Anthropic sends seconds; an unparseable value falls back to
 /// the heuristic cooldown via `None`.
@@ -313,6 +440,12 @@ struct ForwardContext {
     /// requests go upstream verbatim and have nothing to report.
     compatibility: Option<responses_request::CompatibilityReport>,
     auto_classifier: Option<super::auto_classifier::Route>,
+    /// `(client model stamp, sessionId)` of the Messages body the gemini
+    /// request was built from, set at dispatch. The relay's converter must
+    /// cache streamed thought signatures under the SAME session id the next
+    /// turn's `build_request` derives — on the Responses ingress `body` is
+    /// only the metadata summary (last user text), not that Messages body.
+    gemini_converter: Option<(String, String)>,
 }
 
 impl ForwardContext {
@@ -407,6 +540,17 @@ impl ForwardContext {
                 group: Some("claude".to_string()),
                 model: self.model.clone(),
                 effort: claude_effort(&self.body),
+                fast: false,
+            },
+            // The provider-resolved UPSTREAM id for every alias form
+            // (`argon`, `gemini-4-argon[1m]` → `gemini-4-argon`) — codex
+            // parity; pricing keys off this string. No effort: the thinking
+            // level is baked into the gemini model id and client effort is
+            // not sent upstream (docs/gemini/spec.md §R3).
+            Some(BackendGroup::Gemini) => FinishedMeta {
+                group: Some("gemini".to_string()),
+                model: Some(state.gemini.request_meta(&self.body).0),
+                effort: None,
                 fast: false,
             },
             None => FinishedMeta {
@@ -534,6 +678,61 @@ impl ForwardContext {
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
         });
+    }
+
+    /// [`refuses_claude_code_gemini`] for this request, served by `group`.
+    fn is_claude_code_gemini(&self, group: Option<BackendGroup>) -> bool {
+        refuses_claude_code_gemini(group, &self.headers)
+    }
+
+    /// The local answer to a Claude Code request that would be served by the
+    /// gemini group — the ONE place the refusal is logged, emitted and shaped,
+    /// shared by the early gate (no lease) and the post-lease backstop
+    /// (`account` = the leased gemini account). A 400 `invalid_request_error`
+    /// because Claude Code retries 429/5xx but not 400: one prompt is one
+    /// local refusal and zero Antigravity calls. Shaped for the ingress the
+    /// client spoke (the Responses error envelope on `/v1/responses`, the
+    /// Messages one otherwise) with the same text. The finished row names the
+    /// requested model under group `gemini`.
+    fn claude_code_gemini_refusal(
+        &mut self,
+        state: &AppState,
+        account: Option<&AccountId>,
+    ) -> Response {
+        let requested = self.model.as_deref().unwrap_or("gemini");
+        let message = format!("{requested}: {GEMINI_CLAUDE_CODE_REFUSAL}");
+        self.log(format!("=== ERROR ===\n{message}"));
+        self.flush_log(state);
+        state.emit(ActivityEvent::Error {
+            context: Some("gemini".into()),
+            message: message.clone(),
+        });
+        state.emit(ActivityEvent::RequestFinished {
+            id: self.activity_id,
+            endpoint: self.endpoint_origin,
+            method: self.method.to_string(),
+            path: self.path_query.clone(),
+            account: account.map(|a| a.0.clone()),
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            duration: self.started.elapsed(),
+            tokens: None,
+            group: Some(BackendGroup::Gemini.as_str().to_string()),
+            model: self.model.clone(),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: self.user_id.clone(),
+            kind: self.kind.clone(),
+            excerpt: self.excerpt.clone(),
+            tenant: self.tenant.clone(),
+        });
+        if self.endpoint_origin == crate::tui::Endpoint::OpenAi {
+            return super::responses::error(StatusCode::BAD_REQUEST, &message);
+        }
+        error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
     }
 }
 
@@ -802,12 +1001,14 @@ fn compatibility_mode(headers: &HeaderMap) -> Result<CompatibilityMode, String> 
 
 /// The Responses flavor a backend group speaks. `None` for the groups that
 /// serve the Anthropic wire format natively (claude, openrouter) — they are
-/// not translated, so this policy does not apply to them.
+/// not translated, so this policy does not apply to them — and for gemini,
+/// which translates to the Cloud Code `v1internal` envelope rather than to
+/// the Responses API (docs/gemini/spec.md §R3).
 fn responses_flavor(group: BackendGroup) -> Option<responses_request::ResponsesFlavor> {
     match group {
         BackendGroup::Codex => Some(responses_request::ResponsesFlavor::Codex),
         BackendGroup::Grok => Some(responses_request::ResponsesFlavor::Grok),
-        BackendGroup::Claude | BackendGroup::OpenRouter => None,
+        BackendGroup::Claude | BackendGroup::OpenRouter | BackendGroup::Gemini => None,
     }
 }
 
@@ -832,7 +1033,20 @@ fn invalid_request_response(
     error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
 }
 
-/// The pre-refresh compatibility gate for one codex/grok request.
+/// Which translator's compatibility check [`compatibility_gate`] runs.
+#[derive(Debug, Clone, Copy)]
+enum CompatTarget {
+    /// The codex/grok Responses translation (`count_tokens` switches to the
+    /// count contract).
+    Responses {
+        flavor: responses_request::ResponsesFlavor,
+        count_tokens: bool,
+    },
+    /// The gemini Cloud Code translation (`/v1/messages` only).
+    Gemini,
+}
+
+/// The pre-refresh compatibility gate for one codex/grok/gemini request.
 ///
 /// `Err` is the finished response to return as-is: an unreadable body, an
 /// unknown mode, content the flavor cannot represent, or — under `strict` —
@@ -845,8 +1059,7 @@ fn compatibility_gate(
     ctx: &mut ForwardContext,
     account: &AccountId,
     group: BackendGroup,
-    flavor: responses_request::ResponsesFlavor,
-    count_tokens: bool,
+    target: CompatTarget,
 ) -> Result<CompatibilityCheck, Box<Response>> {
     let mode = match compatibility_mode(&ctx.headers) {
         Ok(mode) => mode,
@@ -874,7 +1087,14 @@ fn compatibility_gate(
             "request body is not valid JSON",
         )));
     };
-    let mut report = match responses_request::validate_request(&body, flavor, count_tokens) {
+    let validated = match target {
+        CompatTarget::Responses {
+            flavor,
+            count_tokens,
+        } => responses_request::validate_request(&body, flavor, count_tokens),
+        CompatTarget::Gemini => state.gemini.validate_request(&body),
+    };
+    let mut report = match validated {
         Ok(report) => report,
         Err(ProviderError::InvalidRequest(message)) => {
             return Err(Box::new(invalid_request_response(
@@ -1272,6 +1492,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         served_by: None,
         compatibility: None,
         auto_classifier,
+        gemini_converter: None,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
@@ -1279,6 +1500,13 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             ctx.body.len(),
             body_excerpt(&ctx.ingress_body)
         ));
+    }
+    // Claude Code → gemini is refused HERE in the common case: the classified
+    // group is final and nothing is leased or sent upstream yet. A request
+    // that only lands on gemini AFTER the lease (routing off, or
+    // `on_empty_group="fallback"`) is caught by the backstop in the loop.
+    if ctx.is_claude_code_gemini(ctx.group) {
+        return ctx.claude_code_gemini_refusal(state, None);
     }
     let mut response = if ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor()) {
         // One wall-clock deadline covers queueing, retries, headers and body.
@@ -1543,6 +1771,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     claude_effort(&ctx.body),
                     false,
                 ),
+                // Same contract as `finished_meta`'s gemini arm
+                // (provider-resolved upstream model, no effort).
+                BackendGroup::Gemini => (
+                    Some("gemini".to_string()),
+                    Some(state.gemini.request_meta(&ctx.body).0),
+                    None,
+                    false,
+                ),
             };
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
@@ -1558,6 +1794,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // reuses the same value (a token refresh never changes a credential's
         // kind).
         let served = group.unwrap_or_else(|| BackendGroup::from_kind(credential.kind()));
+        // Backstop for the early Claude Code → gemini gate: routing off (the
+        // served group comes from the leased credential) and
+        // `on_empty_group="fallback"` (the resolved group differs from the
+        // classified one) both learn the group only here. Refused before the
+        // project lookup, compatibility gate, refresh and upstream send.
+        if ctx.is_claude_code_gemini(Some(served)) {
+            drop(lease);
+            return ctx.claude_code_gemini_refusal(state, Some(&account));
+        }
         let request_path = ctx.path_query.split('?').next().unwrap_or("").to_string();
         let count_tokens = request_path == "/v1/messages/count_tokens";
 
@@ -1567,15 +1812,29 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // path is answered here too — it makes no upstream call, so it must
         // not refresh either (a local estimate is not worth a token grant).
         // Only the two endpoints these accounts actually serve are gated;
-        // anything else keeps falling through to the 501 in step 4.
-        let gated_flavor = responses_flavor(served).filter(|_| {
-            matches!(
-                request_path.as_str(),
-                "/v1/messages" | "/v1/messages/count_tokens"
-            )
-        });
-        if let Some(flavor) = gated_flavor {
-            match compatibility_gate(state, ctx, &account, served, flavor, count_tokens) {
+        // anything else keeps falling through to the 501 in step 4. Gemini
+        // runs its own translator's check on `/v1/messages` only (its count
+        // stays the legacy local estimate in step 4), which also answers a
+        // body the adapter refuses before any refresh or project lookup.
+        let gate = match responses_flavor(served) {
+            Some(flavor)
+                if matches!(
+                    request_path.as_str(),
+                    "/v1/messages" | "/v1/messages/count_tokens"
+                ) =>
+            {
+                Some(CompatTarget::Responses {
+                    flavor,
+                    count_tokens,
+                })
+            }
+            None if served == BackendGroup::Gemini && request_path == "/v1/messages" => {
+                Some(CompatTarget::Gemini)
+            }
+            _ => None,
+        };
+        if let Some(target) = gate {
+            match compatibility_gate(state, ctx, &account, served, target) {
                 Ok(check) => {
                     if count_tokens {
                         ctx.served_by = Some(served);
@@ -1750,6 +2009,26 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         }
                         continue;
                     }
+                    // No OAuth client configured: nothing was sent and the
+                    // account is fine. Still-valid token → serve with it;
+                    // already expired → answer with the fix, never bench.
+                    RefreshOutcome::Misconfigured { message } => {
+                        state.emit(ActivityEvent::Error {
+                            context: Some("refresh".into()),
+                            message: format!("{account}: {message}"),
+                        });
+                        if expires_at_ms <= now_epoch_ms() {
+                            ctx.log(format!("=== ERROR ===\n{message}"));
+                            ctx.flush_log(state);
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            drop(lease);
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "proxy_error",
+                                &message,
+                            );
+                        }
+                    }
                     RefreshOutcome::Permanent { detail, status } => {
                         // Only bench if the dead refresh token is still the
                         // account's live credential (relogin-trace B1).
@@ -1784,7 +2063,61 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        // 4. Non-anthropic accounts (codex, grok, openrouter) serve the
+        // 3b. Lazy gemini project (docs/gemini/spec.md §R5): an imported
+        // account has no Cloud Code project until its first request resolves
+        // one via `loadCodeAssist`. Runs AFTER the refresh so the lookup
+        // carries a live access token, and only for a request that goes
+        // upstream (count_tokens is a local estimate, other paths are 501s).
+        let goes_upstream = ctx.responses_input.is_some() || request_path == "/v1/messages";
+        let project = if goes_upstream {
+            let lookup = gemini_project::ProjectLookup {
+                client: &state.client,
+                upstream: &state.config.gemini.upstream,
+                user_agent: &state.config.gemini.user_agent,
+                pool: &state.pool,
+                config_path: state.config_path.as_deref(),
+            };
+            gemini_project::ensure_project(&lookup, &account, &credential).await
+        } else {
+            GeminiProject::Ready
+        };
+        match project {
+            GeminiProject::Ready => {}
+            GeminiProject::Resolved {
+                credential: fresh, ..
+            } => credential = fresh,
+            // A re-login replaced the credential mid-lookup: re-lease, the
+            // same bounded retry as a superseded refresh.
+            GeminiProject::Superseded => {
+                drop(lease);
+                switches += 1;
+                if switches > max_switches {
+                    ctx.flush_log(state);
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "proxy_error",
+                        "account retries exhausted (credential replaced during project lookup)",
+                    );
+                }
+                continue;
+            }
+            // Never benched: the account may be fine and the lookup a blip.
+            GeminiProject::Failed(err) => {
+                let message = gemini_project::failure_message(&err);
+                ctx.log(format!("=== ERROR ===\n{message}"));
+                ctx.flush_log(state);
+                state.emit(ActivityEvent::Error {
+                    context: Some("upstream".into()),
+                    message: format!("{account}: {message}"),
+                });
+                ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                drop(lease);
+                return error_response(StatusCode::BAD_GATEWAY, "proxy_error", &message);
+            }
+        }
+
+        // 4. Non-anthropic accounts (codex, grok, openrouter, gemini) serve the
         // Messages API only: count_tokens is answered locally with a naive
         // estimate (no upstream equivalent); any other endpoint is a clear
         // 501.
@@ -1797,10 +2130,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // (the compatibility gate needed it).
         //
         // Two INDEPENDENT questions, each owned by an exhaustive predicate on
-        // `BackendGroup` so a fifth group cannot answer one and silently
+        // `BackendGroup` so a new group cannot answer one and silently
         // inherit the other (see routing.rs — that conflation already cost one
         // defect in this very feature).
-        //   - needs_body_translation: codex/grok only. OpenRouter serves the
+        //   - needs_body_translation: codex/grok/gemini. OpenRouter serves the
         //     Anthropic Messages format natively, so it rides the passthrough
         //     branch below with a different endpoint, credential and a
         //     `model`-field rewrite — no converter, no SSE transform.
@@ -1814,9 +2147,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         if messages_only && ctx.responses_input.is_none() {
             let path = request_path.as_str();
             if path == "/v1/messages/count_tokens" {
-                // OpenRouter only: the Responses flavors already answered
-                // their count above (pre-refresh), so this arm is the
-                // unchanged legacy estimate for the one group the
+                // OpenRouter and gemini: the Responses flavors already
+                // answered their count above (pre-refresh), so this arm is
+                // the unchanged legacy estimate for the groups the
                 // compatibility policy does not cover.
                 drop(lease);
                 return translate_count_tokens_response(state, ctx, &account, served, None);
@@ -1922,6 +2255,27 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             );
                         }
                     }
+                } else if served == BackendGroup::Gemini {
+                    // Responses → Messages → gemini adapter, the grok shape
+                    // (docs/gemini/spec.md §R5). Explicit so a gemini
+                    // credential can never fall into the openrouter arm below.
+                    match state
+                        .gemini
+                        .build_request(body.to_string().as_bytes(), &credential)
+                    {
+                        Ok((req, _)) => {
+                            ctx.gemini_converter = Some(gemini_converter_keys(state, &body));
+                            translate_stream = Some(true);
+                            (req, state.gemini.endpoint().to_string())
+                        }
+                        Err(ProviderError::InvalidRequest(message)) => {
+                            return invalid_request_response(state, ctx, &account, &message);
+                        }
+                        Err(err) => {
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            return rewrite_error(state, ctx, err.to_string());
+                        }
+                    }
                 } else {
                     let original = std::mem::replace(&mut ctx.body, Bytes::from(body.to_string()));
                     let built = build_openrouter_request(state, ctx, &credential).await;
@@ -1958,6 +2312,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     .grok
                     .build_request(&ctx.body, &credential)
                     .map(|out| (out, state.grok.endpoint().to_string())),
+                // A body the adapter refuses was already a local 400 at the
+                // step-2 gate (same translation), before any refresh.
+                BackendGroup::Gemini => {
+                    let built = state.gemini.build_request(&ctx.body, &credential);
+                    if built.is_ok() {
+                        let body = serde_json::from_slice::<serde_json::Value>(&ctx.body)
+                            .unwrap_or(serde_json::Value::Null);
+                        ctx.gemini_converter = Some(gemini_converter_keys(state, &body));
+                    }
+                    built.map(|out| (out, state.gemini.endpoint().to_string()))
+                }
                 BackendGroup::Claude | BackendGroup::OpenRouter => {
                     unreachable!("is_translate excludes claude and openrouter")
                 }
@@ -2152,7 +2517,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
             UpstreamSignal::RateLimited { retry_after } => {
                 let headers_log = format_headers(response.headers());
-                let detail = upstream_error_detail(response).await;
+                // Read ONCE: the condensed detail feeds the log/activity line,
+                // the raw body feeds the gemini `details[]` parse (which the
+                // condensed form drops). Same detail as `upstream_error_detail`.
+                let (detail, raw_body) = match response.bytes().await {
+                    Ok(body) => (condense_error_body(&body), body),
+                    Err(err) => (format!("<error body unreadable: {err}>"), Bytes::new()),
+                };
                 ctx.log(format!(
                     "=== RESPONSE 429 (retry-after: {retry_after:?}) ===\n{headers_log}\n{detail}"
                 ));
@@ -2168,6 +2539,21 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             "grok free usage exhausted; parking ~24h (estimated rolling window)"
                         );
                         Some(GROK_FREE_USAGE_COOLDOWN)
+                    }
+                    // Gemini states its wait in the BODY (RetryInfo), never in
+                    // a header; quota exhaustion without one parks ~1h
+                    // (ESTIMATED — the real reset is the model's quota
+                    // resetTime). docs/gemini/spec.md §R6.
+                    None if served == BackendGroup::Gemini => {
+                        let body = String::from_utf8_lossy(&raw_body);
+                        let wait = gemini_retry_after(&body);
+                        if wait.is_some() && gemini_stated_delay(&body).is_none() {
+                            tracing::info!(
+                                account = %account,
+                                "gemini quota exhausted; parking ~1h (estimated, no retry delay)"
+                            );
+                        }
+                        wait
                     }
                     other => other,
                 };
@@ -2367,9 +2753,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 let mut auth_status = response.status();
                 ctx.log("=== RESPONSE 401 ===".to_string());
                 drop(response);
+                // Gemini too: Google access tokens live ~1h, and without one
+                // forced refresh a 401 would bench the account (sticky until
+                // re-login) for what a token grant fixes.
                 let oauth = matches!(
                     credential,
-                    AccountCredential::Oauth { .. } | AccountCredential::Codex { .. }
+                    AccountCredential::Oauth { .. }
+                        | AccountCredential::Codex { .. }
+                        | AccountCredential::Gemini { .. }
                 );
                 if oauth && !force_refreshed.contains(&account) {
                     force_refreshed.insert(account.clone());
@@ -2386,6 +2777,25 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         RefreshOutcome::Permanent { status, .. } => auth_status = status,
                         RefreshOutcome::Failed { status } => {
                             auth_status = status.unwrap_or(auth_status);
+                        }
+                        // The 401 says the token is dead and nothing can mint
+                        // a new one until the operator configures the client.
+                        // Not the account's fault: no bench, no switch (every
+                        // account of the provider shares the missing client).
+                        RefreshOutcome::Misconfigured { message } => {
+                            state.emit(ActivityEvent::Error {
+                                context: Some("refresh".into()),
+                                message: format!("{account}: {message}"),
+                            });
+                            ctx.log(format!("=== ERROR ===\n{message}"));
+                            ctx.flush_log(state);
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            drop(lease);
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "proxy_error",
+                                &message,
+                            );
                         }
                     }
                 }
@@ -2610,14 +3020,16 @@ fn resolve_group(
 }
 
 /// Expiry of a refreshable (oauth-style) credential: anthropic `Oauth`,
-/// `Codex`, and `Grok` all rotate access tokens. `Apikey` never expires, and
-/// neither does `OpenRouter` — its PKCE exchange yields a long-lived API key
-/// rather than an access/refresh pair (docs/openrouter/spec.md §R1).
+/// `Codex`, `Grok` and `Gemini` all rotate access tokens. `Apikey` never
+/// expires, and neither does `OpenRouter` — its PKCE exchange yields a
+/// long-lived API key rather than an access/refresh pair
+/// (docs/openrouter/spec.md §R1).
 fn refreshable_expiry(credential: &AccountCredential) -> Option<u64> {
     match credential {
         AccountCredential::Oauth { expires_at_ms, .. }
         | AccountCredential::Codex { expires_at_ms, .. }
-        | AccountCredential::Grok { expires_at_ms, .. } => Some(*expires_at_ms),
+        | AccountCredential::Grok { expires_at_ms, .. }
+        | AccountCredential::Gemini { expires_at_ms, .. } => Some(*expires_at_ms),
         AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => None,
     }
 }
@@ -2629,7 +3041,7 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn expiring_soon(expires_at_ms: u64) -> bool {
+pub(super) fn expiring_soon(expires_at_ms: u64) -> bool {
     expires_at_ms <= now_epoch_ms().saturating_add(REFRESH_AHEAD_MS)
 }
 
@@ -2644,6 +3056,12 @@ pub(crate) enum RefreshOutcome {
     Permanent { detail: String, status: StatusCode },
     /// Transient refresh failure — old token may still work.
     Failed { status: Option<StatusCode> },
+    /// No refresh was attempted: the provider's OAuth client is not
+    /// configured (gemini: `GeminiConfig::oauth_client`). A CONFIGURATION
+    /// failure shared by every account of the provider — never a verdict on
+    /// this account's refresh token, so it never benches the account or asks
+    /// for a re-login. `message` is the operator-facing fix.
+    Misconfigured { message: String },
     /// The account was RE-CREDENTIALED (a re-login) while this refresh was in
     /// flight, so its tokens were discarded rather than applied
     /// (`docs/keys-history/relogin-trace.md` B2). Nothing was written to the
@@ -2729,7 +3147,7 @@ pub(crate) fn refresh_death_detail(status: &StatusCode, body: &str) -> String {
 
 /// The one sanitizer every refresh-death reason passes through, structured
 /// or raw: mask credential-shaped tokens, collapse to one line, bound length.
-fn sanitize_detail(text: &str) -> String {
+pub(super) fn sanitize_detail(text: &str) -> String {
     collapse_and_truncate(&super::logging::mask_credentials(text), RAW_DETAIL_LIMIT)
 }
 
@@ -2798,6 +3216,27 @@ pub(crate) async fn refresh_credential(
         AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
             return RefreshOutcome::Failed { status: None }
         }
+        // Google `refresh_token` grant against the configured token URL
+        // (docs/gemini/spec.md §R2); no coalescer, same rationale as codex.
+        // Without the operator-configured OAuth client there is no grant to
+        // send: no IO, and a configuration verdict instead of a token one.
+        AccountCredential::Gemini { refresh_token, .. } => match state.gemini_oauth_client() {
+            Ok(oauth) => {
+                crate::auth::gemini::refresh_gemini(
+                    &state.client,
+                    oauth,
+                    &state.config.gemini.token_url,
+                    refresh_token,
+                )
+                .await
+            }
+            Err(err) => {
+                tracing::warn!(account = %account, error = %err, "token refresh not attempted");
+                return RefreshOutcome::Misconfigured {
+                    message: err.to_string(),
+                };
+            }
+        },
     };
     match outcome {
         Ok(tokens) => {
@@ -2859,6 +3298,27 @@ pub(crate) async fn refresh_credential(
                         last_refresh_ms: Some(refreshed_at_ms),
                     },
                     non_empty_or(subject, &account.0),
+                ),
+                // Email and project survive a refresh; the refresh token
+                // rotates only when Google returns a new one.
+                AccountCredential::Gemini {
+                    email,
+                    refresh_token,
+                    project_id,
+                    ..
+                } => (
+                    AccountCredential::Gemini {
+                        email: email.clone(),
+                        access_token: tokens.access_token.clone(),
+                        refresh_token: tokens
+                            .refresh_token
+                            .clone()
+                            .unwrap_or_else(|| refresh_token.clone()),
+                        expires_at_ms: tokens.expires_at_ms,
+                        project_id: project_id.clone(),
+                        last_refresh_ms: Some(refreshed_at_ms),
+                    },
+                    non_empty_or(email, &account.0),
                 ),
                 AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
                     unreachable!("filtered above")
@@ -3331,9 +3791,134 @@ fn translate_count_tokens_response(
     response
 }
 
-/// Terminal relay for a translate-path (codex/grok) upstream response. Every
-/// request goes upstream with `stream: true`, so a 2xx from `/responses` IS a
-/// Responses SSE stream by contract — the real chatgpt.com backend sends
+/// The stream converter behind [`relay_translate`]: one per request, picked
+/// by the served group. Codex, grok and the auto classifier speak Responses
+/// SSE; gemini speaks Cloud Code `streamGenerateContent` SSE. Both arms emit
+/// Anthropic SSE and expose the same accessor set, so the relay reads them
+/// through this one type.
+#[derive(Debug)]
+enum TranslateConverter {
+    Responses(responses::ResponsesSseConverter),
+    Gemini(gemini::GeminiSseConverter),
+}
+
+impl From<responses::ResponsesSseConverter> for TranslateConverter {
+    fn from(converter: responses::ResponsesSseConverter) -> Self {
+        Self::Responses(converter)
+    }
+}
+
+impl From<gemini::GeminiSseConverter> for TranslateConverter {
+    fn from(converter: gemini::GeminiSseConverter) -> Self {
+        Self::Gemini(converter)
+    }
+}
+
+impl TranslateConverter {
+    /// See `ResponsesSseConverter::with_safeguards_requested`.
+    fn with_safeguards_requested(self, requested: bool) -> Self {
+        match self {
+            Self::Responses(c) => Self::Responses(c.with_safeguards_requested(requested)),
+            Self::Gemini(c) => Self::Gemini(c.with_safeguards_requested(requested)),
+        }
+    }
+
+    /// The aggregated Messages JSON for a non-streaming client.
+    fn into_message_json(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Responses(c) => c.into_message_json(),
+            Self::Gemini(c) => c.into_message_json(),
+        }
+    }
+
+    /// Upstream error message, when the stream ended in an error.
+    fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Responses(c) => c.error_message(),
+            Self::Gemini(c) => c.error_message(),
+        }
+    }
+
+    /// Verbatim upstream usage object, for the trace.
+    fn raw_usage(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Responses(c) => c.raw_usage(),
+            Self::Gemini(c) => c.raw_usage(),
+        }
+    }
+
+    /// Count of real upstream SSE events parsed so far.
+    fn events_seen(&self) -> u64 {
+        match self {
+            Self::Responses(c) => c.events_seen(),
+            Self::Gemini(c) => c.events_seen(),
+        }
+    }
+}
+
+impl sse::SseTransform for TranslateConverter {
+    fn on_event(&mut self, event: &str) -> Vec<u8> {
+        match self {
+            Self::Responses(c) => c.on_event(event),
+            Self::Gemini(c) => c.on_event(event),
+        }
+    }
+
+    fn on_end(&mut self) -> Vec<u8> {
+        match self {
+            Self::Responses(c) => c.on_end(),
+            Self::Gemini(c) => c.on_end(),
+        }
+    }
+
+    fn usage(&self) -> sse::StreamUsage {
+        match self {
+            Self::Responses(c) => c.usage(),
+            Self::Gemini(c) => c.usage(),
+        }
+    }
+}
+
+/// The converter for one translate-path response, by served group: grok and
+/// gemini from their providers, codex (or the auto classifier's pinned
+/// model) otherwise. Gemini reuses the `(stamp, sessionId)` recorded at
+/// dispatch so streamed signatures land under the key the next turn reads.
+fn translate_converter(
+    state: &AppState,
+    ctx: &ForwardContext,
+    served: BackendGroup,
+) -> TranslateConverter {
+    let converter = match served {
+        BackendGroup::Grok => TranslateConverter::from(state.grok.converter()),
+        BackendGroup::Gemini => {
+            let (stamp, session_id) = ctx.gemini_converter.clone().unwrap_or_else(|| {
+                let body = serde_json::from_slice::<serde_json::Value>(&ctx.body)
+                    .unwrap_or(serde_json::Value::Null);
+                gemini_converter_keys(state, &body)
+            });
+            TranslateConverter::from(state.gemini.converter(stamp, session_id))
+        }
+        _ => TranslateConverter::from(match &ctx.auto_classifier {
+            Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
+            None => state.codex.converter(),
+        }),
+    };
+    converter.with_safeguards_requested(responses::requests_tool_use_review(&ctx.body))
+}
+
+/// `(client model stamp, sessionId)` for the gemini converter answering a
+/// request built from the Anthropic Messages `body`.
+fn gemini_converter_keys(state: &AppState, body: &serde_json::Value) -> (String, String) {
+    (
+        state.gemini.client_model_stamp(body),
+        gemini::session_id_for(body),
+    )
+}
+
+/// Terminal relay for a translate-path (codex/grok/gemini) upstream response.
+/// Every request goes upstream streaming, so a 2xx IS an SSE stream by
+/// contract (Responses events for codex/grok, Cloud Code
+/// `streamGenerateContent` events for gemini) — the real chatgpt.com backend sends
 /// streaming 200s with NO `content-type` header at all (live capture
 /// 2026-06-12), so sniffing the header would misclassify good streams. 2xx
 /// therefore always enters the transform path: converted to Anthropic SSE on
@@ -3380,6 +3965,10 @@ async fn relay_translate(
             state.config.grok.trace,
             state.grok.request_meta(&ctx.body).0,
         ),
+        BackendGroup::Gemini => (
+            state.config.gemini.trace,
+            state.gemini.request_meta(&ctx.body).0,
+        ),
         _ => (state.config.codex.trace, ctx.codex_meta(state).0),
     };
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
@@ -3404,6 +3993,23 @@ async fn relay_translate(
             body_excerpt(&bytes)
         ));
         ctx.flush_log(state);
+        // A Google ToS suspension is an ACCOUNT verdict, not a request one:
+        // bench it (guarded — a re-login since the lease keeps its health) so
+        // the scheduler stops sending traffic to it, and tell the operator
+        // why. The client still gets the wrapped error below.
+        if served == BackendGroup::Gemini
+            && status == StatusCode::FORBIDDEN
+            && gemini_tos_suspended(&bytes)
+        {
+            tracing::warn!(account = %account, "gemini 403: Google suspended Antigravity access (ToS); benching");
+            state
+                .pool
+                .record_auth_failure_if(&account, lease.fingerprint(), Some(status));
+            state.emit(ActivityEvent::Error {
+                context: Some("upstream".into()),
+                message: format!("{account}: {GEMINI_TOS_MESSAGE}"),
+            });
+        }
         let (out_status, error_type) = if status == StatusCode::BAD_REQUEST {
             (status, "invalid_request_error")
         } else {
@@ -3461,14 +4067,7 @@ async fn relay_translate(
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
-        let converter = match served {
-            BackendGroup::Grok => state.grok.converter(),
-            _ => match &ctx.auto_classifier {
-                Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
-                None => state.codex.converter(),
-            },
-        }
-        .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
+        let converter = translate_converter(state, ctx, served);
         let totals = state.totals.clone();
         let logger = state.logger.clone();
         let request_id = ctx.request_id;
@@ -3670,14 +4269,7 @@ async fn relay_translate(
     // Non-streaming client: consume the whole upstream stream through the
     // converter, then answer with the aggregated Messages JSON.
     use tokio_stream::StreamExt as _;
-    let mut converter = match served {
-        BackendGroup::Grok => state.grok.converter(),
-        _ => match &ctx.auto_classifier {
-            Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
-            None => state.codex.converter(),
-        },
-    }
-    .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
+    let mut converter = translate_converter(state, ctx, served);
     // Cloned before `bytes_stream()` consumes the response — the aggregate
     // raw-io capture below wants the upstream response headers.
     let upstream_headers = response.headers().clone();
@@ -4026,6 +4618,64 @@ mod tests {
         );
     }
 
+    /// The Claude Code → gemini gate fires for a `claude-cli/` client routed
+    /// to the gemini group on ANY method and path — `/v1/messages`, its
+    /// `count_tokens`, the Responses ingress, a GET — and ONLY then: Codex,
+    /// Antigravity and UA-less clients pass, and so does every other group.
+    #[test]
+    fn refuses_claude_code_gemini_truth_table() {
+        let ua = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(value));
+            headers
+        };
+        let sdk_cli = ua("claude-cli/2.1.300 (external, sdk-cli)");
+        let cli = ua("claude-cli/2.1.300 (external, cli)");
+        let codex = ua("codex_cli_rs/0.50.0 (Mac OS 26.0.0; arm64)");
+        let antigravity = ua("antigravity/hub/1.0");
+        let none = HeaderMap::new();
+        let gemini = Some(BackendGroup::Gemini);
+
+        assert!(refuses_claude_code_gemini(gemini, &sdk_cli));
+        assert!(refuses_claude_code_gemini(gemini, &cli));
+
+        assert!(!refuses_claude_code_gemini(gemini, &codex));
+        assert!(!refuses_claude_code_gemini(gemini, &antigravity));
+        assert!(!refuses_claude_code_gemini(gemini, &none));
+        for group in [
+            None,
+            Some(BackendGroup::Claude),
+            Some(BackendGroup::Codex),
+            Some(BackendGroup::Grok),
+            Some(BackendGroup::OpenRouter),
+        ] {
+            assert!(!refuses_claude_code_gemini(group, &sdk_cli), "{group:?}");
+        }
+
+        // The request-level check ignores the endpoint: every method/path a
+        // `claude-cli/` client can land on gemini with is refused.
+        for (method, path) in [
+            (Method::POST, "/v1/messages?beta=true"),
+            (Method::POST, "/v1/messages/count_tokens?beta=true"),
+            (Method::POST, "/v1/responses"),
+            (Method::GET, "/v1/messages"),
+            (Method::GET, "/v1/models"),
+        ] {
+            let mut ctx = ctx_for_group("gemini", BackendGroup::Gemini);
+            ctx.method = method.clone();
+            ctx.path_query = path.to_string();
+            ctx.headers = sdk_cli.clone();
+            assert!(ctx.is_claude_code_gemini(gemini), "{method} {path}");
+            ctx.headers = codex.clone();
+            assert!(!ctx.is_claude_code_gemini(gemini), "{method} {path}");
+            ctx.headers = sdk_cli.clone();
+            assert!(
+                !ctx.is_claude_code_gemini(Some(BackendGroup::Claude)),
+                "{method} {path}"
+            );
+        }
+    }
+
     #[test]
     fn redacted_header_pairs_hide_credentials_keep_names() {
         let mut headers = HeaderMap::new();
@@ -4117,6 +4767,7 @@ mod tests {
             served_by: None,
             compatibility: None,
             auto_classifier: None,
+            gemini_converter: None,
         }
     }
 
@@ -4153,6 +4804,134 @@ mod tests {
             condense_error_body(anthropic),
             "rate_limit_error: slow down"
         );
+    }
+
+    /// Codex parity (`request_meta_records_gpt_6_astra_for_every_alias_form`):
+    /// the activity log books a gemini request under the RESOLVED upstream
+    /// id for every alias form, since pricing keys off that string.
+    #[test]
+    fn gemini_finished_meta_records_the_upstream_id_for_every_alias_form() {
+        let state = test_state("http://127.0.0.1:9", vec![oauth_account("a", "at-a")]);
+        for (model, upstream) in [
+            ("argon", "gemini-4-argon"),
+            ("gemini-4-argon[1m]", "gemini-4-argon"),
+            ("gemini", "gemini-3.8-flash-high"),
+            ("gemini-3.8-flash-low[1m]", "gemini-3.8-flash-low"),
+        ] {
+            let mut ctx = ctx_for_group(model, BackendGroup::Gemini);
+            ctx.served_by = Some(BackendGroup::Gemini);
+            let meta = ctx.finished_meta(&state);
+            assert_eq!(meta.group.as_deref(), Some("gemini"), "{model}");
+            assert_eq!(meta.model.as_deref(), Some(upstream), "{model}");
+            assert_eq!(meta.effort, None, "{model}: the level is in the id");
+        }
+    }
+
+    /// A gemini 429 body in the captured Cloud Code shape (CLIProxyAPI
+    /// `antigravity_executor_credits.go:226-282`): `details[]` carries an
+    /// optional `RetryInfo` and an `ErrorInfo` reason.
+    fn gemini_429_body(retry_delay: Option<&str>, reason: &str) -> String {
+        let mut details = Vec::new();
+        if let Some(delay) = retry_delay {
+            details.push(serde_json::json!({
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": delay,
+            }));
+        }
+        details.push(serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": reason,
+            "domain": "cloudcode-pa.googleapis.com",
+        }));
+        serde_json::json!({"error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "message": "Resource has been exhausted.",
+            "details": details,
+        }})
+        .to_string()
+    }
+
+    // ---- G13: gemini 429 RetryInfo → retry-after ----
+    #[test]
+    fn g13_gemini_retry_delay_rounds_up_to_whole_seconds() {
+        let body = gemini_429_body(Some("3.2s"), "RATE_LIMIT_EXCEEDED");
+        assert_eq!(gemini_retry_after(&body), Some(Duration::from_secs(4)));
+        let body = gemini_429_body(Some("0.2s"), "RATE_LIMIT_EXCEEDED");
+        assert_eq!(gemini_retry_after(&body), Some(Duration::from_secs(1)));
+        let body = gemini_429_body(Some("60s"), "QUOTA_EXHAUSTED");
+        assert_eq!(
+            gemini_retry_after(&body),
+            Some(Duration::from_secs(60)),
+            "a stated delay wins over the quota estimate"
+        );
+        // A one-element array of the RPC object parses the same.
+        let wrapped = format!("[{}]", gemini_429_body(Some("2s"), "RATE_LIMIT_EXCEEDED"));
+        assert_eq!(gemini_retry_after(&wrapped), Some(Duration::from_secs(2)));
+        // ErrorInfo.metadata.quotaResetDelay is the reference's fallback.
+        let reset = serde_json::json!({"error": {"code": 429, "details": [{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "QUOTA_EXHAUSTED",
+            "metadata": {"quotaResetDelay": "1h2m3.5s"},
+        }]}})
+        .to_string();
+        assert_eq!(gemini_retry_after(&reset), Some(Duration::from_secs(3_724)));
+    }
+
+    // ---- G13b: quota exhausted without a delay → estimated park ----
+    #[test]
+    fn g13b_gemini_quota_exhausted_without_delay_parks_estimated_hour() {
+        let body = gemini_429_body(None, "QUOTA_EXHAUSTED");
+        assert_eq!(gemini_retry_after(&body), Some(GEMINI_QUOTA_COOLDOWN));
+        assert_eq!(gemini_stated_delay(&body), None, "no stated delay");
+        assert_eq!(GEMINI_QUOTA_COOLDOWN, Duration::from_secs(3_600));
+        // RATE_LIMIT_EXCEEDED without a delay: the ordinary no-retry-after
+        // path, never a fabricated wait.
+        let body = gemini_429_body(None, "RATE_LIMIT_EXCEEDED");
+        assert_eq!(gemini_retry_after(&body), None);
+        // Non-JSON / unrelated bodies carry no wait either.
+        assert_eq!(gemini_retry_after("<html>busy</html>"), None);
+        assert_eq!(gemini_retry_after(""), None);
+        // An unparseable delay is not a delay.
+        let body = gemini_429_body(Some("soon"), "RATE_LIMIT_EXCEEDED");
+        assert_eq!(gemini_retry_after(&body), None);
+    }
+
+    #[test]
+    fn google_duration_forms_round_up_and_reject_garbage() {
+        assert_eq!(parse_google_duration("3s"), Some(Duration::from_secs(3)));
+        assert_eq!(
+            parse_google_duration("3.000000001s"),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(parse_google_duration("250ms"), Some(Duration::from_secs(1)));
+        assert_eq!(
+            parse_google_duration("1m30s"),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_google_duration(" 2h "),
+            Some(Duration::from_secs(7_200))
+        );
+        for bad in ["", "0s", "-3s", "3", "s", "3x", "1.2.3s"] {
+            assert_eq!(parse_google_duration(bad), None, "{bad:?}");
+        }
+    }
+
+    // ---- G14: gemini 403 ToS marker ----
+    #[test]
+    fn g14_gemini_tos_markers_match_and_plain_403_does_not() {
+        assert!(gemini_tos_suspended(
+            br#"{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service.","status":"PERMISSION_DENIED"}}"#
+        ));
+        assert!(gemini_tos_suspended(
+            br#"{"error":{"reason":"TOS_VIOLATION"}}"#
+        ));
+        assert!(gemini_tos_suspended(b"account SUSPENDED"));
+        assert!(!gemini_tos_suspended(
+            br#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#
+        ));
+        assert!(GEMINI_TOS_MESSAGE.contains("(ToS); appeal before re-enabling"));
     }
 
     // ---- C2b: on_empty_group fallback fixed order + parked ≠ empty ----
@@ -6372,5 +7151,267 @@ mod tests {
             snapshot.accounts[0].healthy,
             "transient errors do not mark the account"
         );
+    }
+
+    /// Everything the relay reads off a converter after feeding it `events`
+    /// as SSE `data:` lines: emitted bytes, usage, event count, raw usage,
+    /// error message and the aggregate.
+    type ConverterReadout = (
+        Vec<u8>,
+        sse::StreamUsage,
+        u64,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<serde_json::Value>,
+    );
+
+    fn feed<T: sse::SseTransform>(converter: &mut T, events: &[serde_json::Value]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for event in events {
+            out.extend(converter.on_event(&format!("data: {event}")));
+        }
+        out.extend(converter.on_end());
+        out
+    }
+
+    fn wrapped_readout(
+        converter: TranslateConverter,
+        events: &[serde_json::Value],
+    ) -> ConverterReadout {
+        let mut converter = converter.with_safeguards_requested(true);
+        let bytes = feed(&mut converter, events);
+        let usage = sse::SseTransform::usage(&converter);
+        let events_seen = converter.events_seen();
+        let raw_usage = converter.raw_usage().cloned();
+        let error = converter.error_message().map(str::to_string);
+        (
+            bytes,
+            usage,
+            events_seen,
+            raw_usage,
+            error,
+            converter.into_message_json(),
+        )
+    }
+
+    /// `TranslateConverter` is pure delegation: the Responses arm (codex /
+    /// grok / auto classifier) reports exactly what the bare converter does
+    /// for the same events, safeguards flag included.
+    #[test]
+    fn translate_converter_responses_arm_matches_the_bare_converter() {
+        let events = vec![
+            serde_json::json!({"type": "response.created", "response": {"id": "r1"}}),
+            serde_json::json!({"type": "response.output_item.added",
+                               "item": {"type": "message", "role": "assistant"}}),
+            serde_json::json!({"type": "response.output_text.delta", "delta": "hi"}),
+            serde_json::json!({"type": "response.completed",
+                               "response": {"id": "r1", "status": "completed",
+                                            "usage": {"input_tokens": 12, "output_tokens": 3}}}),
+        ];
+        let mut bare = responses::ResponsesSseConverter::with_model("gpt-x".to_string())
+            .with_safeguards_requested(true);
+        let bytes = feed(&mut bare, &events);
+        let expected: ConverterReadout = (
+            bytes,
+            sse::SseTransform::usage(&bare),
+            bare.events_seen(),
+            bare.raw_usage().cloned(),
+            bare.error_message().map(str::to_string),
+            bare.into_message_json(),
+        );
+        let wrapped = TranslateConverter::from(responses::ResponsesSseConverter::with_model(
+            "gpt-x".to_string(),
+        ));
+        let actual = wrapped_readout(wrapped, &events);
+        assert!(!actual.0.is_empty(), "the arm emitted Anthropic SSE");
+        assert_eq!(actual.2, 4, "every upstream event counted");
+        assert!(actual.5.is_some(), "aggregate produced");
+        assert_eq!(actual, expected);
+    }
+
+    /// The Gemini arm reports exactly what the bare `GeminiSseConverter`
+    /// does — for a clean text turn and for a mid-stream upstream error. The
+    /// relay reaches this arm only once the gemini dispatch is wired.
+    #[test]
+    fn translate_converter_gemini_arm_matches_the_bare_converter() {
+        let text = serde_json::json!({"response": {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2,
+                              "thoughtsTokenCount": 1, "totalTokenCount": 13},
+            "responseId": "resp-1",
+        }});
+        let error = serde_json::json!({"error": {"code": 404, "status": "NOT_FOUND",
+                                                 "message": "model not found"}});
+        for (label, events) in [("text", vec![text]), ("error", vec![error])] {
+            let mut bare = gemini::GeminiSseConverter::with_model("gemini-4-argon".to_string())
+                .with_safeguards_requested(true);
+            let bytes = feed(&mut bare, &events);
+            let expected: ConverterReadout = (
+                bytes,
+                sse::SseTransform::usage(&bare),
+                bare.events_seen(),
+                bare.raw_usage().cloned(),
+                bare.error_message().map(str::to_string),
+                bare.into_message_json(),
+            );
+            let wrapped = TranslateConverter::from(gemini::GeminiSseConverter::with_model(
+                "gemini-4-argon".to_string(),
+            ));
+            let actual = wrapped_readout(wrapped, &events);
+            assert!(
+                !actual.0.is_empty(),
+                "{label}: the arm emitted Anthropic SSE"
+            );
+            assert_eq!(actual.2, 1, "{label}: the upstream event counted");
+            assert_eq!(actual, expected, "{label}");
+        }
+        // The error stream surfaces through the wrapper's accessor (the relay
+        // reads it for provider-health accounting).
+        let wrapped = TranslateConverter::from(gemini::GeminiSseConverter::with_model(
+            "gemini-4-argon".to_string(),
+        ));
+        let (.., error, _) = wrapped_readout(
+            wrapped,
+            &[serde_json::json!({"error": {"status": "NOT_FOUND", "message": "gone"}})],
+        );
+        assert!(error.is_some_and(|message| message.contains("NOT_FOUND")));
+    }
+
+    // ---- gemini OAuth client not configured (llmux ships none) ----
+
+    const GEMINI_NO_CLIENT: &str = "gemini OAuth client not configured: set gemini.client_id and \
+        gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / \
+        LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux after \
+        setting them";
+
+    /// A gemini-only state on the in-process mock, the token endpoint on the
+    /// mock too (so a grant that leaked would be SEEN), and NO OAuth client
+    /// — set on the state directly, never read from the developer's
+    /// environment.
+    fn unconfigured_gemini_state(upstream: &str, expires_at_ms: u64) -> AppState {
+        let mut config = Config {
+            upstream: upstream.to_string(),
+            accounts: vec![AccountConfig {
+                name: "gemini:g@example.com".into(),
+                credential: AccountCredential::Gemini {
+                    email: "g@example.com".into(),
+                    access_token: "at-g".into(),
+                    refresh_token: "rt-g".into(),
+                    expires_at_ms,
+                    project_id: "proj-1".into(),
+                    last_refresh_ms: None,
+                },
+            }],
+            ..Default::default()
+        };
+        // Set BEFORE `AppState::new`: the gemini provider captures its
+        // upstream at construction, and nothing may reach Google.
+        config.gemini.upstream = upstream.to_string();
+        config.gemini.token_url = format!("{upstream}/gemini-token");
+        config.proxy.idle_probe.enabled = false;
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool, None, None).expect("state");
+        state.config_path = None;
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        state.gemini_oauth = None;
+        state
+            .pool
+            .evaluate(None, &state.select_params(), SystemTime::now());
+        state
+    }
+
+    fn gemini_request() -> axum::extract::Request {
+        client_request(
+            r#"{"model":"gemini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+    }
+
+    /// Refreshing without the OAuth client is a configuration failure: no
+    /// token grant leaves the process, the message names the fix, and the
+    /// account keeps its health and its credential — never "refresh token
+    /// dead, re-login required".
+    #[tokio::test]
+    async fn gemini_refresh_without_an_oauth_client_is_a_config_failure_not_a_dead_token() {
+        let shared = MockShared::default();
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = unconfigured_gemini_state(&upstream, 1);
+        let id = AccountId("gemini:g@example.com".into());
+        let (credential, fingerprint) = state
+            .pool
+            .credential_with_fingerprint(&id)
+            .expect("account");
+
+        let outcome = refresh_credential(&state, &id, &credential, &fingerprint).await;
+
+        match outcome {
+            RefreshOutcome::Misconfigured { message } => assert_eq!(message, GEMINI_NO_CLIENT),
+            _ => panic!("expected a configuration failure"),
+        }
+        assert!(
+            shared.seen.lock().expect("lock").is_empty(),
+            "no token grant sent"
+        );
+        let account = &state.pool.snapshot().accounts[0];
+        assert!(account.healthy, "never benched");
+        assert_eq!(account.auth_failure_status, None);
+        assert_eq!(
+            state.pool.credential(&id),
+            Some(credential),
+            "credential untouched"
+        );
+    }
+
+    /// An already-expired gemini token with no OAuth client: answered with
+    /// the fix BEFORE any upstream call, the account left healthy.
+    #[tokio::test]
+    async fn gemini_expired_token_without_an_oauth_client_answers_the_fix_without_upstream() {
+        let shared = MockShared::default();
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = unconfigured_gemini_state(&upstream, 1);
+
+        let response = forward(&state, gemini_request()).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).expect("json");
+        assert_eq!(body["error"]["message"], GEMINI_NO_CLIENT);
+        assert!(
+            shared.seen.lock().expect("lock").is_empty(),
+            "no upstream call"
+        );
+        assert!(state.pool.snapshot().accounts[0].healthy, "never benched");
+    }
+
+    /// A gemini 401 asks for ONE forced refresh; without the OAuth client
+    /// none can be sent. The client gets the fix, and the 401 does not
+    /// bench the account (the missing client is not the account's fault).
+    #[tokio::test]
+    async fn gemini_401_without_an_oauth_client_answers_the_fix_and_never_benches() {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::RequireBearer {
+                accept: &[],
+                body: "{}",
+            });
+        let upstream = spawn_mock(shared.clone()).await;
+        let state = unconfigured_gemini_state(&upstream, far_future_ms());
+
+        let response = forward(&state, gemini_request()).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).expect("json");
+        assert_eq!(body["error"]["message"], GEMINI_NO_CLIENT);
+        let seen = shared.seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 1, "the stream call only, no token grant");
+        assert_ne!(seen[0].path, "/gemini-token");
+        let account = &state.pool.snapshot().accounts[0];
+        assert!(account.healthy, "a missing client never benches");
+        assert_eq!(account.auth_failure_status, None);
     }
 }

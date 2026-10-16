@@ -486,6 +486,24 @@ fn login_state_is_executor_only_and_transient_failure_preserves_device_data() {
 }
 
 #[test]
+fn gemini_login_start_crosses_the_boundary_as_the_gemini_provider() {
+    let handle = new_bridge(&json!({}));
+    let (state, effects) = dispatch(
+        &handle,
+        json!({
+            "type": "login_started",
+            "operation_id": "login-gemini",
+            "provider": "gemini",
+            "started_at_ms": 100
+        }),
+    );
+    assert_eq!(state["usage"]["login"]["provider"], "gemini");
+    assert_eq!(effects[0]["type"], "start_login");
+    assert_eq!(effects[0]["operation_id"], "login-gemini");
+    assert_eq!(effects[0]["provider"], "gemini");
+}
+
+#[test]
 fn null_invalid_utf8_oversized_inputs_and_double_free_are_bounded() {
     let mut bridge = ptr::null_mut();
     let mut error = empty_bytes();

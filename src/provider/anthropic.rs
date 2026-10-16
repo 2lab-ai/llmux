@@ -171,6 +171,11 @@ pub fn inject_credential(
                 "openrouter credential cannot authenticate against the anthropic provider".into(),
             ));
         }
+        AccountCredential::Gemini { .. } => {
+            return Err(ProviderError::Auth(
+                "gemini credential cannot authenticate against the anthropic provider".into(),
+            ));
+        }
     }
     Ok(())
 }

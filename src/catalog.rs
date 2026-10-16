@@ -58,6 +58,13 @@
 //!   (plus its opt-in `grok-4.7[1m]` picker twin), `grok-4.6` and `grok-4.5`;
 //!   any other `grok-*` id passes through at request time and synthesizes a
 //!   null-metadata row when pinned.
+//! - Gemini ids: the live Antigravity `v1internal:fetchAvailableModels`
+//!   response of 2026-10-15 (`gemini-3.8-flash-{high,medium,low}`, ctx
+//!   1,048,576; this account lists Argon only as `gemini-4-argon-disabled`,
+//!   an Ultra/Enterprise model — docs/gemini/spec.md). Context 1,048,576 on
+//!   every row: ai.google.dev model pages, Gemini 3.8 Flash (updated
+//!   2026-09-02) and Gemini 4 Argon (updated 2026-10-14). The thinking level
+//!   is part of the id, so every gemini row has an empty effort menu.
 
 use std::borrow::Cow;
 
@@ -80,7 +87,7 @@ pub struct ModelEntry {
     pub efforts: &'static [&'static str],
     /// Context window in tokens, or `None` when unpublished.
     pub max_context: Option<u64>,
-    /// Backend group: `claude`, `codex`, `grok`, or `openrouter`.
+    /// Backend group: `claude`, `codex`, `grok`, `openrouter`, or `gemini`.
     pub group: &'static str,
 }
 
@@ -287,6 +294,50 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
     ),
 ];
 
+/// Gemini effort menu: empty on every row. The Antigravity backend bakes the
+/// thinking level into the model id (`gemini-3.8-flash-high` / `-medium` /
+/// `-low`), and no `thinkingLevel` wire form is verified for Argon on that
+/// backend (docs/gemini/spec.md §R3), so llmux advertises no effort knob.
+const GEMINI_EFFORTS: &[&str] = &[];
+
+/// Context window of every curated gemini row (ai.google.dev model pages:
+/// 3.8 Flash 1,048,576 in; Argon 1,048,576 unified).
+const GEMINI_CONTEXT: u64 = 1_048_576;
+
+/// The curated gemini catalog (docs/gemini/spec.md §R7). Tuple = (id,
+/// aliases, display name). Every row is group `gemini`, [`GEMINI_EFFORTS`],
+/// [`GEMINI_CONTEXT`].
+///
+/// The family aliases live on the `[1m]` rows (operator rule 2026-09-10, the
+/// astra arrangement): `gemini` / `gemini-3.8-flash` → the high-thinking
+/// Flash twin, `argon` → the Argon twin. Unlike grok's `[1m]` twin there is no
+/// upstream-window caveat to disclose — the backend's real window IS ~1M, so
+/// the 1M-denominated id is the honest default face of the family. The
+/// provider strips one trailing `[1m]` before the request leaves llmux, so a
+/// twin and its base row reach Cloud Code as the same upstream id.
+pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str)] = &[
+    (
+        "gemini-3.8-flash-high[1m]",
+        &["gemini", "gemini-3.8-flash"],
+        "Gemini 3.8 Flash (High) [1M]",
+    ),
+    ("gemini-3.8-flash-high", &[], "Gemini 3.8 Flash (High)"),
+    (
+        "gemini-3.8-flash-medium[1m]",
+        &[],
+        "Gemini 3.8 Flash (Medium) [1M]",
+    ),
+    ("gemini-3.8-flash-medium", &[], "Gemini 3.8 Flash (Medium)"),
+    (
+        "gemini-3.8-flash-low[1m]",
+        &[],
+        "Gemini 3.8 Flash (Low) [1M]",
+    ),
+    ("gemini-3.8-flash-low", &[], "Gemini 3.8 Flash (Low)"),
+    ("gemini-4-argon[1m]", &["argon"], "Gemini 4 Argon [1M]"),
+    ("gemini-4-argon", &[], "Gemini 4 Argon"),
+];
+
 /// The default OpenRouter pin — the wire slug the bare `or` alias resolves to.
 /// SSOT for BOTH `config::schema::default_openrouter_model` (what a fresh
 /// config writes) and `provider::openrouter::OPENROUTER_DEFAULT_MODEL` (what
@@ -338,7 +389,8 @@ pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
         .map(|&(id, _, _, _)| id)
 }
 
-/// The known model catalog in canonical group order (`claude < codex < grok`).
+/// The known model catalog in canonical group order
+/// (`claude < codex < grok < openrouter < gemini`).
 /// `grok_pin` / `codex_pin` are the live provider model slugs; the entry whose
 /// id equals `grok_pin` additionally advertises the `"grok"` family alias. The
 /// match is on the FULL id: a `[1m]` twin is never preferred over the base row
@@ -608,6 +660,20 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         });
     }
 
+    // ---- gemini (live fetchAvailableModels 2026-10-15) ----
+    // Static aliases, no pin: the bare `gemini` / `argon` aliases are fixed
+    // catalog facts (spec §R7), not a live config pin like `grok` / `or`.
+    for &(id, aliases, name) in GEMINI_MODELS {
+        entries.push(ModelEntry {
+            id: Cow::Borrowed(id),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            name: Cow::Borrowed(name),
+            efforts: GEMINI_EFFORTS,
+            max_context: Some(GEMINI_CONTEXT),
+            group: "gemini",
+        });
+    }
+
     entries
 }
 
@@ -654,8 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_43_entries() {
-        // The pinned (curated) case: exactly 43 rows, claude ids in order.
+    fn catalog_matches_user_contract_51_entries() {
+        // The pinned (curated) case: exactly 51 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -663,9 +729,10 @@ mod tests {
         // 31 before the grok-4.7 row landed (2026-09-23); 32 before the
         // `grok-4.7[1m]` twin landed (2026-09-28).
         // 33 before the sonnet-5-5 pair + the gpt-6.1-sol / gpt-6-sol /
-        // gpt-6-luna pairs landed (2026-10-06); 41 before Haiku 5.5 (2026-10-08).
+        // gpt-6-luna pairs landed (2026-10-06); 41 before Haiku 5.5 (2026-10-08);
+        // 43 before the 8 gemini rows landed (2026-10-15).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 43);
+        assert_eq!(entries.len(), 51);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -700,12 +767,99 @@ mod tests {
         let first_codex = groups.iter().position(|g| *g == "codex").unwrap();
         let first_grok = groups.iter().position(|g| *g == "grok").unwrap();
         let first_or = groups.iter().position(|g| *g == "openrouter").unwrap();
+        let first_gemini = groups.iter().position(|g| *g == "gemini").unwrap();
         assert!(groups[..first_codex].iter().all(|g| *g == "claude"));
         assert!(groups[first_codex..first_grok]
             .iter()
             .all(|g| *g == "codex"));
         assert!(groups[first_grok..first_or].iter().all(|g| *g == "grok"));
-        assert!(groups[first_or..].iter().all(|g| *g == "openrouter"));
+        assert!(groups[first_or..first_gemini]
+            .iter()
+            .all(|g| *g == "openrouter"));
+        // Gemini is appended LAST, matching its `BackendGroup` order.
+        assert!(groups[first_gemini..].iter().all(|g| *g == "gemini"));
+        assert_eq!(groups.len() - first_gemini, GEMINI_MODELS.len());
+    }
+
+    // ---- G16: gemini rows (docs/gemini/spec.md §R7) ----
+
+    #[test]
+    fn g16_gemini_rows_ids_names_context_and_empty_efforts() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let gemini: Vec<(&str, &str)> = entries
+            .iter()
+            .filter(|e| e.group == "gemini")
+            .map(|e| (e.id.as_ref(), e.name.as_ref()))
+            .collect();
+        assert_eq!(
+            gemini,
+            vec![
+                ("gemini-3.8-flash-high[1m]", "Gemini 3.8 Flash (High) [1M]"),
+                ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+                (
+                    "gemini-3.8-flash-medium[1m]",
+                    "Gemini 3.8 Flash (Medium) [1M]"
+                ),
+                ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+                ("gemini-3.8-flash-low[1m]", "Gemini 3.8 Flash (Low) [1M]"),
+                ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+                ("gemini-4-argon[1m]", "Gemini 4 Argon [1M]"),
+                ("gemini-4-argon", "Gemini 4 Argon"),
+            ]
+        );
+        for e in entries.iter().filter(|e| e.group == "gemini") {
+            // ai.google.dev: 1,048,576 for both 3.8 Flash and Argon.
+            assert_eq!(e.max_context, Some(1_048_576), "{}", e.id);
+            // The thinking level is in the id; no effort knob.
+            assert!(e.efforts.is_empty(), "{}: no effort menu", e.id);
+        }
+    }
+
+    #[test]
+    fn g16_gemini_aliases_are_owned_once_by_the_1m_rows() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        for (alias, owner) in [
+            ("gemini", "gemini-3.8-flash-high[1m]"),
+            ("gemini-3.8-flash", "gemini-3.8-flash-high[1m]"),
+            ("argon", "gemini-4-argon[1m]"),
+        ] {
+            let owners: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.aliases.iter().any(|a| a == alias))
+                .map(|e| e.id.as_ref())
+                .collect();
+            assert_eq!(
+                owners,
+                vec![owner],
+                "alias {alias:?} must be owned solely by {owner}"
+            );
+        }
+        // Every other gemini row carries no alias.
+        for e in entries.iter().filter(|e| e.group == "gemini") {
+            if !e.id.ends_with("[1m]") {
+                assert!(e.aliases.is_empty(), "{} carries no alias", e.id);
+            }
+        }
+        // No gemini alias is also a curated id (that would silently rewrite
+        // an explicitly chosen model).
+        for &(_, aliases, _) in GEMINI_MODELS {
+            for alias in aliases {
+                assert!(
+                    !entries.iter().any(|e| e.id == *alias),
+                    "gemini alias {alias:?} collides with a curated id"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn g16_gemini_entry_serializes_the_wire_contract() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let json = serde_json::to_string(find(&entries, "gemini-4-argon[1m]")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"gemini-4-argon[1m]","aliases":["argon"],"name":"Gemini 4 Argon [1M]","efforts":[],"max_context":1048576,"group":"gemini"}"#
+        );
     }
 
     #[test]
@@ -979,7 +1133,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 43, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 51, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -1026,14 +1180,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 33.
+        // count 51.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 43, "pin {pin}");
+            assert_eq!(entries.len(), 51, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1048,7 +1202,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 44);
+        assert_eq!(entries.len(), 52);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1075,7 +1229,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 44);
+        assert_eq!(entries.len(), 52);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));

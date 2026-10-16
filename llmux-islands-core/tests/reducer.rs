@@ -63,6 +63,24 @@ fn stale_dashboard_results_are_ignored_by_request_id() {
 }
 
 #[test]
+fn gemini_login_start_emits_a_gemini_start_effect() {
+    let mut core = Core::new(DeriveOptions::default());
+    let start = core.reduce(Action::LoginStarted {
+        operation_id: "login-gemini".into(),
+        provider: Provider::Gemini,
+        started_at_ms: 100,
+    });
+
+    assert!(matches!(
+        start.as_slice(),
+        [Effect::StartLogin { operation_id, provider: Provider::Gemini }]
+            if operation_id == "login-gemini"
+    ));
+    assert_eq!(core.state().usage.login.phase, LoginPhase::Starting);
+    assert_eq!(core.state().usage.login.provider.as_deref(), Some("gemini"));
+}
+
+#[test]
 fn grok_terminal_login_clears_verification_data_and_emits_one_receipt() {
     let mut core = Core::new(DeriveOptions::default());
     let start = core.reduce(Action::LoginStarted {

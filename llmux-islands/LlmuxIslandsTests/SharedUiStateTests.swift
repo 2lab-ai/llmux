@@ -60,6 +60,23 @@ final class SharedUiStateTests: XCTestCase {
         XCTAssertNil(receipt.clientName)
     }
 
+    func testGeminiAccountsReceiptsAndInFlightDecodeAsTheGeminiProvider() throws {
+        // A strict `SharedProvider` decode: an unrecognized provider would
+        // reject the whole canonical state, so gemini must be a known case.
+        let gemini = Self.fixture
+            .replacingOccurrences(of: #""provider": "claude""#, with: #""provider": "gemini""#)
+            .replacingOccurrences(
+                of: #""provider_in_flight": {"claude": 1}"#,
+                with: #""provider_in_flight": {"claude": 1, "gemini": 2}"#
+            )
+        let state = try JSONDecoder().decode(SharedUiState.self, from: Data(gemini.utf8))
+
+        XCTAssertEqual(state.usage.accounts.first?.provider, .gemini)
+        XCTAssertEqual(state.statistics.activityReceipts.first?.provider, .gemini)
+        XCTAssertEqual(state.usage.providerInFlight["gemini"], 2)
+        XCTAssertEqual(state.window.providerInFlight["gemini"], 2)
+    }
+
     func testUnknownSchemaVersionIsRejected() {
         let incompatible = Self.fixture.replacingOccurrences(
             of: #""schema_version": 1"#,

@@ -23,14 +23,16 @@ enum DemoMode {
     /// of the closed-island label (rainbow / jump states at fixed counts).
     ///
     /// Set `LLMUX_ISLANDS_DEMO_INFLIGHT="claude=3,codex=2"` to force the counts
-    /// regardless of daemon state. Either key may be omitted (that provider then
-    /// tracks the real daemon value). Works standalone or together with
+    /// regardless of daemon state. Keys are `claude`, `codex`, `grok` and
+    /// `gemini`; any key may be omitted (that provider then tracks the real
+    /// daemon value). Works standalone or together with
     /// `LLMUX_ISLANDS_DEMO=1` — note that demo mode holds the island *open*, so
     /// to screenshot the closed-state label launch with only this variable set.
     struct ForcedInFlight: Equatable {
         var claude: Int?
         var codex: Int?
         var grok: Int?
+        var gemini: Int?
     }
 
     static let forcedInFlight: ForcedInFlight? =
@@ -51,10 +53,11 @@ enum DemoMode {
             case "claude": forced.claude = value
             case "codex": forced.codex = value
             case "grok": forced.grok = value
+            case "gemini": forced.gemini = value
             default: break
             }
         }
-        guard forced.claude != nil || forced.codex != nil else { return nil }
+        guard forced != ForcedInFlight() else { return nil }
         return forced
     }
 }

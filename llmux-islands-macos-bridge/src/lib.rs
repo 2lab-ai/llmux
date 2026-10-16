@@ -893,6 +893,7 @@ const fn provider_name(provider: Provider) -> &'static str {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Grok => "grok",
+        Provider::Gemini => "gemini",
         Provider::Api => "api",
         Provider::Unknown => "unknown",
     }

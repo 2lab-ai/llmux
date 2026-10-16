@@ -493,9 +493,9 @@ private struct UsageProviderColumn: View {
     @ViewBuilder
     private var usageRows: some View {
         switch provider {
-        case .gemini:
-            GeminiUsageSummaryRow(info: info, now: now)
-        case .claude, .codex, .grok:
+        case .claude, .codex, .grok, .gemini:
+            // llmux reports gemini quota as the shared 5h/7d windows (a 7d
+            // window, like codex), so it renders through the same rows.
             ForEach(providerWindows, id: \.label) { window in
                 UsageWindowRow(
                     window: window,
@@ -510,9 +510,7 @@ private struct UsageProviderColumn: View {
 
     private var providerWindows: [UsageWindow] {
         switch provider {
-        case .gemini:
-            return []
-        case .claude, .codex, .grok:
+        case .claude, .codex, .grok, .gemini:
             // Grok reports no quota windows (docs/grok/spec.md §R3) — the
             // rows render their placeholder until a parked reset appears.
             var windows: [UsageWindow] = [.fiveHour, .sevenDay]
@@ -694,72 +692,6 @@ private struct UsageTokenRefreshRow: View {
         }
         let seconds = max(0, Int(tokenRefresh.expiresAt.timeIntervalSince(now)))
         return UsageDurationText.make(seconds: seconds, digitColor: baseColor, scale: 1.3)
-    }
-}
-
-private struct GeminiUsageSummaryRow: View {
-    let info: CLIUsageInfo?
-    let now: Date
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(modelName)
-                .foregroundColor(.white.opacity(0.6))
-                .lineLimit(1)
-                .truncationMode(.middle)
-
-            Spacer(minLength: 8)
-
-            Text(bucketCountString)
-                .foregroundColor(.white.opacity(0.35))
-                .frame(width: 14, alignment: .trailing)
-
-            Text(remainingPercentString)
-                .foregroundColor(remainingPercentColor)
-                .frame(width: 54, alignment: .trailing)
-
-            resetsInText
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-    }
-
-    private var modelName: String {
-        info?.model?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil ?? "gemini"
-    }
-
-    private var bucketCountString: String {
-        guard let buckets = info?.buckets else { return "--" }
-        return "\(buckets.count)"
-    }
-
-    private var remainingPercentString: String {
-        guard let used = info?.fiveHourPercent else { return "--" }
-        let remaining = max(0, min(100, 100 - used))
-        return String(format: "%.1f%%", remaining)
-    }
-
-    private var remainingPercentColor: Color {
-        guard let used = info?.fiveHourPercent else { return TerminalColors.dim }
-        let remaining = max(0, min(100, 100 - used))
-        if remaining < 10 { return TerminalColors.red }
-        if remaining < 25 { return TerminalColors.amber }
-        return TerminalColors.green
-    }
-
-    private var resetsInText: Text {
-        let baseColor = Color.white.opacity(0.28)
-        guard let resetAt = info?.fiveHourReset else {
-            return Text("(Resets in --)")
-                .foregroundColor(baseColor)
-        }
-
-        let seconds = max(0, Int(resetAt.timeIntervalSince(now)))
-        return Text("(").foregroundColor(baseColor)
-            + Text("Resets in ").foregroundColor(baseColor)
-            + UsageDurationText.make(seconds: seconds, digitColor: baseColor)
-            + Text(")").foregroundColor(baseColor)
     }
 }
 

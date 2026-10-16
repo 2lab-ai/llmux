@@ -81,20 +81,25 @@ struct PickerSettings {
 ///   dropping the efforts part when the menu is empty and the ctx part when the
 ///   window is unpublished. A single-entry menu renders as that one value.
 ///
-/// Catalog order is preserved. `None` for an empty catalog — there is no
-/// lineup to inject, and an empty `options` array would only add noise.
+/// Gemini rows (group `gemini`) are left out: Google's Antigravity backend
+/// refuses Claude Code requests, so gemini is Codex-only (`run --codex`).
+///
+/// Catalog order is preserved. `None` when no row remains (an empty or
+/// gemini-only catalog) — there is no lineup to inject, and an empty
+/// `options` array would only add noise.
 fn model_picker_settings(models: &[CatalogRow]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let options = models
+    let options: Vec<PickerOption> = models
         .iter()
+        .filter(|row| row.group != "gemini")
         .map(|row| PickerOption {
             model: row.id.clone(),
             label: row.name.clone(),
             description: row_description(row),
         })
         .collect();
+    if options.is_empty() {
+        return None;
+    }
     let settings = PickerSettings {
         model_picker: PickerLineup { options },
     };
@@ -279,7 +284,9 @@ async fn catalog_args(
     match model_picker_settings(&models) {
         Some(json) => (vec!["--settings".into(), json], env),
         None => {
-            eprintln!("warning: model picker not injected: catalog is empty");
+            eprintln!(
+                "warning: model picker not injected: catalog has no Claude Code-selectable models"
+            );
             (Vec::new(), env)
         }
     }
@@ -748,11 +755,48 @@ mod tests {
             json.contains(r#"{"model":"claude-fable-5-1[1m]","label":"Claude Fable 5.1","description":"claude · efforts low…max · ctx 1000000"}"#),
             "{json}"
         );
+        let gemini_rows = rows.iter().filter(|row| row.group == "gemini").count();
+        assert!(gemini_rows > 0, "the real catalog carries gemini rows");
         assert_eq!(
             json.matches(r#"{"model":"#).count(),
-            entries.len(),
-            "one picker row per catalog entry"
+            entries.len() - gemini_rows,
+            "one picker row per non-gemini catalog entry"
         );
+        assert!(!json.contains("gemini"), "{json}");
+    }
+
+    /// Gemini rows never reach Claude Code's picker (Google refuses Claude
+    /// Code traffic); every other row keeps its catalog order.
+    #[test]
+    fn model_picker_settings_drops_gemini_rows() {
+        let models = [
+            row("claude-opus-5-5", "Claude Opus 5.5", &[], None, "claude"),
+            row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
+            row("gpt-5.5", "GPT-5.5", &[], None, "codex"),
+            row("gemini-4-argon", "Gemini 4 Argon", &[], None, "gemini"),
+            row("grok-4.6", "Grok 4.6", &[], None, "grok"),
+        ];
+        let json = model_picker_settings(&models).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"modelPicker":{"options":["#,
+                r#"{"model":"claude-opus-5-5","label":"Claude Opus 5.5","description":"claude"},"#,
+                r#"{"model":"gpt-5.5","label":"GPT-5.5","description":"codex"},"#,
+                r#"{"model":"grok-4.6","label":"Grok 4.6","description":"grok"}"#,
+                r#"]}}"#,
+            )
+        );
+    }
+
+    /// A gemini-only catalog leaves nothing to inject — same as empty.
+    #[test]
+    fn model_picker_settings_is_none_for_a_gemini_only_catalog() {
+        let models = [
+            row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
+            row("gemini-4-argon", "Gemini 4 Argon", &[], None, "gemini"),
+        ];
+        assert!(model_picker_settings(&models).is_none());
     }
 
     /// A fixture mirroring the real claude block: the `[1m]` twins own the

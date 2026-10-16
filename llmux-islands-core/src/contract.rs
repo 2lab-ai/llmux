@@ -58,6 +58,7 @@ pub enum Provider {
     Claude,
     Codex,
     Grok,
+    Gemini,
     Api,
     Unknown,
 }
@@ -68,6 +69,7 @@ impl Provider {
             "oauth" | "claude" => Self::Claude,
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "gemini" => Self::Gemini,
             "apikey" | "api_key" | "api" => Self::Api,
             _ => Self::Unknown,
         }
@@ -78,6 +80,7 @@ impl Provider {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "gemini" => Self::Gemini,
             "api" => Self::Api,
             _ => Self::Unknown,
         }
@@ -88,6 +91,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Gemini => "gemini",
             Self::Api => "api",
             Self::Unknown => "unknown",
         }

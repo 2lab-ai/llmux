@@ -32,6 +32,9 @@ pub enum LoginProvider {
     /// OpenRouter OAuth PKCE (browser), yielding a long-lived API key
     /// (docs/openrouter/spec.md §R5).
     OpenRouter,
+    /// Google Gemini (Antigravity subscription) — `auth::gemini` OAuth
+    /// browser flow with a localhost:51121 callback (docs/gemini/spec.md §R2).
+    Gemini,
 }
 
 impl LoginProvider {
@@ -43,6 +46,7 @@ impl LoginProvider {
             "codex" | "chatgpt" | "openai" => Some(Self::Codex),
             "grok" | "xai" | "x-ai" => Some(Self::Grok),
             "openrouter" | "open-router" | "or" => Some(Self::OpenRouter),
+            "gemini" | "google" | "antigravity" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -54,6 +58,7 @@ impl LoginProvider {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::OpenRouter => "openrouter",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -218,8 +223,33 @@ mod tests {
         );
         assert_eq!(LoginProvider::parse("codex"), Some(LoginProvider::Codex));
         assert_eq!(LoginProvider::parse("chatgpt"), Some(LoginProvider::Codex));
-        assert_eq!(LoginProvider::parse("gemini"), None);
+        assert_eq!(LoginProvider::parse("vertex"), None);
         assert_eq!(LoginProvider::parse(""), None);
+    }
+
+    /// docs/gemini/spec.md §R2: the app may send the provider name, the
+    /// vendor, or the product — all land on `Gemini`, echoed as `"gemini"`.
+    #[test]
+    fn provider_parse_accepts_gemini_aliases() {
+        for alias in [
+            "gemini",
+            "google",
+            "antigravity",
+            "  Gemini ",
+            "ANTIGRAVITY",
+        ] {
+            assert_eq!(
+                LoginProvider::parse(alias),
+                Some(LoginProvider::Gemini),
+                "{alias:?}"
+            );
+        }
+        assert_eq!(LoginProvider::Gemini.as_str(), "gemini");
+        assert_eq!(
+            LoginProvider::parse(LoginProvider::Gemini.as_str()),
+            Some(LoginProvider::Gemini),
+            "the echoed wire name parses back"
+        );
     }
 
     #[test]

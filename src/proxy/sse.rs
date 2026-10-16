@@ -3,7 +3,8 @@
 //! from `message_start` / `message_delta` events for stats (FR1).
 //!
 //! Porting pitfall: events fragment across chunks — buffer to event boundary
-//! (`\n\n`) before parsing; never assume one chunk == one event.
+//! (a blank line: `\n\n`, or its CRLF / lone-CR forms) before parsing; never
+//! assume one chunk == one event.
 //!
 //! Byte-identity contract: the bytes sent to the client are the exact chunks
 //! received from upstream — the [`EventBuffer`] only *observes* a copy for
@@ -56,9 +57,18 @@ pub fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 /// Reassembles SSE events from arbitrarily fragmented chunks. Push bytes in,
 /// get complete events out; partial trailing data stays buffered.
+///
+/// Line endings are normalized on the way in: the SSE spec (WHATWG HTML
+/// §9.2.6) ends a line with CRLF, LF or a lone CR, so `\r\n` and a lone `\r`
+/// become `\n` before the `\n\n` event boundary is searched — every consumer
+/// sees LF-only events whatever the upstream's framing. An LF-only stream
+/// passes through byte-identical.
 #[derive(Debug, Default)]
 pub struct EventBuffer {
     buf: Vec<u8>,
+    /// The last byte pushed was a `\r` not yet known to be a lone CR or the
+    /// first half of a CRLF; the next byte (or the stream's end) decides.
+    pending_cr: bool,
 }
 
 impl EventBuffer {
@@ -66,11 +76,37 @@ impl EventBuffer {
         Self::default()
     }
 
+    /// Append `chunk` to the buffer with CRLF / lone CR rewritten to LF.
+    fn append_normalized(&mut self, chunk: &[u8]) {
+        if !self.pending_cr && !chunk.contains(&b'\r') {
+            // LF-only fast path: byte-identical to the pre-normalization
+            // buffer.
+            self.buf.extend_from_slice(chunk);
+            return;
+        }
+        for &byte in chunk {
+            if self.pending_cr {
+                self.pending_cr = false;
+                // The held `\r` is a line end either way; a following `\n`
+                // completes it as CRLF and is consumed with it.
+                self.buf.push(b'\n');
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if byte == b'\r' {
+                self.pending_cr = true;
+            } else {
+                self.buf.push(byte);
+            }
+        }
+    }
+
     /// Append a chunk and drain every COMPLETE event (terminated by a blank
-    /// line, i.e. `\n\n`) accumulated so far, in order. Whitespace-only
-    /// events (stray blank lines) are skipped.
+    /// line — `\n\n` after line-ending normalization) accumulated so far, in
+    /// order. Whitespace-only events (stray blank lines) are skipped.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.extend_from_slice(chunk);
+        self.append_normalized(chunk);
         let mut events = Vec::new();
         while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
             let event: Vec<u8> = self.buf.drain(..pos + 2).collect();
@@ -85,6 +121,10 @@ impl EventBuffer {
     /// Drain whatever is left after the stream ends — an unterminated final
     /// event still gets parsed for usage (mirrors the teamclaude tail parse).
     pub fn take_remainder(&mut self) -> Option<String> {
+        // A `\r` held at the stream's end was a line end.
+        if std::mem::take(&mut self.pending_cr) {
+            self.buf.push(b'\n');
+        }
         let text = String::from_utf8_lossy(&self.buf);
         let out = if text.trim().is_empty() {
             None
@@ -726,6 +766,90 @@ mod tests {
         let mut buf = EventBuffer::new();
         assert!(buf.push(b"\n\n\n\n").is_empty());
         assert_eq!(buf.take_remainder(), None);
+    }
+
+    /// `MESSAGE_START` / `MESSAGE_DELTA` with CRLF line endings, the framing
+    /// WHATWG HTML §9.2.6 allows next to LF and lone CR.
+    fn crlf(event: &str) -> String {
+        event.replace('\n', "\r\n")
+    }
+
+    #[test]
+    fn crlf_events_are_split_and_handed_over_with_lf_lines() {
+        let chunk = format!(
+            "{}\r\n\r\n{}\r\n\r\n",
+            crlf(MESSAGE_START),
+            crlf(MESSAGE_DELTA)
+        );
+        let mut buf = EventBuffer::new();
+        let events = buf.push(chunk.as_bytes());
+        assert_eq!(
+            events,
+            vec![MESSAGE_START.to_string(), MESSAGE_DELTA.to_string()],
+            "same events, `\\r` stripped, as the LF stream yields"
+        );
+        assert_eq!(buf.take_remainder(), None);
+        // The parsers see exactly what they see on an LF stream.
+        assert_eq!(extract_usage(&events[1]), extract_usage(MESSAGE_DELTA));
+    }
+
+    #[test]
+    fn crlf_terminator_split_across_pushes_at_every_byte() {
+        let whole = format!("{}\r\n\r\n", crlf(MESSAGE_DELTA));
+        let bytes = whole.as_bytes();
+        // Every split point, including between the `\r` and `\n` of each
+        // half of the terminator.
+        for cut in 1..bytes.len() {
+            let mut buf = EventBuffer::new();
+            let mut events = buf.push(&bytes[..cut]);
+            events.extend(buf.push(&bytes[cut..]));
+            assert_eq!(events, vec![MESSAGE_DELTA.to_string()], "cut at {cut}");
+            assert_eq!(buf.take_remainder(), None, "cut at {cut}");
+        }
+        // And one byte at a time.
+        let mut buf = EventBuffer::new();
+        let mut events = Vec::new();
+        for byte in bytes {
+            events.extend(buf.push(&[*byte]));
+        }
+        assert_eq!(events, vec![MESSAGE_DELTA.to_string()]);
+    }
+
+    #[test]
+    fn mixed_line_endings_terminate_events() {
+        // `\r\n\n`, `\n\r\n` and lone-CR `\r\r` are all a line end
+        // followed by a blank line.
+        // The next event's first byte follows, so a trailing `\r` is decided.
+        for terminator in ["\r\n\n", "\n\r\n", "\r\r", "\r\n\r\n", "\n\n"] {
+            let chunk =
+                format!("{MESSAGE_DELTA}{terminator}{MESSAGE_START}{terminator}event: tail");
+            let mut buf = EventBuffer::new();
+            assert_eq!(
+                buf.push(chunk.as_bytes()),
+                vec![MESSAGE_DELTA.to_string(), MESSAGE_START.to_string()],
+                "{terminator:?}"
+            );
+            assert_eq!(
+                buf.take_remainder(),
+                Some("event: tail".to_string()),
+                "{terminator:?}"
+            );
+        }
+        // A trailing lone `\r` is held until the next byte decides it.
+        let mut buf = EventBuffer::new();
+        assert!(buf
+            .push(format!("{MESSAGE_DELTA}\r\n\r").as_bytes())
+            .is_empty());
+        assert_eq!(buf.push(b"\n"), vec![MESSAGE_DELTA.to_string()]);
+        // An unterminated CRLF tail comes back LF-normalized.
+        let mut buf = EventBuffer::new();
+        assert!(buf
+            .push(crlf("event: partial\ndata: {").as_bytes())
+            .is_empty());
+        assert_eq!(
+            buf.take_remainder(),
+            Some("event: partial\ndata: {".to_string())
+        );
     }
 
     #[test]

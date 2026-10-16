@@ -20,8 +20,8 @@ struct LlmuxStatus: Decodable {
 
 struct LlmuxAccountRecord: Decodable {
     let name: String
-    let type: String            // "oauth" | "apikey" | "codex" | "grok"
-    let group: String?          // "claude" | "codex" | "grok"
+    let type: String            // "oauth" | "apikey" | "codex" | "grok" | "gemini"
+    let group: String?          // "claude" | "codex" | "grok" | "gemini"
     let status: String?         // "active" | "ok" | "cooldown" | "auth_failed"
     let fiveHour: LlmuxWindow?
     let sevenDay: LlmuxWindow?

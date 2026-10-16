@@ -207,6 +207,11 @@ fn inject_credential(
                 "grok credential cannot authenticate against the openrouter provider".into(),
             ));
         }
+        AccountCredential::Gemini { .. } => {
+            return Err(ProviderError::Auth(
+                "gemini credential cannot authenticate against the openrouter provider".into(),
+            ));
+        }
     }
     Ok(())
 }

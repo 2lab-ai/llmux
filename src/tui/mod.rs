@@ -197,9 +197,10 @@ pub(crate) struct PollHealth {
 /// Which browser login flow the "new login" picker (`n`) kicks off. The flow
 /// runs in the CLIENT (this process) — `login_interactive` for Anthropic,
 /// `login_codex_interactive` for ChatGPT/Codex, the xAI device-code flow for
-/// Grok, PKCE-to-API-key for OpenRouter — then the minted credential is
-/// injected into the daemon (in-process locally, `POST /llmux/inject-account`
-/// when attached). One code path for local and attach (issue #4).
+/// Grok, PKCE-to-API-key for OpenRouter, `login_gemini_interactive` for
+/// Gemini — then the minted credential is injected into the daemon
+/// (in-process locally, `POST /llmux/inject-account` when attached). One code
+/// path for local and attach (issue #4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginKind {
     /// Anthropic Claude PKCE OAuth (`login_interactive`).
@@ -212,15 +213,20 @@ pub(crate) enum LoginKind {
     /// OpenRouter PKCE login whose exchange yields a long-lived API key
     /// (no token refresh to schedule).
     OpenRouter,
+    /// Google Antigravity OAuth (`login_gemini_interactive`) with a
+    /// `localhost:51121` callback — the only port Google registered for the
+    /// client, so a bind failure surfaces instead of retrying elsewhere.
+    Gemini,
 }
 
 impl LoginKind {
     /// Quick-pick rows for `Mode::NewLogin`, in display order.
-    pub(crate) const ALL: [LoginKind; 4] = [
+    pub(crate) const ALL: [LoginKind; 5] = [
         LoginKind::Anthropic,
         LoginKind::Codex,
         LoginKind::Grok,
         LoginKind::OpenRouter,
+        LoginKind::Gemini,
     ];
 
     /// One-line label for the picker + status line.
@@ -230,6 +236,7 @@ impl LoginKind {
             LoginKind::Codex => "Codex (ChatGPT OAuth)",
             LoginKind::Grok => "Grok (xAI OAuth)",
             LoginKind::OpenRouter => "OpenRouter (OAuth key)",
+            LoginKind::Gemini => "Gemini (Google OAuth)",
         }
     }
 }
@@ -4297,9 +4304,10 @@ impl App {
 
     /// Run a new browser login in THIS client and inject the resulting account
     /// into the daemon (issue #4). The OAuth flow runs HERE — a localhost
-    /// callback for Anthropic/Codex/OpenRouter, a printed device code for Grok
-    /// (which has no callback) — and the minted credential is then injected:
-    /// in-process when local, via `POST /llmux/inject-account` when attached.
+    /// callback for Anthropic/Codex/OpenRouter/Gemini (51121 for Gemini), a
+    /// printed device code for Grok (which has no callback) — and the minted
+    /// credential is then injected: in-process when local, via
+    /// `POST /llmux/inject-account` when attached.
     /// ONE code path: the only fork is where the credential lands.
     ///
     /// MUST run with the raw terminal SUSPENDED (the flow prints prompts and
@@ -4424,6 +4432,44 @@ impl App {
                         api_key,
                         label: label.trim().to_string(),
                     },
+                }
+            }
+            LoginKind::Gemini => {
+                // Google Antigravity OAuth, localhost:51121 callback
+                // (docs/gemini/spec.md §R2). Same pre-browser ToS note as
+                // `llmux login --gemini` (the terminal is suspended here).
+                let gemini = match &self.backend {
+                    Backend::Local(state) => state.config.gemini.clone(),
+                    // The flow runs HERE, in the attached client, which has
+                    // no copy of the daemon's config: use this machine's
+                    // config file (and environment) — the OAuth client is
+                    // the operator's, never a built-in default.
+                    Backend::Remote(_) => crate::config::load()
+                        .map(|config| config.gemini)
+                        .unwrap_or_default(),
+                };
+                let oauth = match gemini.oauth_client() {
+                    Ok(oauth) => oauth,
+                    Err(err) => {
+                        self.set_status(format!("gemini login failed: {err}"));
+                        return;
+                    }
+                };
+                println!("{}", crate::auth::gemini::GEMINI_TOS_NOTE);
+                match crate::auth::gemini::login_gemini_interactive(
+                    &client,
+                    &oauth,
+                    &gemini.token_url,
+                    &gemini.upstream,
+                    &gemini.user_agent,
+                )
+                .await
+                {
+                    Ok(account) => account,
+                    Err(err) => {
+                        self.set_status(format!("gemini login failed: {err}"));
+                        return;
+                    }
                 }
             }
         };
@@ -5903,13 +5949,16 @@ mod tests {
         app.mode = Mode::NewLogin { idx: last };
         app.on_key_new_login(KeyCode::Down, last);
         assert_eq!(app.mode, Mode::NewLogin { idx: last });
-        assert_eq!(last, 3, "picker rows: anthropic, codex, grok, openrouter");
+        assert_eq!(
+            last, 4,
+            "picker rows: anthropic, codex, grok, openrouter, gemini"
+        );
     }
 
-    /// Rows 2 and 3 are the providers added alongside Claude/Codex: Enter on
+    /// Rows 2–4 are the providers added alongside Claude/Codex: Enter on
     /// each queues THAT provider, so the picker order and `ALL` cannot drift.
     #[test]
-    fn new_login_picker_enter_queues_grok_and_openrouter_rows() {
+    fn new_login_picker_enter_queues_grok_openrouter_and_gemini_rows() {
         let mut app = remote_app();
         app.mode = Mode::NewLogin { idx: 2 };
         app.on_key_new_login(KeyCode::Enter, 2);
@@ -5918,6 +5967,10 @@ mod tests {
         app.mode = Mode::NewLogin { idx: 3 };
         app.on_key_new_login(KeyCode::Enter, 3);
         assert_eq!(app.take_pending_login(), Some(LoginKind::OpenRouter));
+
+        app.mode = Mode::NewLogin { idx: 4 };
+        app.on_key_new_login(KeyCode::Enter, 4);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::Gemini));
     }
 
     #[test]
@@ -5941,7 +5994,8 @@ mod tests {
         assert!(LoginKind::Codex.label().contains("Codex"));
         assert!(LoginKind::Grok.label().contains("Grok"));
         assert!(LoginKind::OpenRouter.label().contains("OpenRouter"));
-        assert_eq!(LoginKind::ALL.len(), 4);
+        assert!(LoginKind::Gemini.label().contains("Gemini"));
+        assert_eq!(LoginKind::ALL.len(), 5);
         let labels: std::collections::BTreeSet<&str> =
             LoginKind::ALL.iter().map(|k| k.label()).collect();
         assert_eq!(labels.len(), LoginKind::ALL.len(), "labels are unique");

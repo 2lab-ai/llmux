@@ -650,3 +650,16 @@ fn desktop_capabilities_are_unknown_until_qt_reports_runtime_availability() {
         Value::Bool(true)
     );
 }
+
+#[test]
+fn gemini_login_dispatch_starts_a_gemini_login() {
+    let login = dispatch("login_started", r#"{"provider":"gemini"}"#);
+    assert!(login.error.is_none(), "gemini is a valid login provider");
+    assert!(matches!(
+        login.effects.as_slice(),
+        [Effect::StartLogin {
+            operation_id,
+            provider: Provider::Gemini
+        }] if operation_id.starts_with("login-")
+    ));
+}

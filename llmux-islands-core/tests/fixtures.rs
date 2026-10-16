@@ -298,3 +298,42 @@ fn activity_endpoint_origin_reaches_native_receipts_independently_of_provider() 
         .filter(|r| r.kind == ReceiptKind::Note)
         .all(|r| r.endpoint == Endpoint::Anthropic));
 }
+
+#[test]
+fn gemini_accounts_and_activity_map_to_the_gemini_provider() {
+    // The daemon reports gemini accounts as `type: "gemini"` and their
+    // routed requests as group `"gemini"`; both must land on their own
+    // provider instead of collapsing into `unknown`.
+    let mut doc = read_fixture("current");
+    doc.accounts[1].kind = "gemini".into();
+    doc.activity.in_flight[0].group = Some("gemini".into());
+    for row in &mut doc.activity.completed {
+        if let llmux::dashboard::CompletedDoc::Request { group, .. } = row {
+            *group = Some("gemini".into());
+        }
+    }
+    let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
+
+    assert_eq!(state.usage.accounts[1].provider, Provider::Gemini);
+    assert_eq!(state.usage.provider_in_flight.get("gemini"), Some(&1));
+    assert_eq!(state.window.provider_in_flight.get("gemini"), Some(&1));
+    assert_eq!(state.window.provider_in_flight.get("claude"), Some(&2));
+    assert!(!state.window.provider_in_flight.contains_key("codex"));
+    assert!(!state.window.provider_in_flight.contains_key("unknown"));
+
+    let receipts = &state.statistics.activity_receipts;
+    assert_eq!(receipts[0].provider, Some(Provider::Gemini));
+    assert!(receipts
+        .iter()
+        .filter(|receipt| receipt.status.is_some())
+        .all(|receipt| receipt.provider == Some(Provider::Gemini)));
+
+    assert_eq!(
+        serde_json::to_value(Provider::Gemini).expect("provider JSON"),
+        "gemini"
+    );
+    assert_eq!(
+        serde_json::from_value::<Provider>("gemini".into()).expect("provider from JSON"),
+        Provider::Gemini
+    );
+}

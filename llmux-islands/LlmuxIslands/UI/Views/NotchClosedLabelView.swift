@@ -4,7 +4,7 @@
 //
 //  Closed-island label (todo.md items 1–2). Replaces the plain black box with
 //
-//      Llmux Islands [mascot] [claude]{n} [codex]{m}
+//      Llmux Islands [mascot] [claude]{n} [codex]{m} [grok]{k} [gemini]{g}
 //
 //  - `[mascot]` is the existing pixel-art ClaudeCrabIcon (the app's top-left
 //    element), looping a small vertical jump whose speed scales with the Claude
@@ -27,6 +27,8 @@ struct NotchClosedLabelView: View {
     let codexCount: Int
     /// Σ in-flight sessions over Grok accounts — drives `{k}`.
     let grokCount: Int
+    /// Σ in-flight sessions over Gemini accounts — drives `{g}`.
+    let geminiCount: Int
     /// exception-beacon: the worst live exception, or `.none` for today's
     /// label pixel-identical. The chip is STATIC (decoupled from the rainbow
     /// loop) so a warning never reads as decoration.
@@ -51,8 +53,9 @@ struct NotchClosedLabelView: View {
     static let claudeHueSeed: Double = 0
     static let codexHueSeed: Double = 0.35
     static let grokHueSeed: Double = 0.7
+    static let geminiHueSeed: Double = 0.525
 
-    private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 || grokCount > 0 }
+    private var isAnimating: Bool { claudeCount > 0 || codexCount > 0 || grokCount > 0 || geminiCount > 0 }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !(isAnimating && active))) { timeline in
@@ -61,10 +64,12 @@ struct NotchClosedLabelView: View {
                 claudeCount: claudeCount,
                 codexCount: codexCount,
                 grokCount: grokCount,
+                geminiCount: geminiCount,
                 jumpOffset: Self.jumpOffset(time: time, claudeSessions: claudeCount),
                 claudeHue: Self.rainbowHue(time: time, seed: Self.claudeHueSeed),
                 codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed),
                 grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed),
+                geminiHue: Self.rainbowHue(time: time, seed: Self.geminiHueSeed),
                 signal: signal
             )
         }
@@ -117,6 +122,7 @@ struct NotchClosedLabelContent: View {
     let claudeCount: Int
     let codexCount: Int
     let grokCount: Int
+    let geminiCount: Int
     /// Mascot vertical offset in points (≤ 0 while airborne).
     let jumpOffset: CGFloat
     /// 0..<1 rainbow hue for the claude `[icon]{n}` group.
@@ -125,6 +131,8 @@ struct NotchClosedLabelContent: View {
     let codexHue: Double
     /// 0..<1 rainbow hue for the grok `[icon]{k}` group.
     let grokHue: Double
+    /// 0..<1 rainbow hue for the gemini `[icon]{g}` group.
+    let geminiHue: Double
     /// exception-beacon chip; `.none` renders today's label pixel-identical
     /// (no reserved slot, no spacer).
     var signal: GlanceSignal = .none
@@ -158,6 +166,9 @@ struct NotchClosedLabelContent: View {
                 }
                 if grokCount > 0 {
                     providerGroup(.grok, count: grokCount, hue: grokHue)
+                }
+                if geminiCount > 0 {
+                    providerGroup(.gemini, count: geminiCount, hue: geminiHue)
                 }
 
                 if let text = signal.chipText {

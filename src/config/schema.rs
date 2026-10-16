@@ -52,6 +52,11 @@ pub struct Config {
     /// with defaults (docs/openrouter/spec.md §R4).
     #[serde(default)]
     pub openrouter: OpenRouterConfig,
+    /// Google Antigravity (Cloud Code `v1internal`) backend endpoints +
+    /// request defaults (used only by `type: "gemini"` accounts).
+    /// Additive: pre-gemini configs load with defaults (docs/gemini/spec.md).
+    #[serde(default)]
+    pub gemini: GeminiConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Model→backend-group routing (default: disabled — exactly today's
@@ -388,6 +393,7 @@ impl Default for Config {
             claude_code: ClaudeCodeConfig::default(),
             grok: GrokConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            gemini: GeminiConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),
@@ -549,14 +555,19 @@ pub struct RoutingConfig {
     /// with those builtins (docs/openrouter/spec.md §R2).
     #[serde(default)]
     pub openrouter_models: Vec<String>,
+    /// Models routed to the gemini group (empty → builtin `gemini` prefix +
+    /// exact `argon` rules). Additive: pre-gemini configs load with those
+    /// builtins (docs/gemini/spec.md §R1).
+    #[serde(default)]
+    pub gemini_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.
     #[serde(default = "default_routing_group")]
     pub default_group: String,
     /// What to do when the matched group has ZERO CONFIGURED accounts
     /// (parked/limited accounts still count as configured): `"error"`
     /// (default) returns a clean 404 not_found_error; `"fallback"` tries the
-    /// remaining groups in the fixed `Claude → Codex → Grok → OpenRouter`
-    /// order and the
+    /// remaining groups in the fixed
+    /// `Claude → Codex → Grok → OpenRouter → Gemini` order and the
     /// first group with ≥1 configured account serves the request under its
     /// own provider semantics (docs/grok/spec.md §R5).
     #[serde(default = "default_on_empty_group")]
@@ -571,6 +582,7 @@ impl Default for RoutingConfig {
             codex_models: Vec::new(),
             grok_models: Vec::new(),
             openrouter_models: Vec::new(),
+            gemini_models: Vec::new(),
             default_group: default_routing_group(),
             on_empty_group: default_on_empty_group(),
         }
@@ -713,6 +725,137 @@ impl Default for OpenRouterConfig {
         Self {
             upstream: default_openrouter_upstream(),
             default_model: default_openrouter_model(),
+        }
+    }
+}
+
+/// Google Antigravity backend endpoints + request defaults
+/// (docs/gemini/spec.md §R2/§R3). The chat upstream is the Cloud Code daily
+/// host the Antigravity client itself talks to
+/// (`{upstream}/v1internal:streamGenerateContent?alt=sse`); the GCP project
+/// is resolved and persisted PER ACCOUNT (`AccountCredential::Gemini`), so
+/// none lives here. No `fast` and no `reasoning_effort`: the thinking level
+/// is baked into the model id (`gemini-3.8-flash-{high,medium,low}`).
+///
+/// `Debug` is written by hand: `client_secret` prints as `<redacted>`, so a
+/// `{:?}` of this section or of the whole [`Config`] never carries it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeminiConfig {
+    /// Cloud Code base URL (`{upstream}/v1internal:…`).
+    #[serde(default = "default_gemini_upstream")]
+    pub upstream: String,
+    /// Model id the gemini provider requests upstream when the client's
+    /// requested model is not gemini-shaped (empty-group fallback).
+    #[serde(default = "default_gemini_model")]
+    pub default_model: String,
+    /// When set, llmux reports THIS model name to the client instead of the
+    /// real gemini model (same contract as `codex.client_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_model: Option<String>,
+    /// `User-Agent` sent upstream. Cloud Code gates newer models on the
+    /// Antigravity hub version (`antigravity/hub/<version> <os>/<arch>`;
+    /// rejected below 2.23.0 per the spec's verified facts).
+    #[serde(default = "default_gemini_user_agent")]
+    pub user_agent: String,
+    /// Google OAuth token endpoint for refresh-token grants.
+    #[serde(default = "default_gemini_token_url")]
+    pub token_url: String,
+    /// Client id of Antigravity's installed-app Google OAuth client. llmux
+    /// does not ship it: the operator configures it here (or with
+    /// `LLMUX_GEMINI_CLIENT_ID`, which wins). Login and token refresh need
+    /// it ([`Self::oauth_client`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// That client's secret (or `LLMUX_GEMINI_CLIENT_SECRET`, which wins).
+    /// Never displayed by the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// Append a JSON-line trace of every gemini request/response, mirroring
+    /// `grok.trace`. Default `false` (flip on while diagnosing).
+    #[serde(default)]
+    pub trace: bool,
+}
+
+impl std::fmt::Debug for GeminiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile here until it
+        // is printed (or deliberately redacted).
+        let Self {
+            upstream,
+            default_model,
+            client_model,
+            user_agent,
+            token_url,
+            client_id,
+            client_secret,
+            trace,
+        } = self;
+        f.debug_struct("GeminiConfig")
+            .field("upstream", upstream)
+            .field("default_model", default_model)
+            .field("client_model", client_model)
+            .field("user_agent", user_agent)
+            .field("token_url", token_url)
+            .field("client_id", client_id)
+            .field(
+                "client_secret",
+                &client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("trace", trace)
+            .finish()
+    }
+}
+
+/// Overrides [`GeminiConfig::client_id`] when set and non-blank.
+pub const GEMINI_CLIENT_ID_ENV: &str = "LLMUX_GEMINI_CLIENT_ID";
+/// Overrides [`GeminiConfig::client_secret`] when set and non-blank.
+pub const GEMINI_CLIENT_SECRET_ENV: &str = "LLMUX_GEMINI_CLIENT_SECRET";
+
+impl GeminiConfig {
+    /// The Google OAuth client the gemini login and token refresh
+    /// authenticate with: the environment ([`GEMINI_CLIENT_ID_ENV`] /
+    /// [`GEMINI_CLIENT_SECRET_ENV`]) over `client_id` / `client_secret`, each
+    /// value taken only when non-blank. Either one missing is
+    /// [`crate::auth::AuthError::GeminiClientNotConfigured`] — no default
+    /// exists anywhere in llmux.
+    pub fn oauth_client(
+        &self,
+    ) -> Result<crate::auth::gemini::GeminiOAuthClient, crate::auth::AuthError> {
+        self.oauth_client_from(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::oauth_client`] over an injected environment lookup (tests).
+    pub fn oauth_client_from(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<crate::auth::gemini::GeminiOAuthClient, crate::auth::AuthError> {
+        let pick = |name: &str, configured: &Option<String>| {
+            env(name)
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| configured.clone().filter(|v| !v.trim().is_empty()))
+                .map(|v| v.trim().to_string())
+        };
+        match (
+            pick(GEMINI_CLIENT_ID_ENV, &self.client_id),
+            pick(GEMINI_CLIENT_SECRET_ENV, &self.client_secret),
+        ) {
+            (Some(id), Some(secret)) => Ok(crate::auth::gemini::GeminiOAuthClient { id, secret }),
+            _ => Err(crate::auth::AuthError::GeminiClientNotConfigured),
+        }
+    }
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_gemini_upstream(),
+            default_model: default_gemini_model(),
+            client_model: None,
+            user_agent: default_gemini_user_agent(),
+            token_url: default_gemini_token_url(),
+            client_id: None,
+            client_secret: None,
+            trace: false,
         }
     }
 }
@@ -929,8 +1072,8 @@ pub struct AccountConfig {
     pub credential: AccountCredential,
 }
 
-/// Credential payload, tagged by `"type": "oauth" | "apikey" | "codex"`
-/// in JSON.
+/// Credential payload, tagged by `"type": "oauth" | "apikey" | "codex" |
+/// "grok" | "openrouter" | "gemini"` in JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AccountCredential {
@@ -1017,6 +1160,32 @@ pub enum AccountCredential {
         #[serde(default)]
         label: String,
     },
+    /// Google Antigravity subscription (installed-app OAuth against
+    /// accounts.google.com, or imported from the Antigravity CLI store,
+    /// docs/gemini/spec.md §R2). Served by the gemini provider.
+    ///
+    /// NOTE downgrade contract: a config containing this variant does not
+    /// parse under pre-gemini binaries (internally-tagged enum) — remove
+    /// `gemini:*` accounts before downgrading (spec §Compatibility & rollback).
+    Gemini {
+        /// Google account email (userinfo, or the stored id_token's `email`
+        /// claim on import); dedup key across logins. Empty string = unknown.
+        #[serde(default)]
+        email: String,
+        access_token: String,
+        refresh_token: String,
+        /// Access-token expiry, epoch milliseconds. `0` = unknown.
+        expires_at_ms: u64,
+        /// Cloud Code project (`loadCodeAssist` → `cloudaicompanionProject`).
+        /// Empty string = not yet resolved (offline import); resolved lazily
+        /// on the first request and persisted.
+        #[serde(default)]
+        project_id: String,
+        /// Epoch ms of the last successful token refresh; see the `Oauth`
+        /// variant's field of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_refresh_ms: Option<u64>,
+    },
 }
 
 impl AccountCredential {
@@ -1028,6 +1197,7 @@ impl AccountCredential {
             Self::Codex { .. } => "codex",
             Self::Grok { .. } => "grok",
             Self::OpenRouter { .. } => "openrouter",
+            Self::Gemini { .. } => "gemini",
         }
     }
 
@@ -1044,19 +1214,24 @@ impl AccountCredential {
             }
             | Self::Grok {
                 last_refresh_ms, ..
+            }
+            | Self::Gemini {
+                last_refresh_ms, ..
             } => *last_refresh_ms,
             Self::Apikey { .. } | Self::OpenRouter { .. } => None,
         }
     }
 
     /// The dedup key for oauth-style accounts: a non-empty `account_uuid`
-    /// (Anthropic) or `account_id` (Codex). `None` for apikey accounts and
-    /// for accounts whose identity is not (yet) known.
+    /// (Anthropic), `account_id` (Codex), `subject` (Grok) or `email`
+    /// (Gemini). `None` for apikey accounts and for accounts whose identity is
+    /// not (yet) known.
     pub fn account_uuid(&self) -> Option<&str> {
         match self {
             Self::Oauth { account_uuid, .. } if !account_uuid.is_empty() => Some(account_uuid),
             Self::Codex { account_id, .. } if !account_id.is_empty() => Some(account_id),
             Self::Grok { subject, .. } if !subject.is_empty() => Some(subject),
+            Self::Gemini { email, .. } if !email.is_empty() => Some(email),
             _ => None,
         }
     }
@@ -1212,6 +1387,13 @@ impl Config {
                 expires_at_ms: exp,
                 last_refresh_ms: lr,
                 ..
+            }
+            | AccountCredential::Gemini {
+                access_token: at,
+                refresh_token: rt,
+                expires_at_ms: exp,
+                last_refresh_ms: lr,
+                ..
             } => {
                 *at = access_token.to_string();
                 if let Some(new_rt) = refresh_token {
@@ -1261,6 +1443,29 @@ fn default_grok_upstream() -> String {
 /// `provider::grok::GROK_MODEL`.
 fn default_grok_model() -> String {
     "grok-4.7".to_string()
+}
+
+/// Default gemini upstream: the Cloud Code daily host the Antigravity client
+/// calls (agy CLI log 2026-10-15; CLIProxyAPI `antigravity_executor.go`).
+fn default_gemini_upstream() -> String {
+    "https://daily-cloudcode-pa.googleapis.com".to_string()
+}
+
+/// Default gemini model id — the backend's `defaultAgentModelId`
+/// (`fetchAvailableModels`, live 2026-10-15).
+fn default_gemini_model() -> String {
+    "gemini-3.8-flash-high".to_string()
+}
+
+/// Default gemini `User-Agent`: the Antigravity hub identity at the public
+/// manifest version of 2026-10-15 (`2.23.1`).
+fn default_gemini_user_agent() -> String {
+    "antigravity/hub/2.23.1 darwin/arm64".to_string()
+}
+
+/// Default Google OAuth token endpoint for gemini refresh-token grants.
+fn default_gemini_token_url() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
 }
 
 /// Default OpenRouter base URL.
