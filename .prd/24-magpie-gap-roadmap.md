@@ -52,7 +52,9 @@ and what it can reach, wave 3 is polish.
 **Market default.** The vendor set (DeepSeek, Kimi, GLM, MiniMax, Qwen) and the launch channels
 lean CJK-first, because that is where the measured demand is (72% of magpie issues contain CJK). The
 alternative is EN-first: OpenRouter, Ollama, Groq and the OpenAI API first, HN and Reddit first. The
-owner can flip this default.
+owner can flip this default. [추정] OpenRouter payment and access are often blocked for mainland
+China users, so the existing OpenRouter route serves the EN-first audience better, and direct
+vendor keys (item 2) matter more under the CJK-first default.
 
 ## Product track
 
@@ -104,8 +106,9 @@ owner can flip this default.
 - **What:** opt-in, per group. Example: `claude: [pool] → openrouter` today, `→ deepseek-key`
   after item 2. When every account in a group is cooling down, the request goes to the next link
   instead of returning 429.
-- **Never silent.** Respect the "no model laundering" line: send an `X-Llmux-Fallback: <provider>`
-  response header, show a badge in Islands/TUI, and log a line. Default off.
+- **Never silent.** Respect the "no model laundering" line: send an
+  `X-Llmux-Fallback: <provider>/<model>` response header, show the serving model in an Islands/TUI
+  badge, and log a line. Default off.
 - **Why:** at most 107 authors. This is an upper bound: the keyword set includes plain 429 and
   "at capacity" errors, not only fallback requests. #1418 (18 comments) is a routing group that
   could not reach its relay. Today llmux returns 429 + retry-after when a group is exhausted
@@ -113,7 +116,7 @@ owner can flip this default.
   does not wait for item 2.
 - **Acceptance:**
   - With all Claude accounts paused and a fallback configured, a Claude Code turn returns 200 with
-    `X-Llmux-Fallback: openrouter`, and Islands shows the badge.
+    `X-Llmux-Fallback: openrouter/<model>`, and Islands shows the badge with that model.
   - With no fallback configured, behaviour is unchanged.
   - A stream that has already started never switches.
 
@@ -189,7 +192,7 @@ total, 49 repo views from 15 unique visitors in 14 days.
 |---|---|---|
 | D1 | **One-line positioning + honest comparison.** Lead with the harness and the keys, not with account pooling, which is the policy-fragile half ([23 Tensions](23-research-magpie.md)). Example: "Keep Claude Code or Codex. Run them on any model you pay for, and see every quota in one place." Adds a llmux / magpie / CLIProxyAPI table to `docs/why-llmux.md`. | README first screen states it; the table cites only checked facts |
 | D2 | **README that sells in 10 seconds.** A 20–30 s hero GIF (Islands + a Claude Code model switch to an `or-` model), badges, star history, install one-liner, Korean and Chinese READMEs. | GIF renders on github.com; links resolve |
-| D3 | **Landing page** (e.g. dosi.dev/llmux): pitch, demo video, three differentiators (reset-aware pooling, multi-model subagents, remote daemon with client keys), install. | URL returns 200 with the video playing |
+| D3 | **Landing page** (e.g. dosi.dev/llmux): pitch, demo video, three differentiators in D1's order (your harness on any key, multi-model subagents, reset-aware quota across accounts and machines), install. | URL returns 200 with the video playing |
 | D4 | **Launch at the end of wave 1** (quota polish + direct DeepSeek/Kimi keys + fallback chain). Video post on X and Threads, GeekNews, Show HN, r/ClaudeAI and r/codex, V2EX / LINUX DO (72% of magpie issues contain CJK). | Owner publishes; external posts are owner-gated |
 | D5 | **Community + response loop.** GitHub Discussions, issue templates, and the existing agent-triage/agent-resolve loop aimed at same-day answers (magpie's median is 5.1 h to close). | Median first response < 24 h over 30 days |
 | D6 | **Install friction.** A `curl … \| sh` installer next to brew; Windows (item 4); Docker (item 6). | Clean-machine install < 60 s on macOS/Linux |
