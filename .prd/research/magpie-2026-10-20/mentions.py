@@ -14,6 +14,4 @@ pos=r'好用|感谢|谢谢|太棒|很棒|喜欢|神器|离不开|强大|牛|赞|
 m=[r for r in iss if re.search(pos,(r['t']+' '+r['body']).lower())]
 print("  issues with praise words:",len(m))
 c=collections.Counter(cat for r in m for cat in r['cats']); print(" ",c.most_common(12))
-for r in sorted(m,key=lambda r:-r['c'])[:12]:
-    s=re.search(r'.{0,50}('+pos+r').{0,60}',r['body'].lower().replace('\n',' '))
-    print('  #',r['n'],r['t'][:60],'||',s.group(0) if s else '')
+print('  most-discussed praise issues:',[r['n'] for r in sorted(m,key=lambda r:-r['c'])[:12]])

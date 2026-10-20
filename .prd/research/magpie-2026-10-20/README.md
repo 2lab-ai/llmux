@@ -1,6 +1,6 @@
 # magpie issue analysis — reproduction (2026-10-20)
 
-Inputs are fetched, not committed. The issue text is third-party user content and is not stored in this repo.
+Inputs are fetched, not committed: issue bodies are third-party user content, so the outputs keep only counts and issue numbers.
 
 ```sh
 D=$(mktemp -d)
