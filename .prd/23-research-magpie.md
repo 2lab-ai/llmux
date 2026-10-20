@@ -106,7 +106,10 @@ Signals in plain words:
 ## 4. Feature-by-feature gap matrix
 
 Have = llmux ships it. Partial = a narrower version ships. Missing = not built. Out = conflicts with
-an llmux non-goal or thesis (§7). Numbers in brackets = magpie inventory id.
+an llmux non-goal or thesis (§7). Numbers in brackets = magpie inventory id. The full 44-row
+inventory, with an llmux grade for every row (Have 6 · Partial 15 · Missing 10 · Out 10 · N/A 3), is
+[research/magpie-2026-10-20/features.md](research/magpie-2026-10-20/features.md). This table keeps
+the rows the roadmap acts on.
 
 | magpie feature | llmux | llmux evidence / note |
 |---|---|---|
