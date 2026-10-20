@@ -1,0 +1,53 @@
+CLIENT AGENTS
+  Codex                  issues= 537 feat=190 cmts=1400
+  Claude Code            issues= 287 feat=109 cmts=750
+  OpenCode               issues= 147 feat= 66 cmts=353
+  Pi                     issues= 105 feat= 42 cmts=254
+  WorkBuddy/CodeBuddy    issues= 102 feat= 39 cmts=236
+  DeepSeek harness(dsh)  issues=  67 feat= 22 cmts=143
+  Grok                   issues=  66 feat= 24 cmts=169
+  Antigravity            issues=  63 feat= 24 cmts=150
+  Claude Desktop         issues=  58 feat= 20 cmts=138
+  Cursor                 issues=  55 feat= 21 cmts=147
+  Kimi Code              issues=  28 feat= 12 cmts=78
+  Factory droid          issues=  24 feat=  5 cmts=89
+  Gemini CLI             issues=  14 feat=  7 cmts=30
+  Cline                  issues=  13 feat=  4 cmts=31
+  Copilot/VSCode         issues=  12 feat=  3 cmts=35
+  Zed                    issues=   8 feat=  5 cmts=16
+  Qwen Code              issues=   2 feat=  1 cmts=2
+PROVIDERS/BACKENDS
+  DeepSeek               issues= 194 feat= 67 cmts=483
+  ChatGPT/Codex subscription issues= 139 feat= 52 cmts=380
+  Antigravity/Gemini     issues= 114 feat= 48 cmts=248
+  Relay/中转               issues= 111 feat= 45 cmts=314
+  Claude subscription    issues=  87 feat= 25 cmts=221
+  Grok/xAI               issues=  68 feat= 24 cmts=172
+  Zhipu/GLM              issues=  65 feat= 30 cmts=187
+  Kimi/Moonshot          issues=  59 feat= 27 cmts=157
+  ZCode                  issues=  41 feat= 11 cmts=126
+  GitHub Copilot         issues=  36 feat= 12 cmts=88
+  OpenCode Zen           issues=  33 feat= 20 cmts=64
+  Trae                   issues=  32 feat= 13 cmts=94
+  Qoder                  issues=  29 feat=  9 cmts=77
+  MiniMax                issues=  25 feat= 12 cmts=62
+  Qwen/Bailian           issues=  24 feat= 15 cmts=61
+  Ollama/local           issues=  18 feat=  9 cmts=43
+  OpenRouter             issues=  18 feat=  9 cmts=37
+  MiMo (Xiaomi)          issues=  18 feat=  8 cmts=58
+  AWS Bedrock            issues=   5 feat=  2 cmts=27
+LOVE / DEPENDENCY SIGNALS
+  issues with praise words: 111
+  [('agents', 43), ('routing', 34), ('providers', 26), ('ui_ux', 18), ('subscription_auth', 16), ('usage_quota', 15), ('platform_install', 14), ('protocol_compat', 13), ('library_mcp_skills', 7), ('remote_lan', 7), ('sessions', 6), ('docs_i18n', 6)]
+  # 256 希望增加对copilot学生套餐的支持 || 三挡可选）。目前在copilot的配置页面未找到自动路由的相关配置，希望增加对此支持。穷学生也想玩，谢谢😭。
+  # 1457 [Feature Request] 将 Snow App / Snow CLI 作为 Agent 接入 Magpie || gpie 管理的客户端/agent；不涉及将 snow 自身的账号或订阅转接给其他 agent。  谢谢！
+  # 1179 可以支持 Ante Agent 吗？ ||  要快一些：https://github.com/antigmalabs/ante  希望能够支持！谢谢！
+  # 840 [体验优化] 用量卡片优化建议 || 随着magpie越来越强大，兼容的套餐越来越多，及多账号的支持，各套餐的用量卡片需要显示信息的越来越多  以下是一些对统一用量卡片ui的优化建议草
+  # 834 建议精简 Agent 页面，统一接入状态与模型选择的交互 || 感谢之前对 #726 的回复和调整。继续使用后，想再补充一些关于 agent 页面整体交互的建议。 之前的界面对我来说比较简
+  # 248 content_filter 处理 || 或者路由组里面的其他模型（更少宽松safeguard），而不是静默重试五次（且可能重复扣费）后失败。谢谢考虑这个功能。  <img width="1428" height="1016" alt="image" src="ht
+  # 1817 use opencode muse-spark-1.3-contributor-free in magpie 谢谢，辛苦 || ://github.com/diegosouzapw/omniroute/issues/13935 谢谢，辛苦啦
+  # 790 [Feature 是否可以在windows上启动magpie之后可以让他直接连接到wsl中的agent呢] || 里面生效的。 因为如果在wsl里面安装tui版本的magpie的话用起来感觉还是没有gui方便的。 感谢大佬
+  # 224 费用栏内 GPT 模型不显示实际费用 || /assets/f2101e8b-8add-43fc-a1b2-56f46867300b" />  谢谢作者，好像只有 claude 系模型有费用，不知道是不是 api 价格获取出了问题。
+  # 2118 Add bounded async context hooks and completion notifications || e original request retained on failure. 2. send a best-effort notification of the completed exchange after output 
+  # 811 [功能建议]MiniMaxcode自动签到功能支持 || 也有签到送积分功能，如果可以的话希望能支持下，这将节省每天打开minimaxcode签到的时间，非常感谢   <img width="688" height="618" alt="image" src="https://gi
+  # 191 pi coding agent 在含中文的目录路径（如“新建文件夹”）下通过 Magpie 调用模型时，因 Magpie || aracter at index 28 has a value of 26032 which is greater than 255. 使用相同模型进行分析后： - bytestring 是 js 里 http 请求头（heade

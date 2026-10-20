@@ -1,0 +1,22 @@
+unclassified 33 / 2138
+kinds Counter({'feature': 803, 'bug': 697, 'other': 638})
+area                   issues authors  cmts  feat  bug  open
+agents                    859     525  2213   304  328   394
+providers                 614     387  1712   248  197   284
+ui_ux                     467     307  1041   138  191   218
+usage_quota               382     250   956   155  103   178
+subscription_auth         351     240   911   120  110   166
+routing                   387     236   905   137  146   198
+protocol_compat           291     210   717    79  133   132
+platform_install          249     191   591    61  117   116
+sessions                  169     137   415    55   59    84
+remote_lan                146     113   363    64   51    72
+web_image_media           113      94   277    44   32    61
+library_mcp_skills        136      94   301    64   47    59
+compaction_context        102      85   269    37   33    66
+plugins                    91      76   230    24   32    48
+docs_i18n                  95      66   279    30   18    38
+caching                    48      40   135    12   18    25
+free_credits               42      37   152    15   12    28
+unclassified               33      31    28     8    3    10
+privacy                    16      16    28     5    5     9

@@ -1,0 +1,8 @@
+I1 api-key providers: issues=401 authors=268 feat=158
+I2 cross-provider fallback: issues=139 authors=107 feat=50
+I3 quota display: issues=416 authors=270 feat=199
+I4 warm-up / reset credits: issues=31 authors=27 feat=21
+I5 docker / headless server: issues=107 authors=84 feat=54
+I6 windows: issues=294 authors=182 feat=80
+I7 web search: issues=61 authors=56 feat=28
+I8 third harness (other agents only): issues=339 authors=230 feat=138
