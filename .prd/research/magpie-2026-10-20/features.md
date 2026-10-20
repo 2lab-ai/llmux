@@ -24,7 +24,7 @@ one-harness thesis, 23 §7) · **N/A** (does not apply to a proxy).
 | 8 | Claude subscription served through the real local `claude` binary, tools bridged over MCP | providers | S/claude-subscription-bridge.md; I/claudebridge | implemented (**checked**: package exists) | Have | Codex → Claude through the official Agent SDK (`.prd/21-codex-frontend.md`) |
 | 9 | ChatGPT, Copilot, Gemini Code Assist, Antigravity sign-ins as providers | providers | REF §Signed-in agents | implemented | Partial | ChatGPT/Codex yes, Gemini via Antigravity preview, no Copilot |
 | 10 | Grok, Cursor, Devin, Factory, Kiro, Qoder, WorkBuddy, Zed, ZCode, MiMo, Command Code subscriptions — moved to community plugins | providers | `AGENTS.md:26-46` | partial (**checked**: 13 entries) | Partial | Grok is in llmux core (device-code login); the rest do not apply |
-| 11 | Several accounts per subscription; reads existing sign-ins; imports account files from codexbar, CLIProxyAPI, Sub2API, Cockpit Tools | auth | REF | implemented | Have | 6 login types, 5 import sources (`docs/operational-reference.md:13-14`); the third-party import formats are missing |
+| 11 | Several accounts per subscription; reads existing sign-ins; imports account files from codexbar, CLIProxyAPI, Sub2API, Cockpit Tools | auth | REF | implemented | Partial | 6 login types, 5 import sources (`docs/operational-reference.md:13-14`); the third-party import formats are missing |
 | 12 | Imports provider configs from CC Switch, Claude Code, Codex, Alma, OpenCode; "Add to magpie" links | install | REF §Import links | implemented | Missing | small; not on the roadmap |
 | 13 | Routing groups (smart/order/rotate/usage/pace/weight), nested, automatic groups | routing | REF §Routing groups; P/groups, P/rotation | implemented | Partial | model→group routing + `default`/`round-robin` scheduler (`README.md:179-185`, `docs/schedulers.md`) |
 | 14 | Failover on quota: 429 rests the account until reset, next account before any bytes | routing | REF §How magpie picks an account | implemented | Have | `01-spec.md:131-134` |
@@ -37,7 +37,7 @@ one-harness thesis, 23 §7) · **N/A** (does not apply to a proxy).
 | 21 | `quota`/`quota wait`, menu-bar quota cards, reminder before unused quota resets | observability | I/cli/quota_*.go | implemented | Partial | `status --json`, Islands tiles, TUI gauges; no reset reminder, no remaining/used toggle — roadmap item 1 |
 | 22 | Usage and cost: tokens, cache, reasoning, USD/CNY, custom prices, tok/s, by key/account/agent, CSV/JSON | cost | README; I/usage | implemented | Have | `.prd/14-usage-calendar-stats.md`, perf tab |
 | 23 | Sessions with cost and title; reopen in terminal; relocate sessions after a folder rename | observability | docs/session-relocation.md; I/sessions | implemented | Partial | TUI sessions tab |
-| 24 | Live routing view; context-window inspector | observability | README; S/gui-shell.md | implemented | Have | raw request viewer (`docs/features.md:46`); no context-window inspector |
+| 24 | Live routing view; context-window inspector | observability | README; S/gui-shell.md | implemented | Partial | raw request viewer (`docs/features.md:46`); no context-window inspector |
 | 25 | OTLP traces and metrics export | observability | REF §OTLP; I/otlp | implemented | Out | `01-spec.md:50-53` no exporter |
 | 26 | `magpie statusline` for Claude Code | observability | I/cli/statusline_cli.go | implemented | Have | separate repo `2lab-ai/llmux-statusline` |
 | 27 | Named gateway keys for LAN clients with token/cost budgets and model/account allowlists | auth/cost | REF; I/gwbudget, P/budget | implemented | Partial | per-computer client keys issue/suspend/rotate; no budgets or allowlists |
@@ -59,4 +59,4 @@ one-harness thesis, 23 §7) · **N/A** (does not apply to a proxy).
 | 43 | App in en/zh/zh-TW/ja/de; site in 4 languages; EN+ZH release notes | UI | I/gui/assets/i18n.js | implemented | Missing | English only; KO/ZH READMEs are distribution item D2 |
 | 44 | Daily anonymous usage ping, can be turned off | other | README §Privacy | implemented | N/A | telemetry, not a user feature |
 
-Totals over 44 rows: Have 8 · Partial 13 · Missing 10 · Out 10 · N/A 3 (sum 44).
+Totals over 44 rows: Have 6 · Partial 15 · Missing 10 · Out 10 · N/A 3 (sum 44).
