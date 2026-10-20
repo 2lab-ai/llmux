@@ -105,7 +105,7 @@ an llmux non-goal or thesis (§6). Numbers in brackets = magpie inventory id.
 | [28] remote instance: laptop uses the desktop's accounts | Have | remote mode (`.prd/13-remote-cli.md`); Islands needs an HTTPS proxy (`docs/remote.md:82-86`) |
 | [29] Docker image, `daemon install`, LAN + TLS | **Missing** | no Dockerfile; llmux does not terminate TLS (`docs/remote.md:82`) |
 | (Windows build) | **Missing** | release targets macOS + Linux only (`.github/workflows/release.yml:22-33`) |
-| [34] web search for any model | **Missing** | web_search tools dropped on the Codex path (`docs/provider-compatibility.md:220`) |
+| [34] web search for any model | **Missing** | llmux runs no search itself: a nameless server tool is refused (`src/provider/responses_request.rs:1217-1241`); a Codex CLI request served by Gemini drops web_search silently (`docs/provider-compatibility.md:218-220`); Claude Code WebSearch in a GPT session not measured |
 | [39] self-update, signed builds | Have | `llmux channel` / `update`, brew stable + preview |
 | [43] app/site/docs in 4–5 languages | Missing | English only |
 | [3] profiles; [12] import from CC Switch/OpenCode; [36] agent CLI updater; [37] backup/sync; [38] per-account proxy | Missing | small; no demand cluster above 50 authors |

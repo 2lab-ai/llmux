@@ -120,9 +120,11 @@ the headline the launch (D4) needs.
 ### 6. Web search on non-Claude backends
 - **What:** when a Claude Code WebSearch tool request is routed to GPT, Grok or an API-key model,
   llmux runs the search through a configured provider (vendor-native search where it exists, else a
-  search API key) instead of dropping the tool.
-- **Why:** 56 authors. Today web_search tools are "left out silently" on the Codex path
-  (`docs/provider-compatibility.md:220`).
+  search API key) instead of refusing or dropping the tool.
+- **Why:** 56 authors. llmux has no search executor for non-Claude backends: a nameless server
+  tool is refused (`src/provider/responses_request.rs:1217-1241`), and a Codex CLI request served
+  by Gemini drops web_search silently (`docs/provider-compatibility.md:218-220`). Step 0 measures
+  what Claude Code's WebSearch does in a GPT session today (not yet measured).
 - **Acceptance:** a GPT-routed Claude Code turn that asks for a web search returns cited results;
   with no search provider configured, the omission is named in `X-Llmux-Omitted-Fields`.
 
