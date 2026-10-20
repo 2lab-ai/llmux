@@ -43,3 +43,4 @@ Pick the thing you want to do.
   - [Scheduler perishability](../.prd/09-scheduler-perishability.md)
   - [llmux Islands spec](../.prd/11-llmux-islands-spec.md)
   - [llmux Islands architecture](../.prd/12-llmux-islands-architecture.md)
+  - [Improvement roadmap from the magpie gap](../.prd/24-magpie-gap-roadmap.md) (research: [magpie note](../.prd/23-research-magpie.md))

@@ -1,0 +1,42 @@
+CLIENT AGENTS
+  Codex                  issues= 537 feat=190 cmts=1400
+  Claude Code            issues= 287 feat=109 cmts=750
+  OpenCode               issues= 147 feat= 66 cmts=353
+  Pi                     issues= 105 feat= 42 cmts=254
+  WorkBuddy/CodeBuddy    issues= 102 feat= 39 cmts=236
+  DeepSeek harness(dsh)  issues=  67 feat= 22 cmts=143
+  Grok                   issues=  66 feat= 24 cmts=169
+  Antigravity            issues=  63 feat= 24 cmts=150
+  Claude Desktop         issues=  58 feat= 20 cmts=138
+  Cursor                 issues=  55 feat= 21 cmts=147
+  Kimi Code              issues=  28 feat= 12 cmts=78
+  Factory droid          issues=  24 feat=  5 cmts=89
+  Gemini CLI             issues=  14 feat=  7 cmts=30
+  Cline                  issues=  13 feat=  4 cmts=31
+  Copilot/VSCode         issues=  12 feat=  3 cmts=35
+  Zed                    issues=   8 feat=  5 cmts=16
+  Qwen Code              issues=   2 feat=  1 cmts=2
+PROVIDERS/BACKENDS
+  DeepSeek               issues= 194 feat= 67 cmts=483
+  ChatGPT/Codex subscription issues= 139 feat= 52 cmts=380
+  Antigravity/Gemini     issues= 114 feat= 48 cmts=248
+  Relay/中转               issues= 111 feat= 45 cmts=314
+  Claude subscription    issues=  87 feat= 25 cmts=221
+  Grok/xAI               issues=  68 feat= 24 cmts=172
+  Zhipu/GLM              issues=  65 feat= 30 cmts=187
+  Kimi/Moonshot          issues=  59 feat= 27 cmts=157
+  ZCode                  issues=  41 feat= 11 cmts=126
+  GitHub Copilot         issues=  36 feat= 12 cmts=88
+  OpenCode Zen           issues=  33 feat= 20 cmts=64
+  Trae                   issues=  32 feat= 13 cmts=94
+  Qoder                  issues=  29 feat=  9 cmts=77
+  MiniMax                issues=  25 feat= 12 cmts=62
+  Qwen/Bailian           issues=  24 feat= 15 cmts=61
+  Ollama/local           issues=  18 feat=  9 cmts=43
+  OpenRouter             issues=  18 feat=  9 cmts=37
+  MiMo (Xiaomi)          issues=  18 feat=  8 cmts=58
+  AWS Bedrock            issues=   5 feat=  2 cmts=27
+LOVE / DEPENDENCY SIGNALS
+  issues with praise words: 111
+  [('agents', 43), ('routing', 34), ('providers', 26), ('ui_ux', 18), ('subscription_auth', 16), ('usage_quota', 15), ('platform_install', 14), ('protocol_compat', 13), ('library_mcp_skills', 7), ('remote_lan', 7), ('sessions', 6), ('docs_i18n', 6)]
+  most-discussed praise issues: [256, 1457, 1179, 840, 834, 248, 1817, 790, 224, 2118, 811, 191]
