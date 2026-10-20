@@ -8,3 +8,6 @@ I5 docker / headless server: issues=107 authors=84 feat=54
 I6 windows: issues=294 authors=182 feat=80
 I7 web search: issues=61 authors=56 feat=28
 I8 third harness (other agents only): issues=339 authors=230 feat=138
+I8a Messages/Responses-capable agents only (Pi, Claude Desktop, Cursor local, DeepSeek harness, droid): issues=133 authors=106 feat=49
+I8b agents magpie wires through Chat only (OpenCode, WorkBuddy/CodeBuddy, Kimi Code, Cline): issues=185 authors=129 feat=76
+I9 dashboard screens named in the title (page, window, panel, tray, menu bar): issues=239 authors=159 feat=83

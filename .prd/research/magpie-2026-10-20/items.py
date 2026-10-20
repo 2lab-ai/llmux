@@ -13,8 +13,14 @@ ITEMS={
  'I6 windows':r'windows|win11|win10|wsl',
  'I7 web search':r'联网|web.?search|搜索',
  'I8 third harness (other agents only)':None,
+ 'I8a Messages/Responses-capable agents only (Pi, Claude Desktop, Cursor local, DeepSeek harness, droid)':'A',
+ 'I8b agents magpie wires through Chat only (OpenCode, WorkBuddy/CodeBuddy, Kimi Code, Cline)':'B',
+ 'I9 dashboard screens named in the title (page, window, panel, tray, menu bar)':'UI',
 }
 cc=r'codex|claude code|claude-code'; oth=r'opencode|\bpi\b|workbuddy|codebuddy|cursor|\bzed\b|kimi code|droid|factory|claude desktop|cline|vscode|\bdsh\b|deepseek harness|grok app|snow|ante\b|devin|gemini cli'
 for k,p in ITEMS.items():
-    m=[r for r in iss if (re.search(p,T(r)) if p else (re.search(oth,T(r)) and not re.search(cc,T(r))))]
+    if p=='A': m=[r for r in iss if re.search(r'\bpi\b|pi coding agent|claude desktop|cursor (cli|agent|local)|cursorlocal|\bdsh\b|deepseek harness|\bdroid\b|factory droid',T(r)) and not re.search(cc,T(r))]
+    elif p=='B': m=[r for r in iss if re.search(r'opencode|workbuddy|codebuddy|kimi code|kimi-code|kimicode|\bcline\b',T(r)) and not re.search(cc,T(r))]
+    elif p=='UI': m=[r for r in iss if re.search(r'页面|界面|面板|主窗口|窗口|dashboard|\bgui\b|web ?ui|\bpage\b|路由页|用量页|设置页|会话页|tray|托盘|悬浮窗|小窗口|menu ?bar|菜单栏|状态栏',r['t'].lower())]
+    else: m=[r for r in iss if (re.search(p,T(r)) if p else (re.search(oth,T(r)) and not re.search(cc,T(r))))]
     print(f"{k}: issues={len(m)} authors={len({au[r['n']] for r in m})} feat={sum(r['kind']=='feature' for r in m)}")
