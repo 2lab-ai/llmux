@@ -14,7 +14,7 @@ ITEMS={
  'I7 web search':r'联网|web.?search|搜索',
  'I8 third harness (other agents only)':None,
  'I8a Messages/Responses-capable agents only (Pi, Claude Desktop, Cursor local, DeepSeek harness, droid)':'A',
- 'I8b Chat-only agents only (OpenCode, WorkBuddy/CodeBuddy, Kimi Code, Cline)':'B',
+ 'I8b agents magpie wires through Chat only (OpenCode, WorkBuddy/CodeBuddy, Kimi Code, Cline)':'B',
  'I9 dashboard screens named in the title (page, window, panel, tray, menu bar)':'UI',
 }
 cc=r'codex|claude code|claude-code'; oth=r'opencode|\bpi\b|workbuddy|codebuddy|cursor|\bzed\b|kimi code|droid|factory|claude desktop|cline|vscode|\bdsh\b|deepseek harness|grok app|snow|ante\b|devin|gemini cli'

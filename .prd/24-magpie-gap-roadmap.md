@@ -22,7 +22,7 @@ first page carries the quota display magpie users discuss most. Then it closes t
 raise most and llmux lacks: direct vendor keys and coding plans (DeepSeek, Kimi, GLM, MiniMax, Qwen);
 an explicit fallback chain from subscriptions to API-key backends; Windows; tested setups for other
 agents that already speak llmux's two protocols; local models and relays; a Chat Completions
-inbound for Chat-only agents; Docker with remote Islands. **Distribution** makes findable what already ships. magpie's
+inbound for agents that magpie wires through Chat; Docker with remote Islands. **Distribution** makes findable what already ships. magpie's
 tagline, "Codex on DeepSeek, Claude Code on Kimi", is already possible in llmux through OpenRouter
 (`or-<vendor>/<slug>` from both frontends, [23 §5](23-research-magpie.md)), but nobody knows it.
 llmux already serves two client frontends, Claude Code (Anthropic Messages) and Codex CLI (OpenAI
@@ -51,7 +51,7 @@ score (item 1). A dependency overrides it too (item 7 follows item 6).
 | 4 | Windows build | 178 | 1 | 1 | L | **59** | 2 |
 | 5 | Tested setups for other agents on llmux's existing endpoints | 106 | 0.5 | 1 | S | **53** | 2 |
 | 6 | Local models and relays (Chat Completions upstreams) | 97 | 1 | 1 | M | **49** | 2 |
-| 7 | Chat Completions inbound for Chat-only agents | 129 | 1 | 1 | M | **65** | 2 (after 6) |
+| 7 | Chat Completions inbound for agents wired through Chat | 129 | 1 | 1 | M | **65** | 2 (after 6) |
 | 8 | Docker image, service install, built-in TLS, Islands to a remote daemon | 84 | 1 | 1 | M | **42** | 2 |
 | 9 | Web search on non-Claude backends | 56 | 1 | 1 | M | **28** | 3 |
 | 10 | Staggered window warm-up + auto-redeem | 27 | 0.5 | 1 | S | **14** | 3 |
@@ -107,6 +107,9 @@ vendor keys (item 2) matter more under the CJK-first default.
     as the TUI activity row.
   - Usage-page totals equal the TUI usage tab for the same range.
   - The dashboard works against a remote daemon with an admin client key, and refuses without one.
+  - The remaining/used toggle persists across restarts, and both values match `llmux status --json`.
+  - A reset notice fires once per window, only for accounts above a configured unused share.
+  - The per-account USD figure equals the usage-tab cost summed over the window.
   - A desktop and a phone-width capture of each page, read before release.
 
 ### 2. Direct vendor keys and coding plans — "Claude Code on Kimi, Codex on DeepSeek", without OpenRouter
@@ -169,7 +172,8 @@ vendor keys (item 2) matter more under the CJK-first default.
 
 ### 5. Tested setups for other agents on llmux's existing endpoints
 - **What:** a documented, live-tested setup for agents that can already talk to one of llmux's two
-  endpoints: Pi (Responses or Messages), Claude Desktop in its third-party gateway mode (Messages),
+  endpoints: Pi (Responses or Messages), Claude Desktop in its third-party gateway mode (Messages
+  [추정]: magpie's source shows the gateway setting, `claudedesktop.go:3-14`, not the wire format),
   Cursor's local agent (Messages or Responses), DeepSeek harness and Factory droid. Each gets a
   recipe in the docs, `llmux env` output it can paste, and a row in the compatibility matrix.
 - **Why:** 106 authors name these agents and not Codex or Claude Code (`items.txt` I8a). The README
@@ -192,15 +196,16 @@ vendor keys (item 2) matter more under the CJK-first default.
 - **Acceptance:** an Ollama model on `localhost` answers a Claude Code turn with a tool call through
   llmux. Any lost field is named in `X-Llmux-Omitted-Fields`.
 
-### 7. Chat Completions inbound for Chat-only agents
-- **What:** accept OpenAI Chat Completions requests (`/v1/chat/completions`) from clients, so agents
-  that only speak Chat work: OpenCode as magpie wires it (`@ai-sdk/openai-compatible`,
-  `internal/agent/agents.go:386`), WorkBuddy/CodeBuddy (`workbuddy.go`, `codebuddy.go`), Kimi Code
-  (`kimi.go`), Cline.
+### 7. Chat Completions inbound for agents wired through Chat
+- **What:** accept OpenAI Chat Completions requests (`/v1/chat/completions`) from clients, so the
+  agents that magpie wires through Chat work: OpenCode (`@ai-sdk/openai-compatible`,
+  `internal/agent/agents.go:386`), WorkBuddy and CodeBuddy (`workbuddy.go`, `codebuddy.go:10`), Kimi
+  Code (`kimi.go:9`), Cline (OpenAI-compatible provider, `cline.go:30-31,102-104`). magpie's wiring
+  shows the protocol it chose, not every protocol each agent supports.
 - **Why:** 129 authors name these agents and not Codex or Claude Code (`items.txt` I8b). It reuses
   item 6's translator in the other direction, so it follows item 6 even though it scores higher.
-  [추정] OpenCode can also use an Anthropic provider with a custom base URL, which would put it in
-  item 5 instead; check this first.
+  [추정] OpenCode and Cline can also use an Anthropic provider with a custom base URL, which would
+  move them to item 5; check this first.
 - **Acceptance:** OpenCode and Kimi Code each complete a tool-calling turn through
   `/v1/chat/completions` on a Claude account and a Codex account. Any lost field is named in
   `X-Llmux-Omitted-Fields`.

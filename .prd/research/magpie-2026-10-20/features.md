@@ -19,7 +19,7 @@ llmux's "keep your harness, swap the model" bet, 23 §7) · **N/A** (does not ap
 | 3 | Profiles: save and switch every agent's setup at once | config | REF §Use; I/profile | implemented | Missing | small; not on the roadmap |
 | 4 | Per-agent model visibility list | config | I/cli/visible_cli.go | implemented | Partial | one curated catalog for `/model`, not per agent (`.prd/17-claude-code-model-picker.md`) |
 | 5 | Gateway translation across Chat/Responses/Messages/Gemini; count_tokens; speech-to-text; Ollama-style `/api/tags` | routing | REF; I/gateway | implemented | Partial | Messages + Responses inbound (`docs/provider-compatibility.md:15-21`); no Chat Completions inbound (roadmap item 7), no Gemini inbound; count_tokens is a labelled local estimate (`01-spec.md:65-68`) |
-| 6 | 86 presets, custom URLs, custom headers, send the agent's own User-Agent | providers | `internal/provider/presets.go` | implemented (**checked**: 86) | Partial | Anthropic key + OpenRouter key, any OpenRouter model (`docs/configuration.md:209`); no direct vendor keys or custom URL — roadmap item 2, item 5 |
+| 6 | 86 presets, custom URLs, custom headers, send the agent's own User-Agent | providers | `internal/provider/presets.go` | implemented (**checked**: 86) | Partial | Anthropic key + OpenRouter key, any OpenRouter model (`docs/configuration.md:209`); no direct vendor keys or custom URL — roadmap items 2, 6 |
 | 7 | Live model lists from vendors + models.dev metadata, auto-refresh, retired models hidden | providers | REF; I/catalog | implemented | Partial | curated catalog with an `or-<vendor>/<slug>` escape hatch (`docs/models.md:146-150`) |
 | 8 | Claude subscription served through the real local `claude` binary, tools bridged over MCP | providers | S/claude-subscription-bridge.md; I/claudebridge | implemented (**checked**: package exists) | Have | Codex → Claude through the official Agent SDK (`.prd/21-codex-frontend.md`) |
 | 9 | ChatGPT, Copilot, Gemini Code Assist, Antigravity sign-ins as providers | providers | REF §Signed-in agents | implemented | Partial | ChatGPT/Codex yes, Gemini via Antigravity preview, no Copilot |
@@ -33,7 +33,7 @@ llmux's "keep your harness, swap the model" bet, 23 §7) · **N/A** (does not ap
 | 17 | Intent routing by a classifier model | routing | README; v0.1.95 | implemented | Out | `01-spec.md:54` no task-content routing |
 | 18 | Ask another account again after a safety-filter refusal | routing | REF | implemented | Missing | not found; llmux fails over on Claude SDK account policy errors (#189), which is a different case |
 | 19 | Outside the gateway, switch Claude Code's or Codex's own sign-in at 98% use | auth | REF | implemented | N/A | llmux is the gateway; it switches accounts per request instead |
-| 20 | Daily warm-up that starts 5h windows at chosen times | cost | `plugins/warmups/` | implemented (**checked**: plugin exists) | Partial | perishability scheduler + idle probe pick among open windows; no scheduled start — roadmap item 8 |
+| 20 | Daily warm-up that starts 5h windows at chosen times | cost | `plugins/warmups/` | implemented (**checked**: plugin exists) | Partial | perishability scheduler + idle probe pick among open windows; no scheduled start — roadmap item 10 |
 | 21 | `quota`/`quota wait`, menu-bar quota cards, reminder before unused quota resets | observability | I/cli/quota_*.go | implemented | Partial | `status --json`, Islands tiles, TUI gauges; no reset reminder, no remaining/used toggle — roadmap item 1 |
 | 22 | Usage and cost: tokens, cache, reasoning, USD/CNY, custom prices, tok/s, by key/account/agent, CSV/JSON | cost | README; I/usage | implemented | Have | `.prd/14-usage-calendar-stats.md`, perf tab |
 | 23 | Sessions with cost and title; reopen in terminal; relocate sessions after a folder rename | observability | docs/session-relocation.md; I/sessions | implemented | Partial | TUI sessions tab |
@@ -41,19 +41,19 @@ llmux's "keep your harness, swap the model" bet, 23 §7) · **N/A** (does not ap
 | 25 | OTLP traces and metrics export | observability | REF §OTLP; I/otlp | implemented | Out | `01-spec.md:50-53` no exporter |
 | 26 | `magpie statusline` for Claude Code | observability | I/cli/statusline_cli.go | implemented | Have | separate repo `2lab-ai/llmux-statusline` |
 | 27 | Named gateway keys for LAN clients with token/cost budgets and model/account allowlists | auth/cost | REF; I/gwbudget, P/budget | implemented | Partial | per-computer client keys issue/suspend/rotate; no budgets or allowlists |
-| 28 | Remote magpie: a laptop uses the desktop's providers, groups and quotas | other | I/provider/remote_quotas.go | implemented | Partial | remote mode for the CLI (`.prd/13-remote-cli.md`); Islands needs a hand-built HTTPS proxy (`docs/remote.md:82-86`) — roadmap item 6 |
-| 29 | Headless serve/web with LAN + TLS, daemon install, Docker, Termux | install | REF §Install, §Docker | implemented | Missing | daemon auto-start exists (`01-spec.md:34`); no Docker image, service install or TLS — roadmap item 6 |
+| 28 | Remote magpie: a laptop uses the desktop's providers, groups and quotas | other | I/provider/remote_quotas.go | implemented | Partial | remote mode for the CLI (`.prd/13-remote-cli.md`); Islands needs a hand-built HTTPS proxy (`docs/remote.md:82-86`) — roadmap item 8 |
+| 29 | Headless serve/web with LAN + TLS, daemon install, Docker, Termux | install | REF §Install, §Docker | implemented | Missing | daemon auto-start exists (`01-spec.md:34`); no Docker image, service install or TLS — roadmap item 8 |
 | 30 | Plugins on Bun: OpenCode auth plugins and pi packages become providers | providers | I/plugin, I/pluginrt | implemented | Out | scope (23 §7) |
 | 31 | JavaScript gateway middleware + New-API-compatible packages | other | S/gateway-middleware.md; P/middleware | implemented | Out | scope; declarative payload rules preferred (04 note) |
 | 32 | Privacy masking of secrets/personal data; optional local privacy-filter model | other | I/redact, I/pii | implemented | Out | scope; llmux masks logs and emails only |
 | 33 | Library: instructions, MCP servers, skills, subagents, hooks written into every agent's format | config | S/library.md | implemented | Out | `01-spec.md:21` cross-CLI config sync is a non-goal |
-| 34 | Web search for any model (Tavily, Brave, Exa…), `web_search`/`web_fetch` over MCP | other | P/search | implemented | Missing | roadmap item 7 |
+| 34 | Web search for any model (Tavily, Brave, Exa…), `web_search`/`web_fetch` over MCP | other | P/search | implemented | Missing | roadmap item 9 |
 | 35 | Image tool over MCP for any agent; video through a Grok subscription | other | I/imagemcp | implemented | Missing | not on the roadmap (94 authors mention web search or image together; not split) |
 | 36 | Show each agent CLI's version and update it the way it was installed | install | README | implemented [not checked in source] | Missing | small; not on the roadmap |
 | 37 | Backup and sync: file, WebDAV, S3, encrypted GitHub repo | config | S/sync-backup.md; I/davsync | implemented | Missing | small; not on the roadmap |
 | 38 | A proxy per key or account; installer/updater `--proxy`/`--mirror` | install | I/netproxy; I/update/mirror.go | implemented | Missing | small; not on the roadmap |
 | 39 | Self-update; signed and notarised Mac builds | install | REF §Install | implemented | Have | `llmux channel` / `update`, brew stable + preview |
-| 40 | Wires agents inside WSL on Windows | config | I/wslrun | implemented | N/A | no Windows build yet — roadmap item 5 |
+| 40 | Wires agents inside WSL on Windows | config | I/wslrun | implemented | N/A | no Windows build yet — roadmap item 4 |
 | 41 | Keep-awake while agents work, autostart, Omarchy theming, light/dark | UI | I/awake, I/autostart, I/omarchy | implemented | Partial | daemon auto-start only; no keep-awake |
 | 42 | Automatic daily check-in for free credits | cost | REF | implemented | Out | targets CN free plans |
 | 43 | App in en/zh/zh-TW/ja/de; site in 4 languages; EN+ZH release notes | UI | I/gui/assets/i18n.js | implemented | Missing | English only; KO/ZH READMEs are distribution item D2 |

@@ -26,7 +26,8 @@ a judgment [가설], not a measurement:
    coding plans, no local models (Ollama, LM Studio), no relays, and no custom URL. `Local` is a stub
    (`src/provider/stubs.rs:74-79`).
 3. **Reach.** A GUI dashboard (159 authors name one of magpie's screens in an issue title), Windows
-   (178 distinct issue authors), other agents (106 on protocols llmux already serves, 129 Chat-only),
+   (178 distinct issue authors), other agents (106 on protocols llmux already serves, 129 that magpie
+   wires through Chat Completions),
    Docker/NAS (84), and a cross-provider fallback chain.
 
 llmux already serves two client frontends: Claude Code over Anthropic Messages and Codex CLI over
@@ -160,7 +161,7 @@ invisible mainly because they are unmarketed:
 - **Quota display**: Islands tiles with 5h/7d windows and reset timers (macOS notch + KDE port).
 - **Waste-aware scheduling**: perishability ranking burns the quota that resets soonest
   (`docs/configuration.md:100`). It is a different mechanism from #2111's scheduled window start,
-  which llmux does not have (roadmap item 8).
+  which llmux does not have (roadmap item 10).
 - **Central daemon + many machines**: remote mode with per-computer client keys. This answers the
   daemon half of #979. The menu-bar half still needs a reverse proxy (`docs/remote.md:84-86`).
 - **Two harnesses, first-class**: Claude Code (`llmux run`) and Codex CLI (`llmux run --codex`)
@@ -195,19 +196,21 @@ the curve held. llmux can copy the second, not the first.
   coding"). More agents come in through llmux's endpoints (roadmap items 5 and 7), not through config
   rewriting.
 - **Gemini inbound.** Gemini CLI appears in 14 issues.
-- **Intent routing, OTLP, a browser UI, an MCP/skills library.** These are existing non-goals
-  (`01-spec.md:21,50-54`).
+- **Intent routing, OTLP, an MCP/skills library.** These are existing non-goals
+  (`01-spec.md:21,50-54`). The browser-UI clause of `01-spec.md:50-53` stays in force until roadmap
+  item 1 (dashboard UI, owner priority 2026-10-20) amends it in its first PR.
 - **Plugins, JS middleware, PII model, free-credit check-in.** Large surface, low fit.
 
 ## Tensions
 
 - **The largest raw area is client-agent support (525 authors).** llmux covers the two agents named
   most (Codex 537 issues, Claude Code 287). Of the rest, 106 authors name agents that already speak
-  llmux's protocols (roadmap item 5) and 129 name Chat-only agents (item 7).
+  llmux's protocols (roadmap item 5) and 129 name agents that magpie wires through Chat Completions
+  (item 7).
 - **The non-goal is stale.** `01-spec.md:59` says "No production Gemini/local backends. Stub
   providers only." OpenRouter has been a production API-key backend since 2026-08-21
   (`docs/openrouter/spec.md`), and Gemini ships as preview. So direct vendor keys (roadmap item 2)
-  follow OpenRouter's precedent and need no non-goal change. Local models (item 5) do need one. The
+  follow OpenRouter's precedent and need no non-goal change. Local models (item 6) do need one. The
   04 note framed the generic provider as an OpenAI-compatible translator
   (`04-research-cliproxyapi.md:68`). The OpenRouter half has since shipped as a native Messages
   passthrough.
