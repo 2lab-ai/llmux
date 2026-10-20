@@ -27,6 +27,25 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 
 In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
+### Reading account quota columns
+
+`LEFT` means quota remaining; `USED` means quota consumed. The `5h` header
+shows the active meaning (`5h LEFT` or `5h USED`). The `7d` and optional
+`7d Fbl` gauges put `RESET` on the left of the header and the active meaning
+above the percentage on the right. These labels follow both the configured
+`quota_display` mode and the session-local `u` toggle.
+
+The time inside a weekly gauge is its reset countdown. `rst ` is added only
+when the four cells immediately before the existing centered time are blank;
+it never moves the time or grows the gauge. If those cells do not fit, the
+label is omitted, including for an absolute `t` timestamp in an 11-cell bar.
+Cold or unavailable cells do not gain a reset time. Gauge fill, colors, bold
+countdown units, freshness markers, percentages and account order are unchanged.
+
+The in-gauge `rst` labels a **reset time**. The separate, existing `rst`
+column described below counts **reset credits/grants owned**; it is not a
+countdown and its label is unchanged.
+
 ### Usage controls (refresh · resets)
 
 An external reset does not invalidate llmux's observed quota window, so a freshly reset account can keep reading as exhausted. The accounts surface owns the two explicit controls that fix that, and both act on the DAEMON — identically in local and attach mode. Two providers carry reset entitlements: **Codex** (ChatGPT rate-limit reset credits, read from WHAM) and **Claude** (usage-limit reset grants — the "Limit resets" card under claude.ai Settings → Usage — read from the same `/api/oauth/usage` document the poller uses, with `cedar_ember=1`). Grok, Gemini, API-key and OpenRouter accounts have none and answer 422.
