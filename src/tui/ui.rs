@@ -4988,8 +4988,15 @@ fn draw_accounts(
     // column, no width taken. It is a FULL gauge column in both sets (.prd/18
     // rule 3). The `5h` stub (.prd/18 rules 1–2) is a fixed 8-wide column that
     // never stretches and is the first column to drop when the row overflows.
-    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = {
-        let mut header = vec!["", "group", "#", "account", "status"];
+    let quota_label = match ctx.quota_display {
+        crate::config::QuotaDisplay::Remaining => "LEFT",
+        crate::config::QuotaDisplay::Used => "USED",
+    };
+    let (header, constraints): (Vec<Cell<'static>>, Vec<Constraint>) = {
+        let mut header: Vec<Cell<'static>> = ["", "group", "#", "account", "status"]
+            .into_iter()
+            .map(Cell::from)
+            .collect();
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
@@ -4998,23 +5005,24 @@ fn draw_accounts(
             Constraint::Length(status_width),
         ];
         if show_five_h {
-            header.push("5h");
+            header.push(Cell::from(format!("5h {quota_label}")));
             constraints.push(Constraint::Length(FIVE_H_COL_WIDTH));
         }
-        header.push("7d");
-        constraints.push(Constraint::Length(gauge_cell));
-        if show_fable {
-            header.push("7d Fbl");
+        for title in ["7d RESET", "7d Fbl RESET"].into_iter().take(n_gauges) {
+            header.push(Cell::from(format!(
+                "{title:<width$}{quota_label}",
+                width = (gauge_cell as usize - quota_label.len() - 1).max(title.len() + 1),
+            )));
             constraints.push(Constraint::Length(gauge_cell));
         }
         if show_resets {
-            header.push("rst");
+            header.push(Cell::from("rst"));
             constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
-        header.push("if");
+        header.push(Cell::from("if"));
         constraints.push(Constraint::Length(3));
         if wide {
-            header.extend(["req", "tok"]);
+            header.extend(["req", "tok"].into_iter().map(Cell::from));
             constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
         }
         (header, constraints)
@@ -5295,9 +5303,10 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
 /// `text` overlaid centered on top. The first `bold_chars` characters of
 /// `text` (the larger countdown unit) are emboldened. Spans are split at the
 /// fill boundary so the fill shows behind the text — a single-style span
-/// could not paint a partial background. Only spaces + the caller's text are
-/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
-/// `anim.rs` is untouched.
+/// could not paint a partial background. When four leading cells are available,
+/// `rst ` labels the reset without moving `text` or changing its styles. Only
+/// spaces + that label + the caller's text are emitted (no bar glyphs), so the
+/// CJK narrow-width invariant guarded in `anim.rs` is untouched.
 ///
 /// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
 /// the FIXED last bar column, independent of the centered `text`, so the
@@ -5324,6 +5333,8 @@ fn quota_bar_line(
             marker.unwrap_or(' ')
         } else if col >= start && col < start + text_len {
             chars[col - start]
+        } else if text_len > 0 && start >= 4 && col >= start - 4 && col < start {
+            ['r', 's', 't', ' '][col - (start - 4)]
         } else {
             ' '
         };
@@ -9737,6 +9748,175 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert_eq!(bold, "7d", "emphasis covers the larger unit only");
+    }
+
+    #[test]
+    fn c1_quota_reset_label_preserves_countdown_columns_and_styles() {
+        for marker in [None, Some('○'), Some('◑')] {
+            let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 32, marker);
+            let cells: Vec<_> = line
+                .spans
+                .iter()
+                .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+                .collect();
+            let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+            assert_eq!(cells.len(), 32, "the label must not grow the bar");
+            assert_eq!(text.find("7d 10h"), Some(13), "{text:?}");
+            assert_eq!(
+                cells[31].0,
+                marker.unwrap_or(' '),
+                "the freshness marker keeps the last column"
+            );
+            for (col, (_, style)) in cells.iter().enumerate() {
+                assert_eq!(style.fg, Some(Color::Green), "column {col} color");
+                assert_eq!(
+                    style.add_modifier.contains(Modifier::REVERSED),
+                    col < 16,
+                    "column {col} fill"
+                );
+            }
+            let bold: String = cells
+                .iter()
+                .filter(|(_, style)| style.add_modifier.contains(Modifier::BOLD))
+                .map(|(ch, _)| *ch)
+                .collect();
+            assert_eq!(bold, "7d", "only the original leading unit is bold");
+            assert_eq!(
+                text.find("rst 7d 10h"),
+                Some(9),
+                "the label occupies the four blank cells before the original time: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_quota_reset_label_is_omitted_without_four_leading_cells() {
+        // Nine countdown characters leave only three leading cells at width 16.
+        for marker in [None, Some('○')] {
+            let line = quota_bar_line(0.5, Color::Green, "1234d 10h", 5, 16, marker);
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(text.chars().count(), 16, "{text:?}");
+            assert_eq!(text.find("1234d 10h"), Some(3), "{text:?}");
+            assert!(!text.contains("rst"), "no room for a reset label: {text:?}");
+            assert_eq!(text.chars().last(), Some(marker.unwrap_or(' ')));
+        }
+    }
+
+    #[test]
+    fn c1_quota_reset_label_respects_minimum_bar_width() {
+        for (time, bold_chars, marker, expected) in [
+            ("10/20 12:34", 5, None, "10/20 12:34"),
+            ("0s", 2, Some('○'), "rst 0s    ○"),
+        ] {
+            let line = quota_bar_line(0.5, Color::Green, time, bold_chars, 11, marker);
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(text.chars().count(), 11, "{text:?}");
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn c1_quota_headers_fit_minimum_gauge_cell() {
+        use crate::config::QuotaDisplay::{Remaining, Used};
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        for (mode, expected) in [
+            (Remaining, "7d Fbl RESET LEFT"),
+            (Used, "7d Fbl RESET USED"),
+        ] {
+            view.quota_display = mode;
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), 80, 30);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|row| row.contains("account") && row.contains("7d Fbl"))
+                .unwrap_or_else(|| panic!("accounts header missing:\n{frame}"));
+            let seven = header.find("7d").expect("weekly column");
+            let fable = header.find("7d Fbl").expect("Fable column");
+            let in_flight = header.find("if").expect("in-flight column");
+            assert_eq!(fable - seven, 18, "17-cell gauge plus its gap: {header}");
+            assert_eq!(in_flight - fable, 18, "{header}");
+            assert_eq!(
+                header.chars().skip(fable).take(17).collect::<String>(),
+                expected,
+                "the minimum Fable header keeps the reset hint and numeric meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_quota_headers_follow_display_mode_and_session_override() {
+        use crate::config::QuotaDisplay::{Remaining, Used};
+        use crate::scheduler::AccountId;
+
+        let mut account = fable_account();
+        account.seven_day = account.five_hour;
+        account
+            .seven_day
+            .as_mut()
+            .expect("weekly window")
+            .utilization = 0.25;
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = (0..20)
+            .map(|idx| {
+                let mut account = account.clone();
+                account.id = AccountId(format!("claude:{idx:02}@example.com"));
+                account
+            })
+            .collect();
+
+        for (configured, override_mode, label, five, seven, fable) in [
+            (Remaining, None, "LEFT", "58%", "75%", "3%!"),
+            (Used, None, "USED", "42%", "25%", "97%!"),
+            (Remaining, Some(Used), "USED", "42%", "25%", "97%!"),
+            (Used, Some(Remaining), "LEFT", "58%", "75%", "3%!"),
+        ] {
+            view.quota_display = configured;
+            let mut chrome = chrome_overlay(Overlay::None);
+            chrome.quota_display_override = override_mode;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            let frame = rows.join("\n");
+            let header_idx = rows
+                .iter()
+                .position(|row| row.contains("account") && row.contains("7d Fbl"))
+                .unwrap_or_else(|| panic!("accounts header missing:\n{frame}"));
+            let header = &rows[header_idx];
+            assert_eq!(header.find("5h"), Some(50), "{header}");
+            assert_eq!(header.find("7d"), Some(59), "{header}");
+            assert_eq!(header.find("7d Fbl"), Some(98), "{header}");
+            assert_eq!(header.find("if"), Some(137), "{header}");
+            let slice = |row: &str, start, width| -> String {
+                row.chars().skip(start).take(width).collect()
+            };
+            let account_rows = &rows[header_idx + 1..header_idx + 21];
+            for (idx, row) in account_rows.iter().enumerate() {
+                assert!(
+                    row.contains(&format!("{idx:02}@example.com")),
+                    "all 20 accounts keep their order:\n{frame}"
+                );
+                assert_eq!(slice(row, 50, 8).trim(), five, "{row}");
+                assert_eq!(slice(row, 92, 5).trim(), seven, "{row}");
+                assert_eq!(slice(row, 131, 5).trim(), fable, "{row}");
+            }
+            assert_eq!(slice(header, 50, 8).trim(), format!("5h {label}"));
+            for (start, title) in [(59, "7d RESET"), (98, "7d Fbl RESET")] {
+                let cell = slice(header, start, 38);
+                assert!(cell.starts_with(title), "{header}");
+                assert!(
+                    cell.trim_end().ends_with(label),
+                    "configured {configured:?}, override {override_mode:?}: {header}"
+                );
+            }
+        }
     }
 
     /// Chrome with a given overlay active and `Mode::Normal` (issue #5). The
