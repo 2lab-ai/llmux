@@ -23,13 +23,15 @@ conflict with llmux's one-harness thesis stay out ([23 §7](23-research-magpie.m
 ## Priority rule
 
 `score = demand × gap × fit ÷ effort`
-- **demand** = distinct magpie issue authors whose issues match the item's keywords
-  (`research/magpie-2026-10-20/items.txt`, via `items.py`).
+- **demand** = mention authors: distinct magpie issue authors whose issue text matches the
+  item's keywords (`research/magpie-2026-10-20/items.txt`, via `items.py`). This measures how much
+  attention and trouble an area draws, not preference or usage. Some keyword sets are wider than
+  the item (see the notes under items 2 and 3).
 - **gap** = 1 if missing in llmux, 0.5 if partial.
 - **fit** = 1 if on-thesis, 0.5 if it strains the one-harness thesis.
 - **effort** = 1 (S), 2 (M), 3 (L).
 
-Scores rank the items. They are not forecasts. Item 3 depends on item 1, so it follows item 1
+Scores are a heuristic ranking, not a measured forecast. Item 3 depends on item 1, so it follows item 1
 whatever its score.
 
 | # | Item | Demand | Gap | Fit | Effort | Score | Wave |
@@ -37,7 +39,7 @@ whatever its score.
 | 1 | Any API key behind Claude Code and Codex | 268 | 1 | 1 | M | **134** | 1 |
 | 2 | Quota display polish | 270 | 0.5 | 1 | S | **135** | 1 |
 | 3 | Explicit fallback chain: subscriptions → API keys | 107 | 1 | 1 | S | **107** | 2 |
-| 4 | Docker image + service install + built-in TLS | 84 | 1 | 1 | S | **84** | 2 |
+| 4 | Docker image + service install + built-in TLS | 84 | 1 | 1 | S | **84** | 2 (re-estimate effort first) |
 | 5 | Windows build | 182 | 1 | 1 | L | **61** | 3 |
 | 6 | Web search on non-Claude backends | 56 | 1 | 1 | M | **28** | 3 |
 | 7 | Staggered window warm-up + auto-redeem | 27 | 0.5 | 1 | S | **14** | 3 |
@@ -59,9 +61,16 @@ the headline the launch (D4) needs.
   `anthropic↔openai-chat` translator pair. This is the "highest ROI" item in the
   [CLIProxyAPI note](04-research-cliproxyapi.md). It serves Codex and vendors without an Anthropic
   endpoint.
-- **Why:** this is the largest demand cluster (401 issues, 268 authors; DeepSeek alone in 194
-  issues) and magpie's tagline. In llmux's own identity, "other models via API key" is Tier 1 and
-  compliance-safe. Only the `Local` stub exists (`src/provider/stubs.rs:74-79`).
+- **Why:** this is the largest mention cluster (401 issues, 268 authors; DeepSeek alone in 194
+  issues) and magpie's tagline. The CLIProxyAPI note already calls a generic compatible provider
+  "the biggest Tier-1 unlock" (`04-research-cliproxyapi.md:68,96`). Today llmux takes an Anthropic
+  key and an OpenRouter key only (`docs/operational-reference.md:13`). The generic slot is a `Local`
+  stub (`src/provider/stubs.rs:74-79`).
+- **Shortest path [추론]:** the OpenRouter provider is already a passthrough for an
+  Anthropic Messages endpoint. It has a configurable base URL (`openrouter.upstream`) and a Bearer
+  key (`src/provider/openrouter.rs:183-187,218-250`; `docs/openrouter/spec.md`). Slice (a) can
+  generalize it into named presets plus a custom URL, which likely makes slice (a) effort S. Each
+  vendor's auth header and model ids must be live-probed before its preset ships.
 - **Non-goal change:** amend `01-spec.md:59` to "API-key providers over standard
   Anthropic/OpenAI-compatible endpoints are supported; no other local backends". Do this in the
   item's first PR.
@@ -80,8 +89,10 @@ the headline the launch (D4) needs.
   - (b) An opt-in notice when an account will reset with unused quota.
   - (c) API-equivalent USD per account for the current 5h/7d window (#1423).
   - (d) Islands on a remote daemon without a hand-built HTTPS proxy (#979: a central NAS daemon
-    plus a local menu-bar display). This ships with item 4's TLS.
-- **Why:** 270 authors. llmux already has the tiles (Islands, TUI), so this is polish.
+    plus a local menu-bar display). This ships in wave 2 with item 4's TLS; (a)–(c) are wave 1.
+- **Why:** 270 authors mention quota or usage display at all. The four pieces above come from
+  #124, #979 and #1423, not from separate counts. llmux already has the tiles (Islands, TUI), so this
+  is polish.
 - **Acceptance:**
   - The toggle persists across restarts and both values match `llmux status --json`.
   - A reset notice fires once per window, only for accounts above a configured unused share.
@@ -92,7 +103,9 @@ the headline the launch (D4) needs.
   group is cooling down, the request goes to the next link instead of returning 429.
 - **Never silent.** Respect the "no model laundering" line: send an `X-Llmux-Fallback: <provider>`
   response header, show a badge in Islands/TUI, and log a line. Default off.
-- **Why:** 107 authors. #1418 (18 comments) is a routing group that could not reach its relay.
+- **Why:** 107 authors, an upper bound: the keyword set includes generic 429 and "at capacity"
+  errors, not only fallback requests. #1418 (18 comments) is a routing group that could not reach
+  its relay.
   Today llmux returns 429 + retry-after when a group is exhausted (`01-spec.md:131-134`).
 - **Acceptance:**
   - With all Claude accounts paused and a fallback configured, a Claude Code turn returns 200 with
@@ -163,8 +176,8 @@ Measure weekly: stars, release-asset downloads, unique repo visitors, issues fro
 
 ## Waves
 
-1. **Wave 1:** item 1 (API keys) + item 2 (quota polish); prepare D1, D2.
-2. **Wave 2:** item 3 (fallback chain) + item 4 (Docker/TLS); ship D3 and launch D4 on item 1's
+1. **Wave 1:** item 1 (API keys) + item 2 (a)–(c) (quota polish); prepare D1, D2.
+2. **Wave 2:** item 3 (fallback chain) + item 4 (Docker/TLS) + item 2 (d); ship D3 and launch D4 on item 1's
    stable release.
 3. **Wave 3:** item 5 (Windows), item 6 (web search), item 7 (warm-up), D5, D6.
 

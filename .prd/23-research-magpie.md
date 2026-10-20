@@ -10,13 +10,17 @@ Status: research snapshot, 2026-10-20. Not a contract. The improvement plan buil
 llmux does — pooled subscription accounts, quota-aware failover, a menu-bar quota display, a
 remote/central mode — plus the one thing its tagline sells and llmux does not ship: **bring any API
 key** ("Codex on DeepSeek, Claude Code on Kimi"). It reached 17,487 stars in 27 days; llmux has 8
-stars after 130 days (created 2026-06-12). The gap has three parts, in this order of size:
+stars after 130 days (created 2026-06-12). The gap has three parts. The order is a judgment
+[가설], not a measurement:
 
-1. **Distribution, not features.** Several features magpie users love most already ship in llmux
-   (§5). Nobody can find them: no website, no badges, no demo GIF in recent releases, English only,
-   one install channel. magpie launched from an author with 9,614 followers and two earlier hits.
-2. **API-key providers.** The largest demand cluster in magpie's issue tracker. llmux has only a
-   `Local` stub (`src/provider/stubs.rs:74-79`) and a non-goal against it (`01-spec.md:59`).
+1. **Distribution.** Several capabilities that magpie users raise most already ship in llmux (§5).
+   They are hard to find: no website, no badges, no demo GIF in recent releases, English only, one
+   install channel. magpie launched from an author with 9,614 followers and two earlier hits.
+2. **Generic API-key providers.** The largest mention cluster in magpie's issue tracker. llmux
+   takes an Anthropic API key (`login --api`) and an OpenRouter key (`login --openrouter --paste`,
+   `docs/operational-reference.md:13`). It has no generic provider: no presets for DeepSeek, Kimi,
+   GLM, MiniMax or Qwen and no arbitrary endpoint. Only a `Local` stub exists
+   (`src/provider/stubs.rs:74-79`), and a non-goal stands against it (`01-spec.md:59`).
 3. **Reach.** Windows (182 distinct issue authors), Docker/NAS, a cross-provider fallback chain.
 
 ## 1. What magpie is
@@ -45,15 +49,17 @@ Termux. macOS, Windows, Linux (x64 + ARM64). 86 provider presets
 - **Issues:** all 3,036 items via `gh api repos/yetone/magpie/issues?state=all`: 2,464 issues and 572
   PRs. The owner filed 326 issues, so **user issues = 2,138 from 1,014 distinct authors**, filed
   2026-09-24 → 2026-10-20. 72% of all issues contain CJK text (1,765/2,464).
-- **"Loved" cannot be read from reactions.** All 2,464 issues together carry 33 reactions. Demand is
-  measured instead by (a) distinct authors per feature area, (b) comment depth, (c) explicit
-  dependency language ("深度依赖" = deeply rely on, #979).
+- **"Loved" cannot be read from reactions.** All 2,464 issues together carry 33 reactions. The proxy
+  used here is **mention authors**: distinct authors whose issue text matches an area's keywords.
+  Comment depth and explicit dependency language ("深度依赖" = deeply rely on, #979) are read
+  alongside it. Mention authors measure how much attention and trouble an area draws. They do not
+  measure preference or usage share, and a bug report counts the same as a feature request.
 - **Classifier:** keyword areas over title, then body, multi-label; 33/2,138 unclassified.
   Reproduce: [research/magpie-2026-10-20/](research/magpie-2026-10-20/) (`classify.py`,
   `mentions.py`, outputs `areas.txt`, `mentions.txt`). Keyword counts are coarse. Use them for
   ranking, not as exact figures.
 
-## 3. What magpie users value most
+## 3. What magpie users raise most
 
 | Area | Issues | Distinct authors | Feature requests | Signature issues |
 |---|---|---|---|---|
@@ -71,13 +77,13 @@ Termux. macOS, Windows, Linux (x64 + ARM64). 86 provider presets
 (Areas overlap; an issue can count in several. Full table: `research/magpie-2026-10-20/areas.txt`.)
 
 Signals in plain words:
-- Two harnesses dominate. 703 of 2,138 user issues name Codex or Claude Code, and only 339 name
-  just other agents. So llmux's two frontends already cover the bulk of where magpie is used.
-  Codex is twice as frequent as Claude Code.
+- Two harnesses dominate the tracker. 703 of 2,138 user issues name Codex or Claude Code, and 339
+  name only other agents. [가설] Most magpie use sits on the two harnesses llmux already serves.
+  Codex is named about twice as often as Claude Code.
 - The provider users want most is a **cheap API key behind their existing harness**: 401 issues from
   268 authors name DeepSeek, Kimi, GLM, MiniMax, Qwen, Ollama, OpenRouter or a relay.
-- The quota surface is the most-touched UI: the single most-discussed issue is about it (#124), and
-  #979 says the user "deeply relies" on the menu-bar quota capsules.
+- The single most-discussed issue is about the quota display (#124, 35 comments), and #979 says
+  its author "deeply relies" on the menu-bar quota capsules.
 - magpie answers fast: median 5.1 h from open to completed for user issues (n=1,065); feature
   requests completed in a median 2.1 h (376 of 803 completed).
 
@@ -88,7 +94,7 @@ an llmux non-goal or thesis (§6). Numbers in brackets = magpie inventory id.
 
 | magpie feature | llmux | llmux evidence / note |
 |---|---|---|
-| [6] 86 presets, any OpenAI/Anthropic-compatible URL, custom headers | **Missing** | `Local` stub only (`src/provider/stubs.rs:74-79`); non-goal `01-spec.md:59` |
+| [6] 86 presets, any OpenAI/Anthropic-compatible URL, custom headers | **Missing (generic)** | Anthropic key + OpenRouter key only (`docs/operational-reference.md:13`); `Local` stub (`src/provider/stubs.rs:74-79`); non-goal `01-spec.md:59` |
 | [13] user-defined routing groups (smart/order/rotate/pace/weight, nested) | Partial | model→group routing + in-group scheduler (`README.md:179-185`, `docs/schedulers.md`) |
 | [14] quota failover before first byte, rest until reset | Have | `01-spec.md:131-134` |
 | (cross-provider fallback when a group is exhausted) | **Missing** | all-exhausted → 429 + retry-after (`01-spec.md:131-134`) |
@@ -117,14 +123,14 @@ an llmux non-goal or thesis (§6). Numbers in brackets = magpie inventory id.
 | [32] PII privacy filter | Out (scope) | llmux masks logs and emails only |
 | [42] daily check-in for free credits | Out | targets CN free plans, not llmux's market |
 
-## 5. Where llmux is already level or ahead — a marketing gap, not a feature gap
+## 5. Where llmux already ships what magpie users raise
 
-These map to magpie's most-loved areas and already ship in llmux. They are invisible because they
-are unmarketed:
+These match areas that magpie users raise often, and they already ship in llmux. [가설] They are
+invisible mainly because they are unmarketed:
 - **Quota display**: Islands tiles with 5h/7d windows and reset timers (macOS notch + KDE port).
 - **Waste-aware scheduling**: perishability ranking burns the quota that resets soonest
-  (`docs/configuration.md:100`). This answers the pain behind #2111 more directly than a fixed
-  warm-up timetable.
+  (`docs/configuration.md:100`). This is a different mechanism from #2111's staggered window
+  start, which llmux does not have (roadmap item 7).
 - **Central daemon + many machines**: remote mode with per-computer client keys. This is #979's
   request.
 - **Multi-model agents**: Claude Code subagents on GPT or Grok inside one session
@@ -170,7 +176,8 @@ the curve held. llmux can copy the second, not the first.
   into community plugins, because "reaching them can break their vendors' terms". The move
   "keeps magpie itself from being banned" (`AGENTS.md:26-29`; the move commits are dated from
   2026-10-02). API-key providers are
-  the compliance-safe half of llmux's identity. Subscription pooling remains the policy-fragile half.
+  [추론] likely to carry less vendor-policy risk than subscription pooling. Vendor terms were not
+  reviewed for this note.
 - **Counts are keyword-based.** Areas overlap and a few keywords are broad ("codex" appears as
   context in many bugs). Rankings were spot-checked against issue text, but exact numbers are
   approximate.
