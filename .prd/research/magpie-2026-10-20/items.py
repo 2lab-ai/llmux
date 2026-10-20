@@ -4,6 +4,8 @@ au={json.loads(l)['n']:json.loads(l)['u'] for l in open(sys.argv[1]+'/authors.js
 T=lambda r:(r['t']+' '+r['body']).lower()
 ITEMS={
  'I1 api-key providers':r'deepseek|kimi|moonshot|zhipu|智谱|glm|minimax|qwen|百炼|ollama|lm ?studio|openrouter|中转|relay',
+ 'I1a direct vendor keys / coding plans':r'deepseek|kimi|moonshot|zhipu|智谱|glm|minimax|qwen|百炼|dashscope|mimo|coding ?plan|codeplan|token ?plan',
+ 'I1b local models + relays':r'ollama|lm ?studio|omlx|llama\.cpp|vllm|本地模型|local model|中转|relay|new ?api|one ?api|anyrouter|packy',
  'I2 cross-provider fallback':r'failover|故障转移|fallback|备用|capacity|429|回退',
  'I3 quota display':r'用量|额度|quota|余额|剩余|状态栏|menu ?bar|capsule|胶囊|小窗口',
  'I4 warm-up / reset credits':r'预热|warm.?up|prewarm|错峰|重置卡|reset card|redeem|兑换',

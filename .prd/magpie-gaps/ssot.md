@@ -12,9 +12,9 @@ Status: planned (2026-10-20). Fixed target. Do not reinterpret it during the loo
 
 ## Fixed scope
 
-- The improvement list is the product track (items 1–7) and the distribution track (D1–D6) in
+- The improvement list is the product track (items 1–8) and the distribution track (D1–D6) in
   [24-magpie-gap-roadmap.md](../24-magpie-gap-roadmap.md). Order = that document's priority rule.
 - Out of scope: the items in [23 §7](../23-research-magpie.md) (config editing for many agents,
   intent routing, OTLP, browser UI, MCP/skills library, plugins, PII model, credit check-in).
 - Owner-gated: every outward post in D4, stable `v*` releases, and amending `01-spec.md` non-goals
-  beyond the scope of item 1.
+  beyond the sentence item 5 proposes.
