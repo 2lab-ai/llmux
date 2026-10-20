@@ -623,8 +623,25 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
         } else {
             Style::new().fg(Color::Cyan)
         };
+        let label = if area.width >= 140 && (active == Overlay::None || *overlay == Overlay::None) {
+            let key = match overlay {
+                Overlay::None => "Esc",
+                Overlay::Accounts => "a",
+                Overlay::Stats => "g",
+                Overlay::Usage => "U",
+                Overlay::Keys => "K",
+                Overlay::Perf => "p",
+                Overlay::Logs => "l",
+                Overlay::Sessions => "s",
+                Overlay::Misc => "?",
+                Overlay::Config => "c",
+            };
+            format!("[{key}] {label}")
+        } else {
+            (*label).to_string()
+        };
         let width = label.chars().count() as u16;
-        spans.push(Span::styled(*label, style));
+        spans.push(Span::styled(label, style));
         tabs.push(TabHit {
             area: Rect {
                 x,
@@ -12906,11 +12923,144 @@ mod tests {
         assert_eq!(hit_test_activity(&chrome, 5, 0), None);
     }
 
+    fn assert_c2a_tab_strip(
+        width: u16,
+        active_overlays: &[Overlay],
+        expected_header: &str,
+        expected_tabs: &[(&str, u16, Overlay)],
+    ) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).expect("terminal");
+        for active in active_overlays {
+            let mut tabs = Vec::new();
+            terminal
+                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let header: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(
+                header,
+                format!("{expected_header:<width$}", width = width as usize)
+            );
+            assert_eq!(tabs.len(), 10, "one hit target per tab");
+            for (hit, (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
+                assert_eq!(hit.overlay, *overlay);
+                assert_eq!(hit.area, Rect::new(*x, 1, label.len() as u16, 1));
+                assert!(hit.area.right() <= width, "{label} must not be clipped");
+                for col in hit.area.x..hit.area.right() {
+                    assert_eq!(hit_test_tabs(&tabs, col, 1), Some(*overlay), "{label}");
+                    let cell = &buffer[(col, 1)];
+                    assert_eq!(cell.fg, Color::Cyan, "{label}");
+                    assert_eq!(
+                        cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD),
+                        *overlay == *active,
+                        "{label} active style"
+                    );
+                }
+            }
+            for col in 0..width {
+                if !expected_tabs
+                    .iter()
+                    .any(|(label, x, _)| col >= *x && col < *x + label.len() as u16)
+                {
+                    assert_eq!(hit_test_tabs(&tabs, col, 1), None, "separator/padding");
+                }
+                for row in [0, 2] {
+                    assert_eq!(buffer[(col, row)].symbol(), " ", "one-row strip");
+                    assert_eq!(hit_test_tabs(&tabs, col, row), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c2a_tabs_at_139_keep_original_labels_and_hit_targets() {
+        assert_c2a_tab_strip(
+            139,
+            &[
+                Overlay::None,
+                Overlay::Accounts,
+                Overlay::Stats,
+                Overlay::Usage,
+                Overlay::Keys,
+                Overlay::Perf,
+                Overlay::Logs,
+                Overlay::Sessions,
+                Overlay::Misc,
+                Overlay::Config,
+            ],
+            " dashboard │ accounts │ stats │ usage │ keys │ perf │ logs │ sessions │ misc │ config",
+            &[
+                ("dashboard", 1, Overlay::None),
+                ("accounts", 13, Overlay::Accounts),
+                ("stats", 24, Overlay::Stats),
+                ("usage", 32, Overlay::Usage),
+                ("keys", 40, Overlay::Keys),
+                ("perf", 47, Overlay::Perf),
+                ("logs", 54, Overlay::Logs),
+                ("sessions", 61, Overlay::Sessions),
+                ("misc", 72, Overlay::Misc),
+                ("config", 79, Overlay::Config),
+            ],
+        );
+    }
+
+    #[test]
+    fn c2a_tabs_at_140_show_shortcuts_with_full_hit_targets() {
+        assert_c2a_tab_strip(
+            140,
+            &[Overlay::None],
+            " [Esc] dashboard │ [a] accounts │ [g] stats │ [U] usage │ [K] keys │ [p] perf │ [l] logs │ [s] sessions │ [?] misc │ [c] config",
+            &[
+                ("[Esc] dashboard", 1, Overlay::None),
+                ("[a] accounts", 19, Overlay::Accounts),
+                ("[g] stats", 34, Overlay::Stats),
+                ("[U] usage", 46, Overlay::Usage),
+                ("[K] keys", 58, Overlay::Keys),
+                ("[p] perf", 69, Overlay::Perf),
+                ("[l] logs", 80, Overlay::Logs),
+                ("[s] sessions", 91, Overlay::Sessions),
+                ("[?] misc", 106, Overlay::Misc),
+                ("[c] config", 117, Overlay::Config),
+            ],
+        );
+    }
+
+    #[test]
+    fn c2a_tabs_in_usage_show_only_the_dashboard_return_hint() {
+        assert_c2a_tab_strip(
+            140,
+            &[
+                Overlay::Accounts,
+                Overlay::Stats,
+                Overlay::Usage,
+                Overlay::Keys,
+                Overlay::Perf,
+                Overlay::Logs,
+                Overlay::Sessions,
+                Overlay::Misc,
+                Overlay::Config,
+            ],
+            " [Esc] dashboard │ accounts │ stats │ usage │ keys │ perf │ logs │ sessions │ misc │ config",
+            &[
+                ("[Esc] dashboard", 1, Overlay::None),
+                ("accounts", 19, Overlay::Accounts),
+                ("stats", 30, Overlay::Stats),
+                ("usage", 38, Overlay::Usage),
+                ("keys", 46, Overlay::Keys),
+                ("perf", 53, Overlay::Perf),
+                ("logs", 60, Overlay::Logs),
+                ("sessions", 67, Overlay::Sessions),
+                ("misc", 78, Overlay::Misc),
+                ("config", 85, Overlay::Config),
+            ],
+        );
+    }
+
     #[test]
     fn tab_bar_records_seven_hit_targets_and_hit_test_maps_labels() {
         let view = view_with(Vec::new());
         let mut hits = None;
-        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(139, 40)).expect("terminal");
         let chrome = chrome_overlay(Overlay::None);
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
@@ -13034,7 +13184,11 @@ mod tests {
         for (_, overlay) in TABS {
             let text = render(&view, &chrome_overlay(*overlay), 200, 40);
             assert!(
-                text.contains("dashboard │ accounts"),
+                text.contains(if *overlay == Overlay::None {
+                    "[Esc] dashboard │ [a] accounts"
+                } else {
+                    "[Esc] dashboard │ accounts"
+                }),
                 "tab strip visible under {overlay:?}"
             );
         }
