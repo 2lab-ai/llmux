@@ -120,7 +120,8 @@ owner can flip this default.
 ### 4. Windows build
 - **What:** the CLI, daemon and TUI on Windows x64/ARM64, with credential import from Windows
   paths, a background service, and a release + winget/scoop channel. Islands stays macOS/KDE.
-- **Why:** 178 authors mention Windows or WSL (time-window phrases such as "5h windows" excluded). Release targets today are macOS + Linux only
+- **Why:** 178 authors mention Windows or WSL (time-window phrases such as "5h windows" excluded;
+  `research/magpie-2026-10-20/praise.txt`). Release targets today are macOS + Linux only
   (`.github/workflows/release.yml:22-33`).
 - **Acceptance:** on a clean Windows VM, install → `llmux login` → Claude Code and Codex route
   through the daemon; CI runs the test suite on `windows-latest`.

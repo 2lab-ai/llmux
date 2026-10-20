@@ -19,7 +19,8 @@ a judgment [가설], not a measurement:
    `docs/provider-compatibility.md:20`). It is documented, not live-verified for this note. None of
    it is findable: no website, no badges, no demo GIF in recent releases, English only, one install
    channel. magpie launched from an author with 9,614 followers and two earlier hits.
-2. **Direct vendor keys and endpoints.** This is the largest mention cluster in magpie's tracker.
+2. **Direct vendor keys and endpoints.** This is the largest backend-related mention cluster in
+   magpie's tracker (client-agent support is larger overall, §3).
    llmux takes an Anthropic key (`login --api`) and an OpenRouter key (`login --openrouter --paste`,
    `docs/operational-reference.md:13`). It has no direct DeepSeek/Kimi/GLM/MiniMax/Qwen keys or
    coding plans, no local models (Ollama, LM Studio), no relays, and no custom URL. `Local` is a stub
@@ -57,8 +58,8 @@ Termux. macOS, Windows, Linux (x64 + ARM64). 86 provider presets
 - **"Loved" cannot be read from reactions.** All 2,464 issues together carry 33 reactions. The main
   proxy is **mention authors**: distinct authors whose title or body matches an area's keywords.
   Mention authors measure how much attention and trouble an area draws. They do not measure
-  preference or usage share, and a bug report counts the same as a feature request. Every count is
-  an upper bound for its label.
+  preference or usage share, and a bug report counts the same as a feature request. Each count is
+  a keyword-matched set with both false positives and false negatives.
 - **Explicit praise** is read separately (`praise.py`, word-boundary matching for English words).
   An earlier count matched "love" inside "failover" and wrongly made routing the most-praised area.
 - **Classifier:** keyword areas over title, then body, multi-label; 33/2,138 unclassified.
@@ -75,7 +76,7 @@ Termux. macOS, Windows, Linux (x64 + ARM64). 86 provider presets
 | Usage & quota display | 382 | 250 | 155 | **#124 remaining-vs-used toggle (35 comments, most-discussed issue)**; #1423 USD per account |
 | Subscription accounts | 351 | 240 | 120 | #2111 staggered 5h warm-up; #1630 quota card refresh |
 | Routing & failover | 387 | 236 | 137 | #1418 "model at capacity" with no fallback (18 comments); #2077 multi-provider 429 |
-| Platform / install | 249 | 191 | 61 | Windows/WSL: 289 issues, 178 authors; Docker/NAS/headless: 107 issues, 84 authors (`items.txt`) |
+| Platform / install | 249 | 191 | 61 | Windows/WSL: 289 issues, 178 authors (`praise.txt`, time-window phrases excluded); Docker/NAS/headless: 107 issues, 84 authors (`items.txt`) |
 | Remote / LAN | 146 | 113 | 64 | #979 central NAS daemon + local menu-bar quota; #545 LAN sharing |
 | Web search / image | 113 | 94 | 44 | #1399 image/video relay (22 comments); #669 search returns empty |
 | MCP/skills library | 136 | 94 | 64 | out of llmux scope (§7) |
@@ -202,7 +203,7 @@ the curve held. llmux can copy the second, not the first.
   2026-10-02). [추론] API-key backends likely carry less vendor-policy risk than subscription
   pooling, so positioning should lead with "your harness, any key" rather than "pooled accounts".
   Vendor terms were not reviewed for this note.
-- **Counts are keyword-based.** Areas overlap, and title+body matching makes each count an upper
-  bound. Some words are broad: "codex" appears as context in many bugs, "cursor" also matches UI
+- **Counts are keyword-based.** Areas overlap, and title+body matching both over- and under-counts.
+  Some words are broad: "codex" appears as context in many bugs, "cursor" also matches UI
   cursors, and "搜索" also matches magpie's own search box. Rankings were spot-checked against issue
   text, but exact numbers are approximate.
