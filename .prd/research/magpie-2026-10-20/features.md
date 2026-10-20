@@ -9,16 +9,16 @@ How the magpie side was read: README, `docs/reference.md` (REF), `docs/subsystem
 exist. Rows marked **checked** were re-read by the dispatcher in the source. The others come from
 one delegated source read and were not re-read.
 
-llmux grades: **Have** · **Partial** · **Missing** · **Out** (conflicts with a non-goal or the
-one-harness thesis, 23 §7) · **N/A** (does not apply to a proxy).
+llmux grades: **Have** · **Partial** · **Missing** · **Out** (conflicts with a non-goal or with
+llmux's "keep your harness, swap the model" bet, 23 §7) · **N/A** (does not apply to a proxy).
 
 | id | magpie feature | category | magpie evidence | magpie status | llmux | llmux note |
 |---|---|---|---|---|---|---|
-| 1 | Pick any provider/model for any agent; the agent's config is edited in place | config | README; I/edit, I/agent | implemented | Out | thesis; for its two harnesses llmux fills Claude Code's `/model` picker and launches Codex (`.prd/17-claude-code-model-picker.md`, `.prd/21-codex-frontend.md`) |
-| 2 | About 63 agents wired; only installed ones shown | config | REF §Agents | implemented | Out | thesis (23 §7) |
+| 1 | Pick any provider/model for any agent; the agent's config is edited in place | config | README; I/edit, I/agent | implemented | Partial | for its two frontends llmux wires the endpoint and fills the model list per session — `llmux run` (Claude Code `/model` picker, `.prd/17-claude-code-model-picker.md`) and `llmux run --codex` (`.prd/21-codex-frontend.md`), both also from Islands "Start coding"; it does not rewrite other agents' config files |
+| 2 | About 63 agents wired; only installed ones shown | config | REF §Agents | implemented | Partial | two first-class frontends, Claude Code and Codex CLI (`docs/features.md` "Two client frontends", 2026-10-07); any other Anthropic Messages or OpenAI Responses client by hand (`README.md`: "other Messages clients and Codex are served") — roadmap items 5, 7 |
 | 3 | Profiles: save and switch every agent's setup at once | config | REF §Use; I/profile | implemented | Missing | small; not on the roadmap |
 | 4 | Per-agent model visibility list | config | I/cli/visible_cli.go | implemented | Partial | one curated catalog for `/model`, not per agent (`.prd/17-claude-code-model-picker.md`) |
-| 5 | Gateway translation across Chat/Responses/Messages/Gemini; count_tokens; speech-to-text; Ollama-style `/api/tags` | routing | REF; I/gateway | implemented | Out | llmux serves Messages + Responses only; Chat/Gemini inbound is the third-harness question (23 §7); count_tokens is a labelled local estimate (`01-spec.md:65-68`) |
+| 5 | Gateway translation across Chat/Responses/Messages/Gemini; count_tokens; speech-to-text; Ollama-style `/api/tags` | routing | REF; I/gateway | implemented | Partial | Messages + Responses inbound (`docs/provider-compatibility.md:15-21`); no Chat Completions inbound (roadmap item 7), no Gemini inbound; count_tokens is a labelled local estimate (`01-spec.md:65-68`) |
 | 6 | 86 presets, custom URLs, custom headers, send the agent's own User-Agent | providers | `internal/provider/presets.go` | implemented (**checked**: 86) | Partial | Anthropic key + OpenRouter key, any OpenRouter model (`docs/configuration.md:209`); no direct vendor keys or custom URL — roadmap item 2, item 5 |
 | 7 | Live model lists from vendors + models.dev metadata, auto-refresh, retired models hidden | providers | REF; I/catalog | implemented | Partial | curated catalog with an `or-<vendor>/<slug>` escape hatch (`docs/models.md:146-150`) |
 | 8 | Claude subscription served through the real local `claude` binary, tools bridged over MCP | providers | S/claude-subscription-bridge.md; I/claudebridge | implemented (**checked**: package exists) | Have | Codex → Claude through the official Agent SDK (`.prd/21-codex-frontend.md`) |
@@ -59,4 +59,7 @@ one-harness thesis, 23 §7) · **N/A** (does not apply to a proxy).
 | 43 | App in en/zh/zh-TW/ja/de; site in 4 languages; EN+ZH release notes | UI | I/gui/assets/i18n.js | implemented | Missing | English only; KO/ZH READMEs are distribution item D2 |
 | 44 | Daily anonymous usage ping, can be turned off | other | README §Privacy | implemented | N/A | telemetry, not a user feature |
 
-Totals over 44 rows: Have 6 · Partial 15 · Missing 10 · Out 10 · N/A 3 (sum 44).
+Totals over 44 rows: Have 6 · Partial 18 · Missing 10 · Out 7 · N/A 3 (sum 44).
+
+magpie's own GUI (tray panel, desktop window, browser UI) is the surface behind several rows (21, 23,
+24); llmux has no GUI window, only the TUI and Islands. That gap is roadmap item 1.

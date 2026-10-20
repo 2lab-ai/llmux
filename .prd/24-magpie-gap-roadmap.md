@@ -3,7 +3,7 @@
 Status: planned (2026-10-20). Nothing below is built yet. Evidence: [23-research-magpie.md](23-research-magpie.md).
 Workstream driver: [magpie-gaps/](magpie-gaps/).
 
-Owner's request (verbatim, 2026-10-20):
+Owner's request and follow-ups (verbatim, 2026-10-20):
 
 > llmux 개선 https://github.com/yetone/magpie 참조해서 using-dotprd로 이 magpie 리서치하고 분석하고
 > 피쳐리스트를 추출해주고 llmux에 가장 부족한 피쳐를 개선리스트로 prd에 추개해줘 해당 repo에 유저들의
@@ -11,15 +11,23 @@ Owner's request (verbatim, 2026-10-20):
 > 세우고 시각화해서 보내줘 magpie에서 하는일이랑 llmux에서 하는일이 상당히 겹치는데 내가 마케팅으 ㄹ하나도
 > 안한것도 있고
 
+> 니가 llmux 기능 다 모르는데? llmux도 이미 claude code랑 codex2개 지원하고 있음
+
+> 내 생각에 가장 중요한것중 하나는 dashboard ui임
+
 ## The plan in one paragraph
 
-Two tracks run in parallel. **Product** closes the gaps magpie users raise most and llmux lacks.
-In order: quota display polish, direct vendor keys and coding plans (DeepSeek, Kimi, GLM, MiniMax,
-Qwen), an explicit fallback chain from subscriptions to API-key backends, then Windows, local models
-and relays, and Docker with remote Islands. **Distribution** makes findable what already ships. magpie's
+Two tracks run in parallel. **Product** starts with the owner's priority, a dashboard UI, whose
+first page carries the quota display magpie users discuss most. Then it closes the gaps magpie users
+raise most and llmux lacks: direct vendor keys and coding plans (DeepSeek, Kimi, GLM, MiniMax, Qwen);
+an explicit fallback chain from subscriptions to API-key backends; Windows; tested setups for other
+agents that already speak llmux's two protocols; local models and relays; a Chat Completions
+inbound for Chat-only agents; Docker with remote Islands. **Distribution** makes findable what already ships. magpie's
 tagline, "Codex on DeepSeek, Claude Code on Kimi", is already possible in llmux through OpenRouter
 (`or-<vendor>/<slug>` from both frontends, [23 §5](23-research-magpie.md)), but nobody knows it.
-Features that conflict with llmux's one-harness thesis stay out ([23 §7](23-research-magpie.md)).
+llmux already serves two client frontends, Claude Code (Anthropic Messages) and Codex CLI (OpenAI
+Responses), since 2026-10-07 (`docs/features.md`, "Two client frontends"). Features that conflict
+with llmux's "keep your harness, swap the model" bet stay out ([23 §7](23-research-magpie.md)).
 
 ## Priority rule
 
@@ -29,22 +37,28 @@ Features that conflict with llmux's one-harness thesis stay out ([23 §7](23-res
   attention and trouble an area draws, not preference or usage. Bug reports count like requests.
   Some keyword sets are wider than the item (noted per item).
 - **gap** = 1 if missing in llmux, 0.5 if partial.
-- **fit** = 1 if on-thesis, 0.5 if it strains the one-harness thesis.
+- **fit** = 1 if it fits "keep your harness, swap the model", 0.5 if it strains it.
 - **effort** = 1 (S), 2 (M), 3 (L). Grades are estimates; re-estimate before an item starts.
 
-Scores are a heuristic ranking, not a measured forecast.
+Scores are a heuristic ranking, not a measured forecast. The owner's stated priority overrides a
+score (item 1). A dependency overrides it too (item 7 follows item 6).
 
 | # | Item | Demand | Gap | Fit | Effort | Score | Wave |
 |---|---|---|---|---|---|---|---|
-| 1 | Quota display polish | 270 | 0.5 | 1 | S | **135** | 1 |
+| 1 | Dashboard UI (owner priority); first page = quota display | 159 | 0.5 | 1 | L | 27 | 1 (owner) |
 | 2 | Direct vendor keys and coding plans (Anthropic-compatible endpoints) | 225 | 0.5 | 1 | S | **113** | 1 |
 | 3 | Explicit fallback chain: subscriptions → API-key backends | ≤107 | 1 | 1 | S | **≤107** | 1 |
 | 4 | Windows build | 178 | 1 | 1 | L | **59** | 2 |
-| 5 | Local models and relays (Chat Completions endpoints) | 97 | 1 | 1 | M | **49** | 2 |
-| 6 | Docker image, service install, built-in TLS, Islands to a remote daemon | 84 | 1 | 1 | M | **42** | 2 |
-| 7 | Web search on non-Claude backends | 56 | 1 | 1 | M | **28** | 3 |
-| 8 | Staggered window warm-up + auto-redeem | 27 | 0.5 | 1 | S | **14** | 3 |
-| — | Third harness via Chat Completions inbound | 230 | 1 | 0.5 | L | 38 | not now |
+| 5 | Tested setups for other agents on llmux's existing endpoints | 106 | 0.5 | 1 | S | **53** | 2 |
+| 6 | Local models and relays (Chat Completions upstreams) | 97 | 1 | 1 | M | **49** | 2 |
+| 7 | Chat Completions inbound for Chat-only agents | 129 | 1 | 1 | M | **65** | 2 (after 6) |
+| 8 | Docker image, service install, built-in TLS, Islands to a remote daemon | 84 | 1 | 1 | M | **42** | 2 |
+| 9 | Web search on non-Claude backends | 56 | 1 | 1 | M | **28** | 3 |
+| 10 | Staggered window warm-up + auto-redeem | 27 | 0.5 | 1 | S | **14** | 3 |
+
+Item 1's demand is the 159 authors who name a screen in an issue title. The wider count (any mention
+of a page, window, panel or tray) is 346. Quota display alone is 270 authors (`items.txt` I3); it
+lands as item 1's first page and stays on Islands and the TUI.
 
 Waves group by rank and theme: wave 1 is what users touch and pay for, wave 2 is where llmux runs
 and what it can reach, wave 3 is polish.
@@ -58,18 +72,42 @@ vendor keys (item 2) matter more under the CJK-first default.
 
 ## Product track
 
-### 1. Quota display polish — the surface magpie users discuss most
-- **What:**
-  - (a) A remaining ↔ used toggle on Islands tiles and TUI gauges. magpie's most-discussed issue
-    asks for this (#124, 35 comments).
-  - (b) An opt-in notice when an account will reset with unused quota.
-  - (c) API-equivalent USD per account for the current 5h/7d window (#1423).
-- **Why:** 270 authors mention quota or usage display at all. The three pieces come from #124 and
-  #1423, not from separate counts. llmux already has the tiles (Islands, TUI), so this is polish.
+### 1. Dashboard UI — owner priority, quota display as its first page
+- **What:** a graphical dashboard for everything the TUI shows today, in a window instead of a
+  terminal. Pages in the order magpie users discuss them (issue titles naming a screen, `items.txt`
+  I9: routing 42, usage 41, tray/floating window 37, agents 28, providers 24, settings 24,
+  sessions 19):
+  - (a) **Accounts & quota** (first page): each account's 5h/7d windows with reset times, a
+    remaining ↔ used toggle (#124, 35 comments, magpie's most-discussed issue), an opt-in notice
+    when an account will reset with unused quota, API-equivalent USD per account for the current
+    window (#1423), login/pause/switch actions.
+  - (b) **Live routing / activity**: each request with frontend, model, account and timing, and
+    the raw request viewer behind it.
+  - (c) **Usage & cost**: the calendar usage tab and the perf tab as charts.
+  - (d) **Sessions, keys, config**: the TUI's sessions, keys and config tabs.
+  The remaining/used toggle and the reset notice also ship on Islands tiles and TUI gauges.
+- **Form, default [결정, reversible]:** a local web dashboard served by the daemon itself, opened by
+  `llmux dashboard --web` and from Islands. It reuses `GET /llmux/dashboard`, the superset document
+  the attach-mode TUI already polls (`01-spec.md:88`). One codebase reaches macOS, Linux, Windows
+  (item 4), a remote daemon and Docker (item 8). The alternative is a native window grown out of
+  Islands, which means two codebases (SwiftUI + the KDE/Qt port). The owner can flip this default.
+- **Why:** owner priority (2026-10-20, verbatim above). magpie's main surface is a GUI (tray panel,
+  desktop window, browser UI), and 159 authors name one of its screens in an issue title (346 mention
+  one anywhere). llmux has the data and the TUI views but no window; Islands is a glanceable
+  menu-bar/notch companion, not a dashboard.
+- **Non-goal change, in this item's first PR.** `01-spec.md:50-53` says "No analytics database or
+  browser dashboard … no browser UI". Replace the browser-UI clause with: "A local web dashboard
+  served by the daemon, behind the same admin credential as `/llmux/*`. Still no analytics
+  service, no exporter, and no prompt/response content beyond what the raw request viewer already
+  shows."
 - **Acceptance:**
-  - The toggle persists across restarts, and both values match `llmux status --json`.
-  - A reset notice fires once per window, only for accounts above a configured unused share.
-  - The USD figure equals the usage-tab cost summed over the window.
+  - `llmux dashboard --web` opens the dashboard. The accounts page shows the same accounts, windows
+    and reset times as `llmux status --json`, value for value.
+  - A request through llmux appears on the routing page within 2 s, with the same model and account
+    as the TUI activity row.
+  - Usage-page totals equal the TUI usage tab for the same range.
+  - The dashboard works against a remote daemon with an admin client key, and refuses without one.
+  - A desktop and a phone-width capture of each page, read before release.
 
 ### 2. Direct vendor keys and coding plans — "Claude Code on Kimi, Codex on DeepSeek", without OpenRouter
 - **What the user can do:** `llmux login --api-key <preset|url>` adds DeepSeek, Kimi/Moonshot, GLM
@@ -94,7 +132,7 @@ vendor keys (item 2) matter more under the CJK-first default.
   (`04-research-cliproxyapi.md:96`; "✅ highest ROI" at `:68`).
 - **No non-goal change needed.** OpenRouter is already a production API-key backend on a hosted
   Anthropic-compatible endpoint, and direct vendor keys follow that precedent. Local servers need
-  one (item 5).
+  one (item 6).
 - **Acceptance:**
   - With a DeepSeek key in env, `llmux login --api-key deepseek` → `claude --model <deepseek-model>`
     through llmux streams an answer that calls tools. The same model answers through
@@ -129,9 +167,22 @@ vendor keys (item 2) matter more under the CJK-first default.
 - **Acceptance:** on a clean Windows VM, install → `llmux login` → Claude Code and Codex route
   through the daemon; CI runs the test suite on `windows-latest`.
 
-### 5. Local models and relays — Chat Completions endpoints
-- **What:** an `anthropic↔openai-chat` translator pair, so endpoints that only speak OpenAI Chat
-  Completions work as accounts. This covers Ollama, LM Studio, vLLM and OpenAI-compatible relays.
+### 5. Tested setups for other agents on llmux's existing endpoints
+- **What:** a documented, live-tested setup for agents that can already talk to one of llmux's two
+  endpoints: Pi (Responses or Messages), Claude Desktop in its third-party gateway mode (Messages),
+  Cursor's local agent (Messages or Responses), DeepSeek harness and Factory droid. Each gets a
+  recipe in the docs, `llmux env` output it can paste, and a row in the compatibility matrix.
+- **Why:** 106 authors name these agents and not Codex or Claude Code (`items.txt` I8a). The README
+  already says "other Messages clients and Codex are served". Which protocol each agent uses comes
+  from magpie's own wiring (`internal/agent/agents.go:529-541` Pi, `claudedesktop.go:3-14`,
+  `cursorlocal.go:21`, `dsh.go`, `droid.go`). The gap is setup and testing, not a protocol.
+- **Acceptance:** for each agent, a fresh install following the recipe completes one tool-calling
+  turn through llmux on a Claude account and one on a Codex account, with the receipt (version,
+  request id) recorded in the docs.
+
+### 6. Local models and relays — Chat Completions endpoints
+- **What:** an `anthropic↔openai-chat` translator pair, so upstream endpoints that only speak
+  OpenAI Chat Completions work as accounts. This covers Ollama, LM Studio, vLLM and OpenAI-compatible relays.
 - **Why:** 97 authors mention local models or relays. Nothing in llmux reaches them today.
 - **Non-goal change, in this item's first PR.** `01-spec.md:59` ("No production Gemini/local
   backends. Stub providers only.") is already stale: OpenRouter is in production and Gemini is in
@@ -141,7 +192,20 @@ vendor keys (item 2) matter more under the CJK-first default.
 - **Acceptance:** an Ollama model on `localhost` answers a Claude Code turn with a tool call through
   llmux. Any lost field is named in `X-Llmux-Omitted-Fields`.
 
-### 6. Docker image, service install, built-in TLS, Islands to a remote daemon
+### 7. Chat Completions inbound for Chat-only agents
+- **What:** accept OpenAI Chat Completions requests (`/v1/chat/completions`) from clients, so agents
+  that only speak Chat work: OpenCode as magpie wires it (`@ai-sdk/openai-compatible`,
+  `internal/agent/agents.go:386`), WorkBuddy/CodeBuddy (`workbuddy.go`, `codebuddy.go`), Kimi Code
+  (`kimi.go`), Cline.
+- **Why:** 129 authors name these agents and not Codex or Claude Code (`items.txt` I8b). It reuses
+  item 6's translator in the other direction, so it follows item 6 even though it scores higher.
+  [추정] OpenCode can also use an Anthropic provider with a custom base URL, which would put it in
+  item 5 instead; check this first.
+- **Acceptance:** OpenCode and Kimi Code each complete a tool-calling turn through
+  `/v1/chat/completions` on a Claude account and a Codex account. Any lost field is named in
+  `X-Llmux-Omitted-Fields`.
+
+### 8. Docker image, service install, built-in TLS, Islands to a remote daemon
 - **What:** `ghcr.io/2lab-ai/llmux` (multi-arch), `llmux daemon install` (launchd/systemd), and
   optional TLS on the remote listener so Islands connects to a remote daemon without a hand-built
   HTTPS proxy (#979: a central NAS daemon plus a local menu-bar quota display).
@@ -153,7 +217,7 @@ vendor keys (item 2) matter more under the CJK-first default.
   - Islands connects to `https://<host>:<port>` with a client key and no reverse proxy, and shows
     the remote accounts' quota.
 
-### 7. Web search on non-Claude backends
+### 9. Web search on non-Claude backends
 - **What:** when a Claude Code WebSearch tool request is routed to GPT, Grok or an API-key model,
   llmux runs the search through a configured provider (vendor-native search where it exists, else a
   search API key) instead of refusing or dropping the tool.
@@ -165,7 +229,7 @@ vendor keys (item 2) matter more under the CJK-first default.
 - **Acceptance:** a GPT-routed Claude Code turn that asks for a web search returns cited results;
   with no search provider configured, the omission is named in `X-Llmux-Omitted-Fields`.
 
-### 8. Staggered window warm-up + auto-redeem
+### 10. Staggered window warm-up + auto-redeem
 - **What:**
   - (a) Opt-in daily warm-up that starts each account's 5h window at `anchor + i × 5h / N`, so
     resets are staggered (#2111).
@@ -176,12 +240,6 @@ vendor keys (item 2) matter more under the CJK-first default.
 - **Acceptance:** with 3 accounts and anchor 08:00, `llmux status --json` shows window starts
   about 100 minutes apart. Warm-up spends at most one minimal request per account per day.
 
-### Not now: a third harness
-- OpenCode, Pi, Cursor and other agents together reach 230 authors (339 issues name only them).
-  Serving them means a Chat Completions inbound, which strains the one-harness thesis (04 note).
-- Revisit when llmux's own issue tracker asks for a specific third harness, or when item 5's
-  translator makes the inbound direction cheap.
-
 ## Distribution track
 
 The research found that much of what magpie users raise already ships in llmux
@@ -190,12 +248,12 @@ total, 49 repo views from 15 unique visitors in 14 days.
 
 | # | Item | Acceptance (observable) |
 |---|---|---|
-| D1 | **One-line positioning + honest comparison.** Lead with the harness and the keys, not with account pooling, which is the policy-fragile half ([23 Tensions](23-research-magpie.md)). Example: "Keep Claude Code or Codex. Run them on any model you pay for, and see every quota in one place." Adds a llmux / magpie / CLIProxyAPI table to `docs/why-llmux.md`. | README first screen states it; the table cites only checked facts |
-| D2 | **README that sells in 10 seconds.** A 20–30 s hero GIF (Islands + a Claude Code model switch to an `or-` model), badges, star history, install one-liner, Korean and Chinese READMEs. | GIF renders on github.com; links resolve |
+| D1 | **One-line positioning + honest comparison.** Lead with the harness and the keys, not with account pooling, which is the policy-fragile half ([23 Tensions](23-research-magpie.md)). Example: "Keep Claude Code or Codex. Run them on any model you pay for, and see every quota in one place." Adds a llmux / magpie / CLIProxyAPI table to `docs/why-llmux.md`. Once item 5 lands, list the other tested agents. | README first screen states it; the table cites only checked facts |
+| D2 | **README that sells in 10 seconds.** A 20–30 s hero GIF (Islands + a Claude Code model switch to an `or-` model; the dashboard once item 1 ships), badges, star history, install one-liner, Korean and Chinese READMEs. | GIF renders on github.com; links resolve |
 | D3 | **Landing page** (e.g. dosi.dev/llmux): pitch, demo video, three differentiators in D1's order (your harness on any key, multi-model subagents, reset-aware quota across accounts and machines), install. | URL returns 200 with the video playing |
-| D4 | **Launch at the end of wave 1** (quota polish + direct DeepSeek/Kimi keys + fallback chain). Video post on X and Threads, GeekNews, Show HN, r/ClaudeAI and r/codex, V2EX / LINUX DO (72% of magpie issues contain CJK). | Owner publishes; external posts are owner-gated |
+| D4 | **Launch at the end of wave 1** (dashboard + direct DeepSeek/Kimi keys + fallback chain). Video post on X and Threads, GeekNews, Show HN, r/ClaudeAI and r/codex, V2EX / LINUX DO (72% of magpie issues contain CJK). | Owner publishes; external posts are owner-gated |
 | D5 | **Community + response loop.** GitHub Discussions, issue templates, and the existing agent-triage/agent-resolve loop aimed at same-day answers (magpie's median is 5.1 h to close). | Median first response < 24 h over 30 days |
-| D6 | **Install friction.** A `curl … \| sh` installer next to brew; Windows (item 4); Docker (item 6). | Clean-machine install < 60 s on macOS/Linux |
+| D6 | **Install friction.** A `curl … \| sh` installer next to brew; Windows (item 4); Docker (item 8). | Clean-machine install < 60 s on macOS/Linux |
 
 D1–D3 do not wait for any product item: the OpenRouter path and the quota tiles already exist.
 Measure weekly: stars, release-asset downloads, unique repo visitors, issues from non-owner users.
@@ -203,12 +261,13 @@ Measure weekly: stars, release-asset downloads, unique repo visitors, issues fro
 ## Waves
 
 1. **Wave 1:** items 1, 2, 3; D1, D2, D3; launch D4 when wave 1 ships stable.
-2. **Wave 2:** items 4, 5, 6; D5, D6.
-3. **Wave 3:** items 7, 8.
+2. **Wave 2:** items 4–8 (item 7 after item 6); D5, D6.
+3. **Wave 3:** items 9, 10.
 
 ## Tensions
 
-- Item 5 rewrites a written non-goal (`01-spec.md:59`) that is already stale. The new sentence
+- Item 1 rewrites the browser-UI clause of a written non-goal (`01-spec.md:50-53`) on the owner's
+  direction. Item 6 rewrites another (`01-spec.md:59`) that is already stale. The new sentence
   keeps "no hosted brokerage" and does not touch "no task-content routing" (`01-spec.md:54`).
 - Item 3 must not become model laundering. Default off, a header and a badge on every fallback
   turn, and no mid-stream switch.

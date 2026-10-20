@@ -2,7 +2,7 @@
 
 Status: planned (2026-10-20). Fixed target. Do not reinterpret it during the loop.
 
-## Owner's request (verbatim, 2026-10-20)
+## Owner's request and follow-ups (verbatim, 2026-10-20)
 
 > llmux 개선 https://github.com/yetone/magpie 참조해서 using-dotprd로 이 magpie 리서치하고 분석하고
 > 피쳐리스트를 추출해주고 llmux에 가장 부족한 피쳐를 개선리스트로 prd에 추개해줘 해당 repo에 유저들의
@@ -10,11 +10,16 @@ Status: planned (2026-10-20). Fixed target. Do not reinterpret it during the loo
 > 세우고 시각화해서 보내줘 magpie에서 하는일이랑 llmux에서 하는일이 상당히 겹치는데 내가 마케팅으 ㄹ하나도
 > 안한것도 있고
 
+> 니가 llmux 기능 다 모르는데? llmux도 이미 claude code랑 codex2개 지원하고 있음
+
+> 내 생각에 가장 중요한것중 하나는 dashboard ui임
+
 ## Fixed scope
 
-- The improvement list is the product track (items 1–8) and the distribution track (D1–D6) in
+- The improvement list is the product track (items 1–10) and the distribution track (D1–D6) in
   [24-magpie-gap-roadmap.md](../24-magpie-gap-roadmap.md). Order = that document's priority rule.
-- Out of scope: the items in [23 §7](../23-research-magpie.md) (config editing for many agents,
-  intent routing, OTLP, browser UI, MCP/skills library, plugins, PII model, credit check-in).
+- Out of scope: the items in [23 §7](../23-research-magpie.md) (rewriting other agents' config
+  files, Gemini inbound, intent routing, OTLP, MCP/skills library, plugins, PII model, credit
+  check-in).
 - Owner-gated: every outward post in D4, stable `v*` releases, and amending `01-spec.md` non-goals
-  beyond the sentence item 5 proposes.
+  beyond the sentences items 1 and 6 propose.
