@@ -239,6 +239,7 @@ pub(crate) fn draw(
     // automatic. The rect is computed HERE (not per-overlay) so every overlay
     // shares the same top edge: right under the tab bar, banner-aware.
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
+    let mut usage_scope = None;
     match chrome.overlay {
         Overlay::None => {}
         // The overlay draws the SAME accounts table as MAIN over the top of
@@ -251,7 +252,7 @@ pub(crate) fn draw(
             }
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
+        Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
@@ -302,6 +303,23 @@ pub(crate) fn draw(
     };
     frame.render_widget(Clear, footer_area);
     draw_footer(frame, footer_area, chrome, ctx.mask);
+    // Usage context uses only the spare status row; flashes and modal chrome win.
+    if chrome.status_line.as_deref().is_none_or(str::is_empty)
+        && matches!(chrome.mode, Mode::Normal)
+        && chrome.input_modal.is_none()
+        && chrome.raw_modal.is_none()
+        && chrome.account_modal.is_none()
+    {
+        if let Some(scope) = usage_scope {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!(" {scope}"), dim()))),
+                Rect {
+                    height: 1,
+                    ..footer_area
+                },
+            );
+        }
+    }
 }
 
 /// MAIN — the always-rendered wall-clock view (issue #5): header banner ·
@@ -951,9 +969,21 @@ fn heatmap_panel_height(
 /// renderer only filters by the selected granularity, groups consecutive
 /// rows by bucket, and draws a bold per-bucket total row above the per-model
 /// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
-fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+fn draw_usage_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Option<String> {
     frame.render_widget(Clear, area);
     let gran = chrome.usage_gran;
+    // Keep the daemon's cost wording verbatim on wide screens. The compact
+    // summary stays ahead of long ALL sums so narrow screens retain the warning.
+    let cost_warning = if area.width >= 160 {
+        format!("≈ {} · NOT ACTUAL BILL", view.data_quality.cost)
+    } else {
+        "≈ API est. · NOT BILL".to_string()
+    };
     let rows: Vec<&crate::dashboard::UsageStatDoc> = view
         .usage_stats
         .iter()
@@ -974,13 +1004,12 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
             hint,
             Style::new().fg(Color::Yellow),
         )))
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" usage — {} ", gran.label())),
-        );
+        .block(Block::new().borders(Borders::TOP).title(format!(
+            " usage — {} · {cost_warning} · ALL 0 buckets ",
+            gran.label()
+        )));
         frame.render_widget(empty, area);
-        return;
+        return None;
     }
 
     // Group consecutive rows by bucket — the document orders each granularity
@@ -1014,14 +1043,26 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
     let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
-    let title = format!(
-        " usage — {} · {} buckets · Σ {} tok · Σ {}{} ",
-        gran.label(),
-        buckets.len(),
-        format::human_count(total_tokens),
-        format_cost(total_cost),
-        if any_unpriced { " (+unpriced)" } else { "" },
+    let (label, n) = (gran.label(), buckets.len());
+    let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
+    let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
+    // Widest first. The last form is exactly as wide as the pre-scope title,
+    // so any width that fit it still shows the warning, ALL and qualifier.
+    let full = format!(
+        " usage — {label} · {cost_warning} · ALL {n} buckets · Σ {tok} tok · Σ {cost}{unpriced} "
     );
+    let short = format!(
+        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
+    );
+    let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
+    let fits = |t: &str| cell_width(t) <= usize::from(area.width);
+    let title = if fits(&full) {
+        full
+    } else if fits(&short) {
+        short
+    } else {
+        tight
+    };
 
     let mut trows: Vec<Row> = Vec::new();
     for (_, label, group) in buckets.iter().skip(scroll) {
@@ -1115,6 +1156,12 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
     frame.render_widget(table, area);
+    buckets.get(scroll).map(|(_, label, _)| {
+        format!(
+            "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
+            gran.label()
+        )
+    })
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -10267,6 +10314,557 @@ mod tests {
         assert_eq!(dot_col("$1.25"), small, "detail amounts align");
         assert_eq!(dot_col("$1,234.50"), small, "comma amount aligns");
         assert_eq!(dot_col("$0.7500+?"), small, "marker doesn't shift the dot");
+    }
+
+    /// ALL totals cover the selected granularity, not the scrolled viewport;
+    /// scope labels must not consume a row of the existing usage ledger.
+    #[test]
+    fn c5_usage_daily_scroll_keeps_all_totals_and_ledger_rows() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                100,
+                20,
+                1.25,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "codex",
+                "gpt-5.5",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row("day", 19_999, "2024-10-03", "claude", "opus-x", 90, 9, 0.75),
+            {
+                let mut row = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                row.priced = false;
+                row
+            },
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "claude",
+                "hour-only",
+                7,
+                7,
+                99.0,
+            ),
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        for (scroll, top, ledger) in [
+            (
+                0,
+                "2024-10-04",
+                vec![
+                    "2024-10-04 2 models 6 150 30 80 8 $1.75",
+                    "claude/opus-x 3 100 20 40 4 $1.25",
+                    "codex/gpt-5.5 3 50 10 40 4 $0.5000",
+                    "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
+                    "claude/opus-x 3 90 9 40 4 $0.7500",
+                    "misc/mystery 3 11 2 40 4 —",
+                ],
+            ),
+            (
+                1,
+                "2024-10-03",
+                vec![
+                    "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
+                    "claude/opus-x 3 90 9 40 4 $0.7500",
+                    "misc/mystery 3 11 2 40 4 —",
+                ],
+            ),
+        ] {
+            chrome.usage_scroll = scroll;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            assert_eq!(
+                rows[3].split_whitespace().collect::<Vec<_>>(),
+                ["bucket", "model", "req", "input", "output", "cache", "r", "cache", "w", "cost"],
+                "scope chrome must not move the table header"
+            );
+            for (offset, expected) in ledger.iter().enumerate() {
+                assert_eq!(
+                    rows[4 + offset].split_whitespace().collect::<Vec<_>>(),
+                    expected.split_whitespace().collect::<Vec<_>>(),
+                    "existing ledger row {} at scroll {scroll}",
+                    4 + offset
+                );
+            }
+            assert!(
+                rows[4 + ledger.len()..48]
+                    .iter()
+                    .all(|row| row.trim().is_empty()),
+                "no duplicate, hidden-granularity, or extra data rows"
+            );
+            assert!(
+                rows[2].contains("daily")
+                    && rows[2].contains("2 buckets")
+                    && rows[2].contains("Σ 468 tok")
+                    && rows[2].contains("$2.50")
+                    && rows[2].contains("(+unpriced)"),
+                "ALL totals and unpriced qualifier stay unchanged at scroll {scroll}: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains("ALL"),
+                "title must identify ALL returned daily buckets, not the top bucket: {}",
+                rows[2]
+            );
+            let chrome_rows = [rows[2].as_str(), rows[48].as_str()];
+            let scope = chrome_rows
+                .iter()
+                .find(|row| {
+                    let lower = row.to_ascii_lowercase();
+                    lower.contains("top") || lower.contains("displayed")
+                })
+                .expect("existing title/footer identifies the top/displayed bucket");
+            assert!(
+                scope.contains(top),
+                "scope follows the visible bucket: {scope}"
+            );
+            assert!(
+                rows[4].starts_with(top),
+                "top bucket remains the first ledger row"
+            );
+            let labels = chrome_rows.join("\n");
+            assert!(
+                labels.contains('≈')
+                    && labels.contains("API-equivalent")
+                    && labels.to_ascii_lowercase().contains("estimate")
+                    && labels.contains("NOT ACTUAL BILL"),
+                "cost is visibly qualified in existing title/footer chrome: {labels}"
+            );
+            assert!(
+                !labels.to_ascii_lowercase().contains("selected day"),
+                "scrolling is not a selected-date feature"
+            );
+        }
+    }
+
+    /// Granularity changes must neither mix repeated history into ALL totals
+    /// nor describe a scrolled hour/month as a user-selected date.
+    #[test]
+    fn c5_usage_hourly_monthly_scope_counts_only_its_own_buckets() {
+        use crate::tui::activity::UsageGran;
+
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "claude",
+                "hour-new",
+                100,
+                20,
+                2.0,
+            ),
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "codex",
+                "hour-extra",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row(
+                "hour",
+                479_999,
+                "10-04 08h",
+                "claude",
+                "hour-old",
+                90,
+                9,
+                0.75,
+            ),
+            usage_row(
+                "month",
+                650,
+                "2024-10",
+                "claude",
+                "month-new",
+                1_000,
+                100,
+                10.0,
+            ),
+            usage_row(
+                "month",
+                649,
+                "2024-09",
+                "claude",
+                "month-mid",
+                2_000,
+                200,
+                20.0,
+            ),
+            usage_row(
+                "month",
+                648,
+                "2024-08",
+                "claude",
+                "month-old",
+                3_000,
+                300,
+                30.0,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "daily-only",
+                10,
+                1,
+                1_234.0,
+            ),
+        ];
+        for (gran, label, count, tokens, cost, top, hidden) in [
+            (
+                UsageGran::Hour,
+                "hourly",
+                "2 buckets",
+                "Σ 411 tok",
+                "$3.25",
+                "10-04 08h",
+                "hour-new",
+            ),
+            (
+                UsageGran::Month,
+                "monthly",
+                "3 buckets",
+                "Σ 6.7k tok",
+                "$60.00",
+                "2024-09",
+                "month-new",
+            ),
+        ] {
+            let mut chrome = chrome_overlay(Overlay::Usage);
+            chrome.usage_gran = gran;
+            chrome.usage_scroll = 1;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            assert!(
+                [label, count, tokens, cost]
+                    .iter()
+                    .all(|text| rows[2].contains(text)),
+                "title counts/sums all {label} buckets, including the skipped bucket: {}",
+                rows[2]
+            );
+            assert!(
+                rows[4].starts_with(top),
+                "first visible {label} bucket: {}",
+                rows[4]
+            );
+            assert!(
+                rows[4..48]
+                    .iter()
+                    .all(|row| !row.contains(hidden) && !row.contains("daily-only")),
+                "skipped and other-granularity models do not enter the viewport"
+            );
+            assert!(
+                rows[2].contains("ALL"),
+                "{label} title must identify ALL buckets: {}",
+                rows[2]
+            );
+            let scope = [rows[2].as_str(), rows[48].as_str()]
+                .into_iter()
+                .find(|row| {
+                    let lower = row.to_ascii_lowercase();
+                    lower.contains("top") || lower.contains("displayed")
+                })
+                .expect("existing title/footer identifies the top/displayed bucket");
+            assert!(
+                scope.contains(top),
+                "{label} scope follows the viewport: {scope}"
+            );
+            assert!(!scope.to_ascii_lowercase().contains("selected hour"));
+            assert!(!scope.to_ascii_lowercase().contains("selected month"));
+        }
+    }
+
+    /// 106 daily buckets with long totals and an unpriced row.
+    fn c5_long_totals_view() -> DashboardView {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                200_000_000_000,
+                10_000_000_000,
+                180_000.0,
+            ),
+            usage_row(
+                "day",
+                19_999,
+                "2024-10-03",
+                "codex",
+                "gpt-5.5",
+                50_000_000_000,
+                7_417_899_912,
+                8_871.31,
+            ),
+        ];
+        // Three-digit bucket counts plus long totals must not clip the
+        // missing-rate qualifier that fit before cost-warning chrome.
+        for offset in 0..104 {
+            let mut row = usage_row(
+                "day",
+                19_998 - offset,
+                &format!("older-{offset}"),
+                "misc",
+                "mystery",
+                0,
+                0,
+                0.0,
+            );
+            row.priced = false;
+            view.usage_stats.push(row);
+        }
+        view
+    }
+
+    /// A flash status must not replace the cost warning, even when long ALL
+    /// totals would clip a trailing disclaimer at 100 columns.
+    #[test]
+    fn c5_usage_cost_warning_survives_narrow_width_and_real_status() {
+        let view = c5_long_totals_view();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        for status in [Some("refresh failed: retry later"), None] {
+            chrome.status_line = status.map(str::to_string);
+            let rows = render_rows(&view, &chrome, 100, 50);
+            if let Some(status) = status {
+                assert!(
+                    rows[48].contains(status),
+                    "real status remains visible: {}",
+                    rows[48]
+                );
+            }
+            assert!(
+                ["ALL", "daily", "106 buckets", "267417.9M tok", "$188871.31"]
+                    .iter()
+                    .all(|text| rows[2].contains(text)),
+                "100-column title retains ALL scope and both totals: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains("(+unpriced)"),
+                "100-column title must retain the complete missing-rate qualifier: {}",
+                rows[2]
+            );
+            let labels = format!("{}\n{}", rows[2], rows[48]);
+            let lower = labels.to_ascii_lowercase();
+            assert!(
+                labels.contains('≈')
+                    && lower.contains("api")
+                    && (lower.contains("estimate") || lower.contains("est.") || lower.contains("api est") || lower.contains("api-est"))
+                    && (lower.contains("not actual bill") || lower.contains("not bill") || lower.contains("notbill")),
+                "100-column chrome must retain an API estimate / not-bill warning with status {status:?}: {labels}"
+            );
+        }
+    }
+
+    /// The tightest title is exactly as wide as the pre-scope title, so every
+    /// width that fit the old title keeps ALL, both totals, the complete
+    /// unpriced qualifier and the estimate warning.
+    #[test]
+    fn c5_usage_title_fits_legacy_width_with_long_totals() {
+        let view = c5_long_totals_view();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.status_line = Some("refresh failed: retry later".into());
+        for width in [80, 74] {
+            let rows = render_rows(&view, &chrome, width, 50);
+            assert!(
+                rows[48].contains("refresh failed: retry later"),
+                "real status keeps the footer at {width}: {}",
+                rows[48]
+            );
+            assert!(
+                [
+                    "ALL 106",
+                    "daily",
+                    "267417.9M tok",
+                    "$188871.31",
+                    "(+unpriced)"
+                ]
+                .iter()
+                .all(|text| rows[2].contains(text)),
+                "{width}-column title keeps ALL, totals and complete qualifier: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains('≈')
+                    && rows[2].contains("API est")
+                    && rows[2].contains("NOT BILL"),
+                "{width}-column title keeps the estimate warning: {}",
+                rows[2]
+            );
+        }
+    }
+
+    /// The scope row must end on a whole word at narrow widths, never `…by da`.
+    #[test]
+    fn c5_usage_scope_row_fits_80_columns() {
+        let view = c5_long_totals_view();
+        let chrome = chrome_overlay(Overlay::Usage);
+        for width in [80, 74] {
+            let rows = render_rows(&view, &chrome, width, 50);
+            let scope = rows[48].trim_end();
+            assert!(
+                scope.ends_with("ALL = all daily buckets"),
+                "{width}-column scope row is complete: {scope}"
+            );
+            assert!(scope.contains("top/displayed bucket 2024-10-04"), "{scope}");
+        }
+    }
+
+    #[test]
+    fn c5_usage_cost_warning_preserves_totals_and_unpriced_at_80_columns() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                100,
+                20,
+                1.25,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "codex",
+                "gpt-5.5",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row("day", 19_999, "2024-10-03", "claude", "opus-x", 90, 9, 0.75),
+            {
+                let mut row = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                row.priced = false;
+                row
+            },
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.status_line = Some("refresh failed: retry later".into());
+        let rows = render_rows(&view, &chrome, 80, 50);
+        assert!(rows[48].contains("refresh failed: retry later"));
+        assert!(
+            [
+                "ALL",
+                "daily",
+                "2 buckets",
+                "468 tok",
+                "$2.50",
+                "(+unpriced)"
+            ]
+            .iter()
+            .all(|text| rows[2].contains(text)),
+            "80-column title retains ALL scope, both totals, and complete qualifier: {}",
+            rows[2]
+        );
+        assert!(
+            rows[2].contains('≈')
+                && rows[2].contains("API")
+                && rows[2].to_ascii_lowercase().contains("est")
+                && rows[2].contains("NOT BILL"),
+            "80-column warning survives real flash status: {}",
+            rows[2]
+        );
+    }
+
+    /// The source label is daemon-owned; stale scroll offsets must describe
+    /// the same clamped bucket as the ledger, never invent an empty bucket.
+    #[test]
+    fn c5_usage_scope_uses_daemon_qualifier_and_clamped_bucket() {
+        let mut view = view_with(vec![]);
+        view.data_quality.cost = "daemon-owned API-equivalent estimate".into();
+        view.usage_stats = vec![
+            usage_row("day", 20_000, "2024-10-04", "claude", "new", 10, 2, 1.0),
+            usage_row("day", 19_999, "2024-10-03", "claude", "old", 10, 2, 1.0),
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_scroll = usize::MAX;
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(rows[2].contains("daemon-owned API-equivalent estimate"));
+        assert!(rows[4].starts_with("2024-10-03"));
+        assert!(rows[48].contains("top/displayed bucket 2024-10-03"));
+
+        chrome.account_modal = Some(super::super::AccountModal {
+            account: "missing-account".into(),
+            scroll: 0,
+        });
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(
+            rows[48].trim().is_empty(),
+            "modal suppresses Usage footer context"
+        );
+        chrome.account_modal = None;
+
+        view.usage_stats.clear();
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(rows[2].contains("ALL 0 buckets"));
+        assert!(rows[2].contains("daemon-owned API-equivalent estimate"));
+        assert!(rows[3].contains("no usage history yet"));
+        assert!(
+            rows[48].trim().is_empty(),
+            "no invented top bucket for empty usage"
+        );
+    }
+
+    /// Usage scope is not a global footer default; MAIN and other overlays
+    /// retain both their blank/flash status line and their existing keybar.
+    #[test]
+    fn c5_usage_scope_does_not_change_other_footers() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![usage_row(
+            "day",
+            20_000,
+            "2024-10-04",
+            "claude",
+            "opus-x",
+            100,
+            20,
+            1.25,
+        )];
+        for (overlay, keybar) in [
+            (
+                Overlay::None,
+                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll",
+            ),
+            (
+                Overlay::Stats,
+                " stats — g/Esc back  ↑/k ↓/j model  PgUp/PgDn page  w window  q quit",
+            ),
+            (Overlay::Logs, " logs — l/Esc back  q quit"),
+        ] {
+            let mut chrome = chrome_overlay(overlay);
+            for status in [None, Some("switched to codex@example.com")] {
+                chrome.status_line = status.map(str::to_string);
+                let rows = render_rows(&view, &chrome, 160, 50);
+                assert_eq!(
+                    rows[48].trim_end(),
+                    status.map_or(String::new(), |status| format!(" {status}")),
+                    "non-Usage status line is unchanged"
+                );
+                assert_eq!(rows[49].trim_end(), keybar, "non-Usage keybar is unchanged");
+            }
+        }
     }
 
     /// Ledger number splitting (usage-cost polish): carry-safe rounding,
