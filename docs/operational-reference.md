@@ -40,6 +40,79 @@ columns, all ten tabs keep their name-only labels on every surface.
 Each tab's displayed hint and name share one clickable target; separators are
 not targets. These are existing keys, not new bindings or Tab/Enter navigation.
 
+### Dashboard layout (MAIN)
+
+Top to bottom, the dashboard is always: header, tab row, accounts, scheduler
+and detail, models, activity, the group settings line, the status line and
+the key bar. Numbers keep their usual format everywhere.
+
+- **Heights.** The header, the tab row, the settings line and the two bottom
+  rows take one row each. Accounts take one row per account plus two (title
+  and column header). Activity takes every row that is left, and at least 4
+  (its title and three entries). When the terminal is too short for all of
+  that, the accounts pane gives up rows first (it never goes below 3 rows),
+  and its title says how many accounts it cannot show — for example
+  `accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) · +12 more`.
+  The title always lists the number of accounts per group, in table order —
+  on the accounts tab too, which also adds `+N more` when its table is cut.
+  A pane height you set by dragging a border still wins over these rules.
+- **Scheduler and detail band.** When it fits, the scheduler summary and the
+  selected account's details share one 7-row band. Its top border reads
+  `scheduler · poller … · totals …` and, further right, `detail`; when the
+  border has no room for `totals …`, the totals move to the end of the
+  `mode` row. Below it, the left column shows each group's `current` row,
+  then `next` and `mode` (then `load` and the Codex settings while rows are
+  left). The last switch gets a row of its own directly under the `current`
+  row of the group that switched — `{previous} → {reason}, {age} ago`,
+  starting under the account name — and that row is blank before any
+  switch, so the band never changes height on a switch. After a `│` the
+  detail column shows six lines: name · credential type · order · status,
+  the token line, the 5h window, the 7d window, the lifetime totals and the
+  poll line (`poll  ok 4s ago · next ~5m18s`) — the same text as before,
+  uncut. Each band row pairs one left line with one detail line. The detail
+  lines start in one column, set so the widest of lines 2–6 ends at the
+  right edge; a row whose left text is longer than that starts its detail
+  line just after its own text, with its own `│`. Whether the band is used,
+  and where every column sits, changes only on a terminal width change, a
+  change to the set of accounts, a scheduler event (a switch, a failing
+  usage poll) or a count gaining a digit (for example `err` going from 999
+  to 1.0k). Moving the cursor does not change it, and neither does a clock
+  ticking, because the band keeps room for the widest form of everything
+  the cursor or the clock changes: the detail lines of every account the
+  cursor can select, and every countdown, age and time stamp at its widest
+  below 100 days (`99d23h`, a `MM-DD HH:MM` stamp). A value that grows past
+  that form — an age of 100 days or more — is never cut: the layout makes
+  room for it once. Event text — the current and previous account, the
+  switch reason, which group switched, the poll back-off list, the counts —
+  is measured as shown.
+  Below the needed width the dashboard keeps the previous 8-row scheduler
+  pane, with the 48-column detail pane beside it at 110 columns or more.
+  With 27-character account ids the band fits 179 columns for every switch
+  reason: an automatic switch (`SevenDayOverThreshold` /
+  `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on
+  the Codex side. The detail `reset`
+  line was never visible on the dashboard (the 8-row pane cut it off); it
+  appears in the band's seventh row when you drag the band taller than 7
+  rows and the line fits, and the accounts tab's detail pane always shows
+  it.
+- **Models.** When two or more models fit side by side, the models strip packs
+  them several to a line (for example, the top 5 on 3 lines): each entry
+  is the group, the model, the 10-cell share bar, requests, tokens, cost and
+  last use, aligned in columns, and the title row adds a dim
+  `group · model · share · req · tok · $ · last` legend when there is room.
+  Token counts are shown whole (`154581.1M`); the old fixed-width column cut
+  the unit off. Narrower terminals keep the one-model-per-row table. The
+  packing choice reserves room for the widest `last` value (`N in-flight`),
+  so a model starting or finishing a request does not change the strip's
+  height.
+- **Header tail.** When the header does not fit its row, its last part —
+  `cfg <config path>` and the attach marker — moves to the right end of the
+  tab row. There your home directory is shown as `~`, and the marker reads
+  just `attached` when it names the same pid the header already shows
+  (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
+  as before). If the tab row has no room either, the tail is left out (the
+  header used to cut it off). When the whole header fits, nothing moves.
+
 ### Reading account quota columns
 
 `LEFT` means quota remaining; `USED` means quota consumed. The `5h` header
@@ -161,6 +234,7 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes | yes |
 | Numeric combined auth states in `status` / Islands | no | yes | yes |
 | Gemini backend group (`llmux login --gemini`, the dashboard picker's Gemini row, `gemini` / `argon` models, Islands Gemini tiles) | no | no | yes |
+| Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
 
 Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
