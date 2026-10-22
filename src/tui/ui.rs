@@ -410,7 +410,14 @@ fn draw_main(
     // Accounts (rule 1): every row (n + 2) while activity keeps its floor;
     // on a terminal too short for both, the accounts pane shrinks first —
     // never below PANE_MIN_HEIGHT — and its title counts the hidden rows.
-    let accounts_full = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    // With the `z` fold, the rows the fold leaves plus its block's lines.
+    // One column-set decision for the table and its fold.
+    let layout = table_layout(view, ctx, area.width);
+    let fold = fold_plan(view, ctx, chrome, &layout, area.width);
+    let accounts_full = match fold.plan() {
+        Some(fold) => (snapshot.accounts.len() - fold.members.len() + fold.lines() + 2) as u16,
+        None => (snapshot.accounts.len().max(1) as u16).saturating_add(2),
+    };
     let table_height = chrome
         .pane_heights
         .accounts
@@ -452,7 +459,7 @@ fn draw_main(
         tabs_room(tabs_area, &tabs),
     );
     draw_tabs_tail(frame, tabs_area, header_tail);
-    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
     draw_middle(frame, middle_area, view, &middle);
     if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, ctx, now, strip);
@@ -2616,6 +2623,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
         key("wheel", "activity history · overlay cursors"),
         key("f m e", "codex fast / model / effort"),
         key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("z", "dashboard: fold the 7d-spent accounts into text"),
         key("o d", "sessions sort · perf/stats span"),
         key("h l", "perf day drill-down (←/→)"),
         key("j k ⏎ y/n", "config editor: cursor · activate · confirm"),
@@ -4995,9 +5003,16 @@ fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>
 }
 
 /// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) `,
-/// groups in table order, plus ` · +N more` when a pane of `height` rows
-/// (title + header + rows) cannot show all `order.len()` rows.
-fn accounts_title(sort: &str, view: &DashboardView, order: &[usize], height: u16) -> String {
+/// groups in table order, then MAIN's fold note (`fold`, [`Fold::note`];
+/// empty elsewhere), plus ` · +N more` when the pane cannot show `hidden`
+/// (> 0) of the `order.len()` accounts.
+fn accounts_title(
+    sort: &str,
+    view: &DashboardView,
+    order: &[usize],
+    fold: &str,
+    hidden: usize,
+) -> String {
     let mut groups: Vec<(BackendGroup, usize)> = Vec::new();
     for &idx in order {
         let group = view.snapshot.accounts[idx].group;
@@ -5011,47 +5026,38 @@ fn accounts_title(sort: &str, view: &DashboardView, order: &[usize], height: u16
         .map(|(g, count)| format!("{} {count}", g.as_str()))
         .collect::<Vec<_>>()
         .join(" · ");
-    let hidden = order
-        .len()
-        .saturating_sub(usize::from(height.saturating_sub(2)));
     let more = if hidden > 0 {
         format!(" · +{hidden} more")
     } else {
         String::new()
     };
     format!(
-        " accounts · sort {sort} · {} ({counts}){more} ",
+        " accounts · sort {sort} · {} ({counts}){fold}{more} ",
         order.len()
     )
 }
 
-fn draw_accounts(
-    frame: &mut Frame,
-    area: Rect,
-    view: &DashboardView,
-    ctx: &FrameCtx,
-    chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+/// The accounts table's column decisions for one pane width (.prd/18),
+/// made once so the table and MAIN's fold block ([`FoldPlan`]) never
+/// disagree about which columns exist.
+struct TableLayout {
+    /// The `7d Fbl` gauge column (config `show_fable_weekly`).
+    show_fable: bool,
+    /// The reset-inventory column (the daemon reports usage controls).
+    show_resets: bool,
+    /// The wide column set (`req` / `tok`).
+    wide: bool,
+    /// The `5h` stub.
+    show_five_h: bool,
+    name_width: u16,
+    status_width: u16,
+    /// Each stretchy gauge's bar width, and its whole cell's width.
+    bar_width: usize,
+    gauge_cell: u16,
+}
+
+fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout {
     let snapshot = &view.snapshot;
-    // The title carries the active within-group order (`o` toggles it), so the
-    // operator never has to guess why two rows swapped — plus the per-group
-    // account counts and, when the pane is shorter than the table, how many
-    // rows it cannot show (never a silent cut).
-    let title = if snapshot.accounts.is_empty() {
-        format!(" accounts · sort {} ", chrome.account_sort.label())
-    } else {
-        accounts_title(chrome.account_sort.label(), view, &ctx.order, area.height)
-    };
-    let block = Block::new().borders(Borders::TOP).title(title);
-    if snapshot.accounts.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled(
-            "no accounts — run `llmux login` or `llmux import`, then press R",
-            Style::new().fg(Color::Yellow),
-        )))
-        .block(block);
-        frame.render_widget(empty, area);
-        return Vec::new();
-    }
     let show_fable = view.show_fable_weekly;
     // Reset-inventory column (.prd/16): shown only when the daemon reports
     // usage-control metadata at all, so an older daemon's table is
@@ -5115,7 +5121,7 @@ fn draw_accounts(
         let ncols = base_cols + n_gauges + with_five_h as usize + show_resets as usize;
         width + (ncols - 1)
     };
-    let avail = area.width as usize;
+    let avail = width as usize;
     // The wide column set is used whenever it actually FITS (Z 2026-07-13:
     // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
     // hid req/tok and poured the width into fat bars instead). "Fits" is judged
@@ -5161,13 +5167,27 @@ fn draw_accounts(
         (QUOTA_BAR_WIDTH + leftover / n_gauges).min(GAUGE_BAR_MAX)
     };
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
+    TableLayout {
+        show_fable,
+        show_resets,
+        wide,
+        show_five_h,
+        name_width,
+        status_width,
+        bar_width,
+        gauge_cell,
+    }
+}
 
-    let selected = match chrome.mode {
+/// The display position the account cursor is on, in the modes that have
+/// one; `None` otherwise.
+fn cursor_pos(chrome: &Chrome, len: usize) -> Option<usize> {
+    match chrome.mode {
         Mode::Select { idx }
         | Mode::ConfirmRemove { idx }
         | Mode::ConfirmReset { idx }
         | Mode::EditLimits { idx }
-        | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
+        | Mode::ContextMenu { idx, .. } => Some(idx.min(len.saturating_sub(1))),
         // NewLogin is a provider picker, not an account-row cursor; the
         // config-editor modes live in the Config overlay.
         Mode::Normal
@@ -5175,20 +5195,77 @@ fn draw_accounts(
         | Mode::NewLogin { .. }
         | Mode::ConfigEdit { .. }
         | Mode::ConfigConfirm { .. } => None,
+    }
+}
+
+fn draw_accounts(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) -> Vec<AccountRowHit> {
+    let layout = table_layout(view, ctx, area.width);
+    draw_accounts_with(frame, area, view, ctx, chrome, &Fold::Off, &layout)
+}
+
+/// [`draw_accounts`] with MAIN's fold (`z`): when it applies, the table
+/// keeps the accounts the fold does not hold — in display order, each with
+/// its own `#` and click target — and the block sits directly under its
+/// rows; either way the title says what the fold did this frame. `layout`
+/// is the one [`table_layout`] the fold was planned with, so the table and
+/// the fold never see different column sets.
+#[allow(clippy::too_many_arguments)]
+fn draw_accounts_with(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    fold_state: &Fold,
+    layout: &TableLayout,
+) -> Vec<AccountRowHit> {
+    let snapshot = &view.snapshot;
+    let fold = fold_state.plan();
+    let table: Vec<usize> = (0..ctx.order.len())
+        .filter(|pos| fold.is_none_or(|f| !f.members.contains(pos)))
+        .collect();
+    // The title carries the active within-group order (`o` toggles it), so the
+    // operator never has to guess why two rows swapped — plus the per-group
+    // account counts and, when the pane is shorter than the table, how many
+    // accounts it cannot show (never a silent cut): hidden table rows, then
+    // the folded accounts on the fold lines below the pane's edge.
+    let title = if snapshot.accounts.is_empty() {
+        format!(" accounts · sort {} ", chrome.account_sort.label())
+    } else {
+        let lines = usize::from(area.height.saturating_sub(2));
+        let hidden = table.len().saturating_sub(lines)
+            + fold.map_or(0, |f| f.hidden(lines.saturating_sub(table.len())));
+        accounts_title(
+            chrome.account_sort.label(),
+            view,
+            &ctx.order,
+            &fold_state.note(),
+            hidden,
+        )
     };
-    let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
-        let account = &snapshot.accounts[account_idx];
+    let block = Block::new().borders(Borders::TOP).title(title);
+    if snapshot.accounts.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no accounts — run `llmux login` or `llmux import`, then press R",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(block);
+        frame.render_widget(empty, area);
+        return Vec::new();
+    }
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let rows = table.iter().map(|&pos| {
+        let account = &snapshot.accounts[ctx.order[pos]];
         let cursor = selected == Some(pos);
         let row = account_row(
-            account,
-            view,
-            ctx,
-            pos,
-            wide,
-            cursor,
-            bar_width,
-            show_fable,
-            show_five_h,
+            account_row_parts(account, view, ctx, pos, cursor, layout),
+            layout.bar_width,
         );
         if cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
@@ -5214,6 +5291,7 @@ fn draw_accounts(
         crate::config::QuotaDisplay::Remaining => "LEFT",
         crate::config::QuotaDisplay::Used => "USED",
     };
+    let n_gauges = 1 + layout.show_fable as usize;
     let (header, constraints): (Vec<Cell<'static>>, Vec<Constraint>) = {
         let mut header: Vec<Cell<'static>> = ["", "group", "#", "account", "status"]
             .into_iter()
@@ -5223,73 +5301,104 @@ fn draw_accounts(
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Length(name_width),
-            Constraint::Length(status_width),
+            Constraint::Length(layout.name_width),
+            Constraint::Length(layout.status_width),
         ];
-        if show_five_h {
+        if layout.show_five_h {
             header.push(Cell::from(format!("5h {quota_label}")));
             constraints.push(Constraint::Length(FIVE_H_COL_WIDTH));
         }
         for title in ["7d RESET", "7d Fbl RESET"].into_iter().take(n_gauges) {
             header.push(Cell::from(format!(
                 "{title:<width$}{quota_label}",
-                width = (gauge_cell as usize - quota_label.len() - 1).max(title.len() + 1),
+                width = (layout.gauge_cell as usize - quota_label.len() - 1).max(title.len() + 1),
             )));
-            constraints.push(Constraint::Length(gauge_cell));
+            constraints.push(Constraint::Length(layout.gauge_cell));
         }
-        if show_resets {
+        if layout.show_resets {
             header.push(Cell::from("rst"));
             constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
         header.push(Cell::from("if"));
         constraints.push(Constraint::Length(3));
-        if wide {
+        if layout.wide {
             header.extend(["req", "tok"].into_iter().map(Cell::from));
             constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
         }
         (header, constraints)
     };
 
-    let table = Table::new(rows, constraints)
+    let table_widget = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(block);
-    frame.render_widget(table, area);
-    // Row hit map (UI-3 U11): row `pos` renders at area.y + 2 + pos (top
-    // border/title + header row), one line high, full table width. Rows
-    // clipped by the pane height are not clickable.
-    ctx.order
+    // With the fold, the table stops at its own rows so the block can take
+    // the lines below them.
+    let table_area = match fold {
+        Some(_) => Rect {
+            height: area.height.min((table.len() as u16).saturating_add(2)),
+            ..area
+        },
+        None => area,
+    };
+    frame.render_widget(table_widget, table_area);
+    // Row hit map (UI-3 U11): table row `i` renders at area.y + 2 + i (top
+    // border/title + header row), one line high, full table width, and maps
+    // to its account's display position. Rows clipped by the pane height are
+    // not clickable.
+    let mut hits: Vec<AccountRowHit> = table
         .iter()
         .enumerate()
-        .filter(|(pos, _)| area.y as usize + 2 + pos < area.bottom() as usize)
-        .map(|(pos, _)| AccountRowHit {
+        .filter(|(row, _)| area.y as usize + 2 + row < area.bottom() as usize)
+        .map(|(row, &pos)| AccountRowHit {
             area: Rect {
                 x: area.x,
-                y: area.y + 2 + pos as u16,
+                y: area.y + 2 + row as u16,
                 width: area.width,
                 height: 1,
             },
             display_idx: pos,
         })
-        .collect()
+        .collect();
+    if let Some(fold) = fold {
+        let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
+        hits.extend(draw_fold(frame, area, top, fold));
+    }
+    hits
 }
 
-#[allow(clippy::too_many_arguments)]
-fn account_row<'a>(
-    account: &'a AccountSnapshot,
-    view: &'a DashboardView,
+/// One account's table cells as parts: the table turns them into a row
+/// ([`account_row`]), MAIN's fold block into text fields ([`fold_fields`]),
+/// so both show the same strings in the same styles.
+struct RowParts {
+    marker: Span<'static>,
+    group: Span<'static>,
+    number: Span<'static>,
+    name: Span<'static>,
+    status: Span<'static>,
+    /// Present when the layout keeps the `5h` stub.
+    five_h: Option<Span<'static>>,
+    seven: GaugeParts,
+    /// Present when the `7d Fbl` column is on.
+    fable: Option<GaugeParts>,
+    /// Present when the reset-inventory column is shown.
+    resets: Option<Span<'static>>,
+    in_flight: Span<'static>,
+    /// `req` / `tok`, in the wide column set.
+    totals: Option<(String, String)>,
+}
+
+/// Build one account's [`RowParts`] for the columns `layout` keeps (the
+/// effective `5h` / Fbl / `rst` / wide decisions from [`table_layout`] —
+/// reading the view/config here would push a cell into a column the
+/// header/constraints did not reserve).
+fn account_row_parts(
+    account: &AccountSnapshot,
+    view: &DashboardView,
     ctx: &FrameCtx,
     pos: usize,
-    wide: bool,
     cursor: bool,
-    bar_width: usize,
-    // The Fable-column toggle, and the EFFECTIVE `5h` flag from
-    // [`draw_accounts`] (the column drops whole at a width where even a
-    // floor-width status cannot make the row fit) — reading the view/config
-    // here would push a cell into a column the header/constraints did not
-    // reserve.
-    show_fable: bool,
-    show_five_h: bool,
-) -> Row<'a> {
+    layout: &TableLayout,
+) -> RowParts {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let now = ctx.now;
@@ -5348,7 +5457,7 @@ fn account_row<'a>(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let seven_gauge = window_gauge_cell(
+    let seven = window_gauge_parts(
         &account.seven_day,
         params.seven_day_max,
         parked,
@@ -5357,28 +5466,14 @@ fn account_row<'a>(
         consecutive_failures,
         ctx.quota_display,
         ctx.reset_absolute,
-        bar_width,
     );
     let totals = view.totals_for(&account.id.0);
-
     let group_label = account.group.as_str();
-    let mut cells = vec![
-        Cell::from(marker),
-        Cell::from(Span::styled(
-            group_label.to_uppercase(),
-            group_color(Some(group_label)).add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(format!("{}", pos + 1), dim())),
-        Cell::from(name),
-    ];
-    cells.push(Cell::from(status_span(
-        account, gate, is_current, params, now, ctx.frame,
-    )));
     // The `5h` stub (.prd/18): Claude-only, fixed 8 cells, dropped whole at a
     // width where the row cannot hold it — the header/constraints make the same
-    // call above, so the cells stay column-aligned.
-    if show_five_h {
-        cells.push(five_hour_cell(
+    // call, so the cells stay column-aligned.
+    let five_h = layout.show_five_h.then(|| {
+        let (text, style) = five_hour_text(
             account.group,
             &account.five_hour,
             params.five_hour_max,
@@ -5387,16 +5482,15 @@ fn account_row<'a>(
             max_age,
             consecutive_failures,
             ctx.quota_display,
-        ));
-    }
-    cells.push(seven_gauge);
-    // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
-    // same slot (after 7d) as the header/constraints reserve above, so the
-    // cells stay column-aligned. Claude-only, like the 5h stub: a non-Claude
-    // row reads `-`, a Claude row with an absent window keeps the cold state
-    // 7d uses.
-    if show_fable {
-        cells.push(fable_gauge_cell(
+        );
+        Span::styled(text, style)
+    });
+    // Fbl gauge (fable-usage U9a): only when the toggle is on, in the same
+    // slot (after 7d) as the header/constraints reserve, so the cells stay
+    // column-aligned. Claude-only, like the 5h stub: a non-Claude row reads
+    // `-`, a Claude row with an absent window keeps the cold state 7d uses.
+    let fable = layout.show_fable.then(|| {
+        fable_gauge_parts(
             account.group,
             account.fable_weekly(),
             now,
@@ -5405,14 +5499,13 @@ fn account_row<'a>(
             ctx.quota_display,
             ctx.reset_absolute,
             select::effective_limits(account, params).2,
-            bar_width,
-        ));
-    }
+        )
+    });
     // Reset inventory (.prd/16), in the same slot the header/constraints
     // reserve: `?` unknown, `N` owned, `N*` owned-but-none-applicable, `—` for
-    // a provider with no resets at all. Rendered only when the daemon reports
+    // a provider with no resets at all. Shown only when the daemon reports
     // control metadata, so an older daemon's table is unchanged.
-    if !view.usage_controls.is_empty() {
+    let resets = layout.show_resets.then(|| {
         let label =
             super::view::reset_cell(view.usage_control(&account.id.0), account.credential_kind);
         // Unknown and "owned but not applicable now" are dimmed rather than
@@ -5422,14 +5515,541 @@ fn account_row<'a>(
         } else {
             Style::new()
         };
-        cells.push(Cell::from(Span::styled(label, style)));
+        Span::styled(label, style)
+    });
+    RowParts {
+        marker,
+        group: Span::styled(
+            group_label.to_uppercase(),
+            group_color(Some(group_label)).add_modifier(Modifier::BOLD),
+        ),
+        number: Span::styled(format!("{}", pos + 1), dim()),
+        name,
+        status: status_span(account, gate, is_current, params, now, ctx.frame),
+        five_h,
+        seven,
+        fable,
+        resets,
+        in_flight: in_flight_span(account.in_flight),
+        totals: layout.wide.then(|| {
+            (
+                format::human_count(totals.requests),
+                format::human_count(totals.tokens()),
+            )
+        }),
     }
-    cells.push(Cell::from(in_flight_span(account.in_flight)));
-    if wide {
-        cells.push(Cell::from(format::human_count(totals.requests)));
-        cells.push(Cell::from(format::human_count(totals.tokens())));
+}
+
+/// One accounts-table row from its [`RowParts`], cells in column order;
+/// the gauges are drawn as `bar_width`-column bars.
+fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
+    let mut cells = vec![
+        Cell::from(parts.marker),
+        Cell::from(parts.group),
+        Cell::from(parts.number),
+        Cell::from(parts.name),
+        Cell::from(parts.status),
+    ];
+    cells.extend(parts.five_h.map(Cell::from));
+    cells.push(parts.seven.cell(bar_width));
+    cells.extend(parts.fable.map(|fable| fable.cell(bar_width)));
+    cells.extend(parts.resets.map(Cell::from));
+    cells.push(Cell::from(parts.in_flight));
+    if let Some((requests, tokens)) = parts.totals {
+        cells.push(Cell::from(requests));
+        cells.push(Cell::from(tokens));
     }
     Row::new(cells)
+}
+
+/// Blank cells between two fold entries on one line.
+const FOLD_ENTRY_GAP: usize = 3;
+
+/// What MAIN's fold (`z`) does this frame — decided in [`draw_main`] and
+/// stated in the accounts title, so the toggle never claims a fold that did
+/// not happen.
+enum Fold {
+    /// The toggle is off.
+    Off,
+    /// On, but no account is 7d-spent.
+    Nothing,
+    /// On, but no entry form fits: its title (`+N more` at its widest) or
+    /// not even one entry per line is wider than the pane.
+    TooNarrow,
+    /// On, but the block would not take fewer rows than its accounts' table
+    /// rows (rule A).
+    SavesNoRow,
+    Applied(FoldPlan),
+}
+
+impl Fold {
+    fn plan(&self) -> Option<&FoldPlan> {
+        match self {
+            Fold::Applied(plan) => Some(plan),
+            Fold::Off | Fold::Nothing | Fold::TooNarrow | Fold::SavesNoRow => None,
+        }
+    }
+
+    /// The accounts-title segment: the fold label when it applies
+    /// ([`spent_note`]), why not when it is on but does not apply, nothing
+    /// when it is off.
+    fn note(&self) -> String {
+        match self {
+            Fold::Off => String::new(),
+            Fold::Nothing => " · fold: nothing to fold".to_string(),
+            Fold::TooNarrow => " · fold: too narrow".to_string(),
+            Fold::SavesNoRow => " · fold: saves no row".to_string(),
+            Fold::Applied(plan) => spent_note(plan.members.len(), plan.shared_status.as_deref()),
+        }
+    }
+}
+
+/// The fold label in the accounts title: ` · 7d spent 9 folded: 7d 100.0% >
+/// 99%` with the status every member shares, ` · 7d spent 9 folded` when
+/// each entry carries its own.
+fn spent_note(count: usize, shared_status: Option<&str>) -> String {
+    match shared_status {
+        Some(status) => format!(" · 7d spent {count} folded: {status}"),
+        None => format!(" · 7d spent {count} folded"),
+    }
+}
+
+/// MAIN's fold of the 7d-spent accounts (`z`, owner decision 2026-10-22,
+/// "넣기, 기본 꺼짐") for one frame, decided in [`draw_main`] before the
+/// layout because the accounts pane's height depends on it. Members are the
+/// accounts the scheduler holds back for `SevenDayOverThreshold` — the ones
+/// whose status reads `7d N% > N%` — and only those: a `!` for any other
+/// reason (5h, Fable, auth) keeps its table row. Membership is recomputed
+/// every frame. Every value the member's table row shows stays on screen,
+/// as text (owner contract 2026-09: 기존에 보였던 모든 정보는 그대로).
+struct FoldPlan {
+    /// Display positions (`ctx.order` indices) of the folded accounts, in
+    /// table order.
+    members: Vec<usize>,
+    /// One entry per member, in table order: its table cells as fields.
+    entries: Vec<Vec<FoldField>>,
+    /// Index into `members` of the account under the cursor, if folded.
+    cursor: Option<usize>,
+    /// The status text every member shares, shown once in the accounts
+    /// title; `None` = the statuses differ, each entry has its own field.
+    shared_status: Option<String>,
+    /// Entries per line, and each entry column's field widths.
+    per_line: usize,
+    columns: Vec<Vec<usize>>,
+}
+
+impl FoldPlan {
+    /// Lines the block takes: the field header, then one line per
+    /// `per_line` entries.
+    fn lines(&self) -> usize {
+        1 + self.members.len().div_ceil(self.per_line)
+    }
+
+    /// Members the block cannot show when only its first `lines` lines fit
+    /// the pane.
+    fn hidden(&self, lines: usize) -> usize {
+        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
+        self.members.len().saturating_sub(shown)
+    }
+}
+
+/// One field of a fold entry: the header word over it, its alignment and
+/// the table cell's text.
+struct FoldField {
+    header: &'static str,
+    right: bool,
+    spans: Vec<Span<'static>>,
+    /// The widest form a clock tick can give this field ([`FoldBounds`]);
+    /// 0 for a field only a poll or an event can change.
+    min: usize,
+}
+
+impl FoldField {
+    /// Cells the field's column must hold for this entry: the live text,
+    /// or its widest clock-driven form when that is wider — so a value
+    /// past that form (a 100-day countdown) widens the column, never cut.
+    fn width(&self) -> usize {
+        self.spans
+            .iter()
+            .map(Span::width)
+            .sum::<usize>()
+            .max(self.min)
+    }
+}
+
+/// The widest form of each fold field the clock alone can change (rule B:
+/// a tick never moves the fold), formatted by the same code as the live
+/// text — PR-A's [`BOUND_SPANS`] idea:
+///
+/// - a gauge's reset text: the widest countdown below 100 days (or the
+///   absolute stamp under `t`) plus the display-state glyph a window gains
+///   when it goes stale or expires (`23h 59m ◑`);
+/// - the `5h` stub on a Claude row: its widest state `◑ 100%!` — the window
+///   expiring (`○ 100%`) or going stale (`◑ 70%`) needs no poll;
+/// - the Fbl percent: `100%!` — its window can expire without ending the
+///   account's 7d membership (the 7d percent cannot: expiry ends it).
+struct FoldBounds {
+    reset: usize,
+    five_h: usize,
+    percent: usize,
+}
+
+impl FoldBounds {
+    fn new(reset_absolute: bool, max_age: Duration) -> Self {
+        let now = bound_now();
+        let glyphs = [
+            WindowDisplayState::Cold,
+            WindowDisplayState::Stale,
+            WindowDisplayState::PollDegraded,
+        ];
+        let bar = |text: String, marker: Option<char>| GaugeParts::Bar {
+            fill: 1.0,
+            color: Color::Reset,
+            text,
+            bold_chars: 0,
+            over: true,
+            marker,
+        };
+        let cells = |spans: Vec<Span<'static>>| spans.iter().map(Span::width).sum::<usize>();
+        let reset = BOUND_SPANS
+            .into_iter()
+            .flat_map(|span| {
+                let window = QuotaWindow {
+                    utilization: 1.0,
+                    resets_at: now + span,
+                    fetched_at: now,
+                    source: crate::scheduler::window::WindowSource::Headers,
+                };
+                glyphs.map(|state| {
+                    let (text, _, _) = quota_bar_text(&window, now, state, reset_absolute);
+                    cells(bar(text, Some(state.glyph())).text_fields().0)
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        let stale = QuotaWindow {
+            utilization: 1.0,
+            resets_at: now + BOUND_SPANS[0],
+            fetched_at: now - max_age - Duration::from_secs(1),
+            source: crate::scheduler::window::WindowSource::Headers,
+        };
+        let (five, _) = five_hour_text(
+            BackendGroup::Claude,
+            &Some(stale),
+            0.0,
+            false,
+            now,
+            max_age,
+            0,
+            crate::config::QuotaDisplay::Used,
+        );
+        Self {
+            reset,
+            five_h: Line::from(five).width(),
+            percent: cells(bar(String::new(), None).text_fields().1),
+        }
+    }
+}
+
+/// An account's fold entry: its table cells as fields, in column order —
+/// each gauge becomes its reset text and its percent label (marks and
+/// colors kept, only the fill bar goes), and the status field is left out
+/// when the label column shows the status every member shares.
+fn fold_fields(
+    parts: RowParts,
+    with_status: bool,
+    claude: bool,
+    bounds: &FoldBounds,
+) -> Vec<FoldField> {
+    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| FoldField {
+        header,
+        right,
+        spans,
+        min: 0,
+    };
+    let bounded = |mut field: FoldField, min: usize| {
+        field.min = min;
+        field
+    };
+    // Only a drawn gauge has a countdown that ticks; a bare state (`○ cold`,
+    // `-`) changes on a poll.
+    let gauge = |gauge: &GaugeParts, reset: usize| match gauge {
+        GaugeParts::Bar { .. } => reset,
+        GaugeParts::Bare(_) => 0,
+    };
+    let mut fields = vec![
+        field("", false, vec![parts.marker]),
+        field("group", false, vec![parts.group]),
+        field("#", true, vec![parts.number]),
+        field("account", false, vec![parts.name]),
+    ];
+    if with_status {
+        fields.push(field("status", false, vec![parts.status]));
+    }
+    let five_h_min = if claude { bounds.five_h } else { 0 };
+    fields.extend(
+        parts
+            .five_h
+            .map(|five| bounded(field("5h", false, vec![five]), five_h_min)),
+    );
+    let (reset, percent) = parts.seven.text_fields();
+    let reset_min = gauge(&parts.seven, bounds.reset);
+    fields.push(bounded(field("7d RESET", false, reset), reset_min));
+    fields.push(field("7d", true, percent));
+    if let Some(fable) = parts.fable {
+        let (reset, percent) = fable.text_fields();
+        let (reset_min, percent_min) = (gauge(&fable, bounds.reset), gauge(&fable, bounds.percent));
+        fields.push(bounded(field("Fbl RESET", false, reset), reset_min));
+        fields.push(bounded(field("Fbl", true, percent), percent_min));
+    }
+    fields.extend(parts.resets.map(|resets| field("rst", false, vec![resets])));
+    fields.push(field("if", false, vec![parts.in_flight]));
+    if let Some((requests, tokens)) = parts.totals {
+        fields.push(field("req", false, vec![Span::raw(requests)]));
+        fields.push(field("tok", false, vec![Span::raw(tokens)]));
+    }
+    fields
+}
+
+/// Field widths per entry column when `per_line` entries share a line:
+/// column `c` holds entries `c`, `c + per_line`, …, and each of its fields
+/// is as wide as its widest entry or its header.
+fn fold_columns(widths: &[Vec<usize>], headers: &[usize], per_line: usize) -> Vec<Vec<usize>> {
+    (0..per_line)
+        .map(|c| {
+            headers
+                .iter()
+                .enumerate()
+                .map(|(f, &header)| {
+                    widths
+                        .iter()
+                        .skip(c)
+                        .step_by(per_line)
+                        .map(|w| w[f])
+                        .max()
+                        .unwrap_or(0)
+                        .max(header)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Width of one entry: its fields and the one-cell gap between each pair.
+fn fold_entry_width(column: &[usize]) -> usize {
+    column.iter().sum::<usize>() + column.len().saturating_sub(1)
+}
+
+/// Width of a full fold line: the entries and the gaps between them.
+fn fold_line_width(columns: &[Vec<usize>]) -> usize {
+    columns.iter().map(|c| fold_entry_width(c)).sum::<usize>()
+        + FOLD_ENTRY_GAP * columns.len().saturating_sub(1)
+}
+
+/// The fold for this frame ([`Fold`]), planned with the table's own
+/// `layout` at the pane `width`:
+///
+/// 1. the shared form — the status every member shares shown once, in the
+///    accounts title — applies only if that whole title fits `width` in
+///    cells, with `+N more` at its widest (every account hidden), so the
+///    choice never depends on the pane height;
+/// 2. otherwise each entry carries its own status field, and that title
+///    must fit by the same measure — else the fold is too narrow;
+/// 3. entries per line = the most whose aligned line fits `width` (none →
+///    too narrow), every clock-driven field at its widest form
+///    ([`FoldBounds`], rule B), and the block must save a row (rule A —
+///    with one or two members it never does).
+fn fold_plan(
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    layout: &TableLayout,
+    width: u16,
+) -> Fold {
+    if !chrome.fold_exhausted {
+        return Fold::Off;
+    }
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let spent = |pos: usize| {
+        let account = &snapshot.accounts[ctx.order[pos]];
+        (select::eligibility(account, params, ctx.now, ctx.headers_only)
+            == Some(IneligibleReason::SevenDayOverThreshold))
+        .then(|| {
+            select::blocking_reason(
+                account,
+                IneligibleReason::SevenDayOverThreshold,
+                params,
+                ctx.now,
+            )
+        })
+    };
+    let (members, reasons): (Vec<usize>, Vec<String>) = (0..ctx.order.len())
+        .filter_map(|pos| spent(pos).map(|reason| (pos, reason)))
+        .unzip();
+    let Some(first) = reasons.first() else {
+        return Fold::Nothing;
+    };
+    let title_fits = |status: Option<&str>| {
+        let title = accounts_title(
+            chrome.account_sort.label(),
+            view,
+            &ctx.order,
+            &spent_note(members.len(), status),
+            ctx.order.len(),
+        );
+        Line::from(title).width() <= usize::from(width)
+    };
+    // The status text as the scheduler words it — the table's animated
+    // glyph stays in the table.
+    let shared_status = reasons
+        .iter()
+        .all(|r| r == first)
+        .then(|| first.clone())
+        .filter(|status| title_fits(Some(status)));
+    if shared_status.is_none() && !title_fits(None) {
+        return Fold::TooNarrow;
+    }
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let bounds = FoldBounds::new(ctx.reset_absolute, params.usage_max_age);
+    let entries: Vec<Vec<FoldField>> = members
+        .iter()
+        .map(|&pos| {
+            let account = &snapshot.accounts[ctx.order[pos]];
+            let parts = account_row_parts(account, view, ctx, pos, selected == Some(pos), layout);
+            let claude = account.group == BackendGroup::Claude;
+            fold_fields(parts, shared_status.is_none(), claude, &bounds)
+        })
+        .collect();
+    let widths: Vec<Vec<usize>> = entries
+        .iter()
+        .map(|entry| entry.iter().map(FoldField::width).collect())
+        .collect();
+    let headers: Vec<usize> = entries[0]
+        .iter()
+        .map(|f| Line::from(f.header).width())
+        .collect();
+    let Some((per_line, columns)) = (1..=members.len()).rev().find_map(|per_line| {
+        let columns = fold_columns(&widths, &headers, per_line);
+        (fold_line_width(&columns) <= usize::from(width)).then_some((per_line, columns))
+    }) else {
+        return Fold::TooNarrow;
+    };
+    // The fold never makes the pane taller (rule A): its header line plus
+    // its entry lines must take fewer rows than the members' table rows.
+    if 1 + members.len().div_ceil(per_line) >= members.len() {
+        return Fold::SavesNoRow;
+    }
+    Fold::Applied(FoldPlan {
+        cursor: members.iter().position(|&pos| selected == Some(pos)),
+        members,
+        entries,
+        shared_status,
+        per_line,
+        columns,
+    })
+}
+
+/// Lay one entry's (or the header's) fields out at the column widths, a
+/// one-cell gap between fields; `reversed` paints the whole entry the way
+/// the table paints the row under the cursor.
+fn fold_cells(
+    fields: impl Iterator<Item = (Vec<Span<'static>>, bool)>,
+    widths: &[usize],
+    reversed: bool,
+) -> Vec<Span<'static>> {
+    let paint = |style: Style| {
+        if reversed {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        }
+    };
+    let blank = |n: usize| Span::styled(" ".repeat(n), paint(Style::new()));
+    let mut out = Vec::new();
+    for (f, ((spans, right), &width)) in fields.zip(widths).enumerate() {
+        if f > 0 {
+            out.push(blank(1));
+        }
+        let fill = width.saturating_sub(spans.iter().map(Span::width).sum());
+        if right && fill > 0 {
+            out.push(blank(fill));
+        }
+        out.extend(
+            spans
+                .into_iter()
+                .map(|span| Span::styled(span.content, paint(span.style))),
+        );
+        if !right && fill > 0 {
+            out.push(blank(fill));
+        }
+    }
+    out
+}
+
+/// Draw the fold block from row `top` down, from the table's left column
+/// (lines past the pane's bottom are cut, and counted in its title), and
+/// return a click target per visible entry, mapped to its account's display
+/// position.
+fn draw_fold(frame: &mut Frame, area: Rect, top: u16, fold: &FoldPlan) -> Vec<AccountRowHit> {
+    let gap = || Span::raw(" ".repeat(FOLD_ENTRY_GAP));
+    // Line 0: the dim field header over every entry column.
+    let mut header = Vec::new();
+    for (c, widths) in fold.columns.iter().enumerate() {
+        if c > 0 {
+            header.push(gap());
+        }
+        let fields = fold.entries[0]
+            .iter()
+            .map(|f| (vec![Span::styled(f.header, dim())], f.right));
+        header.extend(fold_cells(fields, widths, false));
+    }
+    let mut lines = vec![(Line::from(header), Vec::new())];
+    for (i, chunk) in fold.entries.chunks(fold.per_line).enumerate() {
+        let mut spans = Vec::new();
+        let mut x = 0;
+        let mut targets = Vec::new();
+        for (c, entry) in chunk.iter().enumerate() {
+            if c > 0 {
+                spans.push(gap());
+                x += FOLD_ENTRY_GAP;
+            }
+            let member = i * fold.per_line + c;
+            let fields = entry.iter().map(|f| (f.spans.clone(), f.right));
+            spans.extend(fold_cells(
+                fields,
+                &fold.columns[c],
+                fold.cursor == Some(member),
+            ));
+            let width = fold_entry_width(&fold.columns[c]);
+            targets.push((x, width, fold.members[member]));
+            x += width;
+        }
+        lines.push((Line::from(spans), targets));
+    }
+    let mut hits = Vec::new();
+    for (i, (line, targets)) in lines.into_iter().enumerate() {
+        let y = top.saturating_add(i as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        let row = Rect {
+            y,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(line), row);
+        hits.extend(targets.into_iter().map(|(x, width, pos)| AccountRowHit {
+            area: Rect {
+                x: area.x.saturating_add(x as u16),
+                y,
+                width: width as u16,
+                height: 1,
+            },
+            display_idx: pos,
+        }));
+    }
+    hits
 }
 
 /// Status column: active (green) / ready (default) / the concrete blocking
@@ -5672,8 +6292,11 @@ fn quota_cell_line(
 /// Issue #33: the cell still carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct
 /// from an honest fresh value — render-only, derived from recorded state.
+///
+/// Returned as [`GaugeParts`]: the table draws them as the bar, MAIN's fold
+/// block writes the same values as text.
 #[allow(clippy::too_many_arguments)]
-fn window_gauge_cell(
+fn window_gauge_parts(
     window: &Option<QuotaWindow>,
     threshold: f64,
     parked: bool,
@@ -5682,13 +6305,12 @@ fn window_gauge_cell(
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
-    bar_width: usize,
-) -> Cell<'static> {
+) -> GaugeParts {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
         // Cold (or poll-degraded with no window yet): show the state, not a bare
         // — that reads the same as "0% used".
-        return Cell::from(Span::styled(
+        return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
@@ -5703,9 +6325,80 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
-    Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width, marker,
-    ))
+    GaugeParts::Bar {
+        fill,
+        color,
+        text,
+        bold_chars,
+        over,
+        marker,
+    }
+}
+
+/// A quota gauge's content before it is drawn: a bare state text
+/// (`○ cold`, `-`), or a fill with its reset text, display-state marker and
+/// `!`-marked percent label.
+enum GaugeParts {
+    Bare(Span<'static>),
+    Bar {
+        fill: f64,
+        color: Color,
+        text: String,
+        bold_chars: usize,
+        over: bool,
+        marker: Option<char>,
+    },
+}
+
+impl GaugeParts {
+    /// The accounts-table cell: the in-bar gauge ([`quota_cell_line`]).
+    fn cell(self, bar_width: usize) -> Cell<'static> {
+        match self {
+            GaugeParts::Bare(span) => Cell::from(span),
+            GaugeParts::Bar {
+                fill,
+                color,
+                text,
+                bold_chars,
+                over,
+                marker,
+            } => Cell::from(quota_cell_line(
+                fill, color, &text, bold_chars, over, bar_width, marker,
+            )),
+        }
+    }
+
+    /// The same values as text, for MAIN's fold block: the reset field (the
+    /// bar's text with its bold first unit and its marker after it) and the
+    /// percent field — only the fill bar is gone. A bare state is the
+    /// reset field alone.
+    fn text_fields(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        match self {
+            GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
+            GaugeParts::Bar {
+                fill,
+                color,
+                text,
+                bold_chars,
+                over,
+                marker,
+            } => {
+                let style = Style::new().fg(*color);
+                let head: String = text.chars().take(*bold_chars).collect();
+                let tail: String = text.chars().skip(*bold_chars).collect();
+                let mut reset = vec![Span::styled(head, style.add_modifier(Modifier::BOLD))];
+                if !tail.is_empty() {
+                    reset.push(Span::styled(tail, style));
+                }
+                reset.extend(marker.map(|m| Span::styled(format!(" {m}"), style)));
+                let mut label = format::percent(*fill);
+                if *over {
+                    label.push('!');
+                }
+                (reset, vec![Span::styled(label, style)])
+            }
+        }
+    }
 }
 
 /// The `5h` cell (.prd/18, owner 2026-09-18): a Claude-only compact stub that
@@ -5760,31 +6453,6 @@ fn five_hour_text(
     (text, Style::new().fg(color))
 }
 
-/// [`five_hour_text`] as a table cell.
-#[allow(clippy::too_many_arguments)]
-fn five_hour_cell(
-    group: crate::routing::BackendGroup,
-    window: &Option<QuotaWindow>,
-    threshold: f64,
-    parked: bool,
-    now: SystemTime,
-    max_age: Duration,
-    consecutive_failures: u32,
-    mode: crate::config::QuotaDisplay,
-) -> Cell<'static> {
-    let (text, style) = five_hour_text(
-        group,
-        window,
-        threshold,
-        parked,
-        now,
-        max_age,
-        consecutive_failures,
-        mode,
-    );
-    Cell::from(Span::styled(text, style))
-}
-
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
 /// following the same pattern as [`window_cells`] but as a single cell (no
 /// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
@@ -5818,7 +6486,7 @@ fn five_hour_cell(
 ///   7d gauge shows for an absent window, via [`classify_window_display`] —
 ///   never a crash or blank.
 #[allow(clippy::too_many_arguments)]
-fn fable_gauge_cell(
+fn fable_gauge_parts(
     group: crate::routing::BackendGroup,
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
@@ -5827,12 +6495,11 @@ fn fable_gauge_cell(
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
     fable_max: f64,
-    bar_width: usize,
-) -> Cell<'static> {
+) -> GaugeParts {
     // Claude-only, decided before any classification: a non-Claude row has no
     // Fable scope to ever populate, so it reads n/a rather than a cold gauge.
     if group != crate::routing::BackendGroup::Claude {
-        return Cell::from(Span::styled("-", dim()));
+        return GaugeParts::Bare(Span::styled("-", dim()));
     }
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -5840,7 +6507,7 @@ fn fable_gauge_cell(
         // Cold / absent: mirror the `window_cells` absent branch — the glyph +
         // label — so a never-seen Fable window reads distinctly from an honest
         // 0%.
-        return Cell::from(Span::styled(
+        return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
@@ -5869,9 +6536,14 @@ fn fable_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
-    Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width, marker,
-    ))
+    GaugeParts::Bar {
+        fill,
+        color,
+        text,
+        bold_chars,
+        over,
+        marker,
+    }
 }
 
 /// Reset text for the detail pane: compact countdown plus the absolute local
@@ -10006,6 +10678,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     key("↑↓"),
                     Span::raw(" scroll"),
                 ]);
+                // The fold (`z`) is advertised only while it is on: the
+                // bar that `z` turns off.
+                if chrome.fold_exhausted {
+                    spans.extend([Span::raw("  "), key("z"), Span::raw(" fold")]);
+                }
                 Line::from(spans)
             }
             // Accounts overlay: the issue #3/#4 affordances. a (add) and r
@@ -11420,6 +12097,7 @@ mod tests {
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,
+            fold_exhausted: false,
             limits_input: String::new(),
             attach: None,
             keys: Default::default(),
@@ -18569,5 +19247,983 @@ mod tests {
             let rows = render_rows(&view, &chrome, w, h);
             assert_eq!(rows.len(), usize::from(h));
         }
+    }
+
+    // --- fold 7d-spent accounts (`z`, owner decision 2026-10-22) ---------
+
+    /// Display numbers (1-based, name order) of the recompose fixture's
+    /// accounts whose 7d window is spent past the 99% ceiling: seven claude
+    /// accounts and one codex account, as in the owner-approved picture.
+    const FOLD_MEMBERS: [usize; 8] = [2, 6, 7, 8, 10, 12, 14, 15];
+    /// The claude account over its 5h ceiling: `!`-marked, never folded.
+    const FIVE_H_OVER: usize = 4;
+
+    /// The recompose fixture with [`FOLD_MEMBERS`] at 100% of their 7d
+    /// window (status `7d 100.0% > 99%` on every one) and [`FIVE_H_OVER`]
+    /// at 95% of its 5h window, plus a fixed config path so the frame never
+    /// depends on the machine's home directory.
+    fn fold_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = recompose_view();
+        for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
+            let n = i + 1;
+            if FOLD_MEMBERS.contains(&n) {
+                if let Some(window) = account.seven_day.as_mut() {
+                    window.utilization = 1.0;
+                }
+            }
+            if n == FIVE_H_OVER {
+                if let Some(window) = account.five_hour.as_mut() {
+                    window.utilization = 0.95;
+                }
+            }
+        }
+        view.config_path = Some("/etc/llmux/llmux.json".into());
+        (view, chrome)
+    }
+
+    /// Width-preserving mask of the frame's wall-clock text: `(HH:MM)` /
+    /// `(MM-DD HH:MM)` stamps ([`mask_clocks`]), the activity `HH:MM:SS`
+    /// stamps and the 0.1 s elapsed times (`6.0s`) — every digit in them
+    /// becomes `9`.
+    fn mask_volatile(row: &str) -> String {
+        let chars: Vec<char> = mask_clocks(row).chars().collect();
+        let mut out = chars.clone();
+        let digit = |i: usize| chars.get(i).is_some_and(char::is_ascii_digit);
+        for i in 0..chars.len() {
+            if digit(i) && digit(i + 1) && chars.get(i + 2) == Some(&':') && digit(i + 3) {
+                for j in (i..i + 8).filter(|&j| digit(j)) {
+                    out[j] = '9';
+                }
+            }
+            if chars[i] == '.'
+                && i > 0
+                && digit(i - 1)
+                && digit(i + 1)
+                && chars.get(i + 2) == Some(&'s')
+            {
+                let mut j = i;
+                while j > 0 && digit(j - 1) {
+                    j -= 1;
+                    out[j] = '9';
+                }
+                out[i + 1] = '9';
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// One rendered MAIN frame as masked text rows ([`mask_volatile`]) each
+    /// followed by its style runs (`fg/bg/modifier×cells`), and an FNV-1a
+    /// hash of that text — text AND styles, for the fold-OFF identity pin.
+    fn frame_digest(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> (String, u64) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        let buffer = terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone();
+        let mut out = String::new();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            out.push_str(&mask_volatile(&text));
+            out.push('\n');
+            let mut runs: Vec<(String, usize)> = Vec::new();
+            for x in 0..w {
+                let cell = &buffer[(x, y)];
+                let style = format!("{:?}/{:?}/{}", cell.fg, cell.bg, cell.modifier.bits());
+                match runs.last_mut() {
+                    Some((last, n)) if *last == style => *n += 1,
+                    _ => runs.push((style, 1)),
+                }
+            }
+            let runs: Vec<String> = runs.iter().map(|(s, n)| format!("{s}×{n}")).collect();
+            out.push_str(&runs.join(" "));
+            out.push('\n');
+        }
+        let hash = out.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        (out, hash)
+    }
+
+    /// Digest of the fold fixture at 179×43, pinned from the renderer as it
+    /// was before the fold existed (PR-A main, 26b5ab9).
+    const FOLD_OFF_179X43_DIGEST: u64 = 6_597_409_346_785_969_346;
+
+    /// Fold OFF (the default) renders exactly as the dashboard did before
+    /// the fold existed — every cell's text and style.
+    #[test]
+    fn fold_off_frame_is_identical_to_the_pre_fold_renderer() {
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let (frame, hash) = frame_digest(&view, &chrome, 179, 43);
+        assert_eq!(
+            hash, FOLD_OFF_179X43_DIGEST,
+            "fold-OFF frame changed:\n{frame}"
+        );
+    }
+
+    /// The backend group of fixture account `n`.
+    fn fold_group(n: usize) -> &'static str {
+        match n {
+            1..=14 => "claude",
+            15..=18 => "codex",
+            19..=20 => "grok",
+            _ => "gemini",
+        }
+    }
+
+    /// Display numbers of the live-shaped fixture's 7d-spent accounts:
+    /// seven claude and two codex, as on the owner's dashboard (2026-10-22).
+    const LIVE_MEMBERS: [usize; 9] = [2, 3, 6, 7, 11, 12, 14, 15, 16];
+    /// Claude #4 is over its 5h ceiling and #5 is paused — both also at 100%
+    /// of their 7d window, and both stay in the table.
+    const LIVE_FIVE_H_OVER: usize = 4;
+    const LIVE_PAUSED: usize = 5;
+
+    /// The live-shaped table name of fixture account `n` (synthetic): 8–10
+    /// cells on the members, 16 cells on three non-members, all on
+    /// `ex.io`-style domains no abbreviation rewrites — in name order, so
+    /// `#n` is fixture account `n`.
+    fn fold_name(n: usize) -> String {
+        [
+            "u01@ex.io",
+            "u02@ex.io",
+            "u03@ex.io",
+            "u04@ex.io",
+            "u05@ex.io",
+            "u06@ex.io",
+            "u07@ex.io",
+            "u08-fixture@x.io",
+            "u09@ex.io",
+            "u010@ex.io",
+            "u015@ex.io",
+            "u016@ex.io",
+            "u017xxxxxx@ex.io",
+            "u018@ex.io",
+            "c1@ex.io",
+            "c02@ex.io",
+            "c03@ex.io",
+            "c04xxxxxxx@ex.io",
+            "grok1@ex.io",
+            "grok2@ex.io",
+            "gem1@ex.io",
+        ][n - 1]
+            .to_string()
+    }
+
+    /// The full id behind [`fold_name`]: the group prefix the table strips.
+    fn live_id(n: usize) -> String {
+        format!("{}:{}", fold_group(n), fold_name(n))
+    }
+
+    /// A MAIN state shaped like the owner's live dashboard: the recompose
+    /// fixture with the live names ([`fold_name`]); [`LIVE_MEMBERS`] at 100%
+    /// of a 7d window resetting in `4d 2h`, the claude ones with a Fable
+    /// window at 82% left (`4d 2h`); req `81.0k`–`88.0k` and tok
+    /// `1202.0M`–`1216.0M` (the live value widths); `rst` reading `0`,
+    /// `n/e` and `?`; and the 5h-over and paused accounts also 7d-spent.
+    fn live_view() -> (DashboardView, Chrome) {
+        use crate::scheduler::window::{LimitSeverity, ScopedQuotaWindow, WindowSource};
+        let (mut view, chrome) = recompose_view();
+        let now = SystemTime::now();
+        // 30 s inside `4d 2h`.
+        let window = |utilization: f64| QuotaWindow {
+            utilization,
+            resets_at: now + Duration::from_secs(4 * 86_400 + 2 * 3_600 + 30),
+            fetched_at: now - Duration::from_secs(5),
+            source: WindowSource::Headers,
+        };
+        for n in 1..=21 {
+            rename_account(&mut view, &rid(fold_group(n), n), &live_id(n));
+        }
+        for c in &mut view.in_flight {
+            c.account = Some(live_id(13));
+        }
+        for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
+            let n = i + 1;
+            if LIVE_MEMBERS.contains(&n) || n == LIVE_FIVE_H_OVER || n == LIVE_PAUSED {
+                account.seven_day = Some(window(1.0));
+            }
+            if LIVE_MEMBERS.contains(&n) && fold_group(n) == "claude" {
+                account.scoped_limits = vec![ScopedQuotaWindow {
+                    scope_label: crate::routing::FABLE_SCOPE_LABEL.into(),
+                    window: window(0.18),
+                    severity: LimitSeverity::Normal,
+                    is_active: false,
+                }];
+            }
+            if n == LIVE_FIVE_H_OVER {
+                if let Some(five) = account.five_hour.as_mut() {
+                    five.utilization = 0.95;
+                }
+            }
+            account.paused = n == LIVE_PAUSED;
+        }
+        for &n in &LIVE_MEMBERS {
+            view.session_totals.insert(
+                live_id(n),
+                super::super::activity::Totals {
+                    requests: 80_000 + 500 * n as u64,
+                    ok: 80_000,
+                    errors: 0,
+                    tokens_in: 1_200_000_000 + 1_000_000 * n as u64,
+                    tokens_out: 0,
+                },
+            );
+        }
+        view.usage_controls.clear();
+        for n in [2, 15] {
+            view.usage_controls.insert(
+                live_id(n),
+                crate::proxy::usage_controls::UsageControlDoc {
+                    available_resets: Some(0),
+                    ..Default::default()
+                },
+            );
+        }
+        view.usage_controls.insert(
+            live_id(3),
+            crate::proxy::usage_controls::UsageControlDoc {
+                eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                    eligible: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        view.config_path = Some("/etc/llmux/llmux.json".into());
+        let chrome = Chrome {
+            fold_exhausted: true,
+            ..chrome
+        };
+        (view, chrome)
+    }
+
+    /// [`live_view`] with #6 at 99.5% of its 7d window, so the members'
+    /// status texts differ.
+    fn live_differing_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = live_view();
+        if let Some(window) = view.snapshot.accounts[5].seven_day.as_mut() {
+            window.utilization = 0.995;
+        }
+        (view, chrome)
+    }
+
+    /// `chrome` with the fold toggle off.
+    fn fold_off(chrome: &Chrome) -> Chrome {
+        Chrome {
+            fold_exhausted: false,
+            mode: chrome.mode,
+            attach: chrome.attach,
+            ..chrome_overlay(Overlay::None)
+        }
+    }
+
+    /// The fold MAIN plans at terminal width `w` (with the table's own
+    /// column layout at that width, as [`draw_main`] does).
+    fn fold_at(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome, w: u16) -> Fold {
+        fold_plan(view, ctx, chrome, &table_layout(view, ctx, w), w)
+    }
+
+    /// The narrowest terminal width at which the fold applies.
+    fn fold_bound(view: &DashboardView, chrome: &Chrome) -> u16 {
+        let ctx = frame_ctx(view, chrome);
+        (1..=600u16)
+            .find(|&w| fold_at(view, &ctx, chrome, w).plan().is_some())
+            .expect("the fold applies at some width")
+    }
+
+    /// Terminal column of `needle` in a rendered row (every glyph in these
+    /// rows is one cell wide, so the column is the char count before it).
+    fn col_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+        row[..byte].chars().count() as u16
+    }
+
+    /// Every whitespace-separated token of `line`, in order.
+    fn tokens(line: &str) -> Vec<&str> {
+        line.split_whitespace().collect()
+    }
+
+    /// Whether `want` appears in `have` as an in-order subsequence.
+    fn in_order(have: &[&str], want: &[&str]) -> bool {
+        let mut it = have.iter();
+        want.iter().all(|w| it.any(|h| h == w))
+    }
+
+    /// Render MAIN and return the full buffer (text + styles).
+    fn render_buffer(
+        view: &DashboardView,
+        chrome: &Chrome,
+        w: u16,
+        h: u16,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    /// Rows of the activity pane: from its title to the settings bar.
+    fn activity_rows(rows: &[String]) -> usize {
+        row_of(rows, " sched default") - row_of(rows, " activity ")
+    }
+
+    /// The text of fold entry `name` on `line`: from its `!` marker to the
+    /// next entry's marker (or the line's end).
+    fn entry_on<'a>(line: &'a str, name: &str) -> &'a str {
+        let at = line.find(name).expect("entry name");
+        let start = line[..at].rfind('!').expect("entry marker");
+        let end = line[at..].find("   !").map_or(line.len(), |next| at + next);
+        &line[start..end]
+    }
+
+    /// The fold-OFF frame and the fold-ON frame ([`frame_digest`] lines,
+    /// text and styles) differ only in the accounts title row and the
+    /// keybar row, and those two differ exactly by `note` and `z fold`.
+    fn assert_only_title_and_keybar_differ(view: &DashboardView, on: &Chrome, note: &str) {
+        let (off, _) = frame_digest(view, &fold_off(on), 179, 43);
+        let (on, _) = frame_digest(view, on, 179, 43);
+        let (off, on): (Vec<&str>, Vec<&str>) = (off.lines().collect(), on.lines().collect());
+        assert_eq!(off.len(), on.len());
+        let (title, keybar) = (2 * 2, 2 * 42);
+        for (i, (a, b)) in off.iter().zip(&on).enumerate() {
+            if ![title, title + 1, keybar, keybar + 1].contains(&i) {
+                assert_eq!(a, b, "line {i}:\n{}", on.join("\n"));
+            }
+        }
+        let counts = "(claude 14 · codex 4 · grok 2 · gemini 1)";
+        assert!(
+            off[title].contains(&format!("{counts} ─")),
+            "{}",
+            off[title]
+        );
+        assert!(
+            on[title].contains(&format!("{counts}{note} ─")),
+            "{}",
+            on[title]
+        );
+        assert_eq!(
+            on[keybar].trim_end(),
+            format!("{}  z fold", off[keybar].trim_end())
+        );
+    }
+
+    /// The owner's live shape at 179×43: the 12 accounts that are not
+    /// 7d-spent keep their rows and own numbers (the 5h-over and paused
+    /// ones among them), the title carries the fold label with the shared
+    /// status, and the 9 spent accounts become a dim-headed block of two
+    /// entries per line from the table's left column — every value still
+    /// on screen — and activity gains 3 rows.
+    #[test]
+    fn fold_live_shape_179x43_folds_two_per_line() {
+        let (view, chrome) = live_view();
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        println!("{frame}");
+        assert_eq!(rows.len(), 43);
+        let ctx = frame_ctx(&view, &chrome);
+        let fold = fold_at(&view, &ctx, &chrome, 179);
+        let plan = fold.plan().expect("the fold applies at 179");
+        assert_eq!(
+            (plan.per_line, plan.lines()),
+            (2, 6),
+            "k = 2, 5 entry lines"
+        );
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(
+            rows[accounts].contains(
+                " · 21 (claude 14 · codex 4 · grok 2 · gemini 1) · 7d spent 9 folded: 7d 100.0% > 99% "
+            ) && !rows[accounts].contains("more"),
+            "{frame}"
+        );
+        // Table: the 12 non-members, in order, each with its own number.
+        let others: Vec<usize> = (1..=21).filter(|n| !LIVE_MEMBERS.contains(n)).collect();
+        assert_eq!(others.len(), 12);
+        for (i, n) in others.iter().enumerate() {
+            let row = &rows[accounts + 2 + i];
+            assert!(
+                row.contains(&format!("{n:<2} {}", fold_name(*n))),
+                "table row {i} is #{n}:\n{frame}"
+            );
+        }
+        let five = &rows[accounts + 2 + 1];
+        assert!(
+            five.starts_with("!  CLAUDE  4 ") && five.contains("5h 95.0% > 90%"),
+            "the 5h-over account stays in the table:\n{frame}"
+        );
+        assert!(
+            rows[accounts + 2 + 2].contains(&format!("5  {}", fold_name(5)))
+                && rows[accounts + 2 + 2].contains("paused"),
+            "the paused account stays in the table:\n{frame}"
+        );
+        // Fold block: the field header, then five entry lines, from the
+        // table's left column.
+        let head = accounts + 2 + 12;
+        assert!(rows[head].starts_with("   group   # account "), "{frame}");
+        assert_eq!(rows[head].matches("group").count(), 2, "{frame}");
+        assert_eq!(rows[head].matches(" tok").count(), 2, "{frame}");
+        assert!(!rows[head].contains("status"), "status is shared:\n{frame}");
+        let fold_rows = &rows[head + 1..head + 6];
+        assert!(fold_rows[0].starts_with("!  CLAUDE  2 "), "{frame}");
+        assert!(
+            !frame.contains("7d 100.0% > 99%  ") && frame.matches("7d 100.0% > 99%").count() == 1,
+            "the shared status shows once, in the title:\n{frame}"
+        );
+        for (line, pair) in fold_rows.iter().zip(LIVE_MEMBERS.chunks(2)) {
+            let names: Vec<usize> = pair
+                .iter()
+                .map(|&n| line.find(&fold_name(n)).expect("member on its line"))
+                .collect();
+            assert!(names.windows(2).all(|w| w[0] < w[1]), "{line}");
+        }
+        // Every member's values, as text, in the table's order.
+        for (i, &n) in LIVE_MEMBERS.iter().enumerate() {
+            let name = fold_name(n);
+            let entry = entry_on(&fold_rows[i / 2], &name);
+            let claude = fold_group(n) == "claude";
+            let group = if claude { "CLAUDE" } else { "CODEX" };
+            let rst = match n {
+                2 | 15 => "0",
+                3 => "n/e",
+                _ => "?",
+            };
+            let number = n.to_string();
+            let req = format::human_count(80_000 + 500 * n as u64);
+            let tok = format::human_count(1_200_000_000 + 1_000_000 * n as u64);
+            let mut want = vec!["!", group, number.as_str(), name.as_str()];
+            if claude {
+                want.extend(["70%", "4d", "2h", "0%!", "4d", "2h", "82%"]);
+            } else {
+                want.extend(["-", "4d", "2h", "0%!", "-"]);
+            }
+            want.extend([rst, "0", req.as_str(), tok.as_str()]);
+            assert!(
+                in_order(&tokens(entry), &want),
+                "#{n} entry {entry:?} carries {want:?}:\n{frame}"
+            );
+            assert!(!entry.contains("rst "), "no bar label in text:\n{frame}");
+        }
+        // The band follows the block; activity gains three rows.
+        assert_eq!(row_of(&rows, " scheduler · poller "), head + 6, "{frame}");
+        assert!(
+            rows[42].trim_end().ends_with("↑↓ scroll  z fold"),
+            "{frame}"
+        );
+        let off = render_rows(&view, &fold_off(&chrome), 179, 43);
+        assert_eq!(activity_rows(&rows), activity_rows(&off) + 3, "{frame}");
+    }
+
+    /// The fold never makes the pane taller (coordinator rule A): with
+    /// differing statuses only one entry fits a 179-column line, so the
+    /// block would take 1 + 9 lines for 9 rows — the fold does not apply,
+    /// the title says it saves no row, and the rest of the frame is the
+    /// fold-OFF frame.
+    #[test]
+    fn fold_that_saves_no_row_falls_back_to_the_full_table() {
+        let (view, chrome) = live_differing_view();
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(matches!(
+            fold_at(&view, &ctx, &chrome, 179),
+            Fold::SavesNoRow
+        ));
+        assert_only_title_and_keybar_differ(&view, &chrome, " · fold: saves no row");
+    }
+
+    /// Fold ON with no 7d-spent account: the title says there is nothing to
+    /// fold, and the rest of the frame is the fold-OFF frame.
+    #[test]
+    fn fold_title_says_nothing_to_fold() {
+        let (mut view, chrome) = live_view();
+        for account in &mut view.snapshot.accounts {
+            if let Some(window) = account.seven_day.as_mut() {
+                window.utilization = 0.31;
+            }
+        }
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(matches!(fold_at(&view, &ctx, &chrome, 179), Fold::Nothing));
+        assert_only_title_and_keybar_differ(&view, &chrome, " · fold: nothing to fold");
+    }
+
+    /// Below the narrowest width at which the block saves a row the fold
+    /// does not apply — today's full table — and the title says why: one
+    /// column below the bound only one entry fits a line (`saves no row`);
+    /// at 60 columns not even the title fits (`too narrow`).
+    #[test]
+    fn fold_title_says_why_below_the_fold_bound() {
+        let (view, chrome) = live_view();
+        let w = fold_bound(&view, &chrome);
+        println!("narrowest fold width: {w}");
+        let ctx = frame_ctx(&view, &chrome);
+        for narrow in [w - 1, 60] {
+            let fold = fold_at(&view, &ctx, &chrome, narrow);
+            if narrow == w - 1 {
+                assert!(matches!(fold, Fold::SavesNoRow), "{}", fold.note());
+            } else {
+                assert!(matches!(fold, Fold::TooNarrow), "{}", fold.note());
+            }
+            let rows = render_rows(&view, &chrome, narrow, 80);
+            let frame = rows.join("\n");
+            let accounts = row_of(&rows, " accounts · sort ");
+            if narrow == w - 1 {
+                assert!(
+                    rows[accounts].contains(" · fold: saves no row "),
+                    "{narrow}:\n{frame}"
+                );
+            }
+            for n in 1..=21 {
+                assert!(
+                    rows[accounts + 1 + n].contains(&format!("{n:<2} {}", &fold_name(n)[..3])),
+                    "row #{n} at {narrow}:\n{frame}"
+                );
+            }
+        }
+        let rows = render_rows(&view, &chrome, w, 80);
+        assert!(
+            rows.iter().any(|r| r.contains(" · 7d spent 9 folded: ")),
+            "{w}"
+        );
+    }
+
+    /// Members whose status texts differ: the title has no status, and each
+    /// entry carries its own status field (first after the account) — at
+    /// the narrowest width where that fold saves a row.
+    #[test]
+    fn fold_with_differing_statuses_gives_each_entry_its_status() {
+        let (view, chrome) = live_differing_view();
+        let w = fold_bound(&view, &chrome);
+        println!("differing-status fold bound: {w}");
+        let rows = render_rows(&view, &chrome, w, 60);
+        let frame = rows.join("\n");
+        println!("{frame}");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(rows[accounts].contains(" · 7d spent 9 folded ─"), "{frame}");
+        let head = accounts + 2 + 12;
+        assert!(rows[head].contains("status"), "{frame}");
+        let block = &rows[head + 1..row_of(&rows, " scheduler · poller ")];
+        let statuses: usize = block.iter().map(|r| r.matches("% > 99%").count()).sum();
+        assert_eq!(statuses, 9, "one status per entry:\n{frame}");
+        let six = block
+            .iter()
+            .find(|r| r.contains(&fold_name(6)))
+            .expect("#6 entry");
+        let after = &six[six.find(&fold_name(6)).expect("name")..];
+        assert!(
+            in_order(&tokens(after), &["7d", "99.5%", ">", "99%", "70%"]),
+            "#6's own status right after its account:\n{frame}"
+        );
+    }
+
+    /// A clock tick never moves the fold (coordinator rule B): one member's
+    /// 7d or Fbl reset at its widest form (`23h 59m ◑`, stale) or its
+    /// shortest (`42s`), its Fbl window expired, or its 5h window expired
+    /// (`○ 100%`) or stale
+    /// (`◑ 70%`), leaves the entries per line, every field width and every
+    /// entry's column exactly where they are.
+    #[test]
+    fn fold_geometry_does_not_follow_the_clock() {
+        #[derive(Clone, Copy)]
+        enum Win {
+            Seven,
+            Five,
+            Fable,
+        }
+        let now = SystemTime::now();
+        let variant = |change: Option<(Win, i64, u64)>| {
+            let (mut view, chrome) = live_view();
+            if let Some((win, resets, age)) = change {
+                let account = &mut view.snapshot.accounts[1];
+                let window = match win {
+                    Win::Seven => account.seven_day.as_mut(),
+                    Win::Five => account.five_hour.as_mut(),
+                    Win::Fable => account.scoped_limits.first_mut().map(|s| &mut s.window),
+                };
+                if let Some(w) = window {
+                    w.resets_at = if resets < 0 {
+                        now - Duration::from_secs(resets.unsigned_abs())
+                    } else {
+                        now + Duration::from_secs(resets as u64)
+                    };
+                    w.fetched_at = now - Duration::from_secs(age);
+                }
+            }
+            (view, chrome)
+        };
+        let variants = [
+            ("7d widest", variant(Some((Win::Seven, 86_370, 601)))),
+            ("7d shortest", variant(Some((Win::Seven, 42, 5)))),
+            ("Fbl widest", variant(Some((Win::Fable, 86_370, 601)))),
+            ("Fbl shortest", variant(Some((Win::Fable, 42, 5)))),
+            // Expired: the Fbl window resets back to 100% left while the
+            // member stays 7d-spent (`0s ○` / `100%`).
+            ("Fbl expired", variant(Some((Win::Fable, -1, 2)))),
+            ("5h expired", variant(Some((Win::Five, -1, 2)))),
+            ("5h stale", variant(Some((Win::Five, 10_590, 601)))),
+        ];
+        // Entries per line, field widths per entry column, and each folded
+        // entry's column on screen — `None` = no fold.
+        let geometry = |view: &DashboardView, chrome: &Chrome, w: u16| {
+            let ctx = frame_ctx(view, chrome);
+            let fold = fold_at(view, &ctx, chrome, w);
+            let plan = fold.plan()?;
+            let (rows, hits) = render_with_hits(view, chrome, w, 80);
+            let starts: Vec<(usize, u16)> = hits
+                .account_rows
+                .iter()
+                .filter(|h| plan.members.contains(&h.display_idx))
+                .map(|h| (h.display_idx, h.area.x))
+                .collect();
+            println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
+            Some((plan.per_line, plan.columns.clone(), starts))
+        };
+        let (base_view, base_chrome) = live_view();
+        for w in [fold_bound(&base_view, &base_chrome), 179, 250] {
+            println!("today at {w}:");
+            let base = geometry(&base_view, &base_chrome, w);
+            assert!(base.is_some(), "fold at {w}");
+            for (name, (view, chrome)) in &variants {
+                println!("{name} at {w}:");
+                assert_eq!(geometry(view, chrome, w), base, "{name} at {w}");
+            }
+        }
+    }
+
+    /// The cursor on a folded account highlights its entry the way the
+    /// table highlights a row (reverse video, `>` marker), the detail band
+    /// shows it, and the cursor walks every account in the same order with
+    /// the fold on or off.
+    #[test]
+    fn fold_cursor_on_a_folded_account_highlights_its_entry() {
+        let (view, chrome) = live_view();
+        let target = live_id(7);
+        let on = Chrome {
+            fold_exhausted: true,
+            ..cursor_on(&view, &chrome, &target)
+        };
+        let buffer = render_buffer(&view, &on, 179, 43);
+        let text = |y: u16| {
+            (0..179)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let rows: Vec<String> = (0..43).map(text).collect();
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let head = accounts + 2 + 12;
+        let y = (head + 1 + row_of(&rows[head + 1..], &fold_name(7))) as u16;
+        let row = &rows[usize::from(y)];
+        let x = col_of(row, &fold_name(7));
+        for dx in 0..fold_name(7).len() as u16 {
+            assert!(
+                buffer[(x + dx, y)].modifier.contains(Modifier::REVERSED),
+                "selected entry reversed at {dx}:\n{frame}"
+            );
+        }
+        assert!(
+            row.contains(&format!(">! CLAUDE  7 {}", fold_name(7))),
+            "{frame}"
+        );
+        let other = col_of(row, &fold_name(6));
+        assert!(
+            !buffer[(other, y)].modifier.contains(Modifier::REVERSED),
+            "only the selected entry:\n{frame}"
+        );
+        let band = row_of(&rows, " scheduler · poller ");
+        assert!(
+            rows[band + 1].contains(&format!("│ {target} · oauth")),
+            "{frame}"
+        );
+        // Same cursor walk, fold on or off.
+        let ctx = frame_ctx(&view, &chrome);
+        for (idx, &account) in ctx.order.iter().enumerate() {
+            let walk = |fold: bool| -> String {
+                let c = Chrome {
+                    mode: Mode::Select { idx },
+                    fold_exhausted: fold,
+                    attach: chrome.attach,
+                    ..chrome_overlay(Overlay::None)
+                };
+                let rows = render_rows(&view, &c, 179, 43);
+                rows[row_of(&rows, " scheduler · poller ") + 1].clone()
+            };
+            let id = &view.snapshot.accounts[account].id.0;
+            let detail = walk(true);
+            assert!(
+                detail.contains(&format!("│ {id} · ")),
+                "idx {idx}: {detail}"
+            );
+            assert_eq!(detail, walk(false), "idx {idx}");
+        }
+    }
+
+    /// A remote-backend `App` (no terminal), for driving real clicks.
+    fn fold_app() -> super::super::App {
+        super::super::App::new(super::super::Backend::Remote(Box::new(
+            super::super::Remote {
+                client: reqwest::Client::new(),
+                base_url: "http://localhost:3456".into(),
+                api_key: None,
+                pid: None,
+                doc: None,
+                connected: false,
+                pending_codex: None,
+                pending_settings: None,
+                pending_pause: None,
+                pending_limits: None,
+                pending_mode: None,
+                pending_add: None,
+                pending_remove: None,
+                pending_grok: None,
+            },
+        )))
+    }
+
+    /// Clicks resolve to the right account: a folded entry opens that
+    /// account, a table row below removed members opens its own account,
+    /// and the drag border sits on the shorter pane's bottom.
+    #[test]
+    fn fold_clicks_select_the_folded_entry_and_the_shifted_rows() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (view, chrome) = live_view();
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(
+            (hits.separators[0].y, hits.separators[0].pane_top),
+            (band as u16, accounts as u16),
+            "{frame}"
+        );
+        let click = |id: &str, column: u16, row: u16| {
+            let mut app = fold_app();
+            app.fold_exhausted = true;
+            app.account_row_chrome = hits.account_rows.clone();
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(app.on_mouse(down, Some(&view)), "click at {column},{row}");
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.as_str()),
+                Some(id),
+                "click at {column},{row}:\n{frame}"
+            );
+        };
+        // Table row 2 shows #4 (the row below folded #2 and #3).
+        let y = accounts + 2 + 1;
+        assert!(rows[y].contains(&fold_name(4)), "{frame}");
+        click(&live_id(4), 10, y as u16);
+        // Folded entries: right of a line, left of a line, alone on a line.
+        let head = accounts + 2 + 12;
+        // (An entry is found by its number and name together.)
+        for n in [7, 11, 16] {
+            let needle = format!("{n:>2} {}", fold_name(n));
+            let y = row_of(&rows[head + 1..], &needle) + head + 1;
+            let x = col_of(&rows[y], &needle) + 3;
+            click(&live_id(n), x, y as u16);
+        }
+        // Every hit maps a visible account once.
+        let mut seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..21).collect::<Vec<_>>(), "{frame}");
+    }
+
+    /// The `+N more` count on a short terminal: table rows first, then the
+    /// fold block — N counts the hidden table rows plus the accounts on the
+    /// fold lines the pane cannot show.
+    #[test]
+    fn fold_on_a_short_terminal_counts_the_hidden_entries() {
+        let (view, chrome) = live_view();
+        let rows = render_rows(&view, &chrome, 179, 38);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(band - accounts, 18, "{frame}");
+        assert!(
+            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +3 more "),
+            "{frame}"
+        );
+        assert!(rows[accounts + 14].starts_with("   group "), "{frame}");
+        assert!(rows[band - 1].contains(&fold_name(12)), "{frame}");
+        assert!(!frame.contains(&fold_name(14)), "{frame}");
+    }
+
+    /// Membership is recomputed every frame: an account whose 7d window
+    /// drops back under its ceiling returns to the table at once.
+    #[test]
+    fn fold_membership_follows_the_live_7d_window() {
+        let (mut view, chrome) = live_view();
+        if let Some(window) = view.snapshot.accounts[1].seven_day.as_mut() {
+            window.utilization = 0.31;
+        }
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(rows[accounts].contains(" · 7d spent 8 folded: "), "{frame}");
+        assert!(
+            rows[accounts + 3].contains(&format!("2  {}", fold_name(2))),
+            "{frame}"
+        );
+        assert!(rows[accounts + 2 + 13].starts_with("   group "), "{frame}");
+    }
+
+    /// A synthetic pool whose accounts title is long: 15 accounts in each
+    /// of the five groups (one-letter-and-number ids), codex #1–#4 (display
+    /// #16–#19) 7d-spent with one shared status, the Fable column off and no
+    /// reset inventory — so the fold entries are short and the title is
+    /// the widest part of the pane.
+    fn crowded_view() -> (DashboardView, Chrome) {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::WindowSource;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let now = SystemTime::now();
+        let window = |utilization: f64| {
+            Some(QuotaWindow {
+                utilization,
+                resets_at: now + Duration::from_secs(187_170),
+                fetched_at: now - Duration::from_secs(5),
+                source: WindowSource::Headers,
+            })
+        };
+        let mut view = view_with(Vec::new());
+        view.show_fable_weekly = false;
+        for (group, kind, letter) in [
+            (BackendGroup::Claude, "oauth", "a"),
+            (BackendGroup::Codex, "codex", "c"),
+            (BackendGroup::Grok, "grok", "g"),
+            (BackendGroup::OpenRouter, "openrouter", "o"),
+            (BackendGroup::Gemini, "gemini", "m"),
+        ] {
+            for i in 1..=15 {
+                let spent = group == BackendGroup::Codex && i <= 4;
+                view.snapshot.accounts.push(AccountSnapshot {
+                    id: AccountId(format!("{}:{letter}{i}", group.as_str())),
+                    healthy: true,
+                    auth_failure_status: None,
+                    credential_kind: kind,
+                    group,
+                    five_hour: (group == BackendGroup::Claude)
+                        .then(|| window(0.30))
+                        .flatten(),
+                    seven_day: window(if spent { 1.0 } else { 0.31 }),
+                    scoped_limits: Vec::new(),
+                    scoped_cooldowns: Vec::new(),
+                    cooldown_until: None,
+                    cooldown_source: None,
+                    in_flight: 0,
+                    token_expires_at_ms: None,
+                    last_refresh_ms: None,
+                    paused: false,
+                    limits: Default::default(),
+                });
+            }
+        }
+        let chrome = Chrome {
+            fold_exhausted: true,
+            ..chrome_overlay(Overlay::None)
+        };
+        (view, chrome)
+    }
+
+    /// The crowded pool's accounts title with the fold `note` and the
+    /// widest `+N more` (every account hidden).
+    fn crowded_title(note: &str) -> String {
+        format!(
+            " accounts · sort name · 75 (claude 15 · codex 15 · grok 15 · openrouter 15 · gemini 15){note} · +75 more "
+        )
+    }
+
+    /// Each spent codex account's status text sits on its own line of the
+    /// frame — its table row or its fold entry — right after its name.
+    fn assert_each_member_shows_its_status(rows: &[String], frame: &str) {
+        for (n, name) in [(16, "c1"), (17, "c2"), (18, "c3"), (19, "c4")] {
+            let needle = format!("{n} {name} ");
+            let row = rows
+                .iter()
+                .find(|r| r.contains(&needle))
+                .unwrap_or_else(|| panic!("#{n} on screen:\n{frame}"));
+            let at = row.find(&needle).expect("needle");
+            let end = row[at..].find("   !").map_or(row.len(), |next| at + next);
+            assert!(
+                row[at..end].contains("7d 100.0% > 99%"),
+                "#{n} carries its full status: {:?}\n{frame}",
+                &row[at..end]
+            );
+        }
+    }
+
+    /// MUST-FIX (trinity R1): when the title with the shared status does
+    /// not fit the pane, the status must not be cut off the title and lost.
+    /// The shared-form entries fit two per line at both widths, but that
+    /// title (with `+N more` at its widest) does not: at 134 columns each
+    /// entry carries its own status — whatever the pane height, so the
+    /// choice does not flip when rows get hidden — and at 110 even the
+    /// per-entry title does not fit, so the full table shows them.
+    #[test]
+    fn fold_shared_status_never_clipped_from_the_title() {
+        let (view, chrome) = crowded_view();
+        let shared = crowded_title(" · 7d spent 4 folded: 7d 100.0% > 99%");
+        for (w, h) in [(110u16, 120u16), (134, 40), (134, 120)] {
+            assert!(Line::from(shared.as_str()).width() > usize::from(w));
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let title = &rows[row_of(&rows, " accounts · sort ")];
+            assert!(
+                !title.contains("folded:") || title.contains("folded: 7d 100.0% > 99% "),
+                "{w}x{h}: title cut mid-status: {title}"
+            );
+            if h == 120 {
+                println!("{w}x{h}:\n{frame}");
+                assert_each_member_shows_its_status(&rows, &frame);
+            }
+        }
+        // The decision itself: per-entry form at 134, no fold at 110.
+        let ctx = frame_ctx(&view, &chrome);
+        match fold_at(&view, &ctx, &chrome, 134) {
+            Fold::Applied(plan) => {
+                assert_eq!((plan.shared_status, plan.per_line), (None, 2));
+            }
+            other => panic!("per-entry fold at 134, got {}", other.note()),
+        }
+        assert!(matches!(
+            fold_at(&view, &ctx, &chrome, 110),
+            Fold::TooNarrow
+        ));
+    }
+
+    /// One column below the per-entry title's width (`+N more` at its
+    /// widest), even the per-entry form cannot show its title whole: the
+    /// fold does not apply, the full table carries every status, and the
+    /// title says the pane is too narrow.
+    #[test]
+    fn fold_too_narrow_when_even_the_per_entry_title_does_not_fit() {
+        let (view, chrome) = crowded_view();
+        let per_entry = crowded_title(" · 7d spent 4 folded");
+        let w = Line::from(per_entry.as_str()).width() as u16 - 1;
+        let rows = render_rows(&view, &chrome, w, 120);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(
+            rows[accounts].contains(" · fold: too narrow "),
+            "{w}:\n{frame}"
+        );
+        assert!(!rows[accounts].contains("7d spent"), "{frame}");
+        assert!(
+            rows[accounts + 1 + 16].contains("16 c1 "),
+            "full table, #16 in its row:\n{frame}"
+        );
+        assert_each_member_shows_its_status(&rows, &frame);
     }
 }
