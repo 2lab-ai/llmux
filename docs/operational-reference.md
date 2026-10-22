@@ -112,6 +112,43 @@ the key bar. Numbers keep their usual format everywhere.
   (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
   as before). If the tab row has no room either, the tail is left out (the
   header used to cut it off). When the whole header fits, nothing moves.
+- **Folding spent accounts (`z`).** Off by default. `z` on the dashboard
+  turns it on or off for this session, the same way `u` works, and while
+  it is on the key bar ends with `z fold`. It folds only the accounts the
+  scheduler holds back because their 7d usage is over the ceiling — the
+  ones whose status reads `7d 100.0% > 99%`. A `!` for any other reason (a
+  5h limit, a Fable limit, an auth failure) keeps the account in the
+  table. The table keeps every other account in its usual order and
+  format, and each keeps its own `#`, so the numbers skip the folded ones.
+  The folded accounts are listed directly under the table, from its left
+  edge: one dim line of column names, then the accounts several to a line,
+  in table order, aligned in columns. The accounts title says how many were
+  folded, after the group counts. When all folded accounts have the same
+  status and the whole title fits the width (measured with the widest
+  `+N more` it could carry, so its shape does not change as rows get
+  hidden), it reads `· 7d spent 9 folded: 7d 100.0% > 99%` and the status
+  is shown only there. Otherwise it reads `· 7d spent 9 folded` and each
+  account shows its own status; that title must fit the same way. When
+  neither fits, the dashboard shows the full table. Each folded account
+  shows the same values as its table row, as text — the gauges lose only
+  their fill bar, so the reset time,
+  the `○`/`◑` marks, the percentage and its `!` stay. An account goes back
+  into the table as soon as its 7d usage drops under the ceiling. The
+  cursor still moves through every account in table order, a folded
+  account under the cursor is highlighted like a table row, and clicking
+  a folded account works like clicking its row. When the terminal is too
+  short, `+N more` counts the table rows that do not fit plus the folded
+  accounts on the lines that do not fit. The columns keep room for the
+  widest form of every value the clock changes (a reset countdown with
+  its `◑` mark, a 5h window resetting or going stale), so the block does
+  not move as time passes. The fold never makes the accounts pane taller.
+  When it is on but cannot help, the dashboard shows the full table and
+  the title says why: `· fold: nothing to fold` when no account is
+  7d-spent, `· fold: too narrow` when neither title nor even one folded
+  account per line fits the width, and `· fold: saves no row` when the
+  folded lines would not take fewer rows than the accounts they fold
+  (always the case with one or two spent accounts). Pressing `z` only says
+  `fold on` or `fold off`.
 
 ### Reading account quota columns
 
@@ -235,6 +272,7 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | Numeric combined auth states in `status` / Islands | no | yes | yes |
 | Gemini backend group (`llmux login --gemini`, the dashboard picker's Gemini row, `gemini` / `argon` models, Islands Gemini tiles) | no | no | yes |
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
+| `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | no | yes |
 
 Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
