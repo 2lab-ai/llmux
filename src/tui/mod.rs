@@ -519,6 +519,9 @@ pub(crate) struct Chrome {
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
     /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
     pub reset_absolute: bool,
+    /// `z`-key session toggle: MAIN packs the accounts whose 7d window is
+    /// over its ceiling into a text block under the table (off by default).
+    pub fold_exhausted: bool,
     /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
     /// Rendered raw in the footer (percent ceilings are not secrets).
     pub limits_input: String,
@@ -942,6 +945,10 @@ struct App {
     /// Session toggle (`t`): quota bars show the reset as an absolute UTC
     /// stamp instead of the countdown.
     reset_absolute: bool,
+    /// Session toggle (`z` on MAIN): fold the accounts whose 7d window is
+    /// over its ceiling into a text block under the accounts table. Off
+    /// until the first press; session-local like `u`/`t`/`o`.
+    fold_exhausted: bool,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
@@ -1069,6 +1076,7 @@ impl App {
             clip_inflight: false,
             clip_tx: None,
             reset_absolute: false,
+            fold_exhausted: false,
             pending_control: None,
             control_inflight: false,
             control_tx: None,
@@ -1276,6 +1284,7 @@ impl App {
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
+            fold_exhausted: self.fold_exhausted,
             pane_heights: self.pane_heights,
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
@@ -3234,6 +3243,8 @@ impl App {
             KeyCode::Char('t') => self.toggle_reset_display(),
             // Accounts row order WITHIN each backend group: name ↔ next-pick.
             KeyCode::Char('o') => self.toggle_account_sort(),
+            // Fold the 7d-spent accounts into a text block under the table.
+            KeyCode::Char('z') => self.toggle_fold_exhausted(),
             // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
             KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
@@ -3299,6 +3310,20 @@ impl App {
                 "reset shown as absolute time (UTC)"
             } else {
                 "reset shown as countdown"
+            }
+            .into(),
+        );
+    }
+
+    /// Flip MAIN's fold of the accounts whose 7d window is over its ceiling
+    /// (session-local, like `t`/`u`/`o`; off until the first press).
+    fn toggle_fold_exhausted(&mut self) {
+        self.fold_exhausted = !self.fold_exhausted;
+        self.set_status(
+            if self.fold_exhausted {
+                "fold on"
+            } else {
+                "fold off"
             }
             .into(),
         );
@@ -6636,6 +6661,37 @@ mod tests {
         assert_eq!(app.account_sort, triage::AccountSort::Next);
         app.on_key_accounts(KeyCode::Char('o'), Some(&view));
         assert_eq!(app.account_sort, triage::AccountSort::Name);
+    }
+
+    /// `z` on MAIN folds the 7d-spent accounts: off by default, flipped by
+    /// the key with a status line naming the state, carried on every
+    /// frame's chrome, and session-local like `u` — an overlay round trip
+    /// and the other display toggles leave it alone.
+    #[test]
+    fn fold_key_toggles_on_main_and_persists_like_u() {
+        let view = control_view();
+        let mut app = remote_app();
+        assert!(
+            !app.fold_exhausted && !app.chrome().fold_exhausted,
+            "off by default"
+        );
+        app.on_key(press(KeyCode::Char('z')), Some(&view));
+        assert!(app.fold_exhausted && app.chrome().fold_exhausted);
+        // Plain state, never a claim that something folded (the accounts
+        // title says what the fold did this frame).
+        assert_eq!(app.status_line(), Some("fold on"));
+        app.on_key(press(KeyCode::Char('a')), Some(&view));
+        assert_eq!(app.overlay, Overlay::Accounts);
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        app.on_key(press(KeyCode::Char('u')), Some(&view));
+        app.on_key(press(KeyCode::Char('t')), Some(&view));
+        assert!(app.fold_exhausted && app.chrome().fold_exhausted, "kept");
+        app.on_key(press(KeyCode::Char('z')), Some(&view));
+        assert!(
+            !app.fold_exhausted && !app.chrome().fold_exhausted,
+            "toggles back"
+        );
+        assert_eq!(app.status_line(), Some("fold off"));
     }
 
     #[test]
