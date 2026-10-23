@@ -532,7 +532,10 @@ pub(crate) struct ModelCount {
 ///    booked against it too. Without this, a client sending `opus` produces a
 ///    dashboard row literally named `opus` that matches no pricing entry (no
 ///    `claude-…` prefix) and silently falls through to the group default.
-///    Non-aliases (real ids, codex/grok/unknown slugs) pass through untouched.
+///    Superseded ids resolve the same way (since 2026-10-23
+///    `claude-haiku-4-5[-YYYYMMDD]` → `claude-haiku-5-5[1m]`, the model that
+///    now serves them). Other non-aliases (real ids, codex/grok/unknown
+///    slugs) pass through untouched.
 /// 2. Strip a trailing display-only context suffix `…[1m]` so usage is not split
 ///    by client window hints (req17): `claude-sonnet-4-5[1m]` →
 ///    `claude-sonnet-4-5`. The steps compose: `opus` → `claude-opus-5-5[1m]` →
@@ -2934,6 +2937,11 @@ mod tests {
         assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable-5-1"), "claude-fable-5-1");
         assert_eq!(normalize_model("haiku"), "claude-haiku-5-5");
+        // Served by Haiku 5.5 since 2026-10-23, so booked on its row.
+        assert_eq!(
+            normalize_model("claude-haiku-4-5-20251001"),
+            "claude-haiku-5-5"
+        );
     }
 
     #[test]

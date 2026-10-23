@@ -105,21 +105,26 @@ not that it is zero.
   | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
   | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
   | `haiku`, `haiku-5-5` | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
+  | `claude-haiku-4-5`, `claude-haiku-4-5-YYYYMMDD` (superseded, 2026-10-23) | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
   alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
   exactly like `fable`, because alias resolution runs before the suffix strip.
   The strip is syntactic; the resolved model's context limit still applies.
   `haiku[1m]` now resolves to `claude-haiku-5-5[1m]` (1M published context).
-  Only aliases are rewritten: a real catalog id is not an alias and passes
+  Only aliases and the superseded Haiku 4.5 ids (see alias stability below)
+  are rewritten: a real catalog id is not an alias and passes
   through untouched — the `[1m]` suffix strip is a separate, subsequent step,
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
   and foreign slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The
   mapping has a single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
-  `resolve_claude_alias`; adding a curated row carries its aliases
-  automatically. llmux still does not otherwise *shape* claude requests, and the
-  `efforts` menu on claude rows is the Claude Code `/effort` level list, per the
-  user contract.
+  `resolve_claude_alias` (superseded ids: `SUPERSEDED_CLAUDE_IDS`, same file);
+  adding a curated row carries its aliases
+  automatically. llmux still does not otherwise *shape* claude requests — the
+  one exception is Claude Code's bare `quota` probe, which gets the Claude Code
+  system block ([provider contract](provider-compatibility.md#haiku-55-catalog-update)) —
+  and the `efforts` menu on claude rows is the Claude Code `/effort` level list,
+  per the user contract.
 - **openrouter `or-` aliases** — the openrouter rows advertise the id a client
   SENDS (`or-ox-alpha`); the OpenRouter slug it is rewritten to on the wire
   (`stealth/ox-alpha`) is a different string, because the advertised id has to
@@ -184,9 +189,18 @@ not that it is zero.
   alias onto a new model would be silent substitution. Anyone who needs one specific model must send
   its full catalog id — that is the stable handle. On 2026-10-08, `haiku`
   moved from `claude-haiku-4-5` to `claude-haiku-5-5[1m]`; the explicit 4.5 id
-  remains available. Usage and pricing are booked against the
-  resolved id, not the alias, so alias traffic lands on the same row as id
-  traffic.
+  remained available then. On 2026-10-23 (user decision) that changed for
+  Haiku 4.5 only: the explicit ids `claude-haiku-4-5` and the dated
+  `claude-haiku-4-5-YYYYMMDD` now also resolve to the current `haiku` owner,
+  and the `claude-haiku-4-5` row was retired. Claude Code and the Claude Agent
+  SDK send those explicit ids for their built-in Haiku tier (session titles,
+  `quota` probes, `model: haiku` agents outside `llmux run`), so the alias float
+  alone never reached that traffic. This reverses the 2026-10-08 sentence
+  above for Haiku 4.5 only; every other full id and version alias
+  (`claude-opus-4-8[1m]`, `opus-5`, `sonnet-5`, …) still stays put. Usage and
+  pricing are booked against the resolved id, not the alias, so alias traffic
+  lands on the same row as id traffic — Haiku 4.5 ids included, which the
+  dashboard now books (and prices) as `claude-haiku-5-5`.
 
 ### Out-of-catalog grok pin
 
@@ -232,7 +246,6 @@ model it does not curate.
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-5-5[1m] | haiku, haiku-5-5 | Claude Haiku 5.5 [1M] | low, medium, high, xhigh, max | 1000000 | claude |
 | claude-haiku-5-5 | — | Claude Haiku 5.5 | low, medium, high, xhigh, max | 1000000 | claude |
-| claude-haiku-4-5    | —            | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6.1-sol         | sol, gpt-6.1 | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -549,6 +562,12 @@ without it. Only the `_MODEL` variants are set — Claude Code's `_NAME`,
   drops only the picker document: the exports are env vars, not a settings
   document, so they cannot collide with your lineup.
 - A failed catalog fetch exports nothing, exactly as it injects no lineup.
+- `llmux env` (manual shell wiring, `eval "$(llmux env)"`) prints the same four
+  exports after `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`, with the same
+  already-exported rule. It is offline — `env` never starts the daemon or
+  fetches `/llmux/models` — so the values come from that `llmux` binary's own
+  catalog, not the daemon's; after an upgrade, re-run it. `llmux env --codex`
+  prints none of them.
 
 **These four vars are the only mechanism that changes what a bare native alias
 means, and they do not generalize.** An id Claude Code does not know (`astra`,
@@ -560,6 +579,20 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
+
+## Model sweep: 2026-10-23
+
+Checked all four providers against their current primary sources for 2026-10-12 → 2026-10-23.
+No provider lists a new text model id and no context window changed. Two stale reference prices were
+corrected (Codex, Grok rows). Separately, by user decision the explicit Haiku 4.5 ids now float to the
+`haiku` owner and the `claude-haiku-4-5` row is retired (see [the alias notes](#alias-semantics) above).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | No new model id: the lineup is still Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 (newest, 2026-10-07). Reference prices unchanged. In-window but not catalog changes: Opus 5.5 fast mode left research preview (2026-10-15) and API version `2026-10-21` shipped. | [current lineup](https://platform.claude.com/docs/en/models/overview), [pricing](https://platform.claude.com/docs/en/about-claude/pricing), [release notes](https://platform.claude.com/docs/en/release-notes/overview) |
+| Codex / OpenAI | `models.json` unchanged since `d63a9b8344cf` (2026-10-06); checked at HEAD `30587d78850a` (2026-10-23): same picker ids, contexts and `minimal_client_version`s. New 12-hour cache-write tier (2026-10-20) is not modeled. Corrected `gpt-5.6-terra` to the model page's $2.00 in / $0.20 cached / $12.00 out (was $2.50 / $0.25 / $15.00 from the 2026-07-10 row). | [Codex model catalog @ 30587d78](https://github.com/openai/codex/blob/30587d78850abf2bfc484ffb0ab0f71497cc9c05/codex-rs/models-manager/models.json), [API changelog](https://developers.openai.com/api/docs/changelog), [gpt-5.6-terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) |
+| Grok / xAI | No new text model id (only `grok-voice-3.0`, a speech model, 2026-10-14). `grok-4.7` unchanged (500k, $2.00 / $0.50 cached / $6.00 below 200k). Corrected `grok-4.5` cached input to the listed $0.30 (was $0.50). | [Release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models) |
+| Gemini / Google | No new id affecting the catalog rows. `gemini-4-argon` reached GA on 2026-10-13 under the same id; context and prices unchanged ($2 / $10 / $0.10 through 2026-11-30, Flash $0.75 / $3.75 / $0.075 through 2026-12-31 — both later doublings already noted in `src/pricing.rs`). | [changelog](https://ai.google.dev/gemini-api/docs/changelog), [models](https://ai.google.dev/gemini-api/docs/models), [pricing](https://ai.google.dev/gemini-api/docs/pricing) |
 
 ## Model sweep: 2026-10-15
 
@@ -606,8 +639,10 @@ and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-
 
 Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
 [2026-10-07](https://www.anthropic.com/claude-haiku-5-5). Fable 5.1 now has its
-own $0.25 cache-read reference rate. Explicit older Sonnet 5, Fable 5 and
-Haiku 4.5 keep their own prices.
+own $0.25 cache-read reference rate. Explicit older Sonnet 5 and Fable 5 keep
+their own prices. Explicit Haiku 4.5 ids kept theirs until 2026-10-23; since
+then they are served by Haiku 5.5 and priced at its rates
+([alias stability](#alias-semantics)).
 
 **Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
 ≤100K tier and 5-minute cache writes. It does **not** apply Haiku's >100K tier

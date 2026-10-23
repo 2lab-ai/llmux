@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::provider::codex::{effective_request_meta, CodexShape};
 use crate::routing::BackendGroup;
 
-pub(super) const MAIN: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+pub(crate) const MAIN: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const MONITOR: &str = "You are a security monitor for autonomous AI coding agents";
 const TTL: Duration = Duration::from_secs(6 * 3600);
 const CAPACITY: usize = 4096;

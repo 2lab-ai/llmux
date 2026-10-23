@@ -16,7 +16,9 @@
 //! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`; grok rows re-probed
 //! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7):
 //! - Haiku 5.5: platform.claude.com/docs/en/models/haiku-5-5/overview,
-//!   read 2026-10-08: released 2026-10-07, 1M context, 128k output.
+//!   read 2026-10-08: released 2026-10-07, 1M context, 128k output. The
+//!   `claude-haiku-4-5` row was retired 2026-10-23 (user decision): its ids
+//!   now float to the `haiku` owner via [`SUPERSEDED_CLAUDE_IDS`].
 //! - Claude rows: user-curated 2026-07-27, and they live in [`CLAUDE_MODELS`]
 //!   — that const is the SSOT for both these rows and the alias→id resolution
 //!   in [`crate::provider::anthropic`] (Claude Code model picker; `[1m]`
@@ -24,9 +26,10 @@
 //!   Code `/effort` levels, applied per the user contract — llmux itself does
 //!   NOT shape claude request PARAMETERS (effort/thinking are client metadata,
 //!   advertised here and passed through). It DOES normalize the outbound
-//!   `model` field: [`crate::provider::anthropic`] resolves a curated alias to
-//!   its catalog id and strips the `[1m]` context suffix, with
-//!   [`CLAUDE_MODELS`] as the mapping source.
+//!   `model` field: [`crate::provider::anthropic`] resolves a curated alias —
+//!   or a superseded id ([`SUPERSEDED_CLAUDE_IDS`]) — to its catalog id and
+//!   strips the `[1m]` context suffix, with [`CLAUDE_MODELS`] as the mapping
+//!   source.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14, re-fetched
 //!   2026-09-07 for generation 6 and 2026-10-06 (commit d63a9b83) for
@@ -157,8 +160,25 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
         1_000_000,
     ),
     ("claude-haiku-5-5", &[], "Claude Haiku 5.5", 1_000_000),
-    ("claude-haiku-4-5", &[], "Claude Haiku 4.5", 200_000),
 ];
+
+/// Claude ids that are no longer served as themselves: a request naming one is
+/// rewritten to whichever row CURRENTLY owns the mapped family alias, exactly
+/// as if the client had sent the alias. Tuple = (superseded id, family alias).
+/// A superseded id is never also a [`CLAUDE_MODELS`] row — a row whose
+/// requests are rewritten to another model must not be advertised.
+///
+/// `claude-haiku-4-5` → `haiku` (user decision 2026-10-23): the daemon ledger
+/// for 2026-10-06..2026-10-23 holds ~3,300 requests on `claude-haiku-4-5` /
+/// `claude-haiku-4-5-20251001` — Claude Code / Claude Agent SDK built-in
+/// Haiku-tier traffic (session titles, `quota` probes, an SDK heartbeat bot,
+/// `model: haiku` subagents in sessions not launched by `llmux run`) that the
+/// `haiku` alias float of 2026-10-08 never reached, because the client sends
+/// the explicit id. This deliberately reverses the 2026-10-08 "the explicit
+/// 4.5 id stays available" stance, for Haiku 4.5 ONLY: other version-pinned
+/// ids and aliases (`claude-opus-4-8[1m]`, `opus-5`, `sonnet-5`, …) still do
+/// NOT float — that would be silent model substitution.
+pub(crate) const SUPERSEDED_CLAUDE_IDS: &[(&str, &str)] = &[("claude-haiku-4-5", "haiku")];
 
 /// The curated grok catalog, newest first. Tuple = (id, display name,
 /// max_context); effort menus are looked up per id in
@@ -366,6 +386,13 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 /// ASCII-lowercased before matching. [`CLAUDE_MODELS`] is the only mapping
 /// source, so a new curated row carries its aliases automatically.
 ///
+/// A SUPERSEDED id ([`SUPERSEDED_CLAUDE_IDS`]) resolves too, to the current
+/// owner of its family alias: the exact id, or the id plus a `-YYYYMMDD`-style
+/// all-digit date suffix (`claude-haiku-4-5`, `claude-haiku-4-5-20251001` →
+/// the `haiku` owner, `claude-haiku-5-5[1m]`). Anything else that merely
+/// shares the prefix (`claude-haiku-4-50`, `claude-haiku-4-5-foo`) is not
+/// matched.
+///
 /// A trailing `[1m]` is stripped from the NEEDLE before the lookup, because
 /// the client may attach the context suffix to an alias (`fable[1m]`,
 /// `opus[1m]`) exactly as it does to an id. Alias resolution runs before the
@@ -383,10 +410,34 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
     let needle = model.trim().to_ascii_lowercase();
     let needle = needle.strip_suffix("[1m]").unwrap_or(&needle);
+    alias_owner(needle).or_else(|| {
+        SUPERSEDED_CLAUDE_IDS
+            .iter()
+            .find(|(id, _)| is_superseded_spelling(needle, id))
+            .and_then(|&(_, alias)| alias_owner(alias))
+    })
+}
+
+/// The [`CLAUDE_MODELS`] id advertising `alias`, if any.
+fn alias_owner(alias: &str) -> Option<&'static str> {
     CLAUDE_MODELS
         .iter()
-        .find(|(_, aliases, _, _)| aliases.contains(&needle))
+        .find(|(_, aliases, _, _)| aliases.contains(&alias))
         .map(|&(id, _, _, _)| id)
+}
+
+/// `needle` is `id` itself or `id-<digits>` (a dated snapshot spelling such as
+/// `claude-haiku-4-5-20251001`). The `-` plus a non-empty all-ASCII-digit tail
+/// is the version boundary, so `claude-haiku-4-50` / `claude-haiku-4-5-` /
+/// `claude-haiku-4-5-foo` stay unmatched.
+fn is_superseded_spelling(needle: &str, id: &str) -> bool {
+    match needle.strip_prefix(id) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('-')
+            .is_some_and(|date| !date.is_empty() && date.bytes().all(|b| b.is_ascii_digit())),
+        None => false,
+    }
 }
 
 /// The known model catalog in canonical group order
@@ -720,8 +771,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_51_entries() {
-        // The pinned (curated) case: exactly 51 rows, claude ids in order.
+    fn catalog_matches_user_contract_50_entries() {
+        // The pinned (curated) case: exactly 50 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -730,9 +781,10 @@ mod tests {
         // `grok-4.7[1m]` twin landed (2026-09-28).
         // 33 before the sonnet-5-5 pair + the gpt-6.1-sol / gpt-6-sol /
         // gpt-6-luna pairs landed (2026-10-06); 41 before Haiku 5.5 (2026-10-08);
-        // 43 before the 8 gemini rows landed (2026-10-15).
+        // 43 before the 8 gemini rows landed (2026-10-15); 50 after the
+        // claude-haiku-4-5 row was retired (2026-10-23).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 51);
+        assert_eq!(entries.len(), 50);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -755,7 +807,6 @@ mod tests {
                 "claude-sonnet-5",
                 "claude-haiku-5-5[1m]",
                 "claude-haiku-5-5",
-                "claude-haiku-4-5",
             ]
         );
     }
@@ -915,13 +966,14 @@ mod tests {
             find(&entries, "claude-haiku-5-5[1m]").aliases,
             vec!["haiku", "haiku-5-5"]
         );
-        assert!(find(&entries, "claude-haiku-4-5").aliases.is_empty());
         for model in ["claude-haiku-5-5", "claude-haiku-5-5[1m]"] {
             assert_eq!(find(&entries, model).max_context, Some(1_000_000));
         }
-        assert_eq!(
-            find(&entries, "claude-haiku-4-5").max_context,
-            Some(200_000)
+        // Retired 2026-10-23: its requests are served by the `haiku` owner, so
+        // advertising the row would promise a model that is never reached.
+        assert!(
+            entries.iter().all(|e| e.id != "claude-haiku-4-5"),
+            "the claude-haiku-4-5 row is retired"
         );
         assert_eq!(
             find(&entries, "claude-fable-5-1[1m]").max_context,
@@ -1062,6 +1114,60 @@ mod tests {
         }
     }
 
+    /// User decision 2026-10-23: explicit Haiku 4.5 ids — the bare id and its
+    /// dated snapshot spelling, which Claude Code / the Agent SDK send for
+    /// their built-in Haiku tier — are served by the CURRENT `haiku` owner.
+    /// Only the exact id or id + `-<digits>` floats; a prefix look-alike is a
+    /// different string and must stay untouched.
+    #[test]
+    fn resolve_claude_alias_floats_superseded_haiku_4_5() {
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "  CLAUDE-HAIKU-4-5-20251001[1m] ",
+            "claude-haiku-4-5[1m]",
+        ] {
+            assert_eq!(
+                resolve_claude_alias(model),
+                Some("claude-haiku-5-5[1m]"),
+                "{model:?} floats to the haiku owner"
+            );
+        }
+        for model in [
+            "claude-haiku-4-5x",
+            "claude-haiku-4-5-foo",
+            "claude-haiku-4-50",
+            "claude-haiku-4",
+            "claude-haiku-4-5-",
+        ] {
+            assert_eq!(
+                resolve_claude_alias(model),
+                None,
+                "{model:?} must not float"
+            );
+        }
+    }
+
+    /// A superseded id resolves through its family alias, so that alias must
+    /// have an owner (else the float silently becomes a passthrough), and a
+    /// superseded id must not also be an advertised row (else `/models` would
+    /// list a model whose requests are rewritten to another one).
+    #[test]
+    fn superseded_claude_ids_map_to_an_owned_alias_and_are_not_rows() {
+        for &(superseded, alias) in SUPERSEDED_CLAUDE_IDS {
+            assert!(
+                CLAUDE_MODELS
+                    .iter()
+                    .any(|(_, aliases, _, _)| aliases.contains(&alias)),
+                "{superseded:?} maps to {alias:?}, which no CLAUDE_MODELS row owns"
+            );
+            assert!(
+                CLAUDE_MODELS.iter().all(|(id, ..)| *id != superseded),
+                "superseded id {superseded:?} is still a CLAUDE_MODELS row"
+            );
+        }
+    }
+
     #[test]
     fn curated_grok_rows_carry_context_and_efforts() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -1133,7 +1239,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 51, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 50, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -1180,14 +1286,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 51.
+        // count 50.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 51, "pin {pin}");
+            assert_eq!(entries.len(), 50, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1202,7 +1308,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 52);
+        assert_eq!(entries.len(), 51);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1229,7 +1335,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 52);
+        assert_eq!(entries.len(), 51);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));

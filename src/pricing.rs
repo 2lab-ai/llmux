@@ -16,7 +16,8 @@
 //! Sonnet 5.5 and Fable 5.1 cache rates re-read 2026-10-08 at
 //! https://platform.claude.com/docs/en/about-claude/pricing. Gemini 3.8 Flash
 //! and Gemini 4 Argon from https://ai.google.dev/gemini-api/docs/pricing
-//! (updated 2026-10-14).
+//! (updated 2026-10-14). gpt-5.6-terra and grok-4.5 corrected 2026-10-23
+//! against their model pages (see the rows).
 
 use std::collections::HashMap;
 
@@ -69,7 +70,10 @@ const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
 const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// Sonnet 5.5 cache reads fell to $0.10 on 2026-10-07. Other rates unchanged.
 const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
-/// Haiku 4.5 rates; also the unknown Haiku family fallback.
+/// Haiku 4.5's list rates, kept as the unknown Haiku family fallback (e.g.
+/// `claude-haiku-5-5x`). Haiku 4.5 ids themselves no longer price here: since
+/// 2026-10-23 they are served by Haiku 5.5 and `normalize_model` books them
+/// there (`crate::catalog::SUPERSEDED_CLAUDE_IDS`).
 const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
 /// Haiku 5.5: <=100,000 prompt tokens, 5m cache writes (official pricing,
 /// read 2026-10-08). >100,000 prompt tokens cost 5x ALL these rates;
@@ -91,8 +95,11 @@ const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 /// the "codex has no cache-creation charge" convention no longer holds for
 /// the rows re-read on 2026-10-06.
 const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.40, 5.0);
-/// gpt-5.6-terra (mid tier): $2.50 in / $15 out, cache read 0.25.
-const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.5, 15.0, 0.25, 0.0);
+/// gpt-5.6-terra (mid tier). developers.openai.com/api/docs/models/gpt-5.6-terra,
+/// read 2026-10-23: $2 in / $0.20 cached / $12 out; no cache-write rate is
+/// listed, so that rate stays 0. Corrected from the launch-era (2026-07-10)
+/// $2.50 / $0.25 / $15 row.
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 0.0);
 /// gpt-5.6-luna (budget tier). developers.openai.com model page, read
 /// 2026-10-06: $0.20 in / $0.02 cached / $1.20 out; no cache-write rate is
 /// listed for it, so that rate stays 0. Corrected from the launch-era $1/$6.
@@ -114,16 +121,20 @@ const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// (standard, ≤272k input): $0.10 in / $0.01 cached / $0.125 cache write /
 /// $0.50 out.
 const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
-/// grok-4.5 (docs.x.ai, 2026-07-14): $2 in / $6 out, cached input 0.5, no
-/// cache-creation charge. Also the `group == "grok"` unknown-model fallback.
-/// Like the codex rows, an API-list-price EQUIVALENT for subscription
-/// traffic, not a billed amount (docs/grok/spec.md §Compatibility).
-const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// grok-4.5 (docs.x.ai/developers/models, read 2026-10-23): $2 in / $6 out /
+/// $0.30 cached input below 200k prompt tokens, no cache-creation charge
+/// (corrected from the $0.50 cached carried since 2026-07-14). The ≥200k tier
+/// ($4 / $12 / $0.60) is not modeled — static single tier. Also the
+/// `group == "grok"` unknown-model fallback. Like the codex rows, an
+/// API-list-price EQUIVALENT for subscription traffic, not a billed amount
+/// (docs/grok/spec.md §Compatibility).
+const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.3, 0.0);
 /// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; the $0.50/M cached input
-/// was carried from grok-4.5 when this row landed and is now LISTED on the
-/// page itself (docs.x.ai, re-read 2026-09-23) — same number, no longer an
-/// inference. API-list-price equivalent for subscription traffic, like the
-/// other grok rows.
+/// was copied from the grok-4.5 row as it stood when this row landed, and is
+/// LISTED on grok-4.6's own page (docs.x.ai, re-read 2026-09-23) — no longer
+/// an inference. grok-4.5's own listed cached rate is $0.30 (read
+/// 2026-10-23), so the two rows now differ. API-list-price equivalent for
+/// subscription traffic, like the other grok rows.
 const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
 /// grok-4.7 (docs.x.ai pricing, 2026-09-23): $2 in / $6 out / $0.50 cached
 /// input, no cache-creation charge — unchanged from grok-4.6. The
@@ -166,8 +177,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-sonnet-5-5" => Some(SONNET_5_5),
         "claude-sonnet-5" => Some(SONNET_5),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
+        // No `claude-haiku-4-5` arm: `normalize_model` floats Haiku 4.5 ids to
+        // `claude-haiku-5-5` before this lookup, so an arm here was dead code.
         "claude-haiku-5-5" => Some(HAIKU_5_5),
-        "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5-1" => Some(FABLE_5_1),
         "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
@@ -417,13 +429,27 @@ mod tests {
             "claude-haiku-5-5",
             "claude-haiku-5-5[1m]",
             "claude-haiku-5-5-20261007",
+            // Served by Haiku 5.5 since 2026-10-23 (catalog
+            // SUPERSEDED_CLAUDE_IDS), so booked at its rates.
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5[1m]",
         ] {
             assert_eq!(price_for("claude", model, &empty()), Some(haiku), "{model}");
         }
-        assert_eq!(
-            price_for("claude", "claude-haiku-4-5", &empty()),
-            Some(HAIKU_TIER)
-        );
+        // Override keys are normalized too, so a key written as the old id now
+        // names the Haiku 5.5 key: it prices old-id AND new-id traffic alike
+        // (both are served by Haiku 5.5).
+        let custom = ModelPrice::new(9.0, 8.0, 7.0, 6.0);
+        let overrides = HashMap::from([("claude-haiku-4-5".to_string(), custom)]);
+        for model in ["claude-haiku-4-5-20251001", "claude-haiku-5-5", "haiku"] {
+            assert_eq!(
+                price_for("claude", model, &overrides),
+                Some(custom),
+                "{model}"
+            );
+        }
+        // HAIKU_TIER stays the unknown-haiku fallback.
         assert_eq!(
             builtin_price("claude-haiku-5-50-20261007"),
             Some(HAIKU_TIER)
@@ -498,10 +524,12 @@ mod tests {
     #[test]
     fn c14_grok_prices_and_group_fallback() {
         let overrides = std::collections::HashMap::new();
+        // grok-4.5 (docs.x.ai models, read 2026-10-23): $0.30 cached below
+        // 200k, not the $0.50 that grok-4.6 / grok-4.7 list.
         let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
         assert_eq!(
             (p.input, p.output, p.cache_read, p.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.3, 0.0)
         );
         let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
         assert_eq!(
@@ -849,7 +877,18 @@ mod tests {
             &tc(1_000_000, 0, None, None),
             &empty(),
         );
-        approx(terra, 2.50);
+        // Model page, read 2026-10-23: $2 in / $0.20 cached / $12 out.
+        approx(terra, 2.0);
+        let terra = price_for("codex", "gpt-5.6-terra", &empty()).expect("terra priced");
+        assert_eq!(
+            (
+                terra.input,
+                terra.output,
+                terra.cache_read,
+                terra.cache_creation
+            ),
+            (2.0, 12.0, 0.2, 0.0)
+        );
         let luna = cost_usd(
             "codex",
             "gpt-5.6-luna",
@@ -1058,6 +1097,7 @@ mod tests {
             ),
             3.0,
         );
+        // A Haiku 4.5 id is served (and booked) as Haiku 5.5 since 2026-10-23.
         approx(
             cost_usd(
                 "claude",
@@ -1065,7 +1105,7 @@ mod tests {
                 &tc(0, 1_000_000, None, None),
                 &empty(),
             ),
-            5.0,
+            0.50,
         );
         approx(
             cost_usd(

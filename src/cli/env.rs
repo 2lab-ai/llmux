@@ -6,11 +6,21 @@ use super::{resolve_endpoint, CliError, Endpoint, EnvArgs};
 pub async fn run(args: EnvArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
-    print!("{}", render(&endpoint, args.codex)?);
+    print!(
+        "{}",
+        render(&endpoint, args.codex, |var| std::env::var_os(var).is_some())?
+    );
     Ok(())
 }
 
-fn render(endpoint: &Endpoint, codex: bool) -> Result<String, CliError> {
+/// `already_set` reports whether a variable is already in the caller's
+/// environment (the same skip rule as `run`'s alias exports); it is a
+/// parameter so tests need no process-global env mutation.
+fn render(
+    endpoint: &Endpoint,
+    codex: bool,
+    already_set: impl Fn(&str) -> bool,
+) -> Result<String, CliError> {
     if !codex {
         let mut output = format!(
             "export ANTHROPIC_BASE_URL={}\n",
@@ -18,6 +28,20 @@ fn render(endpoint: &Endpoint, codex: bool) -> Result<String, CliError> {
         );
         if let Some(key) = &endpoint.api_key {
             output.push_str(&format!("export ANTHROPIC_API_KEY={}\n", shell_quote(key)));
+        }
+        // The `ANTHROPIC_DEFAULT_*_MODEL` exports `llmux run` sets, so that
+        // Claude Code's NATIVE `opus` / `fable` / `sonnet` / `haiku` resolve
+        // to the catalog's `[1m]` ids (see `super::run::ALIAS_ENV`). Offline:
+        // `env` never starts the daemon or fetches `/llmux/models`, so the
+        // values come from THIS binary's compiled catalog — `run` reads the
+        // daemon's. A var the caller already exports is left alone.
+        for &(alias, var) in super::run::ALIAS_ENV {
+            if already_set(var) {
+                continue;
+            }
+            if let Some(id) = crate::catalog::resolve_claude_alias(alias) {
+                output.push_str(&format!("export {var}={}\n", shell_quote(id)));
+            }
         }
         return Ok(output);
     }
@@ -70,5 +94,75 @@ fn shell_quote(value: &str) -> String {
         value.to_owned()
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint() -> Endpoint {
+        Endpoint {
+            base_url: "http://127.0.0.1:3456".into(),
+            api_key: Some("lmk-test".into()),
+            remote: false,
+            host: "127.0.0.1".into(),
+            port: 3456,
+        }
+    }
+
+    /// Plain `env` prints the same four alias exports `run` sets, from this
+    /// binary's catalog, `[1m]` ids shell-quoted, after the endpoint exports.
+    #[test]
+    fn render_exports_the_compiled_catalog_alias_owners() {
+        let output = render(&endpoint(), false, |_| false).expect("render");
+        assert_eq!(
+            output,
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:3456\n\
+             export ANTHROPIC_API_KEY=lmk-test\n\
+             export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5-5[1m]'\n\
+             export ANTHROPIC_DEFAULT_FABLE_MODEL='claude-fable-5-1[1m]'\n\
+             export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-5-5[1m]'\n\
+             export ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-haiku-5-5[1m]'\n"
+        );
+    }
+
+    /// The caller's own export wins: that var is omitted, the rest still print.
+    #[test]
+    fn render_omits_an_alias_var_already_set() {
+        let output = render(&endpoint(), false, |var| {
+            var == "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        })
+        .expect("render");
+        assert!(
+            !output.contains("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            "{output}"
+        );
+        for var in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        ] {
+            assert!(
+                output.contains(&format!("export {var}=")),
+                "{var}: {output}"
+            );
+        }
+    }
+
+    /// `--codex` prints only the OpenAI exports and the commented command —
+    /// the alias exports (and the env predicate) do not touch it.
+    #[test]
+    fn render_codex_branch_carries_no_claude_alias_exports() {
+        let unset = render(&endpoint(), true, |_| false).expect("render");
+        let set = render(&endpoint(), true, |_| true).expect("render");
+        assert_eq!(unset, set);
+        assert!(!unset.contains("ANTHROPIC_"), "{unset}");
+        assert!(
+            unset.starts_with(
+                "export OPENAI_BASE_URL=http://127.0.0.1:3456/v1\nexport OPENAI_API_KEY=lmk-test\n"
+            ),
+            "{unset}"
+        );
     }
 }
