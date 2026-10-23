@@ -187,7 +187,9 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
 /// live probes on 2026-10-23 showed Haiku 5.5 on the subscription endpoint
 /// refusing (429) every request whose first system block is not one of those
 /// shapes, while Haiku 4.5 accepted them — so a bare or custom-system request
-/// naming a 4.5 id keeps reaching Haiku 4.5. The Agent SDK (Responses) path
+/// naming a 4.5 id keeps reaching Haiku 4.5, as does one with non-default
+/// sampling (Haiku 5.5 400s `temperature` ≠ 1, `top_p`, `top_k`). The Agent
+/// SDK (Responses) path
 /// floats aliases only. Accounting keeps a superseded id as itself, so history
 /// recorded before the float keeps its Haiku 4.5 identity and price;
 /// `proxy::forward` records a floated request under the served id.

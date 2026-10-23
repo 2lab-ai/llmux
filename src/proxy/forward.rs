@@ -1456,9 +1456,15 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Superseded-id float (Haiku 4.5 → the `haiku` owner): the SAME predicate
     // the anthropic provider applies to these bytes, decided once here so the
     // activity record names the model that actually serves the request. The
-    // Responses ingress floats aliases only (Agent SDK path).
-    let superseded_float =
-        responses_input.is_none() && crate::provider::anthropic::body_floats_superseded_ids(&body);
+    // Responses ingress floats aliases only (Agent SDK path). The predicate
+    // only matters when the model IS a superseded id, so check that first on
+    // the already-extracted `model`: every other request (1M-context bodies
+    // included) skips the extra full parse, with the same result.
+    let superseded_float = model
+        .as_deref()
+        .is_some_and(|m| crate::catalog::resolve_superseded_claude_id(m).is_some())
+        && responses_input.is_none()
+        && crate::provider::anthropic::body_floats_superseded_ids(&body);
     let mut group = if state
         .settings_live
         .routing_enabled

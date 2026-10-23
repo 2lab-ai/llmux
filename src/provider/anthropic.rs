@@ -74,10 +74,31 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
 /// same refused bodies (bare plain: 4.5 200 ×2, 5.5 502 ×2). So a bare or
 /// custom-system client naming a 4.5 id keeps reaching Haiku 4.5.
 ///
+/// In addition the body must use default sampling ([`default_sampling`]): on
+/// a gate-shaped body (billing header + Agent SDK sentence, 2026-10-23) Haiku
+/// 5.5 answered 400 `invalid_request_error` "`temperature` is deprecated for
+/// this model." for `temperature` 0 and 0.7, and the same for `top_p` 0.9 and
+/// `top_k` 40, where Haiku 4.5 returned 200 to all four; `temperature` 1 was
+/// accepted on 5.5. Such a request keeps its 4.5 id rather than having the
+/// caller's sampling value silently dropped.
+///
 /// Shared with `proxy::forward`, which evaluates it once on the same inbound
 /// bytes so the activity record names the model that actually served them.
 pub(crate) fn floats_superseded_ids(body: &serde_json::Value) -> bool {
-    is_quota_probe(body) || first_system_text(body).is_some_and(is_gate_shaped_system)
+    (is_quota_probe(body) || first_system_text(body).is_some_and(is_gate_shaped_system))
+        && default_sampling(body)
+}
+
+/// No `top_p` and no `top_k` (absent or `null`), and `temperature` absent,
+/// `null` or numerically 1 — the only sampling Haiku 5.5 accepted
+/// ([`floats_superseded_ids`]).
+fn default_sampling(body: &serde_json::Value) -> bool {
+    let unset = |key: &str| body.get(key).is_none_or(serde_json::Value::is_null);
+    unset("top_p")
+        && unset("top_k")
+        && body
+            .get("temperature")
+            .is_none_or(|t| t.is_null() || t.as_f64() == Some(1.0))
 }
 
 /// [`floats_superseded_ids`] over raw body bytes (`false` for non-JSON).
@@ -596,6 +617,24 @@ mod tests {
         }
     }
 
+    /// A gate-shaped 4.5 body with non-default sampling stays on Haiku 4.5
+    /// (Haiku 5.5 400s `temperature` 0, 2026-10-23), byte-identical — the
+    /// caller's sampling value is never dropped to make the float fit.
+    #[test]
+    fn normalize_body_keeps_a_sampled_gate_shaped_4_5_body_on_4_5() {
+        let system = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9;"},
+            {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+        ]);
+        let mut sampled: serde_json::Value =
+            serde_json::from_str(&plain_body("claude-haiku-4-5-20251001", Some(system)))
+                .expect("json");
+        sampled["temperature"] = serde_json::json!(0);
+        let body = sampled.to_string();
+        let out = normalize_body(bytes::Bytes::from(body.clone()));
+        assert_eq!(out.as_ref(), body.as_bytes());
+    }
+
     /// The predicate mirrors the 2026-10-23 live probe table on
     /// `claude-haiku-5-5` (200 = floats, 502 = does not).
     #[test]
@@ -647,6 +686,39 @@ mod tests {
                 "502 shape must not float: {system:?}"
             );
         }
+        // Sampling on a gate-shaped body (billing header + SDK sentence):
+        // Haiku 5.5 400'd `temperature` 0 / 0.7, `top_p` 0.9 and `top_k` 40
+        // ("… is deprecated for this model.") and took `temperature` 1.
+        let gate = with_system(Some(serde_json::json!([block(HEADER), block(SDK)])));
+        let sampled = |key: &str, value: serde_json::Value| {
+            let mut body = gate.clone();
+            body[key] = value;
+            body
+        };
+        for (key, value) in [
+            ("temperature", serde_json::json!(0)),
+            ("temperature", serde_json::json!(0.7)),
+            ("top_p", serde_json::json!(0.9)),
+            ("top_k", serde_json::json!(40)),
+        ] {
+            assert!(
+                !floats_superseded_ids(&sampled(key, value.clone())),
+                "400 sampling must not float: {key}={value}"
+            );
+        }
+        for (key, value) in [
+            ("temperature", serde_json::json!(1)),
+            ("temperature", serde_json::json!(1.0)),
+            ("temperature", serde_json::Value::Null),
+            ("top_p", serde_json::Value::Null),
+            ("top_k", serde_json::Value::Null),
+        ] {
+            assert!(
+                floats_superseded_ids(&sampled(key, value.clone())),
+                "default sampling floats: {key}={value}"
+            );
+        }
+        assert!(floats_superseded_ids(&gate), "temperature absent floats");
         // The bare quota probe floats (it gets the Claude Code block).
         let probe = serde_json::json!({
             "model": "claude-haiku-4-5", "max_tokens": 1,

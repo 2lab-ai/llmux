@@ -105,15 +105,16 @@ not that it is zero.
   | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
   | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
   | `haiku`, `haiku-5-5` | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
-  | `claude-haiku-4-5`, `claude-haiku-4-5-YYYYMMDD` (superseded 2026-10-23; Claude Code / Agent SDK–shaped requests only) | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
+  | `claude-haiku-4-5`, `claude-haiku-4-5-YYYYMMDD` (superseded 2026-10-23; Claude Code / Agent SDK–shaped requests with default sampling only) | `claude-haiku-5-5[1m]` | `claude-haiku-5-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
   alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
   exactly like `fable`, because alias resolution runs before the suffix strip.
   The strip is syntactic; the resolved model's context limit still applies.
   `haiku[1m]` now resolves to `claude-haiku-5-5[1m]` (1M published context).
-  Only aliases and, on Claude Code / Agent SDK–shaped requests, the superseded
-  Haiku 4.5 ids (see alias stability below) are rewritten: a real catalog id is not an alias and passes
+  Only aliases and, on Claude Code / Agent SDK–shaped requests with default
+  sampling, the superseded Haiku 4.5 ids (see alias stability below) are
+  rewritten: a real catalog id is not an alias and passes
   through untouched — the `[1m]` suffix strip is a separate, subsequent step,
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
   and foreign slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The
@@ -196,13 +197,16 @@ not that it is zero.
   the dated `claude-haiku-4-5-YYYYMMDD` resolve to the current `haiku` owner on
   Claude Code / Agent SDK–shaped Messages requests — the first system block is
   a billing header (`x-anthropic-billing-header: …`) or exactly one of the
-  Claude Code / Agent SDK identity sentences — and on Claude Code's bare
-  `quota` probe. Claude Code and the Claude Agent SDK send those explicit ids
+  Claude Code / Agent SDK identity sentences — that also use default sampling
+  (no `top_p`, no `top_k`, `temperature` absent or 1), and on Claude Code's
+  bare `quota` probe. Claude Code and the Claude Agent SDK send those explicit ids
   for their built-in Haiku tier (session titles, `quota` probes,
   `model: haiku` agents outside `llmux run`), so the alias float alone never
   reached that traffic. A bare or custom-system request naming a 4.5 id keeps
   reaching Haiku 4.5, because Haiku 5.5 refuses such requests on the
-  subscription endpoint ([probe table](provider-compatibility.md#haiku-55-catalog-update));
+  subscription endpoint, and so does one that sets `temperature` other than 1,
+  `top_p` or `top_k`, which Haiku 5.5 rejects as deprecated
+  ([probe table](provider-compatibility.md#haiku-55-catalog-update));
   the Codex-frontend (Responses) path floats aliases only. The
   `claude-haiku-4-5` row stays retired: the picker is Claude Code-facing, and
   Claude Code requests float. This reverses the 2026-10-08 sentence above for
@@ -592,7 +596,7 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 Checked all four providers against their current primary sources for 2026-10-12 → 2026-10-23.
 No provider lists a new text model id and no context window changed. Two stale reference prices were
 corrected (Codex, Grok rows). Separately, by user decision the explicit Haiku 4.5 ids now float to the
-`haiku` owner on Claude Code / Agent SDK–shaped requests and the `claude-haiku-4-5` row is retired
+`haiku` owner on Claude Code / Agent SDK–shaped requests with default sampling and the `claude-haiku-4-5` row is retired
 (see [the alias notes](#alias-semantics) above).
 
 | Provider | Result | Sources checked |
@@ -650,8 +654,9 @@ Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
 own $0.25 cache-read reference rate. Explicit older Sonnet 5 and Fable 5 keep
 their own prices. Haiku 4.5 records from before 2026-10-23 keep Haiku 4.5
 identity and pricing. From then on a request that floats is served by Haiku 5.5
-and recorded (and priced) as `claude-haiku-5-5`; a bare or custom-system
-request naming a 4.5 id still reaches Haiku 4.5 and keeps its 4.5 id and price
+and recorded (and priced) as `claude-haiku-5-5`; a bare, custom-system or
+non-default-sampling request naming a 4.5 id still reaches Haiku 4.5 and keeps
+its 4.5 id and price
 ([alias stability](#alias-semantics)).
 
 **Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
