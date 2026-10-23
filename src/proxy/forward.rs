@@ -479,9 +479,10 @@ impl ForwardContext {
 
     /// The `(group, model, effort, fast)` shown in the activity log. Codex: the
     /// PER-REQUEST resolved upstream model + effective effort/fast that went
-    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model +
-    /// the thinking budget, never fast. All `None`/`false` before the provider
-    /// path is chosen (early failures).
+    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model
+    /// (a superseded id recorded as the id that served it, see
+    /// [`recorded_claude_model`]) + the thinking budget, never fast. All
+    /// `None`/`false` before the provider path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
         // The override is known even on a pre-lease failure (Codex exhausted).
         if let Some(route) = &self.auto_classifier {
@@ -538,7 +539,7 @@ impl ForwardContext {
             },
             Some(BackendGroup::Claude) => FinishedMeta {
                 group: Some("claude".to_string()),
-                model: self.model.clone(),
+                model: recorded_claude_model(self.model.as_deref()),
                 effort: claude_effort(&self.body),
                 fast: false,
             },
@@ -553,9 +554,16 @@ impl ForwardContext {
                 effort: None,
                 fast: false,
             },
+            // An early failure classified to the claude group would have been
+            // served through the same resolver, so it names the same model;
+            // any other (or no) group keeps the inbound string.
             None => FinishedMeta {
                 group: self.group.map(|g| g.as_str().to_string()),
-                model: self.model.clone(),
+                model: if self.group == Some(BackendGroup::Claude) {
+                    recorded_claude_model(self.model.as_deref())
+                } else {
+                    self.model.clone()
+                },
                 effort: claude_effort(&self.body),
                 fast: false,
             },
@@ -745,6 +753,25 @@ struct FinishedMeta {
     model: Option<String>,
     effort: Option<String>,
     fast: bool,
+}
+
+/// The model a CLAUDE activity record names: the inbound string exactly as
+/// sent (an alias stays `opus` — accounting resolves aliases itself), EXCEPT a
+/// superseded id ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], e.g.
+/// `claude-haiku-4-5-20251001`), which is recorded as the id that actually
+/// served it, suffix-stripped (`claude-haiku-5-5`).
+///
+/// Why: accounting (`tui::activity::normalize_model`, used by pricing, key
+/// usage and the dashboard at read/replay time) deliberately does NOT float
+/// superseded ids, so persisted records from before the 2026-10-23 float keep
+/// their true Haiku 4.5 identity and price. A record written from the float
+/// onward must therefore name the model that served it when it is written.
+fn recorded_claude_model(model: Option<&str>) -> Option<String> {
+    let model = model?;
+    Some(match crate::catalog::resolve_superseded_claude_id(model) {
+        Some(served) => served.strip_suffix("[1m]").unwrap_or(served).to_string(),
+        None => model.to_string(),
+    })
 }
 
 /// The per-request effort recorded for a CLAUDE request: the raw
@@ -2225,7 +2252,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         _ => {}
                     }
                     if let Some(model) = body["model"].as_str() {
-                        let resolved = crate::catalog::resolve_claude_alias(model).unwrap_or(model);
+                        // Routing resolver: aliases AND superseded ids (the
+                        // Haiku 4.5 ids reach the SDK as the haiku owner).
+                        let resolved = crate::catalog::resolve_claude_model(model).unwrap_or(model);
                         body["model"] = serde_json::json!(resolved);
                     }
                     (
@@ -4825,6 +4854,41 @@ mod tests {
             assert_eq!(meta.model.as_deref(), Some(upstream), "{model}");
             assert_eq!(meta.effort, None, "{model}: the level is in the id");
         }
+    }
+
+    /// Since 2026-10-23 a superseded claude id is SERVED by its family alias's
+    /// owner, and accounting does not float it (history keeps Haiku 4.5), so
+    /// the record written now must name the served id. Everything else keeps
+    /// the inbound string exactly as before — an alias stays the alias.
+    #[test]
+    fn claude_finished_meta_records_the_served_id_for_a_superseded_id_only() {
+        let state = test_state("http://127.0.0.1:9", vec![oauth_account("a", "at-a")]);
+        for (inbound, recorded) in [
+            ("claude-haiku-4-5-20251001", "claude-haiku-5-5"),
+            ("claude-haiku-4-5", "claude-haiku-5-5"),
+            ("claude-haiku-4-5[1m]", "claude-haiku-5-5"),
+            ("opus", "opus"),
+            ("haiku", "haiku"),
+            ("claude-opus-4-8[1m]", "claude-opus-4-8[1m]"),
+            ("claude-haiku-5-5", "claude-haiku-5-5"),
+        ] {
+            // Served by the claude group…
+            let mut ctx = ctx_for_group(inbound, BackendGroup::Claude);
+            ctx.served_by = Some(BackendGroup::Claude);
+            let meta = ctx.finished_meta(&state);
+            assert_eq!(meta.group.as_deref(), Some("claude"), "{inbound}");
+            assert_eq!(meta.model.as_deref(), Some(recorded), "{inbound}");
+            // …and an early failure classified to it names the same model.
+            let early = ctx_for_group(inbound, BackendGroup::Claude);
+            let meta = early.finished_meta(&state);
+            assert_eq!(meta.model.as_deref(), Some(recorded), "early {inbound}");
+        }
+        // A non-claude early failure keeps the inbound string untouched.
+        let ctx = ctx_for_group("claude-haiku-4-5-20251001", BackendGroup::Codex);
+        assert_eq!(
+            ctx.finished_meta(&state).model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
     }
 
     /// A gemini 429 body in the captured Cloud Code shape (CLIProxyAPI

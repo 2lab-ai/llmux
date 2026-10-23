@@ -118,7 +118,9 @@ not that it is zero.
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
   and foreign slugs (`grok-4.6`, `gpt-5.6-sol`) are never rewritten. The
   mapping has a single source, the `CLAUDE_MODELS` const in `src/catalog.rs` behind
-  `resolve_claude_alias` (superseded ids: `SUPERSEDED_CLAUDE_IDS`, same file);
+  `resolve_claude_alias` (superseded ids: `SUPERSEDED_CLAUDE_IDS`, same file,
+  applied only by the routing resolver `resolve_claude_model` — usage
+  accounting resolves aliases only);
   adding a curated row carries its aliases
   automatically. llmux still does not otherwise *shape* claude requests — the
   one exception is Claude Code's bare `quota` probe, which gets the Claude Code
@@ -199,8 +201,11 @@ not that it is zero.
   above for Haiku 4.5 only; every other full id and version alias
   (`claude-opus-4-8[1m]`, `opus-5`, `sonnet-5`, …) still stays put. Usage and
   pricing are booked against the resolved id, not the alias, so alias traffic
-  lands on the same row as id traffic — Haiku 4.5 ids included, which the
-  dashboard now books (and prices) as `claude-haiku-5-5`.
+  lands on the same row as id traffic. Haiku 4.5 ids are the exception on the
+  accounting side: records from before the change keep their Haiku 4.5
+  identity and Haiku 4.5 pricing (Haiku 4.5 served them), while requests from
+  the change onward are recorded as `claude-haiku-5-5`, the model that serves
+  them.
 
 ### Out-of-catalog grok pin
 
@@ -566,8 +571,12 @@ without it. Only the `_MODEL` variants are set — Claude Code's `_NAME`,
   exports after `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`, with the same
   already-exported rule. It is offline — `env` never starts the daemon or
   fetches `/llmux/models` — so the values come from that `llmux` binary's own
-  catalog, not the daemon's; after an upgrade, re-run it. `llmux env --codex`
-  prints none of them.
+  catalog, not the daemon's. To pick up a new catalog after an upgrade, run it
+  from a new shell (or after
+  `unset ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL`): in the shell that
+  already evaluated it, the already-exported rule keeps the old values. A
+  value you exported yourself is still preserved. `llmux env --codex` prints
+  none of them.
 
 **These four vars are the only mechanism that changes what a bare native alias
 means, and they do not generalize.** An id Claude Code does not know (`astra`,
@@ -640,9 +649,9 @@ and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-
 Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
 [2026-10-07](https://www.anthropic.com/claude-haiku-5-5). Fable 5.1 now has its
 own $0.25 cache-read reference rate. Explicit older Sonnet 5 and Fable 5 keep
-their own prices. Explicit Haiku 4.5 ids kept theirs until 2026-10-23; since
-then they are served by Haiku 5.5 and priced at its rates
-([alias stability](#alias-semantics)).
+their own prices. Haiku 4.5 records from before 2026-10-23 keep Haiku 4.5
+identity and pricing; requests from then on are served by Haiku 5.5 and
+recorded as `claude-haiku-5-5` ([alias stability](#alias-semantics)).
 
 **Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
 ≤100K tier and 5-minute cache writes. It does **not** apply Haiku's >100K tier

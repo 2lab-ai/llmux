@@ -61,12 +61,14 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
 /// foreign slug) passes through untouched — passthrough stays passthrough.
 /// The one exception is a superseded id
 /// ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], 2026-10-23: the Haiku 4.5 ids),
-/// which is rewritten to its family alias's current owner.
+/// which is rewritten to its family alias's current owner — hence the routing
+/// resolver [`crate::catalog::resolve_claude_model`], not the alias-only one
+/// accounting uses.
 fn resolve_client_alias(value: &mut serde_json::Value) -> bool {
     let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    let Some(id) = crate::catalog::resolve_claude_alias(model) else {
+    let Some(id) = crate::catalog::resolve_claude_model(model) else {
         return false;
     };
     value["model"] = serde_json::Value::String(id.to_string());

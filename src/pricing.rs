@@ -70,10 +70,10 @@ const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75);
 const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// Sonnet 5.5 cache reads fell to $0.10 on 2026-10-07. Other rates unchanged.
 const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
-/// Haiku 4.5's list rates, kept as the unknown Haiku family fallback (e.g.
-/// `claude-haiku-5-5x`). Haiku 4.5 ids themselves no longer price here: since
-/// 2026-10-23 they are served by Haiku 5.5 and `normalize_model` books them
-/// there (`crate::catalog::SUPERSEDED_CLAUDE_IDS`).
+/// Haiku 4.5 rates; also the unknown Haiku family fallback. Since 2026-10-23
+/// Haiku 4.5 ids are SERVED by Haiku 5.5 (`crate::catalog::SUPERSEDED_CLAUDE_IDS`),
+/// but new requests are recorded under the served `claude-haiku-5-5`, so a
+/// record still carrying a 4.5 id is history 4.5 really served — priced here.
 const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25);
 /// Haiku 5.5: <=100,000 prompt tokens, 5m cache writes (official pricing,
 /// read 2026-10-08). >100,000 prompt tokens cost 5x ALL these rates;
@@ -177,9 +177,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-sonnet-5-5" => Some(SONNET_5_5),
         "claude-sonnet-5" => Some(SONNET_5),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
-        // No `claude-haiku-4-5` arm: `normalize_model` floats Haiku 4.5 ids to
-        // `claude-haiku-5-5` before this lookup, so an arm here was dead code.
         "claude-haiku-5-5" => Some(HAIKU_5_5),
+        // Records from before the 2026-10-23 float (accounting never floats).
+        "claude-haiku-4-5" => Some(HAIKU_TIER),
         "claude-fable-5-1" => Some(FABLE_5_1),
         "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
@@ -429,27 +429,38 @@ mod tests {
             "claude-haiku-5-5",
             "claude-haiku-5-5[1m]",
             "claude-haiku-5-5-20261007",
-            // Served by Haiku 5.5 since 2026-10-23 (catalog
-            // SUPERSEDED_CLAUDE_IDS), so booked at its rates.
+        ] {
+            assert_eq!(price_for("claude", model, &empty()), Some(haiku), "{model}");
+        }
+        // A record carrying a Haiku 4.5 id is history Haiku 4.5 served (new
+        // traffic is recorded as `claude-haiku-5-5` since 2026-10-23), so it
+        // keeps 4.5 rates — the routing float must not reprice it.
+        for model in [
             "claude-haiku-4-5",
             "claude-haiku-4-5-20251001",
             "claude-haiku-4-5[1m]",
         ] {
-            assert_eq!(price_for("claude", model, &empty()), Some(haiku), "{model}");
-        }
-        // Override keys are normalized too, so a key written as the old id now
-        // names the Haiku 5.5 key: it prices old-id AND new-id traffic alike
-        // (both are served by Haiku 5.5).
-        let custom = ModelPrice::new(9.0, 8.0, 7.0, 6.0);
-        let overrides = HashMap::from([("claude-haiku-4-5".to_string(), custom)]);
-        for model in ["claude-haiku-4-5-20251001", "claude-haiku-5-5", "haiku"] {
             assert_eq!(
-                price_for("claude", model, &overrides),
-                Some(custom),
+                price_for("claude", model, &empty()),
+                Some(HAIKU_TIER),
                 "{model}"
             );
         }
-        // HAIKU_TIER stays the unknown-haiku fallback.
+        // An override keyed by the 4.5 id prices only 4.5-id records.
+        let custom = ModelPrice::new(9.0, 8.0, 7.0, 6.0);
+        let overrides = HashMap::from([("claude-haiku-4-5".to_string(), custom)]);
+        assert_eq!(
+            price_for("claude", "claude-haiku-4-5", &overrides),
+            Some(custom)
+        );
+        for model in ["claude-haiku-5-5", "haiku"] {
+            assert_eq!(
+                price_for("claude", model, &overrides),
+                Some(haiku),
+                "{model}"
+            );
+        }
+        // HAIKU_TIER is also the unknown-haiku fallback.
         assert_eq!(
             builtin_price("claude-haiku-5-50-20261007"),
             Some(HAIKU_TIER)
@@ -1097,7 +1108,6 @@ mod tests {
             ),
             3.0,
         );
-        // A Haiku 4.5 id is served (and booked) as Haiku 5.5 since 2026-10-23.
         approx(
             cost_usd(
                 "claude",
@@ -1105,7 +1115,7 @@ mod tests {
                 &tc(0, 1_000_000, None, None),
                 &empty(),
             ),
-            0.50,
+            5.0,
         );
         approx(
             cost_usd(

@@ -178,6 +178,10 @@ pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
 /// 4.5 id stays available" stance, for Haiku 4.5 ONLY: other version-pinned
 /// ids and aliases (`claude-opus-4-8[1m]`, `opus-5`, `sonnet-5`, …) still do
 /// NOT float — that would be silent model substitution.
+///
+/// Routing only ([`resolve_claude_model`]). Accounting keeps a superseded id
+/// as itself, so history recorded before the float keeps its Haiku 4.5
+/// identity and price; new traffic is recorded under the served id.
 pub(crate) const SUPERSEDED_CLAUDE_IDS: &[(&str, &str)] = &[("claude-haiku-4-5", "haiku")];
 
 /// The curated grok catalog, newest first. Tuple = (id, display name,
@@ -386,12 +390,8 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 /// ASCII-lowercased before matching. [`CLAUDE_MODELS`] is the only mapping
 /// source, so a new curated row carries its aliases automatically.
 ///
-/// A SUPERSEDED id ([`SUPERSEDED_CLAUDE_IDS`]) resolves too, to the current
-/// owner of its family alias: the exact id, or the id plus a `-YYYYMMDD`-style
-/// all-digit date suffix (`claude-haiku-4-5`, `claude-haiku-4-5-20251001` →
-/// the `haiku` owner, `claude-haiku-5-5[1m]`). Anything else that merely
-/// shares the prefix (`claude-haiku-4-50`, `claude-haiku-4-5-foo`) is not
-/// matched.
+/// Aliases ONLY: a superseded id ([`SUPERSEDED_CLAUDE_IDS`]) is NOT resolved
+/// here — routing uses [`resolve_claude_model`] for that.
 ///
 /// A trailing `[1m]` is stripped from the NEEDLE before the lookup, because
 /// the client may attach the context suffix to an alias (`fable[1m]`,
@@ -408,14 +408,46 @@ pub(crate) fn resolve_openrouter_alias(model: &str) -> Option<&'static str> {
 /// `normalize_model` applies the same mapping so usage and pricing are booked
 /// against the id that actually served the request.
 pub(crate) fn resolve_claude_alias(model: &str) -> Option<&'static str> {
+    alias_owner(&claude_needle(model))
+}
+
+/// ROUTING resolution — "which catalog id serves this request NOW": a curated
+/// alias ([`resolve_claude_alias`]), else a superseded id
+/// ([`resolve_superseded_claude_id`]), else `None` (pass through untouched).
+/// Callers that rewrite the outbound `model` use this.
+///
+/// Accounting must NOT: persisted history keeps the model that served it at
+/// the time. A pre-2026-10-23 `claude-haiku-4-5-20251001` record was served by
+/// Haiku 4.5 and stays booked and priced as Haiku 4.5, which is why
+/// `tui::activity::normalize_model` uses [`resolve_claude_alias`] instead, and
+/// `proxy::forward` records new superseded-id traffic under the served id.
+pub(crate) fn resolve_claude_model(model: &str) -> Option<&'static str> {
+    resolve_claude_alias(model).or_else(|| resolve_superseded_claude_id(model))
+}
+
+/// The id that now serves a SUPERSEDED claude id ([`SUPERSEDED_CLAUDE_IDS`]):
+/// the current owner of its family alias. Matches the exact id or the id plus
+/// a `-YYYYMMDD`-style all-digit date suffix (`claude-haiku-4-5`,
+/// `claude-haiku-4-5-20251001` → the `haiku` owner, `claude-haiku-5-5[1m]`),
+/// trimmed, ASCII-lowercased and with one trailing `[1m]` stripped, like the
+/// alias lookup. Anything else that merely shares the prefix
+/// (`claude-haiku-4-50`, `claude-haiku-4-5-foo`) is `None`.
+pub(crate) fn resolve_superseded_claude_id(model: &str) -> Option<&'static str> {
+    let needle = claude_needle(model);
+    SUPERSEDED_CLAUDE_IDS
+        .iter()
+        .find(|(id, _)| is_superseded_spelling(&needle, id))
+        .and_then(|&(_, alias)| alias_owner(alias))
+}
+
+/// The lookup form of a client model string: trimmed, ASCII-lowercased, one
+/// trailing `[1m]` stripped.
+fn claude_needle(model: &str) -> String {
     let needle = model.trim().to_ascii_lowercase();
-    let needle = needle.strip_suffix("[1m]").unwrap_or(&needle);
-    alias_owner(needle).or_else(|| {
-        SUPERSEDED_CLAUDE_IDS
-            .iter()
-            .find(|(id, _)| is_superseded_spelling(needle, id))
-            .and_then(|&(_, alias)| alias_owner(alias))
-    })
+    match needle.strip_suffix("[1m]") {
+        Some(base) => base.to_string(),
+        None => needle,
+    }
 }
 
 /// The [`CLAUDE_MODELS`] id advertising `alias`, if any.
@@ -1116,11 +1148,12 @@ mod tests {
 
     /// User decision 2026-10-23: explicit Haiku 4.5 ids — the bare id and its
     /// dated snapshot spelling, which Claude Code / the Agent SDK send for
-    /// their built-in Haiku tier — are served by the CURRENT `haiku` owner.
+    /// their built-in Haiku tier — are ROUTED to the CURRENT `haiku` owner.
     /// Only the exact id or id + `-<digits>` floats; a prefix look-alike is a
-    /// different string and must stay untouched.
+    /// different string and must stay untouched. The alias-only resolver
+    /// (accounting) never floats them: history keeps the model that served it.
     #[test]
-    fn resolve_claude_alias_floats_superseded_haiku_4_5() {
+    fn resolve_claude_model_floats_superseded_haiku_4_5() {
         for model in [
             "claude-haiku-4-5",
             "claude-haiku-4-5-20251001",
@@ -1128,9 +1161,19 @@ mod tests {
             "claude-haiku-4-5[1m]",
         ] {
             assert_eq!(
-                resolve_claude_alias(model),
+                resolve_claude_model(model),
                 Some("claude-haiku-5-5[1m]"),
-                "{model:?} floats to the haiku owner"
+                "{model:?} routes to the haiku owner"
+            );
+            assert_eq!(
+                resolve_superseded_claude_id(model),
+                Some("claude-haiku-5-5[1m]"),
+                "{model:?}"
+            );
+            assert_eq!(
+                resolve_claude_alias(model),
+                None,
+                "{model:?} is not an alias: accounting keeps it as itself"
             );
         }
         for model in [
@@ -1141,10 +1184,25 @@ mod tests {
             "claude-haiku-4-5-",
         ] {
             assert_eq!(
-                resolve_claude_alias(model),
+                resolve_claude_model(model),
                 None,
                 "{model:?} must not float"
             );
+        }
+    }
+
+    /// Routing resolution is a strict superset of alias resolution: every
+    /// curated alias resolves identically, and ids / foreign slugs still pass.
+    #[test]
+    fn resolve_claude_model_agrees_with_the_alias_resolver_on_aliases() {
+        for &(id, aliases, _, _) in CLAUDE_MODELS {
+            for alias in aliases {
+                assert_eq!(resolve_claude_model(alias), Some(id), "{alias:?}");
+            }
+            assert_eq!(resolve_claude_model(id), None, "curated id {id:?}");
+        }
+        for slug in ["grok-4.5", "gpt-5.6-sol", "claude-opus-4-8[1m]", ""] {
+            assert_eq!(resolve_claude_model(slug), None, "{slug:?}");
         }
     }
 

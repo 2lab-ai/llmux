@@ -314,7 +314,7 @@ eval "$(llmux env)"
 claude
 ```
 
-Besides `ANTHROPIC_BASE_URL` (and `ANTHROPIC_API_KEY` when a key is configured), plain `llmux env` exports the same four `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` values `run` sets ([alias exports](models.md#alias-exports)); a var already in your environment is skipped. They come from that `llmux` binary's own catalog — `env` never starts the daemon or fetches `/llmux/models` — so re-run it after an upgrade.
+Besides `ANTHROPIC_BASE_URL` (and `ANTHROPIC_API_KEY` when a key is configured), plain `llmux env` exports the same four `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` values `run` sets ([alias exports](models.md#alias-exports)); a var already in your environment is skipped. They come from that `llmux` binary's own catalog — `env` never starts the daemon or fetches `/llmux/models`. To pick up a new catalog after an upgrade, evaluate it in a new shell (or after `unset ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL`); re-running it in the same shell keeps the old values, because they are already exported. A value you exported yourself is still preserved.
 
 Per-agent models: a `.claude/agents/<name>.md` file with `model: gpt-6-astra[1m]` or `model: grok-4.7` runs as a native Claude Code subagent and is routed by llmux like any request; see [multi-model agents](multi-model-agents.md).
 
