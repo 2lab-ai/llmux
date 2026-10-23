@@ -236,7 +236,7 @@ session lifecycle. All carry the client's `metadata.user_id`
 
 | Ping | Wire shape | When | llmux handling |
 | --- | --- | --- | --- |
-| **quota probe** | `messages: [{role: user, content: "quota"}]`, `max_tokens: 1`, no real system | every session start + periodic retries; reads the `anthropic-ratelimit-*` response headers | classified kind `quota` (BOTH halves required); routed with exactly ONE upstream attempt, no failover sweep, no exhaustion park |
+| **quota probe** | `messages: [{role: user, content: "quota"}]`, `max_tokens: 1`, no real system | every session start + periodic retries; reads the `anthropic-ratelimit-*` response headers | classified kind `quota` (BOTH halves required); routed with exactly ONE upstream attempt, no failover sweep, no exhaustion park; on native Messages llmux adds the Claude Code system block upstream (since 2026-10-23, [provider contract](../provider-compatibility.md#haiku-55-catalog-update)) |
 | **warmup ping** | `content: [{text: "Hi", cache_control: ephemeral}]`, `max_tokens: 1`, system = billing header + one-liner | model change / warmup | plain classification; Codex omits the limit with `max_tokens` diagnostics; Grok forwards it with `max_tokens_semantics` diagnostics, not a total-generation budget guarantee; strict compatibility returns 400 |
 | **return recap** | user text starts `The user stepped away and is coming back.` | session resume | classified kind `recap` |
 

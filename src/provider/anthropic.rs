@@ -21,10 +21,13 @@ use super::{
 use crate::config::AccountCredential;
 
 /// Normalize an Anthropic-bound JSON body in ONE parse: resolve a curated
-/// claude ALIAS in `model` to its catalog id, strip the Claude-Code-local
-/// `[1m]` context-window suffix from `model`, and strip foreign (unsigned)
-/// thinking blocks from `messages` (issue #116). The two model steps run in
-/// that order and compose (`opus` → `claude-opus-5-5[1m]` → `claude-opus-5-5`).
+/// claude ALIAS in `model` to its catalog id (and a superseded id such as
+/// `claude-haiku-4-5-20251001` — but only on a body [`floats_superseded_ids`]
+/// accepts), strip the Claude-Code-local `[1m]` context-window suffix from
+/// `model`, strip foreign (unsigned) thinking blocks from `messages` (issue
+/// #116), and give Claude Code's bare `quota` rate-limit probe the Claude Code
+/// system block ([`shape_quota_probe`]). The two model steps run in that order
+/// and compose (`opus` → `claude-opus-5-5[1m]` → `claude-opus-5-5`).
 /// Because the alias step runs FIRST, an alias that already carries the client
 /// suffix (`opus[1m]`, `fable[1m]`) must resolve too — that is handled on the
 /// needle side in [`crate::catalog::resolve_claude_alias`].
@@ -35,16 +38,91 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
-    let alias = resolve_client_alias(&mut value);
+    // Decided on the body AS RECEIVED: the probe counts whether or not its
+    // system block is injected below.
+    let superseded_float = floats_superseded_ids(&value);
+    let alias = resolve_client_alias(&mut value, superseded_float);
     let model = strip_client_context_suffix(&mut value);
     let thinking = strip_foreign_thinking(&mut value);
-    if !(alias || model || thinking) {
+    let quota = shape_quota_probe(&mut value);
+    if !(alias || model || thinking || quota) {
         return body;
     }
     match serde_json::to_vec(&value) {
         Ok(bytes) => bytes::Bytes::from(bytes),
         Err(_) => body,
     }
+}
+
+/// Should a superseded claude id ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`],
+/// the Haiku 4.5 ids) in this body be served by its family alias's owner
+/// (Haiku 5.5)? True for Claude Code's bare `quota` probe (it gets the Claude
+/// Code system block, [`shape_quota_probe`]) and for a body whose FIRST system
+/// block (a plain-string system is one block) is gate-shaped: its text starts
+/// with `x-anthropic-billing-header:`, or EQUALS — exactly, untrimmed — one of
+/// the Claude Code / Agent SDK identity sentences
+/// ([`crate::proxy::auto_classifier::MAIN`], `MAIN_IN_SDK`, `SDK_AGENT`).
+///
+/// Why conditional: live probes through the daemon on 2026-10-23
+/// (`claude-haiku-5-5`, OAuth subscription pool, one plain user turn) got 200
+/// exactly for those first blocks — each identity sentence alone, the SDK
+/// sentence followed by a custom block, a billing-header block followed by an
+/// identity sentence, a custom block or nothing — and 502 (upstream 429 on
+/// every account) for no system, a custom system, a custom block before an
+/// identity sentence, and an identity sentence with anything appended in the
+/// same block (trailing space, extra instructions). Haiku 4.5 accepted the
+/// same refused bodies (bare plain: 4.5 200 ×2, 5.5 502 ×2). So a bare or
+/// custom-system client naming a 4.5 id keeps reaching Haiku 4.5.
+///
+/// In addition the body must use default sampling ([`default_sampling`]): on
+/// a gate-shaped body (billing header + Agent SDK sentence, 2026-10-23) Haiku
+/// 5.5 answered 400 `invalid_request_error` "`temperature` is deprecated for
+/// this model." for `temperature` 0 and 0.7, and the same for `top_p` 0.9 and
+/// `top_k` 40, where Haiku 4.5 returned 200 to all four; `temperature` 1 was
+/// accepted on 5.5. Such a request keeps its 4.5 id rather than having the
+/// caller's sampling value silently dropped.
+///
+/// Shared with `proxy::forward`, which evaluates it once on the same inbound
+/// bytes so the activity record names the model that actually served them.
+pub(crate) fn floats_superseded_ids(body: &serde_json::Value) -> bool {
+    (is_quota_probe(body) || first_system_text(body).is_some_and(is_gate_shaped_system))
+        && default_sampling(body)
+}
+
+/// No `top_p` and no `top_k` (absent or `null`), and `temperature` absent,
+/// `null` or numerically 1 — the only sampling Haiku 5.5 accepted
+/// ([`floats_superseded_ids`]).
+fn default_sampling(body: &serde_json::Value) -> bool {
+    let unset = |key: &str| body.get(key).is_none_or(serde_json::Value::is_null);
+    unset("top_p")
+        && unset("top_k")
+        && body
+            .get("temperature")
+            .is_none_or(|t| t.is_null() || t.as_f64() == Some(1.0))
+}
+
+/// [`floats_superseded_ids`] over raw body bytes (`false` for non-JSON).
+pub(crate) fn body_floats_superseded_ids(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .is_ok_and(|value| floats_superseded_ids(&value))
+}
+
+/// The text of the first system block: the whole string for a plain-string
+/// system, else the first array element's `text`.
+fn first_system_text(body: &serde_json::Value) -> Option<&str> {
+    match body.get("system")? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(blocks) => blocks.first()?.get("text")?.as_str(),
+        _ => None,
+    }
+}
+
+/// See [`floats_superseded_ids`]: a billing-header prefix, or one identity
+/// sentence verbatim.
+fn is_gate_shaped_system(text: &str) -> bool {
+    use crate::proxy::auto_classifier::{MAIN, MAIN_IN_SDK, SDK_AGENT};
+    text.starts_with("x-anthropic-billing-header:")
+        || [MAIN, MAIN_IN_SDK, SDK_AGENT].contains(&text)
 }
 
 /// Rewrite a client-supplied model that is a curated claude ALIAS (`opus`,
@@ -55,11 +133,20 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
 /// [`crate::catalog::resolve_claude_alias`], so a new curated row carries its
 /// aliases automatically and anything that is not an alias (a real id, a
 /// foreign slug) passes through untouched — passthrough stays passthrough.
-fn resolve_client_alias(value: &mut serde_json::Value) -> bool {
+/// The one exception is a superseded id
+/// ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], 2026-10-23: the Haiku 4.5 ids):
+/// when `superseded_float` ([`floats_superseded_ids`]) holds it is rewritten
+/// to its family alias's current owner; otherwise it passes through as before.
+fn resolve_client_alias(value: &mut serde_json::Value, superseded_float: bool) -> bool {
     let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    let Some(id) = crate::catalog::resolve_claude_alias(model) else {
+    let resolved = match crate::catalog::resolve_claude_alias(model) {
+        Some(id) => Some(id),
+        None if superseded_float => crate::catalog::resolve_superseded_claude_id(model),
+        None => None,
+    };
+    let Some(id) = resolved else {
         return false;
     };
     value["model"] = serde_json::Value::String(id.to_string());
@@ -76,6 +163,105 @@ fn strip_client_context_suffix(value: &mut serde_json::Value) -> bool {
     let base = base.to_string();
     value["model"] = serde_json::Value::String(base);
     true
+}
+
+/// Give Claude Code's per-session rate-limit probe — `max_tokens: 1`, exactly
+/// ONE `user` message whose content is `"quota"` (trimmed, the same test as
+/// `proxy::classify`), no tools, and no system text — the Claude Code system
+/// block ([`crate::proxy::auto_classifier::MAIN`]) before it leaves llmux.
+/// The content may be the plain string (the only pinned capture, 2026-07-15)
+/// or an array of exactly one `text` block (optionally `cache_control`), the
+/// two forms `classify::last_user_text` reads; raw-io does not record 502'd
+/// requests, so the 2026-10-23 probe body itself was not captured.
+///
+/// Why: live probes through the daemon on 2026-10-23 against the OAuth
+/// subscription pool showed `claude-haiku-5-5` answering 200 to plain,
+/// thinking (31,999 budget / 32,000 max_tokens, and adaptive), temperature-1
+/// and Agent-SDK-system requests and to a system-less `count_tokens`, but 502
+/// (upstream `429 rate_limit_error` on every account) to exactly this probe
+/// shape — while the same body on `claude-haiku-4-5-20251001` returned 200.
+/// The ledger holds 137 such probes on `claude-haiku-5-5` that already 502'd
+/// (2026-10-06..2026-10-23), and floating the explicit Haiku 4.5 ids onto
+/// Haiku 5.5 (`crate::catalog::SUPERSEDED_CLAUDE_IDS`) would route every
+/// built-in probe there. The same probe body plus this system block returned
+/// 200 on `claude-haiku-5-5` (4 of 4, string and single-text-block content;
+/// the bare control in the same run 502'd).
+///
+/// Deliberately narrow: only this probe is shaped. An arbitrary bare user
+/// request (a different text, a second turn, tools, any non-blank system, any
+/// other `max_tokens`) passes through untouched — llmux does not otherwise
+/// shape claude requests. Classification and internal-task routing read the
+/// ORIGINAL body at forward entry, so the injected block cannot change how
+/// the probe itself is classified.
+fn shape_quota_probe(value: &mut serde_json::Value) -> bool {
+    if !is_quota_probe(value) {
+        return false;
+    }
+    value["system"] = serde_json::json!([
+        {"type": "text", "text": crate::proxy::auto_classifier::MAIN}
+    ]);
+    tracing::debug!("added the Claude Code system block to a bare quota probe");
+    true
+}
+
+fn is_quota_probe(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let Some(body) = value.as_object() else {
+        return false;
+    };
+    if body.get("max_tokens").and_then(Value::as_u64) != Some(1) {
+        return false;
+    }
+    let one_quota_turn = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| match messages.as_slice() {
+            [only] => {
+                only.get("role").and_then(Value::as_str) == Some("user")
+                    && only.get("content").is_some_and(is_quota_content)
+            }
+            _ => false,
+        });
+    let no_tools = match body.get("tools") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(tools)) => tools.is_empty(),
+        Some(_) => false,
+    };
+    let blank_system = match body.get("system") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Array(blocks)) => blocks.iter().all(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.trim().is_empty())
+        }),
+        Some(_) => false,
+    };
+    one_quota_turn && no_tools && blank_system
+}
+
+/// `"quota"` as a plain string, or as exactly one `text` block (other block
+/// fields such as `cache_control` are ignored). Any other block type, or more
+/// than one block, is not the probe.
+fn is_quota_content(content: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let is_quota = |text: &str| text.trim() == "quota";
+    match content {
+        Value::String(text) => is_quota(text),
+        Value::Array(blocks) => match blocks.as_slice() {
+            [block] => {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_quota)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Strip `thinking` blocks the real Anthropic API cannot verify — blocks with
@@ -238,9 +424,10 @@ impl Provider for AnthropicPassthrough {
         })
     }
 
-    /// Normalize the Claude-Code-only context-window suffix and strip foreign
-    /// (unsigned) thinking blocks (issue #116) in one parse; otherwise unwrap
-    /// without reserializing (moves the original wire body out).
+    /// Normalize the outbound `model`, strip foreign (unsigned) thinking
+    /// blocks (issue #116) and shape the bare `quota` probe in one parse
+    /// (`normalize_body`); otherwise unwrap without reserializing (moves the
+    /// original wire body out).
     fn request_in(&self, unified: UnifiedRequest) -> Result<ProviderRequest, ProviderError> {
         let wire = unified.wire;
         Ok(ProviderRequest {
@@ -366,13 +553,180 @@ mod tests {
         assert_eq!(normalized_model("opus[1m]"), "claude-opus-5-5");
     }
 
-    /// Floating Haiku aliases use the new wire id; explicit old ids stay pinned.
+    /// Floating Haiku aliases use the new wire id whatever the body shape.
     #[test]
-    fn normalize_body_resolves_haiku_5_5_and_preserves_4_5() {
+    fn normalize_body_resolves_haiku_5_5_aliases() {
         for model in ["haiku", "haiku[1m]", "haiku-5-5", "claude-haiku-5-5[1m]"] {
-            assert_eq!(normalized_model(model), "claude-haiku-5-5");
+            assert_eq!(normalized_model(model), "claude-haiku-5-5", "{model}");
         }
-        assert_eq!(normalized_model("claude-haiku-4-5"), "claude-haiku-4-5");
+    }
+
+    /// A one-turn body naming `model` with the given `system` (omitted when
+    /// `None`).
+    fn plain_body(model: &str, system: Option<serde_json::Value>) -> String {
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        if let Some(system) = system {
+            body["system"] = system;
+        }
+        body.to_string()
+    }
+
+    /// User decision 2026-10-23: the explicit Haiku 4.5 ids Claude Code / the
+    /// Agent SDK send for their built-in Haiku tier float to the `haiku` owner
+    /// — but only on a gate-shaped body (Haiku 5.5 on the subscription
+    /// endpoint refuses the rest, live probes 2026-10-23).
+    #[test]
+    fn normalize_body_floats_a_4_5_id_only_on_a_gate_shaped_body() {
+        let cc = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.292; cc_entrypoint=cli;"},
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+        ]);
+        let billing_only = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9;"},
+            {"type": "text", "text": "You are a terse assistant."},
+        ]);
+        let sdk =
+            serde_json::json!("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
+        for model in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
+            for system in [&cc, &billing_only, &sdk] {
+                let out =
+                    normalize_body(bytes::Bytes::from(plain_body(model, Some(system.clone()))));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["model"], "claude-haiku-5-5", "{model} / {system}");
+                assert_eq!(&value["system"], system, "system untouched");
+            }
+        }
+        // Bare and custom-system 4.5 requests keep reaching Haiku 4.5: the
+        // body comes back byte-identical.
+        let custom = [
+            None,
+            Some(serde_json::json!("You are a terse assistant.")),
+            Some(serde_json::json!([
+                {"type": "text", "text": "You are a terse assistant."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            ])),
+        ];
+        for system in custom {
+            let body = plain_body("claude-haiku-4-5-20251001", system.clone());
+            let out = normalize_body(bytes::Bytes::from(body.clone()));
+            assert_eq!(out.as_ref(), body.as_bytes(), "{system:?}");
+        }
+    }
+
+    /// A gate-shaped 4.5 body with non-default sampling stays on Haiku 4.5
+    /// (Haiku 5.5 400s `temperature` 0, 2026-10-23), byte-identical — the
+    /// caller's sampling value is never dropped to make the float fit.
+    #[test]
+    fn normalize_body_keeps_a_sampled_gate_shaped_4_5_body_on_4_5() {
+        let system = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9;"},
+            {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+        ]);
+        let mut sampled: serde_json::Value =
+            serde_json::from_str(&plain_body("claude-haiku-4-5-20251001", Some(system)))
+                .expect("json");
+        sampled["temperature"] = serde_json::json!(0);
+        let body = sampled.to_string();
+        let out = normalize_body(bytes::Bytes::from(body.clone()));
+        assert_eq!(out.as_ref(), body.as_bytes());
+    }
+
+    /// The predicate mirrors the 2026-10-23 live probe table on
+    /// `claude-haiku-5-5` (200 = floats, 502 = does not).
+    #[test]
+    fn floats_superseded_ids_matches_the_measured_first_system_blocks() {
+        const CC: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+        const CC_IN_SDK: &str =
+            "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+        const SDK: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+        const HEADER: &str = "x-anthropic-billing-header: cc_version=9.9.9; cc_entrypoint=cli;";
+        const CUSTOM: &str = "You are a terse assistant.";
+        let block = |text: &str| serde_json::json!({"type": "text", "text": text});
+        let with_system = |system: Option<serde_json::Value>| -> serde_json::Value {
+            serde_json::from_str(&plain_body("claude-haiku-5-5", system)).expect("json")
+        };
+        let accepted = [
+            serde_json::json!([block(CC)]),
+            serde_json::json!(CC),
+            serde_json::json!([block(CC_IN_SDK)]),
+            serde_json::json!([block(SDK)]),
+            serde_json::json!([block(SDK), block(CUSTOM)]),
+            serde_json::json!([block(HEADER), block(SDK)]),
+            serde_json::json!([block(HEADER), block(CC)]),
+            serde_json::json!([block(HEADER), block(CC_IN_SDK)]),
+            serde_json::json!([block(HEADER), block(CUSTOM)]),
+            serde_json::json!([block(HEADER)]),
+        ];
+        for system in accepted {
+            assert!(
+                floats_superseded_ids(&with_system(Some(system.clone()))),
+                "200 shape must float: {system}"
+            );
+        }
+        let refused = [
+            None,
+            Some(serde_json::json!(CUSTOM)),
+            Some(serde_json::json!([block(CUSTOM), block(CC)])),
+            Some(serde_json::json!([block(CUSTOM), block(SDK)])),
+            Some(serde_json::json!([block(&format!(
+                "{CC} Extra instructions follow."
+            ))])),
+            Some(serde_json::json!([block(&format!("{CC} "))])),
+            Some(serde_json::json!(format!(
+                "{CC}\n\nYou are a terse assistant."
+            ))),
+        ];
+        for system in refused {
+            assert!(
+                !floats_superseded_ids(&with_system(system.clone())),
+                "502 shape must not float: {system:?}"
+            );
+        }
+        // Sampling on a gate-shaped body (billing header + SDK sentence):
+        // Haiku 5.5 400'd `temperature` 0 / 0.7, `top_p` 0.9 and `top_k` 40
+        // ("… is deprecated for this model.") and took `temperature` 1.
+        let gate = with_system(Some(serde_json::json!([block(HEADER), block(SDK)])));
+        let sampled = |key: &str, value: serde_json::Value| {
+            let mut body = gate.clone();
+            body[key] = value;
+            body
+        };
+        for (key, value) in [
+            ("temperature", serde_json::json!(0)),
+            ("temperature", serde_json::json!(0.7)),
+            ("top_p", serde_json::json!(0.9)),
+            ("top_k", serde_json::json!(40)),
+        ] {
+            assert!(
+                !floats_superseded_ids(&sampled(key, value.clone())),
+                "400 sampling must not float: {key}={value}"
+            );
+        }
+        for (key, value) in [
+            ("temperature", serde_json::json!(1)),
+            ("temperature", serde_json::json!(1.0)),
+            ("temperature", serde_json::Value::Null),
+            ("top_p", serde_json::Value::Null),
+            ("top_k", serde_json::Value::Null),
+        ] {
+            assert!(
+                floats_superseded_ids(&sampled(key, value.clone())),
+                "default sampling floats: {key}={value}"
+            );
+        }
+        assert!(floats_superseded_ids(&gate), "temperature absent floats");
+        // The bare quota probe floats (it gets the Claude Code block).
+        let probe = serde_json::json!({
+            "model": "claude-haiku-4-5", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}],
+        });
+        assert!(floats_superseded_ids(&probe));
+        assert!(body_floats_superseded_ids(probe.to_string().as_bytes()));
+        assert!(!body_floats_superseded_ids(b"not json"));
     }
 
     #[test]
@@ -409,6 +763,139 @@ mod tests {
     fn normalize_body_passes_non_json_through_byte_identical() {
         let out = normalize_body(bytes::Bytes::from_static(b"not json"));
         assert_eq!(out.as_ref(), b"not json");
+    }
+
+    /// Claude Code's rate-limit probe (sanitized 2.1.292 capture shape, the
+    /// same one `tests/e2e.rs::internal_quota` uses) with `extra` merged in.
+    fn quota_probe(extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 1,
+            "metadata": {"user_id": "session"},
+            "messages": [{"role": "user", "content": "quota"}],
+        });
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                body.insert(key.clone(), value.clone());
+            }
+        }
+        body
+    }
+
+    fn normalized(body: &serde_json::Value) -> bytes::Bytes {
+        normalize_body(bytes::Bytes::from(body.to_string()))
+    }
+
+    fn claude_code_system() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude."
+        }])
+    }
+
+    /// 2026-10-23: the system-less probe 502'd on `claude-haiku-5-5` (upstream
+    /// 429 on every account). Absent / `null` / `""` / `[]` / blank-text
+    /// systems all count as "no system" and get the Claude Code block.
+    #[test]
+    fn normalize_body_gives_the_bare_quota_probe_the_claude_code_system() {
+        let blank_systems = [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!("  \n")),
+            Some(serde_json::json!([{"type": "text", "text": " "}])),
+        ];
+        for system in blank_systems {
+            let extra = match &system {
+                Some(system) => serde_json::json!({"system": system}),
+                None => serde_json::json!({}),
+            };
+            let out: serde_json::Value =
+                serde_json::from_slice(&normalized(&quota_probe(extra))).expect("json");
+            assert_eq!(out["system"], claude_code_system(), "system {system:?}");
+            // Nothing else about the probe changes.
+            assert_eq!(out["max_tokens"], 1);
+            assert_eq!(
+                out["messages"],
+                serde_json::json!([{"role": "user", "content": "quota"}])
+            );
+            assert_eq!(out["model"], "claude-haiku-5-5");
+        }
+        // Trimmed equality on the text, like `proxy::classify`; `tools: []`
+        // and `tools: null` are "no tools". The content may also be ONE text
+        // block (optionally cache-controlled) — the other form
+        // `classify::last_user_text` reads.
+        for extra in [
+            serde_json::json!({"messages": [{"role": "user", "content": " quota\n"}]}),
+            serde_json::json!({"tools": []}),
+            serde_json::json!({"tools": null}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "quota"}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": " quota ", "cache_control": {"type": "ephemeral"}}
+            ]}]}),
+        ] {
+            let out: serde_json::Value =
+                serde_json::from_slice(&normalized(&quota_probe(extra.clone()))).expect("json");
+            assert_eq!(out["system"], claude_code_system(), "{extra}");
+        }
+    }
+
+    /// Narrow by design: anything that is not exactly the probe passes through
+    /// byte-identical (refcounted fast path) — llmux does not shape arbitrary
+    /// bare user requests.
+    #[test]
+    fn normalize_body_leaves_every_near_miss_of_the_quota_probe_untouched() {
+        for extra in [
+            serde_json::json!({"max_tokens": 2}),
+            serde_json::json!({"max_tokens": null}),
+            serde_json::json!({"messages": [{"role": "user", "content": "quota please"}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "Quota"}]}),
+            // Block form: two blocks, a non-text block, no block, other text.
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "quota"},
+                {"type": "text", "text": "quota"}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": []}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "quota please"}
+            ]}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": "quota"}]}),
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "quota"},
+                {"role": "user", "content": "quota"}
+            ]}),
+            serde_json::json!({"tools": [{"name": "t", "input_schema": {"type": "object"}}]}),
+            serde_json::json!({"system": "You are a helpful assistant."}),
+            serde_json::json!({"system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.292;"}]}),
+            serde_json::json!({"system": [{"type": "image"}]}),
+        ] {
+            let body = quota_probe(extra.clone()).to_string();
+            let out = normalize_body(bytes::Bytes::from(body.clone()));
+            assert_eq!(out.as_ref(), body.as_bytes(), "{extra}");
+        }
+        // No `max_tokens` at all is not the probe either.
+        let mut body = quota_probe(serde_json::json!({}));
+        body.as_object_mut().expect("object").remove("max_tokens");
+        let body = body.to_string();
+        let out = normalize_body(bytes::Bytes::from(body.clone()));
+        assert_eq!(out.as_ref(), body.as_bytes());
+    }
+
+    /// The steps compose in one parse: Claude Code's built-in probe on the
+    /// explicit Haiku 4.5 id comes out on Haiku 5.5 AND with the system block.
+    #[test]
+    fn normalize_body_floats_and_shapes_a_haiku_4_5_quota_probe() {
+        let probe = quota_probe(serde_json::json!({"model": "claude-haiku-4-5-20251001"}));
+        let out: serde_json::Value = serde_json::from_slice(&normalized(&probe)).expect("json");
+        assert_eq!(out["model"], "claude-haiku-5-5");
+        assert_eq!(out["system"], claude_code_system());
+        assert_eq!(out["metadata"]["user_id"], "session");
     }
 
     /// Issue #116 RED shape: the exact replay a client sends after a grok

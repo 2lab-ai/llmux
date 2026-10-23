@@ -4613,9 +4613,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 51 curated (15 claude + 14 codex + 4 grok + 10 openrouter + 8
+        // 50 curated (14 claude + 14 codex + 4 grok + 10 openrouter + 8
         // gemini) + 1 synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 52);
+        assert_eq!(models.len(), 51);
 
         let by_id = |id: &str| {
             models
@@ -4658,7 +4658,12 @@ mod tests {
             serde_json::json!(["haiku", "haiku-5-5"])
         );
         assert_eq!(by_id("claude-haiku-5-5[1m]")["max_context"], 1_000_000);
-        assert_eq!(by_id("claude-haiku-4-5")["aliases"], serde_json::json!([]));
+        // Retired 2026-10-23: Haiku 4.5 ids are served by the `haiku` owner,
+        // so the endpoint no longer advertises a row for them.
+        assert!(
+            models.iter().all(|m| m["id"] != "claude-haiku-4-5"),
+            "the claude-haiku-4-5 row is retired"
+        );
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
         // no aliases (the version alias stays on the base row).
         for id in ["gpt-5.6-sol[1m]", "gpt-5.6-terra[1m]"] {
