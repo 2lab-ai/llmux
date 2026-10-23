@@ -433,6 +433,13 @@ struct ForwardContext {
     /// then, e.g. a pre-routing failure). Drives the activity log's
     /// group/model/effort columns even when `group` is `None` (routing off).
     served_by: Option<BackendGroup>,
+    /// Whether the anthropic provider floats a superseded claude id in this
+    /// body to its family alias's owner
+    /// ([`crate::provider::anthropic::floats_superseded_ids`], evaluated once
+    /// at entry on the same bytes the provider receives). `false` on the
+    /// Responses ingress, whose Agent SDK path resolves aliases only. Read by
+    /// [`recorded_claude_model`] so activity names the model that served.
+    superseded_float: bool,
     /// What the Responses compatibility gate found in this request, computed
     /// ONCE (pre-refresh) and replayed onto whichever terminal leg answers —
     /// the streamed SSE response and the aggregated JSON one must report the
@@ -479,9 +486,10 @@ impl ForwardContext {
 
     /// The `(group, model, effort, fast)` shown in the activity log. Codex: the
     /// PER-REQUEST resolved upstream model + effective effort/fast that went
-    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model +
-    /// the thinking budget, never fast. All `None`/`false` before the provider
-    /// path is chosen (early failures).
+    /// upstream ([`CodexProvider::request_meta`]); Claude: the inbound model
+    /// (a superseded id recorded as the id that served it, see
+    /// [`recorded_claude_model`]) + the thinking budget, never fast. All
+    /// `None`/`false` before the provider path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
         // The override is known even on a pre-lease failure (Codex exhausted).
         if let Some(route) = &self.auto_classifier {
@@ -538,7 +546,7 @@ impl ForwardContext {
             },
             Some(BackendGroup::Claude) => FinishedMeta {
                 group: Some("claude".to_string()),
-                model: self.model.clone(),
+                model: recorded_claude_model(self.model.as_deref(), self.superseded_float),
                 effort: claude_effort(&self.body),
                 fast: false,
             },
@@ -553,12 +561,70 @@ impl ForwardContext {
                 effort: None,
                 fast: false,
             },
+            // An early failure classified to the claude group would have been
+            // served through the same resolver, so it names the same model;
+            // any other (or no) group keeps the inbound string.
             None => FinishedMeta {
                 group: self.group.map(|g| g.as_str().to_string()),
-                model: self.model.clone(),
+                model: if self.group == Some(BackendGroup::Claude) {
+                    recorded_claude_model(self.model.as_deref(), self.superseded_float)
+                } else {
+                    self.model.clone()
+                },
                 effort: claude_effort(&self.body),
                 fast: false,
             },
+        }
+    }
+
+    /// Served (group, model, effort, fast) for in-flight attribution (req11),
+    /// for the group of the leased credential: codex → the PER-REQUEST
+    /// resolved upstream model + effective effort/fast; claude → the inbound
+    /// model (a floated superseded id recorded as the served id, see
+    /// [`recorded_claude_model`]) + client effort, never fast. Mirrors
+    /// `finished_meta` so the in-flight row matches its eventual finish (same
+    /// badge while running as when done).
+    fn routed_meta(&self, state: &AppState, served: BackendGroup) -> FinishedMeta {
+        let (group, model, effort, fast) = match served {
+            BackendGroup::Codex => {
+                let (model, effort, fast) = self.codex_meta(state);
+                (Some("codex".to_string()), Some(model), effort, fast)
+            }
+            BackendGroup::Grok => {
+                let (model, effort) = state.grok.request_meta(&self.body);
+                (Some("grok".to_string()), Some(model), effort, false)
+            }
+            BackendGroup::OpenRouter => (
+                Some("openrouter".to_string()),
+                // Provider-normalized pin — same reason as `finished_meta`:
+                // the in-flight row must name what actually goes on the wire.
+                Some(crate::provider::openrouter::resolve_model(
+                    self.model.as_deref(),
+                    state.openrouter.model(),
+                )),
+                claude_effort(&self.body),
+                false,
+            ),
+            BackendGroup::Claude => (
+                Some("claude".to_string()),
+                recorded_claude_model(self.model.as_deref(), self.superseded_float),
+                claude_effort(&self.body),
+                false,
+            ),
+            // Same contract as `finished_meta`'s gemini arm
+            // (provider-resolved upstream model, no effort).
+            BackendGroup::Gemini => (
+                Some("gemini".to_string()),
+                Some(state.gemini.request_meta(&self.body).0),
+                None,
+                false,
+            ),
+        };
+        FinishedMeta {
+            group,
+            model,
+            effort,
+            fast,
         }
     }
 
@@ -745,6 +811,34 @@ struct FinishedMeta {
     model: Option<String>,
     effort: Option<String>,
     fast: bool,
+}
+
+/// The model a CLAUDE activity record names: the inbound string exactly as
+/// sent (an alias stays `opus` — accounting resolves aliases itself), EXCEPT a
+/// superseded id ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], e.g.
+/// `claude-haiku-4-5-20251001`) on a request the anthropic provider floats
+/// (`superseded_float`, [`ForwardContext::superseded_float`]): that one is
+/// recorded as the id that actually served it, suffix-stripped
+/// (`claude-haiku-5-5`). A superseded id that does not float (bare or
+/// custom-system body, Responses ingress) reached Haiku 4.5 and is recorded
+/// as sent.
+///
+/// Why: accounting (`tui::activity::normalize_model`, used by pricing, key
+/// usage and the dashboard at read/replay time) deliberately does NOT float
+/// superseded ids, so persisted records from before the 2026-10-23 float keep
+/// their true Haiku 4.5 identity and price. A record written from the float
+/// onward must therefore name the model that served it when it is written.
+fn recorded_claude_model(model: Option<&str>, superseded_float: bool) -> Option<String> {
+    let model = model?;
+    let served = if superseded_float {
+        crate::catalog::resolve_superseded_claude_id(model)
+    } else {
+        None
+    };
+    Some(match served {
+        Some(served) => served.strip_suffix("[1m]").unwrap_or(served).to_string(),
+        None => model.to_string(),
+    })
 }
 
 /// The per-request effort recorded for a CLAUDE request: the raw
@@ -1359,6 +1453,18 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
     // pattern; rides the RequestFinished event for the activity feed.
     let classified = crate::proxy::classify::classify(&path_query, &body);
+    // Superseded-id float (Haiku 4.5 → the `haiku` owner): the SAME predicate
+    // the anthropic provider applies to these bytes, decided once here so the
+    // activity record names the model that actually serves the request. The
+    // Responses ingress floats aliases only (Agent SDK path). The predicate
+    // only matters when the model IS a superseded id, so check that first on
+    // the already-extracted `model`: every other request (1M-context bodies
+    // included) skips the extra full parse, with the same result.
+    let superseded_float = model
+        .as_deref()
+        .is_some_and(|m| crate::catalog::resolve_superseded_claude_id(m).is_some())
+        && responses_input.is_none()
+        && crate::provider::anthropic::body_floats_superseded_ids(&body);
     let mut group = if state
         .settings_live
         .routing_enabled
@@ -1490,6 +1596,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         excerpt: classified.excerpt,
         group,
         served_by: None,
+        superseded_float,
         compatibility: None,
         auto_classifier,
         gemini_converter: None,
@@ -1740,46 +1847,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             account,
         );
         // Served (group, model, effort, fast) for in-flight attribution
-        // (req11): codex → the PER-REQUEST resolved upstream model + effective
-        // effort/fast; claude → the inbound model + client effort, never fast.
-        // Mirrors `finished_meta` so the in-flight row matches its eventual
-        // finish (same badge while running as when done).
-        let (served_group, served_model, served_effort, served_fast) =
-            match BackendGroup::from_kind(credential.kind()) {
-                BackendGroup::Codex => {
-                    let (model, effort, fast) = ctx.codex_meta(state);
-                    (Some("codex".to_string()), Some(model), effort, fast)
-                }
-                BackendGroup::Grok => {
-                    let (model, effort) = state.grok.request_meta(&ctx.body);
-                    (Some("grok".to_string()), Some(model), effort, false)
-                }
-                BackendGroup::OpenRouter => (
-                    Some("openrouter".to_string()),
-                    // Provider-normalized pin — same reason as `finished_meta`:
-                    // the in-flight row must name what actually goes on the wire.
-                    Some(crate::provider::openrouter::resolve_model(
-                        ctx.model.as_deref(),
-                        state.openrouter.model(),
-                    )),
-                    claude_effort(&ctx.body),
-                    false,
-                ),
-                BackendGroup::Claude => (
-                    Some("claude".to_string()),
-                    ctx.model.clone(),
-                    claude_effort(&ctx.body),
-                    false,
-                ),
-                // Same contract as `finished_meta`'s gemini arm
-                // (provider-resolved upstream model, no effort).
-                BackendGroup::Gemini => (
-                    Some("gemini".to_string()),
-                    Some(state.gemini.request_meta(&ctx.body).0),
-                    None,
-                    false,
-                ),
-            };
+        // (req11), see `ForwardContext::routed_meta`.
+        let FinishedMeta {
+            group: served_group,
+            model: served_model,
+            effort: served_effort,
+            fast: served_fast,
+        } = ctx.routed_meta(state, BackendGroup::from_kind(credential.kind()));
         state.emit(ActivityEvent::RequestRouted {
             id: ctx.activity_id,
             account: account.0.clone(),
@@ -2225,6 +2299,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         _ => {}
                     }
                     if let Some(model) = body["model"].as_str() {
+                        // Aliases only: an explicit Haiku 4.5 id from the Codex
+                        // frontend stays 4.5 (its record cannot cheaply know a
+                        // float); `-m haiku` already reaches Haiku 5.5.
                         let resolved = crate::catalog::resolve_claude_alias(model).unwrap_or(model);
                         body["model"] = serde_json::json!(resolved);
                     }
@@ -4765,6 +4842,7 @@ mod tests {
             tenant: None,
             group: Some(group),
             served_by: None,
+            superseded_float: false,
             compatibility: None,
             auto_classifier: None,
             gemini_converter: None,
@@ -4825,6 +4903,65 @@ mod tests {
             assert_eq!(meta.model.as_deref(), Some(upstream), "{model}");
             assert_eq!(meta.effort, None, "{model}: the level is in the id");
         }
+    }
+
+    /// Since 2026-10-23 a superseded claude id on a request that FLOATS is
+    /// served by its family alias's owner, and accounting does not float it
+    /// (history keeps Haiku 4.5), so the record written now must name the
+    /// served id — in the in-flight row (`routed_meta`) and the finished one
+    /// alike. A request that does not float reached Haiku 4.5 and keeps the
+    /// inbound id; every other model keeps the inbound string as before — an
+    /// alias stays the alias.
+    #[test]
+    fn claude_meta_records_the_served_id_only_for_a_floated_superseded_id() {
+        let state = test_state("http://127.0.0.1:9", vec![oauth_account("a", "at-a")]);
+        for (inbound, floated, not_floated) in [
+            (
+                "claude-haiku-4-5-20251001",
+                "claude-haiku-5-5",
+                "claude-haiku-4-5-20251001",
+            ),
+            ("claude-haiku-4-5", "claude-haiku-5-5", "claude-haiku-4-5"),
+            (
+                "claude-haiku-4-5[1m]",
+                "claude-haiku-5-5",
+                "claude-haiku-4-5[1m]",
+            ),
+            ("opus", "opus", "opus"),
+            ("haiku", "haiku", "haiku"),
+            (
+                "claude-opus-4-8[1m]",
+                "claude-opus-4-8[1m]",
+                "claude-opus-4-8[1m]",
+            ),
+            ("claude-haiku-5-5", "claude-haiku-5-5", "claude-haiku-5-5"),
+        ] {
+            for (superseded_float, recorded) in [(true, floated), (false, not_floated)] {
+                let label = format!("{inbound} float={superseded_float}");
+                // Served by the claude group: in-flight and finished agree…
+                let mut ctx = ctx_for_group(inbound, BackendGroup::Claude);
+                ctx.superseded_float = superseded_float;
+                let routed = ctx.routed_meta(&state, BackendGroup::Claude);
+                assert_eq!(routed.group.as_deref(), Some("claude"), "{label}");
+                assert_eq!(routed.model.as_deref(), Some(recorded), "routed {label}");
+                ctx.served_by = Some(BackendGroup::Claude);
+                let meta = ctx.finished_meta(&state);
+                assert_eq!(meta.group.as_deref(), Some("claude"), "{label}");
+                assert_eq!(meta.model.as_deref(), Some(recorded), "{label}");
+                // …and an early failure classified to it names the same model.
+                let mut early = ctx_for_group(inbound, BackendGroup::Claude);
+                early.superseded_float = superseded_float;
+                let meta = early.finished_meta(&state);
+                assert_eq!(meta.model.as_deref(), Some(recorded), "early {label}");
+            }
+        }
+        // A non-claude early failure keeps the inbound string untouched.
+        let mut ctx = ctx_for_group("claude-haiku-4-5-20251001", BackendGroup::Codex);
+        ctx.superseded_float = true;
+        assert_eq!(
+            ctx.finished_meta(&state).model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
     }
 
     /// A gemini 429 body in the captured Cloud Code shape (CLIProxyAPI

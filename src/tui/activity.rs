@@ -532,7 +532,13 @@ pub(crate) struct ModelCount {
 ///    booked against it too. Without this, a client sending `opus` produces a
 ///    dashboard row literally named `opus` that matches no pricing entry (no
 ///    `claude-…` prefix) and silently falls through to the group default.
-///    Non-aliases (real ids, codex/grok/unknown slugs) pass through untouched.
+///    Non-aliases (real ids, codex/grok/unknown slugs) pass through untouched
+///    — deliberately including SUPERSEDED ids
+///    ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`]): this runs at read/replay
+///    time over persisted history, and a `claude-haiku-4-5-20251001` record
+///    from before the 2026-10-23 float was served by Haiku 4.5, so it stays
+///    booked and priced as 4.5. New superseded-id traffic is already recorded
+///    under the served id (`proxy::forward`'s `recorded_claude_model`).
 /// 2. Strip a trailing display-only context suffix `…[1m]` so usage is not split
 ///    by client window hints (req17): `claude-sonnet-4-5[1m]` →
 ///    `claude-sonnet-4-5`. The steps compose: `opus` → `claude-opus-5-5[1m]` →
@@ -2934,6 +2940,12 @@ mod tests {
         assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");
         assert_eq!(normalize_model("fable-5-1"), "claude-fable-5-1");
         assert_eq!(normalize_model("haiku"), "claude-haiku-5-5");
+        // A superseded id is NOT an alias: a persisted 4.5 record keeps its
+        // identity (only routing floats it, 2026-10-23).
+        assert_eq!(
+            normalize_model("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     #[test]
@@ -3259,6 +3271,61 @@ mod tests {
             },
             other => other,
         }
+    }
+
+    /// 2026-10-23 float regression: routing now serves Haiku 4.5 ids on Haiku
+    /// 5.5, but a record persisted BEFORE the float (an older daemon wrote the
+    /// 4.5 id, and 4.5 served it) must replay as Haiku 4.5 at 4.5 rates — not
+    /// be relabeled and repriced as 5.5 by the routing resolver. A record
+    /// written after the float names the served `claude-haiku-5-5`.
+    #[test]
+    fn replay_keeps_pre_float_haiku_4_5_history_apart_from_haiku_5_5() {
+        let dir = TempDir::new();
+        let path = dir.file();
+        let pre_float = r#"{"v":1,"ts_ms":1000,"id":1,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":900,"tokens":{"input":0,"output":1000000,"cache_read":null,"cache_creation":null},"group":"claude","model":"claude-haiku-4-5-20251001","effort":null}"#;
+        std::fs::write(&path, format!("{pre_float}\n")).expect("write history");
+        let post_float = finished_model(
+            2,
+            Some("a"),
+            "claude",
+            "claude-haiku-5-5",
+            None,
+            200,
+            Some(TokenCounts {
+                input: 0,
+                output: 1_000_000,
+                cache_read: None,
+                cache_creation: None,
+            }),
+            "/v1/messages",
+        );
+        persist_request(Some(&path), &post_float, at(2));
+
+        let mut log = ActivityLog::new(50);
+        log.load_persisted(Some(&path));
+        let rows = log.model_usage();
+        let mut models: Vec<&str> = rows.iter().map(|r| r.model.as_str()).collect();
+        models.sort_unstable();
+        assert_eq!(
+            models,
+            vec!["claude-haiku-4-5-20251001", "claude-haiku-5-5"],
+            "two distinct model identities"
+        );
+        let cost = |model: &str| {
+            let row = rows.iter().find(|r| r.model == model).expect("row");
+            crate::pricing::cost_from_parts(
+                &row.group,
+                &row.model,
+                row.tokens_in,
+                row.tokens_out,
+                row.cache_read,
+                row.cache_creation,
+                &HashMap::new(),
+            )
+        };
+        // 1M output tokens: Haiku 4.5 $5.00 vs Haiku 5.5 $0.50.
+        assert!((cost("claude-haiku-4-5-20251001") - 5.0).abs() < 1e-9);
+        assert!((cost("claude-haiku-5-5") - 0.50).abs() < 1e-9);
     }
 
     #[test]

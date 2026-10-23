@@ -7252,3 +7252,80 @@ async fn internal_routing_title_before_first_main_uses_fresh_hint_without_seedin
     assert_eq!(response.status(), 404);
     assert_eq!(mock.seen().len(), 1);
 }
+
+/// The Haiku 4.5 float, wired end to end (2026-10-23): a bare
+/// `claude-haiku-4-5-20251001` request is forwarded unchanged and recorded
+/// under that id, while a billing-header-first (Claude Code-shaped) one is
+/// forwarded as `claude-haiku-5-5` and recorded as `claude-haiku-5-5` — the
+/// entry-time predicate and the provider's rewrite must agree.
+#[tokio::test]
+async fn haiku_4_5_float_reaches_upstream_and_activity_consistently() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..2 {
+        mock.push(ScriptedResponse::ok(
+            r#"{"id":"msg_h","type":"message","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        ));
+    }
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    let bare = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let mut shaped = bare.clone();
+    shaped["system"] = serde_json::json!([
+        {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.292; cc_entrypoint=cli;"},
+        {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+    ]);
+    for body in [&bare, &shaped] {
+        let response = post_messages(&client, &proxy, &body.to_string()).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    let wire = |i: usize| -> serde_json::Value {
+        serde_json::from_slice(&seen[i].body).expect("upstream json")
+    };
+    assert_eq!(
+        wire(0)["model"],
+        "claude-haiku-4-5-20251001",
+        "bare: no float"
+    );
+    assert_eq!(
+        wire(1)["model"],
+        "claude-haiku-5-5",
+        "claude code-shaped: float"
+    );
+
+    // The activity record names the same model per request (the dashboard's
+    // per-model rows are keyed by the recorded model).
+    let mut models: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        models = doc["model_usage"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r["group"] == "claude" && r["requests"] == 1)
+                    .filter_map(|r| r["model"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if models.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    models.sort();
+    assert_eq!(
+        models,
+        vec!["claude-haiku-4-5-20251001", "claude-haiku-5-5"]
+    );
+}

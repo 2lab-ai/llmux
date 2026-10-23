@@ -72,3 +72,43 @@ fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint() -> Endpoint {
+        Endpoint {
+            base_url: "http://127.0.0.1:3456".into(),
+            api_key: Some("lmk-test".into()),
+            remote: false,
+            host: "127.0.0.1".into(),
+            port: 3456,
+        }
+    }
+
+    /// Plain `env` prints the endpoint exports only. It deliberately does NOT
+    /// print the `ANTHROPIC_DEFAULT_*_MODEL` alias exports: `run` skips a var
+    /// already in the environment as the user's own, so llmux-written values
+    /// left in a shell would shadow a later catalog's alias move.
+    #[test]
+    fn render_prints_only_the_endpoint_exports() {
+        assert_eq!(
+            render(&endpoint(), false).expect("render"),
+            "export ANTHROPIC_BASE_URL=http://127.0.0.1:3456\n\
+             export ANTHROPIC_API_KEY=lmk-test\n"
+        );
+    }
+
+    #[test]
+    fn render_codex_branch_prints_openai_exports_only() {
+        let output = render(&endpoint(), true).expect("render");
+        assert!(!output.contains("ANTHROPIC_"), "{output}");
+        assert!(
+            output.starts_with(
+                "export OPENAI_BASE_URL=http://127.0.0.1:3456/v1\nexport OPENAI_API_KEY=lmk-test\n"
+            ),
+            "{output}"
+        );
+    }
+}
