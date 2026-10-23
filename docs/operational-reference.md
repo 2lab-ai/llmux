@@ -273,7 +273,7 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | Gemini backend group (`llmux login --gemini`, the dashboard picker's Gemini row, `gemini` / `argon` models, Islands Gemini tiles) | no | no | yes |
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
 | `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | no | yes |
-| Explicit Haiku 4.5 ids served by Haiku 5.5 (row retired), Claude Code system block on the bare `quota` probe, `ANTHROPIC_DEFAULT_*_MODEL` exports from plain `llmux env` ([models](models.md#alias-semantics)) | no | no | yes |
+| Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests and the bare `quota` probe (bare or custom-system requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | no | yes |
 
 Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
@@ -313,8 +313,6 @@ Manual shell wiring:
 eval "$(llmux env)"
 claude
 ```
-
-Besides `ANTHROPIC_BASE_URL` (and `ANTHROPIC_API_KEY` when a key is configured), plain `llmux env` exports the same four `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` values `run` sets ([alias exports](models.md#alias-exports)); a var already in your environment is skipped. They come from that `llmux` binary's own catalog — `env` never starts the daemon or fetches `/llmux/models`. To pick up a new catalog after an upgrade, evaluate it in a new shell (or after `unset ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL`); re-running it in the same shell keeps the old values, because they are already exported. A value you exported yourself is still preserved.
 
 Per-agent models: a `.claude/agents/<name>.md` file with `model: gpt-6-astra[1m]` or `model: grok-4.7` runs as a native Claude Code subagent and is routed by llmux like any request; see [multi-model agents](multi-model-agents.md).
 

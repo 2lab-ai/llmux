@@ -61,61 +61,85 @@ Native Messages still forwards output caps, thinking, tools/images and sampling
 parameters under the matrix below; Haiku rejects non-default sampling values.
 The Responses SDK path keeps its existing control validation and caller-tool
 execution. Streaming/error handling, usage observation and upstream counting are
-unchanged. Evidence: `provider::anthropic::tests::normalize_body_resolves_haiku_5_5_and_floats_4_5`,
+unchanged. Evidence: `provider::anthropic::tests::normalize_body_resolves_haiku_5_5_aliases`,
 `catalog::tests::claude_entries_carry_curated_efforts_and_context` and the
 frontend matrix's implementation paths. These code tests do not establish
 Haiku-specific subscription availability, tool/streaming behavior or its full
 context ceiling; those remain untested by this catalog change. Public API prices
 are references, with [request-tier/TTL limitations](models.md#current-claude-reference-prices).
 
-**2026-10-23: Haiku 4.5 ids float; the bare quota probe gets a system block.**
+**2026-10-23: Haiku 4.5 ids float on Claude Code / Agent SDK–shaped requests; the bare quota probe gets a system block.**
 By user decision, explicit `claude-haiku-4-5` and dated `claude-haiku-4-5-YYYYMMDD`
-ids now resolve to the `haiku` owner: native Messages sends `claude-haiku-5-5`,
-and the Responses SDK path hands the SDK `claude-haiku-5-5[1m]`
-(`src/proxy/forward.rs:2257`, the same routing resolver,
-`catalog::resolve_claude_model`). The daemon ledger for
-2026-10-06..2026-10-23 held ~3,300 requests on those ids — Claude Code / Agent
-SDK built-in Haiku-tier traffic (titles, quota probes, `model: haiku` agents outside
-`llmux run`) that the `haiku` alias never reached. Live probes through the daemon
-on 2026-10-23, `claude-haiku-5-5` on the OAuth subscription pool:
+ids resolve to the `haiku` owner — native Messages sends `claude-haiku-5-5` — on two
+kinds of request only: Claude Code / Agent SDK–shaped ones, whose FIRST system block (a
+plain-string system counts as one block) starts with `x-anthropic-billing-header:` or
+equals, exactly, `You are Claude Code, Anthropic's official CLI for Claude.`,
+`You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.`
+or `You are a Claude agent, built on Anthropic's Claude Agent SDK.`; and Claude Code's
+bare `quota` probe (below). Bare or custom-system requests naming a 4.5 id keep reaching
+Haiku 4.5, because Haiku 5.5 refuses them on the subscription endpoint (table). The
+Codex-frontend (Responses) path floats aliases only: `-m haiku` reaches Haiku 5.5, an
+explicit 4.5 id stays 4.5 (`src/proxy/forward.rs:2299`). The predicate is
+`provider::anthropic::floats_superseded_ids` (`src/provider/anthropic.rs:79-105`). The
+daemon ledger for 2026-10-06..2026-10-23 held ~3,300 requests on those ids — Claude Code /
+Agent SDK built-in Haiku-tier traffic (titles, quota probes, `model: haiku` agents outside
+`llmux run`) that the `haiku` alias never reached. The 4.5 catalog row stays retired: the
+picker is Claude Code-facing, and Claude Code requests float.
+
+Live probes through the daemon on 2026-10-23, OAuth subscription pool (`claude-haiku-5-5`
+unless the row says otherwise; "custom" = a non-Claude Code text such as
+`You are a terse assistant.`; `CC` / `SDK` / `CC-in-SDK` = the three identity sentences
+above):
 
 | Request | Result |
 | --- | --- |
-| system `You are Claude Code, Anthropic's official CLI for Claude.` + plain turn | 200 |
+| system `CC` + plain turn | 200 |
 | same system + `thinking: {type: enabled, budget_tokens: 31999}`, `max_tokens: 32000` | 200 |
 | same system + `temperature: 1` | 200 |
 | same system + `thinking: {type: adaptive}` | 200 |
-| system `You are a Claude agent, built on Anthropic's Claude Agent SDK.` + 31999 budget | 200 |
+| system `SDK` + 31999 budget | 200 |
 | `/v1/messages/count_tokens`, no system | 200 |
 | Claude Code's rate-limit probe: no system, `max_tokens: 1`, one user turn `"quota"` | **502** (upstream `429 rate_limit_error` on every account) |
 | the same probe body on `claude-haiku-4-5-20251001` | 200 |
 | the probe plus that Claude Code system block (content as a string ×3, as one text block ×1) | 200 each |
+| plain turn (`max_tokens` 16/64), first system block exactly `CC` (as a block or as the plain system string), exactly `CC-in-SDK`, or exactly `SDK` (also when a custom block follows) | 200 |
+| plain turn, first block `x-anthropic-billing-header: …` (any value, e.g. `cc_version=9.9.9; cc_entrypoint=cli;`) followed by `SDK`, `CC`, `CC-in-SDK`, a custom block, or nothing | 200 |
+| plain turn, no system | **502** (Haiku 4.5, same body: 200 ×2; Haiku 5.5: 502 ×2) |
+| plain turn, custom system string | **502** |
+| plain turn, custom block then `CC` or `SDK` | **502** |
+| plain turn, one block `CC` + ` Extra instructions follow.` / `CC` + a trailing space / one string `CC` + `\n\nYou are a terse assistant.` | **502** |
 
 The ledger shows 137 such probes on `claude-haiku-5-5` that already 502'd
 (2026-10-06..2026-10-23), and the float would send every built-in probe there. So
 native Messages now adds `system: [{type: text, text: "You are Claude Code, Anthropic's
 official CLI for Claude."}]` to exactly that probe — `max_tokens: 1`, one `user`
 message whose content is `"quota"` (a string, or one text block), no tools, and an
-absent/empty/blank system — on any model. Every other request, including any other
-bare user turn, is untouched. The shaped body is the last row of the table above
-(sent directly through the daemon before this change was deployed). Evidence: `provider::anthropic::tests::normalize_body_gives_the_bare_quota_probe_the_claude_code_system`,
+absent/empty/blank system — on any model; the probe floats either way. Every other
+request, including any other bare user turn, is untouched. The shaped body is the
+"probe plus that Claude Code system block" row (sent directly through the daemon before
+this change was deployed). Evidence:
+`provider::anthropic::tests::floats_superseded_ids_matches_the_measured_first_system_blocks`,
+`normalize_body_floats_a_4_5_id_only_on_a_gate_shaped_body`,
+`normalize_body_gives_the_bare_quota_probe_the_claude_code_system`,
 `normalize_body_leaves_every_near_miss_of_the_quota_probe_untouched`,
 `normalize_body_floats_and_shapes_a_haiku_4_5_quota_probe` and
-`catalog::tests::resolve_claude_model_floats_superseded_haiku_4_5`.
+`catalog::tests::resolve_superseded_claude_id_maps_haiku_4_5_spellings`.
 
 Usage and pricing: the float is a routing rule, not an accounting one. Records
 written before the change keep their Haiku 4.5 identity and Haiku 4.5 reference
-pricing on replay (Haiku 4.5 served them); requests from the change onward are
-recorded as `claude-haiku-5-5`, the model that serves them
-(`recorded_claude_model`, `src/proxy/forward.rs:769`). Evidence:
+pricing on replay (Haiku 4.5 served them). From the change onward, a request that
+floats is recorded as `claude-haiku-5-5` — in the in-flight row and the finished one —
+and one that does not keeps its 4.5 id: the forward path evaluates the same predicate
+once on the inbound body (`src/proxy/forward.rs:1461`, `recorded_claude_model` at
+`:831`). Evidence:
 `tui::activity::tests::replay_keeps_pre_float_haiku_4_5_history_apart_from_haiku_5_5`,
-`proxy::forward::tests::claude_finished_meta_records_the_served_id_for_a_superseded_id_only`.
+`proxy::forward::tests::claude_meta_records_the_served_id_only_for_a_floated_superseded_id`.
 
 ## Wire paths (incoming Messages)
 
 | Group | Upstream | Path |
 | --- | --- | --- |
-| Claude (`fable`, `opus`, `sonnet`, `claude-*`) | `https://api.anthropic.com` (config `upstream`), subscription OAuth or API key | **native Messages, no translation** — the request keeps its path and shape; llmux swaps the credential header and normalizes the body only: model-alias resolution (including the superseded Haiku 4.5 ids), `[1m]` suffix strip, unsigned-`thinking` strip, and the Claude Code system block on the bare `quota` probe ([above](#haiku-55-catalog-update); `src/provider/anthropic.rs:23-237`, upstream build `src/proxy/forward.rs:3451-3467`, called from the claude branch at `:2378`) |
+| Claude (`fable`, `opus`, `sonnet`, `claude-*`) | `https://api.anthropic.com` (config `upstream`), subscription OAuth or API key | **native Messages, no translation** — the request keeps its path and shape; llmux swaps the credential header and normalizes the body only: model-alias resolution (plus the superseded Haiku 4.5 ids on Claude Code / Agent SDK–shaped requests and the bare `quota` probe), `[1m]` suffix strip, unsigned-`thinking` strip, and the Claude Code system block on the bare `quota` probe ([above](#haiku-55-catalog-update); `src/provider/anthropic.rs:23-294`, upstream build `src/proxy/forward.rs:3493-3509`, called from the claude branch at `:2420`) |
 | OpenRouter (`or-*`) | `https://openrouter.ai/api/v1/messages` — a native Anthropic Messages endpoint (`src/config/schema.rs:1191-1205`) | **native Messages, no translation**, but the body IS rewritten: `model` → wire slug, and the SAME unsigned-`thinking` strip as the Claude path (`src/provider/openrouter.rs:143-167`, which calls `anthropic::strip_foreign_thinking` at `:147`); the `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers are dropped (`:300-314`) |
 | Codex (`gpt-*`, `sol`, `terra`, `luna`) | `https://chatgpt.com/backend-api/codex/responses` — the **ChatGPT subscription gateway**, not the public OpenAI API | **translation** Messages → Responses (`src/provider/responses_request.rs`) |
 | Grok (`grok-*`) | `https://cli-chat-proxy.grok.com/v1/responses` — the **Grok subscription gateway**, not api.x.ai | **translation** Messages → Responses |
@@ -139,7 +163,7 @@ Gemini API, not the Antigravity backend llmux talks to.
 | non-empty `stop_sequences` | forwarded | forwarded | **400**, except [scoped monitor adapter](#claude-code-auto-mode-monitors) | **400** | forwarded as `stopSequences` |
 | assistant `thinking` history | forwarded when **signed**; a block with a missing/empty `signature` is stripped¹ | same¹ | **dropped** | **dropped** | **dropped**; tool-call thought signatures are replayed instead |
 | assistant `redacted_thinking` | forwarded untouched (it carries no `signature` field by design) | same | **dropped** | **dropped** | **dropped** |
-| `model` field | rewritten: alias (or superseded Haiku 4.5 id) resolved, `[1m]` client suffix stripped | rewritten to the OpenRouter wire slug (`or-ox-alpha` → `stealth/ox-alpha`) | replaced by the served upstream model (`src/provider/responses_request.rs:134`) | same | rewritten: alias resolved, `[1m]` client suffix stripped |
+| `model` field | rewritten: alias resolved (a superseded Haiku 4.5 id too, on Claude Code / Agent SDK–shaped requests and the bare `quota` probe), `[1m]` client suffix stripped | rewritten to the OpenRouter wire slug (`or-ox-alpha` → `stealth/ox-alpha`) | replaced by the served upstream model (`src/provider/responses_request.rs:134`) | same | rewritten: alias resolved, `[1m]` client suffix stripped |
 | top-level `thinking` config (`budget_tokens`, `disabled`) | forwarded | forwarded | **dropped** (shape validated first) | **dropped** | **dropped** (`thinking_config`); every request asks for thoughts (`includeThoughts: true`) |
 | base64 PNG/JPEG image on a user message | forwarded | forwarded | converted to `input_image` | converted | converted to `inlineData` (also WebP, HEIC, HEIF and base64 PDF) |
 | image by URL, other media types, unknown blocks | forwarded | forwarded | **400** (never fetched) | **400** | **400** (never fetched), before any credential refresh |

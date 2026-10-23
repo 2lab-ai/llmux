@@ -147,10 +147,7 @@ fn row_description(row: &CatalogRow) -> String {
 /// verbatim, and the client applies its 200k assumption unless the SUBMITTED
 /// id ends in `[1m]` — catalog alias ownership decides the upstream slug, not
 /// the client's window.
-///
-/// Shared with `llmux env` ([`super::env`]), which prints the same four
-/// exports from this binary's compiled catalog.
-pub(super) const ALIAS_ENV: &[(&str, &str)] = &[
+const ALIAS_ENV: &[(&str, &str)] = &[
     ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
     ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
     ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),

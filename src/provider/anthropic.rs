@@ -21,13 +21,13 @@ use super::{
 use crate::config::AccountCredential;
 
 /// Normalize an Anthropic-bound JSON body in ONE parse: resolve a curated
-/// claude ALIAS (or a superseded id such as `claude-haiku-4-5-20251001`) in
-/// `model` to its catalog id, strip the Claude-Code-local `[1m]`
-/// context-window suffix from `model`, strip foreign (unsigned) thinking
-/// blocks from `messages` (issue #116), and give Claude Code's bare `quota`
-/// rate-limit probe the Claude Code system block ([`shape_quota_probe`]). The
-/// two model steps run in that order and compose (`opus` →
-/// `claude-opus-5-5[1m]` → `claude-opus-5-5`).
+/// claude ALIAS in `model` to its catalog id (and a superseded id such as
+/// `claude-haiku-4-5-20251001` — but only on a body [`floats_superseded_ids`]
+/// accepts), strip the Claude-Code-local `[1m]` context-window suffix from
+/// `model`, strip foreign (unsigned) thinking blocks from `messages` (issue
+/// #116), and give Claude Code's bare `quota` rate-limit probe the Claude Code
+/// system block ([`shape_quota_probe`]). The two model steps run in that order
+/// and compose (`opus` → `claude-opus-5-5[1m]` → `claude-opus-5-5`).
 /// Because the alias step runs FIRST, an alias that already carries the client
 /// suffix (`opus[1m]`, `fable[1m]`) must resolve too — that is handled on the
 /// needle side in [`crate::catalog::resolve_claude_alias`].
@@ -38,7 +38,10 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
     };
-    let alias = resolve_client_alias(&mut value);
+    // Decided on the body AS RECEIVED: the probe counts whether or not its
+    // system block is injected below.
+    let superseded_float = floats_superseded_ids(&value);
+    let alias = resolve_client_alias(&mut value, superseded_float);
     let model = strip_client_context_suffix(&mut value);
     let thinking = strip_foreign_thinking(&mut value);
     let quota = shape_quota_probe(&mut value);
@@ -51,6 +54,56 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
     }
 }
 
+/// Should a superseded claude id ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`],
+/// the Haiku 4.5 ids) in this body be served by its family alias's owner
+/// (Haiku 5.5)? True for Claude Code's bare `quota` probe (it gets the Claude
+/// Code system block, [`shape_quota_probe`]) and for a body whose FIRST system
+/// block (a plain-string system is one block) is gate-shaped: its text starts
+/// with `x-anthropic-billing-header:`, or EQUALS — exactly, untrimmed — one of
+/// the Claude Code / Agent SDK identity sentences
+/// ([`crate::proxy::auto_classifier::MAIN`], `MAIN_IN_SDK`, `SDK_AGENT`).
+///
+/// Why conditional: live probes through the daemon on 2026-10-23
+/// (`claude-haiku-5-5`, OAuth subscription pool, one plain user turn) got 200
+/// exactly for those first blocks — each identity sentence alone, the SDK
+/// sentence followed by a custom block, a billing-header block followed by an
+/// identity sentence, a custom block or nothing — and 502 (upstream 429 on
+/// every account) for no system, a custom system, a custom block before an
+/// identity sentence, and an identity sentence with anything appended in the
+/// same block (trailing space, extra instructions). Haiku 4.5 accepted the
+/// same refused bodies (bare plain: 4.5 200 ×2, 5.5 502 ×2). So a bare or
+/// custom-system client naming a 4.5 id keeps reaching Haiku 4.5.
+///
+/// Shared with `proxy::forward`, which evaluates it once on the same inbound
+/// bytes so the activity record names the model that actually served them.
+pub(crate) fn floats_superseded_ids(body: &serde_json::Value) -> bool {
+    is_quota_probe(body) || first_system_text(body).is_some_and(is_gate_shaped_system)
+}
+
+/// [`floats_superseded_ids`] over raw body bytes (`false` for non-JSON).
+pub(crate) fn body_floats_superseded_ids(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .is_ok_and(|value| floats_superseded_ids(&value))
+}
+
+/// The text of the first system block: the whole string for a plain-string
+/// system, else the first array element's `text`.
+fn first_system_text(body: &serde_json::Value) -> Option<&str> {
+    match body.get("system")? {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(blocks) => blocks.first()?.get("text")?.as_str(),
+        _ => None,
+    }
+}
+
+/// See [`floats_superseded_ids`]: a billing-header prefix, or one identity
+/// sentence verbatim.
+fn is_gate_shaped_system(text: &str) -> bool {
+    use crate::proxy::auto_classifier::{MAIN, MAIN_IN_SDK, SDK_AGENT};
+    text.starts_with("x-anthropic-billing-header:")
+        || [MAIN, MAIN_IN_SDK, SDK_AGENT].contains(&text)
+}
+
 /// Rewrite a client-supplied model that is a curated claude ALIAS (`opus`,
 /// `sonnet`, `haiku`, …) to its catalog id, so the alias `GET /models`
 /// advertises is actually honored upstream: before this hook a bare `opus` was
@@ -60,15 +113,19 @@ fn normalize_body(body: bytes::Bytes) -> bytes::Bytes {
 /// aliases automatically and anything that is not an alias (a real id, a
 /// foreign slug) passes through untouched — passthrough stays passthrough.
 /// The one exception is a superseded id
-/// ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], 2026-10-23: the Haiku 4.5 ids),
-/// which is rewritten to its family alias's current owner — hence the routing
-/// resolver [`crate::catalog::resolve_claude_model`], not the alias-only one
-/// accounting uses.
-fn resolve_client_alias(value: &mut serde_json::Value) -> bool {
+/// ([`crate::catalog::SUPERSEDED_CLAUDE_IDS`], 2026-10-23: the Haiku 4.5 ids):
+/// when `superseded_float` ([`floats_superseded_ids`]) holds it is rewritten
+/// to its family alias's current owner; otherwise it passes through as before.
+fn resolve_client_alias(value: &mut serde_json::Value, superseded_float: bool) -> bool {
     let Some(model) = value.get("model").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    let Some(id) = crate::catalog::resolve_claude_model(model) else {
+    let resolved = match crate::catalog::resolve_claude_alias(model) {
+        Some(id) => Some(id),
+        None if superseded_float => crate::catalog::resolve_superseded_claude_id(model),
+        None => None,
+    };
+    let Some(id) = resolved else {
         return false;
     };
     value["model"] = serde_json::Value::String(id.to_string());
@@ -475,21 +532,129 @@ mod tests {
         assert_eq!(normalized_model("opus[1m]"), "claude-opus-5-5");
     }
 
-    /// Floating Haiku aliases use the new wire id, and since 2026-10-23 (user
-    /// decision) so do the explicit Haiku 4.5 ids Claude Code / the Agent SDK
-    /// send for their built-in Haiku tier — bare and dated.
+    /// Floating Haiku aliases use the new wire id whatever the body shape.
     #[test]
-    fn normalize_body_resolves_haiku_5_5_and_floats_4_5() {
-        for model in [
-            "haiku",
-            "haiku[1m]",
-            "haiku-5-5",
-            "claude-haiku-5-5[1m]",
-            "claude-haiku-4-5",
-            "claude-haiku-4-5-20251001",
-        ] {
+    fn normalize_body_resolves_haiku_5_5_aliases() {
+        for model in ["haiku", "haiku[1m]", "haiku-5-5", "claude-haiku-5-5[1m]"] {
             assert_eq!(normalized_model(model), "claude-haiku-5-5", "{model}");
         }
+    }
+
+    /// A one-turn body naming `model` with the given `system` (omitted when
+    /// `None`).
+    fn plain_body(model: &str, system: Option<serde_json::Value>) -> String {
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        if let Some(system) = system {
+            body["system"] = system;
+        }
+        body.to_string()
+    }
+
+    /// User decision 2026-10-23: the explicit Haiku 4.5 ids Claude Code / the
+    /// Agent SDK send for their built-in Haiku tier float to the `haiku` owner
+    /// — but only on a gate-shaped body (Haiku 5.5 on the subscription
+    /// endpoint refuses the rest, live probes 2026-10-23).
+    #[test]
+    fn normalize_body_floats_a_4_5_id_only_on_a_gate_shaped_body() {
+        let cc = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.292; cc_entrypoint=cli;"},
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+        ]);
+        let billing_only = serde_json::json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9;"},
+            {"type": "text", "text": "You are a terse assistant."},
+        ]);
+        let sdk =
+            serde_json::json!("You are a Claude agent, built on Anthropic's Claude Agent SDK.");
+        for model in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
+            for system in [&cc, &billing_only, &sdk] {
+                let out =
+                    normalize_body(bytes::Bytes::from(plain_body(model, Some(system.clone()))));
+                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
+                assert_eq!(value["model"], "claude-haiku-5-5", "{model} / {system}");
+                assert_eq!(&value["system"], system, "system untouched");
+            }
+        }
+        // Bare and custom-system 4.5 requests keep reaching Haiku 4.5: the
+        // body comes back byte-identical.
+        let custom = [
+            None,
+            Some(serde_json::json!("You are a terse assistant.")),
+            Some(serde_json::json!([
+                {"type": "text", "text": "You are a terse assistant."},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            ])),
+        ];
+        for system in custom {
+            let body = plain_body("claude-haiku-4-5-20251001", system.clone());
+            let out = normalize_body(bytes::Bytes::from(body.clone()));
+            assert_eq!(out.as_ref(), body.as_bytes(), "{system:?}");
+        }
+    }
+
+    /// The predicate mirrors the 2026-10-23 live probe table on
+    /// `claude-haiku-5-5` (200 = floats, 502 = does not).
+    #[test]
+    fn floats_superseded_ids_matches_the_measured_first_system_blocks() {
+        const CC: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+        const CC_IN_SDK: &str =
+            "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+        const SDK: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+        const HEADER: &str = "x-anthropic-billing-header: cc_version=9.9.9; cc_entrypoint=cli;";
+        const CUSTOM: &str = "You are a terse assistant.";
+        let block = |text: &str| serde_json::json!({"type": "text", "text": text});
+        let with_system = |system: Option<serde_json::Value>| -> serde_json::Value {
+            serde_json::from_str(&plain_body("claude-haiku-5-5", system)).expect("json")
+        };
+        let accepted = [
+            serde_json::json!([block(CC)]),
+            serde_json::json!(CC),
+            serde_json::json!([block(CC_IN_SDK)]),
+            serde_json::json!([block(SDK)]),
+            serde_json::json!([block(SDK), block(CUSTOM)]),
+            serde_json::json!([block(HEADER), block(SDK)]),
+            serde_json::json!([block(HEADER), block(CC)]),
+            serde_json::json!([block(HEADER), block(CC_IN_SDK)]),
+            serde_json::json!([block(HEADER), block(CUSTOM)]),
+            serde_json::json!([block(HEADER)]),
+        ];
+        for system in accepted {
+            assert!(
+                floats_superseded_ids(&with_system(Some(system.clone()))),
+                "200 shape must float: {system}"
+            );
+        }
+        let refused = [
+            None,
+            Some(serde_json::json!(CUSTOM)),
+            Some(serde_json::json!([block(CUSTOM), block(CC)])),
+            Some(serde_json::json!([block(CUSTOM), block(SDK)])),
+            Some(serde_json::json!([block(&format!(
+                "{CC} Extra instructions follow."
+            ))])),
+            Some(serde_json::json!([block(&format!("{CC} "))])),
+            Some(serde_json::json!(format!(
+                "{CC}\n\nYou are a terse assistant."
+            ))),
+        ];
+        for system in refused {
+            assert!(
+                !floats_superseded_ids(&with_system(system.clone())),
+                "502 shape must not float: {system:?}"
+            );
+        }
+        // The bare quota probe floats (it gets the Claude Code block).
+        let probe = serde_json::json!({
+            "model": "claude-haiku-4-5", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}],
+        });
+        assert!(floats_superseded_ids(&probe));
+        assert!(body_floats_superseded_ids(probe.to_string().as_bytes()));
+        assert!(!body_floats_superseded_ids(b"not json"));
     }
 
     #[test]
