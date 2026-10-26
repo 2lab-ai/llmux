@@ -134,6 +134,9 @@ pub(crate) struct DashboardView {
     /// so local and attach render identically.
     pub usage_controls:
         std::collections::BTreeMap<String, crate::proxy::usage_controls::UsageControlDoc>,
+    /// Subscription plan label per account name (`.prd/25`), carried on the
+    /// document. An account with no entry has no known plan.
+    pub plans: std::collections::BTreeMap<String, String>,
     /// Rolling 5-minute status-class counts for the header health verdict
     /// (glance-triage), carried on the document. `None` from an older daemon
     /// = no telemetry: the verdict skips storm detection and renders the err
@@ -479,6 +482,16 @@ impl DashboardView {
                     a.usage_control
                         .as_ref()
                         .map(|control| (a.name.clone(), control.clone()))
+                })
+                .collect(),
+            plans: doc
+                .accounts
+                .iter()
+                .filter_map(|a| {
+                    a.plan
+                        .as_ref()
+                        .and_then(|p| p.label.clone())
+                        .map(|label| (a.name.clone(), label))
                 })
                 .collect(),
             health: doc.health.as_ref().map(|h| super::activity::HealthCounts {

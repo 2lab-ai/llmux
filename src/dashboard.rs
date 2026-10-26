@@ -990,6 +990,10 @@ pub struct AccountDoc {
     /// is daemon state, not scheduler state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_control: Option<crate::proxy::usage_controls::UsageControlDoc>,
+    /// Daemon-learned subscription plan (`.prd/25`). Additive — `None` when
+    /// not (yet) known and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<crate::proxy::plans::AccountPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1500,6 +1504,9 @@ pub struct DocMeta {
     /// through `DocMeta` (like `pricing_overrides`) so `dashboard_doc` stays a
     /// pure function of its inputs. See [`AccountDoc::usage_control`].
     pub usage_controls: HashMap<String, crate::proxy::usage_controls::UsageControlDoc>,
+    /// Daemon-learned subscription plan by account name (`.prd/25`), from the
+    /// live [`crate::proxy::server::AppState::plans`] store.
+    pub plans: HashMap<String, crate::proxy::plans::AccountPlan>,
 }
 
 pub(crate) fn epoch_ms(at: SystemTime) -> u64 {
@@ -1796,6 +1803,7 @@ pub(crate) fn dashboard_doc(
                     tokens_out: session.tokens_out,
                 },
                 usage_control: meta.usage_controls.get(&account.id.0).cloned(),
+                plan: meta.plans.get(&account.id.0).cloned(),
             }
         })
         .collect();
@@ -2247,6 +2255,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
         // Live store, not a config snapshot: a refresh/redemption must show up
         // on the very next frame/poll.
         usage_controls: state.usage_controls.all(),
+        plans: state.plans.all(),
     };
     dashboard_doc(&snapshot, &hub, &state.totals, &params, now, &meta)
 }
@@ -2333,6 +2342,7 @@ mod tests {
         DocMeta {
             client_keys: Vec::new(),
             usage_controls: HashMap::new(),
+            plans: HashMap::new(),
             grok: GrokSettingsDoc::default(),
             pid: 4321,
             uptime_secs: 130,
@@ -2576,6 +2586,7 @@ mod tests {
                     port: 3456,
                     email_anonymous: false,
                     usage_controls: Default::default(),
+                    plans: Default::default(),
                 },
             );
             assert_eq!(status["accounts"][0]["blocked"], expected);

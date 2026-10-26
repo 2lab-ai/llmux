@@ -166,6 +166,9 @@ impl MockUpstream {
         let app = Router::new()
             .route("/v1/oauth/token", post(token_endpoint))
             .route("/api/oauth/usage", get(usage_endpoint))
+            // The daemon's plan pass (`.prd/25`) reads every oauth account's
+            // profile at start; served here so it never lands in `seen()`.
+            .route("/api/oauth/profile", get(profile_endpoint))
             .fallback(catch_all)
             .with_state(Arc::clone(&shared));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -462,6 +465,18 @@ async fn token_endpoint(
             MockUpstream::REFRESHED_REFRESH_TOKEN,
         )))
         .expect("token response")
+}
+
+/// `GET /api/oauth/profile` — a Max x20 profile for any bearer, outside the
+/// catch-all's `seen()` so forward-path assertions stay intact.
+async fn profile_endpoint() -> axum::response::Response {
+    http::Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"account":{"uuid":"mock-uuid","email":"mock@example.com","has_claude_max":true},"organization":{"uuid":"mock-org","organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#,
+        ))
+        .expect("profile response")
 }
 
 async fn usage_endpoint(

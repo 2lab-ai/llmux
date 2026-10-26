@@ -170,12 +170,34 @@ fn account_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
                     None => "?",
                 },
             };
+            let quota = quota_summary(account)
+                .map(|q| format!("  {q}"))
+                .unwrap_or_default();
             let token = token_summary(account, now)
                 .map(|t| format!("  {t}"))
                 .unwrap_or_default();
-            format!("    {order}. {name:<width$}  {state}{token}")
+            format!("    {order}. {name:<width$}  {state}{quota}{token}")
         })
         .collect()
+}
+
+/// "max20 · 7d 66% left" — the account's subscription plan beside its
+/// remaining weekly quota (`.prd/25`). Either half alone when only one is
+/// known; `None` when neither is (older daemons, api-key accounts).
+fn quota_summary(account: &serde_json::Value) -> Option<String> {
+    let plan = account["plan"].as_str().filter(|p| !p.is_empty());
+    let left = account["seven_day"]["utilization"].as_f64().map(|used| {
+        format!(
+            "7d {}% left",
+            ((1.0 - used.clamp(0.0, 1.0)) * 100.0).round()
+        )
+    });
+    match (plan, left) {
+        (Some(plan), Some(left)) => Some(format!("{plan} · {left}")),
+        (Some(plan), None) => Some(plan.to_string()),
+        (None, Some(left)) => Some(left),
+        (None, None) => None,
+    }
 }
 
 /// "tok 6h52m ↻3m" — expiry countdown plus refreshed-ago marker, mirroring
@@ -366,6 +388,26 @@ server:
             "    3. c@x.com  auth_failed  tok expired \u{21bb}2h"
         );
         assert_eq!(lines[3], "    4. api-1    ready");
+    }
+
+    /// `.prd/25`: the plan sits beside the remaining weekly quota.
+    #[test]
+    fn account_lines_show_the_plan_beside_the_weekly_quota_left() {
+        let doc = serde_json::json!({
+            "accounts": [
+                { "name": "claude:a", "status": "ok", "order": 1, "plan": "max20",
+                  "seven_day": { "utilization": 0.34, "resets_at": 0, "resets_in_secs": 0 } },
+                { "name": "codex:b", "status": "ok", "order": 2, "plan": "promax", "seven_day": null },
+                { "name": "codex:c", "status": "ok", "order": 3,
+                  "seven_day": { "utilization": 1.0, "resets_at": 0, "resets_in_secs": 0 } },
+                { "name": "grok:d", "status": "ok", "order": 4 },
+            ],
+        });
+        let lines = account_lines(&doc, test_now());
+        assert_eq!(lines[0], "    1. claude:a  ready  max20 · 7d 66% left");
+        assert_eq!(lines[1], "    2. codex:b   ready  promax");
+        assert_eq!(lines[2], "    3. codex:c   ready  7d 0% left");
+        assert_eq!(lines[3], "    4. grok:d    ready");
     }
 
     #[test]

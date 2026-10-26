@@ -11,6 +11,7 @@ pub mod internal_requests;
 pub mod keys;
 pub mod logging;
 pub mod login;
+pub mod plans;
 pub mod raw_io;
 pub mod responses;
 pub mod server;

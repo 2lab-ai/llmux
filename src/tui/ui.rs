@@ -6976,7 +6976,11 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
     let first = accounts
         .iter()
         .map(|a| {
-            let mut spans = detail_name_spans(masked_name(&a.id.0, mask), a.credential_kind);
+            let mut spans = detail_name_spans(
+                masked_name(&a.id.0, mask),
+                a.credential_kind,
+                view.plans.get(&a.id.0).map(String::as_str),
+            );
             spans.push(Span::raw(order.clone()));
             Line::from(spans).width() + status
         })
@@ -7785,6 +7789,7 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
     let name = detail_name_spans(
         masked_name(&account.id.0, ctx.mask),
         account.credential_kind,
+        view.plans.get(&account.id.0).map(String::as_str),
     );
     let status = status_span(account, gate, is_current, params, now, ctx.frame);
     let token = detail_token_line(account, view.refresh_ahead, now, ctx.tz_offset);
@@ -7826,15 +7831,23 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
     })
 }
 
-/// ` {id}` bold + ` · {kind}` dim — the detail pane's first line.
-fn detail_name_spans(name: String, kind: &str) -> Vec<Span<'static>> {
-    vec![
+/// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
+/// account's subscription plan (`.prd/25`) — the detail pane's first line.
+fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'static>> {
+    let mut spans = vec![
         Span::styled(
             format!(" {name}"),
             Style::new().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" · {kind}"), dim()),
-    ]
+    ];
+    if let Some(plan) = plan {
+        spans.push(Span::styled(
+            format!(" · {plan}"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    spans
 }
 
 /// ` token {expiry · refreshed · refresh due}`.
@@ -10948,6 +10961,7 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -11736,6 +11750,27 @@ mod tests {
         let frame = render_rows(&view, &chrome, 160, 30).join("\n");
         assert!(frame.contains("3 owned"), "{frame}");
         assert!(frame.contains("0 applicable now"), "{frame}");
+    }
+
+    /// `.prd/25`: the detail pane's first line names the account's plan when
+    /// the daemon knows it, and says nothing when it does not.
+    #[test]
+    fn accounts_detail_pane_names_the_plan() {
+        let mut view = usage_control_view();
+        let codex_pos = view
+            .display_order(Default::default(), SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let codex_idx = view.display_order(Default::default(), SystemTime::now())[codex_pos];
+        let codex_name = view.snapshot.accounts[codex_idx].id.0.clone();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::Select { idx: codex_pos };
+        let before = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(!before.contains("· promax"), "{before}");
+        view.plans.insert(codex_name, "promax".to_string());
+        let after = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(after.contains("· codex · promax"), "{after}");
     }
 
     /// The accounts keybar advertises the two new affordances — and keeps

@@ -23,6 +23,9 @@ pub struct Profile {
     pub org_uuid: Option<String>,
     pub has_claude_max: Option<bool>,
     pub has_claude_pro: Option<bool>,
+    /// `organization.rate_limit_tier` — the exact plan (`default_claude_max_20x`,
+    /// `default_claude_max_5x`, …); `None` when not reported. `.prd/25`.
+    pub rate_limit_tier: Option<String>,
 }
 
 /// Fetch the profile for one oauth account (Bearer auth against the
@@ -72,6 +75,8 @@ struct ProfileOrganization {
     name: Option<String>,
     #[serde(default)]
     uuid: Option<String>,
+    #[serde(default)]
+    rate_limit_tier: Option<String>,
 }
 
 /// Pure parse of the profile JSON body (test seam).
@@ -100,6 +105,10 @@ fn parse_profile(body: &str) -> Result<Profile, AuthError> {
         org_uuid: parsed.organization.uuid.filter(|u| !u.is_empty()),
         has_claude_max: account.has_claude_max,
         has_claude_pro: account.has_claude_pro,
+        rate_limit_tier: parsed
+            .organization
+            .rate_limit_tier
+            .filter(|t| !t.trim().is_empty()),
     })
 }
 
@@ -124,6 +133,28 @@ mod tests {
         assert_eq!(profile.org_name.as_deref(), Some("Org A"));
         assert_eq!(profile.has_claude_max, Some(true));
         assert_eq!(profile.has_claude_pro, Some(false));
+        assert_eq!(profile.rate_limit_tier, None);
+    }
+
+    /// `.prd/25`: the exact plan rides on `organization.rate_limit_tier`
+    /// (live shape measured 2026-10-26, Max x20 accounts).
+    #[test]
+    fn parse_profile_reads_the_organization_rate_limit_tier() {
+        let body = r#"{
+            "account": { "uuid": "u-3", "email": "c@x.com", "has_claude_max": true },
+            "organization": {
+                "name": "Org C", "uuid": "o-3", "organization_type": "claude_max",
+                "rate_limit_tier": "default_claude_max_20x", "billing_type": "stripe_subscription"
+            }
+        }"#;
+        let profile = parse_profile(body).unwrap();
+        assert_eq!(
+            profile.rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x")
+        );
+        let blank =
+            r#"{"account":{"uuid":"u","email":"e"},"organization":{"rate_limit_tier":" "}}"#;
+        assert_eq!(parse_profile(blank).unwrap().rate_limit_tier, None);
     }
 
     #[test]
