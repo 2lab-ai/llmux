@@ -8340,6 +8340,7 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
