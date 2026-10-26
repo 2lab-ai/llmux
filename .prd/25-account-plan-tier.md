@@ -44,8 +44,10 @@ Claude pool as uncountable.
 ## Contract
 
 - **Claude:** a background task fetches `/api/oauth/profile` for each oauth account whose access
-  token is valid, once at daemon start (off the readiness path) and every 6 h after. A failed or
-  incomplete fetch keeps the last known plan; it never clears it.
+  token is valid (more than 60 s left; an expired or unknown-expiry token is never sent), once at
+  daemon start (off the readiness path), then every 10 minutes while any Claude or Codex account
+  still has no plan (expired token at start, failed read, fresh login), and every 6 h once all are
+  known. A failed or incomplete fetch keeps the last known plan; it never clears it.
 - **Codex:** the plan is read from the access token's claim whenever the pass runs, so a token
   refresh that changes the plan is picked up on the next pass. No signature check — the value is
   display-only and comes from the token llmux already holds.

@@ -1263,18 +1263,26 @@ pub async fn serve(
         });
 
     // Background: subscription plan per account (`.prd/25`) — first pass right
-    // away (off the readiness path), then every PLAN_TICK. Display data only.
+    // away (off the readiness path), then PLAN_RETRY while a plan is missing,
+    // PLAN_TICK once all are known. Display data only.
     let plan_state = state.clone();
     let plan_task = tokio::spawn(async move {
         loop {
-            super::plans::refresh_plans(
+            let missing = super::plans::refresh_plans(
                 &plan_state.plans,
                 &plan_state.pool,
                 &plan_state.client,
                 &plan_state.config.upstream,
             )
             .await;
-            tokio::time::sleep(super::plans::PLAN_TICK).await;
+            // Review P1: an account still without a plan (expired token at
+            // start, failed read, fresh login) is retried soon, not in 6 h.
+            let next = if missing > 0 {
+                super::plans::PLAN_RETRY
+            } else {
+                super::plans::PLAN_TICK
+            };
+            tokio::time::sleep(next).await;
         }
     });
 
