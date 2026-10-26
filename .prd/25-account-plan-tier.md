@@ -1,6 +1,7 @@
 # Account plan tier — llmux reports each account's subscription plan
 
-Status: in-progress (2026-10-26)
+Status: **shipped** — v0.2.26 (PR #219 `b8e490f`; stable v0.2.26 + preview-2026-10-26-1105-b8e490ffdfd3), 2026-10-26.
+This document records the implemented contract, not a future target.
 
 ## Problem
 
@@ -65,3 +66,10 @@ Claude pool as uncountable.
 | profile fetch fails | previous plan kept; never-known stays absent |
 | `llmux status` | each line shows `<plan>` and `7d <N>% left` |
 | TUI detail pane | first line ` <name> · <kind> · <plan>` |
+
+## Observed on deployment (2026-10-26)
+
+- Two daemons upgraded to 0.2.26: every Claude Max account reads `max20 · 7d N% left`; Codex `pro` /
+  `promax` match the operator's own plan list. One Claude account reports
+  `rate_limit_tier = default_raven` — not a Max plan — so it carries no label (no guessing), exactly
+  as the contract says; consumers see the raw value.
