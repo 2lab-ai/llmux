@@ -1,6 +1,6 @@
 # Account plan tier — SSOT
 
-Status: in-progress
+Status: shipped (v0.2.26, 2026-10-26)
 Date: 2026-10-26
 
 ## User instruction (verbatim, 2026-10-26)
