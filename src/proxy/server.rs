@@ -400,6 +400,9 @@ pub struct AppState {
     /// Serialized additively onto the dashboard document; NEVER persisted into
     /// credentials.
     pub usage_controls: Arc<super::usage_controls::UsageControlStore>,
+    /// Daemon-learned subscription plan per account (`.prd/25`), read by
+    /// `/llmux/status` and the dashboard document. Display data only.
+    pub plans: Arc<super::plans::PlanStore>,
     /// Where pending-redemption receipts are written before the irreversible
     /// consume POST (state dir `usage-resets.json`, atomic replace). `None`
     /// disables redemption entirely — an unrecorded redemption could be
@@ -529,6 +532,7 @@ impl AppState {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             logins: Arc::new(super::login::LoginRegistry::default()),
             usage_controls: Arc::new(super::usage_controls::UsageControlStore::default()),
+            plans: Arc::new(super::plans::PlanStore::default()),
             // `<state dir>/usage-resets.json`, derived from the activity log's
             // own resolved path so the XDG rule lives in ONE place
             // (`cli::daemon::state_dir`, which this crate does not re-implement).
@@ -1258,6 +1262,30 @@ pub async fn serve(
             })
         });
 
+    // Background: subscription plan per account (`.prd/25`) — first pass right
+    // away (off the readiness path), then PLAN_RETRY while a plan is missing,
+    // PLAN_TICK once all are known. Display data only.
+    let plan_state = state.clone();
+    let plan_task = tokio::spawn(async move {
+        loop {
+            let missing = super::plans::refresh_plans(
+                &plan_state.plans,
+                &plan_state.pool,
+                &plan_state.client,
+                &plan_state.config.upstream,
+            )
+            .await;
+            // Review P1: an account still without a plan (expired token at
+            // start, failed read, fresh login) is retried soon, not in 6 h.
+            let next = if missing > 0 {
+                super::plans::PLAN_RETRY
+            } else {
+                super::plans::PLAN_TICK
+            };
+            tokio::time::sleep(next).await;
+        }
+    });
+
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
     let tick_routing_enabled = state.config.routing.enabled;
@@ -1432,6 +1460,7 @@ pub async fn serve(
         abortable: [
             Some(poller_task.abort_handle()),
             Some(tick_task.abort_handle()),
+            Some(plan_task.abort_handle()),
             sweep_task
                 .as_ref()
                 .map(tokio::task::JoinHandle::abort_handle),
@@ -2195,6 +2224,9 @@ pub struct ServerMeta {
     /// per-account OPTIONAL — an absent entry means "never observed", never
     /// zero. Not `Copy` because of this map; every caller passes `&ServerMeta`.
     pub usage_controls: HashMap<String, crate::proxy::usage_controls::UsageControlDoc>,
+    /// Daemon-learned subscription plan by account name (`.prd/25`). Additive
+    /// and per-account OPTIONAL — absent = not (yet) known.
+    pub plans: HashMap<String, crate::proxy::plans::AccountPlan>,
 }
 
 /// Serializable `/llmux/status` document — pure function of a pool
@@ -2246,6 +2278,7 @@ pub fn status_json(
                         },
                     );
                 let lifetime = totals.get(&account.id);
+                let plan = meta.plans.get(&account.id.0);
                 serde_json::json!({
                     "name": account.id.0,
                     "type": account.credential_kind,
@@ -2274,6 +2307,12 @@ pub fn status_json(
                     // Daemon-owned usage-control metadata (additive; null when
                     // this account has never been refreshed / has no controls).
                     "usage_control": meta.usage_controls.get(&account.id.0),
+                    // Subscription plan (`.prd/25`, additive; null when not
+                    // known): a short label plus the upstream value verbatim —
+                    // Claude `rate_limit_tier`, Codex `plan_type`.
+                    "plan": plan.and_then(|p| p.label.clone()),
+                    "rate_limit_tier": plan.and_then(|p| p.rate_limit_tier.clone()),
+                    "plan_type": plan.and_then(|p| p.plan_type.clone()),
                     "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                     "in_flight": account.in_flight,
                     // Token health (additive): expiry + last refresh, epoch
@@ -2322,6 +2361,7 @@ async fn status(State(state): State<AppState>) -> Response {
         port: state.bound_port.load(Ordering::Relaxed),
         email_anonymous: state.email_anonymous.load(Ordering::Relaxed),
         usage_controls: state.usage_controls.all(),
+        plans: state.plans.all(),
     };
     let body = status_json(
         &state.pool.snapshot(),
@@ -4153,6 +4193,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
 
@@ -4226,6 +4267,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
         let accounts = doc["accounts"].as_array().expect("accounts array");
@@ -4278,6 +4320,50 @@ mod tests {
             .is_empty());
     }
 
+    /// `.prd/25`: the daemon-learned plan reaches `/llmux/status` additively —
+    /// a short label plus the upstream value verbatim; null when unknown.
+    #[test]
+    fn status_json_reports_each_accounts_plan() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_783_000_000);
+        let pool = AccountPool::new(&[oauth_account("dev1"), oauth_account("plain")]);
+        pool.evaluate(None, &params(), now);
+        let mut plans = HashMap::new();
+        plans.insert(
+            "dev1".to_string(),
+            crate::proxy::plans::AccountPlan::claude("default_claude_max_20x"),
+        );
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 1,
+            port: 3456,
+            email_anonymous: false,
+            usage_controls: Default::default(),
+            plans,
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        let accounts = doc["accounts"].as_array().expect("accounts array");
+        let by = |name: &str| {
+            accounts
+                .iter()
+                .find(|a| a["name"] == name)
+                .expect(name)
+                .clone()
+        };
+        let dev1 = by("dev1");
+        assert_eq!(dev1["plan"], "max20");
+        assert_eq!(dev1["rate_limit_tier"], "default_claude_max_20x");
+        assert_eq!(dev1["plan_type"], serde_json::Value::Null);
+        let plain = by("plain");
+        assert_eq!(plain["plan"], serde_json::Value::Null);
+        assert_eq!(plain["rate_limit_tier"], serde_json::Value::Null);
+    }
+
     #[test]
     fn status_json_tags_codex_accounts_with_codex_group() {
         // A codex credential lands in the "codex" backend group; oauth/apikey
@@ -4292,6 +4378,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4327,6 +4414,7 @@ mod tests {
             port: 0,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4359,6 +4447,7 @@ mod tests {
             port: 0,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4425,6 +4514,7 @@ mod tests {
                 port: 0,
                 email_anonymous: false,
                 usage_controls: Default::default(),
+                plans: Default::default(),
             },
         );
         let names: Vec<&str> = doc["accounts"]
@@ -5468,6 +5558,7 @@ mod tests {
                 port: 0,
                 email_anonymous: true,
                 usage_controls: Default::default(),
+                plans: Default::default(),
             },
         );
         assert_eq!(doc["email_anonymous"], true);

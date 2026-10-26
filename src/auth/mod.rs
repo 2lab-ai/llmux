@@ -11,6 +11,7 @@ pub mod grok;
 pub mod grok_usage;
 pub mod oauth;
 pub mod openrouter;
+pub mod plan;
 pub mod profile;
 
 #[derive(Debug, thiserror::Error)]
