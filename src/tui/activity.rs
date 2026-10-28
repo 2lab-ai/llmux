@@ -2891,6 +2891,7 @@ mod tests {
         log.apply(
             ActivityEvent::UsagePolled {
                 account: "a".into(),
+                generation: 0,
                 ok: true,
                 consecutive_failures: 0,
                 next_in: Duration::from_secs(300),
