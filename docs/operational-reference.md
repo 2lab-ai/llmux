@@ -265,14 +265,19 @@ The account detail modal now keeps a scrollable **authentication / usage history
 Click an account row, or press `h` on MAIN / the accounts tab (in the switcher,
 `h` targets the highlighted account). Each receipt shows an absolute local time,
 request source, HTTP status when observed, safe OAuth reason, resulting auth
-state, and usage retry deadline / consecutive failures. The compact detail pane
+state, and usage retry deadline / consecutive failures. The expanded detail pane (including MAIN)
 prioritizes the last permanent auth reason over a later usage-poll error.
 
 `! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
 account; the history distinguishes an OAuth `invalid_grant` from other failures.
 `! auth X` means no HTTP status was available — it does not prove credentials
 were deleted. Usage HTTP 429 means a rate-limited gauge read and does not revoke
-authentication. The reset row's `last error` belongs to the separate combined
+authentication. A Claude usage 403 is recorded as an exclusion only when the
+credential guard applied it; Grok and Gemini usage reads remain informational.
+Responses discarded after token rotation change neither poll health nor backoff.
+A missing Gemini project records `skipped`, with no HTTP status or successful
+poll timestamp, because no usage request was sent. The reset row's `last error`
+belongs to the separate combined
 usage/reset-inventory read; it is not the token-refresh error. After a request
 401, a transient refresh outage (429/5xx/network) now returns retryable 502 and
 keeps auth eligible; permanent refresh rejection or a second request 401 still

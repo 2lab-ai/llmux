@@ -7330,13 +7330,14 @@ fn draw_band(
         .zip(geometry.starts.iter().copied())
         .map(|(line, start)| (start, line))
         .collect();
-    if rows > right.len() {
-        if let Some(reset) = detail.reset.clone() {
-            let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
-            let start = geometry.start(left_w, reset.width(), width);
-            if start + reset.width() <= width {
-                right.push((start, reset));
-            }
+    for extra in detail.auth.iter().chain(detail.reset.iter()) {
+        if rows <= right.len() {
+            break;
+        }
+        let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
+        let start = geometry.start(left_w, extra.width(), width);
+        if start + extra.width() <= width {
+            right.push((start, extra.clone()));
         }
     }
     for row in 0..rows {
@@ -20361,6 +20362,34 @@ mod tests {
         );
         assert_each_member_shows_its_status(&rows, &frame);
     }
+    #[test]
+    fn usage_history_failure_summary_visible_in_expanded_main_band() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.middle = Some(11);
+        let width = band_bound(&view, &chrome).max(240);
+        let body = render_rows(&view, &chrome, width, 60).join("\n");
+        assert!(body.contains("last failure"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("HTTP 400"), "{body}");
+        println!("{body}");
+    }
+
     #[test]
     fn account_history_is_visible_in_scrollable_real_render() {
         let (mut view, name) = rich_account_view();
