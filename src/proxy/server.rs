@@ -634,6 +634,33 @@ impl AppState {
         self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Apply and explain an account exclusion, guarded by the request's credential.
+    pub(crate) fn record_auth_failure(
+        &self,
+        account: &AccountId,
+        expected: &crate::scheduler::AccountFingerprint,
+        status: Option<http::StatusCode>,
+        reason: &str,
+    ) -> bool {
+        let applied = self.pool.record_auth_failure_if(account, expected, status);
+        self.hub
+            .account_history
+            .record(crate::account_history::AccountEvent::new(
+                &account.0,
+                "auth_state",
+                if applied { "excluded" } else { "discarded" },
+                status.map(|s| s.as_u16()),
+                reason,
+                if applied {
+                    "account excluded (auth_failed); re-login required"
+                } else {
+                    "retired credential; current login unchanged"
+                },
+                SystemTime::now(),
+            ));
+        applied
+    }
+
     /// Emit an activity event: `try_send`, dropped on a full channel.
     pub fn emit(&self, event: ActivityEvent) {
         if let Some(events) = &self.events {
@@ -1041,7 +1068,28 @@ impl AppState {
                 .map(|idx| c.accounts[idx].name.clone())
                 .unwrap_or(probe.name);
         })?;
+        let previous = self.pool.fingerprint(&AccountId(name.clone()));
         self.apply_roster(&merged);
+        let replaced = self.pool.fingerprint(&AccountId(name.clone())) != previous;
+        if let Some(fingerprint) = self.pool.fingerprint(&AccountId(name.clone())) {
+            self.hub
+                .reset_poll_health(&name, fingerprint.generation, SystemTime::now());
+        }
+        self.hub
+            .account_history
+            .record(crate::account_history::AccountEvent::new(
+                &name,
+                "registration",
+                "success",
+                None,
+                "credentials installed by login/import",
+                if replaced {
+                    "new login; fresh usage scheduled (global throttle applies)"
+                } else {
+                    "unchanged credentials; existing auth/usage state retained"
+                },
+                SystemTime::now(),
+            ));
         // Names/kinds are not credentials; no token reaches a log line.
         tracing::info!(account = %name, kind, action = ?outcome, "account injected");
         Ok((name, outcome))
@@ -1124,6 +1172,15 @@ pub async fn serve(
     // a background task spawned after the listener is ready, so a big history
     // can no longer delay startup ("serve first, hydrate later").
     let hydrate_cut = state.hub.arm_persistence(state.activity_log_path.clone());
+    if let Some(path) = state
+        .activity_log_path
+        .as_ref()
+        .map(|p| p.with_file_name("account-history.json"))
+    {
+        if let Err(err) = state.hub.account_history.arm(path) {
+            tracing::warn!(error = %err, "account history persistence unavailable");
+        }
+    }
 
     // Arm the durable keys-usage store (`docs/keys-history/spec.md` K). Its
     // location is derived from THIS state's `config_path` (never from the
@@ -1199,7 +1256,8 @@ pub async fn serve(
     // persisted to THIS state's config file, so usage shows up for an
     // operator who never sends a model request.
     .with_gemini_projects(state.client.clone(), state.config_path.clone())
-    .with_events(state.events.clone());
+    .with_events(state.events.clone())
+    .with_hub(state.hub.clone());
     poller.prime(SystemTime::now()).await;
 
     // Initial selection so the first request doesn't pay for it. Evaluate
@@ -1657,7 +1715,15 @@ pub async fn background_refresh_pass(state: &AppState) {
     let Some((account_id, credential, fingerprint, _)) = candidate else {
         return;
     };
-    match forward::refresh_credential(state, &account_id, &credential, &fingerprint).await {
+    match forward::refresh_credential(
+        state,
+        &account_id,
+        &credential,
+        &fingerprint,
+        "background_refresh",
+    )
+    .await
+    {
         forward::RefreshOutcome::Refreshed(fresh) => {
             if let AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. }
@@ -1674,10 +1740,12 @@ pub async fn background_refresh_pass(state: &AppState) {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
-            if state
-                .pool
-                .record_auth_failure_if(&account_id, &fingerprint, Some(status))
-            {
+            if state.record_auth_failure(
+                &account_id,
+                &fingerprint,
+                Some(status),
+                "background refresh permanently rejected",
+            ) {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
                     message: format!(

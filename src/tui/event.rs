@@ -211,6 +211,8 @@ pub enum ActivityEvent {
     /// dashboard's poller-health pane (last success age, backoff, next ETA).
     UsagePolled {
         account: String,
+        /// Roster generation; stale completions cannot degrade a new login.
+        generation: u64,
         /// Whether this attempt succeeded.
         ok: bool,
         /// Consecutive failures so far (0 after a success).

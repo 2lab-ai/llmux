@@ -47,12 +47,14 @@ pub const RPM_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// discipline as the scheduler pool.
 pub struct DashboardHub {
     inner: Mutex<HubState>,
+    pub account_history: crate::account_history::AccountHistory,
 }
 
 struct HubState {
     log: ActivityLog,
     last_switch: Option<LastSwitch>,
     poll_health: HashMap<String, PollHealth>,
+    poll_generations: HashMap<String, u64>,
     console: LogConsole,
     /// Where finished requests are appended (req-persist A/C). `None` until the
     /// daemon arms persistence in [`DashboardHub::load_from_state_dir`]; left
@@ -78,10 +80,12 @@ impl Default for DashboardHub {
                 log: ActivityLog::new(crate::tui::activity::LOG_CAPACITY),
                 last_switch: None,
                 poll_health: HashMap::new(),
+                poll_generations: HashMap::new(),
                 console: LogConsole::new(crate::tui::logs::LOG_CONSOLE_CAPACITY),
                 persist_path: None,
                 usage_store: None,
             }),
+            account_history: crate::account_history::AccountHistory::default(),
         }
     }
 }
@@ -183,6 +187,28 @@ impl DashboardHub {
         self.lock().usage_store.clone()
     }
 
+    pub fn reset_poll_health(&self, account: &str, generation: u64, now: SystemTime) {
+        let mut state = self.lock();
+        if state
+            .poll_generations
+            .get(account)
+            .is_some_and(|old| *old >= generation)
+        {
+            return;
+        }
+        state
+            .poll_generations
+            .insert(account.to_string(), generation);
+        state.poll_health.insert(
+            account.to_string(),
+            PollHealth {
+                last_ok: None,
+                consecutive_failures: 0,
+                next_at: now,
+            },
+        );
+    }
+
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
     /// state, then the activity log itself.
     pub fn apply_event(&self, event: ActivityEvent, now: SystemTime) {
@@ -198,10 +224,19 @@ impl DashboardHub {
             }
             ActivityEvent::UsagePolled {
                 account,
+                generation,
                 ok,
                 consecutive_failures,
                 next_in,
             } => {
+                if state
+                    .poll_generations
+                    .get(account)
+                    .is_some_and(|current| generation < current)
+                {
+                    return;
+                }
+                state.poll_generations.insert(account.clone(), *generation);
                 let entry = state
                     .poll_health
                     .entry(account.clone())
@@ -258,6 +293,7 @@ impl DashboardHub {
         HubView {
             last_switch: state.last_switch.clone(),
             poll_health: state.poll_health.clone(),
+            account_history: self.account_history.snapshot(),
             health: state.log.health_counts(now),
             in_flight: state.log.in_flight().to_vec(),
             completed: state.log.completed().take(ACTIVITY_TAIL).cloned().collect(),
@@ -286,6 +322,7 @@ impl DashboardHub {
 pub(crate) struct HubView {
     pub last_switch: Option<LastSwitch>,
     pub poll_health: HashMap<String, PollHealth>,
+    pub account_history: HashMap<String, Vec<crate::account_history::AccountEvent>>,
     /// Rolling 5-minute status-class counts for the header health verdict
     /// (glance-triage). From the log's dedicated sample deque, NOT the
     /// capacity-bounded completed ring.
@@ -478,6 +515,7 @@ fn trace_event(event: &ActivityEvent) {
         }
         ActivityEvent::UsagePolled {
             account,
+            generation: _,
             ok,
             consecutive_failures,
             next_in,
@@ -994,6 +1032,9 @@ pub struct AccountDoc {
     /// not (yet) known and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<crate::proxy::plans::AccountPlan>,
+    /// Newest-first, bounded, safe lifecycle receipts; absent on older daemons.
+    #[serde(default)]
+    pub auth_history: Vec<crate::account_history::AccountEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1804,6 +1845,11 @@ pub(crate) fn dashboard_doc(
                 },
                 usage_control: meta.usage_controls.get(&account.id.0).cloned(),
                 plan: meta.plans.get(&account.id.0).cloned(),
+                auth_history: hub
+                    .account_history
+                    .get(&account.id.0)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -2480,6 +2526,7 @@ mod tests {
         hub.apply_event(
             ActivityEvent::UsagePolled {
                 account: "a".into(),
+                generation: 0,
                 ok: true,
                 consecutive_failures: 0,
                 next_in: Duration::from_secs(300),
@@ -3790,5 +3837,37 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn queued_old_poll_verdict_cannot_redegrade_relogin() {
+        let hub = DashboardHub::default();
+        hub.reset_poll_health("a", 2, now());
+        hub.apply_event(
+            ActivityEvent::UsagePolled {
+                account: "a".into(),
+                generation: 1,
+                ok: false,
+                consecutive_failures: 32,
+                next_in: Duration::from_secs(900),
+            },
+            now(),
+        );
+        let view = hub.view(now());
+        assert_eq!(view.poll_health["a"].consecutive_failures, 0);
+        assert_eq!(
+            view.poll_health["a"].last_ok, None,
+            "pending is not a fabricated successful read"
+        );
+        hub.apply_event(
+            ActivityEvent::UsagePolled {
+                account: "a".into(),
+                generation: 2,
+                ok: false,
+                consecutive_failures: 1,
+                next_in: Duration::from_secs(120),
+            },
+            now(),
+        );
+        assert_eq!(hub.view(now()).poll_health["a"].consecutive_failures, 1);
     }
 }

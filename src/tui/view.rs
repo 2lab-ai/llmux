@@ -137,6 +137,7 @@ pub(crate) struct DashboardView {
     /// Subscription plan label per account name (`.prd/25`), carried on the
     /// document. An account with no entry has no known plan.
     pub plans: std::collections::BTreeMap<String, String>,
+    pub auth_history: std::collections::BTreeMap<String, Vec<crate::account_history::AccountEvent>>,
     /// Rolling 5-minute status-class counts for the header health verdict
     /// (glance-triage), carried on the document. `None` from an older daemon
     /// = no telemetry: the verdict skips storm detection and renders the err
@@ -483,6 +484,11 @@ impl DashboardView {
                         .as_ref()
                         .map(|control| (a.name.clone(), control.clone()))
                 })
+                .collect(),
+            auth_history: doc
+                .accounts
+                .iter()
+                .map(|a| (a.name.clone(), a.auth_history.clone()))
                 .collect(),
             plans: doc
                 .accounts
@@ -1496,5 +1502,28 @@ mod tests {
             assert!(matches!(&view.completed[0].body,
                 CompletedBody::Request { endpoint, .. } if *endpoint == expected));
         }
+    }
+    #[test]
+    fn auth_history_survives_wire_and_old_documents_default_unknown() {
+        let old: DashboardDoc = serde_json::from_value(doc_json()).unwrap();
+        assert!(DashboardView::from_doc(&old).auth_history["a"].is_empty());
+        let event = crate::account_history::AccountEvent::new(
+            "a",
+            "background_refresh",
+            "permanent_failure",
+            Some(400),
+            "invalid_grant: refresh token expired",
+            "auth_failed",
+            now(),
+        );
+        let mut json = doc_json();
+        json["accounts"][0]["auth_history"] = serde_json::to_value(vec![event.clone()]).unwrap();
+        let wire: DashboardDoc = serde_json::from_value(json).unwrap();
+        let wire: DashboardDoc =
+            serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(
+            DashboardView::from_doc(&wire).auth_history["a"],
+            vec![event]
+        );
     }
 }

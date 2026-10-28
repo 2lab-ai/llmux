@@ -378,6 +378,8 @@ struct GeminiProjects {
 struct PollSchedule {
     next_at: SystemTime,
     consecutive_failures: u32,
+    generation: u64,
+    fresh_login: bool,
 }
 
 /// Background poller: polls every account that HAS a usage source (anthropic
@@ -413,6 +415,7 @@ pub struct UsagePoller<F = ReqwestFetcher> {
     /// Best-effort poller-health feed to the dashboard (`try_send`, dropped
     /// on a full channel — same contract as every activity sender).
     events: Option<tokio::sync::mpsc::Sender<crate::tui::ActivityEvent>>,
+    hub: Option<std::sync::Arc<crate::dashboard::DashboardHub>>,
 }
 
 impl UsagePoller<ReqwestFetcher> {
@@ -455,6 +458,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
             schedule: HashMap::new(),
             last_poll_at: None,
             events: None,
+            hub: None,
         }
     }
 
@@ -465,6 +469,11 @@ impl<F: UsageFetcher> UsagePoller<F> {
         events: Option<tokio::sync::mpsc::Sender<crate::tui::ActivityEvent>>,
     ) -> Self {
         self.events = events;
+        self
+    }
+
+    pub fn with_hub(mut self, hub: std::sync::Arc<crate::dashboard::DashboardHub>) -> Self {
+        self.hub = Some(hub);
         self
     }
 
@@ -516,10 +525,29 @@ impl<F: UsageFetcher> UsagePoller<F> {
             .collect();
         self.schedule.retain(|id, _| pollable.contains(id));
         for id in &pollable {
-            self.schedule.entry(id.clone()).or_insert(PollSchedule {
-                next_at: now,
-                consecutive_failures: 0,
-            });
+            let Some(fingerprint) = self.pool.fingerprint(id) else {
+                continue;
+            };
+            // Roster replacement changes generation; ordinary token rotation
+            // deliberately does not. A new login must not inherit old backoff.
+            if self
+                .schedule
+                .get(id)
+                .is_none_or(|e| e.generation != fingerprint.generation)
+            {
+                self.schedule.insert(
+                    id.clone(),
+                    PollSchedule {
+                        next_at: now,
+                        consecutive_failures: 0,
+                        generation: fingerprint.generation,
+                        fresh_login: true,
+                    },
+                );
+                if let Some(hub) = &self.hub {
+                    hub.reset_poll_health(&id.0, fingerprint.generation, now);
+                }
+            }
         }
         pollable
     }
@@ -533,8 +561,38 @@ impl<F: UsageFetcher> UsagePoller<F> {
         now: SystemTime,
         resolve_projects: bool,
     ) {
+        let Some(expected) = self.pool.fingerprint(&id) else {
+            return;
+        };
         let prev_failures = self.schedule.get(&id).map_or(0, |e| e.consecutive_failures);
-        let failures = match self.poll(&id, now, resolve_projects).await {
+        let outcome = self.poll(&id, now, resolve_projects).await;
+        // The pool already discards old windows/auth verdicts; the scheduling
+        // and dashboard verdict must discard that same retired observation.
+        if self
+            .pool
+            .fingerprint(&id)
+            .is_none_or(|current| current.generation != expected.generation)
+        {
+            if let Some(hub) = &self.hub {
+                hub.account_history
+                    .record(crate::account_history::AccountEvent::new(
+                        &id.0,
+                        "usage_poll",
+                        "discarded",
+                        match &outcome {
+                            Err(UsageError::Status { status }) => Some(status.as_u16()),
+                            Ok(()) => Some(200),
+                            _ => None,
+                        },
+                        "usage response belongs to retired credentials",
+                        "new login and backoff unchanged",
+                        now,
+                    ));
+            }
+            self.refresh_schedule(now);
+            return;
+        }
+        let failures = match &outcome {
             Ok(()) => 0,
             Err(err) => {
                 tracing::warn!(account = %id, error = %err, "usage poll failed");
@@ -542,9 +600,47 @@ impl<F: UsageFetcher> UsagePoller<F> {
             }
         };
         let delay = jittered(self.backoff_delay(failures), &id, now);
+        if let Some(hub) = &self.hub {
+            let (status, reason) = match &outcome {
+                Ok(()) => (Some(200), "usage snapshot received"),
+                Err(UsageError::Status { status }) => (
+                    Some(status.as_u16()),
+                    match status.as_u16() {
+                        401 => "access token rejected; token refresh owns recovery",
+                        403 => "usage endpoint forbidden; account excluded by usage policy",
+                        429 => "usage endpoint rate limited; authentication unchanged",
+                        _ => "usage endpoint error; authentication unchanged",
+                    },
+                ),
+                Err(UsageError::Parse(_)) => (None, "usage response could not be parsed"),
+                Err(_) => (None, "usage transport/provider read failed"),
+            };
+            hub.account_history.record(
+                crate::account_history::AccountEvent::new(
+                    &id.0,
+                    "usage_poll",
+                    if failures == 0 { "success" } else { "failed" },
+                    status,
+                    reason,
+                    if status == Some(403)
+                        && self
+                            .pool
+                            .credential(&id)
+                            .is_some_and(|c| c.kind() == "oauth")
+                    {
+                        "auth_failed"
+                    } else {
+                        "auth unchanged"
+                    },
+                    now,
+                )
+                .with_retry(now + delay, failures),
+            );
+        }
         if let Some(events) = &self.events {
             let _ = events.try_send(crate::tui::ActivityEvent::UsagePolled {
                 account: id.0.clone(),
+                generation: expected.generation,
                 ok: failures == 0,
                 consecutive_failures: failures,
                 next_in: delay,
@@ -555,6 +651,8 @@ impl<F: UsageFetcher> UsagePoller<F> {
             PollSchedule {
                 next_at: now + delay,
                 consecutive_failures: failures,
+                generation: expected.generation,
+                fresh_login: false,
             },
         );
     }
@@ -598,7 +696,12 @@ impl<F: UsageFetcher> UsagePoller<F> {
         let Some(id) = pollable
             .iter()
             .filter(|id| self.schedule.get(*id).is_some_and(|e| e.next_at <= now))
-            .min_by_key(|id| self.schedule.get(*id).map(|e| e.next_at).unwrap_or(now))
+            .min_by_key(|id| {
+                self.schedule
+                    .get(*id)
+                    .map(|e| (!e.fresh_login, e.next_at))
+                    .unwrap_or((true, now))
+            })
             .cloned()
         else {
             return;
@@ -1218,6 +1321,118 @@ mod tests {
     // ---- poll loop behavior (mock fetcher, no network, no sleeps) ----
 
     #[tokio::test]
+    async fn relogin_retries_usage_without_inheriting_backoff() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = MockFetcher::new(vec![Err(status_err(429)), Ok(snapshot_with(0.42))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        assert_eq!(poller.schedule[&id("a")].consecutive_failures, 1);
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "at-relogin".into();
+        }
+        pool.reload_accounts(&[fresh]);
+        poller.tick(now() + MIN_POLL_GAP).await;
+        assert_eq!(
+            fetcher.call_count(),
+            2,
+            "new login must not wait out old 429 backoff"
+        );
+        assert_eq!(poller.schedule[&id("a")].consecutive_failures, 0);
+        assert_eq!(
+            pool.snapshot().accounts[0].five_hour.unwrap().utilization,
+            0.42
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_token_rotation_preserves_usage_backoff() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = MockFetcher::new(vec![Err(status_err(429))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        let due = poller.schedule[&id("a")].next_at;
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "rotated".into();
+        }
+        pool.update_credential(&id("a"), fresh.credential);
+        poller.tick(now() + MIN_POLL_GAP).await;
+        assert_eq!(
+            fetcher.call_count(),
+            1,
+            "ordinary refresh must not bypass 429 pacing"
+        );
+        assert_eq!(poller.schedule[&id("a")].next_at, due);
+        assert_eq!(poller.schedule[&id("a")].consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn relogin_fresh_poll_failure_starts_new_backoff_not_fake_success() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = MockFetcher::new(vec![Err(status_err(429)), Err(status_err(429))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "new-login".into();
+        }
+        pool.reload_accounts(&[fresh]);
+        poller.tick(now() + MIN_POLL_GAP).await;
+        assert_eq!(fetcher.call_count(), 2);
+        assert_eq!(poller.schedule[&id("a")].consecutive_failures, 1);
+        assert!(pool.snapshot().accounts[0].five_hour.is_none());
+        assert!(
+            pool.snapshot().accounts[0].healthy,
+            "429 does not revoke auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_login_is_next_even_when_other_accounts_are_overdue() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        let fetcher = MockFetcher::new(vec![]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.prime(now()).await;
+        poller.schedule.get_mut(&id("a")).unwrap().next_at = now() - Duration::from_secs(60);
+        let mut b = oauth_account("b");
+        if let AccountCredential::Oauth { access_token, .. } = &mut b.credential {
+            *access_token = "new-b".into();
+        }
+        pool.reload_accounts(&[oauth_account("a"), b]);
+        poller.tick(now() + MIN_POLL_GAP).await;
+        assert_eq!(
+            fetcher.calls.lock().unwrap().last().unwrap(),
+            "new-b",
+            "fresh login is queued ahead of old overdue polls, without bypassing global pacing"
+        );
+    }
+
+    #[tokio::test]
     async fn successful_poll_records_usage_into_pool() {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let fetcher = MockFetcher::new(vec![Ok(snapshot_with(0.42))]);
@@ -1396,6 +1611,36 @@ mod tests {
             let result = self.relogin();
             async move { result }
         }
+    }
+
+    #[tokio::test]
+    async fn retired_poll_cannot_redegrade_or_backoff_new_login() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = ReloginFetcher {
+            pool: pool.clone(),
+            result: Mutex::new(Some(Err(status_err(403)))),
+        };
+        let hub = std::sync::Arc::new(crate::dashboard::DashboardHub::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        )
+        .with_events(Some(tx))
+        .with_hub(hub.clone());
+        poller.tick(now()).await;
+        assert_eq!(poller.schedule[&id("a")].consecutive_failures, 0);
+        assert_eq!(poller.schedule[&id("a")].next_at, now());
+        assert!(
+            rx.try_recv().is_err(),
+            "no stale UsagePolled verdict is enqueued"
+        );
+        assert_eq!(hub.view(now()).poll_health["a"].consecutive_failures, 0);
+        assert_eq!(hub.account_history.snapshot()["a"][0].outcome, "discarded");
+        assert!(pool.snapshot().accounts[0].healthy);
     }
 
     /// B4: a 403 earned by the credential the re-login retired must not bench

@@ -259,12 +259,48 @@ llmux channel stable
 
 `llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
+### Account authentication and usage history (preview)
+
+The account detail modal now keeps a scrollable **authentication / usage history**.
+Click an account row, or press `h` on MAIN / the accounts tab (in the switcher,
+`h` targets the highlighted account). Each receipt shows an absolute local time,
+request source, HTTP status when observed, safe OAuth reason, resulting auth
+state, and usage retry deadline / consecutive failures. The compact detail pane
+prioritizes the last permanent auth reason over a later usage-poll error.
+
+`! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
+account; the history distinguishes an OAuth `invalid_grant` from other failures.
+`! auth X` means no HTTP status was available — it does not prove credentials
+were deleted. Usage HTTP 429 means a rate-limited gauge read and does not revoke
+authentication. The reset row's `last error` belongs to the separate combined
+usage/reset-inventory read; it is not the token-refresh error. After a request
+401, a transient refresh outage (429/5xx/network) now returns retryable 502 and
+keeps auth eligible; permanent refresh rejection or a second request 401 still
+excludes the current credential.
+
+A changed credential from re-login / re-registration clears the previous poll
+health and makes that account due for fresh usage on the next scheduling pass,
+subject to the shared 10-second poll spacing. A fresh failed read starts a new
+backoff and remains visibly degraded; unread usage is never fabricated as 0%.
+Normal automatic token rotation keeps the existing rate-limit backoff. Results
+and queued health events from a retired login cannot re-degrade its replacement.
+
+History is local to the daemon, in private `account-history.json` beside
+`activity.jsonl`, and reaches attached dashboards through each account's
+`auth_history` field. It retains up to 64 receipts per account / 2048 total;
+consecutive identical observations coalesce with first/last time and count.
+Writes use a bounded background wake queue and an atomic 0600 snapshot capped
+at 2 MiB (oldest receipts are dropped first). Raw
+provider bodies, credentials and token hashes are not recorded. History before
+the upgrade is **unknown**; existing logs are not silently imported.
+
 ### Release availability
 
 Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed on `main` after the last tag. This table says which release each user-visible feature needs.
 
 | Feature | Stable 0.2.25 (2026-10-08) | Stable 0.2.26 (2026-10-26) | Preview |
 |---|---|---|---|
+| Authentication/usage history, re-login poll recovery, transient refresh handling | no | no | yes |
 | `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
 | Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | yes (source `7fe64d1`) | yes | yes |
 | Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | yes | yes | yes |
@@ -924,12 +960,13 @@ show `! auth X`, or `paused + auth X` when also paused, without an invented stat
 Pause and authentication health remain independent; this combined label changes
 only the display, not scheduling priority or retry policy.
 
-A permanent refresh rejection uses the refresh endpoint's status. When an upstream
-401 triggers refresh and that refresh fails, the last HTTP failure status is
-shown; a refresh failure without an HTTP status retains the observed 401. This
-display does not change retry policy: ordinary 404 responses still relay and
-ordinary 503 responses remain transient.
+A permanent refresh rejection uses the refresh endpoint's status. A second
+upstream 401 after a successful forced refresh records 401. In the current
+preview, a transient forced-refresh failure returns retryable 502 without
+permanently excluding the account; its observed status/reason appears in the
+history above. Ordinary inference 404 responses still relay and ordinary 503
+responses remain transient.
 A successful credential refresh or changed credentials on re-login clear the
 stored failure code; late failures from replaced credentials cannot restore it.
-Only the numeric status is added to account documents, never response bodies or
-credentials.
+The numeric status and safe structured lifecycle receipts are included in account
+documents; provider bodies and credentials are omitted.

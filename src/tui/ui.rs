@@ -3748,6 +3748,16 @@ fn account_modal_lines(
         ),
     ));
 
+    let history = view
+        .auth_history
+        .get(&account.id.0)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+
     // --- 5h / 7d windows ---------------------------------------------------
     let consecutive_failures = view
         .poll_health
@@ -4023,6 +4033,60 @@ fn account_modal_lines(
                         .unwrap_or_else(|| dash.clone()),
                 ),
             ));
+        }
+    }
+    if history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+    lines
+}
+
+fn auth_history_lines(
+    history: &[crate::account_history::AccountEvent],
+    offset: i64,
+) -> Vec<Line<'static>> {
+    if history.is_empty() {
+        return vec![Line::from(
+            " No recorded history yet; events before this upgrade are unknown.",
+        )];
+    }
+    let mut lines = vec![Line::from(format!(
+        " Newest first · {} retained (up to 64/account) · local time · bodies/tokens omitted",
+        history.len()
+    ))];
+    for event in history {
+        let stamp = format::month_day_hm(UNIX_EPOCH + Duration::from_millis(event.at_ms), offset);
+        let http = event.http_status.map_or_else(
+            || "HTTP unavailable".into(),
+            |status| format!("HTTP {status}"),
+        );
+        let count = if event.count > 1 {
+            format!(
+                " ×{} since {}",
+                event.count,
+                format::month_day_hm(
+                    UNIX_EPOCH + Duration::from_millis(event.first_at_ms),
+                    offset
+                )
+            )
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!(
+            " {stamp} · {} · {} · {http}{count}",
+            event.source, event.outcome
+        )));
+        lines.push(Line::from(format!(
+            "   {} → {}",
+            event.reason, event.effect
+        )));
+        if let Some(retry) = event.retry_at_ms {
+            lines.push(Line::from(format!(
+                "   next poll {} · failures {}",
+                format::month_day_hm(UNIX_EPOCH + Duration::from_millis(retry), offset),
+                event.consecutive_failures
+            )));
         }
     }
     lines
@@ -7718,6 +7782,7 @@ struct DetailParts {
     poll: String,
     /// The reset-inventory row, once the daemon reports usage controls.
     reset: Option<Line<'static>>,
+    auth: Vec<Line<'static>>,
 }
 
 impl DetailParts {
@@ -7744,8 +7809,11 @@ fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
         parts.life.clone(),
         detail_poll_line(&parts.poll),
     ];
+    lines.extend(parts.auth.clone());
     lines.extend(parts.reset.clone());
-    let block = Block::new().borders(Borders::TOP).title(" detail ");
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" detail · h / click account: full history ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -7828,6 +7896,37 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
         life,
         poll,
         reset,
+        auth: view
+            .auth_history
+            .get(&account.id.0)
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|e| e.outcome == "permanent_failure")
+                    .or_else(|| events.iter().find(|e| e.outcome == "excluded"))
+                    .or_else(|| {
+                        events
+                            .iter()
+                            .find(|e| matches!(e.outcome.as_str(), "transient_failure" | "failed"))
+                    })
+            })
+            .map(|event| {
+                vec![
+                    Line::from(format!(
+                        " last failure {} · {} · {}",
+                        format::month_day_hm(
+                            UNIX_EPOCH + Duration::from_millis(event.at_ms),
+                            ctx.tz_offset
+                        ),
+                        event.source,
+                        event
+                            .http_status
+                            .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"))
+                    )),
+                    Line::from(format!("   {} → {}", event.reason, event.effect)),
+                ]
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -10962,6 +11061,7 @@ mod tests {
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
             plans: Default::default(),
+            auth_history: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -20260,5 +20360,36 @@ mod tests {
             "full table, #16 in its row:\n{frame}"
         );
         assert_each_member_shows_its_status(&rows, &frame);
+    }
+    #[test]
+    fn account_history_is_visible_in_scrollable_real_render() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: name,
+            scroll: 0,
+        });
+        let rows = render_rows(&view, &chrome, 120, 40);
+        let body = rows.join("\n");
+        assert!(body.contains("authentication / usage history"), "{body}");
+        assert!(body.contains("HTTP 400"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("re-login required"), "{body}");
+        println!("{body}");
     }
 }

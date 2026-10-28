@@ -2063,7 +2063,15 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // codex chatgpt tokens) expiring within 5 minutes.
         if let Some(expires_at_ms) = refreshable_expiry(&credential) {
             if expiring_soon(expires_at_ms) {
-                match refresh_credential(state, &account, &credential, lease.fingerprint()).await {
+                match refresh_credential(
+                    state,
+                    &account,
+                    &credential,
+                    lease.fingerprint(),
+                    "request_expiry_refresh",
+                )
+                .await
+                {
                     RefreshOutcome::Refreshed(fresh) => credential = fresh,
                     // A re-login replaced this account's credential mid-refresh
                     // (relogin-trace B2): re-lease so the request goes out with
@@ -2106,10 +2114,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     RefreshOutcome::Permanent { detail, status } => {
                         // Only bench if the dead refresh token is still the
                         // account's live credential (relogin-trace B1).
-                        state.pool.record_auth_failure_if(
+                        state.record_auth_failure(
                             &account,
                             lease.fingerprint(),
                             Some(status),
+                            "proactive refresh permanently rejected",
                         );
                         state.emit(ActivityEvent::Error {
                             context: Some("refresh".into()),
@@ -2523,9 +2532,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     ctx.log(format!("=== ERROR ===\npersistent: {err}"));
                     // Guarded: this verdict belongs to the credential the lease
                     // pinned, not to whatever replaced it (relogin-trace B1).
-                    state
-                        .pool
-                        .record_auth_failure_if(&account, lease.fingerprint(), err.status());
+                    state.record_auth_failure(
+                        &account,
+                        lease.fingerprint(),
+                        err.status(),
+                        "persistent provider send error; HTTP status may be unavailable",
+                    );
                     drop(lease);
                     switches += 1;
                     if switches > max_switches {
@@ -2844,8 +2856,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     // `Superseded` retries for the same reason `Refreshed`
                     // does: the pool now holds a credential this request has
                     // not tried yet (relogin-trace B2).
-                    match refresh_credential(state, &account, &credential, lease.fingerprint())
-                        .await
+                    match refresh_credential(
+                        state,
+                        &account,
+                        &credential,
+                        lease.fingerprint(),
+                        "request_401_refresh",
+                    )
+                    .await
                     {
                         RefreshOutcome::Refreshed(_) | RefreshOutcome::Superseded => {
                             drop(lease);
@@ -2853,7 +2871,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         }
                         RefreshOutcome::Permanent { status, .. } => auth_status = status,
                         RefreshOutcome::Failed { status } => {
-                            auth_status = status.unwrap_or(auth_status);
+                            ctx.flush_log(state);
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            drop(lease);
+                            let status = status
+                                .map_or_else(String::new, |s| format!(" (HTTP {})", s.as_u16()));
+                            return transient_response(&format!("token refresh temporarily failed{status}; authentication retained, retry later"));
                         }
                         // The 401 says the token is dead and nothing can mint
                         // a new one until the operator configures the client.
@@ -2880,9 +2903,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 // dead — mark and switch. Guarded, so a 401 earned by a
                 // credential a re-login retired cannot bench its successor
                 // (relogin-trace B1).
-                state
-                    .pool
-                    .record_auth_failure_if(&account, lease.fingerprint(), Some(auth_status));
+                state.record_auth_failure(
+                    &account,
+                    lease.fingerprint(),
+                    Some(auth_status),
+                    "request authentication rejected after refresh attempt",
+                );
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -2923,9 +2949,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     context: Some("upstream".into()),
                     message: format!("{status} from {account}: {detail}; switching account"),
                 });
-                state
-                    .pool
-                    .record_auth_failure_if(&account, lease.fingerprint(), Some(status));
+                state.record_auth_failure(
+                    &account,
+                    lease.fingerprint(),
+                    Some(status),
+                    "persistent provider account rejection",
+                );
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -3257,7 +3286,20 @@ pub(crate) async fn refresh_credential(
     account: &AccountId,
     credential: &AccountCredential,
     expected: &AccountFingerprint,
+    source: &str,
 ) -> RefreshOutcome {
+    state
+        .hub
+        .account_history
+        .record(crate::account_history::AccountEvent::new(
+            &account.0,
+            source,
+            "started",
+            None,
+            "OAuth token refresh requested",
+            "auth unchanged",
+            SystemTime::now(),
+        ));
     // (refresh_token, identity for persistence, refresh future) per kind.
     // Anthropic refreshes coalesce via the RefreshCoalescer; codex refreshes
     // go direct to the OpenAI token endpoint (form-encoded grant) — the
@@ -3412,24 +3454,89 @@ pub(crate) async fn refresh_credential(
                     account = %account,
                     "token refresh superseded by a newer credential; discarded"
                 );
+                state
+                    .hub
+                    .account_history
+                    .record(crate::account_history::AccountEvent::new(
+                        &account.0,
+                        source,
+                        "discarded",
+                        Some(200),
+                        "refresh finished for retired credentials",
+                        "current login unchanged",
+                        SystemTime::now(),
+                    ));
                 return RefreshOutcome::Superseded;
             }
+            state
+                .hub
+                .account_history
+                .record(crate::account_history::AccountEvent::new(
+                    &account.0,
+                    source,
+                    "success",
+                    Some(200),
+                    "new access token installed",
+                    "auth healthy",
+                    SystemTime::now(),
+                ));
             state.emit(ActivityEvent::TokenRefreshed {
                 account: account.0.clone(),
                 expires_at_ms: tokens.expires_at_ms,
             });
-            persist_tokens(state, ident, expected, &tokens, refreshed_at_ms).await;
+            persist_tokens(state, account, ident, expected, &tokens, refreshed_at_ms).await;
             RefreshOutcome::Refreshed(fresh)
         }
         Err(crate::auth::AuthError::RefreshPermanent { status, body }) => {
-            tracing::warn!(account = %account, %status, %body, "refresh token dead; re-login required");
+            let reason = crate::account_history::oauth_reason(&body);
+            let current = state.pool.fingerprint(account).as_ref() == Some(expected);
+            state
+                .hub
+                .account_history
+                .record(crate::account_history::AccountEvent::new(
+                    &account.0,
+                    source,
+                    if current {
+                        "permanent_failure"
+                    } else {
+                        "discarded"
+                    },
+                    Some(status.as_u16()),
+                    reason,
+                    if current {
+                        "refresh grant rejected; re-login required"
+                    } else {
+                        "retired credential; current login unchanged"
+                    },
+                    SystemTime::now(),
+                ));
+            tracing::warn!(account = %account, %status, reason, "refresh token rejected");
             RefreshOutcome::Permanent {
                 status,
                 detail: refresh_death_detail(&status, &body),
             }
         }
         Err(err) => {
-            tracing::warn!(account = %account, error = %err, "token refresh failed (transient)");
+            let reason = match &err {
+                crate::auth::AuthError::TokenEndpoint { body, .. } => {
+                    crate::account_history::oauth_reason(body)
+                }
+                crate::auth::AuthError::Parse(_) => "token response could not be parsed",
+                _ => "token refresh network/transport failure",
+            };
+            state
+                .hub
+                .account_history
+                .record(crate::account_history::AccountEvent::new(
+                    &account.0,
+                    source,
+                    "transient_failure",
+                    err.http_status().map(|s| s.as_u16()),
+                    reason,
+                    "auth unchanged; retry allowed",
+                    SystemTime::now(),
+                ));
+            tracing::warn!(account = %account, reason, "token refresh failed (transient)");
             RefreshOutcome::Failed {
                 status: err.http_status(),
             }
@@ -3456,6 +3563,7 @@ fn non_empty_or(preferred: &str, fallback: &str) -> String {
 /// it (`docs/keys-history/relogin-trace.md` B3).
 async fn persist_tokens(
     state: &AppState,
+    account: &AccountId,
     ident: String,
     expected: &AccountFingerprint,
     tokens: &crate::auth::oauth::OAuthTokens,
@@ -3483,6 +3591,29 @@ async fn persist_tokens(
         (merged, refused)
     })
     .await;
+    let (outcome, reason) = match &result {
+        Ok((Ok(_), false)) => ("success", "rotated credentials saved atomically"),
+        Ok((Ok(_), true)) => (
+            "discarded",
+            "stored credential changed; old refresh not saved",
+        ),
+        _ => (
+            "failed",
+            "credential persistence failed; restart may lose rotated token",
+        ),
+    };
+    state
+        .hub
+        .account_history
+        .record(crate::account_history::AccountEvent::new(
+            &account.0,
+            "token_persistence",
+            outcome,
+            None,
+            reason,
+            "runtime credential unchanged",
+            SystemTime::now(),
+        ));
     match result {
         Ok((Ok(_), false)) => {}
         Ok((Ok(_), true)) => tracing::info!(
@@ -4079,9 +4210,12 @@ async fn relay_translate(
             && gemini_tos_suspended(&bytes)
         {
             tracing::warn!(account = %account, "gemini 403: Google suspended Antigravity access (ToS); benching");
-            state
-                .pool
-                .record_auth_failure_if(&account, lease.fingerprint(), Some(status));
+            state.record_auth_failure(
+                &account,
+                lease.fingerprint(),
+                Some(status),
+                "provider access suspended",
+            );
             state.emit(ActivityEvent::Error {
                 context: Some("upstream".into()),
                 message: format!("{account}: {GEMINI_TOS_MESSAGE}"),
@@ -6184,7 +6318,7 @@ mod tests {
     #[tokio::test]
     async fn auth_failure_status_survives_refresh_gateway() {
         for status in [StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
-            for (proactive, permanent) in [(true, true), (false, true), (false, false)] {
+            for (proactive, permanent) in [(true, true), (false, true)] {
                 let token_app = Router::new().route(
                     "/token",
                     post(move || async move {
@@ -6250,6 +6384,51 @@ mod tests {
                 );
                 server.abort();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_outage_does_not_permanently_exclude_account() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let app = Router::new().route(
+                "/token",
+                post(move || async move { (status, r#"{"error":"temporarily_unavailable"}"#) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let shared = MockShared::default();
+            shared
+                .script
+                .lock()
+                .unwrap()
+                .push_back(Scripted::RequireBearer {
+                    accept: &[],
+                    body: "{}",
+                });
+            let upstream = spawn_mock(shared).await;
+            let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+            state.refresher = Arc::new(crate::auth::oauth::RefreshCoalescer::with_token_url(
+                token_url,
+            ));
+            assert_eq!(
+                forward(&state, client_request("{}")).await.status(),
+                StatusCode::BAD_GATEWAY
+            );
+            let account = state.pool.snapshot().accounts[0].clone();
+            assert!(
+                account.healthy,
+                "transient token endpoint {status} cannot require re-login"
+            );
+            assert_eq!(account.auth_failure_status, None);
+            assert!(state.hub.account_history.snapshot()["a"]
+                .iter()
+                .any(|event| event.outcome == "transient_failure"
+                    && event.http_status == Some(status.as_u16())));
+            server.abort();
         }
     }
 
@@ -7480,7 +7659,8 @@ mod tests {
             .credential_with_fingerprint(&id)
             .expect("account");
 
-        let outcome = refresh_credential(&state, &id, &credential, &fingerprint).await;
+        let outcome =
+            refresh_credential(&state, &id, &credential, &fingerprint, "test_refresh").await;
 
         match outcome {
             RefreshOutcome::Misconfigured { message } => assert_eq!(message, GEMINI_NO_CLIENT),
