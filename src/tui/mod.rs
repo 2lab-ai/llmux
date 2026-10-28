@@ -1448,6 +1448,31 @@ impl App {
             self.on_key_account_modal(key.code);
             return;
         }
+        if key.code == KeyCode::Char('h')
+            && matches!(self.overlay, Overlay::None | Overlay::Accounts)
+            && matches!(self.mode, Mode::Normal | Mode::Select { .. })
+        {
+            if let Some(view) = view {
+                let order = view.display_order(self.account_sort, SystemTime::now());
+                let selected = match self.mode {
+                    Mode::Select { idx } => {
+                        order.get(idx).and_then(|&i| view.snapshot.accounts.get(i))
+                    }
+                    _ => view
+                        .snapshot
+                        .representative_current()
+                        .and_then(|id| view.snapshot.accounts.iter().find(|a| &a.id == id))
+                        .or_else(|| view.snapshot.accounts.first()),
+                };
+                if let Some(account) = selected {
+                    self.account_modal = Some(AccountModal {
+                        account: account.id.0.clone(),
+                        scroll: 0,
+                    });
+                }
+            }
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -8341,6 +8366,7 @@ mod tests {
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
             plans: Default::default(),
+            auth_history: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,

@@ -983,6 +983,36 @@ impl AppState {
         outcome: Result<CodexUsage, UsageControlError>,
     ) -> RefreshResult {
         let (mut result, discarded) = self.apply_refresh(account, provider, target, outcome);
+        let status = result.error.as_deref().and_then(|message| {
+            message
+                .split("HTTP ")
+                .nth(1)
+                .and_then(|tail| tail.split_whitespace().next())
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        self.hub
+            .account_history
+            .record(crate::account_history::AccountEvent::new(
+                account,
+                "usage_and_reset_read",
+                if discarded {
+                    "discarded"
+                } else if result.ok {
+                    "success"
+                } else {
+                    "failed"
+                },
+                if result.ok { Some(200) } else { status },
+                if discarded {
+                    "credential replaced during usage/reset read"
+                } else if result.ok {
+                    "usage/reset inventory read completed"
+                } else {
+                    "usage/reset inventory read failed; previous observation retained"
+                },
+                "auth unchanged",
+                SystemTime::now(),
+            ));
         if discarded {
             if let Some(warning) = self.invalidate_pending(account).await {
                 result.error = Some(match result.error.take() {
