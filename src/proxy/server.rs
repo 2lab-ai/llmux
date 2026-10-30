@@ -1517,7 +1517,7 @@ pub async fn serve(
             loop {
                 let cycle_store = Arc::clone(&store);
                 let report = tokio::task::spawn_blocking(move || {
-                    raw_store_maintenance(&cycle_store, raw_io.hot_days)
+                    raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import)
                 })
                 .await;
                 if let Ok(notes) = report {
@@ -1651,10 +1651,11 @@ const RAW_STORE_TICK: Duration = Duration::from_secs(600);
 fn raw_store_maintenance(
     store: &crate::proxy::raw_store::RawStore,
     hot_days: u64,
+    legacy_import: bool,
 ) -> Vec<(String, bool)> {
     use crate::proxy::raw_store::{free_bytes, DEFAULT_MIN_FREE_BYTES};
     let mut notes = Vec::new();
-    match store.import_pending(DEFAULT_MIN_FREE_BYTES) {
+    match store.import_pending(DEFAULT_MIN_FREE_BYTES, legacy_import) {
         Ok(outcomes) => {
             for o in outcomes.iter().filter(|o| o.inserted > 0) {
                 tracing::info!(source = %o.source, inserted = o.inserted, duplicates = o.duplicates, unparsed = o.unparsed, "raw-io import progress");

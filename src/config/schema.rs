@@ -444,6 +444,12 @@ pub struct RawIoConfig {
     /// Default `1` (today + yesterday hot).
     #[serde(default = "default_raw_io_hot_days")]
     pub hot_days: u64,
+    /// Import a pre-upgrade `raw-io.jsonl` found in the state directory into
+    /// the store in the background (resumable, reconciled, the file then
+    /// moved to `store/raw-io/legacy/` — never deleted). `false` leaves the
+    /// file alone for a manual `llmux raw-io import`. Default `true`.
+    #[serde(default = "default_true")]
+    pub legacy_import: bool,
     /// Per-body capture cap, in bytes, applied identically to the request body
     /// and the response body on BOTH the streaming and non-streaming paths. A
     /// body over this is clipped on a UTF-8 char boundary with a
@@ -465,6 +471,7 @@ impl Default for RawIoConfig {
             enabled: true,
             retention_days: default_raw_io_retention_days(),
             hot_days: default_raw_io_hot_days(),
+            legacy_import: true,
             max_body_bytes: default_raw_io_max_body_bytes(),
         }
     }

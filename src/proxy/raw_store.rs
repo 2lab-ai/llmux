@@ -49,7 +49,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,11 @@ const TRASH_MIN_AGE: Duration = Duration::from_secs(24 * 3600);
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Partition holding lines that are not readable records (corrupt / torn
+/// legacy lines), kept verbatim. A fixed key makes their placement
+/// independent of import resume state.
+pub const UNPARSED_DAY: &str = "1970-01-01";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -178,16 +183,13 @@ impl LineMeta {
         }
     }
 
-    /// Parse a stored/legacy line. Unparseable → `parsed = false`, `ts_ms`
-    /// taken from `fallback_ts` (the previous good line) so it lands in the
-    /// right day partition.
-    pub fn from_line(line: &[u8], fallback_ts: u64) -> Self {
+    /// Parse a stored/legacy line. Unparseable → `parsed = false`, `ts_ms = 0`
+    /// (such rows live in the fixed [`UNPARSED_DAY`] partition, so a re-read
+    /// after a resume always lands in the same partition and deduplicates).
+    pub fn from_line(line: &[u8]) -> Self {
         match serde_json::from_slice::<RawIoRecord>(line) {
             Ok(rec) => Self::from_record(&rec),
-            Err(_) => Self {
-                ts_ms: fallback_ts,
-                ..Self::default()
-            },
+            Err(_) => Self::default(),
         }
     }
 }
@@ -367,6 +369,9 @@ struct ImportState {
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = File::create(&tmp)?;
@@ -666,7 +671,6 @@ impl RawStore {
         let mut best: Option<(u64, Vec<u8>)> = None;
         let mut archived: Option<String> = None;
         for day in &days {
-            let mut any = false;
             for path in [
                 self.hot_path(day),
                 self.dir("sealing").join(format!("{day}.sqlite3")),
@@ -674,7 +678,6 @@ impl RawStore {
                 if !path.exists() {
                     continue;
                 }
-                any = true;
                 let Ok(conn) = open_readonly(&path) else {
                     continue;
                 };
@@ -692,7 +695,9 @@ impl RawStore {
                     }
                 }
             }
-            if !any && !self.archives_of(day).is_empty() {
+            // Archived even when a later-generation hot partition exists:
+            // the record may sit in an earlier generation.
+            if !self.archives_of(day).is_empty() {
                 archived = Some(day.clone());
             }
         }
@@ -854,9 +859,19 @@ impl RawStore {
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         let mut out = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         // 1. Crash leftovers: a sealed hot DB is the only copy until archived.
         for day in self.sealing_days() {
-            out.push(self.seal_and_archive(&day, false)?);
+            if self.stop_requested() {
+                break;
+            }
+            match self.seal_and_archive(&day, false) {
+                Ok(o) => out.push(o),
+                Err(err) => {
+                    tracing::error!(day, error = %err, "raw-io seal failed — data kept in sealing/");
+                    failures.push(format!("{day}: {err}"));
+                }
+            }
         }
         // 2. Eligible hot days.
         let today = day_of(now_ms);
@@ -867,12 +882,28 @@ impl RawStore {
             } else {
                 day < cutoff && day < today
             };
-            if eligible {
-                out.push(self.seal_and_archive(&day, true)?);
+            if !eligible || self.stop_requested() {
+                continue;
+            }
+            // One bad day must not wedge the others (or the trash purge).
+            match self.seal_and_archive(&day, true) {
+                Ok(o) => out.push(o),
+                Err(err) => {
+                    tracing::error!(day, error = %err, "raw-io seal failed — data kept");
+                    failures.push(format!("{day}: {err}"));
+                }
             }
         }
-        self.purge_trash();
+        // On low disk (`include_today`) a re-verified trash entry goes now
+        // instead of after the minimum age.
+        self.purge_trash(include_today);
         drop(lock);
+        if !failures.is_empty() && out.is_empty() {
+            return Err(StoreError::Other(format!(
+                "archive failed: {}",
+                failures.join("; ")
+            )));
+        }
         Ok(out)
     }
 
@@ -930,6 +961,12 @@ impl RawStore {
                     conn.busy_timeout(Duration::from_secs(60))?;
                     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
                 }
+            }
+            let wal = PathBuf::from(format!("{}-wal", hot.display()));
+            if fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
+                return Err(StoreError::Other(format!(
+                    "{day}: WAL still holds frames after checkpoint (another connection?) — not sealing"
+                )));
             }
             for suffix in ["-wal", "-shm"] {
                 let side = PathBuf::from(format!("{}{suffix}", hot.display()));
@@ -1087,10 +1124,11 @@ impl RawStore {
         // archive decodes again).
         let trash = self.dir("trash");
         fs::create_dir_all(&trash)?;
+        let stamp = super::raw_io::now_ms();
         for suffix in ["", "-wal", "-shm"] {
             let from = PathBuf::from(format!("{}{suffix}", sealed.display()));
             if from.exists() {
-                let to = trash.join(format!("{day}.g{generation_used}.sqlite3{suffix}"));
+                let to = trash.join(format!("{day}.g{generation_used}.t{stamp}.sqlite3{suffix}"));
                 fs::rename(&from, &to)?;
             }
         }
@@ -1112,9 +1150,10 @@ impl RawStore {
         })
     }
 
-    /// Unlink trash entries older than [`TRASH_MIN_AGE`] whose archive
-    /// generation still decodes to the manifest's row count.
-    fn purge_trash(&self) {
+    /// Unlink trash entries older than [`TRASH_MIN_AGE`] (any age when
+    /// `low_disk`) whose archive generation still decodes to the manifest's
+    /// row count.
+    fn purge_trash(&self, low_disk: bool) {
         let trash = self.dir("trash");
         let Ok(entries) = fs::read_dir(&trash) else {
             return;
@@ -1124,19 +1163,20 @@ impl RawStore {
             let Some(stem) = name.strip_suffix(".sqlite3") else {
                 continue;
             };
-            let Some((day, gen)) = stem.split_once(".g") else {
+            // `DAY.g<gen>.t<trashed-at-ms>`: rename keeps the old mtime, so
+            // the trash time travels in the name.
+            let Some((day, rest)) = stem.split_once(".g") else {
                 continue;
             };
-            let Ok(generation) = gen.parse::<u32>() else {
+            let Some((gen, at)) = rest.split_once(".t") else {
                 continue;
             };
-            let old_enough = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
-                .is_some_and(|age| age >= TRASH_MIN_AGE);
-            if !old_enough {
+            let (Ok(generation), Ok(at_ms)) = (gen.parse::<u32>(), at.parse::<u64>()) else {
+                continue;
+            };
+            let old_enough = super::raw_io::now_ms().saturating_sub(at_ms)
+                >= u64::try_from(TRASH_MIN_AGE.as_millis()).unwrap_or(u64::MAX);
+            if !old_enough && !low_disk {
                 continue;
             }
             let Some(manifest) = self.read_manifest(day, generation) else {
@@ -1228,7 +1268,6 @@ impl RawStore {
         let mut hasher = Sha256::new();
         let mut off = start_off;
         let mut committed_off = start_off;
-        let mut last_ts = 0u64;
         let mut cur: Option<(String, Connection)> = None;
         let mut batch_lines = 0usize;
         let mut batch_bytes = 0usize;
@@ -1267,14 +1306,11 @@ impl RawStore {
                 continue;
             }
             out.lines += 1;
-            let meta = LineMeta::from_line(line, last_ts);
-            if meta.parsed {
-                last_ts = meta.ts_ms;
-            }
-            let day = if meta.ts_ms == 0 {
-                day_of(super::raw_io::now_ms())
-            } else {
+            let meta = LineMeta::from_line(line);
+            let day = if meta.parsed {
                 day_of(meta.ts_ms)
+            } else {
+                UNPARSED_DAY.to_string()
             };
             if opts.from_day.as_deref().is_some_and(|f| day.as_str() < f)
                 || opts.to_day.as_deref().is_some_and(|t| day.as_str() > t)
@@ -1300,6 +1336,21 @@ impl RawStore {
                     out.unparsed += 1;
                 }
             } else {
+                // Same occurrence already stored: it must be the same bytes,
+                // otherwise two different sources share an identity.
+                let existing: Vec<u8> = conn.query_row(
+                    "SELECT rec_hash FROM raw_io WHERE src = ?1 AND src_off = ?2",
+                    params![src, i64_of(line_off)],
+                    |r| r.get(0),
+                )?;
+                if existing != sha256(line) {
+                    return Err(StoreError::Verify {
+                        day: day.clone(),
+                        detail: format!(
+                            "{src} offset {line_off}: stored bytes differ from the source — import stopped"
+                        ),
+                    });
+                }
                 out.duplicates += 1;
             }
             batch_lines += 1;
@@ -1339,12 +1390,16 @@ impl RawStore {
     /// then import the pre-upgrade legacy `raw-io.jsonl` and every spool
     /// generation, resumably. A fully imported, reconciled source is moved to
     /// `legacy/` (kept forever). Holds the shared maintenance lock.
-    pub fn import_pending(&self, min_free_bytes: u64) -> Result<Vec<ImportOutcome>, StoreError> {
+    pub fn import_pending(
+        &self,
+        min_free_bytes: u64,
+        include_legacy: bool,
+    ) -> Result<Vec<ImportOutcome>, StoreError> {
         let lock = self.maint_lock()?;
         lock.lock_shared()?;
         self.rotate_spool()?;
         let mut sources: Vec<PathBuf> = Vec::new();
-        if self.legacy.exists() {
+        if include_legacy && self.legacy.exists() {
             sources.push(self.legacy.clone());
         }
         let mut gens: Vec<PathBuf> = fs::read_dir(self.dir("spool"))
@@ -1449,17 +1504,27 @@ impl RawStore {
         let mut state = self.load_import_state();
         let entry = state.sources.entry(identity.clone()).or_default();
         if entry.offset >= len && !entry.completed && !self.stop_requested() {
-            // Reconcile before moving the source anywhere. A line re-read
-            // after a crash between commit and checkpoint is a duplicate, so
-            // distinct occurrences = lines - duplicates.
+            // Reconcile before moving the source anywhere. `lines` is the
+            // exact non-blank line count of [0, offset) (each checkpoint
+            // stores offset and count together), and every line is one
+            // occurrence = one row.
             let rows = self.count_rows_of_source(&identity);
-            let expected = entry.lines.saturating_sub(entry.duplicates);
+            let expected = entry.lines;
             if rows != expected {
+                // Rows went missing (e.g. a power loss rolled back batches
+                // whose checkpoint was already durable): start the source
+                // over — occurrence dedupe makes the second pass insert only
+                // what is missing. The source stays where it is.
+                let shown = path.display().to_string();
+                *entry = SourceState {
+                    path: shown.clone(),
+                    ..SourceState::default()
+                };
+                self.save_import_state(&state)?;
                 return Err(StoreError::Verify {
                     day: "-".into(),
                     detail: format!(
-                        "source {} has {expected} lines but {rows} rows — kept in place",
-                        path.display()
+                        "source {shown} has {expected} lines but {rows} rows — kept in place, re-importing from offset 0"
                     ),
                 });
             }
@@ -1747,8 +1812,10 @@ mod tests {
             .expect("re-import");
         assert_eq!(again.inserted, 0);
         assert_eq!(again.duplicates, 5);
-        // Both days present; unparsed lines kept verbatim.
-        assert_eq!(store.hot_days().len(), 2);
+        // Both days present, plus the fixed partition of the unparsed lines
+        // (kept verbatim).
+        assert_eq!(store.hot_days().len(), 3);
+        assert!(store.hot_days().contains(&UNPARSED_DAY.to_string()));
         let all: Vec<Vec<u8>> = store
             .hot_days()
             .iter()
@@ -1882,7 +1949,7 @@ mod tests {
         let body = lines.join("\n") + "\n";
         fs::write(&legacy, &body).expect("write");
         let store = RawStore::new(&legacy);
-        let out = store.import_pending(0).expect("import");
+        let out = store.import_pending(0, true).expect("import");
         assert_eq!(out[0].inserted, 1100);
         assert!(!legacy.exists(), "moved out of the live path");
         let moved = store.status().legacy_files;
@@ -1898,13 +1965,64 @@ mod tests {
     }
 
     #[test]
+    fn unparsed_lines_go_to_a_fixed_partition() {
+        let dir = tmp();
+        let src = dir.join("x.jsonl");
+        fs::write(&src, "garbage one\ngarbage two\n").expect("write");
+        let store = RawStore::new(&dir.join("raw-io.jsonl"));
+        let out = store
+            .import_file(&src, &ImportOptions::default())
+            .expect("import");
+        assert_eq!((out.inserted, out.unparsed), (2, 2));
+        assert_eq!(store.hot_days(), vec![UNPARSED_DAY.to_string()]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconciliation_mismatch_restarts_the_source_and_recovers() {
+        let dir = tmp();
+        let legacy = dir.join("raw-io.jsonl");
+        let lines: Vec<String> = (0..10)
+            .map(|i| serde_json::to_string(&rec(i, T0 + i * 1000, "u1")).expect("json"))
+            .collect();
+        let body = lines.join("\n") + "\n";
+        fs::write(&legacy, &body).expect("write");
+        let store = RawStore::new(&legacy);
+        // A checkpoint that claims everything was imported, with no rows
+        // behind it (rows lost after a durable checkpoint).
+        let identity = source_identity_of_file(&legacy).expect("id");
+        let mut state = ImportState::default();
+        state.sources.insert(
+            identity,
+            SourceState {
+                path: legacy.display().to_string(),
+                offset: body.len() as u64,
+                lines: 10,
+                ..SourceState::default()
+            },
+        );
+        store.save_import_state(&state).expect("state");
+        assert!(
+            store.import_pending(0, true).is_err(),
+            "mismatch is reported, not moved"
+        );
+        assert!(legacy.exists(), "source kept in place");
+        // Next cycle re-imports from 0 and reconciles.
+        let out = store.import_pending(0, true).expect("recovered");
+        assert_eq!(out[0].inserted, 10);
+        assert!(!legacy.exists());
+        assert_eq!(store.status().legacy_files.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn spool_generations_are_imported() {
         let dir = tmp();
         let store = RawStore::new(&dir.join("raw-io.jsonl"));
         let r = rec(9, T0, "u1");
         store.spool(serde_json::to_string(&r).expect("json").as_bytes());
         assert_eq!(store.counters(), (1, 0));
-        store.import_pending(0).expect("import");
+        store.import_pending(0, true).expect("import");
         assert_eq!(store.find(9, T0), Lookup::Found(Box::new(r)));
         assert!(!store.dir("spool").join("current.jsonl").exists());
         assert_eq!(store.status().legacy_files.len(), 1);

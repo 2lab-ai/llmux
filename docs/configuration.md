@@ -237,6 +237,7 @@ The GCP project is stored per account, not here (see [Gemini accounts](#gemini-a
 | --- | --- | --- |
 | `raw_io.enabled` | `true` | Capture bounded request/response payloads into the raw-io store; disable to stop capture. |
 | `raw_io.hot_days` | `1` | Past days kept as queryable SQLite partitions besides today. Older days are sealed into verified archives. Read at daemon start. |
+| `raw_io.legacy_import` | `true` | Import a pre-upgrade `raw-io.jsonl` into the store in the background (resumable; the file is then moved to `store/raw-io/legacy/`, never deleted). `false` leaves it for a manual `llmux raw-io import`. |
 | `raw_io.retention_days` | `0` | Deprecated and ignored. llmux never deletes raw-io data; a non-zero value only logs a startup warning. |
 | `raw_io.max_body_bytes` | `8388608` | Per-body capture limit for requests/responses, streaming or JSON. |
 

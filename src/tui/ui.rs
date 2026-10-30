@@ -16408,6 +16408,7 @@ mod tests {
                 enabled: _,
                 retention_days: _,
                 hot_days: _,
+                legacy_import: _,
                 max_body_bytes: _,
             } = raw_io;
             let crate::config::TuiGradient {
@@ -16489,6 +16490,7 @@ mod tests {
             "raw_io.enabled",
             "raw_io.retention_days",
             "raw_io.hot_days",
+            "raw_io.legacy_import",
             "raw_io.max_body_bytes",
             "email_anonymous",
             "tui_effects",
