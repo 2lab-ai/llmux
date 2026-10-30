@@ -266,9 +266,10 @@ the largest hot partition (at least 10 GiB), today is sealed early too.
 Day archives compress about 70 to 90 times on real traffic, because Claude
 Code resends the whole conversation on every turn. Compressing each record on
 its own reaches only about 4 times, which is why past days are archived as one
-stream per day rather than kept in a database. A future server database
-(for example Postgres in Docker) maps to the same metadata columns with the
-body in a separate column or blob store.
+stream per day rather than kept in a database. To move the stores to a
+server database (PostgreSQL in Docker) see
+[Moving the stores to a server database](dbms-migration.md): same tables and
+columns, a loader and a row-for-row verifier.
 
 The keys-usage statistics (`usage.sqlite3`, next to the config) follow the
 same contract: SQLite stays the live store, and once a day every finished
