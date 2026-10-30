@@ -1039,7 +1039,30 @@ impl RawStore {
         conn.busy_timeout(Duration::from_secs(60))?;
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-        let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        // quick_check reads the whole database: a watcher interrupts it on
+        // shutdown (the sealed copy stays in sealing/ for the next start).
+        let interrupt = conn.get_interrupt_handle();
+        let done = AtomicBool::new(false);
+        let check: Result<String, rusqlite::Error> = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    if self.stop_requested() {
+                        interrupt.interrupt();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+            let r = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
+            done.store(true, Ordering::Relaxed);
+            r
+        });
+        if self.stop_requested() {
+            return Err(StoreError::Busy(format!(
+                "{day}: shutdown during integrity check — sealed copy kept in sealing/"
+            )));
+        }
+        let check = check?;
         if check != "ok" {
             return Err(StoreError::Verify {
                 day: day.into(),
@@ -1254,7 +1277,8 @@ impl RawStore {
             let archive = self
                 .dir("archive")
                 .join(Self::archive_name(day, generation));
-            match count_lines_zst(&archive) {
+            match count_lines_zst(&archive, &|| self.stop_requested()) {
+                Err(StoreError::Busy(_)) => return, // shutdown: trash kept
                 Ok(n) if n == manifest.rows => {
                     for suffix in ["", "-wal", "-shm"] {
                         let _ = fs::remove_file(trash.join(format!("{name}{suffix}")));
@@ -1775,14 +1799,21 @@ fn open_maybe_zstd(path: &Path) -> Result<Box<dyn Read>, StoreError> {
     }
 }
 
-/// Count `\n`-terminated (and a final unterminated) lines of a zstd stream.
-pub fn count_lines_zst(path: &Path) -> Result<u64, StoreError> {
+/// Count `\n`-terminated (and a final unterminated) lines of a zstd stream;
+/// `stop` is polled per 4 MiB chunk (shutdown → `Busy`).
+pub fn count_lines_zst(path: &Path, stop: &dyn Fn() -> bool) -> Result<u64, StoreError> {
     let mut d = zstd::stream::read::Decoder::new(File::open(path)?)?;
     d.window_log_max(31)?;
     let mut buf = vec![0u8; 4 << 20];
     let mut n = 0u64;
     let mut last = b'\n';
     loop {
+        if stop() {
+            return Err(StoreError::Busy(format!(
+                "{}: shutdown while counting",
+                path.display()
+            )));
+        }
         let k = d.read(&mut buf)?;
         if k == 0 {
             break;
@@ -1968,7 +1999,7 @@ mod tests {
         assert_eq!(store.archives_of(&old_day).len(), 1);
         // The archive is the legacy format: decode → the exact lines.
         assert_eq!(
-            count_lines_zst(&store.archives_of(&old_day)[0].1).expect("count"),
+            count_lines_zst(&store.archives_of(&old_day)[0].1, &|| false).expect("count"),
             2
         );
         assert_eq!(store.find(1, T0), Lookup::Archived(old_day.clone()));
@@ -2158,6 +2189,33 @@ mod tests {
         let out = successor.archive_cycle(T0, 0, true).expect("cycle");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rows, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stop_during_sealing_keeps_the_sealed_copy_for_the_next_start() {
+        let dir = tmp();
+        let store = RawStore::new(&dir.join("raw-io.jsonl"));
+        for i in 0..200 {
+            store.capture(&rec(i, T0 + i, "u1"));
+        }
+        store.request_stop();
+        let out = store
+            .archive_cycle(T0 + 3 * DAY_MS, 1, false)
+            .expect("cycle");
+        assert!(out.is_empty(), "nothing published under stop");
+        assert!(store.archives_of(&day_of(T0)).is_empty());
+        let kept = store.sealing_days().len() + store.hot_days().len();
+        assert_eq!(kept, 1, "the day is still on disk (hot or sealing)");
+        // A fresh process (new store instance) finishes it once the old one
+        // (and its day lock) is gone.
+        drop(store);
+        let next = RawStore::new(&dir.join("raw-io.jsonl"));
+        let out = next
+            .archive_cycle(T0 + 3 * DAY_MS, 1, false)
+            .expect("cycle");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rows, 200);
         let _ = fs::remove_dir_all(dir);
     }
 
