@@ -244,9 +244,9 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 enum Sync {
     /// Live capture: `synchronous=FULL` — a committed row survives power loss.
     Full,
-    /// Bulk import: `synchronous=NORMAL` (WAL stays consistent; a power loss
-    /// can roll back the last batches). Safe because the source is kept until
-    /// the row count reconciles against it, and resume dedupes by occurrence.
+    /// Bulk import: `synchronous=FULL` too (one fsync per ≤64 MiB batch, so
+    /// the checkpoint written after a commit can never run ahead of the
+    /// rows), with a larger WAL autocheckpoint.
     Bulk,
 }
 
@@ -265,7 +265,7 @@ fn open_partition(path: &Path, day: &str, sync: Sync) -> Result<Connection, Stor
     conn.execute_batch(match sync {
         Sync::Full => "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
         Sync::Bulk => {
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 16384;"
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA wal_autocheckpoint = 16384;"
         }
     })?;
     conn.execute_batch(SCHEMA_SQL)?;
@@ -1312,8 +1312,11 @@ impl RawStore {
             } else {
                 UNPARSED_DAY.to_string()
             };
-            if opts.from_day.as_deref().is_some_and(|f| day.as_str() < f)
-                || opts.to_day.as_deref().is_some_and(|t| day.as_str() > t)
+            // Date filters select parsed records; unreadable lines carry no
+            // date and are always kept.
+            if meta.parsed
+                && (opts.from_day.as_deref().is_some_and(|f| day.as_str() < f)
+                    || opts.to_day.as_deref().is_some_and(|t| day.as_str() > t))
             {
                 out.filtered += 1;
                 continue;
@@ -1508,13 +1511,25 @@ impl RawStore {
             // exact non-blank line count of [0, offset) (each checkpoint
             // stores offset and count together), and every line is one
             // occurrence = one row.
-            let rows = self.count_rows_of_source(&identity);
+            let (hot_rows, archived_rows) = self.count_rows_of_source(&identity)?;
+            let rows = hot_rows + archived_rows;
             let expected = entry.lines;
+            if rows != expected && archived_rows > 0 {
+                // Some of this source is already sealed into archives, which
+                // carry no occurrence index: a re-pass would re-insert those
+                // days and never converge. Keep the file and say so.
+                return Err(StoreError::Verify {
+                    day: "-".into(),
+                    detail: format!(
+                        "source {} has {expected} lines but {rows} rows ({archived_rows} archived) — kept in place; needs a manual check",
+                        path.display()
+                    ),
+                });
+            }
             if rows != expected {
-                // Rows went missing (e.g. a power loss rolled back batches
-                // whose checkpoint was already durable): start the source
-                // over — occurrence dedupe makes the second pass insert only
-                // what is missing. The source stays where it is.
+                // Rows went missing while every imported row is still hot:
+                // start the source over — occurrence dedupe makes the second
+                // pass insert only what is missing. The source stays put.
                 let shown = path.display().to_string();
                 *entry = SourceState {
                     path: shown.clone(),
@@ -1545,10 +1560,11 @@ impl RawStore {
         Ok(outcome)
     }
 
-    /// Rows imported from `src`: hot + sealing partitions, plus the counts
-    /// recorded in archive manifests.
-    pub fn count_rows_of_source(&self, src: &str) -> u64 {
-        let mut total = 0u64;
+    /// Rows imported from `src`: `(hot + sealing rows, rows recorded in
+    /// archive manifests)`. Any read error is an error — reconciliation
+    /// must never act on an undercount.
+    pub fn count_rows_of_source(&self, src: &str) -> Result<(u64, u64), StoreError> {
+        let mut hot = 0u64;
         let mut paths: Vec<PathBuf> = self.hot_days().iter().map(|d| self.hot_path(d)).collect();
         // A sealing copy whose archive is already published (crash before the
         // trash move) is counted through its manifest, not twice.
@@ -1559,32 +1575,26 @@ impl RawStore {
                 .map(|d| self.dir("sealing").join(format!("{d}.sqlite3"))),
         );
         for p in paths {
-            if let Ok(conn) = open_readonly(&p) {
-                if let Ok(n) =
-                    conn.query_row("SELECT count(*) FROM raw_io WHERE src = ?1", [src], |r| {
-                        r.get::<_, i64>(0)
-                    })
-                {
-                    total += u64_of(n);
+            let conn = open_readonly(&p)?;
+            let n: i64 =
+                conn.query_row("SELECT count(*) FROM raw_io WHERE src = ?1", [src], |r| {
+                    r.get(0)
+                })?;
+            hot += u64_of(n);
+        }
+        let mut archived = 0u64;
+        let archive_dir = self.dir("archive");
+        if archive_dir.exists() {
+            for e in fs::read_dir(&archive_dir)? {
+                let e = e?;
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".manifest.json") {
+                    let m: ArchiveManifest = serde_json::from_str(&fs::read_to_string(e.path())?)?;
+                    archived += m.src_counts.get(src).copied().unwrap_or(0);
                 }
             }
         }
-        for e in fs::read_dir(self.dir("archive"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".manifest.json") {
-                if let Some(m) = fs::read_to_string(e.path())
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<ArchiveManifest>(&t).ok())
-                {
-                    total += m.src_counts.get(src).copied().unwrap_or(0);
-                }
-            }
-        }
-        total
+        Ok((hot, archived))
     }
 
     /// Restore every archive generation of `day` into its hot partition (the
@@ -2012,6 +2022,51 @@ mod tests {
         assert_eq!(out[0].inserted, 10);
         assert!(!legacy.exists());
         assert_eq!(store.status().legacy_files.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconciliation_never_resets_a_partly_archived_source() {
+        let dir = tmp();
+        let legacy = dir.join("raw-io.jsonl");
+        let lines: Vec<String> = (0..4)
+            .map(|i| serde_json::to_string(&rec(i, T0 + i * DAY_MS, "u1")).expect("json"))
+            .collect();
+        let body = lines.join("\n") + "\n";
+        fs::write(&legacy, &body).expect("write");
+        let store = RawStore::new(&legacy);
+        // Import (same identity as the auto-import), then seal the old days.
+        store
+            .import_file(&legacy, &ImportOptions::default())
+            .expect("import");
+        store
+            .archive_cycle(T0 + 3 * DAY_MS, 0, false)
+            .expect("archive");
+        let identity = source_identity_of_file(&legacy).expect("id");
+        let (hot, archived) = store.count_rows_of_source(&identity).expect("count");
+        assert_eq!(hot + archived, 4);
+        assert!(archived > 0);
+        // A state that claims one more line than exist: mismatch with
+        // archived rows → refuse the reset, keep the file, keep the state.
+        let mut state = ImportState::default();
+        state.sources.insert(
+            identity.clone(),
+            SourceState {
+                path: legacy.display().to_string(),
+                offset: body.len() as u64,
+                lines: 5,
+                ..SourceState::default()
+            },
+        );
+        store.save_import_state(&state).expect("state");
+        assert!(store.import_pending(0, true).is_err());
+        assert!(legacy.exists(), "source kept");
+        let kept = store.load_import_state();
+        assert_eq!(
+            kept.sources[&identity].offset,
+            body.len() as u64,
+            "no reset to 0"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
