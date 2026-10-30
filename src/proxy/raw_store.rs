@@ -1041,16 +1041,24 @@ impl RawStore {
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         // quick_check reads the whole database: a watcher interrupts it on
         // shutdown (the sealed copy stays in sealing/ for the next start).
+        if self.stop_requested() {
+            return Err(StoreError::Busy(format!(
+                "{day}: shutdown before integrity check — sealed copy kept in sealing/"
+            )));
+        }
         let interrupt = conn.get_interrupt_handle();
         let done = AtomicBool::new(false);
         let check: Result<String, rusqlite::Error> = std::thread::scope(|scope| {
             scope.spawn(|| {
+                // Keep interrupting until the check returns: an interrupt
+                // issued before the statement starts is a no-op in SQLite.
                 while !done.load(Ordering::Relaxed) {
                     if self.stop_requested() {
                         interrupt.interrupt();
-                        return;
+                        std::thread::sleep(Duration::from_millis(20));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(200));
                     }
-                    std::thread::sleep(Duration::from_millis(200));
                 }
             });
             let r = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
