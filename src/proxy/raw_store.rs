@@ -237,10 +237,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS raw_io_src ON raw_io(src, src_off);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 ";
 
-/// Open (creating if needed) a partition read-write with the durability
-/// pragmas: WAL + `synchronous=FULL` (a committed row survives power loss),
-/// 64 KiB pages (rows average ~1.3 MB).
-fn open_partition(path: &Path, day: &str) -> Result<Connection, StoreError> {
+/// How a partition connection syncs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sync {
+    /// Live capture: `synchronous=FULL` — a committed row survives power loss.
+    Full,
+    /// Bulk import: `synchronous=NORMAL` (WAL stays consistent; a power loss
+    /// can roll back the last batches). Safe because the source is kept until
+    /// the row count reconciles against it, and resume dedupes by occurrence.
+    Bulk,
+}
+
+/// Open (creating if needed) a partition read-write: WAL, 64 KiB pages (rows
+/// average ~1.3 MB), the requested sync level.
+fn open_partition(path: &Path, day: &str, sync: Sync) -> Result<Connection, StoreError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -250,7 +260,12 @@ fn open_partition(path: &Path, day: &str) -> Result<Connection, StoreError> {
     if fresh {
         conn.execute_batch("PRAGMA page_size = 65536;")?;
     }
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+    conn.execute_batch(match sync {
+        Sync::Full => "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
+        Sync::Bulk => {
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA wal_autocheckpoint = 16384;"
+        }
+    })?;
     conn.execute_batch(SCHEMA_SQL)?;
     conn.execute(
         "INSERT OR IGNORE INTO meta (k, v) VALUES ('schema_version', ?1), ('day', ?2)",
@@ -596,7 +611,7 @@ impl RawStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.as_ref().is_none_or(|w| w.day != day) {
             *guard = None; // close the previous day before opening the next
-            let conn = open_partition(&self.hot_path(&day), &day)?;
+            let conn = open_partition(&self.hot_path(&day), &day, Sync::Full)?;
             *guard = Some(Writer { day, conn });
         }
         let Some(w) = guard.as_ref() else {
@@ -1255,7 +1270,7 @@ impl RawStore {
             }
             if cur.as_ref().is_none_or(|(d, _)| d != &day) {
                 commit(&mut cur)?;
-                let conn = open_partition(&self.hot_path(&day), &day)?;
+                let conn = open_partition(&self.hot_path(&day), &day, Sync::Bulk)?;
                 cur = Some((day.clone(), conn));
             }
             let Some((_, conn)) = cur.as_ref() else {
