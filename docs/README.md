@@ -18,6 +18,7 @@ Pick the thing you want to do.
 - [Operational reference](operational-reference.md) — commands, TUI keys, daemon/dashboard, scheduling, model routing, Codex frontend/backend, Gemini backend, SDK error lifecycle, install variants.
 - [Release availability](operational-reference.md#release-availability) — which features are on stable 0.2.25 vs the rolling preview channel, and what changed per release.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, frontend/SDK runtime, Codex/Grok shaping, Gemini backend and its ToS risk, account types, email-anonymous mode.
+- [Moving the stores to a server database](dbms-migration.md) — PostgreSQL (Docker) schema, loader and row-for-row verifier for raw-io, keys-usage and soma-work metrics.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
 - [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
 - [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.

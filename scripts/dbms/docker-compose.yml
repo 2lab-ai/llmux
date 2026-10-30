@@ -1,0 +1,17 @@
+# PostgreSQL for the llmux / soma-work stores (see docs/dbms-migration.md).
+#   LLMUX_PG_PASSWORD=... docker compose -f scripts/dbms/docker-compose.yml up -d
+# The schema is applied on first start of an empty data directory.
+services:
+  pg:
+    image: postgres:17-alpine
+    container_name: llmux-pg
+    environment:
+      POSTGRES_USER: llmux
+      POSTGRES_PASSWORD: ${LLMUX_PG_PASSWORD:?set LLMUX_PG_PASSWORD}
+      POSTGRES_DB: llmux
+    ports:
+      - "127.0.0.1:${LLMUX_PG_PORT:-5432}:5432"
+    volumes:
+      - ${LLMUX_PG_DATA:-./pgdata}:/var/lib/postgresql/data
+      - ./postgres-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    restart: unless-stopped
