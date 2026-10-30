@@ -1554,6 +1554,8 @@ pub async fn serve(
                 let last_day = Arc::new(Mutex::new(None::<String>));
                 tokio::time::sleep(USAGE_ARCHIVE_FIRST_DELAY).await;
                 loop {
+                    // Checked once per tick on purpose: after a long startup
+                    // import the export simply starts one tick later.
                     if !usage_store.health().importing {
                         let (db, stop, last_day) =
                             (db.clone(), Arc::clone(&stop), Arc::clone(&last_day));
@@ -1606,6 +1608,7 @@ pub async fn serve(
 
     let shutdown = state.shutdown.clone();
     let on_shutdown = Arc::clone(&background);
+    let usage_archive_stop_tail = Arc::clone(&usage_archive_stop);
     // Fires once the graceful drain has begun — the drain deadline below is
     // measured from THIS moment, not from startup.
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1656,6 +1659,7 @@ pub async fn serve(
     // (the graceful future already did it); when serve returned for any other
     // reason it is the only stop the loops get.
     background.stop_all();
+    usage_archive_stop_tail.store(true, Ordering::Relaxed);
     // Let an in-flight token refresh settle (pool CAS + config persist) before
     // the process goes away. Bounded so a hung token endpoint cannot turn the
     // exiting daemon into a new kind of zombie; past the bound, abort and go.
