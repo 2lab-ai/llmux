@@ -908,15 +908,29 @@ impl RawStore {
                 .writer
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.as_ref().is_some_and(|w| w.day == day) {
-                *guard = None; // closes the connection: checkpoints + drops the WAL
-            }
             if sealed.exists() {
                 return Err(StoreError::Other(format!(
                     "{day}: a sealing copy already exists — finish it first"
                 )));
             }
             let hot = self.hot_path(day);
+            // Fold the WAL into the main file BEFORE anything moves, so no
+            // committed frame lives only in a sidecar (a sidecar left behind
+            // could otherwise be replayed into a fresh partition). The writer
+            // lock is held, so no live capture can reopen the day meanwhile;
+            // importers are excluded by the exclusive maintenance lock.
+            match guard.as_ref() {
+                Some(w) if w.day == day => {
+                    w.conn
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+                    *guard = None;
+                }
+                _ => {
+                    let conn = Connection::open(&hot)?;
+                    conn.busy_timeout(Duration::from_secs(60))?;
+                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+                }
+            }
             for suffix in ["-wal", "-shm"] {
                 let side = PathBuf::from(format!("{}{suffix}", hot.display()));
                 if side.exists() {
@@ -1471,9 +1485,12 @@ impl RawStore {
     pub fn count_rows_of_source(&self, src: &str) -> u64 {
         let mut total = 0u64;
         let mut paths: Vec<PathBuf> = self.hot_days().iter().map(|d| self.hot_path(d)).collect();
+        // A sealing copy whose archive is already published (crash before the
+        // trash move) is counted through its manifest, not twice.
         paths.extend(
             self.sealing_days()
                 .iter()
+                .filter(|d| self.archives_of(d).is_empty())
                 .map(|d| self.dir("sealing").join(format!("{d}.sqlite3"))),
         );
         for p in paths {
