@@ -274,7 +274,11 @@ The keys-usage statistics (`usage.sqlite3`, next to the config) follow the
 same contract: SQLite stays the live store, and once a day every finished
 local day is exported to `usage-archive/usage-YYYY-MM-DD[.N].jsonl.zst` with a
 `.manifest.json` beside it (verified before it is published; a day that
-changes later gets the next generation; nothing is deleted).
+changes later gets the next generation; nothing is deleted). The database runs
+in WAL mode so the export (one short indexed read per day, skipped when the
+day's `count:sum:max` fingerprint is unchanged) never blocks metering writes;
+an export only runs once the file is in WAL mode, and one exporter at a time
+holds `usage-archive/.lock`. Decode with `zstd -d --long=31`.
 
 Use `llmux raw-io` to inspect and operate the store (see
 [operational reference](operational-reference.md#raw-io-store)).

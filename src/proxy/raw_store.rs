@@ -119,7 +119,11 @@ pub fn day_of(ts_ms: u64) -> String {
 /// Pure core of [`day_of`] (unit-testable with explicit offsets).
 pub fn day_at_offset(ts_ms: u64, offset_secs: i64) -> String {
     let secs = i64::try_from(ts_ms / 1000).unwrap_or(i64::MAX) + offset_secs;
-    let days = secs.div_euclid(86_400);
+    day_key(secs.div_euclid(86_400))
+}
+
+/// `YYYY-MM-DD` of a day number (days since 1970-01-01).
+pub(crate) fn day_key(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }

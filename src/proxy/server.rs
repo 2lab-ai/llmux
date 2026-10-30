@@ -1521,7 +1521,12 @@ pub async fn serve(
                 let report = tokio::task::spawn_blocking(move || {
                     let mut notes =
                         raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import);
-                    notes.extend(usage_archive_maintenance(cycle_usage_db.as_deref()));
+                    if !cycle_store.stop_requested() {
+                        notes.extend(usage_archive_maintenance(
+                            cycle_usage_db.as_deref(),
+                            &|| cycle_store.stop_requested(),
+                        ));
+                    }
                     notes
                 })
                 .await;
@@ -1647,8 +1652,12 @@ pub async fn serve(
 
 /// Once per local day: export finished days of the keys-usage statistics to
 /// verified `usage-archive/usage-DAY.jsonl.zst` files (same contract as the
-/// raw-io day archives; the live `usage.sqlite3` is only read).
-fn usage_archive_maintenance(usage_db: Option<&std::path::Path>) -> Vec<(String, bool)> {
+/// raw-io day archives; the live `usage.sqlite3` is only read). Deferred
+/// (another exporter holds the directory, or shutdown) = retried next cycle.
+fn usage_archive_maintenance(
+    usage_db: Option<&std::path::Path>,
+    stop: &dyn Fn() -> bool,
+) -> Vec<(String, bool)> {
     static LAST_DAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let Some(db) = usage_db.filter(|p| p.exists()) else {
         return Vec::new();
@@ -1662,7 +1671,7 @@ fn usage_archive_maintenance(usage_db: Option<&std::path::Path>) -> Vec<(String,
             return Vec::new();
         }
     }
-    match crate::proxy::usage_archive::export_usage_days(db, &today) {
+    match crate::proxy::usage_archive::export_usage_days(db, &today, stop) {
         Ok(written) => {
             *LAST_DAY
                 .lock()
@@ -1676,6 +1685,10 @@ fn usage_archive_maintenance(usage_db: Option<&std::path::Path>) -> Vec<(String,
                     false,
                 )]
             }
+        }
+        Err(crate::proxy::raw_store::StoreError::Busy(why)) => {
+            tracing::debug!(%why, "keys usage day export deferred");
+            Vec::new()
         }
         Err(err) => {
             tracing::warn!(error = %err, "keys usage day export failed — retried next cycle");
