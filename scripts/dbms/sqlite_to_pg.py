@@ -38,6 +38,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 
 RAW_IO = {
     "table": "raw_io",
@@ -118,6 +119,11 @@ def enc(value, typ, where):
     raise Unsupported(f"{where}: {type(value).__name__} {value!r} is not a lossless {typ}")
 
 
+def ro_connect(path):
+    """Read-only handle; the path is URI-quoted (`?`, `#`, `%` are safe)."""
+    return sqlite3.connect(f"file:{urllib.parse.quote(os.path.abspath(path))}?mode=ro", uri=True)
+
+
 def raw_io_day(path):
     day = os.path.basename(path)[:10]
     datetime.date.fromisoformat(day)  # raises on a non-day file name
@@ -126,7 +132,7 @@ def raw_io_day(path):
 
 def sqlite_rows(kind, spec, path):
     """COPY-text lines of one table's SQLite rows, in verification order."""
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = ro_connect(path)
     try:
         cols = [(c, t) for c, t in spec["cols"] if not (kind == "raw-io" and c == "day")]
         prefix = [raw_io_day(path)] if kind == "raw-io" else []
@@ -200,7 +206,7 @@ def cmd_verify(args):
     result = {"kind": args.kind, "file": args.file, "tables": tables}
     if args.kind == "raw-io" and args.manifest:
         m = json.load(open(args.manifest))
-        con = sqlite3.connect(f"file:{args.file}?mode=ro", uri=True)
+        con = ro_connect(args.file)
         lh, ln = hashlib.sha256(), 0
         for (line,) in con.execute("SELECT line FROM raw_io ORDER BY seq"):
             lh.update(bytes(line))

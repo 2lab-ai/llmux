@@ -13,6 +13,9 @@ so a copy can be checked row for row.
 | keys-usage statistics | `usage.sqlite3` next to the config, table `usage` | `usage` |
 | soma-work metrics | `{DATA_DIR}/metrics/metrics.sqlite3`, tables `metrics_events` and `metrics_unparsed` (malformed lines kept verbatim) | `metrics_events`, `metrics_unparsed` |
 
+The metrics columns follow soma-work's `src/metrics/event-store.ts` as of
+soma-work #584 (711e352).
+
 Bookkeeping tables (`meta`, `metrics_jsonl_imports`, `metrics_exports`,
 `metrics_day_rev`) describe the SQLite files and their archives. They are not
 copied, because a server backend keeps its own.
@@ -74,6 +77,7 @@ the database only when it needs to be queried.
    behind. A raw-io day also creates its partition:
 
    ```sh
+   set -o pipefail   # a refused load exits 2 even though psql runs its ROLLBACK cleanly
    python3 scripts/dbms/sqlite_to_pg.py load raw-io  /tmp/rs/2026-08-12.sqlite3 | $PSQL
    python3 scripts/dbms/sqlite_to_pg.py load usage   /tmp/usage.sqlite3          | $PSQL
    python3 scripts/dbms/sqlite_to_pg.py load metrics /tmp/metrics.sqlite3        | $PSQL
