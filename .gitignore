@@ -14,3 +14,4 @@ dist/*.backup.app/
 
 # Agent SDK bridge development dependencies
 /bridge/node_modules/
+scripts/dbms/pgdata/
