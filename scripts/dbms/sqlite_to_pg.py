@@ -10,6 +10,7 @@ KIND
              into a scratch store with `--store DIR`)
     usage    llmux keys-usage statistics, usage.sqlite3
     metrics  soma-work metrics, {DATA_DIR}/metrics/metrics.sqlite3
+             (metrics_events and metrics_unparsed)
 
 `load` writes one transaction (BEGIN; COPY ... FROM STDIN; COMMIT) for psql,
 so a failed load leaves nothing behind:
@@ -19,7 +20,10 @@ so a failed load leaves nothing behind:
 `verify` streams the same rows back out of PostgreSQL (COPY ... TO STDOUT,
 same order) and compares row count and a sha256 over every column of every
 row with the SQLite file. For raw-io, `--manifest` also checks the day's row
-count and line sha256 against the archive manifest. Exit status 0 = equal.
+count and line sha256 against the archive manifest. Exit status 0 = equal,
+1 = different, 2 = a SQLite value that cannot be copied losslessly (a REAL
+in an INTEGER column, a boolean other than 0/1, TEXT in a BLOB column...):
+both commands refuse it instead of normalising it.
 
 Read a live database from a snapshot (sqlite3 FILE ".backup COPY") so both
 sides see the same rows. Standard library only.
@@ -35,57 +39,83 @@ import sqlite3
 import subprocess
 import sys
 
-KINDS = {
-    "raw-io": {
-        "table": "raw_io",
-        "source": "raw_io",
-        "order": "seq",
-        "cols": [
-            ("day", "date"), ("seq", "int"), ("ts_ms", "int"), ("id", "int"),
-            ("grp", "text"), ("model", "text"), ("account", "text"),
-            ("status", "int"), ("duration_ms", "int"), ("user_id", "text"),
-            ("tokens_in", "int"), ("tokens_out", "int"), ("parsed", "bool"),
-            ("rec_hash", "bytea"), ("src", "text"), ("src_off", "int"),
-            ("line", "bytea"),
-        ],
-    },
-    "usage": {
-        "table": "usage",
-        "source": "usage",
-        "order": "event_key",
-        "cols": [
-            ("event_key", "text"), ("ts_ms", "int"), ("tenant", "text"),
-            ("grp", "text"), ("model", "text"), ("status", "int"),
-            ("tokens_in", "int"), ("tokens_out", "int"),
-            ("cache_read", "int"), ("cache_creation", "int"),
-        ],
-    },
-    "metrics": {
-        "table": "metrics_events",
-        "source": "metrics_events",
-        "order": "seq",
-        "cols": [
-            ("seq", "int"), ("id", "text"), ("ts", "int"), ("day", "date"),
-            ("event_type", "text"), ("json", "text"),
-        ],
-    },
+RAW_IO = {
+    "table": "raw_io",
+    "order": ["seq"],
+    "cols": [
+        ("day", "date"), ("seq", "int"), ("ts_ms", "int"), ("id", "int"),
+        ("grp", "text"), ("model", "text"), ("account", "text"),
+        ("status", "int"), ("duration_ms", "int"), ("user_id", "text"),
+        ("tokens_in", "int"), ("tokens_out", "int"), ("parsed", "bool"),
+        ("rec_hash", "bytea"), ("src", "text"), ("src_off", "int"),
+        ("line", "bytea"),
+    ],
 }
+USAGE = {
+    "table": "usage",
+    "order": ["event_key"],
+    "cols": [
+        ("event_key", "text"), ("ts_ms", "int"), ("tenant", "text"),
+        ("grp", "text"), ("model", "text"), ("status", "int"),
+        ("tokens_in", "int"), ("tokens_out", "int"),
+        ("cache_read", "int"), ("cache_creation", "int"),
+    ],
+}
+METRICS_EVENTS = {
+    "table": "metrics_events",
+    "order": ["seq"],
+    "cols": [
+        ("seq", "int"), ("id", "text"), ("ts", "int"), ("day", "date"),
+        ("event_type", "text"), ("json", "text"),
+    ],
+}
+# Malformed JSONL lines soma-work keeps verbatim: data, so they move too.
+METRICS_UNPARSED = {
+    "table": "metrics_unparsed",
+    "order": ["file", "line_no"],
+    "cols": [("file", "text"), ("line_no", "int"), ("text", "text")],
+}
+# Data tables per kind. Bookkeeping tables (`meta`, `metrics_jsonl_imports`,
+# `metrics_exports`, `metrics_day_rev`) describe the SQLite files and their
+# archives; a server backend keeps its own.
+KINDS = {
+    "raw-io": [RAW_IO],
+    "usage": [USAGE],
+    "metrics": [METRICS_EVENTS, METRICS_UNPARSED],
+}
+TEXT_ORDER = {"event_key", "file"}  # ordered bytewise: COLLATE "C" in PostgreSQL
 
 # COPY text format escapes (the set PostgreSQL's COPY TO emits).
 _ESC = {"\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\v": "\\v"}
 _ESC_TABLE = str.maketrans(_ESC)
 
 
-def enc(value, typ):
+class Unsupported(ValueError):
+    pass
+
+
+def enc(value, typ, where):
+    """COPY text for one SQLite value. Strict: a value that would change on
+    the way into PostgreSQL (a REAL in an INTEGER column, 2 in a boolean,
+    TEXT in a BLOB...) raises instead of being normalised, because the
+    verifier uses this same function and would otherwise agree with it."""
     if value is None:
         return "\\N"
-    if typ == "bytea":
-        return "\\\\x" + bytes(value).hex()
-    if typ == "bool":
+    if typ == "int" and type(value) is int:
+        return str(value)
+    if typ == "bool" and type(value) is int and value in (0, 1):
         return "t" if value else "f"
-    if typ == "int":
-        return str(int(value))
-    return str(value).translate(_ESC_TABLE)
+    if typ == "bytea" and isinstance(value, bytes):
+        return "\\\\x" + value.hex()
+    if typ == "text" and isinstance(value, str):
+        return value.translate(_ESC_TABLE)
+    if typ == "date" and isinstance(value, str):
+        try:
+            if datetime.date.fromisoformat(value).isoformat() == value:
+                return value
+        except ValueError:
+            pass
+    raise Unsupported(f"{where}: {type(value).__name__} {value!r} is not a lossless {typ}")
 
 
 def raw_io_day(path):
@@ -94,29 +124,22 @@ def raw_io_day(path):
     return day
 
 
-def sqlite_rows(kind, path):
-    """COPY-text lines of the SQLite rows, in verification order."""
-    spec = KINDS[kind]
+def sqlite_rows(kind, spec, path):
+    """COPY-text lines of one table's SQLite rows, in verification order."""
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        if kind == "raw-io":
-            day = raw_io_day(path)
-            cols = [c for c, _ in spec["cols"] if c != "day"]
-            prefix = [day]
-            types = [t for c, t in spec["cols"] if c != "day"]
-        else:
-            cols = [c for c, _ in spec["cols"]]
-            prefix = []
-            types = [t for _, t in spec["cols"]]
-        sql = f"SELECT {', '.join(cols)} FROM {spec['source']} ORDER BY {spec['order']}"
-        for row in con.execute(sql):
-            yield "\t".join(prefix + [enc(v, t) for v, t in zip(row, types)]) + "\n"
+        cols = [(c, t) for c, t in spec["cols"] if not (kind == "raw-io" and c == "day")]
+        prefix = [raw_io_day(path)] if kind == "raw-io" else []
+        sql = f"SELECT {', '.join(c for c, _ in cols)} FROM {spec['table']} ORDER BY {', '.join(spec['order'])}"
+        for i, row in enumerate(con.execute(sql)):
+            fields = [enc(v, t, f"{spec['table']}.{c} (row {i + 1} in order)") for v, (c, t) in zip(row, cols)]
+            yield "\t".join(prefix + fields) + "\n"
     finally:
         con.close()
 
 
 def cmd_load(args):
-    spec = KINDS[args.kind]
+    sys.stdout.reconfigure(encoding="utf-8")
     out = sys.stdout
     out.write("\\set ON_ERROR_STOP on\nBEGIN;\n")
     if args.kind == "raw-io":
@@ -126,22 +149,32 @@ def cmd_load(args):
         out.write(
             f"CREATE TABLE {part} PARTITION OF raw_io FOR VALUES FROM ('{day}') TO ('{nxt}');\n"
         )
-    out.write(f"COPY {spec['table']} ({', '.join(c for c, _ in spec['cols'])}) FROM STDIN;\n")
-    n = 0
-    for line in sqlite_rows(args.kind, args.file):
-        out.write(line)
-        n += 1
-    out.write("\\.\nCOMMIT;\n")
-    print(f"{args.kind}: {n} rows emitted", file=sys.stderr)
+    for spec in KINDS[args.kind]:
+        out.write(f"COPY {spec['table']} ({', '.join(c for c, _ in spec['cols'])}) FROM STDIN;\n")
+        n = 0
+        try:
+            for line in sqlite_rows(args.kind, spec, args.file):
+                out.write(line)
+                n += 1
+        except Unsupported:
+            # End the COPY and roll the whole load back explicitly, so psql
+            # never commits the rows already streamed.
+            out.write("\\.\nROLLBACK;\n")
+            out.flush()
+            raise
+        out.write("\\.\n")
+        print(f"{spec['table']}: {n} rows emitted", file=sys.stderr)
+    out.write("COMMIT;\n")
 
 
-def pg_digest(kind, path, psql):
-    spec = KINDS[kind]
-    cols = ", ".join(f"{c}" for c, _ in spec["cols"])
-    order = spec["order"] + (' COLLATE "C"' if spec["order"] == "event_key" else "")
+def pg_digest(kind, spec, path, psql):
+    cols = ", ".join(c for c, _ in spec["cols"])
+    order = ", ".join(c + (' COLLATE "C"' if c in TEXT_ORDER else "") for c in spec["order"])
     where = f" WHERE day = '{raw_io_day(path)}'" if kind == "raw-io" else ""
     query = f"COPY (SELECT {cols} FROM {spec['table']}{where} ORDER BY {order}) TO STDOUT"
-    proc = subprocess.Popen(shlex.split(psql) + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", query],
+    # Pin the output settings the encoding above mirrors.
+    pin = "SET bytea_output = 'hex'; SET DateStyle = 'ISO, MDY'; SET client_encoding = 'UTF8';"
+    proc = subprocess.Popen(shlex.split(psql) + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", pin, "-c", query],
                             stdout=subprocess.PIPE)
     h, n = hashlib.sha256(), 0
     for line in proc.stdout:
@@ -153,21 +186,18 @@ def pg_digest(kind, path, psql):
 
 
 def cmd_verify(args):
-    h, n = hashlib.sha256(), 0
-    for line in sqlite_rows(args.kind, args.file):
-        h.update(line.encode("utf-8", "surrogateescape"))
-        n += 1
-    sqlite_side = (n, h.hexdigest())
-    pg_side = pg_digest(args.kind, args.file, args.psql)
-    result = {
-        "kind": args.kind,
-        "file": args.file,
-        "sqlite_rows": sqlite_side[0],
-        "pg_rows": pg_side[0],
-        "rows_sha256_sqlite": sqlite_side[1],
-        "rows_sha256_pg": pg_side[1],
-        "equal": sqlite_side == pg_side,
-    }
+    tables, equal = [], True
+    for spec in KINDS[args.kind]:
+        h, n = hashlib.sha256(), 0
+        for line in sqlite_rows(args.kind, spec, args.file):
+            h.update(line.encode("utf-8"))
+            n += 1
+        pg_n, pg_sha = pg_digest(args.kind, spec, args.file, args.psql)
+        same = (n, h.hexdigest()) == (pg_n, pg_sha)
+        equal = equal and same
+        tables.append({"table": spec["table"], "sqlite_rows": n, "pg_rows": pg_n,
+                       "rows_sha256_sqlite": h.hexdigest(), "rows_sha256_pg": pg_sha, "equal": same})
+    result = {"kind": args.kind, "file": args.file, "tables": tables}
     if args.kind == "raw-io" and args.manifest:
         m = json.load(open(args.manifest))
         con = sqlite3.connect(f"file:{args.file}?mode=ro", uri=True)
@@ -177,12 +207,13 @@ def cmd_verify(args):
             lh.update(b"\n")
             ln += 1
         con.close()
-        result.update(manifest_rows=m["rows"], manifest_plain_sha256=m["plain_sha256"],
-                      lines_sha256=lh.hexdigest(),
-                      manifest_equal=(ln == m["rows"] and lh.hexdigest() == m["plain_sha256"]))
-        result["equal"] = result["equal"] and result["manifest_equal"]
+        same = ln == m["rows"] and lh.hexdigest() == m["plain_sha256"]
+        result["manifest"] = {"rows": m["rows"], "plain_sha256": m["plain_sha256"],
+                              "lines": ln, "lines_sha256": lh.hexdigest(), "equal": same}
+        equal = equal and same
+    result["equal"] = equal
     print(json.dumps(result, indent=1))
-    return 0 if result["equal"] else 1
+    return 0 if equal else 1
 
 
 def main():
@@ -194,12 +225,16 @@ def main():
         s.add_argument("file")
         if name == "verify":
             s.add_argument("--psql", required=True, help='e.g. "docker exec -i llmux-pg psql -U llmux -d llmux"')
-            s.add_argument("--manifest", help="raw-io: archive manifest of the same day")
+            s.add_argument("--manifest", help="raw-io: archive manifest of a single-generation day")
     args = p.parse_args()
-    if args.cmd == "load":
-        cmd_load(args)
-        return 0
-    return cmd_verify(args)
+    try:
+        if args.cmd == "load":
+            cmd_load(args)
+            return 0
+        return cmd_verify(args)
+    except Unsupported as err:
+        print(f"refusing a lossy copy: {err}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

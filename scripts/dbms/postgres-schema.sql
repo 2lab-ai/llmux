@@ -60,3 +60,12 @@ CREATE TABLE IF NOT EXISTS metrics_events (
     json       text   NOT NULL
 );
 CREATE INDEX IF NOT EXISTS metrics_events_day_ts ON metrics_events (day, ts);
+-- Malformed JSONL lines soma-work keeps verbatim (data: copied and verified).
+CREATE TABLE IF NOT EXISTS metrics_unparsed (
+    file    text    NOT NULL,
+    line_no integer NOT NULL,
+    text    text    NOT NULL,
+    PRIMARY KEY (file, line_no)
+);
+-- Bookkeeping tables (meta, metrics_jsonl_imports, metrics_exports,
+-- metrics_day_rev) describe the SQLite files and archives; not copied.

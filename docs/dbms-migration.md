@@ -11,7 +11,11 @@ so a copy can be checked row for row.
 | raw-io capture | `~/.local/state/llmux/store/raw-io/YYYY-MM-DD.sqlite3`, table `raw_io` | `raw_io`, range-partitioned by `day`; one partition per day file |
 | raw-io past days | `store/raw-io/archive/YYYY-MM-DD[.N].jsonl.zst` + `.manifest.json` | stay as files (see below); restore a day to load it |
 | keys-usage statistics | `usage.sqlite3` next to the config, table `usage` | `usage` |
-| soma-work metrics | `{DATA_DIR}/metrics/metrics.sqlite3`, table `metrics_events` | `metrics_events` |
+| soma-work metrics | `{DATA_DIR}/metrics/metrics.sqlite3`, tables `metrics_events` and `metrics_unparsed` (malformed lines kept verbatim) | `metrics_events`, `metrics_unparsed` |
+
+Bookkeeping tables (`meta`, `metrics_jsonl_imports`, `metrics_exports`,
+`metrics_day_rev`) describe the SQLite files and their archives. They are not
+copied, because a server backend keeps its own.
 
 The schema is in [`scripts/dbms/postgres-schema.sql`](../scripts/dbms/postgres-schema.sql).
 The loader and verifier is [`scripts/dbms/sqlite_to_pg.py`](../scripts/dbms/sqlite_to_pg.py)
@@ -43,8 +47,8 @@ the database only when it needs to be queried.
    empty data directory:
 
    ```sh
-   cd scripts/dbms
-   LLMUX_PG_PASSWORD=... LLMUX_PG_DATA=/srv/llmux-pg docker compose up -d
+   # from the repository root
+   LLMUX_PG_PASSWORD=... LLMUX_PG_DATA=/srv/llmux-pg docker compose -f scripts/dbms/docker-compose.yml up -d
    PSQL="docker exec -i llmux-pg psql -U llmux -d llmux"
    ```
 
@@ -56,9 +60,10 @@ the database only when it needs to be queried.
    sqlite3 "$DATA_DIR/metrics/metrics.sqlite3" ".backup /tmp/metrics.sqlite3"
    ```
 
-   A finished raw-io day partition is not written any more and can be read
-   in place. To load an archived day, restore it into a scratch store first.
-   This leaves the live store unchanged:
+   Do not read a raw-io day partition in place. The daemon may seal it and
+   move it to `sealing/` and `trash/` between the load and the check. Copy
+   it, or restore the day into a scratch store. This works for archived
+   days and leaves the live store unchanged:
 
    ```sh
    mkdir -p /tmp/rs/archive && cp ~/.local/state/llmux/store/raw-io/archive/2026-08-12.* /tmp/rs/archive/
@@ -77,8 +82,15 @@ the database only when it needs to be queried.
 4. Verify. The script reads every row back out of PostgreSQL, in the same
    order, and compares the row count and a sha256 over every column with
    the SQLite file. For a raw-io day, `--manifest` also checks the result
-   against the archive manifest. The script exits with 0 only when
-   everything is equal:
+   against the archive manifest. Use it only for a day with a single
+   generation. A day with `.1`, `.2`, ... restores as the union of all its
+   generations and will not match any one manifest.
+
+   Exit status 0 means everything is equal and 1 means something differs.
+   Exit status 2 means a SQLite value cannot be copied without changing it,
+   for example a REAL in an INTEGER column, a boolean other than 0 or 1, or
+   TEXT in a BLOB column. Both `load` and `verify` refuse such a value
+   instead of normalising it:
 
    ```sh
    python3 scripts/dbms/sqlite_to_pg.py verify raw-io /tmp/rs/2026-08-12.sqlite3 --psql "$PSQL" \
@@ -92,14 +104,21 @@ Nothing in this procedure deletes them.
 
 ## Trial run (fable-m5max, 2026-10-31, PostgreSQL 17.11)
 
+I ran the procedure above from an empty data directory:
+
 | Store | Rows | Load | Verify |
 | --- | --- | --- | --- |
-| raw-io 2026-08-12 (restored from its archive) | 800 | 31 s | rows sha256 equal; lines sha256 `7b114508…` = manifest |
-| keys usage (snapshot) | 1,489,769 | 9 s | rows sha256 equal |
-| soma-work metrics (snapshot) | 37,192 | 1 s | rows sha256 equal |
+| raw-io 2026-08-12 (restored from its archive) | 800 | 55 s | rows sha256 equal; lines sha256 `7b114508…` = manifest |
+| keys usage (snapshot) | 1,489,885 | 14 s | rows sha256 equal |
+| soma-work metrics (snapshot) | 37,193 + 0 unparsed | 1 s | rows sha256 equal |
 
-A one-token change to one usage row in PostgreSQL made `verify` fail. Undoing
-the change made it pass again.
+The strict encoder accepted every value in the three real stores.
+
+Negative checks, each in a separate database:
+
+- **Unparsed line:** a `metrics_unparsed` row was copied and verified. After deleting it in PostgreSQL, `verify` exited with 1.
+- **Changed token count:** adding one token to one usage row in PostgreSQL made `verify` exit with 1. Undoing the change made it pass again.
+- **REAL in an INTEGER column:** a value such as 1774463816599.5 in `metrics_events.ts` makes both `load` and `verify` exit with 2. This holds whether the bad row comes first or last. When it is the last of 37,193 rows, the streamed rows are rolled back and nothing is stored.
 
 ## Moving the daemon itself
 
