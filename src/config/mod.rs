@@ -1048,7 +1048,14 @@ mod tests {
         let config: Config =
             serde_json::from_str(r#"{ "version": 1 }"#).expect("old config parses");
         assert!(config.raw_io.enabled, "capture defaults on");
-        assert_eq!(config.raw_io.retention_days, 90);
+        assert_eq!(
+            config.raw_io.retention_days, 0,
+            "retention is inert: nothing is deleted"
+        );
+        assert_eq!(
+            config.raw_io.hot_days, 1,
+            "today + yesterday stay hot by default"
+        );
         assert_eq!(
             config.raw_io.max_body_bytes,
             crate::proxy::raw_io::RESPONSE_CAP_BYTES,

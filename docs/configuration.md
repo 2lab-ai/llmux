@@ -235,9 +235,43 @@ The GCP project is stored per account, not here (see [Gemini accounts](#gemini-a
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `raw_io.enabled` | `true` | Capture bounded request/response payloads to `raw-io.jsonl`; disable to stop capture. |
-| `raw_io.retention_days` | `90` | Prune older records at startup; `0` keeps all history. |
+| `raw_io.enabled` | `true` | Capture bounded request/response payloads into the raw-io store; disable to stop capture. |
+| `raw_io.hot_days` | `1` | Past days kept as queryable SQLite partitions besides today. Older days are sealed into verified archives. Read at daemon start. |
+| `raw_io.legacy_import` | `true` | Import a pre-upgrade `raw-io.jsonl` into the store in the background (resumable; the file is then moved to `store/raw-io/legacy/`, never deleted). `false` leaves it for a manual `llmux raw-io import`. |
+| `raw_io.retention_days` | `0` | Deprecated and ignored. llmux never deletes raw-io data; a non-zero value only logs a startup warning. |
 | `raw_io.max_body_bytes` | `8388608` | Per-body capture limit for requests/responses, streaming or JSON. |
+
+### Where raw-io is stored
+
+The daemon writes one row per request into a SQLite partition per local
+calendar day under `$XDG_STATE_HOME/llmux/store/raw-io/`
+(`~/.local/state/llmux/store/raw-io/` by default):
+
+| Path | Contents |
+| --- | --- |
+| `YYYY-MM-DD.sqlite3` | Hot partition. Table `raw_io`: metadata columns (`ts_ms`, `id`, `grp`, `model`, `account`, `status`, `duration_ms`, `user_id`, `tokens_in`, `tokens_out`) plus `line`, the exact JSON line the old `raw-io.jsonl` held. |
+| `archive/YYYY-MM-DD[.N].jsonl.zst` | A sealed past day: its lines in insertion order, zstd level 3 with a 1 GiB long-distance window (decode with `zstd -d --long=31`). A `.manifest.json` beside it records row count, sha256 and per-source counts. |
+| `spool/` | Fallback when a partition write fails (fsynced; imported on the next maintenance cycle). |
+| `legacy/` | Fully imported pre-upgrade `raw-io.jsonl` and spool files, kept verbatim. |
+| `trash/` | Hot partitions already archived. Removed only after 24 hours and only if the archive decodes again to the manifest's row count. |
+
+The maintenance cycle runs at startup and every 10 minutes. It imports a
+pre-upgrade `raw-io.jsonl` (resumable; every line becomes a row, unreadable
+lines are kept verbatim), checks that row counts match the source's line
+count, moves the source to `legacy/`, then seals days older than
+`raw_io.hot_days`. Each archive is verified row by row (count and sha256)
+before its hot partition moves to `trash/`. When free space drops below twice
+the largest hot partition (at least 10 GiB), today is sealed early too.
+
+Day archives compress about 70 to 90 times on real traffic, because Claude
+Code resends the whole conversation on every turn. Compressing each record on
+its own reaches only about 4 times, which is why past days are archived as one
+stream per day rather than kept in a database. A future server database
+(for example Postgres in Docker) maps to the same metadata columns with the
+body in a separate column or blob store.
+
+Use `llmux raw-io` to inspect and operate the store (see
+[operational reference](operational-reference.md#raw-io-store)).
 
 Credential headers are redacted; prompt/response bodies may still contain private
 content. The SDK upstream legs are labeled `claude-agent-sdk` and contain bridge

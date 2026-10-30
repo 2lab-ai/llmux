@@ -1494,22 +1494,48 @@ pub async fn serve(
             }
         })
     });
-    // 2. Raw-io retention prune (Feature B): guarded by config (`enabled =
-    //    false` skips it; `retention_days = 0` keeps everything). The scan is
-    //    streaming and the commit preserves records appended while it ran (see
-    //    `proxy::raw_io::prune`), so it is safe next to live traffic — and the
-    //    multi-GB payload log no longer stands between restart and readiness.
-    let prune_task = state.config.raw_io.enabled.then(|| {
+    // 2. Raw-io store maintenance (raw-io v2): import the pre-upgrade
+    //    `raw-io.jsonl` and any spool generations into the day partitions
+    //    (resumable, reconciled, the source moved to `legacy/` — never
+    //    deleted), then seal past days into verified long-window zstd
+    //    archives. Repeats every `RAW_STORE_TICK`. There is no retention
+    //    prune any more: llmux never deletes raw-io data.
+    let raw_store_task = state.config.raw_io.enabled.then(|| {
         let path = state.raw_io_path.clone();
-        let retention_days = state.config.raw_io.retention_days;
-        tokio::task::spawn_blocking(move || {
-            crate::proxy::raw_io::prune(
-                path.as_deref(),
-                retention_days,
-                crate::proxy::raw_io::now_ms(),
-            )
+        let raw_io = state.config.raw_io;
+        let hub = state.hub.clone();
+        tokio::spawn(async move {
+            let Some(path) = path else { return };
+            if raw_io.retention_days != 0 {
+                tracing::warn!(
+                    retention_days = raw_io.retention_days,
+                    "raw_io.retention_days is ignored: llmux never deletes raw-io; \
+                     past days are archived after raw_io.hot_days"
+                );
+            }
+            let store = crate::proxy::raw_store::store_for(&path);
+            loop {
+                let cycle_store = Arc::clone(&store);
+                let report = tokio::task::spawn_blocking(move || {
+                    raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import)
+                })
+                .await;
+                if let Ok(notes) = report {
+                    for (note, warn) in notes {
+                        hub.push_note(note, warn, SystemTime::now());
+                    }
+                }
+                if store.stop_requested() {
+                    return;
+                }
+                tokio::time::sleep(RAW_STORE_TICK).await;
+            }
         })
     });
+    let raw_store_for_stop = state
+        .raw_io_path
+        .clone()
+        .map(|p| crate::proxy::raw_store::store_for(&p));
 
     // Stop these the moment shutdown is requested — NOT after the drain. A
     // draining daemon that keeps refreshing tokens fights its successor over
@@ -1523,6 +1549,9 @@ pub async fn serve(
                 .as_ref()
                 .map(tokio::task::JoinHandle::abort_handle),
             fold_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle),
+            raw_store_task
                 .as_ref()
                 .map(tokio::task::JoinHandle::abort_handle),
         ]
@@ -1545,6 +1574,12 @@ pub async fn serve(
     .with_graceful_shutdown(async move {
         shutdown.notified().await;
         on_shutdown.stop_all();
+        // A long legacy import/archive runs on the blocking pool, which the
+        // runtime waits for at exit: ask it to stop at its next committed
+        // batch (resumable) so a restart is not held hostage.
+        if let Some(store) = raw_store_for_stop.as_ref() {
+            store.request_stop();
+        }
         tracing::info!(
             "shutdown: background loops stopping; draining in-flight connections (deadline {}s)",
             drain_deadline.as_secs()
@@ -1599,10 +1634,78 @@ pub async fn serve(
     if let Some(usage_import_task) = usage_import_task {
         usage_import_task.abort();
     }
-    if let Some(prune_task) = prune_task {
-        prune_task.abort();
+    if let Some(raw_store_task) = raw_store_task {
+        raw_store_task.abort();
     }
     result.map_err(ProxyError::Io)
+}
+
+/// Interval between raw-io store maintenance cycles (import + archive).
+const RAW_STORE_TICK: Duration = Duration::from_secs(600);
+
+/// One raw-io maintenance cycle on the blocking pool: import pending legacy /
+/// spool sources, then seal eligible past days. When free space drops below
+/// twice the largest hot partition (floor 10 GiB) today is sealed too, so a
+/// near-full disk keeps shrinking instead of failing writes. Returns
+/// dashboard notes `(text, is_warning)`; never panics.
+fn raw_store_maintenance(
+    store: &crate::proxy::raw_store::RawStore,
+    hot_days: u64,
+    legacy_import: bool,
+) -> Vec<(String, bool)> {
+    use crate::proxy::raw_store::{free_bytes, DEFAULT_MIN_FREE_BYTES};
+    let mut notes = Vec::new();
+    match store.import_pending(DEFAULT_MIN_FREE_BYTES, legacy_import) {
+        Ok(outcomes) => {
+            for o in outcomes.iter().filter(|o| o.inserted > 0) {
+                tracing::info!(source = %o.source, inserted = o.inserted, duplicates = o.duplicates, unparsed = o.unparsed, "raw-io import progress");
+                notes.push((format!("raw-io: imported {} records", o.inserted), false));
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "raw-io import paused");
+            notes.push((format!("raw-io import paused ({err})"), true));
+        }
+    }
+    if store.stop_requested() {
+        return notes;
+    }
+    let status = store.status();
+    let largest = status.hot.iter().map(|p| p.bytes).max().unwrap_or(0);
+    let floor = largest.saturating_mul(2).max(10 * 1024 * 1024 * 1024);
+    let low_disk = status.free_bytes.is_some_and(|free| free < floor);
+    if low_disk {
+        tracing::warn!(free = ?status.free_bytes, floor, "raw-io: low disk — sealing today early");
+        notes.push((
+            "raw-io: low disk — sealing today's partition early".into(),
+            true,
+        ));
+    }
+    match store.archive_cycle(crate::proxy::raw_io::now_ms(), hot_days, low_disk) {
+        Ok(done) => {
+            for a in &done {
+                notes.push((
+                    format!(
+                        "raw-io: archived {} ({} records, {} MB → {} MB)",
+                        a.day,
+                        a.rows,
+                        a.plain_bytes / 1_000_000,
+                        a.archive_bytes / 1_000_000
+                    ),
+                    false,
+                ));
+            }
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "raw-io archive failed — hot partition kept");
+            notes.push((
+                format!("raw-io archive failed ({err}) — data kept hot"),
+                true,
+            ));
+        }
+    }
+    let _ = free_bytes;
+    notes
 }
 
 /// The set of group filters to evaluate on each scheduler tick. With routing
@@ -1772,6 +1875,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/status", get(status))
         .route("/llmux/dashboard", get(dashboard_endpoint))
         .route("/llmux/raw-io", get(raw_io_endpoint))
+        .route("/llmux/raw-io/status", get(raw_io_status_endpoint))
         .route("/llmux/switch", post(switch_endpoint))
         .route("/llmux/codex", post(codex_config_endpoint))
         .route("/llmux/grok", post(grok_config_endpoint))
@@ -2483,20 +2587,20 @@ struct RawIoQuery {
 /// disabled, the record was pruned, or the id+timestamp pair matches nothing.
 /// The backwards scan runs on a blocking thread — the log can be tens of GB.
 async fn raw_io_endpoint(State(state): State<AppState>, Query(q): Query<RawIoQuery>) -> Response {
+    use crate::proxy::raw_store::Lookup;
     let path = state
         .config
         .raw_io
         .enabled
         .then(|| state.raw_io_path.clone())
         .flatten();
-    let record = tokio::task::spawn_blocking(move || {
-        crate::proxy::raw_io::find_record(path.as_deref(), q.id, q.at_ms)
+    let found = tokio::task::spawn_blocking(move || {
+        crate::proxy::raw_io::lookup(path.as_deref(), q.id, q.at_ms)
     })
     .await
-    .ok()
-    .flatten();
-    match record {
-        Some(record) => match serde_json::to_string(&record) {
+    .unwrap_or(Lookup::NotFound);
+    match found {
+        Lookup::Found(record) => match serde_json::to_string(&record) {
             Ok(body) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -2508,9 +2612,41 @@ async fn raw_io_endpoint(State(state): State<AppState>, Query(q): Query<RawIoQue
                 &format!("raw-io serialize failed: {err}"),
             ),
         },
-        None => relay_error(
+        Lookup::Archived(day) => relay_error(
             StatusCode::NOT_FOUND,
-            "no raw-io record for this request (capture disabled, pruned, or unknown id)",
+            &format!(
+                "raw-io record is in the {day} archive — run `llmux raw-io restore {day}` on the daemon host"
+            ),
+        ),
+        Lookup::NotFound => relay_error(
+            StatusCode::NOT_FOUND,
+            "no raw-io record for this request (capture disabled or unknown id)",
+        ),
+    }
+}
+
+/// `GET /llmux/raw-io/status` — the raw-io store's partitions, archives,
+/// import progress and the spool/lost counters of THIS daemon process.
+async fn raw_io_status_endpoint(State(state): State<AppState>) -> Response {
+    let Some(path) = state.raw_io_path.clone() else {
+        return relay_error(
+            StatusCode::NOT_FOUND,
+            "raw-io capture has no state directory",
+        );
+    };
+    let status =
+        tokio::task::spawn_blocking(move || crate::proxy::raw_store::store_for(&path).status())
+            .await;
+    match status.map(|s| serde_json::to_string(&s)) {
+        Ok(Ok(body)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        _ => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "raw-io status unavailable",
         ),
     }
 }
@@ -2886,10 +3022,12 @@ pub fn apply_settings(
             return Err("usage_max_age_secs: must be in [5, 3600]".into());
         }
     }
-    if let Some(days) = req.raw_io_retention_days {
-        if days > 3650 {
-            return Err("raw_io_retention_days: must be <= 3650".into());
-        }
+    if req.raw_io_retention_days.is_some() {
+        return Err(
+            "raw_io_retention_days: removed — llmux never deletes raw-io; past days are \
+             archived after raw_io.hot_days (config file)"
+                .into(),
+        );
     }
     if let Some(bytes) = req.raw_io_max_body_bytes {
         if !(1024..=1_073_741_824).contains(&bytes) {
@@ -5649,7 +5787,7 @@ mod tests {
             State(state.clone()),
             axum::extract::Json(SettingsRequest {
                 tui_effects: Some(false),
-                raw_io_retention_days: Some(7),
+                raw_io_max_body_bytes: Some(1_048_576),
                 ..Default::default()
             }),
         )
@@ -5661,7 +5799,7 @@ mod tests {
         let ack: SettingsAck = serde_json::from_slice(&bytes).expect("typed ack parses");
         assert!(ack.ok);
         assert_eq!(ack.applied, vec!["tui_effects"]);
-        assert_eq!(ack.restart_required, vec!["raw_io_retention_days"]);
+        assert_eq!(ack.restart_required, vec!["raw_io_max_body_bytes"]);
         assert!(
             serde_json::from_str::<SettingsAck>("{}").is_err(),
             "an empty object must not read as a verified ack"
@@ -5696,6 +5834,11 @@ mod tests {
                 upstream: Some("ftp://nope".into()),
                 ..Default::default()
             },
+            // Retention is gone: llmux never deletes raw-io.
+            SettingsRequest {
+                raw_io_retention_days: Some(7),
+                ..Default::default()
+            },
         ] {
             apply_settings(&state, &bad).expect_err("invalid value rejected");
         }
@@ -5711,7 +5854,7 @@ mod tests {
             tui_effects: Some(false),
             routing_enabled: Some(true),
             five_hour_max: Some(0.5),
-            raw_io_retention_days: Some(7),
+            raw_io_max_body_bytes: Some(1_048_576),
             ..Default::default()
         };
         let (applied, restart) = apply_settings(&state, &req).expect("valid");
@@ -5719,7 +5862,7 @@ mod tests {
             applied,
             vec!["tui_effects", "routing_enabled", "five_hour_max"]
         );
-        assert_eq!(restart, vec!["raw_io_retention_days"]);
+        assert_eq!(restart, vec!["raw_io_max_body_bytes"]);
         // Live holders flipped (no restart)...
         assert!(!state.settings_live.tui_effects.load(Ordering::Relaxed));
         assert!(state.settings_live.routing_enabled.load(Ordering::Relaxed));
@@ -5733,7 +5876,7 @@ mod tests {
         assert!(!on_disk.tui_effects);
         assert!(on_disk.routing.enabled);
         assert_eq!(on_disk.scheduler.five_hour_max, 0.5);
-        assert_eq!(on_disk.raw_io.retention_days, 7);
+        assert_eq!(on_disk.raw_io.max_body_bytes, 1_048_576);
         assert_eq!(on_disk.accounts.len(), 1, "accounts survive the merge");
     }
 

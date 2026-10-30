@@ -62,7 +62,7 @@ Claude through Codex still stops at the SDK transport boundary described below.
   replaying. Raw bodies copy to the clipboard, and `save all` writes the whole
   record JSON to `~/Downloads`. A provider bug report with the exact failing frame
   attached is one keypress away.
-- **Wire truth, archived.** Captures persist to `raw-io.jsonl`, and the repo's
+- **Wire truth, archived.** Captures persist to the raw-io store (day partitions under `store/raw-io/`, past days archived as `jsonl.zst`), and the repo's
   [captured system prompts](system-prompts/) were taken from this same wire —
   what Claude Code actually injects per model, not what the docs say it injects.
 - **Email masking for screen shares.** `email_anonymous` masks every account email
