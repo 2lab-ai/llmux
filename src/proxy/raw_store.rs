@@ -392,7 +392,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreEr
     Ok(())
 }
 
-fn sync_dir(dir: Option<&Path>) {
+pub(crate) fn sync_dir(dir: Option<&Path>) {
     if let Some(dir) = dir {
         if let Ok(d) = File::open(dir) {
             let _ = d.sync_all();

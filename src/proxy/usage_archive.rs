@@ -25,7 +25,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::raw_store::{day_key, StoreError};
+use super::raw_store::{day_key, sync_dir, StoreError};
 
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
@@ -72,7 +72,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Latest manifest of `day` and the next free generation number. A data
 /// file without a manifest (crash between the two renames) still occupies
-/// its generation, so it is never overwritten.
+/// its generation, so it is never overwritten; a manifest whose data file
+/// is missing is not trusted, so that day is exported again.
 fn latest(dir: &Path, day: &str) -> (Option<UsageManifest>, u32) {
     let mut generation = 0u32;
     let mut last = None;
@@ -82,8 +83,10 @@ fn latest(dir: &Path, day: &str) -> (Option<UsageManifest>, u32) {
         if !m.exists() && !z.exists() {
             return (last, generation);
         }
-        if let Some(parsed) = fs::read_to_string(&m)
-            .ok()
+        if let Some(parsed) = z
+            .exists()
+            .then(|| fs::read_to_string(&m).ok())
+            .flatten()
             .and_then(|t| serde_json::from_str::<UsageManifest>(&t).ok())
         {
             last = Some(parsed);
@@ -157,34 +160,26 @@ pub fn export_usage_days(
         return Ok(Vec::new());
     };
     let mut written = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut n = local_day_number(first);
     loop {
         let day = day_key(n);
         if day.as_str() >= today {
-            return Ok(written);
+            break;
         }
         if stop() {
             return Err(StoreError::Busy("shutdown".into()));
         }
         let (lo, hi) = bracket(n);
-        let (count, sum_ts, max_ts): (i64, i64, i64) = conn.query_row(
-            &format!(
-                "SELECT count(*), coalesce(sum(ts_ms), 0), coalesce(max(ts_ms), 0) \
-                   FROM usage WHERE {DAY_FILTER}"
-            ),
-            rusqlite::params![lo, hi, day],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        if count > 0 {
-            let fingerprint = format!("{count}:{sum_ts}:{max_ts}");
-            let (last, generation) = latest(&dir, &day);
-            if last.as_ref().is_none_or(|m| m.fingerprint != fingerprint) {
-                let lines = read_day(&conn, lo, hi, &day, stop)?;
-                if let Some(rows) =
-                    publish_day(&dir, &day, generation, last.as_ref(), &lines, fingerprint)?
-                {
-                    written.push((day, generation, rows));
-                }
+        match export_day(&conn, &dir, &day, lo, hi, stop) {
+            Ok(Some((generation, rows))) => written.push((day, generation, rows)),
+            Ok(None) => {}
+            Err(err @ StoreError::Busy(_)) => return Err(err),
+            // One bad day must not stall the later ones; it is retried next
+            // cycle (its rows are still in the live database).
+            Err(err) => {
+                tracing::warn!(%day, error = %err, "keys usage day export failed");
+                failures.push(format!("{day}: {err}"));
             }
         }
         // Next day with any row: one index seek, so long idle gaps cost
@@ -199,22 +194,77 @@ pub fn export_usage_days(
             .optional()?;
         match next {
             Some(ts) => n = (n + 1).max(local_day_number(ts)),
-            None => return Ok(written),
+            None => break,
         }
+    }
+    if failures.is_empty() {
+        Ok(written)
+    } else {
+        Err(StoreError::Other(format!(
+            "{} day(s) failed ({}); {} exported",
+            failures.len(),
+            failures.join("; "),
+            written.len()
+        )))
     }
 }
 
-/// One day's rows as jsonl lines, in one short statement (dropped before
-/// the caller compresses anything).
+/// `count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the sum far
+/// from i64 overflow.
+fn fingerprint(count: i64, sum_off: i64, max_ts: i64) -> String {
+    format!("{count}:{sum_off}:{max_ts}")
+}
+
+/// Export one local day if its rows changed. `Ok(Some((generation, rows)))`
+/// = a new file was published.
+fn export_day(
+    conn: &Connection,
+    dir: &Path,
+    day: &str,
+    lo: i64,
+    hi: i64,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<(u32, u64)>, StoreError> {
+    let (count, sum_off, max_ts): (i64, i64, i64) = conn.query_row(
+        &format!(
+            "SELECT count(*), coalesce(sum(ts_ms - ?1), 0), coalesce(max(ts_ms), 0) \
+               FROM usage WHERE {DAY_FILTER}"
+        ),
+        rusqlite::params![lo, hi, day],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let (last, generation) = latest(dir, day);
+    if last
+        .as_ref()
+        .is_some_and(|m| m.fingerprint == fingerprint(count, sum_off, max_ts))
+    {
+        return Ok(None);
+    }
+    let (lines, read_fp) = read_day(conn, lo, hi, day, stop)?;
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(
+        publish_day(dir, day, generation, last.as_ref(), &lines, read_fp, stop)?
+            .map(|rows| (generation, rows)),
+    )
+}
+
+/// One day's rows as jsonl lines plus the fingerprint of exactly those rows,
+/// in one short statement (dropped before the caller compresses anything).
 fn read_day(
     conn: &Connection,
     lo: i64,
     hi: i64,
     day: &str,
     stop: &dyn Fn() -> bool,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<(Vec<String>, String), StoreError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
+        "SELECT ts_ms,
+                json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
                             'grp', grp, 'model', model, 'status', status,
                             'tokens_in', tokens_in, 'tokens_out', tokens_out,
                             'cache_read', cache_read, 'cache_creation', cache_creation)
@@ -222,13 +272,18 @@ fn read_day(
     ))?;
     let mut rows = stmt.query(rusqlite::params![lo, hi, day])?;
     let mut lines = Vec::new();
+    let (mut sum_off, mut max_ts) = (0i64, 0i64);
     while let Some(row) = rows.next()? {
-        lines.push(row.get::<_, String>(0)?);
-        if lines.len() % 4096 == 0 && stop() {
+        let ts: i64 = row.get(0)?;
+        sum_off += ts - lo;
+        max_ts = max_ts.max(ts);
+        lines.push(row.get::<_, String>(1)?);
+        if lines.len().is_multiple_of(4096) && stop() {
             return Err(StoreError::Busy("shutdown".into()));
         }
     }
-    Ok(lines)
+    let fp = fingerprint(lines.len() as i64, sum_off, max_ts);
+    Ok((lines, fp))
 }
 
 /// Write, decode-verify and publish one day. `Ok(None)` = byte-identical to
@@ -240,6 +295,7 @@ fn publish_day(
     last: Option<&UsageManifest>,
     lines: &[String],
     fingerprint: String,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Option<u64>, StoreError> {
     let mut body = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
     for l in lines {
@@ -249,6 +305,9 @@ fn publish_day(
     let sha = hex(&Sha256::digest(body.as_bytes()));
     if last.is_some_and(|m| m.plain_sha256 == sha) {
         return Ok(None);
+    }
+    if stop() {
+        return Err(StoreError::Busy("shutdown".into()));
     }
     let path = dir.join(name(day, generation, "jsonl.zst"));
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
@@ -274,6 +333,11 @@ fn publish_day(
         }
         hasher.update(&buf);
         n += 1;
+        if n.is_multiple_of(65_536) && stop() {
+            // Our own unpublished temp file; the day is redone next cycle.
+            let _ = fs::remove_file(&tmp);
+            return Err(StoreError::Busy("shutdown".into()));
+        }
     }
     if hex(&hasher.finalize()) != sha || n != lines.len() as u64 {
         // Our own unpublished temp file, not data: the rows are still in
@@ -285,6 +349,9 @@ fn publish_day(
         });
     }
     fs::rename(&tmp, &path)?;
+    // The data file is durable under its final name before any manifest
+    // can claim it.
+    sync_dir(Some(dir));
     let manifest = UsageManifest {
         day: day.to_string(),
         generation,
@@ -301,6 +368,7 @@ fn publish_day(
     fs::write(&mtmp, serde_json::to_vec_pretty(&manifest)?)?;
     File::open(&mtmp)?.sync_all()?;
     fs::rename(&mtmp, final_manifest)?;
+    sync_dir(Some(dir));
     Ok(Some(n))
 }
 
@@ -390,6 +458,20 @@ mod tests {
             rows.push((format!("k{ts}"), ts));
             ts += 37 * 60_000;
         }
+        // The first and last minutes of every local day (the bands a
+        // wrongly anchored window would drop).
+        let first_day = local_day_number(T0 as i64);
+        for n in first_day..first_day + 8 {
+            let (lo, _) = bracket(n);
+            let midnight = lo + BRACKET_MS; // local midnight of day n
+            for (tag, at) in [
+                ("open", midnight + 5 * 60_000),
+                ("close", midnight + DAY_MS - 5 * 60_000),
+            ] {
+                let ts = u64::try_from(at).expect("positive");
+                rows.push((format!("{tag}{n}"), ts));
+            }
+        }
         // Crosses the US DST end (2026-11-01); then idle days, one more
         // active day and "today".
         rows.push(("late1".into(), T0 + 14 * DAY));
@@ -403,6 +485,13 @@ mod tests {
             let d = day_of(*t);
             if d < today {
                 *expected.entry(d).or_default() += 1;
+            }
+        }
+        // The edge rows really sit at 00:05 / 23:55 local of distinct days.
+        for (k, t) in &rows {
+            if let Some(n) = k.strip_prefix("open").or_else(|| k.strip_prefix("close")) {
+                let n: i64 = n.parse().expect("n");
+                assert_eq!(day_of(*t), day_key(n), "{k}");
             }
         }
         let out = export_usage_days(&db, &today, NEVER).expect("export");
@@ -467,6 +556,56 @@ mod tests {
         assert_eq!(
             export_usage_days(&db, &today, NEVER).expect("export").len(),
             2
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A manifest whose data file is gone is not trusted: the day is
+    /// exported again under the next generation.
+    #[test]
+    fn a_manifest_without_its_data_file_does_not_hide_the_day() {
+        let (dir, db) = db_with(&[("a", T0), ("b", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("export"),
+            vec![(day0.clone(), 0, 1)]
+        );
+        let ad = archive_dir_for(&db);
+        let moved = dir.join("moved-away.zst");
+        fs::rename(ad.join(format!("usage-{day0}.jsonl.zst")), &moved).expect("move");
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("again"),
+            vec![(day0.clone(), 1, 1)]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Shutdown requested once publication work has started: nothing
+    /// half-written is left, and the next run completes the day.
+    #[test]
+    fn stop_during_publication_leaves_no_partial_file() {
+        let (dir, db) = db_with(&[("a", T0), ("b", T0 + DAY)]);
+        let today = day_of(T0 + DAY);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // Call 1 = the per-day check, call 2 = the pre-compression check.
+        let stop = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        assert!(matches!(
+            export_usage_days(&db, &today, &stop),
+            Err(StoreError::Busy(_))
+        ));
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let ad = archive_dir_for(&db);
+        let files: Vec<_> = fs::read_dir(&ad)
+            .expect("ls")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".lock")
+            .collect();
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("export").len(),
+            1
         );
         let _ = fs::remove_dir_all(dir);
     }
