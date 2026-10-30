@@ -1519,15 +1519,7 @@ pub async fn serve(
                 let cycle_store = Arc::clone(&store);
                 let cycle_usage_db = usage_db.clone();
                 let report = tokio::task::spawn_blocking(move || {
-                    let mut notes =
-                        raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import);
-                    if !cycle_store.stop_requested() {
-                        notes.extend(usage_archive_maintenance(
-                            cycle_usage_db.as_deref(),
-                            &|| cycle_store.stop_requested(),
-                        ));
-                    }
-                    notes
+                    maintenance_cycle(&cycle_store, raw_io, cycle_usage_db.as_deref())
                 })
                 .await;
                 if let Ok(notes) = report {
@@ -1648,6 +1640,31 @@ pub async fn serve(
         raw_store_task.abort();
     }
     result.map_err(ProxyError::Io)
+}
+
+/// One maintenance cycle on the blocking pool. The keys-usage day export
+/// (once per local day, seconds) runs FIRST: a raw-io seal backlog can take
+/// hours (every eligible day is sealed in one `archive_cycle`), and it must
+/// not hold the statistics backup behind it (#225).
+fn maintenance_cycle(
+    store: &crate::proxy::raw_store::RawStore,
+    raw_io: crate::config::RawIoConfig,
+    usage_db: Option<&std::path::Path>,
+) -> Vec<(String, bool)> {
+    let mut notes = Vec::new();
+    if !store.stop_requested() {
+        notes.extend(usage_archive_maintenance(usage_db, &|| {
+            store.stop_requested()
+        }));
+    }
+    if !store.stop_requested() {
+        notes.extend(raw_store_maintenance(
+            store,
+            raw_io.hot_days,
+            raw_io.legacy_import,
+        ));
+    }
+    notes
 }
 
 /// Once per local day: export finished days of the keys-usage statistics to
@@ -4151,6 +4168,48 @@ async fn forward_any(State(state): State<AppState>, req: axum::extract::Request)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #225: one cycle exports the finished keys-usage days (before the
+    /// raw-io work, which can take hours), and a stop request skips both.
+    #[test]
+    fn maintenance_cycle_exports_usage_days_first_and_honours_stop() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-cycle-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let usage = dir.join("usage.sqlite3");
+        drop(crate::key_usage::UsageDb::open(&usage).expect("usage db (WAL)"));
+        let past = crate::proxy::raw_io::now_ms() - 3 * 86_400_000;
+        rusqlite::Connection::open(&usage)
+            .expect("open")
+            .execute(
+                "INSERT INTO usage (event_key, ts_ms, tenant, status) VALUES ('k', ?1, 't', 200)",
+                [past as i64],
+            )
+            .expect("row");
+        let archive = crate::proxy::usage_archive::archive_dir_for(&usage);
+        let day = crate::proxy::raw_store::day_of(past);
+
+        let stopped = crate::proxy::raw_store::store_for(&dir.join("stopped/raw-io.jsonl"));
+        stopped.request_stop();
+        assert!(maintenance_cycle(
+            &stopped,
+            crate::config::RawIoConfig::default(),
+            Some(&usage)
+        )
+        .is_empty());
+        assert!(!archive.join(format!("usage-{day}.jsonl.zst")).exists());
+
+        let store = crate::proxy::raw_store::store_for(&dir.join("live/raw-io.jsonl"));
+        let notes = maintenance_cycle(&store, crate::config::RawIoConfig::default(), Some(&usage));
+        assert!(
+            archive.join(format!("usage-{day}.jsonl.zst")).exists(),
+            "notes: {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use crate::config::{AccountConfig, AccountCredential};
     use crate::scheduler::headers::{ParsedRateLimitHeaders, WindowReading};
 

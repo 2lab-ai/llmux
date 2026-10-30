@@ -278,7 +278,9 @@ changes later gets the next generation; nothing is deleted). The database runs
 in WAL mode so the export (one short indexed read per day, skipped when the
 day's `count:sum:max` fingerprint is unchanged) never blocks metering writes;
 an export only runs once the file is in WAL mode, and one exporter at a time
-holds `usage-archive/.lock`. Decode with `zstd -d --long=31`.
+holds `usage-archive/.lock`. It runs at the start of each maintenance cycle,
+before raw-io sealing, so a long seal backlog never delays it. Decode with
+`zstd -d --long=31`.
 
 Use `llmux raw-io` to inspect and operate the store (see
 [operational reference](operational-reference.md#raw-io-store)).
