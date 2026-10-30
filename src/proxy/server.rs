@@ -1504,6 +1504,7 @@ pub async fn serve(
         let path = state.raw_io_path.clone();
         let raw_io = state.config.raw_io;
         let hub = state.hub.clone();
+        let usage_db = crate::key_usage::db_path_for_config(state.config_path.as_deref());
         tokio::spawn(async move {
             let Some(path) = path else { return };
             if raw_io.retention_days != 0 {
@@ -1516,8 +1517,12 @@ pub async fn serve(
             let store = crate::proxy::raw_store::store_for(&path);
             loop {
                 let cycle_store = Arc::clone(&store);
+                let cycle_usage_db = usage_db.clone();
                 let report = tokio::task::spawn_blocking(move || {
-                    raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import)
+                    let mut notes =
+                        raw_store_maintenance(&cycle_store, raw_io.hot_days, raw_io.legacy_import);
+                    notes.extend(usage_archive_maintenance(cycle_usage_db.as_deref()));
+                    notes
                 })
                 .await;
                 if let Ok(notes) = report {
@@ -1638,6 +1643,45 @@ pub async fn serve(
         raw_store_task.abort();
     }
     result.map_err(ProxyError::Io)
+}
+
+/// Once per local day: export finished days of the keys-usage statistics to
+/// verified `usage-archive/usage-DAY.jsonl.zst` files (same contract as the
+/// raw-io day archives; the live `usage.sqlite3` is only read).
+fn usage_archive_maintenance(usage_db: Option<&std::path::Path>) -> Vec<(String, bool)> {
+    static LAST_DAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let Some(db) = usage_db.filter(|p| p.exists()) else {
+        return Vec::new();
+    };
+    let today = crate::proxy::raw_store::day_of(crate::proxy::raw_io::now_ms());
+    {
+        let last = LAST_DAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.as_deref() == Some(today.as_str()) {
+            return Vec::new();
+        }
+    }
+    match crate::proxy::usage_archive::export_usage_days(db, &today) {
+        Ok(written) => {
+            *LAST_DAY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(today);
+            if written.is_empty() {
+                Vec::new()
+            } else {
+                tracing::info!(days = written.len(), "keys usage days archived");
+                vec![(
+                    format!("usage stats: {} past days backed up", written.len()),
+                    false,
+                )]
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "keys usage day export failed — retried next cycle");
+            vec![(format!("usage stats backup failed ({err})"), true)]
+        }
+    }
 }
 
 /// Interval between raw-io store maintenance cycles (import + archive).

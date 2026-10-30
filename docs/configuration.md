@@ -270,6 +270,12 @@ stream per day rather than kept in a database. A future server database
 (for example Postgres in Docker) maps to the same metadata columns with the
 body in a separate column or blob store.
 
+The keys-usage statistics (`usage.sqlite3`, next to the config) follow the
+same contract: SQLite stays the live store, and once a day every finished
+local day is exported to `usage-archive/usage-YYYY-MM-DD[.N].jsonl.zst` with a
+`.manifest.json` beside it (verified before it is published; a day that
+changes later gets the next generation; nothing is deleted).
+
 Use `llmux raw-io` to inspect and operate the store (see
 [operational reference](operational-reference.md#raw-io-store)).
 
