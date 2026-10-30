@@ -95,6 +95,10 @@ pub enum StoreError {
     LowDisk { free: u64, floor: u64 },
     #[error("archive verification failed for {day}: {detail}")]
     Verify { day: String, detail: String },
+    /// Not now (another writer holds the day, or shutdown): retried next
+    /// cycle, nothing failed.
+    #[error("deferred: {0}")]
+    Busy(String),
     #[error("{0}")]
     Other(String),
 }
@@ -505,6 +509,11 @@ pub struct StoreStatus {
 struct Writer {
     day: String,
     conn: Connection,
+    /// Shared lock on the day's lock file, held for the connection's
+    /// lifetime: a sealer in ANY process needs it exclusively, so it can never
+    /// move a partition another daemon (e.g. a predecessor still draining in
+    /// a rolling restart) is writing to.
+    _day_lock: File,
 }
 
 /// Process-wide registry: one store per root, so every capture call site that
@@ -577,6 +586,17 @@ impl RawStore {
     fn dir(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
+    /// `<root>/.locks/DAY.lock` — writers hold it shared, sealing exclusive.
+    fn day_lock_file(&self, day: &str) -> Result<File, StoreError> {
+        let dir = self.root.join(".locks");
+        fs::create_dir_all(&dir)?;
+        Ok(OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{day}.lock")))?)
+    }
+
     fn maint_lock(&self) -> Result<File, StoreError> {
         fs::create_dir_all(&self.root)?;
         Ok(OpenOptions::new()
@@ -616,8 +636,23 @@ impl RawStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.as_ref().is_none_or(|w| w.day != day) {
             *guard = None; // close the previous day before opening the next
+                           // Lock BEFORE opening the file. A day being sealed right now
+                           // (exclusive holder) makes this write go to the spool instead of
+                           // blocking captures; the spool lands in a fresh partition later.
+            let day_lock = self.day_lock_file(&day)?;
+            match day_lock.try_lock_shared() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(StoreError::Other(format!("{day} is being sealed")));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
             let conn = open_partition(&self.hot_path(&day), &day, Sync::Full)?;
-            *guard = Some(Writer { day, conn });
+            *guard = Some(Writer {
+                day,
+                conn,
+                _day_lock: day_lock,
+            });
         }
         let Some(w) = guard.as_ref() else {
             return Err(StoreError::Other("writer unavailable".into()));
@@ -867,6 +902,7 @@ impl RawStore {
             }
             match self.seal_and_archive(&day, false) {
                 Ok(o) => out.push(o),
+                Err(StoreError::Busy(why)) => tracing::info!(day, why, "raw-io seal deferred"),
                 Err(err) => {
                     tracing::error!(day, error = %err, "raw-io seal failed — data kept in sealing/");
                     failures.push(format!("{day}: {err}"));
@@ -888,6 +924,7 @@ impl RawStore {
             // One bad day must not wedge the others (or the trash purge).
             match self.seal_and_archive(&day, true) {
                 Ok(o) => out.push(o),
+                Err(StoreError::Busy(why)) => tracing::info!(day, why, "raw-io seal deferred"),
                 Err(err) => {
                     tracing::error!(day, error = %err, "raw-io seal failed — data kept");
                     failures.push(format!("{day}: {err}"));
@@ -945,22 +982,35 @@ impl RawStore {
                 )));
             }
             let hot = self.hot_path(day);
+            if guard.as_ref().is_some_and(|w| w.day == day) {
+                // Our own writer: checkpoint, then close (releases its
+                // shared day lock).
+                if let Some(w) = guard.as_ref() {
+                    w.conn
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+                }
+                *guard = None;
+            }
+            // No writer in any process may hold the day: exclusive or skip.
+            let day_lock = self.day_lock_file(day)?;
+            match day_lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(StoreError::Busy(format!(
+                        "{day} is open for writing in another process — not sealing this cycle"
+                    )));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
             // Fold the WAL into the main file BEFORE anything moves, so no
             // committed frame lives only in a sidecar (a sidecar left behind
             // could otherwise be replayed into a fresh partition). The writer
             // lock is held, so no live capture can reopen the day meanwhile;
             // importers are excluded by the exclusive maintenance lock.
-            match guard.as_ref() {
-                Some(w) if w.day == day => {
-                    w.conn
-                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-                    *guard = None;
-                }
-                _ => {
-                    let conn = Connection::open(&hot)?;
-                    conn.busy_timeout(Duration::from_secs(60))?;
-                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-                }
+            {
+                let conn = Connection::open(&hot)?;
+                conn.busy_timeout(Duration::from_secs(60))?;
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
             }
             let wal = PathBuf::from(format!("{}-wal", hot.display()));
             if fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
@@ -980,6 +1030,7 @@ impl RawStore {
             fs::rename(&hot, &sealed)?;
             sync_dir(Some(&self.root));
             sync_dir(Some(&sealing_dir));
+            drop(day_lock);
             drop(guard);
         }
 
@@ -1027,7 +1078,16 @@ impl RawStore {
             let mut bytes = 0u64;
             let mut stmt = conn.prepare("SELECT line FROM raw_io ORDER BY seq")?;
             let mut it = stmt.query([])?;
+            let mut n = 0u64;
             while let Some(row) = it.next()? {
+                n += 1;
+                if n.is_multiple_of(64) && self.stop_requested() {
+                    drop(enc);
+                    let _ = fs::remove_file(&tmp);
+                    return Err(StoreError::Busy(format!(
+                        "{day}: shutdown during archive — sealed copy kept in sealing/"
+                    )));
+                }
                 let line: Vec<u8> = row.get(0)?;
                 enc.write_all(&line)?;
                 enc.write_all(b"\n")?;
@@ -1054,6 +1114,12 @@ impl RawStore {
                 let k = reader.read_until(b'\n', &mut buf)?;
                 if k == 0 {
                     break;
+                }
+                if n % 64 == 63 && self.stop_requested() {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(StoreError::Busy(format!(
+                        "{day}: shutdown during verify — sealed copy kept in sealing/"
+                    )));
                 }
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
@@ -1159,6 +1225,9 @@ impl RawStore {
             return;
         };
         for e in entries.flatten() {
+            if self.stop_requested() {
+                return;
+            }
             let name = e.file_name().to_string_lossy().to_string();
             let Some(stem) = name.strip_suffix(".sqlite3") else {
                 continue;
@@ -2067,6 +2136,28 @@ mod tests {
             body.len() as u64,
             "no reset to 0"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_day_open_for_writing_elsewhere_is_not_sealed() {
+        let dir = tmp();
+        let legacy = dir.join("raw-io.jsonl");
+        // Two store instances on one root stand in for two daemons (the
+        // lock is a file lock, so the second instance contends like a
+        // second process would).
+        let draining = RawStore::new(&legacy);
+        let successor = RawStore::new(&legacy);
+        draining.capture(&rec(1, T0, "u1"));
+        let day = day_of(T0);
+        let out = successor.archive_cycle(T0, 0, true).expect("cycle");
+        assert!(out.is_empty(), "the other writer holds the day");
+        assert_eq!(successor.hot_days(), vec![day.clone()]);
+        // Once the other writer is gone the day seals.
+        drop(draining);
+        let out = successor.archive_cycle(T0, 0, true).expect("cycle");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rows, 1);
         let _ = fs::remove_dir_all(dir);
     }
 
