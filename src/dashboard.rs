@@ -847,7 +847,11 @@ fn persist_file_sizes(
     }
     let stat =
         |p: Option<&std::path::Path>| p.and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
-    let fresh = (stat(raw_io), stat(activity));
+    // Raw-io = the day-partitioned store (hot + archives + spool + legacy)
+    // plus a legacy `raw-io.jsonl` still awaiting import.
+    let raw = raw_io
+        .map(|p| stat(Some(p)).unwrap_or(0) + crate::proxy::raw_store::store_for(p).disk_bytes());
+    let fresh = (raw, stat(activity));
     *cache = Some((Instant::now(), fresh.0, fresh.1));
     fresh
 }

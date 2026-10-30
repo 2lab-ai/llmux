@@ -433,11 +433,17 @@ pub struct RawIoConfig {
     /// nothing is captured or written.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Days of history to keep. On startup, records older than
-    /// `now - retention_days * 86_400_000 ms` are pruned. `0` = keep forever
-    /// (no pruning). Default `90`.
+    /// DEPRECATED, ignored: llmux never deletes raw-io data (a startup
+    /// warning names a non-zero value). Past days are archived instead — see
+    /// [`RawIoConfig::hot_days`]. Still parsed so existing configs load.
     #[serde(default = "default_raw_io_retention_days")]
     pub retention_days: u64,
+    /// Past days kept as queryable (hot) SQLite partitions besides today.
+    /// Older days are sealed into verified `archive/YYYY-MM-DD.jsonl.zst`
+    /// files (never deleted; `llmux raw-io restore DAY` brings one back).
+    /// Default `1` (today + yesterday hot).
+    #[serde(default = "default_raw_io_hot_days")]
+    pub hot_days: u64,
     /// Per-body capture cap, in bytes, applied identically to the request body
     /// and the response body on BOTH the streaming and non-streaming paths. A
     /// body over this is clipped on a UTF-8 char boundary with a
@@ -458,6 +464,7 @@ impl Default for RawIoConfig {
         Self {
             enabled: true,
             retention_days: default_raw_io_retention_days(),
+            hot_days: default_raw_io_hot_days(),
             max_body_bytes: default_raw_io_max_body_bytes(),
         }
     }
@@ -1560,7 +1567,12 @@ fn default_idle_probe_stale_after_secs() -> u64 {
 
 /// Default raw-io retention window: 90 days (per Feature B).
 fn default_raw_io_retention_days() -> u64 {
-    90
+    0
+}
+
+/// Default raw-io hot window: today + 1 past day stay queryable SQLite.
+fn default_raw_io_hot_days() -> u64 {
+    1
 }
 
 /// Default raw-io per-body capture cap: 8 MiB

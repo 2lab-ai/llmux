@@ -51,6 +51,10 @@ unicode-width = "0.2.2"
 # item 3) — measure/split by the SAME unit ratatui renders (e.g. an emoji +
 # VS16 is one 2-cell cluster, not two scalars). Already in the tree via ratatui.
 unicode-segmentation = "1.13"
+# Raw-io day archives (`proxy::raw_store`): long-window zstd catches the
+# conversation history every Claude Code request resends — measured 72-77x
+# on real raw-io vs 3.8x for per-record compression.
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 # Local UTC offset for the dashboard's absolute reset times (localtime_r);

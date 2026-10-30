@@ -217,13 +217,13 @@ In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the
 The `config` tab (`c`, or click the tab bar) is a mouse-driven config editor covering the **entire** config schema — every field appears with an honest apply-state label:
 
 - `live` — applies immediately (holder-backed; persisted read-merge-write first, then flipped in the running daemon). Covers scheduler mode + ceilings + usage max age, codex model/effort/fast, grok effort, routing on/off, raw-io capture on/off, email mask, quota fill, TUI effects, the Fable weekly gauge.
-- `restart` — persisted now, effective on the next daemon start (routing default/on-empty group, raw-io retention and body cap, gradient speed, upstreams, port, max request bytes). The status line always says which — a saved-but-not-yet-live change never reads as applied.
+- `restart` — persisted now, effective on the next daemon start (routing default/on-empty group, raw-io body cap, gradient speed, upstreams, port, max request bytes). The status line always says which — a saved-but-not-yet-live change never reads as applied.
 - `session` — this TUI only (reset display).
 - `ro` — managed elsewhere, with the note saying where (accounts → Accounts tab, per-account limits → `L`, events → `POST /llmux/events`, pricing/gradient colors/domain abbreviations → config file, `remote.api_key` → secret).
 
-`j`/`k` (or the wheel) move the cursor; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — ask `y/n` first. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
+`j`/`k` (or the wheel) move the cursor; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0 — ask `y/n` first. The raw-io `retention` row is read-only ("never deletes"); the settings API rejects `raw_io_retention_days`. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
 
-The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config path, account count, raw-io capture state and file size, and the activity-log size (sizes refresh at most every 30s).
+The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config path, account count, raw-io capture state and store size (partitions, archives, spool, legacy), and the activity-log size (sizes refresh at most every 30s).
 
 ## Install and launch details
 
@@ -306,6 +306,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Feature | Stable 0.2.25 (2026-10-08) | Stable 0.2.26 (2026-10-26) | Preview |
 |---|---|---|---|
 | Authentication/usage history, re-login poll recovery, transient refresh handling | no | no | yes |
+| Day-partitioned raw-io store (`store/raw-io/`, verified day archives, no retention deletion, `llmux raw-io`, `GET /llmux/raw-io/status`) | no | no | yes |
 | `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
 | Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | yes (source `7fe64d1`) | yes | yes |
 | Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | yes | yes | yes |
@@ -637,11 +638,37 @@ with 200 instead of being forwarded upstream to a guaranteed 404, and a
 the pool, no exhaustion park — so a rate-limited moment paints one line, not
 one per account.
 
+### Raw-io store
+
+`llmux raw-io` operates the day-partitioned raw-io store on this machine (it
+is refused in remote mode). Output is JSON.
+
+| Command | What it does |
+| --- | --- |
+| `llmux raw-io status` | Hot partitions, archives (with manifests), spool, legacy and trash files, import progress, free space. The daemon's live counters (`spooled`, `lost`) are at `GET /llmux/raw-io/status`. |
+| `llmux raw-io import FILE…` | Import `jsonl` or `jsonl.zst` files, read as one stream in the given order. A backup split into byte ranges (`0-N`, `N-end`) therefore imports with the original file's offsets. `--from DAY` / `--to DAY` limit the local days imported. Re-running is safe: rows are deduplicated by source and byte offset, never by content. Pauses below `--min-free-gb` (default 20). |
+| `llmux raw-io restore DAY` | Import every archive generation of DAY back into a hot partition. The archive stays. |
+| `llmux raw-io archive [--hot-days N]` | Seal past days now (minimum 1, so today and yesterday stay open for a running daemon). |
+
+Every command takes `--store DIR` to work on another store root, for example
+to split a backup into day archives on a machine with free space:
+
+```
+llmux raw-io import --store /tmp/split raw-io.0-N.jsonl.zst raw-io.N-END.jsonl.zst
+llmux raw-io archive --store /tmp/split --hot-days 1
+```
+
+Nothing in llmux deletes raw-io data. Archives are never overwritten: a day
+that receives rows after it was sealed gets a further generation
+(`DAY.1.jsonl.zst`).
+
 ### Raw request/response viewer
 
 An expanded entry's `🔍 request` detail line opens a DevTools-style modal
-over the dashboard with the request's captured payloads (from
-`raw-io.jsonl`; see `raw_io` in [configuration.md](configuration.md)).
+over the dashboard with the request's captured payloads (from the raw-io
+store; see `raw_io` in [configuration.md](configuration.md)). A request
+from a day that is already archived answers "in the DAY archive — run
+`llmux raw-io restore DAY`".
 
 - **Tabs follow the wire.** A translated (codex/grok/gemini) exchange shows all
   four HTTP legs — `Request` (client → llmux) → `Upstream Req` (the rewritten

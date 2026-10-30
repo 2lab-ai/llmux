@@ -3024,10 +3024,10 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
         CfgRow {
             section: "raw-io",
             label: "retention",
-            value: format!("{}d", f.raw_io_retention_days),
+            value: "never deletes".to_string(),
             state: CfgState::Restart,
-            note: "decrease deletes history",
-            action: Some(ConfigAction::RawIoRetention),
+            note: "past days archive after raw_io.hot_days (config file); restore with `llmux raw-io restore DAY`",
+            action: None,
         },
         CfgRow {
             section: "raw-io",
@@ -16407,6 +16407,7 @@ mod tests {
             let crate::config::RawIoConfig {
                 enabled: _,
                 retention_days: _,
+                hot_days: _,
                 max_body_bytes: _,
             } = raw_io;
             let crate::config::TuiGradient {
@@ -16487,6 +16488,7 @@ mod tests {
             "routing.on_empty_group",
             "raw_io.enabled",
             "raw_io.retention_days",
+            "raw_io.hot_days",
             "raw_io.max_body_bytes",
             "email_anonymous",
             "tui_effects",

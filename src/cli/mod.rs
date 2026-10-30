@@ -13,6 +13,7 @@ pub mod import;
 pub mod islands;
 pub mod keys;
 pub mod login;
+pub mod raw_io;
 pub mod run;
 pub mod status;
 pub mod update;
@@ -130,6 +131,9 @@ pub enum Command {
     /// Self-update on the current channel (`brew upgrade`), then restart the
     /// daemon / relaunch Islands only if their versions actually changed.
     Update(UpdateArgs),
+    /// Raw-io store: status, import backups/legacy files, restore an archived
+    /// day, seal past days (day-partitioned SQLite + verified zstd archives).
+    RawIo(raw_io::RawIoArgs),
 }
 
 #[derive(Debug, Args)]
@@ -422,6 +426,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Api(args) => api::run(args).await,
         Command::Channel(args) => channel::run(args).await,
         Command::Update(args) => update::run(args).await,
+        Command::RawIo(args) => raw_io::run(args).await,
     }
 }
 
@@ -656,6 +661,7 @@ fn remote_refused_command(command: &Command) -> Option<&'static str> {
         Command::Remove(_) => Some("remove"),
         Command::Login(_) => Some("login"),
         Command::Import(_) => Some("import"),
+        Command::RawIo(_) => Some("raw-io"),
         _ => None,
     }
 }
