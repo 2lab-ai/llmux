@@ -17,6 +17,7 @@ pub mod raw_store;
 pub mod responses;
 pub mod server;
 pub mod sse;
+pub mod usage_archive;
 pub mod usage_controls;
 
 #[derive(Debug, thiserror::Error)]

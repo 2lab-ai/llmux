@@ -452,8 +452,23 @@ impl UsageDb {
     }
 
     fn init(conn: Connection, path: String) -> Result<Self, UsageError> {
+        // Wait out a concurrent reader/writer instead of failing the batch:
+        // the writer loop cannot retry, a BUSY batch would be lost.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| UsageError::sqlite(&path, e))?;
+        // WAL: readers (the day exporter, `llmux keys` views, a second
+        // daemon during a rolling restart) never block this writer's
+        // commits. Best effort — another process holding the file keeps the
+        // current mode until the next open; FULL makes every commit durable.
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") || mode == "memory" => {}
+            Ok(mode) => tracing::debug!(%mode, path = %path, "keys usage db not in WAL mode"),
+            Err(err) => {
+                tracing::debug!(error = %err, path = %path, "keys usage db WAL switch deferred")
+            }
+        }
         conn.execute_batch(
-            "PRAGMA synchronous=NORMAL;
+            "PRAGMA synchronous=FULL;
              CREATE TABLE IF NOT EXISTS usage (
                  event_key      TEXT PRIMARY KEY,
                  ts_ms          INTEGER NOT NULL,
@@ -1465,6 +1480,39 @@ mod tests {
 
     fn len(path: &Path) -> u64 {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The exporter and other readers must never fail the writer's commits:
+    /// a file store runs in WAL with a busy timeout, and a reader holding an
+    /// open read transaction does not block an insert batch.
+    #[test]
+    fn a_file_store_is_wal_and_a_reader_does_not_block_the_writer() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        let mut db = UsageDb::open(&db_path).expect("open");
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        let reader = Connection::open(&db_path).expect("reader");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM usage;")
+            .expect("read txn");
+        let row = UsageRow {
+            ts_ms: 1,
+            request_id: 1,
+            tenant: "t".into(),
+            group: None,
+            model: None,
+            status: 200,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+        };
+        assert_eq!(db.insert_many(&[row]).expect("insert under a reader"), 1);
+        reader.execute_batch("COMMIT;").expect("end");
     }
 
     /// K-4 crash window: the rotation RESET (offset back to 0) and the new
