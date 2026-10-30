@@ -5826,6 +5826,20 @@ mod tests {
         assert_eq!(totals.output_tokens, 3);
     }
 
+    /// The captured raw-io records under `path` (store + any legacy file) as
+    /// jsonl text — `NotFound` until the first record lands.
+    fn raw_io_contents(path: &std::path::Path) -> std::io::Result<String> {
+        let records = crate::proxy::raw_io::load_all(path);
+        if records.is_empty() {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        Ok(records
+            .iter()
+            .filter_map(|r| serde_json::to_string(r).ok())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     #[tokio::test]
     async fn raw_io_capture_records_payloads_without_changing_the_client_body() {
         // Feature B: with capture armed into a tempdir, the body delivered to
@@ -5855,7 +5869,7 @@ mod tests {
             "client body must be byte-identical — capture must not mutate it"
         );
 
-        let contents = std::fs::read_to_string(&raw_path).expect("raw-io written");
+        let contents = raw_io_contents(&raw_path).expect("raw-io written");
         let record: crate::proxy::raw_io::RawIoRecord =
             serde_json::from_str(contents.trim()).expect("one parseable record");
         assert_eq!(record.request_body, r#"{"model":"m","x":"req"}"#);
@@ -5932,7 +5946,7 @@ mod tests {
         // The record is flushed in the finish closure after the stream ends.
         let mut contents = String::new();
         for _ in 0..50 {
-            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+            if let Ok(c) = raw_io_contents(&raw_path) {
                 if !c.trim().is_empty() {
                     contents = c;
                     break;
@@ -6015,7 +6029,7 @@ mod tests {
 
         let mut contents = String::new();
         for _ in 0..100 {
-            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+            if let Ok(c) = raw_io_contents(&raw_path) {
                 if !c.trim().is_empty() {
                     contents = c;
                     break;
@@ -6082,7 +6096,7 @@ mod tests {
 
         let mut contents = String::new();
         for _ in 0..100 {
-            if let Ok(c) = std::fs::read_to_string(&raw_path) {
+            if let Ok(c) = raw_io_contents(&raw_path) {
                 if !c.trim().is_empty() {
                     contents = c;
                     break;

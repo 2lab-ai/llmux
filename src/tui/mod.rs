@@ -5697,12 +5697,14 @@ fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
     (bytes_read.saturating_mul(100) / file_len).min(100) as u8
 }
 
-/// Streaming, progressive variant of the session load: reads the persisted
-/// raw-io log line by line, accumulating parsed records, and every
-/// `SESSIONS_CHUNK_RECORDS` (and always at EOF) folds the ACCUMULATED records
-/// and delivers a partial over `tx`. The final partial carries `done = true`.
-/// A missing/unreadable file delivers a single empty, done partial so the
-/// overlay's loading state always clears. Runs on the blocking pool.
+/// Streaming, progressive variant of the session load: folds the raw-io
+/// store's hot partitions (metadata columns only — no bodies), newest day
+/// first, delivering a partial after each day; then, while a legacy
+/// `raw-io.jsonl` is still awaiting import, its records too (the store's
+/// imported copies are skipped then, so nothing is counted twice). The final
+/// partial carries `done = true`; a missing store delivers a single empty,
+/// done partial so the overlay's loading state always clears. Runs on the
+/// blocking pool.
 fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
     let send_empty_done = || {
         let _ = tx.blocking_send(SessionsLoad {
@@ -5715,50 +5717,65 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
         send_empty_done();
         return;
     };
-    let Ok(file) = std::fs::File::open(&path) else {
-        send_empty_done();
+    let store = crate::proxy::raw_store::store_for(&path);
+    let legacy_pending = path.exists();
+    let total_days = store.hot_days().len().max(1) as u64;
+    let mut rows: Vec<crate::session::SessionRow> = Vec::new();
+    let mut days_read: u64 = 0;
+    let mut receiver_gone = false;
+    store.for_each_session_rows(legacy_pending, |day_rows| {
+        rows.extend(day_rows);
+        days_read += 1;
+        let partial = SessionsLoad {
+            sessions: crate::session::fold_session_rows(&rows),
+            done: false,
+            pct: sessions_load_pct(days_read, total_days + u64::from(legacy_pending)),
+        };
+        receiver_gone = tx.blocking_send(partial).is_err();
+        !receiver_gone
+    });
+    if receiver_gone {
         return;
-    };
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut reader = std::io::BufReader::new(file);
-    let mut records: Vec<crate::proxy::raw_io::RawIoRecord> = Vec::new();
-    let mut line = String::new();
-    let mut bytes_read: u64 = 0;
-    let mut since_fold: usize = 0;
-    loop {
-        line.clear();
-        // `read_line` keeps the newline so `bytes_read` tracks real file offset
-        // for an accurate `pct`.
-        match std::io::BufRead::read_line(&mut reader, &mut line) {
-            Ok(0) => break, // EOF
-            Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
-            Err(_) => break, // truncated/unreadable tail → fold what we have
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
-            records.push(rec);
-            since_fold += 1;
-        }
-        if since_fold >= SESSIONS_CHUNK_RECORDS {
-            since_fold = 0;
-            let partial = SessionsLoad {
-                sessions: crate::session::fold_sessions(&records),
-                done: false,
-                pct: sessions_load_pct(bytes_read, file_len),
-            };
-            // Receiver gone (overlay closed / app exiting) → stop early.
-            if tx.blocking_send(partial).is_err() {
-                return;
+    }
+    if legacy_pending {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = String::new();
+            let mut bytes_read: u64 = 0;
+            let mut since_fold: usize = 0;
+            loop {
+                line.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) => break,
+                    Ok(n) => bytes_read = bytes_read.saturating_add(n as u64),
+                    Err(_) => break,
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed)
+                {
+                    rows.push(crate::session::SessionRow::from_record(&rec));
+                    since_fold += 1;
+                }
+                if since_fold >= SESSIONS_CHUNK_RECORDS {
+                    since_fold = 0;
+                    let partial = SessionsLoad {
+                        sessions: crate::session::fold_session_rows(&rows),
+                        done: false,
+                        pct: sessions_load_pct(bytes_read, file_len),
+                    };
+                    if tx.blocking_send(partial).is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
-    // Final fold at EOF — always delivered (even for an empty file) so the
-    // loading state clears.
     let _ = tx.blocking_send(SessionsLoad {
-        sessions: crate::session::fold_sessions(&records),
+        sessions: crate::session::fold_session_rows(&rows),
         done: true,
         pct: 100,
     });

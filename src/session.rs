@@ -127,7 +127,7 @@ pub fn user_id_from_request_body(body: &str) -> Option<String> {
 /// (`src/proxy/sse.rs` reads the same shape for the live path). A missing field
 /// counts as 0 so a partial/streamed body still folds without error; a non-JSON
 /// body yields `(0, 0)`. Metadata only — the body text itself is never retained.
-fn tokens_from_response_body(body: &str) -> (u64, u64) {
+pub(crate) fn tokens_from_response_body(body: &str) -> (u64, u64) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return (0, 0);
     };
@@ -208,28 +208,62 @@ impl Acc {
     }
 }
 
-/// Fold persisted raw-io records into per-`user_id` sessions.
+/// The metadata one raw-io record contributes to a session — everything
+/// [`fold_session_rows`] reads. The raw-io store keeps these as columns
+/// (`proxy::raw_store`), so the sessions view never loads request/response
+/// bodies; [`SessionRow::from_record`] derives them from a full record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRow {
+    pub ts_ms: u64,
+    pub id: u64,
+    pub model: Option<String>,
+    pub account: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub user_id: Option<String>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+impl SessionRow {
+    pub fn from_record(rec: &RawIoRecord) -> Self {
+        let (tokens_in, tokens_out) = tokens_from_response_body(&rec.response_body);
+        Self {
+            ts_ms: rec.ts_ms,
+            id: rec.id,
+            model: rec.model.clone(),
+            account: rec.account.clone(),
+            duration_ms: rec.duration_ms,
+            user_id: user_id_from_request_body(&rec.request_body),
+            tokens_in,
+            tokens_out,
+        }
+    }
+}
+
+/// Fold persisted raw-io records into per-`user_id` sessions
+/// (see [`fold_session_rows`]).
+pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
+    let rows: Vec<SessionRow> = records.iter().map(SessionRow::from_record).collect();
+    fold_session_rows(&rows)
+}
+
+/// Fold session rows into per-`user_id` sessions.
 ///
-/// Records are grouped by `metadata.user_id` (extracted from each
-/// `request_body`); records with no user_id are collected into a single
-/// `ungrouped` bucket keyed `None` and flagged [`Confidence::Low`]. Within a
-/// group the records are processed in timestamp order so `account_rotations`
-/// (consecutive serving-account changes) and the `first_ms`/`last_ms` span are
-/// correct regardless of input order.
+/// Rows are grouped by `metadata.user_id`; rows with no user_id are collected
+/// into a single `ungrouped` bucket keyed `None` and flagged
+/// [`Confidence::Low`]. Within a group the rows are processed in timestamp
+/// order so `account_rotations` (consecutive serving-account changes) and the
+/// `first_ms`/`last_ms` span are correct regardless of input order.
 ///
 /// The returned vector is sorted by `last_ms` descending (most recent session
 /// first), with the `ungrouped` bucket — if present — always last so the
 /// confident sessions lead the timeline.
 ///
 /// Pure: no IO, no clock, no panics.
-pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
-    // Stable per-key grouping. The BTreeMap key is the user_id (or a sentinel for
-    // the ungrouped bucket) so iteration order is deterministic before the final
-    // sort.
-    let mut groups: BTreeMap<Option<String>, Vec<&RawIoRecord>> = BTreeMap::new();
-    for rec in records {
-        let key = user_id_from_request_body(&rec.request_body);
-        groups.entry(key).or_default().push(rec);
+pub fn fold_session_rows(rows: &[SessionRow]) -> Vec<Session> {
+    let mut groups: BTreeMap<Option<String>, Vec<&SessionRow>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.user_id.clone()).or_default().push(row);
     }
 
     let mut sessions: Vec<Session> = groups
@@ -239,10 +273,11 @@ pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
             // the span are independent of file/append order.
             recs.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then(a.id.cmp(&b.id)));
             let first_ts = recs.first().map(|r| r.ts_ms).unwrap_or(0);
+            let missing = user_id.is_none();
             let mut acc = Acc::new(user_id, first_ts);
             for rec in recs {
                 acc.requests = acc.requests.saturating_add(1);
-                let (tin, tout) = tokens_from_response_body(&rec.response_body);
+                let (tin, tout) = (rec.tokens_in, rec.tokens_out);
                 acc.tokens_in = acc.tokens_in.saturating_add(tin);
                 acc.tokens_out = acc.tokens_out.saturating_add(tout);
                 // Timed rate sums (perf telemetry v1): only records that
@@ -270,7 +305,7 @@ pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
                 }
                 acc.first_ms = acc.first_ms.min(rec.ts_ms);
                 acc.last_ms = acc.last_ms.max(rec.ts_ms);
-                if user_id_from_request_body(&rec.request_body).is_none() {
+                if missing {
                     acc.any_missing_user_id = true;
                 }
             }

@@ -6324,10 +6324,10 @@ async fn auto_classifier_streaming_stage_one_and_raw_provenance() {
     let path = proxy._tmp.path().join("raw-io.jsonl");
     let record = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Some(record) = raw
-                    .lines()
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            {
+                if let Some(record) = llmux::proxy::raw_io::load_all(&path)
+                    .iter()
+                    .filter_map(|r| serde_json::to_value(r).ok())
                     .find(|r| r["model"] == "gpt-6-luna")
                 {
                     break record;

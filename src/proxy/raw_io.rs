@@ -1,7 +1,11 @@
-//! Raw input/output payload capture (`[raw_io]`, Feature B): one JSON line per
-//! proxied request appended to `$XDG_STATE_HOME/llmux/raw-io.jsonl`, holding the
-//! verbatim request body and the response body delivered to the client, so the
-//! actual traffic can be replayed/audited offline.
+//! Raw input/output payload capture (`[raw_io]`, Feature B): one record per
+//! proxied request holding the verbatim request body and the response body
+//! delivered to the client, so the actual traffic can be replayed/audited
+//! offline. Records are persisted in the day-partitioned store
+//! ([`super::raw_store`], `$XDG_STATE_HOME/llmux/store/raw-io/`); the old
+//! single `raw-io.jsonl` is only read now — imported once by the store and
+//! scanned by [`find_record`] while that import is still pending. Nothing in
+//! this module deletes raw-io data (the startup retention prune is gone).
 //!
 //! This is DISTINCT from activity persistence (`activity.jsonl`), which keeps
 //! per-request *metadata* (status, tokens, model). This store keeps the payload
@@ -67,22 +71,13 @@
 //! cap (then stop growing), and the non-streaming full-body path clips to it as
 //! the final backstop — one cap, every path, request and response alike.
 
-use std::io::{BufRead as _, Seek as _, Write as _};
-use std::sync::Mutex;
+use std::io::Seek as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// Serializes [`append`] against the commit step of a concurrent [`prune`].
-/// Since prune runs in the background after the listener is up (it no longer
-/// blocks readiness), live requests can append while a prune is rewriting the
-/// file; the commit holds this lock while copying the appended tail onto the
-/// pruned temp file and renaming it into place, so no live record is lost.
-/// Appends are short (one buffered line) — contention is negligible.
-static IO_LOCK: Mutex<()> = Mutex::new(());
-
 /// Schema version of a [`RawIoRecord`] line. Bump on a breaking layout change;
-/// [`prune`] tolerates (skips) lines it cannot parse, so old/new lines coexist.
+/// the store keeps lines it cannot parse verbatim, so old/new lines coexist.
 pub const RECORD_VERSION: u8 = 1;
 
 /// Default cap on each captured body before it is stored, used when no
@@ -97,9 +92,6 @@ pub const RECORD_VERSION: u8 = 1;
 /// replay/audit. Most LLM responses stream tens to hundreds of KB, so reusing
 /// the 8 KiB debug cap here would discard almost the entire response.
 pub const RESPONSE_CAP_BYTES: usize = 8 * 1024 * 1024;
-
-/// Milliseconds in a day, for the retention window arithmetic.
-const MS_PER_DAY: u64 = 86_400_000;
 
 /// One raw-io line: the verbatim request/response payloads for a single proxied
 /// request plus the correlation/attribution fields the forward path already
@@ -272,34 +264,16 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Append one record as a JSON line to `path`, best-effort. A `None` path (no
-/// state dir / disabled), a serialization failure, or any IO error is swallowed
-/// — the request path is never affected, nothing here panics. The parent dir is
-/// created if missing; the file is opened `create(true).append(true)`.
+/// Persist one record in the day-partitioned store anchored at `path` (the
+/// legacy `raw-io.jsonl` location; see [`super::raw_store::store_for`]). A
+/// `None` path (capture disabled / no state dir) is a silent no-op. Never
+/// fails the request: a partition error falls back to the fsynced spool, and
+/// a spool failure is counted + logged at error level by the store.
 pub fn append(path: Option<&std::path::Path>, record: &RawIoRecord) {
     let Some(path) = path else {
         return;
     };
-    let Ok(line) = serde_json::to_string(record) else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Serialized against a background prune's commit (see [`IO_LOCK`]): an
-    // append lands either before the commit's tail copy (and is carried over)
-    // or after the rename (and lands in the pruned file) — never in between.
-    let _guard = IO_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let _ = writeln!(file, "{line}");
+    super::raw_store::store_for(path).capture(record);
 }
 
 /// Build a record at `now_ms()` and [`append`] it, best-effort. The single
@@ -439,7 +413,52 @@ pub fn capture_streamed(
 /// resets on restart) out of the match.
 const FIND_TS_WINDOW_MS: u64 = 300_000;
 
-/// Find the raw-io record for activity `id` completed around `at_ms`, reading
+/// Find activity `id` completed around `at_ms`: the store first, then — while
+/// the legacy `raw-io.jsonl` at `path` is still awaiting import — a backwards
+/// scan of that file. `None` when capture is disabled or nothing matches.
+pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Option<RawIoRecord> {
+    match lookup(path, id, at_ms) {
+        super::raw_store::Lookup::Found(record) => Some(*record),
+        _ => None,
+    }
+}
+
+/// [`find_record`] with the "archived" outcome kept, so the raw viewer can
+/// say "restore DAY" instead of "unknown id".
+pub fn lookup(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> super::raw_store::Lookup {
+    use super::raw_store::Lookup;
+    let Some(path) = path else {
+        return Lookup::NotFound;
+    };
+    match super::raw_store::store_for(path).find(id, at_ms) {
+        Lookup::Found(record) => Lookup::Found(record),
+        other => match path
+            .exists()
+            .then(|| find_record_jsonl(path, id, at_ms))
+            .flatten()
+        {
+            Some(record) => Lookup::Found(Box::new(record)),
+            None => other,
+        },
+    }
+}
+
+/// Every parseable record: the store's hot partitions, then any legacy
+/// `raw-io.jsonl` still awaiting import. Diagnostic/test helper — it reads
+/// whole bodies, so production readers use the store's metadata columns.
+pub fn load_all(path: &std::path::Path) -> Vec<RawIoRecord> {
+    let mut out = super::raw_store::store_for(path).load_hot_records();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        out.extend(
+            text.lines()
+                .filter_map(|l| serde_json::from_str::<RawIoRecord>(l.trim()).ok()),
+        );
+    }
+    out
+}
+
+/// Backwards scan of a legacy jsonl log for activity `id` completed around
+/// `at_ms`, reading
 /// the log BACKWARDS from the end (clicks land on recent entries; the file can
 /// be tens of GB, so a forward scan would read all of it for every lookup).
 ///
@@ -455,8 +474,11 @@ const FIND_TS_WINDOW_MS: u64 = 300_000;
 /// candidate in hand, past the point where anything older must lose). Corrupt/
 /// foreign lines are skipped. Strictly best-effort and read-only: any IO
 /// error yields `None` (or the best candidate so far), never a panic.
-pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Option<RawIoRecord> {
-    let path = path?;
+pub(crate) fn find_record_jsonl(
+    path: &std::path::Path,
+    id: u64,
+    at_ms: u64,
+) -> Option<RawIoRecord> {
     let file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     // Cheap pre-filter fragment: a matching line MUST contain `"id":<id>,`
@@ -543,185 +565,6 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
     best.map(|(_, r)| r)
 }
 
-/// Prune the raw-io log to a retention window, best-effort.
-///
-/// When `retention_days > 0`, the file is rewritten keeping only records whose
-/// `ts_ms >= now_ms - retention_days * 86_400_000`. `retention_days == 0` keeps
-/// everything (no-op). Corrupt lines (not JSON, or not the current
-/// [`RECORD_VERSION`]) are tolerated by being DROPPED — a rewrite is a natural
-/// point to shed unreadable history; the kept set is exactly the in-window,
-/// parseable records.
-///
-/// # Streaming + safe against concurrent appends
-///
-/// The log can be tens of GB (one line per proxied request, bodies up to
-/// `max_body_bytes` each), so every pass is STREAMING — line by line through a
-/// [`std::io::BufRead`], memory bounded by the longest line — never
-/// `read_to_string` of the whole file (which pinned ~2× the file size in RAM
-/// and blocked startup for its whole duration). A read-only pre-pass decides
-/// whether anything would be dropped at all, so the common "everything still
-/// in window" restart costs ONE sequential read and ZERO writes (a naive
-/// streaming rewrite would copy the whole multi-GB file to a temp only to
-/// discard it). Since the caller now runs this in the background AFTER the
-/// listener is ready, live requests may [`append`] while the rewrite runs: the
-/// commit step takes [`IO_LOCK`], copies any bytes appended past the scanned
-/// offset verbatim onto the pruned temp file, and only then renames — so a
-/// record appended mid-prune is never lost ("history behind live": kept-old
-/// records keep their order, the live tail follows).
-///
-/// Strictly best-effort: a `None` path, a missing/unreadable file, or any IO
-/// error on read/write leaves the file as-is (the temp file is discarded).
-/// Never panics. The rewrite goes through a sibling temp file + atomic rename
-/// so a crash mid-prune can't truncate the log.
-pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
-    if retention_days == 0 {
-        return; // keep forever
-    }
-    let Some(path) = path else {
-        return;
-    };
-    let cutoff = now_ms.saturating_sub(retention_days.saturating_mul(MS_PER_DAY));
-    if !needs_prune(path, cutoff) {
-        return; // nothing to drop — no temp written, original untouched
-    }
-    let Some(stage) = prune_scan(path, cutoff) else {
-        return; // nothing to drop, or scan failed — original left as-is
-    };
-    prune_commit(path, stage);
-}
-
-/// Read-only pre-pass: would the retention window drop anything? `true` on the
-/// first out-of-window, wrong-version, unparseable, or blank line — exactly
-/// the lines [`prune_scan`] rewrites the file to shed. A missing/unreadable
-/// file or a torn final line (no trailing newline — crash artifact or an
-/// append racing this scan; the rewrite carries it over verbatim either way)
-/// is not by itself a reason to rewrite.
-fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return false, // EOF, everything in window
-            Ok(_) => {
-                if !line.ends_with('\n') {
-                    return false; // torn final line — not a drop candidate
-                }
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return true;
-                }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {}
-                    _ => return true,
-                }
-            }
-            Err(_) => return false, // unreadable — leave the file as-is
-        }
-    }
-}
-
-/// A staged prune rewrite: the pruned temp file plus how many bytes of the
-/// original were scanned to produce it (the tail past `consumed` is whatever
-/// concurrent appends added while scanning — [`prune_commit`] carries it over).
-struct PruneStage {
-    tmp: std::path::PathBuf,
-    consumed: u64,
-}
-
-/// Phase 1 (unlocked, streaming): scan `path` line by line, writing in-window
-/// parseable records to a sibling temp file. Returns `None` when there is
-/// nothing to rewrite (every line kept verbatim, or any IO error — the temp is
-/// discarded either way).
-fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
-    let file = std::fs::File::open(path).ok()?; // missing/unreadable = nothing to prune
-    let mut reader = std::io::BufReader::new(file);
-    let tmp = path.with_extension("jsonl.prune.tmp");
-    // `create` truncates a stale temp left by a crashed prune.
-    let out = std::fs::File::create(&tmp).ok()?;
-    let mut writer = std::io::BufWriter::new(out);
-
-    let mut consumed: u64 = 0;
-    let mut changed = false;
-    let mut line = String::new();
-    let discard = |writer: std::io::BufWriter<std::fs::File>, tmp: &std::path::Path| {
-        drop(writer);
-        let _ = std::fs::remove_file(tmp);
-    };
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if !line.ends_with('\n') {
-                    // Partial final line: either a crash artifact or an append
-                    // racing this scan mid-write. Leave it for the commit's
-                    // verbatim tail copy (do NOT count it as consumed) so it is
-                    // carried over whole once the writer finishes.
-                    break;
-                }
-                consumed += n as u64;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    changed = true;
-                    continue;
-                }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {
-                        if writer
-                            .write_all(trimmed.as_bytes())
-                            .and_then(|()| writer.write_all(b"\n"))
-                            .is_err()
-                        {
-                            discard(writer, &tmp);
-                            return None;
-                        }
-                    }
-                    // Out of window, wrong version, or unparseable → drop it.
-                    _ => changed = true,
-                }
-            }
-            Err(_) => {
-                discard(writer, &tmp);
-                return None;
-            }
-        }
-    }
-    // Nothing to do (every line kept verbatim), or the kept set failed to
-    // flush: discard the temp and leave the original untouched.
-    if !changed || writer.flush().is_err() {
-        discard(writer, &tmp);
-        return None;
-    }
-    Some(PruneStage { tmp, consumed })
-}
-
-/// Phase 2 (under [`IO_LOCK`]): copy any bytes appended past the scanned
-/// offset verbatim onto the temp file, then atomically rename it over the
-/// original. On any IO error the temp is discarded and the original is left
-/// as-is.
-fn prune_commit(path: &std::path::Path, stage: PruneStage) {
-    let _guard = IO_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let copied_tail = (|| -> std::io::Result<()> {
-        let mut src = std::fs::File::open(path)?;
-        let len = src.metadata()?.len();
-        if len > stage.consumed {
-            src.seek(std::io::SeekFrom::Start(stage.consumed))?;
-            let mut out = std::fs::OpenOptions::new().append(true).open(&stage.tmp)?;
-            std::io::copy(&mut src, &mut out)?;
-        }
-        Ok(())
-    })();
-    if copied_tail.is_err() || std::fs::rename(&stage.tmp, path).is_err() {
-        let _ = std::fs::remove_file(&stage.tmp);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,12 +586,27 @@ mod tests {
         )
     }
 
+    const MS_PER_DAY: u64 = 86_400_000;
+
+    /// The verbatim stored lines (the bytes the legacy append wrote), in
+    /// insertion order, from the store anchored at `path`.
+    fn stored_lines(path: &std::path::Path) -> Vec<String> {
+        super::super::raw_store::store_for(path)
+            .load_hot_records()
+            .iter()
+            .map(|r| serde_json::to_string(r).expect("json"))
+            .collect()
+    }
+
+    /// A unique `<dir>/raw-io.jsonl` (its store lives in `<dir>/store/`).
     fn tmp_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "llmux-rawio-test-{}-{}-{tag}.jsonl",
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-rawio-test-{}-{}-{tag}",
             std::process::id(),
             ulid::Ulid::new()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir.join("raw-io.jsonl")
     }
 
     #[test]
@@ -757,9 +615,10 @@ mod tests {
         let record = rec(7, 1_700_000_000_000);
         append(Some(&path), &record);
 
-        let contents = std::fs::read_to_string(&path).expect("file written");
-        let parsed: RawIoRecord =
-            serde_json::from_str(contents.trim()).expect("one parseable line");
+        let parsed = stored_lines(&path)
+            .pop()
+            .map(|l| serde_json::from_str::<RawIoRecord>(&l).expect("one parseable line"))
+            .expect("record stored");
         assert_eq!(parsed, record, "all fields survive the round-trip");
         assert_eq!(parsed.v, RECORD_VERSION);
         assert_eq!(parsed.id, 7);
@@ -782,14 +641,14 @@ mod tests {
             response_headers: Some(vec![("x-request-id".into(), "req_9".into())]),
         });
         append(Some(&path), &record);
-        let line = std::fs::read_to_string(&path).expect("written");
+        let line = stored_lines(&path).pop().expect("written");
         let parsed: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
         assert_eq!(parsed, record, "upstream half survives the round-trip");
         // …while a passthrough record (upstream: None) serializes WITHOUT the
         // key at all (additive schema), and a pre-UI-8 line parses to None.
-        let _ = std::fs::remove_file(&path);
+        let path = tmp_path("upstream-none");
         append(Some(&path), &rec(1, 1));
-        let line = std::fs::read_to_string(&path).expect("written");
+        let line = stored_lines(&path).pop().expect("written");
         assert!(!line.contains("\"upstream\""), "absent, not null: {line}");
         let old: RawIoRecord = serde_json::from_str(line.trim()).expect("parseable");
         assert_eq!(old.upstream, None);
@@ -968,88 +827,9 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_recent_drops_old() {
-        let path = tmp_path("prune");
-        let now = 100 * MS_PER_DAY; // day 100
-                                    // Old: day 1; recent: day 99. Retention 90 days → cutoff = day 10.
-        append(Some(&path), &rec(1, MS_PER_DAY));
-        append(Some(&path), &rec(2, 99 * MS_PER_DAY));
-
-        prune(Some(&path), 90, now);
-
-        let contents = std::fs::read_to_string(&path).expect("file kept");
-        let ids: Vec<u64> = contents
-            .lines()
-            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(ids, vec![2], "only the in-window record survives");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn prune_with_zero_retention_keeps_all() {
-        let path = tmp_path("prune-zero");
-        append(Some(&path), &rec(1, 1)); // ancient
-        append(Some(&path), &rec(2, 2));
-        let before = std::fs::read_to_string(&path).expect("file");
-
-        prune(Some(&path), 0, u64::MAX);
-
-        let after = std::fs::read_to_string(&path).expect("file");
-        assert_eq!(before, after, "retention_days == 0 is a no-op");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn prune_tolerates_corrupt_lines_and_keeps_valid_recent_ones() {
-        let path = tmp_path("prune-corrupt");
-        let now = 100 * MS_PER_DAY;
-        // A recent valid record, a corrupt line, and an old valid record.
-        append(Some(&path), &rec(2, 99 * MS_PER_DAY));
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open");
-            writeln!(f, "not json at all {{").expect("write");
-        }
-        append(Some(&path), &rec(1, MS_PER_DAY));
-
-        prune(Some(&path), 90, now);
-
-        let contents = std::fs::read_to_string(&path).expect("file");
-        let ids: Vec<u64> = contents
-            .lines()
-            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(ids, vec![2], "corrupt + old dropped, recent kept");
-        assert!(
-            !contents.contains("not json"),
-            "corrupt line shed on rewrite"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn prune_missing_file_is_a_noop() {
-        let path = tmp_path("prune-missing");
-        // Never created.
-        prune(Some(&path), 90, now_ms());
-        assert!(!path.exists(), "prune does not create the file");
-    }
-
-    #[test]
     fn append_with_none_path_writes_nothing_and_never_panics() {
         // No path = disabled / no state dir → silent no-op.
         append(None, &rec(1, 1));
-    }
-
-    #[test]
-    fn prune_with_none_path_is_a_noop() {
-        prune(None, 90, now_ms());
     }
 
     #[test]
@@ -1123,59 +903,6 @@ mod tests {
         let record = find_record(Some(&path), 3, MS_PER_DAY).expect("old line found");
         assert_eq!(record.request_headers, None);
         assert_eq!(record.response_headers, None);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The common restart (nothing out of window) must be read-only: no temp
-    /// file written, the log byte-identical — the pre-pass decides without
-    /// staging a rewrite. (A multi-GB log would otherwise be fully copied to a
-    /// temp and discarded on every restart.)
-    #[test]
-    fn prune_with_nothing_to_drop_writes_nothing() {
-        let path = tmp_path("prune-noop");
-        let now = 100 * MS_PER_DAY;
-        append(Some(&path), &rec(1, 98 * MS_PER_DAY));
-        append(Some(&path), &rec(2, 99 * MS_PER_DAY));
-        let before = std::fs::read_to_string(&path).expect("file");
-
-        prune(Some(&path), 90, now);
-
-        let after = std::fs::read_to_string(&path).expect("file");
-        assert_eq!(before, after, "log untouched");
-        assert!(
-            !path.with_extension("jsonl.prune.tmp").exists(),
-            "no temp file staged for a no-op prune"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// A record appended BETWEEN the streaming scan and the commit (prune now
-    /// runs in the background next to live traffic) must survive the rewrite:
-    /// the commit copies the appended tail verbatim before renaming.
-    #[test]
-    fn prune_preserves_records_appended_during_scan() {
-        let path = tmp_path("prune-tail");
-        let now = 100 * MS_PER_DAY;
-        append(Some(&path), &rec(1, MS_PER_DAY)); // old → dropped
-        append(Some(&path), &rec(2, 99 * MS_PER_DAY)); // recent → kept
-
-        // Drive the two phases by hand to interleave an append deterministically.
-        let cutoff = now.saturating_sub(90 * MS_PER_DAY);
-        let stage = prune_scan(&path, cutoff).expect("old record → rewrite staged");
-        append(Some(&path), &rec(3, 99 * MS_PER_DAY)); // lands after the scan
-        prune_commit(&path, stage);
-
-        let contents = std::fs::read_to_string(&path).expect("file");
-        let ids: Vec<u64> = contents
-            .lines()
-            .filter_map(|l| serde_json::from_str::<RawIoRecord>(l).ok())
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec![2, 3],
-            "old dropped; kept record first, mid-prune append preserved behind it"
-        );
         let _ = std::fs::remove_file(&path);
     }
 }

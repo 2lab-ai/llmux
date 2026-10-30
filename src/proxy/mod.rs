@@ -13,6 +13,7 @@ pub mod logging;
 pub mod login;
 pub mod plans;
 pub mod raw_io;
+pub mod raw_store;
 pub mod responses;
 pub mod server;
 pub mod sse;
