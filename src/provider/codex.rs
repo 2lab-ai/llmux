@@ -418,23 +418,14 @@ fn supports_extended_efforts(model: &str) -> bool {
         || m.starts_with("gpt-6.1-")
 }
 
-/// `ultra` ("maximum reasoning with automatic task delegation") is listed for
-/// the sol/terra/astra tiers but NOT for luna (`gpt-5.6-luna`, `gpt-6-luna` —
-/// openai/codex models.json @ d63a9b83, 2026-10-06). The picker menu alone
-/// cannot constrain a configured or directly submitted value, so the clamp in
-/// [`resolve_reasoning_effort`] uses this too.
-fn supports_ultra(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    supports_extended_efforts(&m) && !m.contains("-luna")
-}
-
 /// Per-request reasoning effort: a CONFIGURED shape effort (dashboard `e`
 /// cycle / config `reasoning_effort`) OVERRIDES whatever the client sent —
 /// that is what selecting a concrete value in the UI means (UI-3 U12).
 /// Unset / "default" shape = BYPASS: the request's `output_config.effort`
 /// (the Claude Agent SDK wire form, observed 2026-07-10) passes through.
-/// `max`/`ultra` pass for the gpt-5.6 family (natively supported per the
-/// codex model catalog) and clamp to `xhigh` for older models.
+/// `max` passes for the gpt-5.6 family and later (natively supported per the
+/// codex model catalog) and clamps to `xhigh` for older models. `ultra` never
+/// reaches the wire: it lands as `max` (see the clamp).
 ///
 /// Precedence flipped 2026-07-15 (was request-wins): with request-wins a
 /// configured effort was dead weight for Claude Code traffic, which always
@@ -447,10 +438,18 @@ fn resolve_reasoning_effort(
     let clamp = |e: String| {
         if (e == "max" || e == "ultra") && !supports_extended_efforts(upstream_model) {
             "xhigh".to_string()
-        } else if e == "ultra" && !supports_ultra(upstream_model) {
-            // Luna tiers list low..max only (models.json 2026-10-06): `ultra`
-            // lands as `max`, the top of their menu, rather than reaching a
-            // backend that would reject it.
+        } else if e == "ultra" {
+            // `ultra` is a selection, not a wire value. The catalog lists it for
+            // the sol / terra / astra tiers (not luna), but the codex backend
+            // takes none..max only — probed 2026-11-02 on gpt-6-astra,
+            // gpt-6.1-sol and gpt-5.6-terra: 400 "Invalid value: 'ultra'.
+            // Supported values are: 'none', 'minimal', 'low', 'medium', 'high',
+            // 'xhigh', and 'max'". The codex CLI resolves it before sending too
+            // (openai/codex protocol/src/openai_models/reasoning_effort.rs: the
+            // model's multi-agent effort, else max), because its "ultra" is max
+            // reasoning plus automatic task delegation. llmux has no delegation
+            // to add, so `ultra` lands as the strongest level the model takes:
+            // `max` — on every tier, luna included.
             "max".to_string()
         } else {
             e
@@ -886,7 +885,8 @@ mod tests {
         let body = json!({ "model": "gpt-5.6-luna", "messages": [{"role":"user","content":"hi"}] });
         let (_, effort, _) = effective_request_meta(&body, &shape);
         assert_eq!(effort.as_deref(), Some("max"));
-        // `ultra` still rides through on the tiers that list it.
+        // On the tiers that list it, `ultra` lands as `max` too: the backend
+        // rejects `ultra` on the wire (probe 2026-11-02).
         for m in [
             "gpt-6.1-sol",
             "gpt-6-sol",
@@ -900,7 +900,11 @@ mod tests {
                 "messages": [{"role":"user","content":"hi"}]
             });
             let (_, effort, _) = effective_request_meta(&body, &CodexShape::default());
-            assert_eq!(effort.as_deref(), Some("ultra"), "{m}");
+            assert_eq!(effort.as_deref(), Some("max"), "{m}");
+            // ...and the request that goes upstream says max, never ultra.
+            let (upstream, _) =
+                translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+            assert_eq!(upstream["reasoning"]["effort"], "max", "{m}");
         }
         // Below the extended families it still clamps to xhigh.
         let body = json!({
@@ -944,16 +948,16 @@ mod tests {
             "configured effort overrides the request"
         );
 
-        // The gpt-5.6 family natively supports max/ultra (codex catalog) —
-        // pass through unclamped.
-        for e in ["max", "ultra"] {
+        // The gpt-5.6 family natively supports max (codex catalog) — it passes
+        // through unclamped; `ultra` is not a wire value and lands as max.
+        for (e, wire) in [("max", "max"), ("ultra", "max")] {
             let body = json!({
                 "model": "gpt-5.6-sol",
                 "output_config": { "effort": e },
                 "messages": [{"role":"user","content":"hi"}],
             });
             let (upstream, _) = translate_request_with(&body, "s", &shape).expect("translate");
-            assert_eq!(upstream["reasoning"]["effort"], e);
+            assert_eq!(upstream["reasoning"]["effort"], wire, "{e}");
         }
 
         // Older models top out at xhigh — max clamps.
@@ -1021,14 +1025,14 @@ mod tests {
                 "ultra clamps on {unknown} (not the gpt-6 generation)"
             );
         }
-        // ...while astra keeps max/ultra unclamped.
-        for keep in ["max", "ultra"] {
+        // ...while astra keeps max unclamped, and its ultra lands as max.
+        for (sent, wire) in [("max", "max"), ("ultra", "max")] {
             let effort = resolve_reasoning_effort(
-                &json!({ "output_config": { "effort": keep } }),
+                &json!({ "output_config": { "effort": sent } }),
                 None,
                 "gpt-6-astra",
             );
-            assert_eq!(effort.as_deref(), Some(keep), "{keep} survives on astra");
+            assert_eq!(effort.as_deref(), Some(wire), "{sent} on astra");
         }
     }
 
