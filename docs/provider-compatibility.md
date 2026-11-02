@@ -342,7 +342,13 @@ is stored or replayed by llmux. Multi-turn text and tool transcripts are unaffec
 `thinking` config is validated and then dropped: `budget_tokens` bounds nothing upstream and
 `{"type":"disabled"}` does not stop these models from reasoning. Reasoning effort on these
 groups comes from llmux's own resolution (`config.codex` / `config.grok`, `/effort`), not
-from the Messages body — see [models](models.md) for the per-model effort menus. Gemini's
+from the Messages body — see [models](models.md) for the per-model effort menus. **Codex
+`ultra` lands as `max`:** the catalog lists `ultra` for the sol / terra / astra tiers
+(openai/codex `models.json`), but the codex backend takes `none`..`max` only — a probe on
+2026-11-02 against gpt-6-astra, gpt-6.1-sol and gpt-5.6-terra returned 400 "Invalid value:
+'ultra'". The codex CLI resolves Ultra before sending too (its Ultra is max reasoning plus
+automatic task delegation, which llmux does not add), so llmux sends the strongest wire
+level, `max`, whether `ultra` comes from the request or from the configured effort. Gemini's
 tool-call thought signatures are the one form of carried reasoning; see
 [Gemini](#gemini-no-cap-sent-thought-signatures-replayed).
 
