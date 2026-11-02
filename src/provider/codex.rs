@@ -389,10 +389,12 @@ fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
     pinned.to_string()
 }
 
-/// Valid codex `reasoning.effort` values. Per the openai/codex model
-/// catalog (models-manager/models.json): the gpt-5.6 family supports
-/// low/medium/high/xhigh/max (+ `ultra` on sol/terra); gpt-5.5 tops out at
-/// xhigh. none/minimal are documented CLI values.
+/// Effort values a request may carry. Per the openai/codex model catalog
+/// (models-manager/models.json): the gpt-5.6 family supports
+/// low/medium/high/xhigh/max (+ `ultra` on sol/terra/astra); gpt-5.5 tops out
+/// at xhigh. none/minimal are documented CLI values. `ultra` is accepted from
+/// a client but never sent: the clamp in [`resolve_reasoning_effort`] lands it
+/// as `max`, the backend's strongest wire value.
 const CODEX_EFFORT_VALUES: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
