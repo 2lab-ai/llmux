@@ -69,14 +69,13 @@ the key bar. Numbers keep their usual format everywhere.
   detail column shows five lines: name · credential type · order · status,
   the token line, the 7d window, the lifetime totals and the poll line
   (`poll  ok 4s ago · next ~5m18s`) — the same text as before, uncut. The
-  sixth row shows the account's last failure (`last failure …`) or its
-  `reset` line when that line fits the detail column; a longer one is left
-  out there rather than moving the `│`. Each band row pairs one left line
-  with one detail line. The detail lines start in one column, set so the
-  widest of lines 2–5 ends at the right edge; a row whose left text is
-  longer than that starts its detail line just after its own text, with its
-  own `│`. Whether the band is used, and where every column sits, changes
-  only on a terminal width change, a
+  sixth row (`mode`) has no detail line: it keeps only its `│`, so the bar
+  runs unbroken down the band. Each band row pairs one left line with one
+  detail line. The detail lines start in one column, set so the widest of
+  lines 2–5 ends at the right edge; a row whose left text is longer than
+  that starts its detail line just after its own text, with its own `│`.
+  Whether the band is used, and where every column sits, changes only on
+  a terminal width change, a
   change to the set of accounts, a scheduler event (a switch, a failing
   usage poll) or a count gaining a digit (for example `err` going from 999
   to 1.0k). Moving the cursor does not change it, and neither does a clock
@@ -94,11 +93,11 @@ the key bar. Numbers keep their usual format everywhere.
   reason: an automatic switch (`SevenDayOverThreshold` /
   `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on
   the Codex side. The detail `reset`
-  line shows in the band's sixth row when it fits the detail column, and
-  in the seventh row of the 8-row pane; an account with a recorded failure
-  shows its `last failure …` lines there first. Dragging the band taller
-  adds rows for the lines that follow, and the accounts tab's detail pane
-  always shows it.
+  line and an account's `last failure …` lines never take a band row of the
+  automatic height; they appear in the rows you add by dragging the band
+  taller, when they fit (failure lines first). The 8-row pane shows the
+  `reset` line in its seventh row when the account has no recorded
+  failure, and the accounts tab's detail pane always shows it.
 - **Models.** When two or more models fit side by side, the models strip packs
   them several to a line (for example, the top 5 on 3 lines): each entry
   is the group, the model, the 10-cell share bar, requests, tokens, cost and
