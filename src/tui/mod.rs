@@ -61,6 +61,9 @@ use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEventKind,
 };
+use crossterm::style::{Attribute, ResetColor, SetAttribute};
+use crossterm::terminal::{enable_raw_mode, Clear, ClearType, EnterAlternateScreen};
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -5121,47 +5124,111 @@ fn http_error_text(status: reqwest::StatusCode, body: &str) -> String {
         .unwrap_or_else(|| status.to_string())
 }
 
-/// Initialize the terminal for the dashboard: `ratatui::try_init` (raw mode +
-/// alternate screen + a panic hook that restores them) PLUS native mouse
-/// capture (Feature B), which `try_init` does NOT enable. Because the panic
-/// hook installed by `try_init` only undoes raw-mode/alt-screen, we chain our
-/// own hook BEFORE it that also disables mouse capture, so a panic on any path
-/// leaves the terminal fully restored. Every call site uses this helper (and
+/// Initialize the terminal for the dashboard: raw mode + alternate screen +
+/// a full clear + native mouse capture (Feature B), then a fresh
+/// [`ratatui::Terminal`] over stdout. Done by hand instead of
+/// `ratatui::try_init`, which installs a new panic hook on every call and so
+/// stacked one more per login suspend/resume; [`install_panic_restore_hook`]
+/// installs ours once per process. Every call site uses this helper (and
 /// [`restore_terminal`]) so the enable/disable always pair up — including the
 /// login suspend/resume path that re-inits the terminal mid-session.
+///
+/// If any step after raw mode fails, the terminal is restored before the
+/// error is returned: a failed start must not leave the outer terminal in raw
+/// mode on the alternate screen, the very state that garbles the next launch.
+///
+/// Why the clear: `Terminal::new` starts from blank buffers, so the first draw
+/// only writes non-blank cells. If the outer terminal is already on the
+/// alternate screen (a previous TUI killed before it could leave it), entering
+/// it again is a no-op and the stale content shows through every blank cell.
+/// A bare `Clear(All)` makes the screen match the blank back buffer. Colours
+/// and attributes are reset first because `CSI 2J` paints with the current
+/// background. Not `Terminal::clear()`: it first queries the cursor position
+/// (`CSI 6n`) and waits on stdin for the reply, which can time out under a
+/// slow multiplexer.
 fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
-    // Chain a mouse-disable into the panic hook BEFORE `try_init` installs its
-    // own restore hook. `try_init`'s hook runs `restore()` then calls the
-    // previous hook (this one), so on panic the order is: leave alt-screen +
-    // raw mode, then disable mouse capture. Idempotent if it runs twice.
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-        prev(info);
-    }));
-    let terminal = ratatui::try_init()?;
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
-    Ok(terminal)
+    install_panic_restore_hook();
+    enable_raw_mode()?;
+    TERMINAL_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    crossterm::execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        Clear(ClearType::All),
+        EnableMouseCapture
+    )
+    .and_then(|()| ratatui::Terminal::new(CrosstermBackend::new(std::io::stdout())))
+    .inspect_err(|_| restore_terminal())
 }
 
-/// Tear down the terminal: disable mouse capture FIRST, then `ratatui::restore`
-/// (leave alternate screen + disable raw mode). The inverse of
-/// [`init_terminal`]; runs on every normal exit path.
+/// True while the dashboard owns the terminal: set right after raw mode is
+/// enabled, cleared by the first [`restore_terminal`]. Makes restore
+/// idempotent — the init error path, the panic hook, [`TerminalGuard`] and the
+/// login suspend can all call it, but only the first call after an init
+/// writes anything. A second `?1049l` would land on the main screen and can
+/// move the cursor.
+static TERMINAL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install, once per process, a panic hook that runs [`restore_terminal`] and
+/// then the previous hook, so a panic while the dashboard owns the terminal
+/// leaves it fully restored (mouse capture off, cursor shown, raw mode off,
+/// main screen) before the panic message prints. When the TUI is not active
+/// the restore is a no-op ([`TERMINAL_ACTIVE`]).
+fn install_panic_restore_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            prev(info);
+        }));
+    });
+}
+
+/// Tear down the terminal: disable mouse capture and show the cursor FIRST,
+/// then `ratatui::restore` (disable raw mode + leave alternate screen). The
+/// inverse of [`init_terminal`]. A no-op unless the terminal is active
+/// ([`TERMINAL_ACTIVE`]), so a second call writes nothing. The cursor is shown
+/// here because the dashboard hides it while drawing and otherwise only the
+/// old `Terminal`'s drop shows it again — on the login suspend path that drop
+/// runs after the re-init, so the OAuth prompt would run with a hidden cursor.
 fn restore_terminal() {
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    if !TERMINAL_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
     ratatui::restore();
+}
+
+/// Restores the terminal when dropped. Held by [`run_local`] and
+/// [`run_remote`] for the whole session, so the terminal is restored even when
+/// their future is dropped mid-await — `cli` races `run_local` against the
+/// server task in a `tokio::select!`, and a server exit drops the TUI future
+/// before any code after its `.await` runs.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
 }
 
 /// Run the in-process dashboard over live server state until quit.
 ///
 /// Terminal lifecycle via [`init_terminal`] / [`restore_terminal`]: raw mode +
-/// alternate screen + mouse capture, all undone on every exit path (and the
-/// panic hook).
+/// alternate screen + mouse capture, all undone on every exit path — normal
+/// return, a dropped future ([`TerminalGuard`]) and the panic hook.
 pub async fn run_local(state: crate::proxy::server::AppState) -> std::io::Result<()> {
     let mut terminal = init_terminal()?;
+    let guard = TerminalGuard;
     let mut app = App::new(Backend::Local(Box::new(state)));
     let result = event_loop(&mut terminal, &mut app, None).await;
-    restore_terminal();
+    drop(guard);
     result
 }
 
@@ -5183,6 +5250,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         tx,
     ));
     let mut terminal = init_terminal()?;
+    let guard = TerminalGuard;
     let mut app = App::new(Backend::Remote(Box::new(Remote {
         client,
         base_url: opts.base_url,
@@ -5200,7 +5268,7 @@ pub async fn run_remote(opts: RemoteOptions) -> std::io::Result<()> {
         pending_grok: None,
     })));
     let result = event_loop(&mut terminal, &mut app, Some(rx)).await;
-    restore_terminal();
+    drop(guard);
     fetcher.abort();
     result
 }
@@ -5411,13 +5479,13 @@ async fn event_loop(
         // A new browser login needs the RAW terminal back: the OAuth flow
         // prints prompts and may read a pasted code from stdin, which would
         // corrupt the alternate-screen TUI. Suspend (restore the terminal),
-        // run the flow, then re-init and force a full redraw. The fetch poller
-        // (remote mode) keeps running in the background meanwhile.
+        // run the flow, then re-init (which clears the screen) and force a
+        // full redraw. The fetch poller (remote mode) keeps running in the
+        // background meanwhile.
         if let Some(kind) = app.take_pending_login() {
             restore_terminal();
             app.perform_login(kind).await;
             *terminal = init_terminal()?;
-            let _ = terminal.clear();
             redraw = true;
         }
         if app.should_quit {
