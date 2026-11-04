@@ -18,14 +18,12 @@ enum UsageProvider: Hashable {
 }
 
 enum UsageWindow: CaseIterable {
-    case fiveHour
     case twentyFourHour
     case sevenDay
     case fableWeekly
 
     var label: String {
         switch self {
-        case .fiveHour: "5h"
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
         // Fable weekly is a 7-day window scoped to the Fable model — stack the
@@ -494,8 +492,8 @@ private struct UsageProviderColumn: View {
     private var usageRows: some View {
         switch provider {
         case .claude, .codex, .grok, .gemini:
-            // llmux reports gemini quota as the shared 5h/7d windows (a 7d
-            // window, like codex), so it renders through the same rows.
+            // llmux reports gemini quota as the shared 7d window (like codex),
+            // so it renders through the same rows.
             ForEach(providerWindows, id: \.label) { window in
                 UsageWindowRow(
                     window: window,
@@ -511,9 +509,11 @@ private struct UsageProviderColumn: View {
     private var providerWindows: [UsageWindow] {
         switch provider {
         case .claude, .codex, .grok, .gemini:
-            // Grok reports no quota windows (docs/grok/spec.md §R3) — the
-            // rows render their placeholder until a parked reset appears.
-            var windows: [UsageWindow] = [.fiveHour, .sevenDay]
+            // Only the 7d row: Islands intentionally no longer displays the 5h
+            // window (owner 2026-11-04), even when the daemon reports one.
+            // Grok reports no quota windows (docs/grok/spec.md §R3) — the row
+            // renders its placeholder until a parked reset appears.
+            var windows: [UsageWindow] = [.sevenDay]
             // The Fable weekly row is opt-out (default on) and only appears when
             // the daemon actually reports a Fable weekly window for this account.
             if showFableWeekly, info?.fableWeeklyPercent != nil {
@@ -526,7 +526,7 @@ private struct UsageProviderColumn: View {
     private func percentUsed(for window: UsageWindow) -> Double? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .fiveHour, .twentyFourHour: return info.fiveHourPercent
+        case .twentyFourHour: return info.fiveHourPercent
         case .sevenDay: return info.sevenDayPercent
         case .fableWeekly: return info.fableWeeklyPercent
         }
@@ -535,7 +535,7 @@ private struct UsageProviderColumn: View {
     private func resetAt(for window: UsageWindow) -> Date? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .fiveHour, .twentyFourHour: return info.fiveHourReset
+        case .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
         case .fableWeekly: return info.fableWeeklyReset
         }
@@ -797,8 +797,6 @@ private struct UsageWindowRow: View {
 
     private var windowDurationSeconds: TimeInterval? {
         switch window {
-        case .fiveHour:
-            return 5 * 60 * 60
         case .twentyFourHour:
             return 24 * 60 * 60
         case .sevenDay, .fableWeekly:
@@ -841,56 +839,39 @@ struct UsageAccountCompactList: View {
 }
 
 /// One account: status dot + provider mark + masked name, then a thin
-/// CONTINUOUS capsule bar per REPORTED window (5h / 7d / Fable-only-when-the-
-/// daemon-reports-it) with a small used-% label. Cold/absent windows are
-/// omitted entirely — no dashes, no empty gauges. One color semantic: neutral
-/// fill for normal utilization, warning red only at ≥ 90% (Fable additionally
-/// requires the daemon's reset-aware `constraining` — same rule as
-/// `DashboardHealth`).
+/// CONTINUOUS capsule bar per REPORTED window (7d / Fable-only-when-the-
+/// daemon-reports-it; never 5h — `CompactUsageGauges`) with a small used-%
+/// label. Cold/absent windows are omitted entirely — no dashes, no empty
+/// gauges. One color semantic: neutral fill for normal utilization, warning
+/// red only at ≥ 90% (Fable additionally requires the daemon's reset-aware
+/// `constraining` — same rule as `DashboardHealth`).
 struct UsageAccountCompactRow: View {
     let tile: UsageAccountTile
 
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
     @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
 
-    private struct Gauge: Identifiable {
-        let id: String
-        let usedFraction: Double
-        let warning: Bool
-    }
+    private typealias Gauge = CompactUsageGauges.Gauge
 
     private var displayName: String { tile.email ?? tile.label }
 
     private var isBroken: Bool { tile.info?.error == true || tile.info?.available == false }
 
-    private var gauges: [Gauge] {
-        guard let info = tile.info, info.available, !info.error else { return [] }
-        var result: [Gauge] = []
-        if let five = info.fiveHourPercent {
-            result.append(gauge("5h", usedPercent: five))
-        }
-        if let seven = info.sevenDayPercent {
-            result.append(gauge("7d", usedPercent: seven))
-        }
-        if showFableWeekly, let fable = info.fableWeeklyPercent {
-            // Fable is scoped: red only while the daemon marks it constraining.
-            result.append(gauge("Fab", usedPercent: fable, warningOverride: info.fableWeeklyConstraining == true))
-        }
-        return result
+    /// The reported usage, when the account answered.
+    private var usage: CLIUsageInfo? {
+        guard let info = tile.info, info.available, !info.error else { return nil }
+        return info
     }
 
-    private func gauge(_ id: String, usedPercent: Double, warningOverride: Bool? = nil) -> Gauge {
-        let fraction = max(0, min(1, usedPercent / 100))
-        return Gauge(
-            id: id,
-            usedFraction: fraction,
-            warning: warningOverride ?? (fraction >= DashboardHealth.quotaThreshold)
-        )
+    private var gauges: [Gauge] {
+        usage.map { CompactUsageGauges.gauges($0, showFable: showFableWeekly) } ?? []
     }
 
     private var dotColor: Color {
         if isBroken { return TerminalColors.red }
-        if gauges.contains(where: \.warning) { return TerminalColors.amber }
+        if let usage, CompactUsageGauges.warning(usage, showFable: showFableWeekly) {
+            return TerminalColors.amber
+        }
         return TerminalColors.green
     }
 
@@ -1089,3 +1070,6 @@ private struct SaveProfileSheet: View {
         .frame(width: 380)
     }
 }
+
+/// The compact account row reads its gauges from the daemon's usage DTO.
+extension CLIUsageInfo: CompactUsageInput {}
