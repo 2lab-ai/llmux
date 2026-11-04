@@ -6501,9 +6501,9 @@ const ACTIVITY_FLOOR: u16 = 4;
 /// Content rows of the scheduler + detail band (owner decision 2026-10-22):
 /// current · switch note · current · next · next · mode on the left, name ·
 /// token · 7d · life · poll on the right (the 5h line is gone, owner
-/// 2026-11-04 — the sixth row carries a detail extra when one fits, see
-/// [`draw_band`]), one title row above them — 7 rows in all, whether or not
-/// a switch note is showing.
+/// 2026-11-04 — the sixth row keeps only its `│`, see [`draw_band`]), one
+/// title row above them — 7 rows in all, whether or not a switch note is
+/// showing.
 const BAND_ROWS: u16 = 6;
 /// Cells between the band's left column and its detail column: a space and
 /// the `│` separator (the detail lines keep their own leading space).
@@ -6640,10 +6640,12 @@ impl BandGeometry {
 
 /// The band fit decision (owner mockup 2026-10-22, rule 3; row-paired
 /// geometry), pure: the band applies only when every row holds its left
-/// text, the gap and its detail line without cutting, the detail lines fit
-/// the band's `rows`, and the title row holds both titles. When only the
-/// title is too long, ` · totals …` moves to the mode row and everything is
-/// checked again. `None` = render today's middle instead.
+/// text, the gap and its detail line without cutting — a left row with no
+/// detail line (the sixth, the mode row, since the 5h line went) its text
+/// and the gap — the detail lines fit the band's `rows`, and the title row
+/// holds both titles. When only the title is too long, ` · totals …` moves
+/// to the mode row and everything is checked again. `None` = render today's
+/// middle instead.
 fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeometry> {
     let width = usize::from(width);
     let lines = widths.right.len();
@@ -6675,6 +6677,17 @@ fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeo
                 return None;
             }
             geometry.starts.push(start);
+        }
+        // Left rows past the detail lines (totals included on the mode
+        // row): the text and the `│` gap after it.
+        if geometry
+            .left
+            .iter()
+            .take(rows)
+            .skip(lines)
+            .any(|&left_w| left_w + BAND_SEP_W > width)
+        {
+            return None;
         }
         let title = if totals_on_mode_row {
             widths.title_bare
@@ -7155,13 +7168,12 @@ fn draw_middle(frame: &mut Frame, area: Rect, view: &DashboardView, plan: &Middl
 
 /// The scheduler + detail band: one border row carrying both titles, then
 /// [`BAND_ROWS`] rows, each its left text, `│` and its detail line at the
-/// columns the geometry fixed. Rows past the five detail lines show the
-/// detail extras (`last failure` lines, then `reset`), in order: the sixth
-/// row at the automatic height, more in a band dragged taller. The extras
-/// are not in [`band_width_bounds`], so a row inside the automatic height
-/// takes one only when it fits the detail block — a wider one would start
-/// left of `detail_x` and move that row's `│` on a cursor move (owner policy
-/// 2026-10-22). A row a drag adds takes any extra that fits the frame.
+/// columns the geometry fixed. The sixth row has no detail line since the
+/// 5h line went (owner 2026-11-04); it keeps its `│` where a detail line
+/// would start, so the bar column runs unbroken, and its detail side stays
+/// empty. The detail extras (`last failure` lines, then `reset`) ride only
+/// the rows a band dragged taller adds, each when it fits this frame — they
+/// are not in [`band_width_bounds`], so no automatic row ever takes one.
 fn draw_band(
     frame: &mut Frame,
     area: Rect,
@@ -7197,30 +7209,41 @@ fn draw_band(
             mode.spans.extend(band_totals_segment(&summary.totals));
         }
     }
-    let mut right: Vec<(usize, Line<'static>)> = band_right_lines(detail)
+    let paired: Vec<(usize, Line<'static>)> = band_right_lines(detail)
         .into_iter()
         .zip(geometry.starts.iter().copied())
         .map(|(line, start)| (start, line))
         .collect();
+    let automatic = usize::from(BAND_ROWS);
+    let first_extra = paired.len().max(automatic);
+    let mut extras: Vec<(usize, Line<'static>)> = Vec::new();
     for extra in detail.auth.iter().chain(detail.reset.iter()) {
-        if rows <= right.len() {
+        let row = first_extra + extras.len();
+        if rows <= row {
             break;
         }
-        let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
+        let left_w = geometry.left.get(row).copied().unwrap_or(0);
         let start = geometry.start(left_w, extra.width(), width);
-        let in_block = start >= geometry.detail_x || right.len() >= usize::from(BAND_ROWS);
-        if in_block && start + extra.width() <= width {
-            right.push((start, extra.clone()));
+        if start + extra.width() <= width {
+            extras.push((start, extra.clone()));
         }
     }
+    let right = |row: usize| {
+        paired
+            .get(row)
+            .or_else(|| extras.get(row.checked_sub(first_extra)?))
+    };
     for row in 0..rows {
         let y = area.y + 1 + row as u16;
-        let paired = right.get(row).map(|(start, _)| *start);
-        // A row with no detail line keeps the block's `│` when it clears it.
-        let bar = paired.or_else(|| {
-            let left_w = geometry.left.get(row).copied().unwrap_or(0);
-            (left_w + BAND_SEP_W <= geometry.detail_x).then_some(geometry.detail_x)
-        });
+        let row_left = geometry.left.get(row).copied().unwrap_or(0);
+        let bar = match right(row) {
+            Some((start, _)) => Some(*start),
+            // An automatic row with no detail line keeps the `│` where a
+            // detail line would start (band_geometry checked it fits).
+            None if row < automatic => Some((row_left + BAND_SEP_W).max(geometry.detail_x)),
+            // A row a drag adds keeps the block's `│` when it clears it.
+            None => (row_left + BAND_SEP_W <= geometry.detail_x).then_some(geometry.detail_x),
+        };
         let left_w = bar.map_or(width, |start| start - 1);
         if let Some(line) = left.get(row) {
             frame.render_widget(
@@ -7234,7 +7257,7 @@ fn draw_band(
                 Rect::new(area.x + start as u16 - 1, y, 1, 1),
             );
         }
-        if let Some((start, line)) = right.get(row) {
+        if let Some((start, line)) = right(row) {
             frame.render_widget(
                 Paragraph::new(line.clone()),
                 Rect::new(area.x + *start as u16, y, (width - start) as u16, 1),
@@ -18451,7 +18474,7 @@ mod tests {
             "token line uncut:\n{frame}"
         );
         // No 5h line (owner 2026-11-04): 7d follows the token line, and the
-        // freed sixth row carries the `reset` extra.
+        // sixth row keeps only its `│` (extras ride rows a drag adds).
         assert!(
             detail[2].contains(" 7d ") && detail[2].trim_end().ends_with(" ago"),
             "{frame}"
@@ -18461,10 +18484,7 @@ mod tests {
             "life line uncut:\n{frame}"
         );
         assert!(detail[4].contains("poll  ok 4s ago · next ~"), "{frame}");
-        assert!(
-            detail[5].contains("reset unknown — press f to refresh"),
-            "{frame}"
-        );
+        assert!(detail[5].trim().is_empty(), "{frame}");
         assert!(
             detail.iter().all(|line| !line.contains(" 5h ")),
             "no 5h usage line in the band:\n{frame}"
@@ -18574,7 +18594,7 @@ mod tests {
     const BAND_179_ROW_5: &str =
         "          codex  codex:user15xxxxxxxxx@ex.io                                            │ poll  ok 4s ago · next ~5m19s";
     const BAND_179_ROW_6: &str =
-        " mode     default   [S switch]                                                          │ reset unknown — press f to refresh";
+        " mode     default   [S switch]                                                          │";
 
     /// Column of the `│` in a band row.
     fn bar_at(row: &str) -> usize {
@@ -18583,54 +18603,57 @@ mod tests {
             .expect("band row has a │")
     }
 
-    /// Owner 2026-11-04: with the 5h line gone the band's detail column has
-    /// five lines, so its sixth row carries a detail extra (`last failure` /
-    /// `reset`) at the automatic height. Those extras are not in the band's
-    /// width bounds, so one wider than the detail block is left out instead
-    /// of being pulled left of it — a cursor move never moves a `│` inside
-    /// the automatic height (owner policy 2026-10-22: no jump on a cursor
-    /// move), and the 5h usage line appears in no band row.
+    /// Owner 2026-11-04 + review decision: with the 5h line gone the band's
+    /// detail column has five lines, and the sixth automatic row takes no
+    /// detail extra — `reset …` / `last failure …` ride only the rows a drag
+    /// adds, as before. It keeps its `│` in the block column, so the bar runs
+    /// unbroken through all six rows, at the same column whichever account
+    /// the cursor is on (owner policy 2026-10-22: no jump on a cursor move),
+    /// and the 5h usage line appears in no band row.
     #[test]
-    fn band_sixth_row_extra_never_moves_the_bar_on_a_cursor_move() {
+    fn band_sixth_row_stays_free_of_extras_and_keeps_its_bar() {
         let (mut view, chrome) = recompose_view();
+        // An account whose `reset` extra is wider than the detail block, and
+        // the current one, whose `reset unknown` would fit it.
         let wide = rid("claude", 2);
         view.usage_controls.insert(
             wide.clone(),
             crate::proxy::usage_controls::UsageControlDoc {
                 available_resets: Some(3),
                 applicable_resets: Some(1),
-                // ~110 cells: wider than the 90-cell detail block, narrow
-                // enough for the frame — the case `start` would pull left.
                 last_error: Some(format!("upstream 502 {}", "x".repeat(49))),
                 ..Default::default()
             },
         );
         let fitting = rid("claude", 13);
-        let bars = |id: &str| -> (Vec<usize>, Vec<String>) {
+        let band_rows = |id: &str| -> Vec<String> {
             let rows = render_rows(&view, &cursor_on(&view, &chrome, id), 179, 43);
             let band = row_of(&rows, " scheduler · poller ");
-            let band_rows: Vec<String> = rows[band + 1..band + 1 + usize::from(BAND_ROWS)].to_vec();
-            (band_rows.iter().map(|r| bar_at(r)).collect(), band_rows)
+            rows[band + 1..band + 1 + usize::from(BAND_ROWS)].to_vec()
         };
-        let (fit_bars, fit_rows) = bars(&fitting);
-        let (wide_bars, wide_rows) = bars(&wide);
+        let (fit_rows, wide_rows) = (band_rows(&fitting), band_rows(&wide));
+        let bars = |rows: &[String]| rows.iter().map(|r| bar_at(r)).collect::<Vec<_>>();
         assert_eq!(
-            fit_bars,
-            wide_bars,
+            bars(&fit_rows),
+            vec![88; 6],
+            "one unbroken `│` column:\n{}",
+            fit_rows.join("\n")
+        );
+        assert_eq!(
+            bars(&wide_rows),
+            bars(&fit_rows),
             "no band `│` moves on a cursor move:\n{}\n---\n{}",
             fit_rows.join("\n"),
             wide_rows.join("\n")
         );
-        assert!(
-            fit_rows[5].contains("│ reset unknown — press f to refresh"),
-            "the sixth row carries the fitting reset extra:\n{}",
-            fit_rows.join("\n")
-        );
-        assert!(
-            !wide_rows[5].contains("last error"),
-            "an extra wider than the block stays out of the sixth row:\n{}",
-            wide_rows.join("\n")
-        );
+        for rows in [&fit_rows, &wide_rows] {
+            let (_, sixth) = rows[5].split_once('│').expect("bar");
+            assert!(
+                sixth.trim().is_empty(),
+                "the sixth automatic row carries no extra:\n{}",
+                rows.join("\n")
+            );
+        }
         for row in fit_rows.iter().chain(&wide_rows) {
             assert!(
                 !row.contains("│ 5h "),
@@ -18824,12 +18847,12 @@ mod tests {
         }
         assert!(missing.is_empty(), "no band at 179: {}", missing.join(", "));
         // The note row pairs with the token line on the claude side (172)
-        // and with the 5h line on the codex side (160).
+        // and with the 7d line on the codex side (160).
         assert_eq!(bounds, [172, 160, 172, 160]);
     }
 
     /// The note's row is an event input: after a codex switch the note
-    /// row sits under the codex current row and pairs with the 5h line
+    /// row sits under the codex current row and pairs with the 7d line
     /// instead of the token line, so the capture fixture's bound moves from
     /// 161 to 148 — the band stays at every width it had.
     #[test]
@@ -18967,22 +18990,17 @@ mod tests {
             accounts + 10,
             "{frame}"
         );
-        // A dragged-tall band keeps the band layout and gains a row. The
-        // reset row no longer needs the drag: with the 5h line gone (owner
-        // 2026-11-04) it rides the sixth row, the drag only adds an empty one.
+        // A dragged-tall band keeps the band layout and gains the reset row
+        // today's 7-row detail pane clipped. The sixth (automatic) row stays
+        // free of it even with the 5h line gone (review decision 2026-11-04).
         chrome.pane_heights.accounts = None;
         chrome.pane_heights.middle = Some(8);
         let rows = render_rows(&view, &chrome, w, 50);
         let frame = rows.join("\n");
         let band = row_of(&rows, " scheduler · poller ");
         assert_eq!(row_of(&rows, " models — "), band + 8, "{frame}");
-        assert!(rows[band + 6].contains("│ reset "), "{frame}");
-        assert!(
-            rows[band + 7]
-                .split_once('│')
-                .is_none_or(|(_, right)| right.trim().is_empty()),
-            "{frame}"
-        );
+        assert!(rows[band + 7].contains("│ reset "), "{frame}");
+        assert!(!rows[band + 6].contains("reset"), "{frame}");
     }
 
     /// With ONE scheduler group the summary's `load` line is visible in
@@ -19084,6 +19102,33 @@ mod tests {
         assert!(band_geometry(179, 6, &six).is_some());
         // No detail at all → no band.
         assert!(band_geometry(179, 5, &fixture_widths(&[10], &[])).is_none());
+    }
+
+    /// Review 2026-11-04 (MUST-FIX): with five detail lines the band's sixth
+    /// left row — the mode row, carrying ` · totals …` when they leave the
+    /// title — pairs with no detail line, and it must still hold its text
+    /// and its `│` gap inside the frame, or the band does not apply.
+    #[test]
+    fn band_geometry_checks_left_rows_past_the_detail_lines() {
+        // Six left rows (the sixth is the mode row), five detail lines.
+        let widths = |mode: usize| BandWidths {
+            mode_row: 5,
+            ..fixture_widths(&[41, 40, 57, 40, 34, mode], &FIXTURE_RIGHT)
+        };
+        // 180: the title holds totals (170 + 2 + 8), the mode row needs
+        // its text + 2.
+        let fits = band_geometry(180, 6, &widths(178)).expect("178 + 2 = 180");
+        assert!(!fits.totals_on_mode_row);
+        assert_eq!(band_geometry(180, 6, &widths(179)), None, "179 + 2 > 180");
+        // 179: totals ride the mode row (+70), so it needs 107 + 70 + 2.
+        let ride = band_geometry(179, 6, &widths(107)).expect("107 + 70 + 2 = 179");
+        assert!(ride.totals_on_mode_row);
+        assert_eq!(ride.left[5], 177);
+        assert_eq!(
+            band_geometry(179, 6, &widths(108)),
+            None,
+            "108 + 70 + 2 > 179"
+        );
     }
 
     /// Rule 4, pure: the largest per-line count whose aligned line fits.
@@ -19341,9 +19386,13 @@ mod tests {
             "{frame}"
         );
         // The mode row is the sixth: with the 5h line gone (owner
-        // 2026-11-04) it pairs with the `reset` extra, after its own `│`.
-        assert!(
-            right.starts_with(" reset ") && !right.trim_end().is_empty(),
+        // 2026-11-04) it pairs with no detail line and takes no extra; its
+        // `│` sits where a detail line would start: right after the row's
+        // bounded width (totals included), as the paired rows place theirs.
+        assert!(right.trim().is_empty(), "{frame}");
+        assert_eq!(
+            bar_at(&rows[band + 1 + mode]),
+            geometry.left[mode] + BAND_SEP_W - 1,
             "{frame}"
         );
         for (row, line) in band_right_lines(plan.detail.as_ref().expect("detail"))
@@ -19497,9 +19546,11 @@ mod tests {
     /// when the owner removed the 5h column, the 5h detail line and the
     /// in-gauge `rst ` prefix — the only changes in that frame: no `5h`
     /// header or cell (columns right of `status` 9 cells left), countdowns
-    /// bare, and the band's detail lines one row up with `reset` in the
-    /// sixth row.
-    const FOLD_OFF_179X43_DIGEST: u64 = 10_583_319_980_142_849_399;
+    /// bare, and the band's detail lines one row up with the sixth (mode)
+    /// row keeping only its `│`. (origin/main still renders the old digest
+    /// 6_597_409_346_785_969_346 from this fixture; the frame diff is PR #230
+    /// review evidence.)
+    const FOLD_OFF_179X43_DIGEST: u64 = 15_536_070_822_945_120_328;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
