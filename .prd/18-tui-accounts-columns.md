@@ -56,3 +56,15 @@ detail pane.
 
 This ships as a stable release (`v0.2.23`) followed by a preview build of the
 same commit, per the owner's standing rule (zbrain `rules/DEV.md` §6).
+
+## Amendment 2026-11-04 — the 5h column is removed
+
+2026-11-04 owner: the 5h column/stub is removed from the accounts table,
+detail band and account modal — no provider reports a 5h window any more;
+scheduler 5h ceiling unchanged. Rules 1–2 no longer render anything; the
+give-way order of rules 4–5 becomes status 20→8 → `account` 20→7 → clip.
+The same change removes the `rst ` prefix inside the weekly gauges (added
+in #210): the gauge shows the bare reset countdown again under its `RESET`
+header. The `rst` reset-credit column (`.prd/16`), the `five_hour` data in
+`/llmux/status` and `/llmux/dashboard`, the `five_hour_max` config knob and
+the `5h,7d,fbl` limits editor are untouched.
