@@ -21,8 +21,9 @@ enum GlanceSignal: Equatable {
     /// Distinct from `lowQuota`: exhaustion changes the action (now), an
     /// approaching limit changes the plan (soon).
     case limit(count: Int)
-    /// The worst account×window at ≤10% remaining (but not exhausted):
-    /// window is "5h" or "7d", remainingPct the ACTUAL remaining percent.
+    /// The worst account's 7d window at ≤10% remaining (but not exhausted):
+    /// window is "7d" (no 5h candidate since owner 2026-11-04), remainingPct
+    /// the ACTUAL remaining percent.
     case lowQuota(window: String, remainingPct: Int, account: String)
     /// An account the daemon EXPLICITLY reports as degraded, debounced over
     /// [`GlanceResolver.degradedDebounce`] consecutive polls. unknown/cold are
@@ -32,7 +33,7 @@ enum GlanceSignal: Equatable {
 
     /// The closed-label chip text. `nil` = render today's label unchanged.
     /// Text IS the signal (color is reinforcement only); quota always carries
-    /// its window so 5h and 7d can never be confused.
+    /// its window name.
     var chipText: String? {
         switch self {
         case .offline: return "offline"
@@ -49,7 +50,7 @@ enum GlanceSignal: Equatable {
 /// next. Derived by the SAME resolver run as the closed chip.
 struct GlanceAttention: Equatable, Identifiable {
     let account: String
-    /// "authentication required — re-login", "5h limit exhausted", "5h 8%".
+    /// "authentication required — re-login", "7d limit exhausted", "7d 8% left".
     let reason: String
     /// "resets in 1h 42m" when the window carries a reset. nil otherwise.
     let detail: String?
@@ -101,8 +102,10 @@ enum GlanceResolver {
         }
 
         // 2/3. Windows: exhausted (LIMIT) and approaching (lowQuota).
-        // Candidates over EVERY eligible account × {5h, 7d} — never an
-        // average, never a representative account. Eligible = an OPERATIONAL
+        // Candidates over EVERY eligible account × 7d — never an average,
+        // never a representative account. A 5h window the daemon may still
+        // report is not a candidate (owner 2026-11-04: no 5h on any Islands
+        // surface; the scheduler still gates on it). Eligible = an OPERATIONAL
         // status ("active"/"ok") and not operator-paused: unknown/cold/
         // cooldown/degraded states are NEVER promoted into a quota chip
         // (consensus MUST-FIX 4 — their quota reading is not an action).
@@ -110,12 +113,6 @@ enum GlanceResolver {
         let operational: Set<String?> = ["active", "ok"]
         for (index, record) in records.enumerated()
         where operational.contains(record.status) && record.paused != true {
-            if let five = record.fiveHour {
-                windows.append(WindowState(
-                    index: index, name: record.name, window: "5h",
-                    utilization: five.utilization, resetsInSecs: five.resetsInSecs
-                ))
-            }
             if let seven = record.sevenDay {
                 windows.append(WindowState(
                     index: index, name: record.name, window: "7d",
@@ -127,8 +124,7 @@ enum GlanceResolver {
         let exhaustedWindows = windows
             .filter { $0.utilization >= exhaustedUtilization }
             .sorted(by: Self.worstFirst)
-        // LIMIT counts AFFECTED ACCOUNTS, not windows: one account with both
-        // 5h and 7d at 0% is still "LIMIT 1".
+        // LIMIT counts AFFECTED ACCOUNTS (one 7d window each).
         let limitAccounts = Set(exhaustedWindows.map(\.name))
         for state in exhaustedWindows {
             attention.append(
@@ -202,11 +198,10 @@ enum GlanceResolver {
     }
 
     /// Stable worst-first order for window candidates: lower remaining first,
-    /// then 5h before 7d, then account name — so the beacon target can never
-    /// flap between equal candidates across polls.
+    /// then account name — so the beacon target can never flap between equal
+    /// candidates across polls.
     private static func worstFirst(_ a: WindowState, _ b: WindowState) -> Bool {
         if a.utilization != b.utilization { return a.utilization > b.utilization }
-        if a.window != b.window { return a.window == "5h" }
         return a.name < b.name
     }
 
