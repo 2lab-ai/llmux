@@ -6526,11 +6526,15 @@ struct MiddlePlan {
 impl MiddlePlan {
     /// `rows` = content rows the band would get (its height minus the title
     /// row): [`BAND_ROWS`] for the automatic height, the drag height minus
-    /// one under a drag override.
+    /// one under a drag override. Fewer than [`BAND_ROWS`] → no band: its
+    /// left column needs every one of those rows (the `mode` row is the
+    /// sixth), so a shorter drag keeps today's middle pane, as it did while
+    /// the detail column had six lines (PR #230 review, 2026-11-04).
     fn new(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome, width: u16, rows: usize) -> Self {
         let summary = summary_parts(view, ctx);
         let detail = detail_parts(view, ctx, chrome);
-        let band = detail.as_ref().and_then(|_| {
+        let tall_enough = rows >= usize::from(BAND_ROWS);
+        let band = detail.as_ref().filter(|_| tall_enough).and_then(|_| {
             let selectable: Vec<DetailParts> = (0..ctx.order.len())
                 .filter_map(|pos| detail_parts_at(view, ctx, pos))
                 .collect();
@@ -6640,12 +6644,13 @@ impl BandGeometry {
 
 /// The band fit decision (owner mockup 2026-10-22, rule 3; row-paired
 /// geometry), pure: the band applies only when every row holds its left
-/// text, the gap and its detail line without cutting — a left row with no
-/// detail line (the sixth, the mode row, since the 5h line went) its text
-/// and the gap — the detail lines fit the band's `rows`, and the title row
-/// holds both titles. When only the title is too long, ` · totals …` moves
-/// to the mode row and everything is checked again. `None` = render today's
-/// middle instead.
+/// text, the gap and its detail line without cutting — every left row past
+/// the detail lines, up to `rows`, its text and the gap (at the automatic
+/// height that is the sixth, the mode row, since the 5h line went; a band
+/// dragged taller checks its added rows too) — the detail lines fit the
+/// band's `rows`, and the title row holds both titles. When only the title
+/// is too long, ` · totals …` moves to the mode row and everything is
+/// checked again. `None` = render today's middle instead.
 fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeometry> {
     let width = usize::from(width);
     let lines = widths.right.len();
@@ -6678,8 +6683,9 @@ fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeo
             }
             geometry.starts.push(start);
         }
-        // Left rows past the detail lines (totals included on the mode
-        // row): the text and the `│` gap after it.
+        // Every left row past the detail lines, up to `rows` (totals
+        // included when they ride the mode row): its text and the `│` gap
+        // after it.
         if geometry
             .left
             .iter()
@@ -18972,6 +18978,43 @@ mod tests {
                 "{frame}"
             );
         }
+    }
+
+    /// Review round 3 (PR #230): a middle pane dragged to 6 rows gives the
+    /// band only 5 content rows. With six detail lines that fell back to
+    /// today's middle pane; with five it must still fall back, because the
+    /// band's left column needs [`BAND_ROWS`] rows and would lose its `mode`
+    /// row. From 7 (the automatic height) the band applies and shows it.
+    #[test]
+    fn dragged_middle_below_the_band_height_falls_back_with_the_mode_row() {
+        let (view, mut chrome) = recompose_view();
+        let w = band_bound(&view, &chrome);
+        for height in [5u16, 6] {
+            chrome.pane_heights.middle = Some(height);
+            let rows = render_rows(&view, &chrome, w, 50);
+            let frame = rows.join("\n");
+            assert!(
+                !has_band(&rows),
+                "a {height}-row middle is below the band height:\n{frame}"
+            );
+            if height == 6 {
+                assert!(
+                    rows.iter()
+                        .any(|r| r.contains(" mode ") && r.contains("[S switch]")),
+                    "the fallback pane shows the mode row at {height}:\n{frame}"
+                );
+            }
+        }
+        chrome.pane_heights.middle = Some(BAND_ROWS + 1);
+        let rows = render_rows(&view, &chrome, w, 50);
+        let frame = rows.join("\n");
+        assert!(has_band(&rows), "the band applies at 7:\n{frame}");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert!(
+            rows[band + usize::from(BAND_ROWS)].contains(" mode ")
+                && rows[band + usize::from(BAND_ROWS)].contains("[S switch]"),
+            "the band's sixth row is the mode row at 7:\n{frame}"
+        );
     }
 
     /// Drag overrides still replace the automatic heights (UI-3 U7/U8), and
