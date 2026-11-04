@@ -6501,9 +6501,9 @@ const ACTIVITY_FLOOR: u16 = 4;
 /// Content rows of the scheduler + detail band (owner decision 2026-10-22):
 /// current · switch note · current · next · next · mode on the left, name ·
 /// token · 7d · life · poll on the right (the 5h line is gone, owner
-/// 2026-11-04 — the sixth row keeps only its `│`, see [`draw_band`]), one
-/// title row above them — 7 rows in all, whether or not a switch note is
-/// showing.
+/// 2026-11-04 — the sixth row, whichever left line lands there, keeps only
+/// its `│`, see [`draw_band`]), one title row above them — 7 rows in all,
+/// whether or not a switch note is showing.
 const BAND_ROWS: u16 = 6;
 /// Cells between the band's left column and its detail column: a space and
 /// the `│` separator (the detail lines keep their own leading space).
@@ -6526,10 +6526,11 @@ struct MiddlePlan {
 impl MiddlePlan {
     /// `rows` = content rows the band would get (its height minus the title
     /// row): [`BAND_ROWS`] for the automatic height, the drag height minus
-    /// one under a drag override. Fewer than [`BAND_ROWS`] → no band: its
-    /// left column needs every one of those rows (the `mode` row is the
-    /// sixth), so a shorter drag keeps today's middle pane, as it did while
-    /// the detail column had six lines (PR #230 review, 2026-11-04).
+    /// one under a drag override. Fewer than [`BAND_ROWS`] → no band: the
+    /// band is a fixed [`BAND_ROWS`]-row layout whose left column is laid
+    /// out for all of them, so a shorter drag keeps today's middle pane —
+    /// the same outcome as before the 5h line went, when six detail lines
+    /// never fit fewer than six rows (PR #230 review, 2026-11-04).
     fn new(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome, width: u16, rows: usize) -> Self {
         let summary = summary_parts(view, ctx);
         let detail = detail_parts(view, ctx, chrome);
@@ -6646,11 +6647,11 @@ impl BandGeometry {
 /// geometry), pure: the band applies only when every row holds its left
 /// text, the gap and its detail line without cutting — every left row past
 /// the detail lines, up to `rows`, its text and the gap (at the automatic
-/// height that is the sixth, the mode row, since the 5h line went; a band
-/// dragged taller checks its added rows too) — the detail lines fit the
-/// band's `rows`, and the title row holds both titles. When only the title
-/// is too long, ` · totals …` moves to the mode row and everything is
-/// checked again. `None` = render today's middle instead.
+/// height that is the sixth row, since the 5h line went — `mode` with two
+/// scheduler groups; a band dragged taller checks its added rows too) — the
+/// detail lines fit the band's `rows`, and the title row holds both titles.
+/// When only the title is too long, ` · totals …` moves to the mode row and
+/// everything is checked again. `None` = render today's middle instead.
 fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeometry> {
     let width = usize::from(width);
     let lines = widths.right.len();
@@ -7151,11 +7152,19 @@ fn detail_poll_line(poll: &str) -> Line<'static> {
 /// #5): on MAIN the detail rides alongside the summary whenever the width
 /// allows, and the Accounts overlay (`a`) gives detail the full-width slot.
 /// When the plan carries a band geometry, the two panes recompose into the
-/// scheduler + detail band instead ([`draw_band`]).
+/// scheduler + detail band instead ([`draw_band`]) — but only when the area
+/// the layout actually gave the pane still holds the title row plus
+/// [`BAND_ROWS`] rows. The plan decides on the band height, and the vertical
+/// solver can still squeeze this pane (a short terminal with the accounts
+/// pane dragged: activity's `Min(3)` outranks the `Length` panes); a band
+/// with fewer rows would cut its left column's last rows (`mode` with two
+/// scheduler groups).
 fn draw_middle(frame: &mut Frame, area: Rect, view: &DashboardView, plan: &MiddlePlan) {
     if let (Some(geometry), Some(detail)) = (plan.band.as_ref(), plan.detail.as_ref()) {
-        draw_band(frame, area, &plan.summary, detail, geometry);
-        return;
+        if area.height > BAND_ROWS {
+            draw_band(frame, area, &plan.summary, detail, geometry);
+            return;
+        }
     }
     let has_accounts = !view.snapshot.accounts.is_empty();
     if has_accounts && area.width >= SIDE_BY_SIDE_AT {
@@ -19017,6 +19026,51 @@ mod tests {
         );
     }
 
+    /// Review final round (PR #230): the plan picks the band from the band
+    /// height alone, but the vertical layout can still squeeze the middle
+    /// pane — a short terminal with the accounts pane dragged: `Min(3)`
+    /// activity outranks the `Length` panes, so the solver takes rows from
+    /// them. At 22 rows with accounts dragged to 3 the middle area is 6
+    /// rows (measured): the band would get 5 content rows and lose its
+    /// `mode` row, so the middle pane falls back to today's pair, which
+    /// shows it. Over a sweep of heights the band never renders without
+    /// its `mode` row.
+    #[test]
+    fn squeezed_middle_area_falls_back_instead_of_cutting_the_band() {
+        let (view, mut chrome) = recompose_view();
+        let w = band_bound(&view, &chrome);
+        chrome.pane_heights.accounts = Some(3);
+        let rows = render_rows(&view, &chrome, w, 22);
+        let frame = rows.join("\n");
+        let models = row_of(&rows, " models — ");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert_eq!(
+            models - (accounts + 3),
+            6,
+            "the middle area is 6 rows:\n{frame}"
+        );
+        assert!(!has_band(&rows), "no band in a 6-row middle area:\n{frame}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(" mode ") && r.contains("[S switch]")),
+            "the fallback pane shows the mode row:\n{frame}"
+        );
+        for accounts in [3u16, 10] {
+            chrome.pane_heights.accounts = Some(accounts);
+            for height in 18u16..=30 {
+                let rows = render_rows(&view, &chrome, w, height);
+                if has_band(&rows) {
+                    assert!(
+                        rows.iter()
+                            .any(|r| r.contains(" mode ") && r.contains("[S switch]")),
+                        "a band always shows its mode row ({accounts}, {height}):\n{}",
+                        rows.join("\n")
+                    );
+                }
+            }
+        }
+    }
+
     /// Drag overrides still replace the automatic heights (UI-3 U7/U8), and
     /// a dragged-short accounts pane says how many rows it hides.
     #[test]
@@ -19428,10 +19482,11 @@ mod tests {
             bar_at(&rows[band + 1 + mode]) > geometry.detail_x - 1,
             "{frame}"
         );
-        // The mode row is the sixth: with the 5h line gone (owner
-        // 2026-11-04) it pairs with no detail line and takes no extra; its
-        // `│` sits where a detail line would start: right after the row's
-        // bounded width (totals included), as the paired rows place theirs.
+        // In this two-group fixture the mode row is the sixth: with the 5h
+        // line gone (owner 2026-11-04) it pairs with no detail line and
+        // takes no extra; its `│` sits where a detail line would start:
+        // right after the row's bounded width (totals included), as the
+        // paired rows place theirs.
         assert!(right.trim().is_empty(), "{frame}");
         assert_eq!(
             bar_at(&rows[band + 1 + mode]),
