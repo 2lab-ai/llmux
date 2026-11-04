@@ -66,14 +66,17 @@ the key bar. Numbers keep their usual format everywhere.
   row of the group that switched — `{previous} → {reason}, {age} ago`,
   starting under the account name — and that row is blank before any
   switch, so the band never changes height on a switch. After a `│` the
-  detail column shows six lines: name · credential type · order · status,
-  the token line, the 5h window, the 7d window, the lifetime totals and the
-  poll line (`poll  ok 4s ago · next ~5m18s`) — the same text as before,
-  uncut. Each band row pairs one left line with one detail line. The detail
-  lines start in one column, set so the widest of lines 2–6 ends at the
-  right edge; a row whose left text is longer than that starts its detail
-  line just after its own text, with its own `│`. Whether the band is used,
-  and where every column sits, changes only on a terminal width change, a
+  detail column shows five lines: name · credential type · order · status,
+  the token line, the 7d window, the lifetime totals and the poll line
+  (`poll  ok 4s ago · next ~5m18s`) — the same text as before, uncut. The
+  sixth row shows the account's last failure (`last failure …`) or its
+  `reset` line when that line fits the detail column; a longer one is left
+  out there rather than moving the `│`. Each band row pairs one left line
+  with one detail line. The detail lines start in one column, set so the
+  widest of lines 2–5 ends at the right edge; a row whose left text is
+  longer than that starts its detail line just after its own text, with its
+  own `│`. Whether the band is used, and where every column sits, changes
+  only on a terminal width change, a
   change to the set of accounts, a scheduler event (a switch, a failing
   usage poll) or a count gaining a digit (for example `err` going from 999
   to 1.0k). Moving the cursor does not change it, and neither does a clock
@@ -91,10 +94,11 @@ the key bar. Numbers keep their usual format everywhere.
   reason: an automatic switch (`SevenDayOverThreshold` /
   `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on
   the Codex side. The detail `reset`
-  line was never visible on the dashboard (the 8-row pane cut it off); it
-  appears in the band's seventh row when you drag the band taller than 7
-  rows and the line fits, and the accounts tab's detail pane always shows
-  it.
+  line shows in the band's sixth row when it fits the detail column, and
+  in the seventh row of the 8-row pane; an account with a recorded failure
+  shows its `last failure …` lines there first. Dragging the band taller
+  adds rows for the lines that follow, and the accounts tab's detail pane
+  always shows it.
 - **Models.** When two or more models fit side by side, the models strip packs
   them several to a line (for example, the top 5 on 3 lines): each entry
   is the group, the model, the 10-cell share bar, requests, tokens, cost and
@@ -140,8 +144,8 @@ the key bar. Numbers keep their usual format everywhere.
   short, `+N more` counts the table rows that do not fit plus the folded
   accounts on the lines that do not fit. The columns keep room for the
   widest form of every value the clock changes (a reset countdown with
-  its `◑` mark, a 5h window resetting or going stale), so the block does
-  not move as time passes. The fold never makes the accounts pane taller.
+  its `◑` mark, a Fable window resetting), so the block does not move as
+  time passes. The fold never makes the accounts pane taller.
   When it is on but cannot help, the dashboard shows the full table and
   the title says why: `· fold: nothing to fold` when no account is
   7d-spent, `· fold: too narrow` when neither title nor even one folded
@@ -152,22 +156,18 @@ the key bar. Numbers keep their usual format everywhere.
 
 ### Reading account quota columns
 
-`LEFT` means quota remaining; `USED` means quota consumed. The `5h` header
-shows the active meaning (`5h LEFT` or `5h USED`). The `7d` and optional
-`7d Fbl` gauges put `RESET` on the left of the header and the active meaning
-above the percentage on the right. These labels follow both the configured
-`quota_display` mode and the session-local `u` toggle.
+`LEFT` means quota remaining; `USED` means quota consumed. The `7d` and
+optional `7d Fbl` gauges put `RESET` on the left of the header and the
+active meaning above the percentage on the right. These labels follow both
+the configured `quota_display` mode and the session-local `u` toggle. There
+is no `5h` column: no provider reports a 5h window any more (the scheduler's
+5h ceiling still applies when a window is reported).
 
-The time inside a weekly gauge is its reset countdown. `rst ` is added only
-when the four cells immediately before the existing centered time are blank;
-it never moves the time or grows the gauge. If those cells do not fit, the
-label is omitted, including for an absolute `t` timestamp in an 11-cell bar.
-Cold or unavailable cells do not gain a reset time. Gauge fill, colors, bold
-countdown units, freshness markers, percentages and account order are unchanged.
-
-The in-gauge `rst` labels a **reset time**. The separate, existing `rst`
-column described below counts **reset credits/grants owned**; it is not a
-countdown and its label is unchanged.
+The time inside a weekly gauge is its reset countdown, shown bare and
+centered (`7d 10h`, or the absolute stamp under `t`); the header's `RESET`
+names it. Cold or unavailable cells show no reset time. The `rst` column
+described below counts **reset credits/grants owned**; it is not a
+countdown.
 
 ### Usage controls (refresh · resets)
 
