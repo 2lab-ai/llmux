@@ -529,7 +529,7 @@ async fn server(args: ServerArgs, remote: Option<String>) -> Result<(), CliError
 
     // TUI mode: bind BEFORE initializing the terminal. `serve` reports the
     // bound address on `ready`; if it fails to bind it returns the error
-    // first, so we never call `ratatui::try_init` over a doomed server.
+    // first, so we never call `init_terminal` over a doomed server.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let tui_state = state.clone();
     let mut serve_task = tokio::spawn(crate::proxy::server::serve(state, Some(ready_tx)));
