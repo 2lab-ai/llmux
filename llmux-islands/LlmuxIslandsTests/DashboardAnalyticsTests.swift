@@ -217,6 +217,48 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(DashboardHealth.bannerText(summary), "1 account auth failed")
     }
 
+    // MARK: - Displayed quota windows: no 5h (owner 2026-11-04)
+
+    private struct Usage: CompactUsageInput {
+        var fiveHourPercent: Double?
+        var sevenDayPercent: Double?
+        var fableWeeklyPercent: Double?
+        var fableWeeklyConstraining: Bool?
+    }
+
+    func testCompactGaugesNeverDrawFiveHour() {
+        // A reported 5h window (95% used) draws no gauge; 7d and Fab do.
+        let usage = Usage(
+            fiveHourPercent: 95, sevenDayPercent: 31,
+            fableWeeklyPercent: 82, fableWeeklyConstraining: false
+        )
+        let gauges = CompactUsageGauges.gauges(usage, showFable: true)
+        XCTAssertEqual(gauges.map(\.id), ["7d", "Fab"])
+        XCTAssertEqual(gauges.first?.usedFraction ?? 0, 0.31, accuracy: 1e-9)
+        XCTAssertEqual(CompactUsageGauges.gauges(usage, showFable: false).map(\.id), ["7d"])
+        // Only a 5h window reported: no gauge at all.
+        XCTAssertTrue(CompactUsageGauges.gauges(Usage(fiveHourPercent: 40), showFable: true).isEmpty)
+        // The status dot keeps its old rule: an undrawn 5h window at ≥ 90%
+        // still warns (the scheduler still gates on it), a calm one does not.
+        XCTAssertTrue(CompactUsageGauges.warning(usage, showFable: true))
+        XCTAssertFalse(CompactUsageGauges.warning(Usage(fiveHourPercent: 40, sevenDayPercent: 31), showFable: true))
+        XCTAssertTrue(CompactUsageGauges.warning(Usage(sevenDayPercent: 92), showFable: true))
+    }
+
+    func testQuotaSummaryNeverShowsFiveHour() throws {
+        let dash = try JSONDecoder().decode(LlmuxDashboard.self, from: Data(DashboardFixtures.full.utf8))
+        let user1 = try XCTUnwrap(dash.accounts.first { $0.name == "claude:user1@example.com" })
+        XCTAssertNotNil(user1.fiveHour, "the fixture reports a 5h window")
+        XCTAssertEqual(user1.quotaSummary, "7d 61% · Fab 91%")
+        for account in dash.accounts {
+            XCTAssertFalse(account.quotaSummary?.contains("5h") ?? false, account.name)
+        }
+        // An account reporting only a 5h window has no summary (cold).
+        let json = #"{"name": "claude:x@example.com", "type": "oauth", "five_hour": {"utilization": 0.2}}"#
+        let only5h = try JSONDecoder().decode(LlmuxDashboardAccount.self, from: Data(json.utf8))
+        XCTAssertNil(only5h.quotaSummary)
+    }
+
     // MARK: - (group, model) row identity (U13 hard rule)
 
     func testModelRowsKeyedByGroupAndModel() throws {

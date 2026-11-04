@@ -217,6 +217,78 @@ enum DashboardHealth {
     }
 }
 
+// MARK: - Displayed quota windows (owner 2026-11-04: no 5h on any surface)
+
+/// The per-account usage the compact account row reads (`CLIUsageInfo`
+/// conforms in the app target). Percents are 0...100.
+protocol CompactUsageInput {
+    var fiveHourPercent: Double? { get }
+    var sevenDayPercent: Double? { get }
+    var fableWeeklyPercent: Double? { get }
+    var fableWeeklyConstraining: Bool? { get }
+}
+
+/// What the compact account row (`UsageAccountCompactRow`) draws: a thin
+/// gauge per reported window, `7d` then `Fab` (only when the toggle is on).
+/// There is no `5h` gauge even when the daemon still reports a 5h window
+/// (owner 2026-11-04: "5h 사용량 삭제해줘"). That window keeps only its say in
+/// the status dot, because the scheduler still gates on the 5h ceiling.
+enum CompactUsageGauges {
+    struct Gauge: Equatable, Identifiable {
+        let id: String
+        let usedFraction: Double
+        let warning: Bool
+    }
+
+    static func gauges<Info: CompactUsageInput>(_ info: Info, showFable: Bool) -> [Gauge] {
+        var result: [Gauge] = []
+        if let seven = info.sevenDayPercent {
+            result.append(gauge("7d", usedPercent: seven))
+        }
+        if showFable, let fable = info.fableWeeklyPercent {
+            // Fable is scoped: red only while the daemon marks it constraining.
+            result.append(gauge("Fab", usedPercent: fable, warningOverride: info.fableWeeklyConstraining == true))
+        }
+        return result
+    }
+
+    /// The status dot's warning: a drawn gauge at its warning level, or an
+    /// undrawn 5h window at ≥ 90% — the same amber the row showed when it
+    /// still drew the 5h gauge.
+    static func warning<Info: CompactUsageInput>(_ info: Info, showFable: Bool) -> Bool {
+        if gauges(info, showFable: showFable).contains(where: \.warning) { return true }
+        guard let five = info.fiveHourPercent else { return false }
+        return fraction(five) >= DashboardHealth.quotaThreshold
+    }
+
+    private static func gauge(_ id: String, usedPercent: Double, warningOverride: Bool? = nil) -> Gauge {
+        let used = fraction(usedPercent)
+        return Gauge(
+            id: id,
+            usedFraction: used,
+            warning: warningOverride ?? (used >= DashboardHealth.quotaThreshold)
+        )
+    }
+
+    private static func fraction(_ percent: Double) -> Double {
+        max(0, min(1, percent / 100))
+    }
+}
+
+extension LlmuxDashboardAccount {
+    /// The account health row's quota text: `7d 31% · Fab 82%`, used
+    /// percentages of the reported windows. No `5h` part even when the
+    /// daemon still reports a 5h window (owner 2026-11-04). nil (cold
+    /// account, no displayed window reported) omits the element entirely
+    /// (#68).
+    var quotaSummary: String? {
+        var parts: [String] = []
+        if let seven = sevenDay { parts.append("7d \(Int((seven.utilization * 100).rounded()))%") }
+        if let fable = fableWeekly { parts.append("Fab \(Int((fable.utilization * 100).rounded()))%") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
 /// Human display label for a `client_usage[].client` id (issue #68).
 ///
 /// Claude Code sends `metadata.user_id` as a JSON blob

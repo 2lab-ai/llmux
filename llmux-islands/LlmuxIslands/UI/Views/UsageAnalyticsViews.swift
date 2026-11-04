@@ -703,7 +703,8 @@ struct UsageAccountHealthRow: View {
             }
             Spacer()
             // Cold account (no windows reported) omits the summary — no `—`.
-            if let quotaSummary {
+            // No 5h part (`LlmuxDashboardAccount.quotaSummary`).
+            if let quotaSummary = account.quotaSummary {
                 MetricText(quotaSummary)
             }
             if let inFlight = account.inFlight, inFlight > 0 {
@@ -713,15 +714,6 @@ struct UsageAccountHealthRow: View {
                 .font(.system(size: 8, weight: .semibold))
                 .foregroundColor(.white.opacity(0.35))
         }
-    }
-
-    /// nil (cold account, no windows reported) omits the element entirely (#68).
-    private var quotaSummary: String? {
-        var parts: [String] = []
-        if let five = account.fiveHour { parts.append("5h \(Int((five.utilization * 100).rounded()))%") }
-        if let seven = account.sevenDay { parts.append("7d \(Int((seven.utilization * 100).rounded()))%") }
-        if let fable = account.fableWeekly { parts.append("Fab \(Int((fable.utilization * 100).rounded()))%") }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private var detail: some View {
