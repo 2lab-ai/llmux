@@ -9,7 +9,8 @@ final class GlanceSignalTests: XCTestCase {
         status: String = "ok",
         fiveHour: Double? = nil,
         sevenDay: Double? = nil,
-        fiveResets: Int? = nil
+        fiveResets: Int? = nil,
+        sevenResets: Int? = nil
     ) -> LlmuxAccountRecord {
         LlmuxAccountRecord(
             name: name,
@@ -17,7 +18,7 @@ final class GlanceSignalTests: XCTestCase {
             group: "claude",
             status: status,
             fiveHour: fiveHour.map { LlmuxWindow(utilization: $0, resetsInSecs: fiveResets) },
-            sevenDay: sevenDay.map { LlmuxWindow(utilization: $0, resetsInSecs: nil) },
+            sevenDay: sevenDay.map { LlmuxWindow(utilization: $0, resetsInSecs: sevenResets) },
             fableWeekly: nil,
             inFlight: 0,
             tokenExpiresAtMs: nil,
@@ -53,8 +54,8 @@ final class GlanceSignalTests: XCTestCase {
 
     func testAuthBeatsLimitBeatsLowQuota() {
         let output = resolve([
-            record("low", fiveHour: 0.93),
-            record("gone", fiveHour: 1.0),
+            record("low", sevenDay: 0.93),
+            record("gone", sevenDay: 1.0),
             record("broken", status: "auth_failed"),
         ])
         XCTAssertEqual(output.signal, .auth(count: 1))
@@ -67,31 +68,32 @@ final class GlanceSignalTests: XCTestCase {
 
     func testLimitCountsAccountsNotWindows() {
         let output = resolve([
-            record("both", fiveHour: 1.0, sevenDay: 1.0),
-            record("fine", fiveHour: 0.2),
+            record("one", sevenDay: 1.0),
+            record("two", sevenDay: 1.0),
+            record("fine", sevenDay: 0.2),
         ])
-        XCTAssertEqual(output.signal, .limit(count: 1))
-        XCTAssertEqual(output.signal.chipText, "LIMIT 1")
+        XCTAssertEqual(output.signal, .limit(count: 2))
+        XCTAssertEqual(output.signal.chipText, "LIMIT 2")
     }
 
     func testNinetySevenPercentIsLowQuotaNotLimit() {
         // 97% used = 3% left: unusable soon, but NOT exhausted — the chip must
-        // say "5h 3%", never "LIMIT" (estimating exhaustion is forbidden).
-        let output = resolve([record("hot", fiveHour: 0.97, fiveResets: 6120)])
+        // say "7d 3%", never "LIMIT" (estimating exhaustion is forbidden).
+        let output = resolve([record("hot", sevenDay: 0.97, sevenResets: 6120)])
         XCTAssertEqual(
             output.signal,
-            .lowQuota(window: "5h", remainingPct: 3, account: "hot")
+            .lowQuota(window: "7d", remainingPct: 3, account: "hot")
         )
-        XCTAssertEqual(output.signal.chipText, "5h 3%")
+        XCTAssertEqual(output.signal.chipText, "7d 3%")
         XCTAssertEqual(output.attention.first?.detail, "resets in 1h 42m")
     }
 
-    // MARK: lowQuota — worst across every account × {5h, 7d}, window named
+    // MARK: lowQuota — worst across every account's 7d window, window named
 
     func testLowQuotaPicksTheWorstWindowAcrossAccounts() {
         let output = resolve([
-            record("a", fiveHour: 0.91),
-            record("b", fiveHour: 0.40, sevenDay: 0.96),
+            record("a", sevenDay: 0.91),
+            record("b", sevenDay: 0.96),
         ])
         XCTAssertEqual(
             output.signal,
@@ -100,29 +102,43 @@ final class GlanceSignalTests: XCTestCase {
     }
 
     func testElevenPercentRemainingIsQuiet() {
-        let output = resolve([record("a", fiveHour: 0.89)])
+        let output = resolve([record("a", sevenDay: 0.89)])
         XCTAssertEqual(output.signal, .none)
     }
 
-    func testTieBreakPrefersFiveHourThenAccountName() {
-        // Same remaining on both: 5h wins over 7d; equal windows fall back to
-        // the account name, so the beacon can never flap between polls.
-        let fiveVsSeven = resolve([
-            record("a", sevenDay: 0.92),
-            record("b", fiveHour: 0.92),
-        ])
-        XCTAssertEqual(
-            fiveVsSeven.signal,
-            .lowQuota(window: "5h", remainingPct: 8, account: "b")
-        )
+    func testTieBreakFallsBackToAccountName() {
+        // Same remaining on both: the account name decides, so the beacon
+        // can never flap between polls.
         let sameWindow = resolve([
-            record("zed", fiveHour: 0.92),
-            record("abe", fiveHour: 0.92),
+            record("zed", sevenDay: 0.92),
+            record("abe", sevenDay: 0.92),
         ])
         XCTAssertEqual(
             sameWindow.signal,
-            .lowQuota(window: "5h", remainingPct: 8, account: "abe")
+            .lowQuota(window: "7d", remainingPct: 8, account: "abe")
         )
+    }
+
+    // MARK: 5h — owner 2026-11-04: never a chip or an attention row
+
+    func testFiveHourWindowNeverReachesTheChipOrThePanel() {
+        // The daemon may still report a 5h window; exhausted or nearly so, it
+        // is no candidate — the 7d window is the only quota signal.
+        let output = resolve([
+            record("gone5h", fiveHour: 1.0, sevenDay: 0.10, fiveResets: 600),
+            record("hot5h", fiveHour: 0.97, sevenDay: 0.20),
+        ])
+        XCTAssertEqual(output.signal, .none)
+        XCTAssertNil(output.signal.chipText)
+        XCTAssertTrue(output.attention.isEmpty)
+        // Next to a real 7d problem, the 5h window still adds nothing.
+        let mixed = resolve([
+            record("five", fiveHour: 0.99),
+            record("seven", fiveHour: 0.10, sevenDay: 0.95),
+        ])
+        XCTAssertEqual(mixed.signal, .lowQuota(window: "7d", remainingPct: 5, account: "seven"))
+        XCTAssertEqual(mixed.attention.map(\.account), ["seven"])
+        XCTAssertFalse(mixed.attention.contains { $0.reason.contains("5h") })
     }
 
     // MARK: degraded — explicit + debounced, unknown/cold never promoted
@@ -152,14 +168,14 @@ final class GlanceSignalTests: XCTestCase {
         // A cooldown/unknown/paused account may carry a real window, but its
         // quota is not an actionable beacon — never LIMIT, never lowQuota.
         XCTAssertEqual(
-            resolve([record("cooling", status: "cooldown", fiveHour: 1.0)]).signal,
+            resolve([record("cooling", status: "cooldown", sevenDay: 1.0)]).signal,
             .none
         )
         XCTAssertEqual(
-            resolve([record("weird", status: "mystery", fiveHour: 0.97)]).signal,
+            resolve([record("weird", status: "mystery", sevenDay: 0.97)]).signal,
             .none
         )
-        var paused = record("paused", fiveHour: 0.95)
+        var paused = record("paused", sevenDay: 0.95)
         paused = LlmuxAccountRecord(
             name: paused.name, type: paused.type, group: paused.group,
             status: paused.status, fiveHour: paused.fiveHour, sevenDay: paused.sevenDay,
@@ -170,7 +186,7 @@ final class GlanceSignalTests: XCTestCase {
 
     func testAttentionRowsAlwaysCarryAnAction() {
         // LIMIT with no reset time still tells the user what to do.
-        let noReset = resolve([record("gone", fiveHour: 1.0)])
+        let noReset = resolve([record("gone", sevenDay: 1.0)])
         XCTAssertEqual(noReset.attention.first?.detail, "reset unknown — rotate accounts")
         let degraded = resolve([record("a", status: "degraded")], degradedStreak: 1)
         XCTAssertEqual(degraded.attention.first?.detail, "reported by daemon — check llmux logs")
@@ -180,14 +196,14 @@ final class GlanceSignalTests: XCTestCase {
 
     func testDisplayNameMapsAttentionAndSignalAccounts() {
         let output = GlanceResolver.resolve(
-            records: [record("real@secret.io", fiveHour: 0.93)],
+            records: [record("real@secret.io", sevenDay: 0.93)],
             offline: false,
             degradedStreak: 0,
             displayName: { index, _ in "user\(index)@example.com" }
         )
         XCTAssertEqual(
             output.signal,
-            .lowQuota(window: "5h", remainingPct: 7, account: "user0@example.com")
+            .lowQuota(window: "7d", remainingPct: 7, account: "user0@example.com")
         )
         XCTAssertEqual(output.attention.first?.account, "user0@example.com")
     }

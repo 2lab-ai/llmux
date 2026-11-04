@@ -22,9 +22,9 @@ Review (trinity, 3 engines): R1 grok APPROVE / astra REJECT (after 5h drops, 80 
 
 | Acceptance | Status | Observation |
 | --- | --- | --- |
-| codex/grok 5h = `-` | GREEN (live 2026-09-18) | 200-col capture: all 4 CODEX rows and the GROK row render `-` in the 5h slot; CLAUDE rows `○ cold` / `14%` / `○ 100%` |
-| 5h column fixed 8 wide | GREEN (live 2026-09-18) | header `5h`→`7d` offset 9 at 200 and 100 cols; `five_hour_cell_fits_eight_cells` enumerates every state (widest `◑ 100%!` = 7) |
-| Fbl never gives way; 5h drops last | GREEN (live 2026-09-18) | 80 cols: `7d Fbl` full gauge with percent, `5h` header absent; 100 cols: both present |
+| codex/grok 5h = `-` | GREEN (live 2026-09-18) · superseded 2026-11-04 | 200-col capture: all 4 CODEX rows and the GROK row render `-` in the 5h slot; CLAUDE rows `○ cold` / `14%` / `○ 100%`. The 5h slot itself was removed by the [`.prd/18`](../18-tui-accounts-columns.md) 2026-11-04 amendment; absence on every row = `accounts_table_has_no_five_hour_column` |
+| 5h column fixed 8 wide | GREEN (live 2026-09-18) · superseded 2026-11-04 | header `5h`→`7d` offset 9 at 200 and 100 cols; `five_hour_cell_fits_eight_cells` enumerates every state (widest `◑ 100%!` = 7). Column and test removed by the [`.prd/18`](../18-tui-accounts-columns.md) 2026-11-04 amendment; absence = `accounts_table_has_no_five_hour_column`, give-way = `narrow_keeps_fable_gauge_and_shrinks_status_then_name` |
+| Fbl never gives way; 5h drops last | GREEN (live 2026-09-18) · superseded 2026-11-04 | 80 cols: `7d Fbl` full gauge with percent, `5h` header absent; 100 cols: both present. Since the [`.prd/18`](../18-tui-accounts-columns.md) 2026-11-04 amendment there is no `5h` step: Fbl still never gives way, status 20→8 then `account` = `narrow_keeps_fable_gauge_and_shrinks_status_then_name` |
 | status shrinks first, floor 8 | GREEN (live 2026-09-18) | 100 cols: status 16 (`▒ 7d 100.0% > 99`); 80 cols: status 8 (`▒ 7d 100`), name 13; 74 cols: name 7, no shaving |
 | stable release v0.2.23 deployed (tap + local brew + daemon) | GREEN 2026-09-18 | see ship table |
 | preview rebuilt from the v0.2.23 commit and deployed | GREEN 2026-09-18 | see ship table |
