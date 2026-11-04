@@ -69,9 +69,10 @@ the key bar. Numbers keep their usual format everywhere.
   detail column shows five lines: name · credential type · order · status,
   the token line, the 7d window, the lifetime totals and the poll line
   (`poll  ok 4s ago · next ~5m18s`) — the same text as before, uncut. The
-  sixth row (`mode`) has no detail line: it keeps only its `│`, so the bar
-  runs unbroken down the band. Each band row pairs one left line with one
-  detail line. The detail lines start in one column, set so the widest of
+  sixth row (with both scheduler groups, `mode`) has no detail line: it
+  keeps only its `│`, so the bar runs unbroken down the band. Each band row
+  pairs one left line with one detail line. The detail lines start in one
+  column, set so the widest of
   lines 2–5 ends at the right edge; a row whose left text is longer than
   that starts its detail line just after its own text, with its own `│`.
   Whether the band is used, and where every column sits, changes only on
@@ -89,6 +90,8 @@ the key bar. Numbers keep their usual format everywhere.
   is measured as shown.
   Below the needed width the dashboard keeps the previous 8-row scheduler
   pane, with the 48-column detail pane beside it at 110 columns or more.
+  The same pane is used when the middle row gets fewer than 7 rows — dragged
+  shorter, or squeezed on a short terminal — so the band never loses a row.
   With 27-character account ids the band fits 179 columns for every switch
   reason: an automatic switch (`SevenDayOverThreshold` /
   `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on

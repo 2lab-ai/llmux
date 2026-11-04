@@ -7155,10 +7155,10 @@ fn detail_poll_line(poll: &str) -> Line<'static> {
 /// scheduler + detail band instead ([`draw_band`]) — but only when the area
 /// the layout actually gave the pane still holds the title row plus
 /// [`BAND_ROWS`] rows. The plan decides on the band height, and the vertical
-/// solver can still squeeze this pane (a short terminal with the accounts
-/// pane dragged: activity's `Min(3)` outranks the `Length` panes); a band
-/// with fewer rows would cut its left column's last rows (`mode` with two
-/// scheduler groups).
+/// solver can still squeeze this pane — the accounts pane dragged, or a short
+/// terminal where the table bottoms out at [`PANE_MIN_HEIGHT`]: activity's
+/// `Min(3)` outranks the `Length` panes; a band with fewer rows would cut
+/// its left column's last rows (`mode` with two scheduler groups).
 fn draw_middle(frame: &mut Frame, area: Rect, view: &DashboardView, plan: &MiddlePlan) {
     if let (Some(geometry), Some(detail)) = (plan.band.as_ref(), plan.detail.as_ref()) {
         if area.height > BAND_ROWS {
@@ -19028,13 +19028,14 @@ mod tests {
 
     /// Review final round (PR #230): the plan picks the band from the band
     /// height alone, but the vertical layout can still squeeze the middle
-    /// pane — a short terminal with the accounts pane dragged: `Min(3)`
-    /// activity outranks the `Length` panes, so the solver takes rows from
-    /// them. At 22 rows with accounts dragged to 3 the middle area is 6
-    /// rows (measured): the band would get 5 content rows and lose its
-    /// `mode` row, so the middle pane falls back to today's pair, which
-    /// shows it. Over a sweep of heights the band never renders without
-    /// its `mode` row.
+    /// pane — the accounts pane dragged, or a short terminal where the
+    /// table already bottoms out at `PANE_MIN_HEIGHT`: `Min(3)` activity
+    /// outranks the `Length` panes, so the solver takes rows from them. At
+    /// 22 rows with accounts dragged to 3 the middle area is 6 rows
+    /// (measured): the band would get 5 content rows and lose its `mode`
+    /// row, so the middle pane falls back to today's pair, which shows it.
+    /// Over a sweep of heights the band is drawn in some frames and never
+    /// without its `mode` row.
     #[test]
     fn squeezed_middle_area_falls_back_instead_of_cutting_the_band() {
         let (view, mut chrome) = recompose_view();
@@ -19042,10 +19043,15 @@ mod tests {
         chrome.pane_heights.accounts = Some(3);
         let rows = render_rows(&view, &chrome, w, 22);
         let frame = rows.join("\n");
-        let models = row_of(&rows, " models — ");
         let accounts = row_of(&rows, " accounts · sort ");
+        let middle = row_of(&rows, " scheduler ");
         assert_eq!(
-            models - (accounts + 3),
+            middle,
+            accounts + 3,
+            "the middle pane starts under the 3-row accounts pane:\n{frame}"
+        );
+        assert_eq!(
+            row_of(&rows, " models — ") - middle,
             6,
             "the middle area is 6 rows:\n{frame}"
         );
@@ -19055,11 +19061,13 @@ mod tests {
                 .any(|r| r.contains(" mode ") && r.contains("[S switch]")),
             "the fallback pane shows the mode row:\n{frame}"
         );
+        let mut bands = 0;
         for accounts in [3u16, 10] {
             chrome.pane_heights.accounts = Some(accounts);
             for height in 18u16..=30 {
                 let rows = render_rows(&view, &chrome, w, height);
                 if has_band(&rows) {
+                    bands += 1;
                     assert!(
                         rows.iter()
                             .any(|r| r.contains(" mode ") && r.contains("[S switch]")),
@@ -19069,6 +19077,10 @@ mod tests {
                 }
             }
         }
+        assert!(
+            bands > 0,
+            "the sweep reaches the band height in some frames"
+        );
     }
 
     /// Drag overrides still replace the automatic heights (UI-3 U7/U8), and
