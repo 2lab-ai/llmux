@@ -14857,9 +14857,32 @@ mod tests {
         // 가 = 2 cells; at width 4 only two fit per row, so 5 of them need 3
         // rows. Integer cell-width division would have said 2 (undercount).
         assert_eq!(cells::wrapped_rows(&"가".repeat(5), 4), 3);
-        // Odd width where a 2-cell glyph cannot straddle the edge: width 3 holds
-        // exactly one 가 per row (2+2 > 3), so 3 가 = 3 rows.
-        assert_eq!(cells::wrapped_rows(&"가".repeat(3), 3), 3);
+        // The count is ratatui's own (Paragraph::line_count, the wrapper the
+        // modal renders with), so it equals the rows actually drawn — the
+        // tail is reachable and there is no blank overscroll. At odd widths
+        // ratatui 0.30 lets a 2-cell glyph straddle the edge (an upstream
+        // wrap bug: `가가가` at width 3 draws 2 rows, not 3); the count
+        // follows the drawing, which is what the scroll limit needs.
+        for (text, w) in [
+            ("가".repeat(3), 3u16),
+            ("가".repeat(5), 4),
+            ("가".repeat(7), 5),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(w, 12)).expect("terminal");
+            let frame = terminal
+                .draw(|f| {
+                    f.render_widget(
+                        Paragraph::new(text.as_str()).wrap(Wrap { trim: false }),
+                        f.area(),
+                    )
+                })
+                .expect("draw");
+            let drawn = (0..12u16)
+                .rev()
+                .find(|&y| (0..w).any(|x| frame.buffer[(x, y)].symbol() != " "))
+                .map_or(1, |y| usize::from(y) + 1);
+            assert_eq!(cells::wrapped_rows(&text, w), drawn, "{text} at {w}");
+        }
     }
 
     #[test]
