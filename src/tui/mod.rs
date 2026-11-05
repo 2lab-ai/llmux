@@ -5511,8 +5511,12 @@ async fn event_loop(
             let mut hits = None;
             terminal.draw(|frame| {
                 ui::draw(frame, view.as_ref(), &chrome, &mut hits);
-                // NO_COLOR (https://no-color.org): the frame keeps its
-                // weight and glyphs, loses its colours; red turns bold.
+                // NO_COLOR (https://no-color.org): take the colour out of
+                // the frame itself. crossterm already skips colour codes
+                // under NO_COLOR, but it still writes an empty `ESC[m` for
+                // each colour change — a full SGR reset that wiped bold and
+                // reverse too. A colourless frame emits no colour changes,
+                // so weight stays; red text turns bold.
                 if no_color() {
                     twolab_tui::theme::decolor(frame.buffer_mut());
                 }
