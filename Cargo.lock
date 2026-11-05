@@ -3030,6 +3030,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "twolab-tui"
 version = "0.1.0"
+source = "git+https://github.com/2lab-ai/tui?rev=da8dace6edd4#da8dace6edd47500eed88a530272a7da74f2f61f"
 dependencies = [
  "ratatui",
  "unicode-segmentation",
