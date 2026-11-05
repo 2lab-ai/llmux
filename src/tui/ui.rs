@@ -10444,6 +10444,39 @@ fn draw_heatmap(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// A footer keybar fitted to `width` cells by twolab-tui's
+/// [`KeyHints`](twolab_tui::key_hints::KeyHints): when the row is too narrow,
+/// whole hints drop — lowest priority first, the rightmost of equals first —
+/// and `… +N more` says how many, instead of the terminal clipping the bar
+/// mid-word. `quit` stays longest, then `back` / `cancel`.
+fn keybar(
+    title: Option<&str>,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> Line<'static> {
+    use twolab_tui::key_hints::{KeyHint, KeyHints};
+    let lead = match title {
+        Some(t) => format!(" {t} — "),
+        None => " ".to_string(),
+    };
+    let room = width.saturating_sub(cells::width(&lead) as u16);
+    let hints = hints.iter().map(|&(k, l)| {
+        let priority = match l {
+            "quit" => 9,
+            "back" | "cancel" => 8,
+            _ => 5,
+        };
+        KeyHint::new(k, l).priority(priority)
+    });
+    let bar = KeyHints::new(hints)
+        .no_more()
+        .theme(twolab_tui::Theme::ansi())
+        .line(room);
+    let mut spans = vec![Span::raw(lead)];
+    spans.extend(bar.spans);
+    Line::from(spans)
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
     // embedded email under the email-anonymous setting.
@@ -10463,20 +10496,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     let keybar = match chrome.mode {
         // Config-editor prompts render their own inline hint line inside the
         // overlay; the keybar mirrors the essentials.
-        Mode::ConfigEdit { .. } => Line::from(vec![
-            Span::raw(" edit — "),
-            key("Enter"),
-            Span::raw(" apply  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
-        Mode::ConfigConfirm { .. } => Line::from(vec![
-            Span::raw(" confirm — "),
-            key("y"),
-            Span::raw(" apply  "),
-            key("n/Esc"),
-            Span::raw(" cancel"),
-        ]),
+        Mode::ConfigEdit { .. } => keybar(
+            Some("edit"),
+            &[("Enter", "apply"), ("Esc", "cancel")],
+            area.width,
+        ),
+        Mode::ConfigConfirm { .. } => keybar(
+            Some("confirm"),
+            &[("y", "apply"), ("n/Esc", "cancel")],
+            area.width,
+        ),
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
         Mode::Normal => match chrome.overlay {
@@ -10487,31 +10516,25 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // clickable group-settings bar (U9/U10), so their hint is gone
             // too (UI-4 V7).
             Overlay::None => {
-                let mut spans = vec![Span::raw(" "), key("q"), Span::raw(" quit  ")];
-                if attached {
-                    spans.push(Span::styled("R disabled (attached)  ", dim()));
+                let mut hints: Vec<(&'static str, &'static str)> = vec![("q", "quit")];
+                hints.push(if attached {
+                    ("R", "disabled (attached)")
                 } else {
-                    spans.push(key("R"));
-                    spans.push(Span::raw(" reload  "));
-                }
-                spans.extend([
-                    key("u"),
-                    Span::raw(" used/left  "),
-                    key("t"),
-                    Span::raw(" eta/utc  "),
-                    key("o"),
-                    Span::raw(" sort  "),
-                    key("S"),
-                    Span::raw(" sched  "),
-                    key("↑↓"),
-                    Span::raw(" scroll"),
+                    ("R", "reload")
+                });
+                hints.extend([
+                    ("u", "used/left"),
+                    ("t", "eta/utc"),
+                    ("o", "sort"),
+                    ("S", "sched"),
+                    ("↑↓", "scroll"),
                 ]);
                 // The fold (`z`) is advertised only while it is on: the
                 // bar that `z` turns off.
                 if chrome.fold_exhausted {
-                    spans.extend([Span::raw("  "), key("z"), Span::raw(" fold")]);
+                    hints.push(("z", "fold"));
                 }
-                Line::from(spans)
+                keybar(None, &hints, area.width)
             }
             // Accounts overlay: the issue #3/#4 affordances. a (add) and r
             // (remove) act on the DAEMON via the control endpoints, so they are
@@ -10520,138 +10543,112 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // controls. `R` is deliberately the SHIFTED key next to `r`
             // remove: a redemption spends something upstream, so it must not
             // share a keystroke with anything else.
-            Overlay::Accounts => Line::from(vec![
-                Span::raw(" accounts — "),
-                key("s"),
-                Span::raw(" switch  "),
-                key("f"),
-                Span::raw(" refresh  "),
-                key("R"),
-                Span::raw(" reset  "),
-                key("a"),
-                Span::raw(" add  "),
-                key("n"),
-                Span::raw(" login  "),
-                key("r"),
-                Span::raw(" remove  "),
-                key("u"),
-                Span::raw(" used/left  "),
-                key("t"),
-                Span::raw(" eta/utc  "),
-                key("o"),
-                Span::raw(" sort  "),
-                key("Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Accounts => keybar(
+                Some("accounts"),
+                &[
+                    ("s", "switch"),
+                    ("f", "refresh"),
+                    ("R", "reset"),
+                    ("a", "add"),
+                    ("n", "login"),
+                    ("r", "remove"),
+                    ("u", "used/left"),
+                    ("t", "eta/utc"),
+                    ("o", "sort"),
+                    ("Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Stats overlay: navigation + window cycle + back, regardless of
             // attach mode. `w` toggles the heatmap window (issue #23).
-            Overlay::Stats => Line::from(vec![
-                Span::raw(" stats — "),
-                key("g/Esc"),
-                Span::raw(" back  "),
-                key("↑/k ↓/j"),
-                Span::raw(" model  "),
-                key("PgUp/PgDn"),
-                Span::raw(" page  "),
-                key("w"),
-                Span::raw(" window  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Stats => keybar(
+                Some("stats"),
+                &[
+                    ("g/Esc", "back"),
+                    ("↑/k ↓/j", "model"),
+                    ("PgUp/PgDn", "page"),
+                    ("w", "window"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Usage overlay (usage-stats): granularity cycle + scroll + back.
-            Overlay::Usage => Line::from(vec![
-                Span::raw(" usage — "),
-                key("g"),
-                Span::raw(" hour/day/month  "),
-                key("↑/k ↓/j"),
-                Span::raw(" bucket  "),
-                key("U/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Usage => keybar(
+                Some("usage"),
+                &[
+                    ("g", "hour/day/month"),
+                    ("↑/k ↓/j", "bucket"),
+                    ("U/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Logs overlay: full-screen tail; l/Esc back.
-            Overlay::Logs => Line::from(vec![
-                Span::raw(" logs — "),
-                key("l/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Perf => Line::from(vec![
-                Span::raw(" perf — "),
-                key("d"),
-                Span::raw(" span  "),
-                key("←/h →/l"),
-                Span::raw(" day  "),
-                key("↑/k ↓/j"),
-                Span::raw(" series  "),
-                key("p/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Misc => Line::from(vec![
-                Span::raw(" misc — "),
-                key("?/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Config => Line::from(vec![
-                Span::raw(" config — "),
-                key("c/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Logs => keybar(
+                Some("logs"),
+                &[("l/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
+            Overlay::Perf => keybar(
+                Some("perf"),
+                &[
+                    ("d", "span"),
+                    ("←/h →/l", "day"),
+                    ("↑/k ↓/j", "series"),
+                    ("p/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
+            Overlay::Misc => keybar(
+                Some("misc"),
+                &[("?/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
+            Overlay::Config => keybar(
+                Some("config"),
+                &[("c/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
             // Keys overlay (multi-tenant #22): read-only; mutations live in
             // the CLI (`llmux key …`).
-            Overlay::Keys => Line::from(vec![
-                Span::raw(" keys — "),
-                key("w"),
-                Span::raw(" window  "),
-                key("f"),
-                Span::raw(" models  "),
-                key("↑/↓ PgUp/PgDn Home/End"),
-                Span::raw(" scroll  "),
-                key("r"),
-                Span::raw(" refresh  "),
-                key("K/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Keys => keybar(
+                Some("keys"),
+                &[
+                    ("w", "window"),
+                    ("f", "models"),
+                    ("↑/↓ PgUp/PgDn Home/End", "scroll"),
+                    ("r", "refresh"),
+                    ("K/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Sessions overlay (issue #34): navigation + back.
-            Overlay::Sessions => Line::from(vec![
-                Span::raw(" sessions — "),
-                key("s/Esc"),
-                Span::raw(" back  "),
-                key("↑/k ↓/j"),
-                Span::raw(" session  "),
-                key("PgUp/PgDn"),
-                Span::raw(" page  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Sessions => keybar(
+                Some("sessions"),
+                &[
+                    ("s/Esc", "back"),
+                    ("↑/k ↓/j", "session"),
+                    ("PgUp/PgDn", "page"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
         },
-        Mode::Select { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" move  "),
-            key("Enter"),
-            Span::raw(" switch  "),
-            key("p"),
-            Span::raw(" pause  "),
-            key("L"),
-            Span::raw(" limits  "),
-            key("n"),
-            Span::raw(" new login  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
+        Mode::Select { .. } => keybar(
+            None,
+            &[
+                ("↑/k ↓/j", "move"),
+                ("Enter", "switch"),
+                ("p", "pause"),
+                ("L", "limits"),
+                ("n", "new login"),
+                ("Esc", "cancel"),
+            ],
+            area.width,
+        ),
         // The typed key is shown ONLY as a masked width — never the raw
         // characters (AGENTS.md credential rule).
         Mode::EditLimits { .. } => Line::from(vec![
@@ -10678,15 +10675,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             key("Esc"),
             Span::raw(" cancel"),
         ]),
-        Mode::ContextMenu { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" move  "),
-            key("Enter/click"),
-            Span::raw(" run  "),
-            key("Esc"),
-            Span::raw(" close"),
-        ]),
+        Mode::ContextMenu { .. } => keybar(
+            None,
+            &[
+                ("↑/k ↓/j", "move"),
+                ("Enter/click", "run"),
+                ("Esc", "close"),
+            ],
+            area.width,
+        ),
         Mode::ConfirmRemove { .. } => Line::from(vec![
             Span::raw(" "),
             key("↑/k ↓/j"),
@@ -19486,7 +19483,12 @@ mod tests {
     /// and the eighth blocks take two cells on a terminal that draws
     /// East-Asian Ambiguous glyphs wide — the only change in the frame
     /// (reverting the crate's glyph commit restores 15_536_070_822_945_120_328).
-    const FOLD_OFF_179X43_DIGEST: u64 = 6_181_608_817_893_489_260;
+    /// Re-pinned again the same day for the footer keybar on twolab-tui's
+    /// KeyHints: the frame's text is unchanged (it fits at 179 columns); the
+    /// hint labels are now the secondary (gray) colour under bold keys, and
+    /// `R disabled (attached)` reads as a key and a label instead of one dim
+    /// run (previous digest 6_181_608_817_893_489_260).
+    const FOLD_OFF_179X43_DIGEST: u64 = 17_379_241_155_914_426_102;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -19696,6 +19698,48 @@ mod tests {
     }
 
     /// Render MAIN and return the full buffer (text + styles).
+    /// A narrow terminal drops whole hints from the key bar — never half a
+    /// word — keeps `quit` and `back`, and says how many it dropped.
+    #[test]
+    fn keybar_drops_whole_hints_and_says_how_many_on_a_narrow_terminal() {
+        let hints = [
+            ("s", "switch"),
+            ("f", "refresh"),
+            ("R", "reset"),
+            ("a", "add"),
+            ("n", "login"),
+            ("r", "remove"),
+            ("u", "used/left"),
+            ("t", "eta/utc"),
+            ("o", "sort"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ];
+        let wide: String = keybar(Some("accounts"), &hints, 200)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!wide.contains("more"), "{wide}");
+        let narrow: String = keybar(Some("accounts"), &hints, 48)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(cells::width(&narrow) <= 48, "{narrow}");
+        assert!(narrow.starts_with(" accounts — "), "{narrow}");
+        assert!(
+            narrow.contains("Esc back") && narrow.contains("q quit"),
+            "{narrow}"
+        );
+        assert!(narrow.contains(" more"), "{narrow}");
+        for (k, l) in hints {
+            let shown = narrow.contains(&format!("{k} {l}"));
+            let half = !shown && narrow.contains(l) && l.len() > 3;
+            assert!(!half, "{l} cut in half: {narrow}");
+        }
+    }
+
     /// NO_COLOR: the runtime's decolor pass leaves no coloured cell on a full
     /// frame (overlay + table + activity), keeps the reversed selection and
     /// turns red text bold — colour was its only signal.
