@@ -36,7 +36,10 @@ and `[c] config`, in that order. Inside an overlay, only `[Esc] dashboard`
 keeps a hint; the other tabs show their names because overlay keys have their
 own meanings (`g` changes granularity in Usage, for example). Return to MAIN
 with `Esc` before using a letter shortcut to open another surface. Below 140
-columns, all ten tabs keep their name-only labels on every surface.
+columns, all ten tabs keep their name-only labels on every surface. When
+even the names do not fit (below about 86 columns), the strip keeps the
+active tab in view and says how many tabs are hidden at each end — for
+example `misc 1›` at 80 columns — instead of cutting the last name off.
 Each tab's displayed hint and name share one clickable target; separators are
 not targets. These are existing keys, not new bindings or Tab/Enter navigation.
 
