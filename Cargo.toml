@@ -31,6 +31,9 @@ http-body-util = "0.1.3"
 # none of them, each one more attack surface on untrusted client bytes.
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
 ratatui = "0.30.1"
+# The terminal widgets this dashboard shares with the 2lab-ai/tui catalog
+# (https://2lab.ai/tui): text cells, spinners, meters, tabs, menus, key hints.
+twolab-tui = { path = "../tui/crates/twolab-tui" }
 # Durable keys-usage store (docs/keys-history/spec.md K): bundled SQLite so a
 # brew/CI build never depends on a system libsqlite3 or its version.
 rusqlite = { version = "0.37.0", features = ["bundled"] }
