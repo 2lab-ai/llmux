@@ -26,7 +26,6 @@
 //! JSON) — the draw code in [`ui`] is never forked.
 
 pub(crate) mod activity;
-mod anim;
 mod clip;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
@@ -54,6 +53,14 @@ pub use event::{ActivityEvent, Endpoint, TokenCounts};
 /// [`activity::ActivityLog::prune_stale_in_flight`] is the backstop that
 /// guarantees a dropped finish can never leak.
 pub const ACTIVITY_CHANNEL_CAP: usize = 4096;
+
+/// Whether the dashboard draws without colour: `NO_COLOR` set to anything
+/// non-empty when the process started (https://no-color.org). Read once —
+/// the frame loop asks every tick.
+fn no_color() -> bool {
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_COLOR.get_or_init(|| twolab_tui::Theme::from_env().is_mono())
+}
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5502,7 +5509,18 @@ async fn event_loop(
             // Capture the activity panel's hit-test layout from this frame so a
             // left-click in the next input drain maps to the right entry.
             let mut hits = None;
-            terminal.draw(|frame| ui::draw(frame, view.as_ref(), &chrome, &mut hits))?;
+            terminal.draw(|frame| {
+                ui::draw(frame, view.as_ref(), &chrome, &mut hits);
+                // NO_COLOR (https://no-color.org): take the colour out of
+                // the frame itself. crossterm already skips colour codes
+                // under NO_COLOR, but it still writes an empty `ESC[m` for
+                // each colour change — a full SGR reset that wiped bold and
+                // reverse too. A colourless frame emits no colour changes,
+                // so weight stays; red text turns bold.
+                if no_color() {
+                    twolab_tui::theme::decolor(frame.buffer_mut());
+                }
+            })?;
             let main = hits.unwrap_or_default();
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
