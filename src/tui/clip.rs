@@ -67,9 +67,10 @@ fn pipe_to(tool: &str, args: &[&str], text: &str) -> Result<(), String> {
 }
 
 /// OSC 52 fallback: hand the payload to the terminal emulator itself
-/// (base64, `\x1b]52;c;…\x07`), which owns the clipboard on the machine the
-/// user is actually looking at. Written straight to the tty so it bypasses
-/// ratatui's buffer (an escape sequence renders nothing).
+/// (base64, `\x1b]52;c;…\x07`, wrapped for tmux or screen when inside one —
+/// `twolab_tui::osc52`), which owns the clipboard on the machine the user is
+/// actually looking at. Written straight to the tty so it bypasses ratatui's
+/// buffer (an escape sequence renders nothing).
 fn osc52(text: &str) -> Result<String, String> {
     if text.len() > OSC52_MAX_BYTES {
         return Err(format!(
@@ -77,9 +78,13 @@ fn osc52(text: &str) -> Result<String, String> {
             text.len()
         ));
     }
-    use base64::Engine as _;
-    let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let seq = format!("\x1b]52;c;{payload}\x07");
+    // Inside tmux or screen the bare escape is swallowed by the multiplexer;
+    // wrap it in its passthrough so the copy reaches the real terminal.
+    let mux = twolab_tui::osc52::Mux::detect(
+        std::env::var_os("TMUX").is_some_and(|v| !v.is_empty()),
+        std::env::var_os("STY").is_some_and(|v| !v.is_empty()),
+    );
+    let seq = twolab_tui::osc52::sequence(text, mux);
     std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/tty")

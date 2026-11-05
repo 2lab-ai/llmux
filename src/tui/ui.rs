@@ -16,7 +16,8 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, Wrap,
 };
 use ratatui::Frame;
-use unicode_segmentation::UnicodeSegmentation;
+use twolab_tui::spinner::SpinnerKind;
+use twolab_tui::text as cells;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -32,7 +33,7 @@ use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
+use super::{AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -99,6 +100,23 @@ const HEATMAP_BAR_WIDTH: usize = 12;
 
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
+}
+
+/// `text` clipped with `…` to at most `max` display cells (twolab-tui
+/// `text::truncate`, owned for the call sites that keep the string).
+fn truncate_cells(text: &str, max: usize) -> String {
+    cells::truncate(text, max).into_owned()
+}
+
+/// `text` in exactly `width` display cells, left-aligned (clipped with `…`
+/// when too wide).
+fn pad_cells(text: &str, width: usize) -> String {
+    cells::pad(text, width, cells::Align::Left)
+}
+
+/// `text` in exactly `width` display cells, right-aligned (numeric columns).
+fn pad_cells_left(text: &str, width: usize) -> String {
+    cells::pad(text, width, cells::Align::Right)
 }
 
 fn level_color(level: GaugeLevel) -> Color {
@@ -443,15 +461,8 @@ fn draw_main(
     if let Some(line) = event_line {
         frame.render_widget(Paragraph::new(line), banner_area);
     }
-    let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
-    let header_tail = draw_header(
-        frame,
-        header_area,
-        view,
-        chrome,
-        now,
-        tabs_room(tabs_area, &tabs),
-    );
+    let (tabs, tabs_room) = draw_tabs(frame, tabs_area, chrome.overlay);
+    let header_tail = draw_header(frame, header_area, view, chrome, now, tabs_room);
     draw_tabs_tail(frame, tabs_area, header_tail);
     let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
     draw_middle(frame, middle_area, view, &middle);
@@ -648,54 +659,52 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
 /// the header. The active surface renders reversed; every label's rect is
 /// returned for the mouse hit-test. Keyboard shortcuts keep working — the
 /// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
-fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut tabs: Vec<TabHit> = Vec::new();
-    let mut x = area.x + 1;
-    for (i, (label, overlay)) in TABS.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", dim()));
-            x += 3;
+/// Draw the tab strip; returns the click targets and the cells left free at
+/// the right end (after any `N›` scroll marker) for the header tail.
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, usize) {
+    // The documented hint rule (operational-reference "Tab shortcut hints"):
+    // at 140 columns or more, MAIN shows every tab's key; inside an overlay
+    // only `[Esc] dashboard` keeps one (overlay keys mean other things there).
+    let wide = area.width >= 140;
+    let tabs = TABS.iter().map(|(label, overlay)| {
+        let tab = twolab_tui::tabs::Tab::new(*label);
+        if wide && (active == Overlay::None || *overlay == Overlay::None) {
+            tab.key(tab_key(*overlay))
+        } else {
+            tab
         }
-        let style = if *overlay == active {
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Cyan)
-        };
-        let label = if area.width >= 140 && (active == Overlay::None || *overlay == Overlay::None) {
-            let key = match overlay {
-                Overlay::None => "Esc",
-                Overlay::Accounts => "a",
-                Overlay::Stats => "g",
-                Overlay::Usage => "U",
-                Overlay::Keys => "K",
-                Overlay::Perf => "p",
-                Overlay::Logs => "l",
-                Overlay::Sessions => "s",
-                Overlay::Misc => "?",
-                Overlay::Config => "c",
-            };
-            format!("[{key}] {label}")
-        } else {
-            (*label).to_string()
-        };
-        let width = label.chars().count() as u16;
-        spans.push(Span::styled(label, style));
-        tabs.push(TabHit {
-            area: Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            overlay: *overlay,
-        });
-        x += width;
+    });
+    let active_i = TABS.iter().position(|(_, o)| *o == active).unwrap_or(0);
+    let strip = twolab_tui::tabs::Tabs::new(tabs)
+        .active(active_i)
+        .theme(twolab_tui::Theme::ansi())
+        .hints(twolab_tui::tabs::Hints::Bracket);
+    let layout = strip.render_layout(area, frame.buffer_mut());
+    let hits = layout
+        .hits
+        .into_iter()
+        .map(|h| TabHit {
+            area: h.rect,
+            overlay: TABS[h.index].1,
+        })
+        .collect();
+    (hits, layout.room)
+}
+
+/// The key that opens a surface from MAIN, as the tab strip shows it.
+fn tab_key(overlay: Overlay) -> &'static str {
+    match overlay {
+        Overlay::None => "Esc",
+        Overlay::Accounts => "a",
+        Overlay::Stats => "g",
+        Overlay::Usage => "U",
+        Overlay::Keys => "K",
+        Overlay::Perf => "p",
+        Overlay::Logs => "l",
+        Overlay::Sessions => "s",
+        Overlay::Misc => "?",
+        Overlay::Config => "c",
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    tabs
 }
 
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
@@ -1078,7 +1087,7 @@ fn draw_usage_overlay(
         " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
     );
     let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
-    let fits = |t: &str| cell_width(t) <= usize::from(area.width);
+    let fits = |t: &str| cells::width(t) <= usize::from(area.width);
     let title = if fits(&full) {
         full
     } else if fits(&short) {
@@ -1333,7 +1342,7 @@ fn draw_sessions_overlay(
     // in rather than staring at a spinner. On reopen, a prior open's `sessions`
     // stay visible (with the loading title) until the first fresh partial lands.
     if chrome.sessions_loading && chrome.sessions.is_empty() {
-        let glyph = anim::braille_spin(chrome.frame);
+        let glyph = SpinnerKind::Braille.glyph(chrome.frame);
         let loading = Paragraph::new(Line::from(vec![
             Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
             Span::styled("loading sessions…", dim()),
@@ -3425,94 +3434,6 @@ fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     }
 }
 
-/// Number of terminal rows `text` occupies when wrapped at `width` cells to
-/// match ratatui's `Wrap { trim: false }`: greedy word wrap, whitespace is
-/// rendered (leading/interior spaces occupy cells, never dropped from the width
-/// tally), over-wide words hard-split, explicit newlines honored. Used to bound
-/// the input modal's scroll (UI-6 item 3).
-///
-/// INVARIANT: this NEVER underestimates the row count. Ratatui trims trailing
-/// whitespace on wrapped rows, which we may charge — so we can overshoot by a
-/// row or two, but never undershoot. That direction matters: an underestimate
-/// would shrink `max_scroll`, letting the post-draw clamp cut off the tail of a
-/// long/indented prompt (operator can't reach "전체 input"); an overestimate at
-/// most leaves a blank overscroll row while the tail stays reachable.
-fn wrapped_line_count(text: &str, width: u16) -> usize {
-    let width = (width as usize).max(1);
-    let mut rows = 0usize;
-    for source in text.split('\n') {
-        rows += wrap_rows(source, width);
-    }
-    rows.max(1)
-}
-
-/// Rows one newline-free `source` string wraps into at `width` cells. Iterates
-/// GRAPHEME CLUSTERS (the unit ratatui measures/renders), grouping non-space
-/// clusters into words and treating each space as its own 1-cell token, so that
-/// EVERY cell — including leading indentation — is charged, then greedily packs
-/// them, hard-splitting any token too wide for a full row. Empty string counts
-/// as 1 row.
-fn wrap_rows(source: &str, width: usize) -> usize {
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    let mut word = String::new();
-    for g in source.graphemes(true) {
-        if g == " " {
-            if !word.is_empty() {
-                place_token(&word, width, &mut rows, &mut col);
-                word.clear();
-            }
-            // Each space is its own 1-cell token — leading/interior spaces
-            // occupy width exactly as `Wrap { trim: false }` renders them.
-            place_token(" ", width, &mut rows, &mut col);
-        } else {
-            word.push_str(g);
-        }
-    }
-    if !word.is_empty() {
-        place_token(&word, width, &mut rows, &mut col);
-    }
-    rows
-}
-
-/// Place one token (a word or a single space) into the greedy wrap accounting,
-/// advancing `rows`/`col`. A token that overflows the current row moves to a
-/// fresh one; a token wider than a whole row hard-splits by GRAPHEME CLUSTER
-/// using str-based cell width — the identical basis ratatui measures with — so
-/// a multi-scalar cluster (a 2-cell CJK glyph, an emoji + VS16) is never split
-/// mid-cluster and never mis-measured by summing scalar widths.
-fn place_token(token: &str, width: usize, rows: &mut usize, col: &mut usize) {
-    let w = cell_width(token);
-    if w == 0 {
-        return;
-    }
-    if *col + w <= width {
-        *col += w;
-        return;
-    }
-    // Does not fit on the current row: break to a fresh one first.
-    if *col > 0 {
-        *rows += 1;
-        *col = 0;
-    }
-    if w <= width {
-        *col = w;
-        return;
-    }
-    // Token wider than a full row: hard-split, charging each cluster's cell width.
-    for g in token.graphemes(true) {
-        let cw = cell_width(g);
-        if cw == 0 {
-            continue;
-        }
-        if *col + cw > width {
-            *rows += 1;
-            *col = 0;
-        }
-        *col += cw;
-    }
-}
-
 /// Draw the click-opened input-text modal (UI-6 item 3): a centered, bordered,
 /// scrollable box showing an entry's FULL stored excerpt. The content is looked
 /// up from `view.completed` by the modal's stable key EVERY frame, so it renders
@@ -3550,8 +3471,10 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
         .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
     let inner = block.inner(area);
 
-    let text = masked_text(excerpt, view.email_anonymous);
-    let total = wrapped_line_count(&text, inner.width) as u16;
+    // Wrap-safe text (a 2-cell U+3000 space can make ratatui 0.30's wrapper
+    // overrun the area): count and draw the same string.
+    let text = cells::wrap_safe(&masked_text(excerpt, view.email_anonymous)).into_owned();
+    let total = cells::wrapped_rows(&text, inner.width) as u16;
     let max_scroll = total.saturating_sub(inner.height);
     let scroll = modal.scroll.min(max_scroll);
 
@@ -4121,14 +4044,11 @@ fn draw_account_modal(
         .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
     let inner = block.inner(area);
 
-    let lines = account_modal_lines(view, ctx, chrome, account);
-    let total: usize = lines
-        .iter()
-        .map(|line| {
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            wrapped_line_count(&text, inner.width)
-        })
-        .sum();
+    let lines: Vec<Line<'static>> = account_modal_lines(view, ctx, chrome, account)
+        .into_iter()
+        .map(cells::wrap_safe_line)
+        .collect();
+    let total = cells::wrapped_rows_lines(&lines, inner.width);
     let max_scroll = (total as u16).saturating_sub(inner.height);
     let scroll = modal.scroll.min(max_scroll);
 
@@ -4289,79 +4209,18 @@ fn raw_header_lines(headers: Option<&[(String, String)]>) -> Vec<Line<'static>> 
 /// (escapes keep them single-line), so a per-line pass is lossless. Scanning
 /// is byte-based but only ever splits at ASCII bytes — always char-safe.
 fn highlight_json_line(line: &str) -> Line<'static> {
-    let bytes = line.as_bytes();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => i += 2,
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-                let end = i.min(bytes.len());
-                let is_key = line[end..].trim_start().starts_with(':');
-                let color = if is_key { Color::Cyan } else { Color::Green };
-                spans.push(Span::styled(
-                    line[start..end].to_string(),
-                    Style::new().fg(color),
-                ));
-            }
-            b'0'..=b'9' | b'-' => {
-                let start = i;
-                while i < bytes.len()
-                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-                {
-                    i += 1;
-                }
-                spans.push(Span::styled(
-                    line[start..i].to_string(),
-                    Style::new().fg(Color::Yellow),
-                ));
-            }
-            b't' | b'f' | b'n' => {
-                let rest = &line[i..];
-                match ["true", "false", "null"]
-                    .iter()
-                    .find(|k| rest.starts_with(*k))
-                {
-                    Some(k) => {
-                        spans.push(Span::styled(
-                            (*k).to_string(),
-                            Style::new().fg(Color::Magenta),
-                        ));
-                        i += k.len();
-                    }
-                    None => {
-                        spans.push(Span::raw(rest[..1].to_string()));
-                        i += 1;
-                    }
-                }
-            }
-            _ => {
-                // Whitespace, punctuation, and any non-ASCII bytes: batch until
-                // the next token start. ASCII stops are always char boundaries.
-                let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && !matches!(bytes[i], b'"' | b'0'..=b'9' | b'-' | b't' | b'f' | b'n')
-                {
-                    i += 1;
-                }
-                spans.push(Span::styled(line[start..i].to_string(), dim()));
-            }
-        }
-    }
-    Line::from(spans)
+    twolab_tui::json_view::json_line_with(line, &RAW_JSON_STYLES)
 }
+
+/// The raw viewer's JSON colours (keys cyan, strings green, numbers yellow,
+/// keywords magenta, punctuation dim), fed to twolab-tui's highlighter.
+const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view::JsonStyles {
+    key: Style::new().fg(Color::Cyan),
+    string: Style::new().fg(Color::Green),
+    number: Style::new().fg(Color::Yellow),
+    keyword: Style::new().fg(Color::Magenta),
+    punct: Style::new().fg(Color::DarkGray),
+};
 
 /// Hard-wrap a single logical line into `RAW_LINE_WRAP`-char chunks on char
 /// boundaries (continuation chunks lose highlighting context by design — they
@@ -4722,7 +4581,10 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         RawModalState::Loading => {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" {} loading raw record…", anim::braille_spin(modal.spin)),
+                    format!(
+                        " {} loading raw record…",
+                        SpinnerKind::Braille.glyph(modal.spin)
+                    ),
                     Style::new().fg(Color::Yellow),
                 ))),
                 viewport,
@@ -4970,14 +4832,6 @@ fn draw_header(
     }
     frame.render_widget(Paragraph::new(Line::from(full)), area);
     Vec::new()
-}
-
-/// Cells the tab labels leave free at the right end of the tabs row.
-fn tabs_room(area: Rect, tabs: &[TabHit]) -> usize {
-    let used = tabs
-        .last()
-        .map_or(0, |t| t.area.right().saturating_sub(area.x));
-    usize::from(area.width.saturating_sub(used))
 }
 
 /// Right-align the header tail at the end of the tabs row ([`draw_header`]
@@ -6054,19 +5908,19 @@ fn status_span(
         // heartbeat. Other eligible accounts get a faint "ready" drift.
         return if is_current {
             let glyph = if account.in_flight > 0 {
-                anim::braille_spin(frame)
+                SpinnerKind::Braille.glyph(frame)
             } else {
-                anim::bar_pulse(frame)
+                SpinnerKind::Pulse.glyph(frame)
             };
             Span::styled(
                 format!("{glyph} active"),
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(format!("{} ready", anim::idle_drift(frame)), dim())
+            Span::styled(format!("{} ready", SpinnerKind::Drift.glyph(frame)), dim())
         };
     };
-    // Cooldowns render TIME-ONLY (`▌ 45m 34s`, yellow): the rotating-timer
+    // Cooldowns render TIME-ONLY (`⡇ 45m 34s`, yellow): the rotating-timer
     // glyph + yellow already say "waiting", so the word "cooldown" was pure
     // width (Z 2026-07-09). The `/llmux/status` API string is untouched —
     // `blocking_reason` still says "cooldown 45m34s" there.
@@ -6077,7 +5931,7 @@ fn status_span(
             .map(format::countdown)
             .unwrap_or_default();
         return Span::styled(
-            format!("{} {left}", anim::half_block_clock(frame)),
+            format!("{} {left}", SpinnerKind::Clock.glyph(frame)),
             Style::new().fg(Color::Yellow),
         );
     }
@@ -6091,18 +5945,18 @@ fn status_span(
         ),
         IneligibleReason::Paused => (None, Style::new().fg(Color::Yellow)),
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
-            Some(anim::shade_breathe(frame)),
+            Some(SpinnerKind::Breathe.glyph(frame)),
             Style::new().fg(Color::Red),
         ),
         IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
-            Some(anim::half_block_clock(frame)),
+            Some(SpinnerKind::Clock.glyph(frame)),
             Style::new().fg(Color::Yellow),
         ),
         IneligibleReason::FableWeeklyExhausted => (
-            Some(anim::shade_breathe(frame)),
+            Some(SpinnerKind::Breathe.glyph(frame)),
             Style::new().fg(Color::Red),
         ),
-        IneligibleReason::UsageStale => (Some(anim::idle_drift(frame)), dim()),
+        IneligibleReason::UsageStale => (Some(SpinnerKind::Drift.glyph(frame)), dim()),
     };
     Span::styled(
         match glyph {
@@ -8379,7 +8233,7 @@ impl RowMetrics {
                 request.model.as_deref(),
                 request.effort.as_deref(),
             );
-            m.meta_w = m.meta_w.max(cell_width(&meta));
+            m.meta_w = m.meta_w.max(cells::width(&meta));
             let elapsed = now.duration_since(request.started_at).unwrap_or_default();
             m.dur_w = m.dur_w.max(format::elapsed_secs(elapsed).len());
         }
@@ -8396,7 +8250,7 @@ impl RowMetrics {
                 continue;
             };
             let meta = activity_meta_body(group.as_deref(), model.as_deref(), effort.as_deref());
-            m.meta_w = m.meta_w.max(cell_width(&meta));
+            m.meta_w = m.meta_w.max(cells::width(&meta));
             m.dur_w = m.dur_w.max(format::elapsed_secs(*duration).len());
             if let Some(tokens) = tokens {
                 m.tok_w = m
@@ -8474,12 +8328,18 @@ fn draw_activity(
             // colors as the group labels — so you can tell what's running where
             // at a glance. Pre-routing rows (no account yet) are a dim braille.
             let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
-                Some(BackendGroup::Codex) => (anim::block_spin(anim_frame), Color::Cyan),
-                Some(BackendGroup::Claude) => (anim::braille_spin(anim_frame), Color::Magenta),
-                Some(BackendGroup::Grok) => (anim::block_spin(anim_frame), Color::Yellow),
-                Some(BackendGroup::OpenRouter) => (anim::block_spin(anim_frame), Color::Green),
-                Some(BackendGroup::Gemini) => (anim::block_spin(anim_frame), Color::LightBlue),
-                None => (anim::braille_spin(anim_frame), Color::DarkGray),
+                Some(BackendGroup::Codex) => (SpinnerKind::Block.glyph(anim_frame), Color::Cyan),
+                Some(BackendGroup::Claude) => {
+                    (SpinnerKind::Braille.glyph(anim_frame), Color::Magenta)
+                }
+                Some(BackendGroup::Grok) => (SpinnerKind::Block.glyph(anim_frame), Color::Yellow),
+                Some(BackendGroup::OpenRouter) => {
+                    (SpinnerKind::Block.glyph(anim_frame), Color::Green)
+                }
+                Some(BackendGroup::Gemini) => {
+                    (SpinnerKind::Block.glyph(anim_frame), Color::LightBlue)
+                }
+                None => (SpinnerKind::Braille.glyph(anim_frame), Color::DarkGray),
             };
             let mut spans = vec![
                 // Mirror the completed row's stamp spacing (`▸ HH:MM:SS  `):
@@ -8513,7 +8373,7 @@ fn draw_activity(
             // routing time (req11) with the same per-request values the finish
             // will record, so the running badge reads exactly like its
             // eventual completed row. Padded to the frame's shared meta slot.
-            spans.extend(pad_spans(
+            spans.extend(cells::pad_spans(
                 activity_meta_spans(
                     request.group.as_deref(),
                     request.model.as_deref(),
@@ -8561,14 +8421,14 @@ fn draw_activity(
                 spans.push(Span::styled(
                     format!(
                         " \u{ab}{}\u{bb}",
-                        truncate_chars(&masked_text(label, view.email_anonymous), 16)
+                        truncate_cells(&masked_text(label, view.email_anonymous), 16)
                     ),
                     dim().add_modifier(Modifier::ITALIC),
                 ));
             }
             // Input excerpt LAST, on the same budget math as a completed row.
             if let Some(excerpt) = request.excerpt.as_deref() {
-                let consumed: usize = spans.iter().map(|s| cell_width(&s.content)).sum();
+                let consumed: usize = spans.iter().map(|s| cells::width(&s.content)).sum();
                 let budget = (metrics.width as usize).saturating_sub(consumed + 3);
                 if budget > 0 {
                     spans.push(Span::raw(format!(
@@ -8775,21 +8635,6 @@ const PENDING_CELL: &str = "\u{2014}";
 /// [`format::client_short_name`]; wide glyphs `…`-clip to the same 4 cells.
 const ACTIVITY_NAME_W: usize = 4;
 
-/// Pad `text` with trailing spaces to exactly `width` display cells,
-/// `…`-clipping first when it is too wide.
-fn pad_cells(text: &str, width: usize) -> String {
-    let clipped = truncate_cells(text, width);
-    let pad = width.saturating_sub(cell_width(&clipped));
-    format!("{clipped}{}", " ".repeat(pad))
-}
-
-/// Right-align `text` in `width` display cells (numeric columns).
-fn pad_cells_left(text: &str, width: usize) -> String {
-    let clipped = truncate_cells(text, width);
-    let pad = width.saturating_sub(cell_width(&clipped));
-    format!("{}{clipped}", " ".repeat(pad))
-}
-
 /// One folded activity row (glance-triage atom 3, narrowed to `count` runs):
 /// `▸ HH:MM:SS count 33×  [meta] email → (all 2xx)` — the START time only
 /// (Z 2026-07-15), the run size riding the NAME column slot (padded to the
@@ -8837,7 +8682,7 @@ fn folded_run_line(
     // its member rows. A count too wide for the slot (10000+ runs) widens
     // the cell rather than truncating a number.
     let count = format!("{}×", run.len());
-    let count_pad = ACTIVITY_NAME_W.saturating_sub(cell_width(&count));
+    let count_pad = ACTIVITY_NAME_W.saturating_sub(cells::width(&count));
     let mut spans = vec![
         stamp,
         Span::styled(format!("{kind:<8} "), kind_style(kind)),
@@ -8846,7 +8691,7 @@ fn folded_run_line(
             Style::new().add_modifier(Modifier::BOLD),
         ),
     ];
-    spans.extend(pad_spans(
+    spans.extend(cells::pad_spans(
         activity_meta_spans(
             group.as_deref(),
             model.as_deref(),
@@ -8969,7 +8814,7 @@ fn completed_line(
                 format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
                 Style::new().fg(Color::Cyan),
             ));
-            spans.extend(pad_spans(
+            spans.extend(cells::pad_spans(
                 activity_meta_spans(
                     group.as_deref(),
                     model.as_deref(),
@@ -9010,14 +8855,14 @@ fn completed_line(
                 spans.push(Span::styled(
                     format!(
                         " \u{ab}{}\u{bb}",
-                        truncate_chars(&masked_text(label, mask), 16)
+                        truncate_cells(&masked_text(label, mask), 16)
                     ),
                     dim().add_modifier(Modifier::ITALIC),
                 ));
             }
             // Input excerpt LAST, filling the rest of the panel width.
             if let Some(excerpt) = excerpt.as_deref() {
-                let consumed: usize = spans.iter().map(|s| cell_width(&s.content)).sum();
+                let consumed: usize = spans.iter().map(|s| cells::width(&s.content)).sum();
                 // 1 leading space + a pair of quotes.
                 let budget = (m.width as usize).saturating_sub(consumed + 3);
                 if budget > 0 {
@@ -9339,16 +9184,6 @@ fn kind_style(kind: &str) -> Style {
     }
 }
 
-/// Truncate to `max` chars (boundary-safe) with a `…` marker when clipped.
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
-}
-
 /// Color a backend-group label: codex = cyan, claude = magenta, grok =
 /// yellow, gemini = light blue, unknown = gray. Shared by the account table
 /// (req5) and the activity log (req7) so the group reads the same everywhere.
@@ -9373,63 +9208,34 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Smooth animated gradients (TUI UI-7): a port of herdr-mx's host-banner
-/// "lolcat" effect (`herdr src/ui/sidebar.rs`), replacing the old discrete
-/// ANSI marquee palettes — those slid hard color bands one cell per tick and
-/// read as flicker, not a gradient. Two modes, exactly like herdr:
-///
-/// - **rainbow** — per-char truecolor from a 3-phase sine sweep (R/G/B offset
-///   by 120°), hue rotating with the frame. Used for the `max` effort token
-///   (the deliberately loud top-effort marker, UI-6 item 6).
-/// - **solid (단색)** — a fixed per-group base color whose LUMA breathes with
-///   the same sine phase, hue never changing. Used for headline-model names
-///   (`fable-5*` magenta family, `gpt-5.6-sol*` cyan family, UI-6 item 7).
-///
-/// `phase = FREQ * char_index + DRIFT * frame` gives the spatial spread across
-/// characters plus temporal drift; luma is floored at `MIN_LUMA` for
-/// legibility. FREQ/luma mirror herdr's constants. DRIFT is the speed-1.0
-/// baseline: at llmux's 120 ms render tick (~8 fps) it completes a luma cycle
-/// in ~2.2 s — herdr's `normal` (0.09/frame at its faster tick) translated to
-/// a tick this slow read as barely moving (UI-8 user report), hence the
-/// larger baseline. Config `tui_gradient.speed` multiplies it.
-const GRADIENT_MIN_LUMA: f32 = 0.45;
-const GRADIENT_MAX_LUMA: f32 = 1.00;
-const GRADIENT_FREQ: f32 = 0.30;
-const GRADIENT_DRIFT: f32 = 0.35;
-
-/// The shared gradient phase for `(frame, char_idx)`. The frame is bounded
-/// before it meets f32: past ~2^24 an f32 can no longer step by 1, so
-/// `DRIFT * frame` would freeze on a long-lived daemon/attach TUI. The modulo
-/// wrap (~33 h at 120 ms/tick) is a single-frame phase jump — invisible next
-/// to a frozen animation.
-fn gradient_phase(frame: usize, char_idx: usize, speed: f32) -> f32 {
-    GRADIENT_FREQ * char_idx as f32 + GRADIENT_DRIFT * speed * ((frame % 1_000_000) as f32)
+/// Animated model names and the `max` effort badge are twolab-tui's
+/// [`GradientText`](twolab_tui::gradient_text::GradientText): the same
+/// herdr-derived constants (FREQ 0.30, DRIFT 0.35 per 120 ms tick, luma
+/// 0.45–1.00) moved into the crate, split by grapheme instead of `char` (a
+/// ZWJ emoji in a model id no longer gets one colour per scalar). llmux's
+/// render tick counter becomes the crate's time input here.
+fn gradient_t(frame: usize) -> Duration {
+    // Bounded like the old f32 phase so a long-lived TUI never overflows.
+    twolab_tui::gradient_text::TICK * ((frame % 1_000_000) as u32)
 }
 
-/// Rainbow mode: deterministic truecolor for `(frame, char_idx)` — R/G/B are
-/// the same sine offset by 0° / 120° / 240°, so the hue rotates while every
-/// channel stays inside the legible luma band.
-fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
-    let phase = gradient_phase(frame, char_idx, speed);
-    let chan = |offset: f32| -> u8 {
-        let raw = (phase + offset).sin() * 0.5 + 0.5; // 0.0..=1.0
-        let lit = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
-        (lit * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    Color::Rgb(
-        chan(0.0),
-        chan(std::f32::consts::TAU / 3.0),
-        chan(2.0 * std::f32::consts::TAU / 3.0),
+/// The colour of grapheme `char_idx` of a solid gradient on `base` at render
+/// tick `frame` (what [`model_name_spans`] draws), for tests.
+#[cfg(test)]
+fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize, speed: f32) -> Color {
+    use twolab_tui::gradient_text as gt;
+    gt::solid(
+        base,
+        gt::phase(char_idx, gradient_t(frame), speed),
+        gt::LUMA,
     )
 }
 
-/// Solid (단색) mode: scale a fixed base color by the sine luma factor — the
-/// hue is the group's, only its brightness breathes along the text.
-fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize, speed: f32) -> Color {
-    let raw = gradient_phase(frame, char_idx, speed).sin() * 0.5 + 0.5; // 0.0..=1.0
-    let factor = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
-    let scale = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
-    Color::Rgb(scale(base.0), scale(base.1), scale(base.2))
+/// The rainbow colour of grapheme `char_idx` at render tick `frame`, for tests.
+#[cfg(test)]
+fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
+    use twolab_tui::gradient_text as gt;
+    gt::rainbow(gt::phase(char_idx, gradient_t(frame), speed), gt::LUMA)
 }
 
 /// Solid-gradient base colors per headline family: truecolor anchors of the
@@ -9517,18 +9323,10 @@ fn model_name_spans(
     g: GradientCfg,
 ) -> Vec<Span<'static>> {
     match model_gradient_base(group, text, g) {
-        Some(base) if effects_on => text
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                Span::styled(
-                    c.to_string(),
-                    Style::new()
-                        .fg(gradient_solid(base, frame, i, g.speed))
-                        .add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect(),
+        Some(base) if effects_on => twolab_tui::gradient_text::GradientText::solid(text, base)
+            .speed(g.speed)
+            .at(gradient_t(frame))
+            .spans(),
         Some(_) => vec![Span::styled(
             text.to_string(),
             group_color(group).add_modifier(Modifier::BOLD),
@@ -9558,20 +9356,14 @@ fn effort_spans(
         )],
         // Config `tui_gradient.max_effort` swaps the rainbow for a solid
         // gradient on the chosen color (UI-8); default keeps the rainbow.
-        "max" if effects_on => effort
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                let color = match g.max_effort {
-                    Some(base) => gradient_solid(base, frame, i, g.speed),
-                    None => gradient_rainbow(frame, i, g.speed),
-                };
-                Span::styled(
-                    c.to_string(),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect(),
+        "max" if effects_on => {
+            use twolab_tui::gradient_text::GradientText;
+            let text = match g.max_effort {
+                Some(base) => GradientText::solid(effort, base),
+                None => GradientText::rainbow(effort),
+            };
+            text.speed(g.speed).at(gradient_t(frame)).spans()
+        }
         "max" => vec![Span::styled(
             effort.to_string(),
             Style::new()
@@ -9580,35 +9372,6 @@ fn effort_spans(
         )],
         _ => vec![Span::styled(effort.to_string(), group_color(group))],
     }
-}
-
-/// Display-cell width of `text` — ratatui's own column accounting
-/// (`unicode-width`), NOT the char count: group/model/effort ride in from
-/// request bodies, so wide/combining input must not shift the badge column.
-fn cell_width(text: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(text)
-}
-
-/// `…`-clip `text` to at most `max` display CELLS (the cell-aware sibling of
-/// [`truncate_chars`]). `max == 0` yields the empty string. The bound is
-/// enforced by WHOLE-STRING re-measurement with the same [`cell_width`] the
-/// caller pads with — never by summing per-char widths, which disagrees with
-/// string measurement on context-sensitive sequences (VS16/ZWJ): chars are
-/// popped until the remainder plus the one-cell ellipsis fits (review R2).
-fn truncate_cells(text: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if cell_width(text) <= max {
-        return text.to_string();
-    }
-    let budget = max - 1; // room for the ellipsis
-    let mut out = text.to_string();
-    while !out.is_empty() && cell_width(&out) > budget {
-        out.pop();
-    }
-    out.push('\u{2026}');
-    out
 }
 
 /// Compose the UNPADDED `[model effort]` badge body for an activity line
@@ -9678,25 +9441,11 @@ fn activity_meta_spans(
     // activity_meta_body): a hostile assembly collapses to the same single
     // `…`-clipped span so the text never diverges from the width SSOT.
     let raw: String = spans.iter().map(|s| s.content.as_ref()).collect();
-    if cell_width(&raw) <= META_W_MAX {
+    if cells::width(&raw) <= META_W_MAX {
         spans
     } else {
         vec![Span::styled(truncate_cells(&raw, META_W_MAX), base)]
     }
-}
-
-/// Right-pad a multi-span badge to `width` display CELLS by the SUM of its span
-/// cell widths (never char count) — the multi-span analogue of [`pad_cells`],
-/// so the styled `[model effort]` badge lines up with the plain-padded columns
-/// around it. The badge text is capped at [`META_W_MAX`] and `width` is the
-/// frame's max badge width, so a trailing blank span always fills the gap.
-fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
-    let used: usize = spans.iter().map(|s| cell_width(s.content.as_ref())).sum();
-    let pad = width.saturating_sub(used);
-    if pad > 0 {
-        spans.push(Span::raw(" ".repeat(pad)));
-    }
-    spans
 }
 
 /// Bottom log console: the tail of the tracing ring, newest line on the
@@ -9822,9 +9571,9 @@ fn model_active_marker(m: &ModelUsageDoc, now: SystemTime, frame: usize) -> Span
     // cell right of the border while the column stays aligned.
     if m.in_flight > 0 {
         let glyph = if m.group == "codex" {
-            anim::block_spin(frame)
+            SpinnerKind::Block.glyph(frame)
         } else {
-            anim::braille_spin(frame)
+            SpinnerKind::Braille.glyph(frame)
         };
         Span::styled(format!(" {glyph}"), group_color(Some(m.group.as_str())))
     } else if model_is_recent(m.last_used_ms, now) {
@@ -10596,14 +10345,14 @@ fn draw_heatmap(
         let bar_color = level_color(format::gauge_level(share));
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:<7}", trunc(&c.group, 7)),
+                format!(" {}", pad_cells(&c.group, 7)),
                 group_color(Some(c.group.as_str())),
             ),
-            Span::raw(format!(" {:<20}", trunc(&c.model, 20))),
+            Span::raw(format!(" {}", pad_cells(&c.model, 20))),
             Span::styled(
                 format!(
-                    " {:<14}",
-                    trunc(&masked_name(&c.account, view.email_anonymous), 14)
+                    " {}",
+                    pad_cells(&masked_name(&c.account, view.email_anonymous), 14)
                 ),
                 dim(),
             ),
@@ -10622,19 +10371,50 @@ fn draw_heatmap(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Truncate `s` to `width` display columns, appending `…` when clipped. Keeps
-/// the heatmap columns aligned without depending on a unicode-width crate (the
-/// model/account strings here are ASCII slugs/emails).
-fn trunc(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        s.to_string()
-    } else if width == 0 {
-        String::new()
-    } else {
-        let keep: String = s.chars().take(width.saturating_sub(1)).collect();
-        format!("{keep}…")
-    }
+/// A footer keybar fitted to `width` cells by twolab-tui's
+/// [`KeyHints`](twolab_tui::key_hints::KeyHints): when the row is too narrow,
+/// whole hints drop — lowest priority first, the rightmost of equals first —
+/// and `… +N more` says how many, instead of the terminal clipping the bar
+/// mid-word. `quit` stays longest, then `back` / `cancel`.
+fn keybar(
+    title: Option<&str>,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> Line<'static> {
+    use twolab_tui::key_hints::{KeyHint, KeyHints};
+    let lead = match title {
+        Some(t) => format!(" {t} — "),
+        None => " ".to_string(),
+    };
+    let room = width.saturating_sub(cells::width(&lead) as u16);
+    let hints = hints.iter().map(|&(k, l)| {
+        let priority = match l {
+            "quit" => 9,
+            "back" | "cancel" | "close" => 8,
+            // The prompt's own action outlasts navigation.
+            _ if k == "Enter" || k == "y" => 7,
+            _ => 5,
+        };
+        // `R disabled (attached)`: the key exists, does nothing here — dim.
+        let disabled = l.starts_with("disabled");
+        KeyHint::new(k, l).priority(priority).disabled(disabled)
+    });
+    let bar = KeyHints::new(hints)
+        .no_more()
+        .theme(KEYBAR_THEME)
+        .line(room);
+    let mut spans = vec![Span::raw(lead)];
+    spans.extend(bar.spans);
+    Line::from(spans)
 }
+
+/// The key bar's theme: ANSI colours with labels in the terminal's default
+/// foreground (as before the move to KeyHints) — ANSI grey labels would be
+/// near-invisible on a light-background terminal.
+const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
+    text_secondary: Color::Reset,
+    ..twolab_tui::Theme::ansi()
+};
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
@@ -10655,20 +10435,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     let keybar = match chrome.mode {
         // Config-editor prompts render their own inline hint line inside the
         // overlay; the keybar mirrors the essentials.
-        Mode::ConfigEdit { .. } => Line::from(vec![
-            Span::raw(" edit — "),
-            key("Enter"),
-            Span::raw(" apply  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
-        Mode::ConfigConfirm { .. } => Line::from(vec![
-            Span::raw(" confirm — "),
-            key("y"),
-            Span::raw(" apply  "),
-            key("n/Esc"),
-            Span::raw(" cancel"),
-        ]),
+        Mode::ConfigEdit { .. } => keybar(
+            Some("edit"),
+            &[("Enter", "apply"), ("Esc", "cancel")],
+            area.width,
+        ),
+        Mode::ConfigConfirm { .. } => keybar(
+            Some("confirm"),
+            &[("y", "apply"), ("n/Esc", "cancel")],
+            area.width,
+        ),
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
         Mode::Normal => match chrome.overlay {
@@ -10679,31 +10455,25 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // clickable group-settings bar (U9/U10), so their hint is gone
             // too (UI-4 V7).
             Overlay::None => {
-                let mut spans = vec![Span::raw(" "), key("q"), Span::raw(" quit  ")];
-                if attached {
-                    spans.push(Span::styled("R disabled (attached)  ", dim()));
+                let mut hints: Vec<(&'static str, &'static str)> = vec![("q", "quit")];
+                hints.push(if attached {
+                    ("R", "disabled (attached)")
                 } else {
-                    spans.push(key("R"));
-                    spans.push(Span::raw(" reload  "));
-                }
-                spans.extend([
-                    key("u"),
-                    Span::raw(" used/left  "),
-                    key("t"),
-                    Span::raw(" eta/utc  "),
-                    key("o"),
-                    Span::raw(" sort  "),
-                    key("S"),
-                    Span::raw(" sched  "),
-                    key("↑↓"),
-                    Span::raw(" scroll"),
+                    ("R", "reload")
+                });
+                hints.extend([
+                    ("u", "used/left"),
+                    ("t", "eta/utc"),
+                    ("o", "sort"),
+                    ("S", "sched"),
+                    ("↑↓", "scroll"),
                 ]);
                 // The fold (`z`) is advertised only while it is on: the
                 // bar that `z` turns off.
                 if chrome.fold_exhausted {
-                    spans.extend([Span::raw("  "), key("z"), Span::raw(" fold")]);
+                    hints.push(("z", "fold"));
                 }
-                Line::from(spans)
+                keybar(None, &hints, area.width)
             }
             // Accounts overlay: the issue #3/#4 affordances. a (add) and r
             // (remove) act on the DAEMON via the control endpoints, so they are
@@ -10712,138 +10482,112 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // controls. `R` is deliberately the SHIFTED key next to `r`
             // remove: a redemption spends something upstream, so it must not
             // share a keystroke with anything else.
-            Overlay::Accounts => Line::from(vec![
-                Span::raw(" accounts — "),
-                key("s"),
-                Span::raw(" switch  "),
-                key("f"),
-                Span::raw(" refresh  "),
-                key("R"),
-                Span::raw(" reset  "),
-                key("a"),
-                Span::raw(" add  "),
-                key("n"),
-                Span::raw(" login  "),
-                key("r"),
-                Span::raw(" remove  "),
-                key("u"),
-                Span::raw(" used/left  "),
-                key("t"),
-                Span::raw(" eta/utc  "),
-                key("o"),
-                Span::raw(" sort  "),
-                key("Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Accounts => keybar(
+                Some("accounts"),
+                &[
+                    ("s", "switch"),
+                    ("f", "refresh"),
+                    ("R", "reset"),
+                    ("a", "add"),
+                    ("n", "login"),
+                    ("r", "remove"),
+                    ("u", "used/left"),
+                    ("t", "eta/utc"),
+                    ("o", "sort"),
+                    ("Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Stats overlay: navigation + window cycle + back, regardless of
             // attach mode. `w` toggles the heatmap window (issue #23).
-            Overlay::Stats => Line::from(vec![
-                Span::raw(" stats — "),
-                key("g/Esc"),
-                Span::raw(" back  "),
-                key("↑/k ↓/j"),
-                Span::raw(" model  "),
-                key("PgUp/PgDn"),
-                Span::raw(" page  "),
-                key("w"),
-                Span::raw(" window  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Stats => keybar(
+                Some("stats"),
+                &[
+                    ("g/Esc", "back"),
+                    ("↑/k ↓/j", "model"),
+                    ("PgUp/PgDn", "page"),
+                    ("w", "window"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Usage overlay (usage-stats): granularity cycle + scroll + back.
-            Overlay::Usage => Line::from(vec![
-                Span::raw(" usage — "),
-                key("g"),
-                Span::raw(" hour/day/month  "),
-                key("↑/k ↓/j"),
-                Span::raw(" bucket  "),
-                key("U/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Usage => keybar(
+                Some("usage"),
+                &[
+                    ("g", "hour/day/month"),
+                    ("↑/k ↓/j", "bucket"),
+                    ("U/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Logs overlay: full-screen tail; l/Esc back.
-            Overlay::Logs => Line::from(vec![
-                Span::raw(" logs — "),
-                key("l/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Perf => Line::from(vec![
-                Span::raw(" perf — "),
-                key("d"),
-                Span::raw(" span  "),
-                key("←/h →/l"),
-                Span::raw(" day  "),
-                key("↑/k ↓/j"),
-                Span::raw(" series  "),
-                key("p/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Misc => Line::from(vec![
-                Span::raw(" misc — "),
-                key("?/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
-            Overlay::Config => Line::from(vec![
-                Span::raw(" config — "),
-                key("c/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Logs => keybar(
+                Some("logs"),
+                &[("l/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
+            Overlay::Perf => keybar(
+                Some("perf"),
+                &[
+                    ("d", "span"),
+                    ("←/h →/l", "day"),
+                    ("↑/k ↓/j", "series"),
+                    ("p/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
+            Overlay::Misc => keybar(
+                Some("misc"),
+                &[("?/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
+            Overlay::Config => keybar(
+                Some("config"),
+                &[("c/Esc", "back"), ("q", "quit")],
+                area.width,
+            ),
             // Keys overlay (multi-tenant #22): read-only; mutations live in
             // the CLI (`llmux key …`).
-            Overlay::Keys => Line::from(vec![
-                Span::raw(" keys — "),
-                key("w"),
-                Span::raw(" window  "),
-                key("f"),
-                Span::raw(" models  "),
-                key("↑/↓ PgUp/PgDn Home/End"),
-                Span::raw(" scroll  "),
-                key("r"),
-                Span::raw(" refresh  "),
-                key("K/Esc"),
-                Span::raw(" back  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Keys => keybar(
+                Some("keys"),
+                &[
+                    ("w", "window"),
+                    ("f", "models"),
+                    ("↑/↓ PgUp/PgDn Home/End", "scroll"),
+                    ("r", "refresh"),
+                    ("K/Esc", "back"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
             // Sessions overlay (issue #34): navigation + back.
-            Overlay::Sessions => Line::from(vec![
-                Span::raw(" sessions — "),
-                key("s/Esc"),
-                Span::raw(" back  "),
-                key("↑/k ↓/j"),
-                Span::raw(" session  "),
-                key("PgUp/PgDn"),
-                Span::raw(" page  "),
-                key("q"),
-                Span::raw(" quit"),
-            ]),
+            Overlay::Sessions => keybar(
+                Some("sessions"),
+                &[
+                    ("s/Esc", "back"),
+                    ("↑/k ↓/j", "session"),
+                    ("PgUp/PgDn", "page"),
+                    ("q", "quit"),
+                ],
+                area.width,
+            ),
         },
-        Mode::Select { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" move  "),
-            key("Enter"),
-            Span::raw(" switch  "),
-            key("p"),
-            Span::raw(" pause  "),
-            key("L"),
-            Span::raw(" limits  "),
-            key("n"),
-            Span::raw(" new login  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
+        Mode::Select { .. } => keybar(
+            None,
+            &[
+                ("↑/k ↓/j", "move"),
+                ("Enter", "switch"),
+                ("p", "pause"),
+                ("L", "limits"),
+                ("n", "new login"),
+                ("Esc", "cancel"),
+            ],
+            area.width,
+        ),
         // The typed key is shown ONLY as a masked width — never the raw
         // characters (AGENTS.md credential rule).
         Mode::EditLimits { .. } => Line::from(vec![
@@ -10870,15 +10614,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             key("Esc"),
             Span::raw(" cancel"),
         ]),
-        Mode::ContextMenu { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" move  "),
-            key("Enter/click"),
-            Span::raw(" run  "),
-            key("Esc"),
-            Span::raw(" close"),
-        ]),
+        Mode::ContextMenu { .. } => keybar(
+            None,
+            &[
+                ("↑/k ↓/j", "move"),
+                ("Enter/click", "run"),
+                ("Esc", "close"),
+            ],
+            area.width,
+        ),
         Mode::ConfirmRemove { .. } => Line::from(vec![
             Span::raw(" "),
             key("↑/k ↓/j"),
@@ -11256,7 +11000,7 @@ mod tests {
         assert_eq!(rows[0].cells[0], "pc-b <b@x.com>", "name is column 0");
         let key_cell = &rows[0].cells[1];
         assert!(
-            cell_width(key_cell) <= 16,
+            cells::width(key_cell) <= 16,
             "key cell is at most 16 display cells: {key_cell:?}"
         );
         assert!(
@@ -13269,7 +13013,7 @@ mod tests {
             text.contains("best-effort"),
             "accuracy contract: best-effort qualifier visible"
         );
-        // The account column is truncated via `trunc(&c.account, 14)`, so the
+        // The account column is clipped via `pad_cells(&c.account, 14)`, so the
         // 16-char `user@example.com` renders as `user@example.…`; assert on the
         // visible prefix rather than the full address.
         assert!(text.contains("user@example"), "per-account axis rendered");
@@ -13628,7 +13372,7 @@ mod tests {
     fn activity_meta_body_caps_hostile_width_and_pads_via_pad_cells() {
         // Belt-and-braces: a hostile model id cannot exceed the cap…
         let hostile = activity_meta_body(Some("claude"), Some(&"x".repeat(100)), Some("high"));
-        assert!(cell_width(&hostile) <= META_W_MAX);
+        assert!(cells::width(&hostile) <= META_W_MAX);
         // …including wide (CJK) + context-sensitive sequences (VS16/ZWJ) —
         // the contract is display CELLS, not chars.
         for meta in [
@@ -13639,11 +13383,11 @@ mod tests {
                 Some("high"),
             ),
         ] {
-            assert!(cell_width(&meta) <= META_W_MAX, "badge {meta:?} within cap");
+            assert!(cells::width(&meta) <= META_W_MAX, "badge {meta:?} within cap");
         }
         // And the caller-side padding lands every body on the shared width.
         for body in ["", "[opus-4-8 low]", "[gpt-5.6-sol max]"] {
-            assert_eq!(cell_width(&pad_cells(body, 20)), 20);
+            assert_eq!(cells::width(&pad_cells(body, 20)), 20);
         }
     }
 
@@ -13855,9 +13599,10 @@ mod tests {
     #[test]
     fn gradient_speed_scales_the_temporal_drift(/* UI-8 */) {
         // Same frame, double speed ⇒ double the temporal phase advance.
-        let base = gradient_phase(10, 0, 1.0) - gradient_phase(0, 0, 1.0);
-        let fast = gradient_phase(10, 0, 2.0) - gradient_phase(0, 0, 2.0);
-        assert!((fast - 2.0 * base).abs() < 1e-4);
+        use twolab_tui::gradient_text::phase;
+        let base = phase(0, gradient_t(1), 1.0) - phase(0, gradient_t(0), 1.0);
+        let fast = phase(0, gradient_t(1), 2.0) - phase(0, gradient_t(0), 2.0);
+        assert!((fast - 2.0 * base).abs() < 1e-9);
         // And the configured base colors drive the solid gradient directly:
         // at any phase the scaled channels keep the base's ordering.
         let custom = GradientCfg::from_config(&crate::config::TuiGradient {
@@ -14336,7 +14081,7 @@ mod tests {
     /// char counts both lie here — the spinner/marker glyphs are multi-byte
     /// and a CJK name cell is one char but two cells wide.
     fn cells_before(row: &str, at: usize) -> usize {
-        cell_width(&row[..at])
+        cells::width(&row[..at])
     }
 
     /// Every column boundary of an activity row that can be located by
@@ -14735,11 +14480,19 @@ mod tests {
         // an ellipsis inside the SAME fixed column.
         let cell = name_cell(&named("위대한이름 (U1)"));
         assert!(cell.starts_with("위…"), "wide name cell-clips: {cell:?}");
-        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        assert_eq!(
+            cells::width(&cell),
+            ACTIVITY_NAME_W + 1,
+            "column stays fixed"
+        );
         // Family-emoji name: ONE grapheme survives shortening whole (the
         // helper test proves no tear), then cell-clips to the column.
         let cell = name_cell(&named("👨‍👩‍👧‍👦 (U1)"));
-        assert_eq!(cell_width(&cell), ACTIVITY_NAME_W + 1, "column stays fixed");
+        assert_eq!(
+            cells::width(&cell),
+            ACTIVITY_NAME_W + 1,
+            "column stays fixed"
+        );
         assert!(cell.starts_with('👨'), "clip starts at the emoji: {cell:?}");
     }
 
@@ -14781,7 +14534,7 @@ mod tests {
             )
             .spans
             .iter()
-            .map(|s| cell_width(&s.content))
+            .map(|s| cells::width(&s.content))
             .sum::<usize>()
         };
         assert!(
@@ -14850,7 +14603,7 @@ mod tests {
         let boundary = |line: &Line<'static>, spans: usize| {
             line.spans[..spans]
                 .iter()
-                .map(|s| cell_width(&s.content))
+                .map(|s| cells::width(&s.content))
                 .sum::<usize>()
         };
         // Span-by-span: stamp end, kind end, and the post-kind column start
@@ -15078,13 +14831,13 @@ mod tests {
     #[test]
     fn wrapped_line_count_wraps_words_and_hard_splits(/* UI-6 item 3 */) {
         // Three short words fit one 12-cell line.
-        assert_eq!(wrapped_line_count("aa bb cc", 12), 1);
+        assert_eq!(cells::wrapped_rows("aa bb cc", 12), 1);
         // Two 6-cell words + a short one spill to a second line.
-        assert_eq!(wrapped_line_count("aaaaaa bbbbbb cc", 12), 2);
+        assert_eq!(cells::wrapped_rows("aaaaaa bbbbbb cc", 12), 2);
         // Explicit newlines always break.
-        assert_eq!(wrapped_line_count("line1\nline2", 40), 2);
+        assert_eq!(cells::wrapped_rows("line1\nline2", 40), 2);
         // A word wider than the line hard-splits across rows.
-        assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
+        assert_eq!(cells::wrapped_rows(&"x".repeat(25), 10), 3);
     }
 
     #[test]
@@ -15092,21 +14845,44 @@ mod tests {
         // Leading indentation occupies cells: "    " fills the 4-cell row, so the
         // "x" wraps to a second row (ratatui `Wrap { trim: false }` renders the
         // spaces). The old estimator dropped leading spaces and returned 1.
-        assert_eq!(wrapped_line_count("    x", 4), 2);
+        assert_eq!(cells::wrapped_rows("    x", 4), 2);
         // A multi-line indented block = per-line manual cell math:
         //   "    x"  → "    " (row) + "x" (row)        = 2 rows
         //   "  yy"   → "  yy" is 4 cells, fits one row  = 1 row
-        assert_eq!(wrapped_line_count("    x\n  yy", 4), 3);
+        assert_eq!(cells::wrapped_rows("    x\n  yy", 4), 3);
     }
 
     #[test]
     fn wrapped_line_count_accounts_wide_chars(/* UI-6 item 3 MUST-FIX */) {
         // 가 = 2 cells; at width 4 only two fit per row, so 5 of them need 3
         // rows. Integer cell-width division would have said 2 (undercount).
-        assert_eq!(wrapped_line_count(&"가".repeat(5), 4), 3);
-        // Odd width where a 2-cell glyph cannot straddle the edge: width 3 holds
-        // exactly one 가 per row (2+2 > 3), so 3 가 = 3 rows.
-        assert_eq!(wrapped_line_count(&"가".repeat(3), 3), 3);
+        assert_eq!(cells::wrapped_rows(&"가".repeat(5), 4), 3);
+        // The count is ratatui's own (Paragraph::line_count, the wrapper the
+        // modal renders with), so it equals the rows actually drawn — the
+        // tail is reachable and there is no blank overscroll. At odd widths
+        // ratatui 0.30 lets a 2-cell glyph straddle the edge (an upstream
+        // wrap bug: `가가가` at width 3 draws 2 rows, not 3); the count
+        // follows the drawing, which is what the scroll limit needs.
+        for (text, w) in [
+            ("가".repeat(3), 3u16),
+            ("가".repeat(5), 4),
+            ("가".repeat(7), 5),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(w, 12)).expect("terminal");
+            let frame = terminal
+                .draw(|f| {
+                    f.render_widget(
+                        Paragraph::new(text.as_str()).wrap(Wrap { trim: false }),
+                        f.area(),
+                    )
+                })
+                .expect("draw");
+            let drawn = (0..12u16)
+                .rev()
+                .find(|&y| (0..w).any(|x| frame.buffer[(x, y)].symbol() != " "))
+                .map_or(1, |y| usize::from(y) + 1);
+            assert_eq!(cells::wrapped_rows(&text, w), drawn, "{text} at {w}");
+        }
     }
 
     #[test]
@@ -15115,8 +14891,12 @@ mod tests {
         // wide; summing scalar widths (1 + 0) would undercount it as 1. Measured
         // per cluster, 5 of them at width 4 = 2 clusters/row → 3 rows.
         let heart = "\u{2764}\u{FE0F}".repeat(5);
-        assert_eq!(cell_width("\u{2764}\u{FE0F}"), 2, "VS16 cluster is 2 cells");
-        assert_eq!(wrapped_line_count(&heart, 4), 3);
+        assert_eq!(
+            cells::width("\u{2764}\u{FE0F}"),
+            2,
+            "VS16 cluster is 2 cells"
+        );
+        assert_eq!(cells::wrapped_rows(&heart, 4), 3);
     }
 
     #[test]
@@ -15813,7 +15593,7 @@ mod tests {
         for active in active_overlays {
             let mut tabs = Vec::new();
             terminal
-                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active))
+                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active).0)
                 .expect("draw");
             let buffer = terminal.backend().buffer();
             let header: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
@@ -19659,8 +19439,22 @@ mod tests {
     /// bare, and the band's detail lines one row up with the sixth (mode)
     /// row keeping only its `│`. (origin/main still renders the old digest
     /// 6_597_409_346_785_969_346 from this fixture; the frame diff is PR #230
-    /// review evidence.)
-    const FOLD_OFF_179X43_DIGEST: u64 = 15_536_070_822_945_120_328;
+    /// review evidence.) Re-pinned 2026-11-05 when the spinner families moved
+    /// to twolab-tui: the cooldown clock, active pulse and filling-up breath
+    /// are braille now (`⠂` where `░` was in this frame), because `▌ ▀ ▄ █ ▒ ▓`
+    /// and the eighth blocks take two cells on a terminal that draws
+    /// East-Asian Ambiguous glyphs wide — the only change in the frame
+    /// (reverting the crate's glyph commit restores 15_536_070_822_945_120_328).
+    /// Re-pinned again the same day for the footer keybar on twolab-tui's
+    /// KeyHints: the frame's text is unchanged (it fits at 179 columns); the
+    /// hint labels are now the secondary (gray) colour under bold keys, and
+    /// `R disabled (attached)` reads as a key and a label instead of one dim
+    /// run (previous digest 6_181_608_817_893_489_260).
+    /// Re-pinned a third time after review: labels back in the terminal's
+    /// default foreground (ANSI grey was near-invisible on light terminals)
+    /// and `R disabled (attached)` drawn dim as a whole; text unchanged
+    /// (previous digest 17_379_241_155_914_426_102).
+    const FOLD_OFF_179X43_DIGEST: u64 = 9_289_721_260_446_823_680;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -19870,6 +19664,75 @@ mod tests {
     }
 
     /// Render MAIN and return the full buffer (text + styles).
+    /// A narrow terminal drops whole hints from the key bar — never half a
+    /// word — keeps `quit` and `back`, and says how many it dropped.
+    #[test]
+    fn keybar_drops_whole_hints_and_says_how_many_on_a_narrow_terminal() {
+        let hints = [
+            ("s", "switch"),
+            ("f", "refresh"),
+            ("R", "reset"),
+            ("a", "add"),
+            ("n", "login"),
+            ("r", "remove"),
+            ("u", "used/left"),
+            ("t", "eta/utc"),
+            ("o", "sort"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ];
+        let wide: String = keybar(Some("accounts"), &hints, 200)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!wide.contains("more"), "{wide}");
+        let narrow: String = keybar(Some("accounts"), &hints, 48)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(cells::width(&narrow) <= 48, "{narrow}");
+        assert!(narrow.starts_with(" accounts — "), "{narrow}");
+        assert!(
+            narrow.contains("Esc back") && narrow.contains("q quit"),
+            "{narrow}"
+        );
+        assert!(narrow.contains(" more"), "{narrow}");
+        for (k, l) in hints {
+            let shown = narrow.contains(&format!("{k} {l}"));
+            let half = !shown && narrow.contains(l) && l.len() > 3;
+            assert!(!half, "{l} cut in half: {narrow}");
+        }
+    }
+
+    /// NO_COLOR: the runtime's decolor pass leaves no coloured cell on a full
+    /// frame (overlay + table + activity), keeps the reversed selection and
+    /// turns red text bold — colour was its only signal.
+    #[test]
+    fn no_color_frame_keeps_weight_and_drops_every_colour() {
+        let view = email_everywhere_view();
+        let mut buf = render_buffer(&view, &chrome_overlay(Overlay::None), 140, 40);
+        assert!(
+            buf.content().iter().any(|c| c.fg != Color::Reset),
+            "the fixture draws colour before the pass"
+        );
+        let had_red = buf
+            .content()
+            .iter()
+            .any(|c| matches!(c.fg, Color::Red | Color::LightRed));
+        twolab_tui::theme::decolor(&mut buf);
+        for cell in buf.content() {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+        }
+        if had_red {
+            assert!(buf
+                .content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::BOLD)));
+        }
+    }
+
     fn render_buffer(
         view: &DashboardView,
         chrome: &Chrome,

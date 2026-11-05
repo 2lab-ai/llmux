@@ -36,7 +36,10 @@ and `[c] config`, in that order. Inside an overlay, only `[Esc] dashboard`
 keeps a hint; the other tabs show their names because overlay keys have their
 own meanings (`g` changes granularity in Usage, for example). Return to MAIN
 with `Esc` before using a letter shortcut to open another surface. Below 140
-columns, all ten tabs keep their name-only labels on every surface.
+columns, all ten tabs keep their name-only labels on every surface. When
+even the names do not fit (below about 86 columns), the strip keeps the
+active tab in view and says how many tabs are hidden at each end — for
+example `misc 1›` at 80 columns — instead of cutting the last name off.
 Each tab's displayed hint and name share one clickable target; separators are
 not targets. These are existing keys, not new bindings or Tab/Enter navigation.
 
@@ -45,6 +48,16 @@ not targets. These are existing keys, not new bindings or Tab/Enter navigation.
 Top to bottom, the dashboard is always: header, tab row, accounts, scheduler
 and detail, models, activity, the group settings line, the status line and
 the key bar. Numbers keep their usual format everywhere.
+
+The key bar at the bottom fits the terminal width: when it is too narrow for
+every hint, whole hints drop out (the least important first; `quit` and
+`back` stay longest) and the bar ends with `… +N more`, instead of the
+terminal cutting a hint in half.
+
+With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
+dashboard draws no colour at all: every cell keeps your terminal's default
+colours, bold, dim, reversed and underline stay, and text that would be red
+(errors, failures, a nearly spent window) is bold instead.
 
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
@@ -697,7 +710,9 @@ the configured size/redaction limits.
   `save all` (`S`) write the body / the whole record JSON to `~/Downloads`
   (timestamped). Clipboard uses `pbcopy`/`wl-copy`/`xclip`/`xsel` when
   available, falling back to the OSC 52 terminal escape; the outcome
-  flashes on the modal's hint line.
+  flashes on the modal's hint line. Inside tmux or GNU screen the OSC 52
+  escape is wrapped in the multiplexer's passthrough so it reaches your
+  terminal (tmux 3.3 or later also needs `set -g allow-passthrough on`).
 - `Esc`/`q`/`Enter` closes. Records written by a daemon predating a field
   render it as "(not captured)"; passthrough records carry no upstream
   half by design.
