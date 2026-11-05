@@ -19739,6 +19739,33 @@ mod tests {
     }
 
     /// Render MAIN and return the full buffer (text + styles).
+    /// NO_COLOR: the runtime's decolor pass leaves no coloured cell on a full
+    /// frame (overlay + table + activity), keeps the reversed selection and
+    /// turns red text bold — colour was its only signal.
+    #[test]
+    fn no_color_frame_keeps_weight_and_drops_every_colour() {
+        let view = email_everywhere_view();
+        let mut buf = render_buffer(&view, &chrome_overlay(Overlay::None), 140, 40);
+        assert!(
+            buf.content().iter().any(|c| c.fg != Color::Reset),
+            "the fixture draws colour before the pass"
+        );
+        let had_red = buf
+            .content()
+            .iter()
+            .any(|c| matches!(c.fg, Color::Red | Color::LightRed));
+        twolab_tui::theme::decolor(&mut buf);
+        for cell in buf.content() {
+            assert_eq!((cell.fg, cell.bg), (Color::Reset, Color::Reset), "{cell:?}");
+        }
+        if had_red {
+            assert!(buf
+                .content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::BOLD)));
+        }
+    }
+
     fn render_buffer(
         view: &DashboardView,
         chrome: &Chrome,
