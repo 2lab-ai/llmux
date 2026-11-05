@@ -26,7 +26,6 @@
 //! JSON) — the draw code in [`ui`] is never forked.
 
 pub(crate) mod activity;
-mod anim;
 mod clip;
 mod event;
 // pub(crate): `cli::status` reuses the token/age formatters so the plain
