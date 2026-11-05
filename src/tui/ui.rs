@@ -461,15 +461,8 @@ fn draw_main(
     if let Some(line) = event_line {
         frame.render_widget(Paragraph::new(line), banner_area);
     }
-    let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
-    let header_tail = draw_header(
-        frame,
-        header_area,
-        view,
-        chrome,
-        now,
-        tabs_room(tabs_area, &tabs),
-    );
+    let (tabs, tabs_room) = draw_tabs(frame, tabs_area, chrome.overlay);
+    let header_tail = draw_header(frame, header_area, view, chrome, now, tabs_room);
     draw_tabs_tail(frame, tabs_area, header_tail);
     let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
     draw_middle(frame, middle_area, view, &middle);
@@ -666,7 +659,9 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
 /// the header. The active surface renders reversed; every label's rect is
 /// returned for the mouse hit-test. Keyboard shortcuts keep working — the
 /// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
-fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
+/// Draw the tab strip; returns the click targets and the cells left free at
+/// the right end (after any `N›` scroll marker) for the header tail.
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, usize) {
     // The documented hint rule (operational-reference "Tab shortcut hints"):
     // at 140 columns or more, MAIN shows every tab's key; inside an overlay
     // only `[Esc] dashboard` keeps one (overlay keys mean other things there).
@@ -684,14 +679,16 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
         .active(active_i)
         .theme(twolab_tui::Theme::ansi())
         .hints(twolab_tui::tabs::Hints::Bracket);
-    strip
-        .render_hits(area, frame.buffer_mut())
+    let layout = strip.render_layout(area, frame.buffer_mut());
+    let hits = layout
+        .hits
         .into_iter()
         .map(|h| TabHit {
             area: h.rect,
             overlay: TABS[h.index].1,
         })
-        .collect()
+        .collect();
+    (hits, layout.room)
 }
 
 /// The key that opens a surface from MAIN, as the tab strip shows it.
@@ -3474,7 +3471,9 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
         .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
     let inner = block.inner(area);
 
-    let text = masked_text(excerpt, view.email_anonymous);
+    // Wrap-safe text (a 2-cell U+3000 space can make ratatui 0.30's wrapper
+    // overrun the area): count and draw the same string.
+    let text = cells::wrap_safe(&masked_text(excerpt, view.email_anonymous)).into_owned();
     let total = cells::wrapped_rows(&text, inner.width) as u16;
     let max_scroll = total.saturating_sub(inner.height);
     let scroll = modal.scroll.min(max_scroll);
@@ -4045,14 +4044,11 @@ fn draw_account_modal(
         .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
     let inner = block.inner(area);
 
-    let lines = account_modal_lines(view, ctx, chrome, account);
-    let total: usize = lines
-        .iter()
-        .map(|line| {
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            cells::wrapped_rows(&text, inner.width)
-        })
-        .sum();
+    let lines: Vec<Line<'static>> = account_modal_lines(view, ctx, chrome, account)
+        .into_iter()
+        .map(cells::wrap_safe_line)
+        .collect();
+    let total = cells::wrapped_rows_lines(&lines, inner.width);
     let max_scroll = (total as u16).saturating_sub(inner.height);
     let scroll = modal.scroll.min(max_scroll);
 
@@ -4836,14 +4832,6 @@ fn draw_header(
     }
     frame.render_widget(Paragraph::new(Line::from(full)), area);
     Vec::new()
-}
-
-/// Cells the tab labels leave free at the right end of the tabs row.
-fn tabs_room(area: Rect, tabs: &[TabHit]) -> usize {
-    let used = tabs
-        .last()
-        .map_or(0, |t| t.area.right().saturating_sub(area.x));
-    usize::from(area.width.saturating_sub(used))
 }
 
 /// Right-align the header tail at the end of the tabs row ([`draw_header`]
@@ -5932,7 +5920,7 @@ fn status_span(
             Span::styled(format!("{} ready", SpinnerKind::Drift.glyph(frame)), dim())
         };
     };
-    // Cooldowns render TIME-ONLY (`▌ 45m 34s`, yellow): the rotating-timer
+    // Cooldowns render TIME-ONLY (`⡇ 45m 34s`, yellow): the rotating-timer
     // glyph + yellow already say "waiting", so the word "cooldown" was pure
     // width (Z 2026-07-09). The `/llmux/status` API string is untouched —
     // `blocking_reason` still says "cooldown 45m34s" there.
@@ -10402,19 +10390,31 @@ fn keybar(
     let hints = hints.iter().map(|&(k, l)| {
         let priority = match l {
             "quit" => 9,
-            "back" | "cancel" => 8,
+            "back" | "cancel" | "close" => 8,
+            // The prompt's own action outlasts navigation.
+            _ if k == "Enter" || k == "y" => 7,
             _ => 5,
         };
-        KeyHint::new(k, l).priority(priority)
+        // `R disabled (attached)`: the key exists, does nothing here — dim.
+        let disabled = l.starts_with("disabled");
+        KeyHint::new(k, l).priority(priority).disabled(disabled)
     });
     let bar = KeyHints::new(hints)
         .no_more()
-        .theme(twolab_tui::Theme::ansi())
+        .theme(KEYBAR_THEME)
         .line(room);
     let mut spans = vec![Span::raw(lead)];
     spans.extend(bar.spans);
     Line::from(spans)
 }
+
+/// The key bar's theme: ANSI colours with labels in the terminal's default
+/// foreground (as before the move to KeyHints) — ANSI grey labels would be
+/// near-invisible on a light-background terminal.
+const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
+    text_secondary: Color::Reset,
+    ..twolab_tui::Theme::ansi()
+};
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
@@ -15593,7 +15593,7 @@ mod tests {
         for active in active_overlays {
             let mut tabs = Vec::new();
             terminal
-                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active))
+                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active).0)
                 .expect("draw");
             let buffer = terminal.backend().buffer();
             let header: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
@@ -19450,7 +19450,11 @@ mod tests {
     /// hint labels are now the secondary (gray) colour under bold keys, and
     /// `R disabled (attached)` reads as a key and a label instead of one dim
     /// run (previous digest 6_181_608_817_893_489_260).
-    const FOLD_OFF_179X43_DIGEST: u64 = 17_379_241_155_914_426_102;
+    /// Re-pinned a third time after review: labels back in the terminal's
+    /// default foreground (ANSI grey was near-invisible on light terminals)
+    /// and `R disabled (attached)` drawn dim as a whole; text unchanged
+    /// (previous digest 17_379_241_155_914_426_102).
+    const FOLD_OFF_179X43_DIGEST: u64 = 9_289_721_260_446_823_680;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
