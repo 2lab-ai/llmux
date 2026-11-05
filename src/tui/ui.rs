@@ -667,53 +667,47 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
 /// returned for the mouse hit-test. Keyboard shortcuts keep working — the
 /// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
 fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut tabs: Vec<TabHit> = Vec::new();
-    let mut x = area.x + 1;
-    for (i, (label, overlay)) in TABS.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", dim()));
-            x += 3;
+    // The documented hint rule (operational-reference "Tab shortcut hints"):
+    // at 140 columns or more, MAIN shows every tab's key; inside an overlay
+    // only `[Esc] dashboard` keeps one (overlay keys mean other things there).
+    let wide = area.width >= 140;
+    let tabs = TABS.iter().map(|(label, overlay)| {
+        let tab = twolab_tui::tabs::Tab::new(*label);
+        if wide && (active == Overlay::None || *overlay == Overlay::None) {
+            tab.key(tab_key(*overlay))
+        } else {
+            tab
         }
-        let style = if *overlay == active {
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Cyan)
-        };
-        let label = if area.width >= 140 && (active == Overlay::None || *overlay == Overlay::None) {
-            let key = match overlay {
-                Overlay::None => "Esc",
-                Overlay::Accounts => "a",
-                Overlay::Stats => "g",
-                Overlay::Usage => "U",
-                Overlay::Keys => "K",
-                Overlay::Perf => "p",
-                Overlay::Logs => "l",
-                Overlay::Sessions => "s",
-                Overlay::Misc => "?",
-                Overlay::Config => "c",
-            };
-            format!("[{key}] {label}")
-        } else {
-            (*label).to_string()
-        };
-        let width = label.chars().count() as u16;
-        spans.push(Span::styled(label, style));
-        tabs.push(TabHit {
-            area: Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            overlay: *overlay,
-        });
-        x += width;
+    });
+    let active_i = TABS.iter().position(|(_, o)| *o == active).unwrap_or(0);
+    let strip = twolab_tui::tabs::Tabs::new(tabs)
+        .active(active_i)
+        .theme(twolab_tui::Theme::ansi())
+        .hints(twolab_tui::tabs::Hints::Bracket);
+    strip
+        .render_hits(area, frame.buffer_mut())
+        .into_iter()
+        .map(|h| TabHit {
+            area: h.rect,
+            overlay: TABS[h.index].1,
+        })
+        .collect()
+}
+
+/// The key that opens a surface from MAIN, as the tab strip shows it.
+fn tab_key(overlay: Overlay) -> &'static str {
+    match overlay {
+        Overlay::None => "Esc",
+        Overlay::Accounts => "a",
+        Overlay::Stats => "g",
+        Overlay::Usage => "U",
+        Overlay::Keys => "K",
+        Overlay::Perf => "p",
+        Overlay::Logs => "l",
+        Overlay::Sessions => "s",
+        Overlay::Misc => "?",
+        Overlay::Config => "c",
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    tabs
 }
 
 /// Accounts overlay (`a`): a near-full-screen surface giving the account quota
@@ -9287,63 +9281,34 @@ fn abbrev_model<'a>(group: Option<&str>, model: &'a str) -> &'a str {
     }
 }
 
-/// Smooth animated gradients (TUI UI-7): a port of herdr-mx's host-banner
-/// "lolcat" effect (`herdr src/ui/sidebar.rs`), replacing the old discrete
-/// ANSI marquee palettes — those slid hard color bands one cell per tick and
-/// read as flicker, not a gradient. Two modes, exactly like herdr:
-///
-/// - **rainbow** — per-char truecolor from a 3-phase sine sweep (R/G/B offset
-///   by 120°), hue rotating with the frame. Used for the `max` effort token
-///   (the deliberately loud top-effort marker, UI-6 item 6).
-/// - **solid (단색)** — a fixed per-group base color whose LUMA breathes with
-///   the same sine phase, hue never changing. Used for headline-model names
-///   (`fable-5*` magenta family, `gpt-5.6-sol*` cyan family, UI-6 item 7).
-///
-/// `phase = FREQ * char_index + DRIFT * frame` gives the spatial spread across
-/// characters plus temporal drift; luma is floored at `MIN_LUMA` for
-/// legibility. FREQ/luma mirror herdr's constants. DRIFT is the speed-1.0
-/// baseline: at llmux's 120 ms render tick (~8 fps) it completes a luma cycle
-/// in ~2.2 s — herdr's `normal` (0.09/frame at its faster tick) translated to
-/// a tick this slow read as barely moving (UI-8 user report), hence the
-/// larger baseline. Config `tui_gradient.speed` multiplies it.
-const GRADIENT_MIN_LUMA: f32 = 0.45;
-const GRADIENT_MAX_LUMA: f32 = 1.00;
-const GRADIENT_FREQ: f32 = 0.30;
-const GRADIENT_DRIFT: f32 = 0.35;
-
-/// The shared gradient phase for `(frame, char_idx)`. The frame is bounded
-/// before it meets f32: past ~2^24 an f32 can no longer step by 1, so
-/// `DRIFT * frame` would freeze on a long-lived daemon/attach TUI. The modulo
-/// wrap (~33 h at 120 ms/tick) is a single-frame phase jump — invisible next
-/// to a frozen animation.
-fn gradient_phase(frame: usize, char_idx: usize, speed: f32) -> f32 {
-    GRADIENT_FREQ * char_idx as f32 + GRADIENT_DRIFT * speed * ((frame % 1_000_000) as f32)
+/// Animated model names and the `max` effort badge are twolab-tui's
+/// [`GradientText`](twolab_tui::gradient_text::GradientText): the same
+/// herdr-derived constants (FREQ 0.30, DRIFT 0.35 per 120 ms tick, luma
+/// 0.45–1.00) moved into the crate, split by grapheme instead of `char` (a
+/// ZWJ emoji in a model id no longer gets one colour per scalar). llmux's
+/// render tick counter becomes the crate's time input here.
+fn gradient_t(frame: usize) -> Duration {
+    // Bounded like the old f32 phase so a long-lived TUI never overflows.
+    twolab_tui::gradient_text::TICK * ((frame % 1_000_000) as u32)
 }
 
-/// Rainbow mode: deterministic truecolor for `(frame, char_idx)` — R/G/B are
-/// the same sine offset by 0° / 120° / 240°, so the hue rotates while every
-/// channel stays inside the legible luma band.
-fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
-    let phase = gradient_phase(frame, char_idx, speed);
-    let chan = |offset: f32| -> u8 {
-        let raw = (phase + offset).sin() * 0.5 + 0.5; // 0.0..=1.0
-        let lit = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
-        (lit * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    Color::Rgb(
-        chan(0.0),
-        chan(std::f32::consts::TAU / 3.0),
-        chan(2.0 * std::f32::consts::TAU / 3.0),
+/// The colour of grapheme `char_idx` of a solid gradient on `base` at render
+/// tick `frame` (what [`model_name_spans`] draws), for tests.
+#[cfg(test)]
+fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize, speed: f32) -> Color {
+    use twolab_tui::gradient_text as gt;
+    gt::solid(
+        base,
+        gt::phase(char_idx, gradient_t(frame), speed),
+        gt::LUMA,
     )
 }
 
-/// Solid (단색) mode: scale a fixed base color by the sine luma factor — the
-/// hue is the group's, only its brightness breathes along the text.
-fn gradient_solid(base: (u8, u8, u8), frame: usize, char_idx: usize, speed: f32) -> Color {
-    let raw = gradient_phase(frame, char_idx, speed).sin() * 0.5 + 0.5; // 0.0..=1.0
-    let factor = GRADIENT_MIN_LUMA + raw * (GRADIENT_MAX_LUMA - GRADIENT_MIN_LUMA);
-    let scale = |c: u8| (f32::from(c) * factor).round().clamp(0.0, 255.0) as u8;
-    Color::Rgb(scale(base.0), scale(base.1), scale(base.2))
+/// The rainbow colour of grapheme `char_idx` at render tick `frame`, for tests.
+#[cfg(test)]
+fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
+    use twolab_tui::gradient_text as gt;
+    gt::rainbow(gt::phase(char_idx, gradient_t(frame), speed), gt::LUMA)
 }
 
 /// Solid-gradient base colors per headline family: truecolor anchors of the
@@ -9431,18 +9396,10 @@ fn model_name_spans(
     g: GradientCfg,
 ) -> Vec<Span<'static>> {
     match model_gradient_base(group, text, g) {
-        Some(base) if effects_on => text
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                Span::styled(
-                    c.to_string(),
-                    Style::new()
-                        .fg(gradient_solid(base, frame, i, g.speed))
-                        .add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect(),
+        Some(base) if effects_on => twolab_tui::gradient_text::GradientText::solid(text, base)
+            .speed(g.speed)
+            .at(gradient_t(frame))
+            .spans(),
         Some(_) => vec![Span::styled(
             text.to_string(),
             group_color(group).add_modifier(Modifier::BOLD),
@@ -9472,20 +9429,14 @@ fn effort_spans(
         )],
         // Config `tui_gradient.max_effort` swaps the rainbow for a solid
         // gradient on the chosen color (UI-8); default keeps the rainbow.
-        "max" if effects_on => effort
-            .chars()
-            .enumerate()
-            .map(|(i, c)| {
-                let color = match g.max_effort {
-                    Some(base) => gradient_solid(base, frame, i, g.speed),
-                    None => gradient_rainbow(frame, i, g.speed),
-                };
-                Span::styled(
-                    c.to_string(),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                )
-            })
-            .collect(),
+        "max" if effects_on => {
+            use twolab_tui::gradient_text::GradientText;
+            let text = match g.max_effort {
+                Some(base) => GradientText::solid(effort, base),
+                None => GradientText::rainbow(effort),
+            };
+            text.speed(g.speed).at(gradient_t(frame)).spans()
+        }
         "max" => vec![Span::styled(
             effort.to_string(),
             Style::new()
@@ -13712,9 +13663,10 @@ mod tests {
     #[test]
     fn gradient_speed_scales_the_temporal_drift(/* UI-8 */) {
         // Same frame, double speed ⇒ double the temporal phase advance.
-        let base = gradient_phase(10, 0, 1.0) - gradient_phase(0, 0, 1.0);
-        let fast = gradient_phase(10, 0, 2.0) - gradient_phase(0, 0, 2.0);
-        assert!((fast - 2.0 * base).abs() < 1e-4);
+        use twolab_tui::gradient_text::phase;
+        let base = phase(0, gradient_t(1), 1.0) - phase(0, gradient_t(0), 1.0);
+        let fast = phase(0, gradient_t(1), 2.0) - phase(0, gradient_t(0), 2.0);
+        assert!((fast - 2.0 * base).abs() < 1e-9);
         // And the configured base colors drive the solid gradient directly:
         // at any phase the scaled channels keep the base's ordering.
         let custom = GradientCfg::from_config(&crate::config::TuiGradient {
