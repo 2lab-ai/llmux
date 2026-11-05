@@ -46,6 +46,11 @@ Top to bottom, the dashboard is always: header, tab row, accounts, scheduler
 and detail, models, activity, the group settings line, the status line and
 the key bar. Numbers keep their usual format everywhere.
 
+With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
+dashboard draws no colour at all: every cell keeps your terminal's default
+colours, bold, dim, reversed and underline stay, and text that would be red
+(errors, failures, a nearly spent window) is bold instead.
+
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
   and column header). Activity takes every row that is left, and at least 4
@@ -697,7 +702,9 @@ the configured size/redaction limits.
   `save all` (`S`) write the body / the whole record JSON to `~/Downloads`
   (timestamped). Clipboard uses `pbcopy`/`wl-copy`/`xclip`/`xsel` when
   available, falling back to the OSC 52 terminal escape; the outcome
-  flashes on the modal's hint line.
+  flashes on the modal's hint line. Inside tmux or GNU screen the OSC 52
+  escape is wrapped in the multiplexer's passthrough so it reaches your
+  terminal (tmux 3.3 or later also needs `set -g allow-passthrough on`).
 - `Esc`/`q`/`Enter` closes. Records written by a daemon predating a field
   render it as "(not captured)"; passthrough records carry no upstream
   half by design.
