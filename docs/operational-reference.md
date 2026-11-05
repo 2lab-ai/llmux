@@ -46,6 +46,11 @@ Top to bottom, the dashboard is always: header, tab row, accounts, scheduler
 and detail, models, activity, the group settings line, the status line and
 the key bar. Numbers keep their usual format everywhere.
 
+The key bar at the bottom fits the terminal width: when it is too narrow for
+every hint, whole hints drop out (the least important first; `quit` and
+`back` stay longest) and the bar ends with `… +N more`, instead of the
+terminal cutting a hint in half.
+
 With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
 dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
