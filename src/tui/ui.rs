@@ -19480,8 +19480,13 @@ mod tests {
     /// bare, and the band's detail lines one row up with the sixth (mode)
     /// row keeping only its `│`. (origin/main still renders the old digest
     /// 6_597_409_346_785_969_346 from this fixture; the frame diff is PR #230
-    /// review evidence.)
-    const FOLD_OFF_179X43_DIGEST: u64 = 15_536_070_822_945_120_328;
+    /// review evidence.) Re-pinned 2026-11-05 when the spinner families moved
+    /// to twolab-tui: the cooldown clock, active pulse and filling-up breath
+    /// are braille now (`⠂` where `░` was in this frame), because `▌ ▀ ▄ █ ▒ ▓`
+    /// and the eighth blocks take two cells on a terminal that draws
+    /// East-Asian Ambiguous glyphs wide — the only change in the frame
+    /// (reverting the crate's glyph commit restores 15_536_070_822_945_120_328).
+    const FOLD_OFF_179X43_DIGEST: u64 = 6_181_608_817_893_489_260;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
