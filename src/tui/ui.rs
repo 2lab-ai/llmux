@@ -4213,79 +4213,18 @@ fn raw_header_lines(headers: Option<&[(String, String)]>) -> Vec<Line<'static>> 
 /// (escapes keep them single-line), so a per-line pass is lossless. Scanning
 /// is byte-based but only ever splits at ASCII bytes — always char-safe.
 fn highlight_json_line(line: &str) -> Line<'static> {
-    let bytes = line.as_bytes();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => i += 2,
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-                let end = i.min(bytes.len());
-                let is_key = line[end..].trim_start().starts_with(':');
-                let color = if is_key { Color::Cyan } else { Color::Green };
-                spans.push(Span::styled(
-                    line[start..end].to_string(),
-                    Style::new().fg(color),
-                ));
-            }
-            b'0'..=b'9' | b'-' => {
-                let start = i;
-                while i < bytes.len()
-                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-                {
-                    i += 1;
-                }
-                spans.push(Span::styled(
-                    line[start..i].to_string(),
-                    Style::new().fg(Color::Yellow),
-                ));
-            }
-            b't' | b'f' | b'n' => {
-                let rest = &line[i..];
-                match ["true", "false", "null"]
-                    .iter()
-                    .find(|k| rest.starts_with(*k))
-                {
-                    Some(k) => {
-                        spans.push(Span::styled(
-                            (*k).to_string(),
-                            Style::new().fg(Color::Magenta),
-                        ));
-                        i += k.len();
-                    }
-                    None => {
-                        spans.push(Span::raw(rest[..1].to_string()));
-                        i += 1;
-                    }
-                }
-            }
-            _ => {
-                // Whitespace, punctuation, and any non-ASCII bytes: batch until
-                // the next token start. ASCII stops are always char boundaries.
-                let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && !matches!(bytes[i], b'"' | b'0'..=b'9' | b'-' | b't' | b'f' | b'n')
-                {
-                    i += 1;
-                }
-                spans.push(Span::styled(line[start..i].to_string(), dim()));
-            }
-        }
-    }
-    Line::from(spans)
+    twolab_tui::json_view::json_line_with(line, &RAW_JSON_STYLES)
 }
+
+/// The raw viewer's JSON colours (keys cyan, strings green, numbers yellow,
+/// keywords magenta, punctuation dim), fed to twolab-tui's highlighter.
+const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view::JsonStyles {
+    key: Style::new().fg(Color::Cyan),
+    string: Style::new().fg(Color::Green),
+    number: Style::new().fg(Color::Yellow),
+    keyword: Style::new().fg(Color::Magenta),
+    punct: Style::new().fg(Color::DarkGray),
+};
 
 /// Hard-wrap a single logical line into `RAW_LINE_WRAP`-char chunks on char
 /// boundaries (continuation chunks lose highlighting context by design — they
