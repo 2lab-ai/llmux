@@ -2130,7 +2130,9 @@ impl App {
             self.overlay,
             Overlay::Keys | Overlay::Sessions | Overlay::Usage
         ) && self.mode == Mode::Normal
-            && self.keys.picker.is_none()
+            // The keys tab's model picker blocks its own table's bar only: a
+            // picker left open under another tab blocks nothing there.
+            && !(self.overlay == Overlay::Keys && self.keys.picker.is_some())
         {
             if let Some(changed) = self.table_scrollbar_mouse(&mouse, target, view) {
                 return changed;
@@ -9493,6 +9495,66 @@ mod tests {
             Some(&view),
         );
         assert_eq!(app.session_cursor, 60 - page, "the first row in view");
+    }
+
+    /// A keys model picker left open (and filtering) on the keys tab blocks
+    /// only that tab's table: under the sessions tab the scrollbar takes a
+    /// press as usual, and back on the keys tab the picker still holds it.
+    #[test]
+    fn a_keys_picker_left_open_does_not_block_another_tabs_scrollbar() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('/'), None);
+        assert!(app.keys.picker.as_ref().is_some_and(|p| p.filtering));
+        app.open_tab(Overlay::Sessions, Some(&view));
+        assert_eq!(app.overlay, Overlay::Sessions);
+        assert!(app.keys.picker.is_some(), "the picker stays open under it");
+        app.sessions_loading = false;
+        app.sessions = (0..60u64)
+            .map(|i| crate::session::Session {
+                user_id: Some(format!("u-{i:02}")),
+                requests: 1,
+                tokens_in: 1,
+                tokens_out: 1,
+                models: vec![],
+                accounts: vec![],
+                account_rotations: 0,
+                first_ms: i,
+                last_ms: i,
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
+                confidence: crate::session::Confidence::High,
+            })
+            .collect();
+        draw_and_adopt(&mut app, &view, 80, 24);
+        let bar = app.table_scroll.expect("60 sessions overflow");
+        let last = bar.track.bottom() - 1;
+        assert!(app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        ));
+        assert_eq!(app.session_cursor, 59, "the bar took the press");
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        // Back on the keys tab, its own bar is held while the picker is up.
+        app.overlay = Overlay::Keys;
+        app.table_scroll = Some(bar);
+        let before = app.keys.scroll;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        assert_eq!(app.keys.scroll, before, "the picker holds the keys bar");
     }
 
     /// The usage table scrolls by bucket while its scrollbar counts rows: a
