@@ -345,7 +345,9 @@ released for selecting; press v/Esc to return`; the status line above it
 keeps its message. While copy mode is on the screen holds still (it redraws
 only on a resize) and every key but `v`/`Esc` is ignored, so nothing moves
 under the selection; `v` or `Esc` takes the mouse back and the dashboard
-carries on where it was. `Ctrl-C` still quits.
+carries on where it was. Its clock stands still meanwhile, so a message card
+that was up (or arrived) during copy mode is still there to read on the way
+back. `Ctrl-C` still quits.
 
 ### Perf tab (observed performance)
 
