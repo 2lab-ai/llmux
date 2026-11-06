@@ -9280,6 +9280,49 @@ mod tests {
         assert!(app.pending_redemption.is_none());
     }
 
+    /// Only `1` / `y` spend a reset: Enter (the marked "Cancel"), `2`, Tab
+    /// and any other key close the gate with nothing queued (review of #233
+    /// — the remove gate had this pinned by key, the reset gate only by text).
+    #[test]
+    fn reset_gate_spends_only_on_1_or_y() {
+        let mut view = control_view();
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        let open = |app: &mut App| {
+            app.mode = Mode::Normal;
+            app.overlay = Overlay::Accounts;
+            app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+            let Mode::ConfirmReset { idx } = app.mode else {
+                panic!("expected the reset gate, got {:?}", app.mode);
+            };
+            idx
+        };
+        for cancel in [
+            KeyCode::Enter,
+            KeyCode::Char('2'),
+            KeyCode::Char('n'),
+            KeyCode::Tab,
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+        ] {
+            let mut app = remote_app();
+            let idx = open(&mut app);
+            app.on_key_confirm_reset(cancel, idx, Some(&view));
+            assert_eq!(app.mode, Mode::Normal, "{cancel:?} closes the gate");
+            assert_eq!(app.pending_control, None, "{cancel:?} spends nothing");
+            assert!(app.pending_redemption.is_none(), "{cancel:?} holds nothing");
+        }
+        for confirm in [KeyCode::Char('1'), KeyCode::Char('y')] {
+            let mut app = remote_app();
+            let idx = open(&mut app);
+            app.on_key_confirm_reset(confirm, idx, Some(&view));
+            assert!(
+                app.pending_control.is_some() || app.pending_redemption.is_some(),
+                "{confirm:?} spends one reset"
+            );
+        }
+    }
+
     /// A roster with no codex OR claude account cannot open the gate at all;
     /// a claude-only roster can (its grants are a reset entitlement too).
     #[test]
