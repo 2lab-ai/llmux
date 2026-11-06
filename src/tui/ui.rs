@@ -321,7 +321,7 @@ pub(crate) fn draw(
     // footer — same layering contract as the input modal (the two are never
     // open at once: each swallows the clicks that could open the other).
     if let Some(modal) = &chrome.raw_modal {
-        let raw_chrome = draw_raw_modal(frame, modal);
+        let raw_chrome = draw_raw_modal(frame, modal, chrome.clock, chrome.motion);
         if let Some(hits) = hits.as_mut() {
             hits.raw_modal = Some(raw_chrome);
         }
@@ -1439,12 +1439,16 @@ fn draw_sessions_overlay(
     // in rather than staring at a spinner. On reopen, a prior open's `sessions`
     // stay visible (with the loading title) until the first fresh partial lands.
     if chrome.sessions_loading && chrome.sessions.is_empty() {
-        let glyph = SpinnerKind::Braille.glyph(chrome.frame);
-        let loading = Paragraph::new(Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
-            Span::styled("loading sessions…", dim()),
-        ]))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
+        let glyph = SpinnerKind::Braille.glyph(loading_spin(chrome.frame, chrome.motion));
+        let mut spans = vec![Span::styled(format!("{glyph} "), KEYBAR_THEME.accent())];
+        spans.extend(loading_label(
+            "loading sessions…",
+            Style::new(),
+            chrome.clock.saturating_sub(chrome.sessions_since),
+            chrome.motion,
+        ));
+        let loading = Paragraph::new(Line::from(spans))
+            .block(Block::new().borders(Borders::TOP).title(" sessions "));
         frame.render_widget(loading, area);
         return;
     }
@@ -1552,13 +1556,23 @@ fn draw_sessions_table(
     // the growing table reads as "filling in", not stalled.
     let sort = chrome.session_sort.label();
     let title = if chrome.sessions_loading {
-        format!(
-            " sessions — {} of {total} — sort {sort} (o) — loading… {}% ",
-            cursor + 1,
-            chrome.sessions_pct
-        )
+        let mut spans = vec![Span::raw(format!(
+            " sessions — {} of {total} — sort {sort} (o) — ",
+            cursor + 1
+        ))];
+        spans.extend(loading_label(
+            "loading…",
+            Style::new(),
+            chrome.clock.saturating_sub(chrome.sessions_since),
+            chrome.motion,
+        ));
+        spans.push(Span::raw(format!(" {}% ", chrome.sessions_pct)));
+        Line::from(spans)
     } else {
-        format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
+        Line::from(format!(
+            " sessions — {} of {total} — sort {sort} (o) ",
+            cursor + 1
+        ))
     };
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
@@ -2555,11 +2569,21 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         .filter(|d| d.health.importing)
         .map(|d| format!(" · importing history {}%", d.health.import_pct))
         .unwrap_or_default();
-    let title = format!(
-        " keys — {issued} issued · window {} · {filter} · {matched} requests{}{importing} ",
+    // The title's `loading…` is the panel's live label (twolab-tui shimmer).
+    let mut title = vec![Span::raw(format!(
+        " keys — {issued} issued · window {} · {filter} · {matched} requests",
         panel.window.as_str(),
-        if panel.loading { " · loading…" } else { "" }
-    );
+    ))];
+    if panel.loading {
+        title.push(Span::raw(" · "));
+        title.extend(loading_label(
+            "loading…",
+            Style::new(),
+            chrome.clock.saturating_sub(panel.loading_since),
+            chrome.motion,
+        ));
+    }
+    title.push(Span::raw(format!("{importing} ")));
 
     // A failed or missing query NEVER renders as zeros: the panel says what it
     // could not answer (keys-history K-5).
@@ -2572,7 +2596,7 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
             )),
             Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
-        .block(Block::bordered().title(title));
+        .block(Block::bordered().title(Line::from(title)));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
         return;
@@ -2595,7 +2619,7 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
                 ),
             ])
         }
-        .block(Block::bordered().title(title));
+        .block(Block::bordered().title(Line::from(title)));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
         return;
@@ -2662,9 +2686,10 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
     } else {
         String::new()
     };
+    title.push(Span::raw(scrolled));
     let table = Table::new(table_rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::bordered().title(format!("{title}{scrolled}")));
+        .block(Block::bordered().title(Line::from(title)));
     frame.render_widget(table, area);
     draw_keys_picker(frame, area, panel);
 }
@@ -4871,7 +4896,14 @@ const RAW_KEYS: [(&str, &str); 9] = [
     ("esc", "close"),
 ];
 
-fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
+/// The raw request/response viewer (UI-7). `clock` and `motion` are the
+/// frame's [`Chrome`] values; they drive the Loading label's shimmer.
+fn draw_raw_modal(
+    frame: &mut Frame,
+    modal: &RawModal,
+    clock: Duration,
+    motion: twolab_tui::Motion,
+) -> RawModalChrome {
     let mut area = centered_rect(frame.area(), 94, 92);
     // Its bottom border carries the key legend: keep it above the two footer
     // rows (at 24 rows the footer used to cover it).
@@ -4991,16 +5023,16 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     };
     let content = match &modal.state {
         RawModalState::Loading => {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(
-                        " {} loading raw record…",
-                        SpinnerKind::Braille.glyph(modal.spin)
-                    ),
-                    Style::new().fg(Color::Yellow),
-                ))),
-                viewport,
-            );
+            let wait = Style::new().fg(KEYBAR_THEME.wait);
+            let glyph = SpinnerKind::Braille.glyph(loading_spin(modal.spin, motion));
+            let mut spans = vec![Span::styled(format!(" {glyph} "), wait)];
+            spans.extend(loading_label(
+                "loading raw record…",
+                wait,
+                clock.saturating_sub(modal.since),
+                motion,
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), viewport);
             return chrome;
         }
         RawModalState::Failed(msg) => {
@@ -10833,6 +10865,32 @@ const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
     ..twolab_tui::Theme::ansi()
 };
 
+/// A loading label (sessions, the keys title, the raw viewer) on twolab-tui's
+/// shimmer, `age` after it appeared: still for 600 ms — a load that ends
+/// sooner never sweeps — then a band passes across it every 4 s. On the
+/// dashboard's ANSI theme the band is weight only (dim at rest, bold at the
+/// crest) over `style`'s colour, so the `NO_COLOR` decolor pass keeps it.
+/// Plain bold under reduced motion. The text is `label`, unchanged.
+fn loading_label(
+    label: &str,
+    style: Style,
+    age: Duration,
+    motion: twolab_tui::Motion,
+) -> Vec<Span<'static>> {
+    twolab_tui::shimmer::Shimmer::new(label)
+        .style(style)
+        .spans_at(age, &KEYBAR_THEME.with_motion(motion))
+}
+
+/// The spinner frame beside a loading label: `frame`, or the first glyph held
+/// under reduced motion.
+fn loading_spin(frame: usize, motion: twolab_tui::Motion) -> usize {
+    match motion {
+        twolab_tui::Motion::Reduced => 0,
+        twolab_tui::Motion::Full => frame,
+    }
+}
+
 /// The option an account gate (remove / reset) keeps marked: Cancel, so
 /// Enter — like every key but `1` / `y` — never deletes or spends anything.
 pub(crate) const ACCOUNT_GATE_MARK: usize = 1;
@@ -12546,6 +12604,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: super::super::RawModalState::Failed("gone".into()),
         });
@@ -13008,6 +13067,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_loading: false,
             sessions_pct: 100,
+            sessions_since: Duration::ZERO,
             session_cursor: 0,
             session_sort: Default::default(),
             account_sort: Default::default(),
@@ -14493,6 +14553,196 @@ mod tests {
             !text.contains("loading…"),
             "loading title gone once the load is done"
         );
+    }
+
+    /// When the loading labels below began loading, on the dashboard clock.
+    /// Not zero, so a label swept from the dashboard's start would read apart.
+    const LOADING_SINCE: Duration = Duration::from_secs(5);
+
+    /// The cells that spell `label` on the first row that holds it (one cell
+    /// per char: the loading labels are narrow text), and that whole row.
+    fn label_cells(
+        buf: &ratatui::buffer::Buffer,
+        label: &str,
+    ) -> (Vec<ratatui::buffer::Cell>, Vec<ratatui::buffer::Cell>) {
+        let want: Vec<String> = label.chars().map(String::from).collect();
+        let n = want.len() as u16;
+        for y in 0..buf.area.height {
+            for x in 0..=buf.area.width.saturating_sub(n) {
+                if (0..n).all(|i| buf[(x + i, y)].symbol() == want[i as usize]) {
+                    let cells = (0..n).map(|i| buf[(x + i, y)].clone()).collect();
+                    let row = (0..buf.area.width).map(|c| buf[(c, y)].clone()).collect();
+                    return (cells, row);
+                }
+            }
+        }
+        panic!("{label:?} is not on screen");
+    }
+
+    /// A loading label on the twolab-tui shimmer, drawn by `at(age, motion)`
+    /// `age` after its load began: dim and still at first (a load that ends
+    /// within 600 ms never sweeps), a band 1.1 s in — a bold crest between
+    /// dim cells, also once `NO_COLOR`'s decolor pass has run — and under
+    /// reduced motion plain bold with its row (spinner included) the same
+    /// at every moment. Returns the mid-sweep frame.
+    fn assert_loading_label_shimmers(
+        label: &str,
+        at: impl Fn(Duration, twolab_tui::Motion) -> ratatui::buffer::Buffer,
+    ) -> ratatui::buffer::Buffer {
+        use twolab_tui::Motion;
+        let (rest, _) = label_cells(&at(Duration::ZERO, Motion::Full), label);
+        assert!(
+            rest.iter()
+                .all(|c| c.modifier.contains(Modifier::DIM) && !c.modifier.contains(Modifier::BOLD)),
+            "{label} at rest: {rest:?}"
+        );
+        let mid = at(Duration::from_millis(1_100), Motion::Full);
+        let mut decolored = mid.clone();
+        twolab_tui::theme::decolor(&mut decolored);
+        for buf in [&mid, &decolored] {
+            let (cells, _) = label_cells(buf, label);
+            let bold = cells
+                .iter()
+                .filter(|c| c.modifier.contains(Modifier::BOLD))
+                .count();
+            let dim = cells
+                .iter()
+                .filter(|c| c.modifier.contains(Modifier::DIM))
+                .count();
+            assert!(bold > 0 && dim > 0, "a band across {label}: {cells:?}");
+        }
+        let still: Vec<_> = [0u64, 1_100, 4_000]
+            .iter()
+            .map(|&ms| {
+                let (cells, row) =
+                    label_cells(&at(Duration::from_millis(ms), Motion::Reduced), label);
+                assert!(
+                    cells.iter().all(|c| c.modifier.contains(Modifier::BOLD)
+                        && !c.modifier.contains(Modifier::DIM)),
+                    "{label} plain bold under reduced motion: {cells:?}"
+                );
+                row
+            })
+            .collect();
+        assert!(
+            still.iter().all(|r| r == &still[0]),
+            "{label} holds still under reduced motion"
+        );
+        mid
+    }
+
+    /// The sessions overlay's loading labels shimmer from when the load
+    /// began: the spinner's `loading sessions…` while nothing has arrived,
+    /// then the title's `loading…` before ` N%` while the table fills — at
+    /// 80×24 and 179×43, the text unchanged. Under reduced motion the label
+    /// is plain bold and the spinner holds its first glyph.
+    #[test]
+    fn sessions_loading_labels_shimmer_from_when_the_load_began() {
+        let view = view_with(Vec::new());
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for filling in [false, true] {
+                let at = |age: Duration, motion| {
+                    let mut chrome = chrome_overlay(Overlay::Sessions);
+                    chrome.sessions_loading = true;
+                    chrome.sessions_since = LOADING_SINCE;
+                    chrome.clock = LOADING_SINCE + age;
+                    // The shared tick turns the spinner.
+                    chrome.frame = (age.as_millis() / 80) as usize;
+                    chrome.motion = motion;
+                    if filling {
+                        chrome.sessions = vec![one_session()];
+                        chrome.sessions_pct = 42;
+                    }
+                    render_buffer(&view, &chrome, w, h)
+                };
+                let label = if filling {
+                    "loading…"
+                } else {
+                    "loading sessions…"
+                };
+                let mid = assert_loading_label_shimmers(label, at);
+                let (_, row) = label_cells(&mid, label);
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                let want = if filling {
+                    "(o) — loading… 42% "
+                } else {
+                    " loading sessions…"
+                };
+                assert!(text.contains(want), "{w}x{h}: {text:?}");
+            }
+        }
+    }
+
+    /// The keys panel's title says `· loading…` with a shimmer band while a
+    /// query is in flight — on the first load (no rows yet) and on a refresh
+    /// over the table — swept from when the panel started loading, at 80×24
+    /// and 179×43; plain bold under reduced motion.
+    #[test]
+    fn keys_title_loading_shimmers_while_a_query_is_in_flight() {
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for refresh in [false, true] {
+                let at = |age: Duration, motion| {
+                    let base = if refresh {
+                        loaded_panel()
+                    } else {
+                        crate::tui::KeysPanel::default()
+                    };
+                    let mut chrome = keys_chrome(crate::tui::KeysPanel {
+                        loading: true,
+                        loading_since: LOADING_SINCE,
+                        ..base
+                    });
+                    chrome.clock = LOADING_SINCE + age;
+                    chrome.motion = motion;
+                    let view = if refresh {
+                        keys_view()
+                    } else {
+                        view_with(Vec::new())
+                    };
+                    render_buffer(&view, &chrome, w, h)
+                };
+                let mid = assert_loading_label_shimmers("loading…", at);
+                let (_, row) = label_cells(&mid, "loading…");
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                assert!(text.contains(" requests · loading… "), "{w}x{h}: {text:?}");
+            }
+        }
+    }
+
+    /// The raw viewer's `loading raw record…` line shimmers from when the
+    /// viewer opened, in the wait colour, at 80×24 and 179×43; under reduced
+    /// motion it is plain bold and its spinner holds its first glyph.
+    #[test]
+    fn raw_viewer_loading_line_shimmers_from_when_it_opened() {
+        let view = usage_control_view();
+        let entry = completed_request(7_000, Some("claude"), Some("claude-opus-4-8"), 1, 1, 200);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let at = |age: Duration, motion| {
+                let mut chrome = chrome_overlay(Overlay::None);
+                chrome.raw_modal = Some(super::super::RawModal {
+                    key: key_of(&entry),
+                    id: 1,
+                    generation: 1,
+                    title: "raw".into(),
+                    tab: 0,
+                    scroll: 0,
+                    hscroll: 0,
+                    spin: (age.as_millis() / 80) as usize,
+                    since: LOADING_SINCE,
+                    flash: None,
+                    state: super::super::RawModalState::Loading,
+                });
+                chrome.clock = LOADING_SINCE + age;
+                chrome.motion = motion;
+                render_buffer(&view, &chrome, w, h)
+            };
+            let mid = assert_loading_label_shimmers("loading raw record…", at);
+            let (cells, _) = label_cells(&mid, "loading raw record…");
+            assert!(
+                cells.iter().all(|c| c.fg == KEYBAR_THEME.wait),
+                "{w}x{h}: the band keeps the wait colour: {cells:?}"
+            );
+        }
     }
 
     /// Issue #5 acceptance: local and attach render IDENTICALLY from the same
