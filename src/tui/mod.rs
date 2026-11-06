@@ -1964,6 +1964,12 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
+        // Copy mode has handed the mouse to the terminal: an event already
+        // queued behind the `v` in the same input drain (a click, the wheel)
+        // is swallowed, so nothing opens or scrolls under the selection.
+        if self.copy_mode {
+            return false;
+        }
         // What the last frame drew under the pointer, topmost first — the one
         // lookup every click below matches on. Open modals, the menu and
         // the current surface still decide who gets the event at all.
@@ -8600,6 +8606,59 @@ mod tests {
             &mut dirty,
         );
         assert!(dirty && !app.copy_mode, "leaving does");
+    }
+
+    /// Mouse events already queued behind the `v` in the same input drain
+    /// (the terminal sent them before it saw capture go off) are swallowed:
+    /// a click on an accounts row opens no modal, the wheel scrolls nothing,
+    /// and neither asks for a frame.
+    #[test]
+    fn copy_mode_swallows_the_mouse_events_queued_behind_the_v() {
+        let view = control_view();
+        let mut app = remote_app();
+        draw_and_adopt(&mut app, &view, 179, 43);
+        let (row, _) = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::AccountRow(_)))
+            .expect("an accounts row is drawn");
+        let (x, y) = (row.x + 1, row.y);
+        let (mut drain, mut dirty) = (Some(Some(control_view())), false);
+        apply_event(
+            &mut app,
+            Event::Key(press(KeyCode::Char('v'))),
+            &mut drain,
+            &mut dirty,
+        );
+        assert!(app.copy_mode);
+        dirty = false;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            apply_event(
+                &mut app,
+                Event::Mouse(mouse(kind, x, y)),
+                &mut drain,
+                &mut dirty,
+            );
+        }
+        assert!(app.account_modal.is_none(), "no modal opened");
+        assert_eq!(app.mode, Mode::Normal, "no menu opened");
+        assert_eq!(app.activity_scroll, 0, "nothing scrolled");
+        assert!(!dirty, "and no frame is asked for");
+        // Back out of copy mode, the same click opens the row.
+        app.on_key(press(KeyCode::Char('v')), Some(&view));
+        apply_event(
+            &mut app,
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+            &mut drain,
+            &mut dirty,
+        );
+        assert!(app.account_modal.is_some(), "{dirty}");
     }
 
     /// A drag across the Logs pager (80x24) selects from the press to the
