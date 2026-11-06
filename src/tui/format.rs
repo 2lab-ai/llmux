@@ -71,36 +71,20 @@ pub(crate) fn countdown_units(remaining: Duration) -> (String, Option<String>) {
     }
 }
 
-/// Fixed-width utilization bar, e.g. `▰▰▰▱▱▱▱▱` (utilization clamped 0..=1).
-pub(crate) fn gauge_bar(utilization: f64, width: usize) -> String {
-    let clamped = utilization.clamp(0.0, 1.0);
-    // Round so 0 < utilization is visible only from ~half a cell up; full
-    // width strictly at 100%.
-    let filled = ((clamped * width as f64).round() as usize).min(width);
-    let mut bar = String::with_capacity(width * 3);
-    for _ in 0..filled {
-        bar.push('▰');
-    }
-    for _ in filled..width {
-        bar.push('▱');
-    }
-    bar
-}
-
-/// Whole-number percentage label: "42%".
+/// Whole-number percentage label: "42%", clamped to 0–100. A non-finite
+/// utilization (a share of nothing) reads `—`, never `NaN%`. twolab-tui's
+/// [`twolab_tui::format::percent`].
 pub(crate) fn percent(utilization: f64) -> String {
-    format!("{:.0}%", utilization.clamp(0.0, 1.0) * 100.0)
+    twolab_tui::format::percent(utilization)
 }
 
-/// Humanized count for the totals column: "999", "1.2k", "3.4M".
+/// Humanized count in at most six cells: "999", "1.2k", "3.4M", "243.6G",
+/// up through T/P/E. A value that would round to `1000.0` of one unit moves
+/// to the next (`999_999` → `1.0M`), so the unit is never pushed out of a
+/// fixed column (the models table used to show a clipped `243578.5`).
+/// twolab-tui's [`twolab_tui::format::human_count`].
 pub(crate) fn human_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
+    twolab_tui::format::human_count(n)
 }
 
 /// Single largest-unit age for "refreshed N ago" markers: "42s", "3m",
@@ -415,20 +399,16 @@ mod tests {
     // ---- bar / labels ----
 
     #[test]
-    fn gauge_bar_fills_proportionally_and_clamps() {
-        assert_eq!(gauge_bar(0.0, 4), "▱▱▱▱");
-        assert_eq!(gauge_bar(0.5, 4), "▰▰▱▱");
-        assert_eq!(gauge_bar(1.0, 4), "▰▰▰▰");
-        assert_eq!(gauge_bar(7.0, 4), "▰▰▰▰", "clamped above 1.0");
-        assert_eq!(gauge_bar(-1.0, 4), "▱▱▱▱", "clamped below 0.0");
-        assert_eq!(gauge_bar(0.5, 0), "", "zero width degrades to empty");
-    }
-
-    #[test]
     fn percent_rounds_and_clamps() {
         assert_eq!(percent(0.42), "42%");
         assert_eq!(percent(0.999), "100%");
         assert_eq!(percent(2.0), "100%");
+    }
+
+    #[test]
+    fn percent_of_an_uncomputable_share_reads_a_dash() {
+        assert_eq!(percent(f64::NAN), "—");
+        assert_eq!(percent(f64::INFINITY), "—");
     }
 
     #[test]
@@ -438,6 +418,18 @@ mod tests {
         assert_eq!(human_count(1_200), "1.2k");
         assert_eq!(human_count(999_949), "999.9k");
         assert_eq!(human_count(3_400_000), "3.4M");
+    }
+
+    /// Billions keep their unit inside a six-cell column, and a carry moves
+    /// up a unit instead of reading `1000.0k`.
+    #[test]
+    fn human_count_steps_past_millions_and_carries_into_the_next_unit() {
+        assert_eq!(human_count(243_578_500_000), "243.6G");
+        assert_eq!(human_count(5_036_900_000), "5.0G");
+        assert_eq!(human_count(2_500_000_000_000), "2.5T");
+        assert_eq!(human_count(999_999), "1.0M");
+        assert_eq!(human_count(999_950_000), "1.0G");
+        assert!(human_count(u64::MAX).chars().count() <= 6);
     }
 
     // ---- refreshed-ago marker (token column / status line) ----

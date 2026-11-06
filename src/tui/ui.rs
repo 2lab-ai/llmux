@@ -102,6 +102,16 @@ fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
+/// `value`'s share of `max` as a twolab-tui mini bar (`▰▰▰▱▱▱`, empty cells
+/// dim) `width` cells wide. With nothing to compare against — `max` zero,
+/// every row empty — the share cannot be computed and the bar reads `—`
+/// instead of an empty bar that looks like 0 %.
+fn share_bar(value: u64, max: u64, width: usize) -> twolab_tui::mini_bar::MiniBar {
+    twolab_tui::mini_bar::MiniBar::new(value as f64, max as f64)
+        .width(u16::try_from(width).unwrap_or(u16::MAX))
+        .theme(KEYBAR_THEME)
+}
+
 /// `text` clipped with `…` to at most `max` display cells (twolab-tui
 /// `text::truncate`, owned for the call sites that keep the string).
 fn truncate_cells(text: &str, max: usize) -> String {
@@ -138,6 +148,24 @@ fn format_cost(usd: f64) -> String {
     } else {
         format!("${usd:.4}")
     }
+}
+
+/// Cells of a ledger cost column (models strip and table, keys panel): the
+/// `$`, a `999,999` integer part and a `.0000` fraction — twolab-tui's
+/// `Amount::width`, so no amount up to $999,999.99 loses a digit (the
+/// 9-cell column cut `$112293.04` to `$112293.0`).
+const COST_COL_WIDTH: u16 =
+    (1 + twolab_tui::ledger::INT_WIDTH + twolab_tui::ledger::FRAC_WIDTH) as u16;
+
+/// A cost on twolab-tui's ledger: the decimal point in one column for every
+/// row, dollars at the row's weight, cents a tier dimmer, the `$` quietest,
+/// and `—` where the ones digit would be when the cost is unknown. A
+/// [`twolab_tui::ledger::Tier::Detail`] row (a per-model line under a total)
+/// is one tier dimmer throughout.
+fn cost_amount(usd: Option<f64>, tier: twolab_tui::ledger::Tier) -> twolab_tui::ledger::Amount {
+    twolab_tui::ledger::Amount::new(usd)
+        .tier(tier)
+        .theme(KEYBAR_THEME)
 }
 
 /// Everything a row/pane needs that is derived once per frame.
@@ -265,7 +293,12 @@ pub(crate) fn draw(
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
-        Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
+        Overlay::Logs => {
+            let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.logs = Some(pos);
+            }
+        }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
@@ -278,9 +311,9 @@ pub(crate) fn draw(
     // when the entry aged out) rides back on the hit record so the runtime can
     // clamp/close. Drawn before the footer so the `q`/`esc` hint stays visible.
     if let Some(modal) = &chrome.input_modal {
-        let max_scroll = draw_input_modal(frame, view, modal);
+        let layout = draw_input_modal(frame, view, modal);
         if let Some(hits) = hits.as_mut() {
-            hits.input_modal_max_scroll = max_scroll;
+            hits.input_modal = layout;
         }
     }
 
@@ -299,9 +332,9 @@ pub(crate) fn draw(
     // max-scroll (or the close signal for a vanished account) riding back on
     // the hit record.
     if let Some(modal) = &chrome.account_modal {
-        let max_scroll = draw_account_modal(frame, view, &ctx, chrome, modal);
+        let layout = draw_account_modal(frame, view, &ctx, chrome, modal);
         if let Some(hits) = hits.as_mut() {
-            hits.account_modal_max_scroll = max_scroll;
+            hits.account_modal = layout;
         }
     }
 
@@ -517,8 +550,9 @@ fn draw_main(
         config_rows: Vec::new(),
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
-        input_modal_max_scroll: None,
-        account_modal_max_scroll: None,
+        input_modal: None,
+        account_modal: None,
+        logs: None,
         raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
@@ -1320,10 +1354,62 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
-fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
+/// Logs overlay (`l`): the whole log ring in a twolab-tui
+/// [`Pager`](twolab_tui::pager::Pager) — long lines wrap, `~` past the end,
+/// the bottom rule says how far down the view is (`NN%`). It follows new
+/// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
+/// once scrolled back. Returns where it drew, so the runtime can turn the
+/// next key or wheel step into a row offset.
+fn draw_logs_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> twolab_tui::scrollbar::ScrollPos {
+    use twolab_tui::pager::Pager;
+    use twolab_tui::scrollbar::ScrollPos;
+
     frame.render_widget(Clear, area);
-    draw_logs(frame, area, view);
+    let lines: Vec<Line<'static>> = if view.logs.is_empty() {
+        // Say so instead of a blank pane (the same in attach mode, where the
+        // lines come from the daemon's document).
+        vec![
+            Line::from(Span::styled(" no log lines yet", dim())),
+            Line::from(Span::styled(
+                " new lines appear here as the daemon logs them",
+                dim(),
+            )),
+        ]
+    } else {
+        view.logs
+            .iter()
+            .map(|line| log_line(line, view.email_anonymous))
+            .collect()
+    };
+    let n = view.logs.len();
+    let count = if n == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{n} lines")
+    };
+    let title = match chrome.logs_scroll {
+        _ if n == 0 => "logs".to_string(),
+        None => format!("logs · {count} · following"),
+        Some(_) => format!("logs · {count} · scrolled back — End follows"),
+    };
+    let pager = Pager::new(title, lines)
+        .hints(false)
+        .theme(KEYBAR_THEME)
+        .scroll_to(chrome.logs_scroll.unwrap_or(usize::MAX));
+    frame.render_widget(&pager, area);
+    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
+    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
+    let view_h = area.height.saturating_sub(chrome_rows) as usize;
+    ScrollPos::of(
+        pager.content_height(area.width),
+        view_h,
+        pager.scroll_offset(),
+    )
 }
 
 /// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
@@ -2156,10 +2242,14 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
 /// key / builtin bucket, or one of its per-model breakdown rows. Built ONCE
 /// per frame and shared by the renderer and the scroll handler, so "how many
 /// rows can I scroll through" and "what is drawn" can never disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KeysRow {
-    /// Display cells, in header order.
+    /// Display cells, in header order. The `cost` cell is drawn from
+    /// [`KeysRow::cost`] on the ledger; its text here is empty.
     pub cells: Vec<String>,
+    /// The row's API-equivalent cost; `None` (a key with no usage in the
+    /// window) reads `—`.
+    pub cost: Option<f64>,
     pub kind: KeysRowKind,
 }
 
@@ -2258,7 +2348,7 @@ pub(crate) const KEYS_COLUMNS: [KeysColumn; 10] = [
     },
     KeysColumn {
         header: "cost",
-        width: 9,
+        width: COST_COL_WIDTH,
         shed: 5,
     },
     KeysColumn {
@@ -2350,9 +2440,10 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                     String::new(),
                     format::human_count(m.tokens_in),
                     format::human_count(m.tokens_out),
-                    format!("${:.2}", m.cost_usd),
+                    String::new(),
                     String::new(),
                 ],
+                cost: Some(m.cost_usd),
                 kind: KeysRowKind::Model,
             });
         }
@@ -2384,15 +2475,13 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                 },
                 format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0)),
                 format::human_count(usage.map(|t| t.tokens_out).unwrap_or(0)),
-                match usage {
-                    Some(t) => format!("${:.2}", t.cost_usd),
-                    None => "—".into(),
-                },
+                String::new(),
                 match usage {
                     Some(t) => span_label(t.first_ms, t.last_ms),
                     None => "never".into(),
                 },
             ],
+            cost: usage.map(|t| t.cost_usd),
             kind: KeysRowKind::Key(state),
         });
         push_models(&mut rows, usage);
@@ -2413,9 +2502,10 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                 format!("{}/{}", t.ok, t.errors),
                 format::human_count(t.tokens_in),
                 format::human_count(t.tokens_out),
-                format!("${:.2}", t.cost_usd),
+                String::new(),
                 span_label(t.first_ms, t.last_ms),
             ],
+            cost: Some(t.cost_usd),
             kind: KeysRowKind::Builtin,
         });
         push_models(&mut rows, Some(t));
@@ -2526,6 +2616,18 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
                             (KeysRowKind::Key(state), "state") => Cell::from(Line::from(
                                 Span::styled(text, Style::new().fg(state.color())),
                             )),
+                            // Cost on the ledger; a model row one tier dimmer.
+                            (kind, "cost") => Cell::from(
+                                cost_amount(
+                                    row.cost,
+                                    if kind == KeysRowKind::Model {
+                                        twolab_tui::ledger::Tier::Detail
+                                    } else {
+                                        twolab_tui::ledger::Tier::Total
+                                    },
+                                )
+                                .line(),
+                            ),
                             _ => Cell::from(text),
                         }
                     })
@@ -3628,15 +3730,33 @@ fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     }
 }
 
-/// Draw the click-opened input-text modal (UI-6 item 3): a centered, bordered,
-/// scrollable box showing an entry's FULL stored excerpt. The content is looked
-/// up from `view.completed` by the modal's stable key EVERY frame, so it renders
-/// identically in local and attach mode and needs no extra wire field. Returns
-/// `Some(max_scroll)` (wrapped line count minus the visible inner height) when
-/// the entry was found and drawn, or `None` when it has aged out of the ring —
-/// the caller then closes the modal. `Clear` blanks the rect first, so nothing
-/// beneath shows through.
-fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal) -> Option<u16> {
+/// The keys every scrolling text modal takes, as its footer shows them; the
+/// title row carries the `esc close` button.
+fn modal_scroll_hints() -> twolab_tui::key_hints::KeyHints<'static> {
+    twolab_tui::key_hints::KeyHints::new([
+        key_hint("↑↓/j k", "scroll"),
+        key_hint("PgUp/PgDn", "page"),
+        key_hint("Home/End", "ends"),
+    ])
+    .no_more()
+}
+
+/// Draw the click-opened input-text modal (UI-6 item 3): a twolab-tui
+/// [`Modal`](twolab_tui::modal::Modal) showing an entry's FULL stored
+/// excerpt, sized to the text up to 80% × 80% of the screen; a body taller
+/// than that scrolls with the library's scrollbar and the border says which
+/// rows are in view. The content is looked up from `view.completed` by the
+/// modal's stable key EVERY frame, so it renders identically in local and
+/// attach mode and needs no extra wire field. Returns where the modal drew
+/// (its scroll range and scrollbar track, for the runtime's keys and mouse)
+/// when the entry was found, or `None` when it has aged out of the ring —
+/// the caller then closes the modal.
+fn draw_input_modal(
+    frame: &mut Frame,
+    view: &DashboardView,
+    modal: &InputModal,
+) -> Option<twolab_tui::modal::ModalLayout> {
+    use twolab_tui::modal::{Modal, PopupSize};
     // Look up the clicked entry by its stable key; a miss = it aged out → close.
     let entry = view
         .completed
@@ -3647,37 +3767,24 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
     };
     let excerpt = excerpt.as_deref()?;
 
-    let area = centered_rect(frame.area(), 80, 80);
-    frame.render_widget(Clear, area);
-
     let title = format!(
-        " 🔍 input — {} · {} ",
+        "🔍 input — {} · {}",
         kind.as_deref().unwrap_or("?"),
         format::clock_hms_utc(entry.at),
     );
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(dim())
-        .title(Span::styled(
-            title,
-            Style::new().add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
-    let inner = block.inner(area);
-
-    // Wrap-safe text (a 2-cell U+3000 space can make ratatui 0.30's wrapper
-    // overrun the area): count and draw the same string.
-    let text = cells::wrap_safe(&masked_text(excerpt, view.email_anonymous)).into_owned();
-    let total = cells::wrapped_rows(&text, inner.width) as u16;
-    let max_scroll = total.saturating_sub(inner.height);
-    let scroll = modal.scroll.min(max_scroll);
-
-    let para = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(para, area);
-    Some(max_scroll)
+    let text = masked_text(excerpt, view.email_anonymous);
+    let body: Vec<Line<'static>> = text
+        .split('\n')
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+    let popup = Modal::new(title)
+        .body(body)
+        .footer(modal_scroll_hints())
+        .fit_content(PopupSize::Percent(80), PopupSize::Percent(80))
+        .theme(KEYBAR_THEME);
+    let mut state = modal.state.clone();
+    let area = frame.area();
+    Some(popup.render(area, frame.buffer_mut(), &mut state))
 }
 
 /// One section header inside the account modal: dim + bold, flush left, so the
@@ -3690,27 +3797,90 @@ fn modal_section(name: &str) -> Line<'static> {
     ))
 }
 
-/// One `label  value` row inside the account modal. Unknown/absent values are
-/// the caller's `—`, never an invented zero.
-fn modal_row(label: &str, value: String) -> Line<'static> {
-    modal_row_spans(label, vec![Span::raw(value)])
+/// One row of the account modal's body, before it is laid out for a width.
+enum ModalRow {
+    /// A section header ([`modal_section`]).
+    Section(&'static str),
+    /// `label: value`; a long value wraps under the value column. An empty
+    /// value reads `—`.
+    Field(String, String),
+    /// `label: value` with a value styled by the caller (status verdicts,
+    /// token health), on one row.
+    Styled(String, Vec<Span<'static>>),
+    /// A quota window: a bar of what is left, the reset beside it.
+    Limit(String, twolab_tui::status_card::Limit<'static>),
+    /// A line as it is (the authentication history).
+    Plain(Line<'static>),
 }
 
-/// [`modal_row`] with a pre-styled value (status verdicts, token health).
-fn modal_row_spans(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!(" {label:<10}"), dim())];
-    spans.extend(value);
-    Line::from(spans)
+impl ModalRow {
+    fn field(label: &str, value: String) -> ModalRow {
+        ModalRow::Field(label.to_string(), value)
+    }
+
+    fn styled(label: &str, value: Vec<Span<'static>>) -> ModalRow {
+        ModalRow::Styled(label.to_string(), value)
+    }
+}
+
+/// The account modal's rows laid out `width` cells wide by one twolab-tui
+/// [`StatusCard`](twolab_tui::status_card::StatusCard): every label in one
+/// dim column, every value in the next, long values wrapped under it. The
+/// rows the card does not draw (headers, styled values, history lines) hold
+/// a blank card row each — the only blank rows a card emits — and are put
+/// in its place, a styled value after a label padded to the card's column.
+fn modal_rows_lines(rows: Vec<ModalRow>, width: u16) -> Vec<Line<'static>> {
+    use twolab_tui::status_card::StatusCard;
+    const INDENT: usize = 1;
+    let mut card = StatusCard::new().indent(INDENT).theme(KEYBAR_THEME);
+    for row in &rows {
+        card = match row {
+            ModalRow::Field(label, value) => card.field(label.clone(), value.clone()),
+            ModalRow::Limit(label, limit) => card.limit(label.clone(), limit.clone()),
+            ModalRow::Section(_) | ModalRow::Styled(..) | ModalRow::Plain(_) => card.gap(),
+        };
+    }
+    let offset = card.value_offset();
+    let mut own = rows.into_iter().filter_map(|row| match row {
+        ModalRow::Section(name) => Some(modal_section(name)),
+        ModalRow::Styled(label, value) => {
+            let pad = offset
+                .saturating_sub(INDENT + cells::width(&label) + 1)
+                .max(1);
+            let mut spans = vec![Span::styled(
+                format!("{}{label}:{}", " ".repeat(INDENT), " ".repeat(pad)),
+                dim(),
+            )];
+            spans.extend(value);
+            Some(Line::from(spans))
+        }
+        ModalRow::Plain(line) => Some(line),
+        ModalRow::Field(..) | ModalRow::Limit(..) => None,
+    });
+    card.lines(width)
+        .into_iter()
+        .map(|line| {
+            if line.spans.is_empty() {
+                own.next().unwrap_or_default()
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 /// Body of the account detail modal (.prd/19 rule 7): EVERY per-account datum
 /// the view holds, in labeled sections. Split out of [`draw_account_modal`] so
 /// the assembly stays testable as data and the draw function stays layout-only.
+/// `width` is the body's text width: the quota windows are a twolab-tui
+/// [`StatusCard`](twolab_tui::status_card::StatusCard) laid out for it (a
+/// bar of what is left per window, the reset beside it or under it).
 fn account_modal_lines(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     account: &AccountSnapshot,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -3747,16 +3917,19 @@ fn account_modal_lines(
         Err(_) => format!("ahead ({})", abs(at)),
     };
     let yes_no = |b: bool| if b { "yes" } else { "no" };
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<ModalRow> = Vec::new();
 
     // --- identity ----------------------------------------------------------
     let pos = ctx
         .order
         .iter()
         .position(|&i| snapshot.accounts[i].id == account.id);
-    lines.push(modal_section("identity"));
-    lines.push(modal_row("name", masked_name(&account.id.0, ctx.mask)));
-    lines.push(modal_row(
+    rows.push(ModalRow::Section("identity"));
+    rows.push(ModalRow::field(
+        "name",
+        masked_name(&account.id.0, ctx.mask),
+    ));
+    rows.push(ModalRow::field(
         "auth",
         format!(
             "{} · group {} · healthy {} · paused {} · urgent {}",
@@ -3767,7 +3940,7 @@ fn account_modal_lines(
             yes_no(triage::urgent(account, gate)),
         ),
     ));
-    lines.push(modal_row(
+    rows.push(ModalRow::field(
         "order",
         match pos {
             Some(pos) => format!(
@@ -3781,8 +3954,8 @@ fn account_modal_lines(
     ));
 
     // --- status / gate -----------------------------------------------------
-    lines.push(modal_section("status"));
-    lines.push(modal_row_spans(
+    rows.push(ModalRow::Section("status"));
+    rows.push(ModalRow::styled(
         "gate",
         vec![status_span(
             account,
@@ -3794,7 +3967,7 @@ fn account_modal_lines(
         )],
     ));
     if let Some(reason) = gate {
-        lines.push(modal_row(
+        rows.push(ModalRow::field(
             "blocked",
             select::blocking_reason(account, reason, params, now),
         ));
@@ -3803,7 +3976,7 @@ fn account_modal_lines(
         // Why a heuristic-parked account above still reads `ready`: the whole
         // group is heuristic-locked, so the selector drops that cooldown gate.
         // The `cooldown` section below still prints the park itself.
-        lines.push(modal_row(
+        rows.push(ModalRow::field(
             "degraded",
             "group heuristic lockout — cooldown gate dropped for this group".to_string(),
         ));
@@ -3827,7 +4000,7 @@ fn account_modal_lines(
         .find(|(_, pin)| pin.account == account.id)
         .map(|(group, pin)| format!("{} {}", group.as_str(), until(pin.until)))
         .unwrap_or_else(|| dash.clone());
-    lines.push(modal_row(
+    rows.push(ModalRow::field(
         "current",
         format!(
             "{} · fable {} · pin {pin}",
@@ -3835,16 +4008,16 @@ fn account_modal_lines(
             groups_for(&snapshot.fable_current),
         ),
     ));
-    lines.push(modal_row("in-flight", account.in_flight.to_string()));
+    rows.push(ModalRow::field("in-flight", account.in_flight.to_string()));
 
     // --- token -------------------------------------------------------------
     // Timestamps and counts only: no credential byte ever reaches this modal.
-    lines.push(modal_section("token"));
-    lines.push(modal_row_spans(
+    rows.push(ModalRow::Section("token"));
+    rows.push(ModalRow::styled(
         "token",
         token_detail_spans(account, view.refresh_ahead, now, ctx.tz_offset),
     ));
-    lines.push(modal_row(
+    rows.push(ModalRow::field(
         "stamps",
         format!(
             "expires_at {} · last_refresh {}",
@@ -3865,8 +4038,12 @@ fn account_modal_lines(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if !history.is_empty() {
-        lines.push(modal_section("authentication / usage history"));
-        lines.extend(auth_history_lines(history, ctx.tz_offset));
+        rows.push(ModalRow::Section("authentication / usage history"));
+        rows.extend(
+            auth_history_lines(history, ctx.tz_offset)
+                .into_iter()
+                .map(ModalRow::Plain),
+        );
     }
 
     // --- 7d window ----------------------------------------------------------
@@ -3875,65 +4052,67 @@ fn account_modal_lines(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let raw_window = |window: &Option<QuotaWindow>| match window {
-        None => format!(
-            "{dash} · state {}",
-            classify_window_display(window, now, max_age, consecutive_failures).label()
-        ),
-        Some(w) => format!(
-            "util {:.3} · eff {:.3} · resets {} · fetched {} · {} · expired {} · state {}",
-            w.utilization,
-            w.effective_utilization(now),
-            abs(w.resets_at),
-            ago(w.fetched_at),
-            match w.source {
-                crate::scheduler::window::WindowSource::Headers => "headers",
-                crate::scheduler::window::WindowSource::UsagePoll => "poll",
-            },
-            yes_no(w.is_expired(now)),
-            classify_window_display(window, now, max_age, consecutive_failures).label(),
-        ),
+    // --- quota windows: a bar of what is left per window -------------------
+    // The 7d window and every model-scoped limit (Fable) get a bar with the
+    // reset beside it, each followed by its raw facts, so nothing the old
+    // text rows printed is lost (utilization to three places, effective
+    // value, source, age, state).
+    use twolab_tui::status_card::Limit;
+    let source = |w: &QuotaWindow| match w.source {
+        crate::scheduler::window::WindowSource::Headers => "headers",
+        crate::scheduler::window::WindowSource::UsagePoll => "poll",
     };
-    // The detail pane's own window line, re-labeled to the modal's wider label
-    // column (its first span IS the label — dropped here, never re-formatted),
-    // so `7d` and `7d raw` line their values up.
-    let window_line = |name: &'static str, window: &Option<QuotaWindow>| {
-        modal_row_spans(
-            name,
-            window_detail_line(name, window, ctx, max_age, consecutive_failures)
-                .spans
-                .into_iter()
-                .skip(1)
-                .collect(),
-        )
+    let limit = |w: &QuotaWindow| {
+        let resets = match w.resets_at.duration_since(now) {
+            Ok(left) if !left.is_zero() => {
+                format!("{} · {}", select::compact_duration(left), abs(w.resets_at))
+            }
+            _ => format!("elapsed · {}", abs(w.resets_at)),
+        };
+        Limit::used(w.effective_utilization(now) * 100.0)
+            .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
+            .resets(resets)
     };
-    lines.push(modal_section("windows"));
-    lines.push(window_line("7d", &account.seven_day));
-    lines.push(modal_row("7d raw", raw_window(&account.seven_day)));
-
-    // --- model-scoped limits ----------------------------------------------
+    rows.push(ModalRow::Section("windows"));
+    let display = classify_window_display(&account.seven_day, now, max_age, consecutive_failures);
+    match &account.seven_day {
+        None => {
+            rows.push(ModalRow::Limit("7d".into(), Limit::unknown()));
+            rows.push(ModalRow::field(
+                "7d raw",
+                format!("no data · state {}", display.label()),
+            ));
+        }
+        Some(w) => {
+            rows.push(ModalRow::Limit("7d".into(), limit(w)));
+            rows.push(ModalRow::field(
+                "7d raw",
+                format!(
+                    "util {:.3} · eff {:.3} · fetched {} · {} · expired {} · state {}",
+                    w.utilization,
+                    w.effective_utilization(now),
+                    ago(w.fetched_at),
+                    source(w),
+                    yes_no(w.is_expired(now)),
+                    display.label(),
+                ),
+            ));
+        }
+    }
     let fable_ceiling = select::effective_limits(account, params).2;
-    lines.push(modal_section("scoped"));
     if account.scoped_limits.is_empty() {
-        lines.push(modal_row("scope", format!("{dash} (none recorded)")));
+        rows.push(ModalRow::field("scoped", format!("{dash} (none recorded)")));
     }
     for scoped in &account.scoped_limits {
         let window = &scoped.window;
-        lines.push(modal_row(
-            &scoped.scope_label,
-            format!(
-                "{} · resets {} · severity {} · active {}",
-                format::percent(window.effective_utilization(now)),
-                until(window.resets_at),
-                scoped.severity.label(),
-                yes_no(scoped.is_active),
-            ),
-        ));
-        lines.push(modal_row(
+        rows.push(ModalRow::Limit(scoped.scope_label.clone(), limit(window)));
+        rows.push(ModalRow::field(
             &format!("{} raw", scoped.scope_label),
             format!(
-                "util {:.3} · constraining {} (ceiling {}) · fetched {}",
+                "util {:.3} · severity {} · active {} · constraining {} (ceiling {}) · fetched {}",
                 window.utilization,
+                scoped.severity.label(),
+                yes_no(scoped.is_active),
                 yes_no(scoped.is_constraining(now, fable_ceiling)),
                 format::percent(fable_ceiling),
                 ago(window.fetched_at),
@@ -3942,8 +4121,8 @@ fn account_modal_lines(
     }
 
     // --- cooldowns ---------------------------------------------------------
-    lines.push(modal_section("cooldown"));
-    lines.push(modal_row(
+    rows.push(ModalRow::Section("cooldown"));
+    rows.push(ModalRow::field(
         "account",
         match account.cooldown_until {
             None => format!("none · source {dash}"),
@@ -3959,10 +4138,10 @@ fn account_modal_lines(
         },
     ));
     if account.scoped_cooldowns.is_empty() {
-        lines.push(modal_row("scoped", format!("{dash} (none parked)")));
+        rows.push(ModalRow::field("scoped", format!("{dash} (none parked)")));
     }
     for cooldown in &account.scoped_cooldowns {
-        lines.push(modal_row(
+        rows.push(ModalRow::field(
             cooldown.scope.label().unwrap_or("account-wide"),
             format!(
                 "until {} · set {} · reason {:?}",
@@ -3979,8 +4158,8 @@ fn account_modal_lines(
         Some(v) => format!("{} (override)", format::percent(v)),
         None => format!("{dash} (global {})", format::percent(global)),
     };
-    lines.push(modal_section("limits"));
-    lines.push(modal_row(
+    rows.push(ModalRow::Section("limits"));
+    rows.push(ModalRow::field(
         "override",
         format!(
             "5h {} · 7d {} · fbl {}",
@@ -3989,7 +4168,7 @@ fn account_modal_lines(
             override_of(account.limits.fable_weekly_max, params.fable_weekly_max),
         ),
     ));
-    lines.push(modal_row(
+    rows.push(ModalRow::field(
         "effective",
         format!(
             "5h {} · 7d {} · fbl {}",
@@ -4001,8 +4180,8 @@ fn account_modal_lines(
 
     // --- lifetime totals ---------------------------------------------------
     let totals = view.totals_for(&account.id.0);
-    lines.push(modal_section("lifetime"));
-    lines.push(modal_row(
+    rows.push(ModalRow::Section("lifetime"));
+    rows.push(ModalRow::field(
         "requests",
         format!(
             "{} req · {} ok · {} err",
@@ -4011,7 +4190,7 @@ fn account_modal_lines(
             format::human_count(totals.errors),
         ),
     ));
-    lines.push(modal_row(
+    rows.push(ModalRow::field(
         "tokens",
         format!(
             "in {} · out {} · total {}",
@@ -4022,10 +4201,10 @@ fn account_modal_lines(
     ));
 
     // --- usage poller health ----------------------------------------------
-    lines.push(modal_section("poll"));
+    rows.push(ModalRow::Section("poll"));
     match view.poll_health(&account.id.0) {
         Some(health) => {
-            lines.push(modal_row(
+            rows.push(ModalRow::field(
                 "health",
                 format!(
                     "{} · failures {}",
@@ -4036,28 +4215,28 @@ fn account_modal_lines(
                     health.consecutive_failures,
                 ),
             ));
-            lines.push(modal_row("next", until(health.next_at)));
+            rows.push(ModalRow::field("next", until(health.next_at)));
         }
         None if account.credential_kind == "oauth" => {
-            lines.push(modal_row("health", "not polled yet".into()))
+            rows.push(ModalRow::field("health", "not polled yet".into()))
         }
         // apikey/codex accounts have no Anthropic usage endpoint to poll.
-        None => lines.push(modal_row(
+        None => rows.push(ModalRow::field(
             "health",
             format!("n/a ({})", account.credential_kind),
         )),
     }
 
     // --- usage controls (.prd/16) ------------------------------------------
-    lines.push(modal_section("resets"));
+    rows.push(ModalRow::Section("resets"));
     match view.usage_control(&account.id.0) {
-        None => lines.push(modal_row(
+        None => rows.push(ModalRow::field(
             "control",
             super::view::reset_detail(None, account.credential_kind, now),
         )),
         Some(control) => {
             if let Some(e) = &control.eligibility {
-                lines.push(modal_row(
+                rows.push(ModalRow::field(
                     "eligible",
                     format!(
                         "{} · reason {} · weekly resets {}",
@@ -4072,7 +4251,7 @@ fn account_modal_lines(
                     ),
                 ));
             }
-            lines.push(modal_row(
+            rows.push(ModalRow::field(
                 "counts",
                 format!(
                     "available {} · applicable {}",
@@ -4086,7 +4265,7 @@ fn account_modal_lines(
                         .unwrap_or_else(|| dash.clone()),
                 ),
             ));
-            lines.push(modal_row(
+            rows.push(ModalRow::field(
                 "credits",
                 if control.credits.is_empty() {
                     format!("{dash} (none listed)")
@@ -4096,7 +4275,7 @@ fn account_modal_lines(
             ));
             for (i, credit) in control.credits.iter().enumerate() {
                 let field = |value: &Option<String>| value.clone().unwrap_or_else(|| dash.clone());
-                lines.push(modal_row(
+                rows.push(ModalRow::field(
                     &format!("#{}", i + 1),
                     format!(
                         "id {} · type {} · status {} · granted {} · expires {} · title {} · desc {}",
@@ -4118,7 +4297,7 @@ fn account_modal_lines(
                 ms.map(|ms| ago(UNIX_EPOCH + Duration::from_millis(ms)))
                     .unwrap_or_else(|| dash.clone())
             };
-            lines.push(modal_row(
+            rows.push(ModalRow::field(
                 "last",
                 format!(
                     "refresh {} · reset {} · error {} ({})",
@@ -4128,7 +4307,7 @@ fn account_modal_lines(
                     stamp(control.last_error_ms),
                 ),
             ));
-            lines.push(modal_row(
+            rows.push(ModalRow::field(
                 "pending",
                 format!(
                     "request {} · credit {}",
@@ -4145,10 +4324,14 @@ fn account_modal_lines(
         }
     }
     if history.is_empty() {
-        lines.push(modal_section("authentication / usage history"));
-        lines.extend(auth_history_lines(history, ctx.tz_offset));
+        rows.push(ModalRow::Section("authentication / usage history"));
+        rows.extend(
+            auth_history_lines(history, ctx.tz_offset)
+                .into_iter()
+                .map(ModalRow::Plain),
+        );
     }
-    lines
+    modal_rows_lines(rows, width)
 }
 
 fn auth_history_lines(
@@ -4203,55 +4386,51 @@ fn auth_history_lines(
 
 /// The account detail modal (.prd/19 rules 6–7): everything the view records
 /// about ONE account, opened by a left-click on its table row and pinned to
-/// the account's REAL id. `None` = that id is no longer in the snapshot, the
-/// runtime's signal to close the modal (same contract as the input modal's
-/// aged-out entry).
+/// the account's REAL id. A twolab-tui [`Modal`](twolab_tui::modal::Modal)
+/// sized to its body up to 80% × 85% of the screen, scrolling with the
+/// library's scrollbar and saying which rows are in view. `None` = that id
+/// is no longer in the snapshot, the runtime's signal to close the modal
+/// (same contract as the input modal's aged-out entry).
 fn draw_account_modal(
     frame: &mut Frame,
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     modal: &AccountModal,
-) -> Option<u16> {
+) -> Option<twolab_tui::modal::ModalLayout> {
+    use twolab_tui::modal::{Modal, ModalSize, PopupSize};
     let account = view
         .snapshot
         .accounts
         .iter()
         .find(|a| a.id.0 == modal.account)?;
 
-    let area = centered_rect(frame.area(), 80, 85);
-    frame.render_widget(Clear, area);
-
     let title = format!(
-        " 🔍 account — {} · {} · {} ",
+        "🔍 account — {} · {} · {}",
         masked_name(&account.id.0, ctx.mask),
         account.credential_kind,
         account.group.as_str().to_uppercase(),
     );
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(dim())
-        .title(Span::styled(
-            title,
-            Style::new().add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
-    let inner = block.inner(area);
-
-    let lines: Vec<Line<'static>> = account_modal_lines(view, ctx, chrome, account)
-        .into_iter()
-        .map(cells::wrap_safe_line)
-        .collect();
-    let total = cells::wrapped_rows_lines(&lines, inner.width);
-    let max_scroll = (total as u16).saturating_sub(inner.height);
-    let scroll = modal.scroll.min(max_scroll);
-
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(para, area);
-    Some(max_scroll)
+    let popup = |body: Vec<Line<'static>>| {
+        Modal::new(title.clone())
+            .body(body)
+            .footer(modal_scroll_hints())
+            .fit_content(PopupSize::Percent(80), PopupSize::Percent(85))
+            .theme(KEYBAR_THEME)
+    };
+    let area = frame.area();
+    // The window cards lay out at the body's width, which the body decides:
+    // size the popup with the cards at their widest, then lay them out at
+    // the width that gave and keep that width.
+    let wide_modal = popup(account_modal_lines(view, ctx, chrome, account, u16::MAX));
+    let wide = wide_modal.outer(area);
+    // The library's own geometry (border only from 4×3 up, padding from 8
+    // wide, the scrollbar column when the body overflows) — not a copy of it.
+    let body_w = wide_modal.layout(area, &modal.state).body.width;
+    let popup = popup(account_modal_lines(view, ctx, chrome, account, body_w))
+        .width(ModalSize::Fixed(PopupSize::Cells(wide.width)));
+    let mut state = modal.state.clone();
+    Some(popup.render(area, frame.buffer_mut(), &mut state))
 }
 
 // ---------------------------------------------------------------------------
@@ -8234,16 +8413,19 @@ pub(crate) struct MainChrome {
     /// Config overlay clickable value cells this frame (config-editor v1):
     /// row index + action, so a click activates exactly like Enter.
     pub config_rows: Vec<ConfigHit>,
-    /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some(max)`
-    /// is the largest valid scroll offset (wrapped line count minus the modal's
-    /// visible inner height) so the runtime can clamp its stored offset; `None`
-    /// means no modal was open OR its entry aged out of the ring (→ close it).
-    pub input_modal_max_scroll: Option<u16>,
+    /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some`
+    /// is where the modal drew — its clamped scroll position and scrollbar
+    /// track, which the runtime's keys and mouse act on; `None` means no
+    /// modal was open OR its entry aged out of the ring (→ close it).
+    pub input_modal: Option<twolab_tui::modal::ModalLayout>,
     /// Set by `draw` after rendering the account detail modal (.prd/19 rule 6),
-    /// with the same contract as [`Self::input_modal_max_scroll`]: `Some(max)`
-    /// clamps the stored scroll, `None` means no modal was open OR its pinned
-    /// account left the snapshot (→ close it).
-    pub account_modal_max_scroll: Option<u16>,
+    /// with the same contract as [`Self::input_modal`]: `Some` is where it
+    /// drew, `None` means no modal was open OR its pinned account left the
+    /// snapshot (→ close it).
+    pub account_modal: Option<twolab_tui::modal::ModalLayout>,
+    /// Where the Logs overlay's pager drew this frame (`None`: not open), so
+    /// a scroll key or wheel step moves from what is on screen.
+    pub logs: Option<twolab_tui::scrollbar::ScrollPos>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
@@ -9670,26 +9852,9 @@ fn activity_meta_spans(
     }
 }
 
-/// Bottom log console: the tail of the tracing ring, newest line on the
-/// bottom row (auto-follow), level-colored prefix, no wrapping (long lines
-/// truncate — the console is a glance surface, not a pager).
-fn draw_logs(frame: &mut Frame, area: Rect, view: &DashboardView) {
-    let block = Block::new().borders(Borders::TOP).title(" logs ");
-    let capacity = area.height.saturating_sub(1) as usize; // top border
-                                                           // `view.logs` is oldest→newest; take the newest `capacity` lines.
-    let start = view.logs.len().saturating_sub(capacity);
-    let lines: Vec<Line> = view.logs[start..]
-        .iter()
-        .map(|line| log_line(line, view.email_anonymous))
-        .collect();
-    // Bottom-align: pad above so the newest line hugs the bottom edge.
-    let mut padded: Vec<Line> = Vec::with_capacity(capacity);
-    padded.resize_with(capacity.saturating_sub(lines.len()), Line::default);
-    padded.extend(lines);
-    frame.render_widget(Paragraph::new(padded).block(block), area);
-}
-
-fn log_line(line: &LogLine, mask: bool) -> Line<'_> {
+/// One tracing line as the Logs overlay shows it: a level-coloured prefix,
+/// then the text with emails masked under `email_anonymous`.
+fn log_line(line: &LogLine, mask: bool) -> Line<'static> {
     use tracing::Level;
 
     let (label, style) = if line.level == Level::ERROR {
@@ -9735,15 +9900,16 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
 /// pricing the token parts locally so the `$` column stays useful during a
 /// rolling upgrade. The fallback holds no config overrides (empty map = the
 /// built-in default rate table); an unknown/zero-rate `(group, model)` still
-/// yields `0.0`.
-fn model_cost(m: &ModelUsageDoc) -> f64 {
+/// yields `None`: no rate is known, and the `$` cell says `—` rather than a
+/// credible `$0`.
+fn model_cost(m: &ModelUsageDoc) -> Option<f64> {
     if m.cost_usd > 0.0 {
-        return m.cost_usd;
+        return Some(m.cost_usd);
     }
     if m.tokens_in.saturating_add(m.tokens_out) == 0 {
-        return 0.0;
+        return Some(0.0);
     }
-    crate::pricing::cost_from_parts(
+    crate::pricing::priced_cost(
         &m.group,
         &m.model,
         m.tokens_in,
@@ -9909,7 +10075,9 @@ fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
         MODEL_BAR_WIDTH,
         cells(format::human_count(m.requests)),
         cells(format::human_count(model_total(m))),
-        cells(format_cost(model_cost(m))),
+        cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
+            .line()
+            .width(),
         cells(strip_last(m, now)),
     ]
 }
@@ -10025,13 +10193,7 @@ fn draw_models_strip_packed(
     let entries = &view.model_usage[..shown.min(view.model_usage.len())];
     let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
     let columns = strip_columns(&widths, per_line);
-    let max_total = view
-        .model_usage
-        .iter()
-        .map(model_total)
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
     let frame_n = ctx.frame;
     let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
         let w = Line::from(field.clone()).width();
@@ -10051,7 +10213,6 @@ fn draw_models_strip_packed(
                 let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
                 let (group, name) =
                     model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
-                let share = model_total(m) as f64 / max_total as f64;
                 let marker = model_active_marker(m, now, frame_n);
                 let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
                     vec![if j == 0 {
@@ -10064,16 +10225,14 @@ fn draw_models_strip_packed(
                     }],
                     vec![group],
                     name,
-                    vec![Span::styled(
-                        format::gauge_bar(share, MODEL_BAR_WIDTH),
-                        group_color(Some(m.group.as_str())),
-                    )],
+                    share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+                        .style(group_color(Some(m.group.as_str())))
+                        .spans(),
                     vec![Span::raw(format::human_count(m.requests))],
                     vec![Span::raw(format::human_count(model_total(m)))],
-                    vec![Span::styled(
-                        format_cost(model_cost(m)),
-                        Style::new().fg(Color::Green),
-                    )],
+                    cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
+                        .line()
+                        .spans,
                     vec![Span::styled(strip_last(m, now), dim())],
                 ];
                 for (f, field) in fields.into_iter().enumerate() {
@@ -10143,13 +10302,7 @@ fn draw_models_strip(
     let visible = (area.height.saturating_sub(2)) as usize;
     let rows_data: Vec<&ModelUsageDoc> = view.model_usage.iter().take(visible).collect();
     let shown = rows_data.len();
-    let max_total = view
-        .model_usage
-        .iter()
-        .map(model_total)
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
     let wide = area.width >= SIDE_BY_SIDE_AT;
     // The strip marker rides the SAME shared animation frame as the rest of the
     // board (TUI UI-6 item 2a) — it was frozen at 0 before, so in-flight strip
@@ -10160,25 +10313,25 @@ fn draw_models_strip(
         let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
         let (group_cell, name_cell) =
             model_name_cells(m, active, frame_n, view.tui_effects, view.gradient);
-        let share = model_total(m) as f64 / max_total as f64;
         let mut cells = vec![
             Cell::from(model_active_marker(m, now, frame_n)),
             group_cell,
             name_cell,
         ];
         if wide {
-            cells.push(Cell::from(Span::styled(
-                format::gauge_bar(share, MODEL_BAR_WIDTH),
-                group_color(Some(m.group.as_str())),
-            )));
+            cells.push(Cell::from(
+                share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+                    .style(group_color(Some(m.group.as_str())))
+                    .line(),
+            ));
         }
         cells.push(Cell::from(format::human_count(m.requests)));
         cells.push(Cell::from(format::human_count(model_total(m))));
-        // API-equivalent cost ($) cell, right after tok (item #4).
-        cells.push(Cell::from(Span::styled(
-            format_cost(model_cost(m)),
-            Style::new().fg(Color::Green),
-        )));
+        // API-equivalent cost ($) cell, right after tok (item #4), on the
+        // ledger: the point in one column, every digit kept.
+        cells.push(Cell::from(
+            cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line(),
+        ));
         let mut last = model_age_compact(m.last_used_ms, now);
         if m.in_flight > 0 {
             last = format!("{} in-flight", m.in_flight);
@@ -10197,7 +10350,7 @@ fn draw_models_strip(
                 Constraint::Length(MODEL_BAR_WIDTH as u16 + 1),
                 Constraint::Length(7),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(12),
             ],
         )
@@ -10210,7 +10363,7 @@ fn draw_models_strip(
                 Constraint::Fill(1),
                 Constraint::Length(7),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(12),
             ],
         )
@@ -10300,11 +10453,9 @@ fn draw_models_table(
                 Cell::from(ok_err),
                 Cell::from(format::human_count(m.tokens_in)),
                 Cell::from(format::human_count(m.tokens_out)),
-                // API-equivalent cost ($) column, after out (item #4).
-                Cell::from(Span::styled(
-                    format_cost(model_cost(m)),
-                    Style::new().fg(Color::Green),
-                )),
+                // API-equivalent cost ($) column, after out (item #4), on
+                // the ledger.
+                Cell::from(cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line()),
             ];
             if wide {
                 cells.push(Cell::from(Span::styled(opt_count(m.cache_read), dim())));
@@ -10335,7 +10486,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(3),
@@ -10354,7 +10505,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(3),
             ],
         )
@@ -10559,13 +10710,13 @@ fn draw_heatmap(
         dim().add_modifier(Modifier::BOLD),
     )));
 
-    let max_tokens = cells.iter().map(|c| c.tokens).max().unwrap_or(0).max(1);
+    let max_tokens = cells.iter().map(|c| c.tokens).max().unwrap_or(0);
     let shown = total.min(HEATMAP_MAX_ROWS);
     for c in &cells[..shown] {
-        let share = c.tokens as f64 / max_tokens as f64;
-        let bar = format::gauge_bar(share, HEATMAP_BAR_WIDTH);
-        let bar_color = level_color(format::gauge_level(share));
-        lines.push(Line::from(vec![
+        // Coloured by intensity on the gauge thresholds (green / yellow / red).
+        let bar = share_bar(c.tokens, max_tokens, HEATMAP_BAR_WIDTH)
+            .levels(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT);
+        let mut spans = vec![
             Span::styled(
                 format!(" {}", pad_cells(&c.group, 7)),
                 group_color(Some(c.group.as_str())),
@@ -10581,8 +10732,9 @@ fn draw_heatmap(
             Span::raw(format!(" {:>6}", format::human_count(c.requests))),
             Span::raw(format!(" {:>8}", format::human_count(c.tokens))),
             Span::raw("  "),
-            Span::styled(bar, Style::new().fg(bar_color)),
-        ]));
+        ];
+        spans.extend(bar.spans());
+        lines.push(Line::from(spans));
     }
     if total > shown {
         lines.push(Line::from(Span::styled(
@@ -11058,8 +11210,17 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("q", "quit"),
             ],
         ),
-        // Logs overlay: full-screen tail; l/Esc back.
-        Overlay::Logs => (Some("logs"), vec![("l/Esc", "back"), ("q", "quit")]),
+        // Logs overlay: the log ring in a pager; End follows new lines.
+        Overlay::Logs => (
+            Some("logs"),
+            vec![
+                ("l/Esc", "back"),
+                ("↑/k ↓/j", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Home/End", "top/follow"),
+                ("q", "quit"),
+            ],
+        ),
         Overlay::Perf => (
             Some("perf"),
             vec![
@@ -11540,6 +11701,48 @@ mod tests {
         );
         assert!(all.contains("local"), "builtin bucket with usage:\n{all}");
         assert!(all.contains("→"), "used-from → used-to span:\n{all}");
+    }
+
+    /// The keys panel's cost column is on the ledger: decimal points in one
+    /// column for keys, builtin buckets and their model rows (a model row
+    /// one tier dimmer), and `—` for a key with no usage in the window.
+    #[test]
+    fn keys_overlay_costs_line_up_on_the_decimal_point() {
+        let mut view = keys_view();
+        view.client_keys.push(crate::dashboard::KeyRowDoc {
+            id: "k-idle".into(),
+            name: "pc-idle".into(),
+            ..view.client_keys[0].clone()
+        });
+        let mut doc = keys_doc("all", Vec::new());
+        doc.tenants[0].cost_usd = 1_204.5;
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let rows = render_rows(&view, &keys_chrome(panel), 200, 30);
+        let all = rows.join("\n");
+        let find = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}:\n{all}"))
+                .clone()
+        };
+        let point = |r: &str, money: &str| {
+            let at = r.find(money).unwrap_or_else(|| panic!("{money} in {r}"));
+            cells::width(&r[..at]) + money.find('.').expect("point")
+        };
+        let key = find("$1,204.50");
+        let model = find("└ claude/claude-opus-4-8");
+        assert_eq!(point(&key, "$1,204.50"), point(&model, "$1.25"), "{all}");
+        let idle = find("pc-idle");
+        assert!(!idle.contains('$'), "{idle}");
+        // The cost dash is the row's last one (`ok/err` reads `—` too).
+        assert_eq!(
+            cells::width(&idle[..idle.rfind('—').expect("dash")]) + 1,
+            point(&key, "$1,204.50"),
+            "{all}"
+        );
     }
 
     /// K-6 `name을 맨 앞`: the NAME column is first and the key metadata cell
@@ -12654,6 +12857,7 @@ mod tests {
             perf_day_off: None,
             usage_gran: Default::default(),
             usage_scroll: 0,
+            logs_scroll: None,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -12775,6 +12979,127 @@ mod tests {
             "keybar advertises the stats overlay"
         );
         assert!(text.contains("gpt-5.5"), "strip shows the top model");
+    }
+
+    /// Audit frame 5.1: at 80 columns the strip's 8-cell `tok` column cut
+    /// 243.6 billion tokens to `243578.5` (its `M` clipped). The count now
+    /// steps to `G` and keeps its unit, in the strip and the full table.
+    #[test]
+    fn billions_of_tokens_keep_their_unit_in_the_models_strip_and_table() {
+        let view = view_with(vec![model_row(
+            "claude",
+            "claude-opus-5-5",
+            243_000_000_000,
+            578_500_000,
+        )]);
+        let main = render_rows(&view, &chrome_overlay(Overlay::None), 80, 24);
+        let row = main
+            .iter()
+            .find(|r| r.contains("claude-opus-5-5"))
+            .expect("strip row");
+        assert!(row.contains(" 243.6G "), "{row}");
+        assert!(!row.contains("243578"), "{row}");
+        let stats = render_rows(&view, &chrome_overlay(Overlay::Stats), 80, 24);
+        let row = stats
+            .iter()
+            .find(|r| r.contains("claude-opus-5-5"))
+            .expect("table row");
+        assert!(row.contains(" 243.0G "), "{row}");
+        assert!(row.contains(" 578.5M "), "{row}");
+    }
+
+    /// The share bar fills by `value / max`, clamped, and reads `—` when
+    /// there is no total to compare against (it was an empty bar, which
+    /// reads as 0 %).
+    #[test]
+    fn share_bar_fills_proportionally_and_reads_a_dash_without_a_total() {
+        let text = |value, max| share_bar(value, max, 4).text();
+        assert_eq!(text(0, 4), "▱▱▱▱");
+        assert_eq!(text(2, 4), "▰▰▱▱");
+        assert_eq!(text(4, 4), "▰▰▰▰");
+        assert_eq!(text(28, 4), "▰▰▰▰", "clamped above the max");
+        assert_eq!(text(0, 0), "—   ", "no total: the share is unknown");
+    }
+
+    /// Models that have not counted a token yet: the strip's share column
+    /// says `—` instead of drawing empty bars.
+    #[test]
+    fn strip_share_reads_a_dash_when_no_model_has_tokens() {
+        let idle = |group: &str, model: &str| ModelUsageDoc {
+            cache_read: None,
+            ..model_row(group, model, 0, 0)
+        };
+        let view = view_with(vec![
+            idle("codex", "gpt-5.5"),
+            idle("claude", "claude-sonnet-4-5"),
+        ]);
+        for w in [120, 179] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), w, 30);
+            let strip: Vec<&String> = rows
+                .iter()
+                .filter(|r| r.contains("gpt-5.5") || r.contains("claude-sonnet-4-5"))
+                .collect();
+            assert!(!strip.is_empty(), "{}", rows.join("\n"));
+            let strip = strip
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!strip.contains('▱') && !strip.contains('▰'), "{strip}");
+            // Two models, each with `—` for its share and for `last`.
+            assert_eq!(strip.matches('—').count(), 4, "{strip}");
+        }
+    }
+
+    /// Audit frame 5.1: the strip's 9-cell `$` column cut `$112293.04` to
+    /// `$112293.0`. Costs are on the ledger now: every digit kept, grouped,
+    /// the decimal point in one column down the strip and the table, and
+    /// `—` for a model no rate prices.
+    #[test]
+    fn model_costs_keep_their_cents_on_one_decimal_column() {
+        let priced = |model: &str, cost: f64| ModelUsageDoc {
+            cost_usd: cost,
+            ..model_row("claude", model, 1_000, 10)
+        };
+        let view = view_with(vec![
+            priced("claude-opus-5-5", 112_293.04),
+            priced("claude-sonnet-5", 8.5),
+            priced("claude-haiku-5", 0.0123),
+            model_row("openrouter", "vendor/unlisted-model", 1_000, 10),
+        ]);
+        assert_eq!(
+            usize::from(COST_COL_WIDTH),
+            cost_amount(None, twolab_tui::ledger::Tier::Total).width()
+        );
+        for overlay in [Overlay::None, Overlay::Stats] {
+            let rows = render_rows(&view, &chrome_overlay(overlay), 80, 24);
+            let row = |needle: &str| {
+                rows.iter()
+                    .find(|r| r.contains(needle))
+                    .unwrap_or_else(|| panic!("{needle}:\n{}", rows.join("\n")))
+                    .clone()
+            };
+            let point = |r: &str| cells::width(&r[..r.find('.').expect("a point")]);
+            let big = row("claude-opus-5-5");
+            assert!(big.contains("$112,293.04"), "{big}");
+            let mid = row("claude-sonnet-5");
+            assert!(mid.contains("$8.50"), "{mid}");
+            let small = row("claude-haiku-5");
+            assert!(small.contains("$0.0123"), "{small}");
+            let cost_point = |r: &str| {
+                let at = r.find('$').expect("a $");
+                cells::width(&r[..at]) + point(&r[at..])
+            };
+            assert_eq!(cost_point(&big), cost_point(&mid), "{big}\n{mid}");
+            assert_eq!(cost_point(&big), cost_point(&small), "{big}\n{small}");
+            let unpriced = row("vendor/unlisted");
+            assert!(!unpriced.contains('$'), "never a free $0: {unpriced}");
+            assert_eq!(
+                cells::width(&unpriced[..unpriced.find('—').expect("dash")]) + 1,
+                cost_point(&big),
+                "the dash stands in the ones column: {unpriced}"
+            );
+        }
     }
 
     #[test]
@@ -13312,7 +13637,7 @@ mod tests {
                 );
             }
             assert!(
-                ["ALL", "daily", "106 buckets", "267417.9M tok", "$188871.31"]
+                ["ALL", "daily", "106 buckets", "267.4G tok", "$188871.31"]
                     .iter()
                     .all(|text| rows[2].contains(text)),
                 "100-column title retains ALL scope and both totals: {}",
@@ -13354,7 +13679,7 @@ mod tests {
                 [
                     "ALL 106",
                     "daily",
-                    "267417.9M tok",
+                    "267.4G tok",
                     "$188871.31",
                     "(+unpriced)"
                 ]
@@ -13465,10 +13790,7 @@ mod tests {
         assert!(rows[4].starts_with("2024-10-03"));
         assert!(rows[48].contains("top/displayed bucket 2024-10-03"));
 
-        chrome.account_modal = Some(super::super::AccountModal {
-            account: "missing-account".into(),
-            scroll: 0,
-        });
+        chrome.account_modal = Some(super::super::AccountModal::new("missing-account".into()));
         let rows = render_rows(&view, &chrome, 160, 50);
         assert!(
             rows[48].trim().is_empty(),
@@ -13511,7 +13833,10 @@ mod tests {
                 Overlay::Stats,
                 " stats — g/Esc back  ↑/k ↓/j model  PgUp/PgDn page  w window  q quit",
             ),
-            (Overlay::Logs, " logs — l/Esc back  q quit"),
+            (
+                Overlay::Logs,
+                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  q quit",
+            ),
         ] {
             let mut chrome = chrome_overlay(overlay);
             for status in [None, Some("switched to codex@example.com")] {
@@ -13769,11 +14094,75 @@ mod tests {
             text: "proxy started on :3456".into(),
         }];
         let text = render(&view, &chrome_overlay(Overlay::Logs), 160, 30);
-        assert!(text.contains("logs"), "logs overlay titled");
+        assert!(
+            text.contains("logs · 1 line · following"),
+            "logs overlay titled"
+        );
         assert!(
             text.contains("proxy started on :3456"),
             "logs overlay shows the tail"
         );
+    }
+
+    fn log_lines(n: usize) -> Vec<crate::logging::LogLine> {
+        (0..n)
+            .map(|i| crate::logging::LogLine {
+                level: tracing::Level::INFO,
+                text: format!("log line {i:03}"),
+            })
+            .collect()
+    }
+
+    /// Before any line arrives the Logs overlay says so — locally and
+    /// attached — instead of a blank pane.
+    #[test]
+    fn logs_overlay_says_when_there_are_no_lines_yet() {
+        let view = view_with(Vec::new());
+        for chrome in [chrome_overlay(Overlay::Logs), chrome_attach(Overlay::Logs)] {
+            let rows = render_rows(&view, &chrome, 80, 24);
+            assert_eq!(rows[3].trim_end(), " no log lines yet", "{rows:#?}");
+            assert!(rows[4].contains("new lines appear here"), "{rows:#?}");
+        }
+    }
+
+    /// The Logs pager at 80x24: following, the newest line sits on the last
+    /// content row and the rule reads 100%; scrolled to the top it shows the
+    /// oldest line at 0%; a long line wraps instead of being cut. The pager
+    /// reports where it drew so the runtime can scroll from there.
+    #[test]
+    fn logs_overlay_pages_through_the_ring_with_a_position() {
+        let mut view = view_with(Vec::new());
+        view.logs = log_lines(100);
+        view.logs.push(crate::logging::LogLine {
+            level: tracing::Level::WARN,
+            text: format!("long {} end-of-long-line", "word ".repeat(30)),
+        });
+        let mut chrome = chrome_overlay(Overlay::Logs);
+        let rows = render_rows(&view, &chrome, 80, 24);
+        // Overlay rows 2..22: title row, 18 content rows, the bottom rule.
+        assert!(
+            rows[2].contains("logs · 101 lines · following"),
+            "{rows:#?}"
+        );
+        assert!(rows[20].contains("end-of-long-line"), "{rows:#?}");
+        assert!(rows[18].contains("  WARN long word"), "wrapped: {rows:#?}");
+        assert!(rows[17].contains("log line 099"), "{rows:#?}");
+        assert!(rows[21].contains(" 100% "), "{rows:#?}");
+
+        chrome.logs_scroll = Some(0);
+        let rows = render_rows(&view, &chrome, 80, 24);
+        assert!(rows[2].contains("scrolled back — End follows"), "{rows:#?}");
+        assert!(rows[3].contains("log line 000"), "{rows:#?}");
+        assert!(rows[21].contains(" 0% "), "{rows:#?}");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let pos = hits.and_then(|h| h.logs).expect("logs position reported");
+        assert_eq!((pos.top, pos.viewport), (0, 18));
+        assert_eq!(pos.max, 103 - 18, "101 lines, the long one on 3 rows");
     }
 
     /// Sessions overlay (issue #34): renders the folded session list with the
@@ -15420,7 +15809,7 @@ mod tests {
         let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
         m.cache_read = Some(40_000);
         m.cache_creation = None;
-        let cost = model_cost(&m);
+        let cost = model_cost(&m).expect("opus has a rate");
         assert!((cost - (1.0 + 2.5 + 0.02)).abs() < 1e-9, "got {cost}");
         assert_eq!(format_cost(cost), "$3.52");
     }
@@ -15432,15 +15821,19 @@ mod tests {
         let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
         m.cache_read = Some(40_000);
         m.cost_usd = 9.99;
-        assert!((model_cost(&m) - 9.99).abs() < 1e-12);
+        assert!((model_cost(&m).expect("server cost") - 9.99).abs() < 1e-12);
         // Old-daemon doc (serde default 0.0) with tokens → local pricing
         // fallback (same math as `model_cost_matches_pricing_table`).
         m.cost_usd = 0.0;
-        assert!((model_cost(&m) - 3.52).abs() < 1e-9);
+        assert!((model_cost(&m).expect("local rate") - 3.52).abs() < 1e-9);
         // No tokens at all (e.g. an in-flight-only row) → $0, no lookup.
         let mut idle = model_row("claude", "claude-opus-4-8", 0, 0);
         idle.cache_read = None;
-        assert!(model_cost(&idle).abs() < 1e-12);
+        assert_eq!(model_cost(&idle), Some(0.0));
+        // Tokens under a group nothing prices (an uncurated openrouter
+        // model) and no server cost: unknown, never a free `$0`.
+        let unpriced = model_row("openrouter", "vendor/unlisted-model", 1_000, 10);
+        assert_eq!(model_cost(&unpriced), None);
     }
 
     #[test]
@@ -15626,10 +16019,7 @@ mod tests {
 
         // First render: read back the reported max scroll for this modal size.
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.input_modal = Some(InputModal {
-            key: key.clone(),
-            scroll: 0,
-        });
+        chrome.input_modal = Some(InputModal::new(key.clone()));
         let mut hits = None;
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("terminal");
         terminal
@@ -15637,11 +16027,15 @@ mod tests {
             .expect("draw");
         let max = hits
             .expect("layout")
-            .input_modal_max_scroll
-            .expect("modal drawn");
+            .input_modal
+            .expect("modal drawn")
+            .pos
+            .max;
 
         // Scroll to the reported max and re-render: the tail line is on screen.
-        chrome.input_modal = Some(InputModal { key, scroll: max });
+        let mut modal = InputModal::new(key);
+        modal.state.scroll_to(max);
+        chrome.input_modal = Some(modal);
         let text = render(&view, &chrome, 60, 24);
         assert!(
             text.contains("TAILMARKER_LAST"),
@@ -15682,7 +16076,7 @@ mod tests {
 
         // Open the modal and render: the box, its scroll/esc footer, and the
         // excerpt text are all on screen.
-        chrome.input_modal = Some(InputModal { key, scroll: 0 });
+        chrome.input_modal = Some(InputModal::new(key));
         let text = render(&view, &chrome, 200, 40);
         assert!(
             text.contains("scroll"),
@@ -15702,20 +16096,73 @@ mod tests {
         let missing = key_of(&completed_with_excerpt(Some("user"), "gone"));
         let view = view_with(Vec::new()); // empty ring
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.input_modal = Some(InputModal {
-            key: missing,
-            scroll: 0,
-        });
+        chrome.input_modal = Some(InputModal::new(missing));
         let mut hits = None;
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
         assert_eq!(
-            hits.expect("layout").input_modal_max_scroll,
+            hits.expect("layout").input_modal,
             None,
             "aged-out entry yields the close signal"
         );
+    }
+
+    /// Batch 2 of #232: the input modal is sized to its excerpt (it was 80%
+    /// of the screen for two lines) and still shows every line of it.
+    #[test]
+    fn input_modal_fits_its_content() {
+        let entry =
+            completed_with_excerpt(Some("user"), "fix the login bug\nand add a test for it");
+        let key = key_of(&entry);
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.input_modal = Some(InputModal::new(key));
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let text = rows.join("\n");
+        assert!(text.contains("fix the login bug"), "{text}");
+        assert!(text.contains("and add a test for it"), "{text}");
+        let top = rows
+            .iter()
+            .find(|r| r.contains('┌') && r.contains('┐'))
+            .expect("a framed modal");
+        let width = top
+            .chars()
+            .skip_while(|&c| c != '┌')
+            .take_while(|&c| c != '┐')
+            .count()
+            + 1;
+        assert!(
+            width < 64,
+            "narrower than the old 80% popup ({width} cells):\n{text}"
+        );
+        let height = rows.iter().filter(|r| r.contains('│')).count();
+        assert!(
+            height < 19,
+            "shorter than the old 80% popup ({height} rows):\n{text}"
+        );
+    }
+
+    /// The account modal's body overflows at 80×24: it scrolls with a
+    /// scrollbar and its border says which rows are in view; quota windows
+    /// read as bars with what is left.
+    #[test]
+    fn account_modal_says_which_rows_are_in_view() {
+        let (view, name) = rich_account_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal::new(name));
+        let text = render_rows(&view, &chrome, 80, 24).join("\n");
+        assert!(
+            text.split_whitespace().any(|w| {
+                let mut parts = w.split('-');
+                matches!((parts.next(), parts.next()), (Some(a), Some(b)) if a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok())
+            }) && text.contains(" of "),
+            "a `first-last of total` position on the border:\n{text}"
+        );
+        let wide = render_rows(&view, &chrome, 179, 43).join("\n");
+        assert!(wide.contains("% left (resets"), "windows as bars:\n{wide}");
     }
 
     /// A view whose single account carries EVERY optional datum the modal can
@@ -15839,22 +16286,18 @@ mod tests {
     fn account_modal_renders_every_section() {
         let (view, name) = rich_account_view();
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.account_modal = Some(AccountModal {
-            account: name.clone(),
-            scroll: 0,
-        });
+        chrome.account_modal = Some(AccountModal::new(name.clone()));
         let (w, h) = (120u16, 50u16);
         let rows = render_rows(&view, &chrome, w, h);
-        let area = centered_rect(
-            Rect {
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
-            },
-            80,
-            85,
-        );
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let area = hits
+            .and_then(|h| h.account_modal)
+            .expect("modal drawn")
+            .outer;
         let body: String = rows
             [area.y as usize..(area.y as usize + area.height as usize).min(rows.len())]
             .iter()
@@ -15866,9 +16309,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // The model-scoped limits (Fable) share the windows card now; its
+        // raw row stands where the `scoped` section was.
         for label in [
-            "identity", "status", "token", "windows", "7d raw", "scoped", "cooldown", "limits",
-            "lifetime", "poll", "resets",
+            "identity",
+            "status",
+            "token",
+            "windows",
+            "7d raw",
+            "Fable raw",
+            "cooldown",
+            "limits",
+            "lifetime",
+            "poll",
+            "resets",
         ] {
             assert!(body.contains(label), "section `{label}` missing:\n{body}");
         }
@@ -15910,10 +16364,7 @@ mod tests {
             );
         }
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.account_modal = Some(AccountModal {
-            account: name,
-            scroll: 0,
-        });
+        chrome.account_modal = Some(AccountModal::new(name));
         let rows = render_rows(&view, &chrome, 120, 50);
         let frame = rows.join("\n");
         assert!(
@@ -15938,17 +16389,14 @@ mod tests {
     fn account_modal_closes_when_account_gone() {
         let (view, _) = rich_account_view();
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.account_modal = Some(AccountModal {
-            account: "claude:gone@example.com".into(),
-            scroll: 0,
-        });
+        chrome.account_modal = Some(AccountModal::new("claude:gone@example.com".into()));
         let mut hits = None;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
         assert_eq!(
-            hits.expect("layout").account_modal_max_scroll,
+            hits.expect("layout").account_modal,
             None,
             "a vanished account yields the close signal"
         );
@@ -16031,7 +16479,7 @@ mod tests {
             reset_absolute: false,
         };
         let chrome = chrome_overlay(Overlay::None);
-        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[0]);
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[0], 120);
         let flat: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -16151,7 +16599,7 @@ mod tests {
         };
         let chrome = chrome_overlay(Overlay::None);
         // Index 1 = the account the selector just picked.
-        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[1]);
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[1], 120);
         let flat: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -19122,7 +19570,7 @@ mod tests {
             "{frame}"
         );
         let strip = &rows[models + 1..models + 4];
-        assert!(strip.iter().any(|r| r.contains("154581.1M")), "{frame}");
+        assert!(strip.iter().any(|r| r.contains("154.6G")), "{frame}");
         for row in strip {
             assert!(share_bar_runs(row).iter().all(|&len| len == 10), "{row}");
         }
@@ -19177,7 +19625,7 @@ mod tests {
     }
 
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5036.9M / out 847.6M tok ────────── detail ───────────────────────────";
+        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ──────────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -20067,7 +20515,7 @@ mod tests {
         let mode = plan.summary.band_head.len() - 1;
         let (left, right) = rows[band + 1 + mode].split_once('│').expect("bar");
         assert!(
-            left.trim_end().ends_with("in 5036.9M / out 847.6M tok"),
+            left.trim_end().ends_with("in 5.0G / out 847.6M tok"),
             "{frame}"
         );
         assert!(
@@ -20254,7 +20702,23 @@ mod tests {
     /// default foreground (ANSI grey was near-invisible on light terminals)
     /// and `R disabled (attached)` drawn dim as a whole; text unchanged
     /// (previous digest 17_379_241_155_914_426_102).
-    const FOLD_OFF_179X43_DIGEST: u64 = 9_289_721_260_446_823_680;
+    /// Re-pinned 2026-11-06 for counts on twolab-tui's `human_count`, which
+    /// steps past `M` to `G`: the strip's tok cells read `154.6G` / `40.8G`
+    /// / `30.1G` / `14.1G` / `13.2G` (were `154581.1M` …) and the band title
+    /// `in 5.0G` (was `in 5036.9M`; the rule after `detail` three cells
+    /// longer); styles and every other cell unchanged (previous digest
+    /// 9_289_721_260_446_823_680).
+    /// Re-pinned the same day for the strip's share bars on twolab-tui's
+    /// `mini_bar`: text unchanged; the empty `▱` cells are dim (DarkGray)
+    /// instead of the group colour, so the filled part stands out (previous
+    /// digest 5_486_511_068_981_384_955).
+    /// Re-pinned the same day for the strip's `$` cells on twolab-tui's
+    /// `ledger`: amounts are grouped and lined up on the decimal point
+    /// (`$71123.86` reads ` $71,123.86`, `$8349.47` reads `  $8,349.47`,
+    /// each entry two cells wider), dollars in the default colour over dim
+    /// cents and a dim `$` instead of all green; every other cell unchanged
+    /// (previous digest 7_483_902_083_238_678_069).
+    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -21252,10 +21716,7 @@ mod tests {
             )],
         );
         let mut chrome = chrome_overlay(Overlay::None);
-        chrome.account_modal = Some(AccountModal {
-            account: name,
-            scroll: 0,
-        });
+        chrome.account_modal = Some(AccountModal::new(name));
         let rows = render_rows(&view, &chrome, 120, 40);
         let body = rows.join("\n");
         assert!(body.contains("authentication / usage history"), "{body}");

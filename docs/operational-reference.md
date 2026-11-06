@@ -25,7 +25,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Tab shortcut hints
 
@@ -116,11 +116,19 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   failure, and the accounts tab's detail pane always shows it.
 - **Models.** When two or more models fit side by side, the models strip packs
   them several to a line (for example, the top 5 on 3 lines): each entry
-  is the group, the model, the 10-cell share bar, requests, tokens, cost and
-  last use, aligned in columns, and the title row adds a dim
+  is the group, the model, the 10-cell share bar (the model's share of the
+  biggest model's tokens; `—` while no model has any), requests, tokens,
+  cost and last use, aligned in columns, and the title row adds a dim
   `group · model · share · req · tok · $ · last` legend when there is room.
-  Token counts are shown whole (`154581.1M`); the old fixed-width column cut
-  the unit off. Narrower terminals keep the one-model-per-row table. The
+  Counts take at most six cells and keep their unit: `999`, `1.2k`, `3.4M`,
+  then `154.6G`, `T` and up, and a count that would read `1000.0k` reads
+  `1.0M` (they used to stay in `M`, so the one-model-per-row table cut
+  243.6 billion tokens to `243578.5`). A percentage that cannot be computed
+  reads `—`. Costs in the strip and in the `stats` table are ledger-style:
+  grouped (`$112,293.04`; the old 9-cell column cut it to `$112293.0`), the
+  decimal point in one column, cents dimmer, and `—` for a model no rate
+  prices (it read `$0.0000`). Narrower terminals keep the one-model-per-row
+  table. The
   packing choice reserves room for the widest `last` value (`N in-flight`),
   so a model starting or finishing a request does not change the strip's
   height.
@@ -206,6 +214,19 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
+### Logs tab
+
+The `logs` tab (`l`, or click the tab bar) pages through the daemon's
+recent log lines — the newest 500 — in a pager: long lines wrap instead of
+being cut, `~` marks the rows past the last line, and the bottom rule says how
+far down you are (`NN%`). It opens on the newest line and follows new ones
+(the title says `following`); `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home` and the
+mouse wheel scroll back and hold the view still (`scrolled back — End
+follows`), and `End`, or scrolling down to the last line, follows again.
+Lines that leave the 500-line ring while you read move the text up by as
+much. Before the first line arrives it says `no log lines yet` — locally and
+attached — instead of showing an empty pane. `l`/`Esc` goes back, `q` quits.
+
 ### Perf tab (observed performance)
 
 The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
@@ -282,6 +303,12 @@ Click an account row, or press `h` on MAIN / the accounts tab (in the switcher,
 request source, HTTP status when observed, safe OAuth reason, resulting auth
 state, and usage retry deadline / consecutive failures. The expanded detail pane (including MAIN)
 prioritizes the last permanent auth reason over a later usage-poll error.
+
+The account modal and the request-input modal size themselves to what they show (capped at
+80% of the screen) instead of always taking 80%. When the body is taller than the modal it
+scrolls with `↑↓`/`j k`, `PgUp`/`PgDn` and `Home`/`End` (or the mouse wheel), a scrollbar on the
+right shows where you are, and the bottom border says which rows are in view (`1-14 of 53`).
+Quota windows read as a bar with what is left and when it resets.
 
 `! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
 account; the history distinguishes an OAuth `invalid_grant` from other failures.
@@ -451,6 +478,9 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
   secret), kind, state, requests, ok/err, tokens, API-equivalent cost, the
   used-from → used-to span, and a per-model breakdown — the builtin
   `local`/`legacy` buckets included, so every request is accounted for.
+  Costs are ledger-style like the `usage` tab: decimal points in one
+  column, thousands grouped, cents dimmer, model rows a tier darker, and
+  `—` for a key with no usage in the window.
   History persisted before multi-tenant keys shows as the `unknown` tenant —
   it is never folded into a live bucket.
 
