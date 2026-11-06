@@ -263,7 +263,7 @@ rules: table rows, gauges and the popups' box borders draw as before.
   in view. A left click on an entry opens that account's detail modal and
   a right click (dashboard) its context menu, exactly like its table row.
   `V` on the accounts tab switches between the table and the list for this
-  session (the footer says `v compact` or `v table`); the dashboard uses the
+  session (the footer says `V compact` or `V table`); the dashboard uses the
   list by itself whenever its table would show fewer than 5 account rows
   and still hide some (at 80×24 the table showed 2 rows and `+19 more` of
   21 accounts; the list shows 10). `z` folding does not apply while the
