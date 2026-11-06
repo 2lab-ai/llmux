@@ -17,7 +17,8 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
                       │                                · trend_chart · working · mini_bar · composer (masked field)
                       ├─ Already done (PR #231) ...... text · spinner · gradient_text · key_hints (main bar) · tabs (main row)
                       │                                · json_view highlighter · theme decolor · osc52
-                      ├─ Later, with a reason ........ meter · packed_grid · rule · shimmer · theme sweep · hit · agent_list
+                      ├─ Done after the batches ...... agent_list (compact account list)
+                      ├─ Later, with a reason ........ meter · packed_grid · rule · shimmer · theme sweep · hit
                       │                                · pager selection (copy mode)
                       └─ Not applicable .............. completion_menu · diff_view · approval_card · layout · fact_table*
 ```
@@ -47,7 +48,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days; tokens and perf charts on one renderer | done |
 | working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | done |
 | mini_bar | llmux | an empty share bar when the total is zero | `—` when the share cannot be computed | 3 |
-| composer | fx + herdr | add-key and config edits only append or delete at the end | caret moves, mid-value edits, Ctrl+U/Ctrl+Y; the API key stays masked in every render | 3 |
+| composer | fx + herdr | add-key and config edits only append or delete at the end | add key, limits and config value are one-line composer fields: caret moves, mid-value edits, Ctrl+U/K/W cut and Ctrl+Y puts back, a paste lands whole; the API key is a masked composer, `∙` in every frame | done |
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
 | meter | llmux | the original of the crate's meter | the same bars (the 179×43 frame digest is unchanged); the cursor row's bar keeps its fill visible; under `t` a stamp beside a state glyph shows its date instead of losing a digit | done |
@@ -56,7 +57,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | shimmer | Codex | loading labels are plain text | a band of light passes across `loading…` while it waits (sessions, keys title, raw viewer); plain bold under reduced motion | done |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
-| agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
+| agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a compact account list: one row per account with a one-cell glyph per state (`✗ ◌ ◉ ⠋ ◦ ǁ ?`), the cursor's account highlighted, a one-line tally and `+N more` in the title; `V` on the accounts tab, and MAIN uses it whenever its table would show fewer than 5 rows (21 accounts at 80×24: 10 shown instead of 2) | done |
 | pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | `v` releases the mouse for the terminal's selection under a banner (screen held still, `v`/Esc return); a drag in the Logs pager selects and copies through the clipboard/OSC52 path with a status confirmation | done |
 | fact_table | fx | model drill-down facts as free text | figures aligned on the last digit, two columns on a wide pane, `—` for unknown; the misc tab's build/daemon facts too | done |
 | completion_menu | fx | no typed command line | — | not applicable |
@@ -70,8 +71,8 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 - Batch 2 needs the library's modal, scrollbar and json_view row cache (2lab-ai/tui, herdr port).
 - Batch 3 needs the library's toast and format units. `format`, `status_bar` and `mini_bar` can move the pinned 179×43
   frame digest; each re-pin is explained next to the digest, as PR #231 did.
-- The later items either change nothing a person sees (meter, packed_grid) or need a design decision first (agent_list,
-  copy mode, rule).
+- The later items either change nothing a person sees (meter, packed_grid) or need a design decision first (copy mode,
+  rule). agent_list got its decision — the compact list replaces the table in the same pane, never beside it.
 
 ## Evidence
 
