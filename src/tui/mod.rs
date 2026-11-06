@@ -1291,6 +1291,8 @@ struct App {
     /// The log lines the Logs pager drew last frame (`None`: not open) —
     /// what a press on it freezes.
     logs_drawn: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    /// A press went to a toast: its drag and release are swallowed too.
+    toast_press: bool,
     /// Copy mode (`v`), see [`Chrome::copy_mode`]: the event loop releases
     /// mouse capture while it is on and holds the frame still, so the text
     /// under the terminal's own selection does not move.
@@ -1420,6 +1422,7 @@ impl App {
             logs_sel: None,
             logs_frozen: None,
             logs_drawn: None,
+            toast_press: false,
             copy_mode: false,
             copy_since: None,
             held_for: Duration::ZERO,
@@ -1978,6 +1981,19 @@ impl App {
         if self.copy_mode {
             return false;
         }
+        // The drag and the release of a press a toast took are the toast's
+        // too: they must not finish a Logs selection (and copy it again) or
+        // move a thumb under it.
+        if self.toast_press {
+            match mouse.kind {
+                MouseEventKind::Up(_) => {
+                    self.toast_press = false;
+                    return true;
+                }
+                MouseEventKind::Drag(_) => return true,
+                _ => self.toast_press = false,
+            }
+        }
         // What the last frame drew under the pointer, topmost first — the one
         // lookup every click below matches on. Open modals, the menu and
         // the current surface still decide who gets the event at all.
@@ -2066,6 +2082,7 @@ impl App {
         // press on it reaches what it covers. The wheel and a held drag pass.
         if let Some(&ui::ClickTarget::Toast(id)) = target {
             if let MouseEventKind::Down(button) = mouse.kind {
+                self.toast_press = true;
                 if button == MouseButton::Left {
                     let clock = self.clock_at(Instant::now());
                     self.toasts.dismiss(id, clock);
@@ -9814,6 +9831,19 @@ mod tests {
         draw_and_adopt(&mut app, &view, 120, 24);
         let bar = app.table_scroll.expect("60 rows overflow");
         assert_eq!(bar.pos.max, 60 - bar.pos.viewport);
+        // End, the wheel and the keys stop where the scrollbar ends: the
+        // last model on the last row, not the last bucket at the top with
+        // blank rows under it (the drawn top and the thumb used to differ).
+        app.on_key_usage(KeyCode::End, Some(&view));
+        assert_eq!(app.usage_scroll, bar.pos.max, "End is the bar's end");
+        for _ in 0..3 {
+            app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        }
+        assert_eq!(app.usage_scroll, bar.pos.max, "j stops there too");
+        draw_and_adopt(&mut app, &view, 120, 24);
+        assert_eq!(app.table_scroll.map(|b| b.pos.top), Some(bar.pos.max));
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        draw_and_adopt(&mut app, &view, 120, 24);
         let last = bar.track.bottom() - 1;
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
@@ -12446,6 +12476,50 @@ mod tests {
             .expect("draw");
         let text = format!("{:?}", terminal.backend().buffer());
         assert!(!text.contains("FAILED"), "{text}");
+    }
+
+    /// A click that takes a toast down owns its release too: with a Logs
+    /// selection already made under the toast, the release does not finish
+    /// that selection again (it used to copy the old text a second time).
+    #[test]
+    fn a_click_on_a_toast_over_the_logs_does_not_copy_the_selection_again() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..30).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        draw_and_adopt(&mut app, &view, 179, 43);
+        for (kind, col) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 18),
+            (MouseEventKind::Up(MouseButton::Left), 18),
+        ] {
+            app.on_mouse(left(kind, col, 4), Some(&view));
+        }
+        assert_eq!(app.pending_clip.len(), 1, "the selection copied once");
+        app.pending_clip.clear();
+        let lines = (2..=6)
+            .map(|n| format!("claude:a{n}@x.com: upstream 50{n}"))
+            .collect();
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 5 FAILED").with_lines(lines));
+        draw_and_adopt(&mut app, &view, 179, 43);
+        let toast = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::Toast(_)))
+            .map(|(rect, _)| rect)
+            .expect("the toast is drawn over the pager");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(app.on_mouse(left(kind, toast.x + 2, toast.y + 1), Some(&view)));
+        }
+        assert!(app.toasts.is_empty(), "the click took the toast down");
+        assert!(app.pending_clip.is_empty(), "nothing copied again");
     }
 
     /// A toast lies over the accounts table: a left click on it takes it

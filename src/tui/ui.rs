@@ -176,6 +176,11 @@ mod palette {
     /// endpoint origin, told apart from the model's provider (AGENTS.md
     /// "preserve endpoint origin").
     pub(super) const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
+    /// Text on that row that has no colour of its own (the `user` tag, the
+    /// email): a light foreground, because the row's background is dark on
+    /// every terminal — the default foreground of a light terminal is near
+    /// black and would vanish on it.
+    pub(super) const OPENAI_ACTIVITY_FG: Color = Color::White;
     /// The raw viewer's JSON keywords (`true`/`false`/`null`): the magenta
     /// its users know (twolab-tui's default would be `run`).
     pub(super) const JSON_KEYWORD: Color = Color::Magenta;
@@ -1553,16 +1558,18 @@ pub(crate) fn usage_rows(
     (starts, rows)
 }
 
-/// The furthest top row of the usage table with `viewport` rows on screen:
-/// the last bucket's own row (the table always could put it at the top),
-/// or further when the rows below it outrun the screen — far enough that
-/// the last model shows.
+/// The furthest top row of the usage table with `viewport` rows on screen.
+/// A table taller than the screen ends where its last model reaches the
+/// last row — the bound its scrollbar measures, so a key, the wheel, End
+/// and a drag agree on where the end is. A table that fits (no scrollbar)
+/// can still bring its last bucket's own row to the top, so the footer's
+/// scope can name any bucket.
 pub(crate) fn usage_max_top(starts: &[usize], total: usize, viewport: usize) -> usize {
-    starts
-        .last()
-        .copied()
-        .unwrap_or(0)
-        .max(total.saturating_sub(viewport))
+    if total > viewport {
+        total - viewport
+    } else {
+        starts.last().copied().unwrap_or(0)
+    }
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -9756,7 +9763,11 @@ fn draw_activity(
 
 fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
     match endpoint {
-        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(palette::OPENAI_ACTIVITY_BG)),
+        crate::tui::Endpoint::OpenAi => line.style(
+            Style::new()
+                .bg(palette::OPENAI_ACTIVITY_BG)
+                .fg(palette::OPENAI_ACTIVITY_FG),
+        ),
         crate::tui::Endpoint::Anthropic => line,
     }
 }
@@ -21296,6 +21307,19 @@ mod tests {
             c.symbol() == "5" && c.fg == Color::Red && c.bg == palette::OPENAI_ACTIVITY_BG
         });
         assert!(red_status, "error foreground remains red on dark gray");
+        // Text without a colour of its own reads light on the dark row, also
+        // on a light terminal whose default foreground is near black.
+        let plain: Vec<Color> = (1..openai_hit.bottom())
+            .flat_map(|y| (0..160).map(move |x| (x, y)))
+            .map(|(x, y)| &buffer[(x, y)])
+            .filter(|c| c.symbol().chars().any(char::is_alphanumeric))
+            .map(|c| c.fg)
+            .collect();
+        assert!(
+            plain.iter().all(|fg| *fg != Color::Reset),
+            "no letter on the dark row takes the terminal's default foreground: {plain:?}"
+        );
+        assert!(plain.contains(&palette::OPENAI_ACTIVITY_FG), "{plain:?}");
         for y in 0..=anthropic_y {
             let text: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
             println!(
