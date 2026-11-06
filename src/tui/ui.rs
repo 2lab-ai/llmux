@@ -22999,12 +22999,33 @@ mod tests {
 
     /// The theme sweep's guard: every colour the dashboard draws comes from
     /// `mod palette` — a field of the dashboard [`THEME`] or a named
-    /// categorical hue. A `Color::` literal, or a second colour theme
-    /// (`Theme::ansi()`, `dark()`, `light()`; `mono()` is `NO_COLOR`'s), in
+    /// categorical hue. A `Color::` literal, a `Stylize` colour helper, or a
+    /// second colour theme (`Theme::ansi()`, `dark()`, `light()`,
+    /// `default()`, `from_env()`; `mono()` is `NO_COLOR`'s), in
     /// the non-test part of any TUI source (comments aside) fails here, with
     /// its lines — the palette module in this file is the one exception.
     #[test]
     fn colour_literals_live_only_in_the_palette() {
+        // ratatui's `Stylize` colour helpers (`.red()`, `.on_blue()`) are
+        // literals by another name.
+        const STYLIZE: [&str; 16] = [
+            "black",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "gray",
+            "dark_gray",
+            "light_red",
+            "light_green",
+            "light_yellow",
+            "light_blue",
+            "light_magenta",
+            "light_cyan",
+            "white",
+        ];
         let sources = [
             ("ui.rs", include_str!("ui.rs")),
             ("mod.rs", include_str!("mod.rs")),
@@ -23049,9 +23070,20 @@ mod tests {
                     .filter(|(_, l)| !l.trim_start().starts_with("//"))
                     .filter(|(_, l)| {
                         l.contains("Color::")
-                            || ["Theme::ansi(", "Theme::dark(", "Theme::light("]
-                                .iter()
-                                .any(|t| l.contains(t))
+                            || [
+                                "Theme::ansi(",
+                                "Theme::dark(",
+                                "Theme::light(",
+                                "Theme::default(",
+                                "Theme::from_env(",
+                            ]
+                            .iter()
+                            // Asking the environment whether `NO_COLOR` is
+                            // set is not drawing with a second theme.
+                            .any(|t| l.contains(t) && !l.contains(".is_mono()"))
+                            || STYLIZE.iter().any(|c| {
+                                l.contains(&format!(".{c}()")) || l.contains(&format!(".on_{c}()"))
+                            })
                     })
                     .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim())),
             );
@@ -24795,6 +24827,11 @@ mod tests {
                 "{line:?} is inside the block {block:?}:\n{frame}"
             );
         }
+        // With a kind line the detail lines read request, kind, input: the
+        // request line is the block's second row and the input line its
+        // fourth, so neither covers the other.
+        assert_eq!(raw.y, block.y + 1, "{frame}");
+        assert_eq!(input.y, block.y + 3, "{frame}");
         let col = block.x + 8;
         assert_eq!(
             activity_at(&hits.hits, col, input.y),
