@@ -10850,6 +10850,35 @@ fn strip_per_line(widths: &[Vec<usize>], width: u16) -> usize {
     .unwrap_or(1)
 }
 
+/// Width of a packed strip line of `per_line` entries over `widths`, every
+/// field aligned down its entry column — what twolab-tui's packer measures
+/// in `packed_grid::per_line`.
+fn strip_line_width(widths: &[Vec<usize>], per_line: usize) -> usize {
+    GridPlan {
+        per_line,
+        columns: packed_grid::columns(widths, &[], per_line),
+    }
+    .line_width()
+}
+
+/// The most entries a packed line of `room` cells could ever hold: an
+/// aligned column is never narrower than the entry on its first line, so a
+/// line of `n` is at least the first `n` entries side by side — past the
+/// count where those overrun, no packing of any entries fits.
+fn strip_most_per_line(widths: &[Vec<usize>], room: usize) -> usize {
+    let mut used = 0usize;
+    for (n, entry) in widths.iter().enumerate() {
+        let own = entry.iter().sum::<usize>() + entry.len().saturating_sub(1);
+        used =
+            used.saturating_add(own)
+                .saturating_add(if n > 0 { packed_grid::ENTRY_GAP } else { 0 });
+        if used > room {
+            return n;
+        }
+    }
+    widths.len()
+}
+
 /// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
 /// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
 /// entries fit a line. A drag override keeps its height; packing then
@@ -10887,13 +10916,21 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             // The most entries the lines hold at k per line, for the
             // largest k at which the packer puts at least k of them on a
             // line — it may put more, which only leaves a line spare.
+            // The packer's choice for those entries is at least k exactly
+            // when some count from k up fits, and it is the largest that
+            // does; no count past `most` can, so only counts from k to
+            // `most` are measured (a full search per k was O(n³) a frame).
             let lines = usize::from(height - 1);
-            (2..=total)
+            let room = usize::from(width.saturating_sub(STRIP_MARGIN));
+            let most = strip_most_per_line(&widths, room);
+            (2..=most)
                 .rev()
                 .find_map(|k| {
                     let shown = total.min(lines * k);
-                    let per_line = strip_per_line(&widths[..shown], width);
-                    (per_line >= k).then_some(StripPlan {
+                    let per_line = (k..=most.min(shown))
+                        .rev()
+                        .find(|&n| strip_line_width(&widths[..shown], n) <= room)?;
+                    Some(StripPlan {
                         shown,
                         per_line,
                         height,
@@ -22661,6 +22698,107 @@ mod tests {
             None,
             "108 + 70 + 2 > 179"
         );
+    }
+
+    /// The drag-height plan as it was searched before: for every k from
+    /// all the models down, the packer's full search over the entries k
+    /// per line would show — O(n³) a frame. The bounded search must agree.
+    fn strip_plan_full_search(view: &DashboardView, width: u16, height: u16) -> StripPlan {
+        let total = view.model_usage.len();
+        let widths: Vec<Vec<usize>> = strip_entries(view, total, UNIX_EPOCH, 0)
+            .iter()
+            .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+            .collect();
+        let height = height.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT);
+        let lines = usize::from(height - 1);
+        (2..=total)
+            .rev()
+            .find_map(|k| {
+                let shown = total.min(lines * k);
+                let per_line = strip_per_line(&widths[..shown], width);
+                (per_line >= k).then_some(StripPlan {
+                    shown,
+                    per_line,
+                    height,
+                })
+            })
+            .unwrap_or(StripPlan {
+                shown: total.min(usize::from(height - 2)),
+                per_line: 1,
+                height,
+            })
+    }
+
+    /// A dragged strip's packing measures only the counts that can fit (the
+    /// first entries side by side bound them) instead of re-running the
+    /// packer's whole search for every candidate: the plan is the same for
+    /// every fixture — few and many models, names short and long, narrow
+    /// and wide terminals, every drag height up to 12 — and a strip of 200
+    /// models, dragged tall, plans and draws every entry it says it shows.
+    #[test]
+    fn dragged_strip_packing_keeps_its_plan_with_the_bounded_search() {
+        let models = |n: usize| -> Vec<ModelUsageDoc> {
+            (0..n)
+                .map(|i| {
+                    let group = ["claude", "codex", "grok", "gemini"][i % 4];
+                    let name = format!("m{i}-{}", "x".repeat((i * 7) % 23));
+                    model_row(group, &name, 1_000_000 - i as u64 * 997, 500 + i as u64)
+                })
+                .collect()
+        };
+        let mut packed = 0;
+        for n in [1usize, 2, 3, 5, 9, 17, 33] {
+            let view = view_with(models(n));
+            for width in [80u16, 120, 152, 179, 220, 300, 400] {
+                for height in PANE_MIN_HEIGHT..=12 {
+                    let plan = strip_plan(&view, width, Some(height));
+                    assert_eq!(
+                        plan,
+                        strip_plan_full_search(&view, width, height),
+                        "{n} models, {width} wide, {height} tall"
+                    );
+                    packed += usize::from(plan.per_line >= 2);
+                }
+            }
+        }
+        assert!(packed > 50, "the fixtures pack: {packed}");
+        // The line width the plan measures is the packer's own.
+        let view = view_with(models(17));
+        let widths: Vec<Vec<usize>> = strip_entries(&view, 17, UNIX_EPOCH, 0)
+            .iter()
+            .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+            .collect();
+        for room in [60usize, 151, 219, 399] {
+            let ours = (2..=17)
+                .rev()
+                .find(|&k| strip_line_width(&widths, k) <= room)
+                .unwrap_or(1);
+            assert_eq!(
+                Some(ours).filter(|&k| k >= 2),
+                packed_grid::per_line(&widths, &[], room, 2)
+            );
+            if ours >= 2 {
+                assert!(strip_most_per_line(&widths, room) >= ours, "{room}");
+            }
+        }
+
+        let view = view_with(models(200));
+        let plan = strip_plan(&view, 400, Some(12));
+        assert!(plan.per_line >= 2, "{plan:?}");
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(12);
+        let (rows, hits) = render_with_hits(&view, &chrome, 400, 60);
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains(&format!(" models — top {} of 200 by tokens", plan.shown)),
+            "{plan:?}\n{frame}"
+        );
+        let entries = hits
+            .hits
+            .iter()
+            .filter(|(_, t)| matches!(t, ClickTarget::StripEntry { .. }))
+            .count();
+        assert_eq!(entries, plan.shown, "{frame}");
     }
 
     /// Rule 4, pure: the largest per-line count whose aligned line fits,
