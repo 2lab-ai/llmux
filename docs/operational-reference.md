@@ -76,7 +76,9 @@ the top-right corner, under the tab row — `fail` in its border,
 `✗ refresh: 1 ok, 5 FAILED`, then one line per failed account with its error
 and `+N more` past four lines. The card stays for 8 seconds (5 for a
 warning); a newer card replaces it, and at 64 columns or fewer it is a
-one-row banner instead.
+one-row banner instead. A left click on the card takes it down, and the row
+under it never gets that click; the card sits under modals, confirmation
+cards, the login picker and the footer, so it never hides a live prompt.
 
 A label that waits on a load — `loading sessions…` and then the title's
 `loading… N%` in the sessions tab, `· loading…` in the keys title,
@@ -248,8 +250,11 @@ rules: table rows, gauges and the popups' box borders draw as before.
   room for every name, the state's word — `✗ error 401` (auth failed),
   `◌ 7d spent` / `5h spent` (over a ceiling until the window resets),
   `◉ cooling 45m10s` (parked by a cooldown), `⠋ active` (the scheduler's
-  current account; the glyph turns), `◦ ok` (eligible), `ǁ paused` and
-  `? stale` (usage too old to trust). Every glyph is one cell wide, CJK
+  current account; the glyph turns, and holds still under
+  `LLMUX_REDUCED_MOTION`), `◦ ok` (eligible), `ǁ paused` and
+  `? stale` (usage too old to trust). The name is the table's short one
+  (no provider); two entries that would read the same — one email under
+  two providers — show their provider (`codex:me@example.com`). Every glyph is one cell wide, CJK
   terminals included, so states differ by shape under `NO_COLOR` too. The
   rows keep the table's order and run down, then across in as many
   columns as fit (at least 14 cells each). The title keeps the sort and
@@ -309,7 +314,7 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 ### Usage tab (calendar usage + cost)
 
-The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; when the rows overflow, a scrollbar in the table's last column shows where you are (it counts rows: a bucket row plus one per model) — click the track to jump, drag the thumb to scroll, and the table lands on the first bucket at or after that row; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
+The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. The table scrolls by row (a bucket row plus one per model): `j`/`k` (or arrows, the mouse wheel) step to the next or previous bucket, at most a page at a time, so a bucket taller than the screen is read a page at a time; `PgUp`/`PgDn` move a page and `Home`/`End` jump to the top and to the last model. When the rows overflow, a scrollbar in the table's last column shows where you are (it counts the same rows) — click the track to jump, drag the thumb to scroll, and the table lands on that row; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
 ### Logs tab
 
@@ -329,9 +334,13 @@ dragging past the top or bottom edge scrolls). Releasing copies the
 selection — exactly the cells shown, one line per row — through the same
 clipboard path as the raw viewer's copy buttons (`pbcopy`/`wl-copy`/`xclip`/
 `xsel`, else OSC 52, wrapped for tmux or GNU screen), and the status line
-confirms it (`copied 2 lines → pbcopy`). While a selection is shown the
-pager holds still instead of following (`held for the selection — End
-follows`); a plain click clears it, and `End` follows again.
+confirms it (`copied 2 lines → pbcopy`). From the press until the
+selection is gone the pager keeps the lines it showed at the press — new
+lines, or the ring dropping its oldest, change nothing under the pointer,
+so the copy is the text you saw. While a selection is shown the pager holds
+still instead of following (`held for the selection — End follows`); a
+plain click clears it, and `End` (or scrolling to the last line) drops it
+and follows the live lines again.
 
 ### Copy mode
 
@@ -345,7 +354,9 @@ released for selecting; press v/Esc to return`; the status line above it
 keeps its message. While copy mode is on the screen holds still (it redraws
 only on a resize) and every key but `v`/`Esc` is ignored, so nothing moves
 under the selection; `v` or `Esc` takes the mouse back and the dashboard
-carries on where it was. `Ctrl-C` still quits.
+carries on where it was. Its clock stands still meanwhile, so a message card
+that was up (or arrived) during copy mode is still there to read on the way
+back. `Ctrl-C` still quits.
 
 ### Perf tab (observed performance)
 

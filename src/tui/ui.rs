@@ -99,8 +99,115 @@ const HEATMAP_MAX_ROWS: usize = 8;
 /// Width of the heatmap's token-intensity mini-bar.
 const HEATMAP_BAR_WIDTH: usize = 12;
 
+/// Every colour the dashboard draws, in one place. Drawing code names a
+/// [`THEME`] field for what a colour MEANS — `ok`/`warn`/`crit` for how far
+/// into the red a value is, `run`/`wait`/`done`/`fail` for the state of a
+/// request or an account, `accent` for "look here", `muted` for the quiet
+/// parts — or, when a hue tells one thing from its peers rather than how it
+/// is doing (a provider, a chart series, a kind of message), one of the
+/// categorical consts below. No `Color::` literal lives outside this module
+/// (`colour_literals_live_only_in_the_palette` fails on one). Under
+/// `NO_COLOR` the frame loop's `decolor` pass strips all of them; meaning
+/// that must survive it is carried by weight and glyphs.
+mod palette {
+    use ratatui::style::Color;
+
+    /// The dashboard's one theme: llmux's own spans and every twolab-tui
+    /// widget (key bars, confirm gates, pickers, meters) draw with it. ANSI
+    /// colours, so the terminal's palette decides the hues, with labels
+    /// (`text_secondary`) in the terminal's default foreground — as before
+    /// the move to KeyHints — because ANSI grey labels are near-invisible on
+    /// a light-background terminal. Its `selected()` is reverse video, which
+    /// reads with and without colour ([`super::selected_style`]).
+    pub(super) const THEME: twolab_tui::Theme = twolab_tui::Theme {
+        text_secondary: Color::Reset,
+        ..twolab_tui::Theme::ansi()
+    };
+
+    /// The theme both trend charts draw with (tokens per day, perf t/s). The
+    /// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank,
+    /// so this carries the hues the charts always had — magenta, cyan,
+    /// yellow, green, distinct on dark terminals. Under `NO_COLOR` the charts
+    /// draw with [`twolab_tui::Theme::mono`] instead ([`super::chart_theme`]),
+    /// where a glyph at every sample (`* + x o`, also in the legend) tells
+    /// the series apart.
+    pub(super) const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
+        accent: Color::Magenta,
+        wait: Color::Cyan,
+        done: Color::Yellow,
+        fail: Color::Green,
+        ..THEME
+    };
+
+    // Backend groups: one hue per provider, the same in the tables, the
+    // activity log, the in-flight spinners and the settings bar — it says
+    // which provider, never how it is doing.
+    /// The claude group.
+    pub(super) const CLAUDE: Color = Color::Magenta;
+    /// The codex group.
+    pub(super) const CODEX: Color = Color::Cyan;
+    /// The grok group.
+    pub(super) const GROK: Color = Color::Yellow;
+    /// The gemini group.
+    pub(super) const GEMINI: Color = Color::LightBlue;
+    /// The openrouter group.
+    pub(super) const OPENROUTER: Color = Color::Green;
+    /// Truecolor anchor of the claude family's headline-model gradient (the
+    /// `tui_gradient.claude` default; magenta's family).
+    pub(super) const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
+    /// Truecolor anchor of the codex family's headline-model gradient (the
+    /// `tui_gradient.codex` default; cyan's family).
+    pub(super) const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
+
+    // Effort badges in the activity log: each high effort its own static hue.
+    /// `xhigh`: light red, apart from every group hue and from `crit`.
+    pub(super) const EFFORT_XHIGH: Color = Color::LightRed;
+    /// `max` with the effects off (the rainbow marquee's still form).
+    pub(super) const EFFORT_MAX: Color = Color::LightMagenta;
+
+    // Message kinds in the activity log.
+    /// The mechanical control turns (`compact`, `summary`, `recap`): a quiet
+    /// hue that still reads apart from the dim noise kinds.
+    pub(super) const KIND_CONTROL: Color = Color::Blue;
+    /// `subagent` / `sdk` turns (drawn dim over it).
+    pub(super) const KIND_SUBAGENT: Color = Color::Cyan;
+
+    /// Background of an activity row that came in on the OpenAI endpoint: the
+    /// endpoint origin, told apart from the model's provider (AGENTS.md
+    /// "preserve endpoint origin").
+    pub(super) const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
+    /// Text on that row that has no colour of its own (the `user` tag, the
+    /// email): a light foreground, because the row's background is dark on
+    /// every terminal — the default foreground of a light terminal is near
+    /// black and would vanish on it.
+    pub(super) const OPENAI_ACTIVITY_FG: Color = Color::White;
+    /// The raw viewer's JSON keywords (`true`/`false`/`null`): the magenta
+    /// its users know (twolab-tui's default would be `run`).
+    pub(super) const JSON_KEYWORD: Color = Color::Magenta;
+    /// The expanded activity row's total cost: money green, the one figure
+    /// of the cost line that is a total.
+    pub(super) const COST_TOTAL: Color = Color::Green;
+    /// An active upstream event on the banner row: a hue no account state
+    /// uses, so the event never reads as a status.
+    pub(super) const EVENT: Color = Color::Magenta;
+    /// The header's `attached` marker: this dashboard draws another process's
+    /// daemon — a fact about the session, not a status.
+    pub(super) const ATTACHED: Color = Color::Magenta;
+}
+use palette::{CHART_THEME, THEME};
+
 fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(THEME.muted)
+}
+
+/// The one style of a selected row or item. llmux draws it on the cursor
+/// row of its own tables (accounts, models, sessions, perf); the twolab-tui
+/// widgets draw theirs with the same [`THEME`]`.selected()` — the compact
+/// list's focus, the fold's and the strip's cursor entry, the config, login
+/// and keys pickers, the menu. Reverse video on the ANSI theme: it needs no
+/// colour, so it reads the same under `NO_COLOR`.
+fn selected_style() -> Style {
+    THEME.selected()
 }
 
 thread_local! {
@@ -215,7 +322,7 @@ fn rule_fill(n: usize) -> String {
 fn share_bar(value: u64, max: u64, width: usize) -> twolab_tui::mini_bar::MiniBar {
     twolab_tui::mini_bar::MiniBar::new(value as f64, max as f64)
         .width(u16::try_from(width).unwrap_or(u16::MAX))
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
 }
 
 /// `text` clipped with `…` to at most `max` display cells (twolab-tui
@@ -237,9 +344,9 @@ fn pad_cells_left(text: &str, width: usize) -> String {
 
 fn level_color(level: GaugeLevel) -> Color {
     match level {
-        GaugeLevel::Green => Color::Green,
-        GaugeLevel::Yellow => Color::Yellow,
-        GaugeLevel::Red => Color::Red,
+        GaugeLevel::Green => THEME.ok,
+        GaugeLevel::Yellow => THEME.warn,
+        GaugeLevel::Red => THEME.crit,
     }
 }
 
@@ -269,9 +376,7 @@ const COST_COL_WIDTH: u16 =
 /// [`twolab_tui::ledger::Tier::Detail`] row (a per-model line under a total)
 /// is one tier dimmer throughout.
 fn cost_amount(usd: Option<f64>, tier: twolab_tui::ledger::Tier) -> twolab_tui::ledger::Amount {
-    twolab_tui::ledger::Amount::new(usd)
-        .tier(tier)
-        .theme(KEYBAR_THEME)
+    twolab_tui::ledger::Amount::new(usd).tier(tier).theme(THEME)
 }
 
 /// Everything a row/pane needs that is derived once per frame.
@@ -377,8 +482,10 @@ pub(crate) fn draw(
 
     // MAIN is the wall-clock view: ALWAYS drawn first, every frame, so it keeps
     // updating underneath any overlay (issue #5). Local and attach render from
-    // the same `DashboardView`, so this path is never forked.
-    draw_main(frame, view, &ctx, chrome, now, hits);
+    // the same `DashboardView`, so this path is never forked. Its record
+    // starts this frame's click targets; every surface drawn after it
+    // pushes its own on top.
+    let main = hits.insert(draw_main(frame, view, &ctx, chrome, now));
 
     // A summoned overlay (if any) is then drawn OVER MAIN. Each overlay clears
     // its own rect with `Clear` so MAIN shows through only outside it; because
@@ -387,52 +494,65 @@ pub(crate) fn draw(
     // shares the same top edge: right under the tab bar, banner-aware.
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
     let mut usage_scope = None;
+    // An overlay covers MAIN's click targets under it before it records
+    // its own on top.
+    if chrome.overlay != Overlay::None {
+        main.hits
+            .push(overlay_area, ClickTarget::Surface(Surface::Overlay));
+    }
     match chrome.overlay {
         Overlay::None => {}
         // The overlay draws the SAME accounts table as MAIN over the top of
-        // it, so its row rects replace MAIN's as this frame's click targets
+        // it, so its row rects cover MAIN's as this frame's click targets
         // (.prd/19 rule 6 — a row click must work on both surfaces).
         Overlay::Accounts => {
             let rows = draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.account_rows = rows;
-            }
+            main.hits.extend(rows);
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => {
             let bar;
             (usage_scope, bar) = draw_usage_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.table_scroll = bar;
-            }
+            main.record_table_scroll(bar);
         }
         Overlay::Logs => {
             let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.logs = Some(pos);
-                hits.logs_area = Some(overlay_area);
-            }
+            main.hits.push(overlay_area, ClickTarget::LogsPager);
+            main.logs = Some(pos);
+            main.logs_area = Some(overlay_area);
+            main.logs_lines = Some(
+                chrome
+                    .logs_frozen
+                    .clone()
+                    .unwrap_or_else(|| view.logs.as_slice().into()),
+            );
         }
-        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
+        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, main),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
+        Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, main),
         Overlay::Keys => {
             let bar = draw_keys_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.table_scroll = bar;
-            }
+            main.record_table_scroll(bar);
         }
     }
+
+    // Status messages with several facts float over MAIN and any overlay,
+    // in the corner under the tab row — and under every modal, gate and
+    // picker drawn after them, so a toast never covers a question that is
+    // still waiting for its answer (a short terminal stacks them). Each
+    // toast drawn is a click target over what lies beneath it.
+    let toasts = draw_toasts(frame, overlay_area, chrome, ctx.mask);
+    main.hits.extend(toasts);
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
     // centered, scrollable full-text box. Its max-scroll (or a close signal
     // when the entry aged out) rides back on the hit record so the runtime can
     // clamp/close. Drawn before the footer so the `q`/`esc` hint stays visible.
     if let Some(modal) = &chrome.input_modal {
-        let layout = draw_input_modal(frame, view, modal);
-        if let Some(hits) = hits.as_mut() {
-            hits.input_modal = layout;
+        main.input_modal = draw_input_modal(frame, view, modal);
+        if let Some(layout) = &main.input_modal {
+            push_modal(&mut main.hits, frame.area(), layout);
         }
     }
 
@@ -440,10 +560,15 @@ pub(crate) fn draw(
     // footer — same layering contract as the input modal (the two are never
     // open at once: each swallows the clicks that could open the other).
     if let Some(modal) = &chrome.raw_modal {
-        let raw_chrome = draw_raw_modal(frame, modal, chrome.clock, chrome.motion);
-        if let Some(hits) = hits.as_mut() {
-            hits.raw_modal = Some(raw_chrome);
+        // The viewer holds the whole screen; its tabs, buttons and scrollbar
+        // are pushed on top as it draws them.
+        main.hits
+            .push(frame.area(), ClickTarget::Surface(Surface::Modal));
+        let raw = draw_raw_modal(frame, modal, chrome.clock, chrome.motion, &mut main.hits);
+        if let Some(bar) = raw.bar {
+            main.hits.push(bar.track, ClickTarget::RawScrollbar);
         }
+        main.raw_modal = Some(raw);
     }
 
     // The account detail modal (.prd/19 rules 6–7) layers exactly like the
@@ -451,19 +576,16 @@ pub(crate) fn draw(
     // max-scroll (or the close signal for a vanished account) riding back on
     // the hit record.
     if let Some(modal) = &chrome.account_modal {
-        let layout = draw_account_modal(frame, view, &ctx, chrome, modal);
-        if let Some(hits) = hits.as_mut() {
-            hits.account_modal = layout;
+        main.account_modal = draw_account_modal(frame, view, &ctx, chrome, modal);
+        if let Some(layout) = &main.account_modal {
+            push_modal(&mut main.hits, frame.area(), layout);
         }
     }
 
     // A confirm gate (remove / reset / config) or the new-login picker
     // stands on the footer, over whichever surface opened it.
-    draw_gate(frame, view, &ctx, chrome);
-    draw_login_picker(frame, chrome);
-    // Status messages with several facts float over everything but the
-    // footer, in the corner under the tab row.
-    draw_toasts(frame, overlay_area, chrome, ctx.mask);
+    draw_gate(frame, view, &ctx, chrome, &mut main.hits);
+    draw_login_picker(frame, chrome, &mut main.hits);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -475,9 +597,7 @@ pub(crate) fn draw(
     };
     frame.render_widget(Clear, footer_area);
     let footer_field = draw_footer(frame, footer_area, chrome, ctx.mask);
-    if let Some(hits) = hits.as_mut() {
-        hits.field_width = hits.field_width.or(footer_field);
-    }
+    main.field_width = main.field_width.or(footer_field);
     // Usage context uses only the spare status row; flashes and modal chrome win.
     if chrome
         .status_line
@@ -533,18 +653,18 @@ fn event_banner_line(
     Some(Line::from(vec![
         Span::styled(
             event.content.clone(),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::new().fg(palette::EVENT).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
         Span::styled("until ", dim()),
         Span::styled(
             format::month_day_hm(to, offset),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ),
         sep,
         Span::styled(
             format!("{} left", format::remaining_hms(remaining)),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.warn).add_modifier(Modifier::BOLD),
         ),
     ]))
 }
@@ -555,8 +675,7 @@ fn draw_main(
     ctx: &FrameCtx,
     chrome: &Chrome,
     now: SystemTime,
-    hits: &mut Option<MainChrome>,
-) {
+) -> MainChrome {
     let snapshot = &view.snapshot;
     // Event banner (config `events`): ONE line pinned to the very top while an
     // event is active; zero height (no reserved row) when none is active
@@ -670,7 +789,33 @@ fn draw_main(
             pane_top: middle_area.y,
         });
     }
-    let settings = draw_group_settings(frame, groups_area, view);
+    // The click targets in paint order: each pane's own, then the borders
+    // between them (the whole row), then the settings bar.
+    let mut map = Hits::new();
+    map.extend(tabs);
+    map.extend(account_rows);
+    // Each entry carries the model it showed, not its place: the view may
+    // re-sort before the click lands.
+    map.extend(models_strip.into_iter().filter_map(|h| {
+        let m = view.model_usage.get(h.index)?;
+        Some((
+            h.rect,
+            ClickTarget::StripEntry {
+                group: m.group.clone(),
+                model: m.model.clone(),
+            },
+        ))
+    }));
+    map.extend(activity);
+    map.extend(separators.into_iter().map(|sep| {
+        let row = Rect {
+            y: sep.y,
+            height: 1,
+            ..area
+        };
+        (row, ClickTarget::Separator(sep))
+    }));
+    map.extend(draw_group_settings(frame, groups_area, view));
     // The context menu (UI-3 U11) draws last so it floats over every pane.
     // Its bounds stop above the footer, which `draw` paints over everything.
     let menu_bounds = Rect {
@@ -681,27 +826,23 @@ fn draw_main(
         .menu_anchor
         .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
         .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
-    *hits = Some(MainChrome {
-        activity,
-        tabs,
-        separators,
-        account_rows,
-        models_strip,
-        menu,
-        sessions_table: None,
-        config_rows: Vec::new(),
-        settings,
-        // Filled in by `draw` after the modal (if any) renders over MAIN.
-        input_modal: None,
-        account_modal: None,
-        logs: None,
-        logs_area: None,
-        table_scroll: None,
-        raw_modal: None,
-        field_width: None,
-    });
+    // The popup lies over every pane; a click on it off its runnable items
+    // (a dim item, a separator, the border) lands on the popup itself.
+    if let Some(menu) = menu {
+        map.push(menu.area, ClickTarget::Surface(Surface::Menu));
+        map.extend(
+            menu.items
+                .into_iter()
+                .map(|item| (item.rect, ClickTarget::MenuItem(item.index))),
+        );
+    }
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
-    // last (over any overlay). Keep MAIN's bottom row clear here.
+    // last (over any overlay). Keep MAIN's bottom row clear here. The rest
+    // of the record is filled in by `draw` as overlays and modals render.
+    MainChrome {
+        hits: map,
+        ..MainChrome::default()
+    }
 }
 
 /// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
@@ -716,13 +857,17 @@ fn draw_main(
 /// and `+N` says how many went. The click rects come from
 /// `StatusBar::hits`, so a click lands on the value that is drawn there,
 /// measured in cells (a wide model name included).
-fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+fn draw_group_settings(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::status_bar::{Segment, StatusBar};
     if area.height == 0 {
         return Vec::new();
     }
     let groups = settings_groups(view);
-    let bar = StatusBar::new(KEYBAR_THEME)
+    let bar = StatusBar::new(THEME)
         .style(dim())
         .separator("  │  ")
         .count_dropped(true)
@@ -753,10 +898,10 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
                 .min(rect.right());
             if let Some(action) = *action {
                 if right > x {
-                    hits.push(SettingHit {
-                        area: Rect::new(x, rect.y, right - x, 1),
-                        action,
-                    });
+                    hits.push((
+                        Rect::new(x, rect.y, right - x, 1),
+                        ClickTarget::Setting(action),
+                    ));
                 }
             }
             x = right;
@@ -777,7 +922,7 @@ struct SettingsGroup {
 /// each backend group that is present.
 fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
     let clickable = Style::new()
-        .fg(Color::Cyan)
+        .fg(THEME.accent)
         .add_modifier(Modifier::UNDERLINED);
     let plain = |text: String, style: Style| (Span::styled(text, style), None);
     let click = |text: String, action: SettingAction| (Span::styled(text, clickable), Some(action));
@@ -859,7 +1004,7 @@ fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
 /// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
 /// Draw the tab strip; returns the click targets and the cells left free at
 /// the right end (after any `N›` scroll marker) for the header tail.
-fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, usize) {
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<(Rect, ClickTarget)>, usize) {
     // The documented hint rule (operational-reference "Tab shortcut hints"):
     // at 140 columns or more, MAIN shows every tab's key; inside an overlay
     // only `[Esc] dashboard` keeps one (overlay keys mean other things there).
@@ -875,16 +1020,13 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, us
     let active_i = TABS.iter().position(|(_, o)| *o == active).unwrap_or(0);
     let strip = twolab_tui::tabs::Tabs::new(tabs)
         .active(active_i)
-        .theme(twolab_tui::Theme::ansi())
+        .theme(THEME)
         .hints(twolab_tui::tabs::Hints::Bracket);
     let layout = strip.render_layout(area, frame.buffer_mut());
     let hits = layout
         .hits
         .into_iter()
-        .map(|h| TabHit {
-            area: h.rect,
-            overlay: TABS[h.index].1,
-        })
+        .map(|h| (h.rect, ClickTarget::Tab(TABS[h.index].1)))
         .collect();
     (hits, layout.room)
 }
@@ -917,7 +1059,7 @@ fn draw_accounts_overlay(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     // `v`: the compact list — a title row and a row per account.
@@ -934,7 +1076,7 @@ fn draw_accounts_overlay(
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, detail_area, " detail ");
         frame.render_widget(empty, body);
@@ -1011,20 +1153,6 @@ const DAILY_CHART_HEIGHT: u16 = 13;
 /// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
 /// overlay — UI-3 U14 period selection).
 pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
-
-/// The theme both trend charts draw with (tokens per day, perf t/s). The
-/// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank, so
-/// this carries the hues the charts always had — magenta, cyan, yellow,
-/// green, distinct on dark terminals. Under `NO_COLOR` the charts draw with
-/// [`twolab_tui::Theme::mono`] instead ([`chart_theme`]), where a glyph at
-/// every sample (`* + x o`, also in the legend) tells the series apart.
-const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
-    accent: Color::Magenta,
-    wait: Color::Cyan,
-    done: Color::Yellow,
-    fail: Color::Green,
-    ..KEYBAR_THEME
-};
 
 /// [`CHART_THEME`], or mono under `NO_COLOR` — the frame loop's `decolor`
 /// pass alone would leave four identical lines.
@@ -1131,12 +1259,12 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
         .take(CLIENT_PANEL_ROWS)
         .map(|c| {
             let ok_err = Line::from(vec![
-                Span::styled(format::human_count(c.ok), Style::new().fg(Color::Green)),
+                Span::styled(format::human_count(c.ok), Style::new().fg(THEME.done)),
                 Span::raw("/"),
                 Span::styled(
                     format::human_count(c.errors),
                     if c.errors > 0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.fail)
                     } else {
                         dim()
                     },
@@ -1189,7 +1317,8 @@ fn heatmap_panel_height(
 /// overrides are the single source of truth — see `UsageStatDoc`); this
 /// renderer only filters by the selected granularity, groups consecutive
 /// rows by bucket, and draws a bold per-bucket total row above the per-model
-/// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
+/// rows (cost desc). `usage_scroll` is the table row at the top, counting
+/// bucket and model rows alike, up to [`usage_max_top`].
 fn draw_usage_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -1221,10 +1350,7 @@ fn draw_usage_overlay(
         } else {
             "no buckets in this granularity's window — `g` switches granularity"
         };
-        let empty = Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::new().fg(Color::Yellow),
-        )));
+        let empty = Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(THEME.warn))));
         let body = section(
             frame,
             area,
@@ -1267,17 +1393,19 @@ fn draw_usage_overlay(
         .flat_map(|(_, _, g)| g.iter())
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
-    let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
-    // The scrollbar counts table rows (a bucket row plus one per model), so
-    // its thumb is the share of rows in view; `scroll` stays in buckets.
-    let rows_total: usize = buckets.iter().map(|(_, _, g)| 1 + g.len()).sum();
-    let rows_above: usize = buckets
-        .iter()
-        .take(scroll)
-        .map(|(_, _, g)| 1 + g.len())
-        .sum();
+    // The table scrolls by row (a bucket row plus one per model), so every
+    // model of a bucket taller than the screen can be brought into view;
+    // the scrollbar counts the same rows.
+    let (starts, rows_total) = usage_rows(view, gran);
     let body_h = usize::from(area.height.saturating_sub(2)); // rule + header
-    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, rows_above);
+    let top = chrome
+        .usage_scroll
+        .min(usage_max_top(&starts, rows_total, body_h));
+    // The bucket the top row belongs to (the footer's scope names it).
+    let top_bucket = starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, top);
     let (label, n) = (gran.label(), buckets.len());
     let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
@@ -1303,13 +1431,16 @@ fn draw_usage_overlay(
     };
 
     let mut trows: Vec<Row> = Vec::new();
-    for (_, label, group) in buckets.iter().skip(scroll) {
+    for ((_, label, group), &start) in buckets.iter().zip(&starts).skip(top_bucket) {
         // The table widget truncates below the fold, so building rows past
         // the visible area is pure waste — bound the construction to the
         // screen (review CR: 180 daily buckets × models per frame otherwise).
         if trows.len() > area.height as usize {
             break;
         }
+        // Rows of this bucket above the top one (only the first bucket's).
+        let skip = top.saturating_sub(start);
+        let mut bucket_rows: Vec<Row> = Vec::with_capacity(1 + group.len());
         // ONE accumulator pass per bucket (review CR): six parallel `.sum()`
         // sweeps were six lines nothing forced to stay in step with the
         // columns rendered below them.
@@ -1333,7 +1464,7 @@ fn draw_usage_overlay(
                     )
                 },
             );
-        trows.push(
+        bucket_rows.push(
             Row::new(vec![
                 Cell::from(*label),
                 Cell::from(Span::styled(format!("{} models", group.len()), dim())),
@@ -1358,7 +1489,7 @@ fn draw_usage_overlay(
                 .then_with(|| usage_row_tokens(b).cmp(&usage_row_tokens(a)))
         });
         for m in models {
-            trows.push(Row::new(vec![
+            bucket_rows.push(Row::new(vec![
                 Cell::from(""),
                 Cell::from(Span::styled(
                     format!("{}/{}", m.group, m.model),
@@ -1375,6 +1506,7 @@ fn draw_usage_overlay(
                 usage_cost_cell(usage_cost_valid(m), UsageCostTier::Detail, ""),
             ]));
         }
+        trows.extend(bucket_rows.into_iter().skip(skip));
     }
 
     let header = vec![
@@ -1396,13 +1528,48 @@ fn draw_usage_overlay(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
     frame.render_widget(table, table_area);
     let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
-    let scope = buckets.get(scroll).map(|(_, label, _)| {
+    let scope = buckets.get(top_bucket).map(|(_, label, _)| {
         format!(
             "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
             gran.label()
         )
     });
     (scope, bar)
+}
+
+/// The usage table's rows for granularity `gran`, as the overlay draws them
+/// — a bucket row, then one row per model, newest bucket first (the
+/// document keeps a bucket's rows adjacent): the row each bucket starts on,
+/// and how many rows there are in all.
+pub(crate) fn usage_rows(
+    view: &DashboardView,
+    gran: crate::tui::activity::UsageGran,
+) -> (Vec<usize>, usize) {
+    let mut starts = Vec::new();
+    let (mut rows, mut last) = (0usize, None);
+    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
+        if last != Some(r.bucket) {
+            starts.push(rows);
+            rows += 1;
+            last = Some(r.bucket);
+        }
+        rows += 1;
+    }
+    (starts, rows)
+}
+
+/// The furthest top row of the usage table with `viewport` rows on screen.
+/// A table taller than the screen ends where its last model reaches the
+/// last row — the bound its scrollbar measures, so a key, the wheel, End
+/// and a drag agree on where the end is. A table that fits (no scrollbar)
+/// can still bring its last bucket's own row to the top, so the footer's
+/// scope can name any bucket.
+pub(crate) fn usage_max_top(starts: &[usize], total: usize, viewport: usize) -> usize {
+    if total > viewport {
+        total - viewport
+    } else {
+        starts.last().copied().unwrap_or(0)
+    }
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -1457,16 +1624,16 @@ const USAGE_COST_COL_WIDTH: u16 = (1 + USAGE_COST_INT_WIDTH as u16) + 1 + 4 + 2;
 ///   legible), dollar-plus amounts keep 2 — the point column never moves.
 fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell<'static> {
     let (int_style, frac_style) = match tier {
-        UsageCostTier::Total => (Style::new(), Style::new().fg(Color::DarkGray)),
+        UsageCostTier::Total => (Style::new(), Style::new().fg(THEME.muted)),
         UsageCostTier::Detail => (
-            Style::new().fg(Color::DarkGray),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::new().fg(THEME.muted),
+            Style::new().fg(THEME.muted).add_modifier(Modifier::DIM),
         ),
     };
     // The `$` sign sits at the QUIETEST tier — never louder than the
     // fraction (on Detail rows the fraction is already at the floor, so
     // they share it).
-    let sign_style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    let sign_style = Style::new().fg(THEME.muted).add_modifier(Modifier::DIM);
     // No rate known — or an INVALID amount (negative / non-finite, reachable
     // through a pathological config `pricing` override) — renders as the
     // explicit dash: invalid data must never dress up as a credible $0
@@ -1556,7 +1723,7 @@ fn draw_table_scrollbar(
 ) -> Option<TableScroll> {
     twolab_tui::scrollbar::thumb(pos, track)?;
     frame.render_widget(
-        twolab_tui::scrollbar::Scrollbar::new(pos).theme(KEYBAR_THEME),
+        twolab_tui::scrollbar::Scrollbar::new(pos).theme(THEME),
         track,
     );
     Some(TableScroll { pos, track })
@@ -1578,7 +1745,14 @@ fn draw_logs_overlay(
     use twolab_tui::scrollbar::ScrollPos;
 
     frame.render_widget(Clear, area);
-    let pager = logs_pager(view, chrome.logs_scroll, chrome.logs_selection);
+    // Held at a press on the pager until its selection is gone.
+    let lines = chrome.logs_frozen.as_deref().unwrap_or(&view.logs);
+    let pager = logs_pager(
+        lines,
+        view.email_anonymous,
+        chrome.logs_scroll,
+        chrome.logs_selection,
+    );
     frame.render_widget(&pager, area);
     // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
     let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
@@ -1590,19 +1764,22 @@ fn draw_logs_overlay(
     )
 }
 
-/// The Logs overlay's pager over this frame's log ring — the one build the
-/// draw and the mouse share, so a drag lands on the cells the person saw.
-/// `scroll` is `chrome.logs_scroll` (`None` follows the tail); `selection`
-/// is the drag-selected stretch, drawn reversed (it shows under `NO_COLOR`
-/// too). A pager held for a selection says so in its title.
+/// The Logs overlay's pager over `logs` — this frame's log ring, or the
+/// lines held since a press on the pager — the one build the draw and the
+/// mouse share, so a drag lands on the cells the person saw. `mask` is the
+/// email-anonymous setting. `scroll` is `chrome.logs_scroll` (`None`
+/// follows the tail); `selection` is the drag-selected stretch, drawn
+/// reversed (it shows under `NO_COLOR` too). A pager held for a selection
+/// says so in its title.
 pub(crate) fn logs_pager(
-    view: &DashboardView,
+    logs: &[crate::logging::LogLine],
+    mask: bool,
     scroll: Option<usize>,
     selection: Option<twolab_tui::pager::Selection>,
 ) -> twolab_tui::pager::Pager {
     use twolab_tui::pager::Pager;
 
-    let lines: Vec<Line<'static>> = if view.logs.is_empty() {
+    let lines: Vec<Line<'static>> = if logs.is_empty() {
         // Say so instead of a blank pane (the same in attach mode, where the
         // lines come from the daemon's document).
         vec![
@@ -1613,12 +1790,9 @@ pub(crate) fn logs_pager(
             )),
         ]
     } else {
-        view.logs
-            .iter()
-            .map(|line| log_line(line, view.email_anonymous))
-            .collect()
+        logs.iter().map(|line| log_line(line, mask)).collect()
     };
-    let n = view.logs.len();
+    let n = logs.len();
     let count = if n == 1 {
         "1 line".to_string()
     } else {
@@ -1633,7 +1807,7 @@ pub(crate) fn logs_pager(
     };
     let mut pager = Pager::new(title, lines)
         .hints(false)
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .scroll_to(scroll.unwrap_or(usize::MAX));
     pager.set_selection(selection);
     pager
@@ -1650,7 +1824,7 @@ fn draw_sessions_overlay(
     area: Rect,
     ctx: &FrameCtx,
     chrome: &Chrome,
-    hits: &mut Option<MainChrome>,
+    main: &mut MainChrome,
 ) {
     frame.render_widget(Clear, area);
     // The load runs on the blocking pool and streams progressive partials. Show
@@ -1661,7 +1835,7 @@ fn draw_sessions_overlay(
     // stay visible (with the loading title) until the first fresh partial lands.
     if chrome.sessions_loading && chrome.sessions.is_empty() {
         let glyph = SpinnerKind::Braille.glyph(loading_spin(chrome.frame, chrome.motion));
-        let mut spans = vec![Span::styled(format!("{glyph} "), KEYBAR_THEME.accent())];
+        let mut spans = vec![Span::styled(format!("{glyph} "), THEME.accent())];
         spans.extend(loading_label(
             "loading sessions…",
             Style::new(),
@@ -1676,13 +1850,13 @@ fn draw_sessions_overlay(
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " sessions ");
         frame.render_widget(empty, body);
         return;
     }
-    let (table_chrome, bar) = if area.width >= SIDE_BY_SIDE_AT {
+    let (rows, bar) = if area.width >= SIDE_BY_SIDE_AT {
         let [list_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
         let tc = draw_sessions_table(frame, list_area, ctx, chrome);
@@ -1691,10 +1865,8 @@ fn draw_sessions_overlay(
     } else {
         draw_sessions_table(frame, area, ctx, chrome)
     };
-    if let Some(hits) = hits.as_mut() {
-        hits.sessions_table = table_chrome;
-        hits.table_scroll = bar;
-    }
+    main.hits.extend(rows);
+    main.record_table_scroll(bar);
 }
 
 /// The session timeline table. Columns: confidence label, user_id, request
@@ -1706,7 +1878,7 @@ fn draw_sessions_table(
     area: Rect,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> (Option<SessionsChrome>, Option<TableScroll>) {
+) -> (Vec<(Rect, ClickTarget)>, Option<TableScroll>) {
     let total = chrome.sessions.len();
     let cursor = chrome.session_cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
@@ -1724,8 +1896,8 @@ fn draw_sessions_table(
         .map(|(i, s)| {
             let idx = start + i;
             let conf_color = match s.confidence {
-                crate::session::Confidence::High => Color::Green,
-                crate::session::Confidence::Low => Color::DarkGray,
+                crate::session::Confidence::High => THEME.ok,
+                crate::session::Confidence::Low => THEME.muted,
             };
             // Honest per-session output rate: Σtimed output / Σrecorded
             // request duration (never tokens over the wall-clock span —
@@ -1755,7 +1927,7 @@ fn draw_sessions_table(
             ];
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -1812,11 +1984,17 @@ fn draw_sessions_table(
         height: area.height.saturating_sub(2),
     };
     let _ = ctx;
-    let table_chrome = (rows_rect.height > 0).then_some(SessionsChrome {
-        rows: rows_rect,
-        start,
-    });
-    (table_chrome, bar)
+    let rows = (0..rows_rect.height)
+        .map(|k| {
+            let row = Rect {
+                y: rows_rect.y + k,
+                height: 1,
+                ..rows_rect
+            };
+            (row, ClickTarget::SessionsRow(start + usize::from(k)))
+        })
+        .collect();
+    (rows, bar)
 }
 
 /// Drill-down pane for the cursored session: the grouping confidence, the full
@@ -1853,7 +2031,7 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             Span::styled(
                 s.confidence.label(),
                 match s.confidence {
-                    crate::session::Confidence::High => Style::new().fg(Color::Green),
+                    crate::session::Confidence::High => Style::new().fg(THEME.ok),
                     crate::session::Confidence::Low => dim(),
                 },
             ),
@@ -2102,7 +2280,7 @@ fn draw_perf_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no perf data yet — collecting starts with this daemon version (metric v1); \
              send requests through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " perf ");
         frame.render_widget(empty, body);
@@ -2292,11 +2470,11 @@ fn draw_perf_health(
                     };
                     let err = a.err_pct();
                     let err_style = if err >= 10.0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.crit)
                     } else if err > 0.0 {
-                        Style::new().fg(Color::Yellow)
+                        Style::new().fg(THEME.warn)
                     } else {
-                        Style::new().fg(Color::Green)
+                        Style::new().fg(THEME.ok)
                     };
                     // Confidence is judged PER CELL on the stat's own sample
                     // count (e2e → tps_n, est → measured_n) — never on the
@@ -2379,7 +2557,7 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
             Cell::from(format!("{coverage:>7}")),
         ]);
         if idx == cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -2455,9 +2633,9 @@ impl KeyState {
 
     fn color(self) -> Color {
         match self {
-            Self::Active => Color::Green,
-            Self::Suspended => Color::Yellow,
-            Self::Revoked => Color::Red,
+            Self::Active => THEME.ok,
+            Self::Suspended => THEME.wait,
+            Self::Revoked => THEME.fail,
         }
     }
 }
@@ -2751,7 +2929,7 @@ fn draw_keys_overlay(
             Line::default(),
             Line::from(Span::styled(
                 format!("  keys usage unavailable: {err}"),
-                Style::new().fg(Color::Red),
+                Style::new().fg(THEME.fail),
             )),
             Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
@@ -2896,7 +3074,7 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
     let Some(picker) = &panel.picker else {
         return;
     };
-    let mut list = picker.list.clone().theme(KEYBAR_THEME);
+    let mut list = picker.list.clone().theme(THEME);
     list = if picker.filtering {
         list.placeholder("type to filter by name")
     } else {
@@ -2970,7 +3148,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
     // The build and daemon facts on a fact table: two columns when the pane
     // holds them — the build on the left, the daemon on the right — figures
     // right-aligned on their last digit, `—` for a size not measured yet.
-    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+    let facts = FactTable::new(THEME).max_columns(2).facts([
         Fact::new("llmux", view.display_version()),
         Fact::new("daemon pid", view.pid.to_string()),
         Fact::new("port", view.port.to_string()),
@@ -2981,7 +3159,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         Fact::maybe("activity log", bytes(f.activity_log_bytes)),
     ]);
     // A path, not a figure: its own row under the table.
-    let config = FactTable::new(KEYBAR_THEME).fact(Fact::maybe("config", view.config_path.clone()));
+    let config = FactTable::new(THEME).fact(Fact::maybe("config", view.config_path.clone()));
     let inner = section(frame, area, " misc — keys · build · daemon ");
     // The facts keep their rows at the bottom (a blank row, the table, the
     // config path); the key grid takes the rest and, when it does not fit,
@@ -2993,10 +3171,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         height: inner.height - facts_h,
         ..inner
     };
-    frame.render_widget(
-        KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
-        help_area,
-    );
+    frame.render_widget(KeyHelp::new(help_groups(chrome)).theme(THEME), help_area);
     let [_, table_area, config_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -3077,14 +3252,6 @@ impl ConfigAction {
             _ => None,
         }
     }
-}
-
-/// One clickable config value cell (config-editor v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConfigHit {
-    pub area: Rect,
-    pub row: usize,
-    pub action: ConfigAction,
 }
 
 /// How a config row applies (trinity contract C6 3-state honesty).
@@ -3607,7 +3774,7 @@ fn config_list(
         .row_display(RowDisplay::SingleLine)
         .max_rows(max_rows)
         .footer(Line::styled(CFG_LEGEND, dim()))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     select_at(&mut list, rest);
     list
 }
@@ -3722,7 +3889,7 @@ fn draw_config_overlay(
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
-    hits: &mut Option<MainChrome>,
+    main: &mut MainChrome,
 ) {
     frame.render_widget(Clear, area);
     let rows = config_rows(view, chrome);
@@ -3754,22 +3921,19 @@ fn draw_config_overlay(
     // (contract: click the control, not the whole row). The rows sit one per
     // line under the top spacer, from `start`.
     let col = config_value_column(&rows, &config_names(&rows, start), list_area.width);
-    let mut hit_rows: Vec<ConfigHit> = Vec::new();
+    let mut hit_rows: Vec<(Rect, ClickTarget)> = Vec::new();
     if col > 0 && usize::from(list_area.height) >= max_rows + 3 {
         let width = (config_value_width(&rows, col, list_area.width) as u16)
             .min(list_area.width.saturating_sub(col as u16));
         for (line, i) in (start..rows.len().min(start + max_rows)).enumerate() {
             if let Some(action) = rows[i].action {
-                hit_rows.push(ConfigHit {
-                    area: Rect {
-                        x: list_area.x + col as u16,
-                        y: list_area.y + 1 + line as u16,
-                        width,
-                        height: 1,
-                    },
-                    row: i,
-                    action,
-                });
+                let cell = Rect {
+                    x: list_area.x + col as u16,
+                    y: list_area.y + 1 + line as u16,
+                    width,
+                    height: 1,
+                };
+                hit_rows.push((cell, ClickTarget::ConfigRow { row: i, action }));
             }
         }
     }
@@ -3784,7 +3948,7 @@ fn draw_config_overlay(
         let width = room
             .saturating_sub(cells::width(&hint) as u16)
             .max(FIELD_MIN.min(room));
-        let mut spans = vec![Span::styled(lead, Style::new().fg(Color::Cyan))];
+        let mut spans = vec![Span::styled(lead, Style::new().fg(THEME.accent))];
         spans.extend(field_line(&chrome.field, "", width).spans);
         spans.push(Span::styled(hint, dim()));
         frame.render_widget(
@@ -3800,10 +3964,8 @@ fn draw_config_overlay(
         );
         field_width = Some(width);
     }
-    if let Some(hits) = hits.as_mut() {
-        hits.config_rows = hit_rows;
-        hits.field_width = field_width;
-    }
+    main.hits.extend(hit_rows);
+    main.field_width = field_width;
 }
 
 /// What the open context menu acts on (UI-3 U11): the PINNED account id
@@ -3889,7 +4051,7 @@ fn draw_context_menu(
     let menu = Menu::new(account_menu_items(target.ok().flatten()))
         .title(name)
         .anchor(anchor.0, anchor.1)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let mut state = MenuState {
         selected: item,
         ..MenuState::default()
@@ -3980,7 +4142,7 @@ fn draw_input_modal(
         .body(body)
         .footer(modal_scroll_hints())
         .fit_content(PopupSize::Percent(80), PopupSize::Percent(80))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let mut state = modal.state.clone();
     let area = frame.area();
     Some(popup.render(area, frame.buffer_mut(), &mut state))
@@ -4031,7 +4193,7 @@ impl ModalRow {
 fn modal_rows_lines(rows: Vec<ModalRow>, width: u16) -> Vec<Line<'static>> {
     use twolab_tui::status_card::StatusCard;
     const INDENT: usize = 1;
-    let mut card = StatusCard::new().indent(INDENT).theme(KEYBAR_THEME);
+    let mut card = StatusCard::new().indent(INDENT).theme(THEME);
     for row in &rows {
         card = match row {
             ModalRow::Field(label, value) => card.field(label.clone(), value.clone()),
@@ -4615,7 +4777,7 @@ fn draw_account_modal(
             .body(body)
             .footer(modal_scroll_hints())
             .fit_content(PopupSize::Percent(80), PopupSize::Percent(85))
-            .theme(KEYBAR_THEME)
+            .theme(THEME)
     };
     let area = frame.area();
     // The window cards lay out at the body's width, which the body decides:
@@ -4752,16 +4914,14 @@ fn line_bytes(line: &Line) -> usize {
 fn raw_section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("── {title} ──"),
-        Style::new()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
+        Style::new().fg(THEME.muted).add_modifier(Modifier::BOLD),
     ))
 }
 
 /// One `name: value` header line (name cyan, value plain — CDT's palette).
 fn raw_header_line(name: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{name}: "), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("{name}: "), Style::new().fg(THEME.accent)),
         Span::raw(value.to_string()),
     ])
 }
@@ -4793,11 +4953,11 @@ fn highlight_json_line(line: &str) -> Line<'static> {
 /// The raw viewer's JSON colours (keys cyan, strings green, numbers yellow,
 /// keywords magenta, punctuation dim), fed to twolab-tui's highlighter.
 const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view::JsonStyles {
-    key: Style::new().fg(Color::Cyan),
-    string: Style::new().fg(Color::Green),
-    number: Style::new().fg(Color::Yellow),
-    keyword: Style::new().fg(Color::Magenta),
-    punct: Style::new().fg(Color::DarkGray),
+    key: Style::new().fg(THEME.accent),
+    string: Style::new().fg(THEME.done),
+    number: Style::new().fg(THEME.warn),
+    keyword: Style::new().fg(palette::JSON_KEYWORD),
+    punct: Style::new().fg(THEME.muted),
 };
 
 /// Render a captured body as styled lines, one per source line (the viewer
@@ -4971,14 +5131,14 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
     };
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("{label:<12}"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{label:<12}"), Style::new().fg(THEME.accent)),
             Span::raw(value),
         ])
     };
     let status_color = if *status < 400 {
-        Color::Green
+        THEME.done
     } else {
-        Color::Red
+        THEME.fail
     };
     let model_label = match (group.as_deref(), model.as_deref()) {
         (Some(g), Some(m)) => format!("{g} {m}"),
@@ -4999,7 +5159,7 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
         raw_section("general"),
         field("request", format!("{method} {path}")),
         Line::from(vec![
-            Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{:<12}", "status"), Style::new().fg(THEME.accent)),
             Span::styled(status.to_string(), Style::new().fg(status_color)),
             Span::styled(
                 format!("  ·  {} elapsed", format::elapsed_secs(*duration)),
@@ -5098,7 +5258,7 @@ pub(crate) fn raw_content_from_record(
     // Last tab: the response llmux delivered to Claude Code.
     let mut lines = vec![raw_section("response")];
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("{:<12}", "status"), Style::new().fg(THEME.accent)),
         Span::raw(
             record
                 .status
@@ -5161,6 +5321,7 @@ fn draw_raw_modal(
     modal: &RawModal,
     clock: Duration,
     motion: twolab_tui::Motion,
+    hits: &mut Hits,
 ) -> RawModalChrome {
     let mut area = centered_rect(frame.area(), 94, 92);
     // Its bottom border carries the key legend: keep it above the two footer
@@ -5253,18 +5414,16 @@ fn draw_raw_modal(
                 x += 1;
             }
             let w = btn_w(*btn);
-            chrome.buttons.push((
-                *btn,
-                Rect {
-                    x,
-                    y: area.y,
-                    width: w,
-                    height: 1,
-                },
-            ));
+            let button = Rect {
+                x,
+                y: area.y,
+                width: w,
+                height: 1,
+            };
+            hits.push(button, ClickTarget::RawButton(*btn));
             spans.push(Span::styled(
                 format!(" {} ", btn.label()),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             x += w;
         }
@@ -5282,7 +5441,7 @@ fn draw_raw_modal(
     };
     let content = match &modal.state {
         RawModalState::Loading => {
-            let wait = Style::new().fg(KEYBAR_THEME.wait);
+            let wait = Style::new().fg(THEME.wait);
             let glyph = SpinnerKind::Braille.glyph(loading_spin(modal.spin, motion));
             let mut spans = vec![Span::styled(format!(" {glyph} "), wait)];
             spans.extend(loading_label(
@@ -5298,7 +5457,7 @@ fn draw_raw_modal(
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {msg}"),
-                    Style::new().fg(Color::Red),
+                    Style::new().fg(THEME.fail),
                 )))
                 .wrap(Wrap { trim: false }),
                 viewport,
@@ -5318,10 +5477,15 @@ fn draw_raw_modal(
             .map(|t| twolab_tui::tabs::Tab::new(t.label)),
     )
     .active(active)
-    .theme(twolab_tui::Theme::ansi())
+    .theme(THEME)
     .hints(twolab_tui::tabs::Hints::Off);
     let layout = strip.render_layout(Rect { height: 1, ..inner }, frame.buffer_mut());
-    chrome.tabs = layout.hits.iter().map(|h| (h.index, h.rect)).collect();
+    hits.extend(
+        layout
+            .hits
+            .iter()
+            .map(|h| (h.rect, ClickTarget::RawTab(h.index))),
+    );
 
     if viewport.height == 0 || viewport.width == 0 {
         return chrome;
@@ -5372,7 +5536,7 @@ fn draw_raw_body(
     cache.state.set_generation(generation);
     cache.state.scroll = modal.scroll;
     let lines = long.map_or(tab.lines.as_slice(), |l| l.lines.as_slice());
-    let view = JsonView::new(lines).hints(false).theme(KEYBAR_THEME);
+    let view = JsonView::new(lines).hints(false).theme(THEME);
     (&view).render(viewport, frame.buffer_mut(), &mut cache.state);
 
     let max = cache.state.max_scroll().unwrap_or(0);
@@ -5387,7 +5551,7 @@ fn draw_raw_body(
             height: viewport.height - 1,
             ..viewport
         };
-        frame.render_widget(Scrollbar::new(pos).theme(KEYBAR_THEME), track);
+        frame.render_widget(Scrollbar::new(pos).theme(THEME), track);
         chrome.bar = Some(TableScroll { pos, track });
     }
     // With long lines wrapped here the widget counted display lines; say the
@@ -5411,8 +5575,7 @@ fn draw_raw_body(
             };
             frame.render_widget(Clear, row);
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(at, KEYBAR_THEME.secondary())))
-                    .right_aligned(),
+                Paragraph::new(Line::from(Span::styled(at, THEME.secondary()))).right_aligned(),
                 row,
             );
         }
@@ -5437,7 +5600,7 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
     let mut header = vec![
         Span::styled(
             " llmux ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(crate::build_info::version_with_build(), dim()),
     ];
@@ -5455,7 +5618,7 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
         .no_interrupt()
         .inline("q quit");
     frame.render_widget(
-        working.at(chrome.clock, KEYBAR_THEME.with_motion(chrome.motion)),
+        working.at(chrome.clock, THEME.with_motion(chrome.motion)),
         Rect {
             x: body_area.x.saturating_add(1),
             width: body_area.width.saturating_sub(1),
@@ -5481,12 +5644,14 @@ fn attach_spans(chrome: &Chrome) -> Vec<Span<'static>> {
     if attach.connected {
         vec![Span::styled(
             format!(" attached → pid {pid} "),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(palette::ATTACHED)
+                .add_modifier(Modifier::BOLD),
         )]
     } else {
         vec![Span::styled(
             format!(" reconnecting → pid {pid}… "),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         )]
     }
 }
@@ -5531,7 +5696,9 @@ fn header_tail_spans(
         Some(attach) if attach.connected && attach.pid == Some(view.pid) => {
             spans.push(Span::styled(
                 " attached ",
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(palette::ATTACHED)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         _ => spans.extend(attach_spans(chrome)),
@@ -5580,7 +5747,7 @@ const HEADER_GAP: &str = "  ";
 
 /// The header's segments as twolab-tui `StatusBar` lays them out.
 fn header_bar(segments: Vec<twolab_tui::status_bar::Segment>) -> twolab_tui::status_bar::StatusBar {
-    twolab_tui::status_bar::StatusBar::new(KEYBAR_THEME)
+    twolab_tui::status_bar::StatusBar::new(THEME)
         .style(dim())
         .separator(HEADER_SEPARATOR)
         .segments(segments)
@@ -5661,9 +5828,9 @@ fn header_verdict_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'stat
     // a no-truecolor panel. Identity (version/port/pid/up) compresses right.
     let verdict = triage::health_verdict(view, now);
     let (tag, color) = match verdict.level() {
-        VerdictLevel::Ok => ("[OK]", Color::Green),
-        VerdictLevel::Warn => ("[WARN]", Color::Yellow),
-        VerdictLevel::Fail => ("[FAIL]", Color::Red),
+        VerdictLevel::Ok => ("[OK]", THEME.ok),
+        VerdictLevel::Warn => ("[WARN]", THEME.warn),
+        VerdictLevel::Fail => ("[FAIL]", THEME.crit),
     };
     let mut spans = vec![Span::styled(
         format!(" {tag} "),
@@ -5936,7 +6103,7 @@ fn draw_accounts(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     let layout = table_layout(view, ctx, area.width);
     draw_accounts_with(frame, area, view, ctx, chrome, &Fold::Off, &layout)
 }
@@ -5956,7 +6123,7 @@ fn draw_accounts_with(
     chrome: &Chrome,
     fold_state: &Fold,
     layout: &TableLayout,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     let snapshot = &view.snapshot;
     let fold = fold_state.plan();
     let table: Vec<usize> = (0..ctx.order.len())
@@ -5994,7 +6161,7 @@ fn draw_accounts_with(
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         frame.render_widget(empty, body);
         return Vec::new();
@@ -6008,7 +6175,7 @@ fn draw_accounts_with(
             layout.bar_width,
         );
         if cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -6080,18 +6247,18 @@ fn draw_accounts_with(
     // border/title + header row), one line high, full table width, and maps
     // to its account's display position. Rows clipped by the pane height are
     // not clickable.
-    let mut hits: Vec<AccountRowHit> = table
+    let mut hits: Vec<(Rect, ClickTarget)> = table
         .iter()
         .enumerate()
         .filter(|(row, _)| area.y as usize + 2 + row < area.bottom() as usize)
-        .map(|(row, &pos)| AccountRowHit {
-            area: Rect {
+        .map(|(row, &pos)| {
+            let rect = Rect {
                 x: area.x,
                 y: area.y + 2 + row as u16,
                 width: area.width,
                 height: 1,
-            },
-            display_idx: pos,
+            };
+            (rect, ClickTarget::AccountRow(pos))
         })
         .collect();
     hits.extend(fold_hits);
@@ -6232,6 +6399,35 @@ fn compact_word(
     }
 }
 
+/// The compact list's label for each account id: the table's short name
+/// ([`row_account_name`] — no provider, abbreviated domain), except where two
+/// entries would read the same (`claude:me@x.com` and `codex:me@x.com` are
+/// both `me@x.com`): those show the masked full id, provider and all. The
+/// list has no group column to tell them apart.
+fn compact_labels<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    mask: bool,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let named: Vec<(&str, String)> = ids
+        .map(|id| (id, row_account_name(id, mask, abbrev)))
+        .collect();
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, short) in &named {
+        *seen.entry(short.as_str()).or_default() += 1;
+    }
+    named
+        .iter()
+        .map(|(id, short)| {
+            if seen.get(short.as_str()).is_some_and(|&n| n > 1) {
+                masked_name(id, mask)
+            } else {
+                short.clone()
+            }
+        })
+        .collect()
+}
+
 /// The compact account list (`V` on the accounts tab; MAIN's own choice
 /// when the table would show fewer than [`COMPACT_BELOW`] rows): a
 /// twolab-tui `agent_list` with one row per account — focus mark, state
@@ -6247,20 +6443,27 @@ fn draw_accounts_compact(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::agent_list::{AgentItem, AgentList, AgentListState, AgentState, Sort, Tally};
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let selected = cursor_pos(chrome, ctx.order.len());
+    let labels = compact_labels(
+        ctx.order
+            .iter()
+            .map(|&idx| snapshot.accounts[idx].id.0.as_str()),
+        ctx.mask,
+        &view.domain_abbrev,
+    );
     let (kinds, items): (Vec<CompactKind>, Vec<AgentItem>) = ctx
         .order
         .iter()
+        .zip(labels)
         .enumerate()
-        .map(|(pos, &idx)| {
+        .map(|(pos, (&idx, label))| {
             let account = &snapshot.accounts[idx];
             let gate = select::eligibility(account, params, ctx.now, ctx.headers_only);
             let kind = CompactKind::of(gate, snapshot.is_current(&account.id));
-            let label = row_account_name(&account.id.0, ctx.mask, &view.domain_abbrev);
             let item = AgentItem::new(kind.state(), label)
                 .word(compact_word(account, gate, kind, ctx.now))
                 .focused(selected == Some(pos));
@@ -6301,7 +6504,7 @@ fn draw_accounts_compact(
     let mut tally = Tally::new(items.iter().map(|i| i.state))
         .glyphs(true)
         .empty("no accounts")
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     // A slot two llmux states share names both (`spent+cooling`); a slot
     // that holds only `spent` or only `paused` shows that state's glyph.
     let mut glyph_swaps: Vec<(char, &'static str)> = Vec::new();
@@ -6384,12 +6587,14 @@ fn draw_accounts_compact(
         };
         // The words only when every entry keeps its whole name beside its
         // word; else the glyph says the state and the name gets the room.
+        // `LLMUX_REDUCED_MOTION` holds the active spinner still, like
+        // every other spinner on the dashboard.
         let list = AgentList::new(&items[from..to])
             .sort(Sort::Given)
             .words(col_w >= natural)
-            .frame(ctx.frame)
+            .frame(loading_spin(ctx.frame, chrome.motion))
             .empty("no accounts")
-            .theme(KEYBAR_THEME);
+            .theme(THEME.with_motion(chrome.motion));
         let mut state = AgentListState::new();
         frame.render_stateful_widget(&list, rect, &mut state);
         for &(i, r) in &state.layout().items {
@@ -6399,10 +6604,7 @@ fn draw_accounts_compact(
                     cell.set_symbol(glyph);
                 }
             }
-            hits.push(AccountRowHit {
-                area: r,
-                display_idx: pos,
-            });
+            hits.push((r, ClickTarget::AccountRow(pos)));
         }
     }
     hits
@@ -6465,11 +6667,11 @@ fn account_row_parts(
             (lead, false) => format!("{lead} "),
         };
         let style = if urgent {
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::new().fg(THEME.crit).add_modifier(Modifier::BOLD)
         } else if cursor {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(THEME.accent)
         } else if is_current {
-            Style::new().fg(Color::Green)
+            Style::new().fg(THEME.ok)
         } else {
             Style::new()
         };
@@ -6863,7 +7065,7 @@ fn fold_plan(
     )
     .headers(headers)
     .cursor(members.iter().position(|&pos| selected == Some(pos)))
-    .theme(KEYBAR_THEME);
+    .theme(THEME);
     let Some(GridPlan { per_line, .. }) = grid.plan(width) else {
         return Fold::TooNarrow;
     };
@@ -6891,7 +7093,7 @@ fn draw_fold(
     area: Rect,
     top: u16,
     fold: &FoldPlan,
-) -> (Vec<AccountRowHit>, usize) {
+) -> (Vec<(Rect, ClickTarget)>, usize) {
     let block = Rect {
         y: top,
         height: area.bottom().saturating_sub(top),
@@ -6904,10 +7106,7 @@ fn draw_fold(
     let hits = drawn
         .hits
         .iter()
-        .map(|hit| AccountRowHit {
-            area: hit.rect,
-            display_idx: fold.members[hit.index],
-        })
+        .map(|hit| (hit.rect, ClickTarget::AccountRow(fold.members[hit.index])))
         .collect();
     (hits, drawn.hidden)
 }
@@ -6936,7 +7135,7 @@ fn status_span(
             };
             Span::styled(
                 format!("{glyph} active"),
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(format!("{} ready", SpinnerKind::Drift.glyph(frame)), dim())
@@ -6954,7 +7153,7 @@ fn status_span(
             .unwrap_or_default();
         return Span::styled(
             format!("{} {left}", SpinnerKind::Clock.glyph(frame)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.wait),
         );
     }
     let text = select::blocking_reason(account, reason, params, now);
@@ -6963,20 +7162,20 @@ fn status_span(
     let (glyph, style) = match reason {
         IneligibleReason::AuthUnhealthy => (
             None,
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         ),
-        IneligibleReason::Paused => (None, Style::new().fg(Color::Yellow)),
+        IneligibleReason::Paused => (None, Style::new().fg(THEME.wait)),
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
             Some(SpinnerKind::Breathe.glyph(frame)),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         ),
         IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
             Some(SpinnerKind::Clock.glyph(frame)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.wait),
         ),
         IneligibleReason::FableWeeklyExhausted => (
             Some(SpinnerKind::Breathe.glyph(frame)),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         ),
         IneligibleReason::UsageStale => (Some(SpinnerKind::Drift.glyph(frame)), dim()),
     };
@@ -6995,7 +7194,7 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     } else {
         Span::styled(
             in_flight.to_string(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -7031,7 +7230,7 @@ fn quota_meter(
     let meter = Meter::new(used)
         .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
         .fill(fill)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let meter = if absolute {
         meter.resets_at(window.resets_at, now, 0)
     } else {
@@ -7066,7 +7265,7 @@ fn quota_cell_line(meter: &Meter, bar_width: usize) -> Line<'static> {
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
         cells::pad(&meter.label_text(), QUOTA_LABEL_WIDTH, cells::Align::Right),
-        KEYBAR_THEME.level(meter.current_level()),
+        THEME.level(meter.current_level()),
     ));
     line
 }
@@ -7137,7 +7336,7 @@ impl GaugeParts {
         match self {
             GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
             GaugeParts::Bar { meter, marker } => {
-                let style = KEYBAR_THEME.level(meter.current_level());
+                let style = THEME.level(meter.current_level());
                 let (text, bold) = meter.bar_text();
                 let (head, _) = cells::take_cells(&text, bold);
                 let tail = &text[head.len()..];
@@ -8108,7 +8307,7 @@ fn summary_parts(view: &DashboardView, ctx: &FrameCtx) -> SummaryParts {
     if groups_present.is_empty() {
         lines.push(Line::from(vec![
             label("current"),
-            Span::styled("(none)", Style::new().fg(Color::Red)),
+            Span::styled("(none)", Style::new().fg(THEME.crit)),
         ]));
         band_head.extend(lines.iter().cloned());
     }
@@ -8204,13 +8403,13 @@ fn summary_totals_spans(totals: super::activity::Totals) -> Vec<Span<'static>> {
         Span::raw(format!("{} req · ", format::human_count(totals.requests))),
         Span::styled(
             format!("{} ok", format::human_count(totals.ok)),
-            Style::new().fg(Color::Green),
+            Style::new().fg(THEME.done),
         ),
         Span::raw(" / "),
         Span::styled(
             format!("{} err", format::human_count(totals.errors)),
             if totals.errors > 0 {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             } else {
                 dim()
             },
@@ -8256,14 +8455,14 @@ fn summary_current_line(
         Some(current) => {
             spans.push(Span::styled(
                 current,
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD),
             ));
             if let Some((from, why, ago)) = switch {
                 let from = from.map(|f| format!("{f} → ")).unwrap_or_default();
                 spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
             }
         }
-        None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
+        None => spans.push(Span::styled("(none)", Style::new().fg(THEME.crit))),
     }
     Line::from(spans)
 }
@@ -8312,7 +8511,7 @@ fn summary_mode_line(mode: crate::config::SchedulerMode) -> Line<'static> {
         Span::styled(
             mode.label().to_string(),
             if mode == crate::config::SchedulerMode::RoundRobin {
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             },
@@ -8330,7 +8529,7 @@ fn summary_load_line(rpm_5m: f64, in_flight: u64) -> Line<'static> {
 
 fn summary_codex_line(model: &str, fast: bool, effort: &str) -> Line<'static> {
     let fast_style = if fast {
-        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD)
     } else {
         dim()
     };
@@ -8622,7 +8821,7 @@ fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'
     if let Some(plan) = plan {
         spans.push(Span::styled(
             format!(" · {plan}"),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ));
     }
     spans
@@ -8705,13 +8904,13 @@ fn token_detail_spans(
             } else {
                 vec![Span::styled(
                     format!("{head} · refresh due"),
-                    Style::new().fg(Color::Yellow),
+                    Style::new().fg(THEME.warn),
                 )]
             }
         }
         Err(_) => vec![Span::styled(
             "expired — refresh overdue".to_string(),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         )],
     };
     let refreshed = match account.last_refresh_ms {
@@ -8817,32 +9016,6 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("config", Overlay::Config),
 ];
 
-/// The sessions table's clickable data area for one frame: `rows` covers the
-/// data rows only (border + header excluded); a click at `rows.y + k` selects
-/// session `start + k`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SessionsChrome {
-    pub rows: Rect,
-    pub start: usize,
-}
-
-/// One clickable tab label's rendered rect (UI-3 U6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TabHit {
-    pub area: Rect,
-    pub overlay: Overlay,
-}
-
-/// Pure hit-test: which tab, if any, does the click at absolute `(col, row)`
-/// land on?
-pub(crate) fn hit_test_tabs(tabs: &[TabHit], col: u16, row: u16) -> Option<Overlay> {
-    tabs.iter()
-        .find(|t| {
-            row >= t.area.y && row < t.area.bottom() && col >= t.area.x && col < t.area.right()
-        })
-        .map(|t| t.overlay)
-}
-
 /// Minimum drag-set pane height (top border + one content row) and a sanity
 /// ceiling (UI-3 U7/U8) — the layout solver squeezes overflow anyway, this
 /// just keeps the override numbers honest.
@@ -8866,15 +9039,6 @@ pub(crate) struct SeparatorHit {
     pub pane_top: u16,
 }
 
-/// One accounts-table row's rendered rect + its DISPLAY index (selection
-/// order — the same index the switch/pause/limits/remove flows take).
-/// Right-click target map (UI-3 U11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AccountRowHit {
-    pub area: Rect,
-    pub display_idx: usize,
-}
-
 /// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
 /// its segment cycles the setting to its next value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8886,35 +9050,114 @@ pub(crate) enum SettingAction {
     GrokEffort,
 }
 
-/// One clickable segment of the group-settings bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SettingHit {
-    pub area: Rect,
-    pub action: SettingAction,
+/// What a click can land on (the hit module): every clickable thing a
+/// frame drew, recorded in one [`Hits`] map while it draws. Surfaces push in
+/// paint order, so where rects overlap the one drawn last — the one on top
+/// — wins by construction: a modal over a row, a menu item over a row, the
+/// `🔍 input` line over its entry's block. The mouse handler asks the map
+/// once and matches on the answer; a new widget brings its rects by pushing
+/// them here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClickTarget {
+    /// Drawn over what is beneath, with nothing clickable at this spot: a
+    /// click here never reaches the targets under it.
+    Surface(Surface),
+    /// A tab label (UI-3 U6): opens that surface.
+    Tab(Overlay),
+    /// A pane's top border row (UI-3 U7/U8): a press starts a drag that
+    /// resizes the pane above it. The whole row, every column.
+    Separator(SeparatorHit),
+    /// An accounts row — a table row, a fold entry or a compact entry — at
+    /// its DISPLAY index (selection order, the index the switch / pause /
+    /// limits / remove flows take). Left-click opens the account modal,
+    /// right-click the context menu (UI-3 U11).
+    AccountRow(usize),
+    /// A models-strip entry (packed entry or table row), by the model it
+    /// showed: opens that model in `stats`, looked up in the view the click
+    /// lands on — a re-sort since the frame never opens another model.
+    StripEntry { group: String, model: String },
+    /// A value on the group-settings bar (UI-3 U9/U10): rotates it.
+    Setting(SettingAction),
+    /// A request row of the activity panel, or one of its clickable detail
+    /// lines (UI-5, UI-6 item 3, UI-7): the whole panel width, as many rows
+    /// as it drew. [`activity_click`] says what a click on it means.
+    Activity {
+        key: ActivityKey,
+        kind: ActivityHitKind,
+    },
+    /// A config row's value cell (config-editor v1): `row` is its index in
+    /// the config rows; a click activates it exactly like Enter.
+    ConfigRow { row: usize, action: ConfigAction },
+    /// A data row of the sessions table (mouse select): the session index
+    /// it shows, or would show — a row past the last session takes the
+    /// click and selects nothing.
+    SessionsRow(usize),
+    /// The open keys, sessions or usage table's scrollbar track: a press
+    /// jumps there or grabs the thumb ([`MainChrome::table_scroll`] has the
+    /// maths the drag after it uses).
+    TableScrollbar,
+    /// The Logs overlay's pager: a press there starts a text selection.
+    LogsPager,
+    /// A runnable item of the open context menu (UI-3 U11), by its index
+    /// in the menu's items.
+    MenuItem(usize),
+    /// A text modal's (input, account) `esc close` button.
+    ModalClose,
+    /// A text modal's scrollbar track: a press jumps there or grabs the
+    /// thumb (the modal's own state has the maths).
+    ModalScrollbar,
+    /// A payload tab of the raw viewer (UI-8), by its index.
+    RawTab(usize),
+    /// One of the raw viewer's top-right action buttons (UI-8).
+    RawButton(RawButton),
+    /// The raw viewer's body scrollbar track ([`RawModalChrome::bar`] has
+    /// the maths the drag after a press uses).
+    RawScrollbar,
+    /// A toast card (or banner) as drawn, by its id in the queue: a left
+    /// click takes it down, and no press on it reaches what lies beneath.
+    Toast(twolab_tui::toast::ToastId),
 }
 
-/// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
-/// activity panel's rows plus the tab bar, the drag separators, the accounts
-/// rows (right-click), the group-settings bar, and the open context menu.
-/// Threaded back to the runtime the same way `ActivityChrome` alone used to
-/// be.
+/// A surface drawn over what came before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// A summoned overlay, over MAIN.
+    Overlay,
+    /// The open context menu's popup: a click on it off its items (a dim
+    /// item, a separator, the border) keeps the menu open.
+    Menu,
+    /// A modal, which holds the whole screen while it is open: a click off
+    /// its parts is swallowed.
+    Modal,
+    /// A card standing on the footer (a confirm gate, the login picker),
+    /// over any toast or row beneath it.
+    Card,
+}
+
+/// A text modal (input, account) as drawn: it holds the whole `screen`,
+/// with its scrollbar track and its `esc close` button on top.
+pub(crate) fn push_modal(hits: &mut Hits, screen: Rect, layout: &twolab_tui::modal::ModalLayout) {
+    hits.push(screen, ClickTarget::Surface(Surface::Modal));
+    if let Some(track) = layout.track {
+        hits.push(track, ClickTarget::ModalScrollbar);
+    }
+    if let Some(close) = layout.close {
+        hits.push(close, ClickTarget::ModalClose);
+    }
+}
+
+/// One frame's click targets, topmost last; see [`ClickTarget`].
+pub(crate) type Hits = twolab_tui::hit::HitMap<ClickTarget>;
+
+/// Everything a frame rendered that the mouse and the keys act on (UI-3
+/// U5): the click targets of every surface in one [`Hits`] map, plus the
+/// layout state the handlers need beyond "what is under the pointer" —
+/// scroll positions, scrollbar maths, the field's width. Built fresh by
+/// every `draw`, so nothing outlives the frame that drew it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MainChrome {
-    pub activity: ActivityChrome,
-    pub tabs: Vec<TabHit>,
-    pub separators: Vec<SeparatorHit>,
-    pub account_rows: Vec<AccountRowHit>,
-    /// The models strip's click targets this frame: one per drawn model
-    /// (packed entry or table row), `index` into `model_usage`.
-    pub models_strip: Vec<packed_grid::GridHit>,
-    pub menu: Option<twolab_tui::menu::MenuLayout>,
-    pub settings: Vec<SettingHit>,
-    /// Sessions overlay table layout this frame (issue: sessions mouse
-    /// select): the data-row rect + the index of its first visible session.
-    pub sessions_table: Option<SessionsChrome>,
-    /// Config overlay clickable value cells this frame (config-editor v1):
-    /// row index + action, so a click activates exactly like Enter.
-    pub config_rows: Vec<ConfigHit>,
+    /// Every click target this frame drew, in paint order.
+    pub hits: Hits,
     /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some`
     /// is where the modal drew — its clamped scroll position and scrollbar
     /// track, which the runtime's keys and mouse act on; `None` means no
@@ -8931,6 +9174,10 @@ pub(crate) struct MainChrome {
     /// The rect the Logs pager drew in this frame: the mouse paints the same
     /// pager there off-screen so a drag selects the cells on screen.
     pub logs_area: Option<Rect>,
+    /// The log lines the pager drew this frame — what a press freezes, so
+    /// the selection starts on the text that was on screen, not on a line
+    /// that arrived after the frame.
+    pub logs_lines: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// The open keys, sessions or usage table's scrollbar this frame, when
     /// its rows overflow: a press on the track jumps, a drag moves the thumb.
     pub table_scroll: Option<TableScroll>,
@@ -8944,9 +9191,20 @@ pub(crate) struct MainChrome {
     pub field_width: Option<u16>,
 }
 
+impl MainChrome {
+    /// The open table's scrollbar as drawn: its track is a click target,
+    /// its maths stay for the drag that follows a press on it.
+    fn record_table_scroll(&mut self, bar: Option<TableScroll>) {
+        if let Some(bar) = bar {
+            self.hits.push(bar.track, ClickTarget::TableScrollbar);
+        }
+        self.table_scroll = bar;
+    }
+}
+
 /// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
-/// offsets and to route clicks — the tab bar and the top-right action buttons
-/// are mouse targets.
+/// offsets and to drag the body's scrollbar. Its tabs, action buttons and
+/// scrollbar track are click targets in the frame's [`Hits`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RawModalChrome {
     /// Largest valid scroll (in wrapped rows) for the ACTIVE tab.
@@ -8956,10 +9214,6 @@ pub(crate) struct RawModalChrome {
     /// The body's scrollbar when its lines overflow: a press on the track
     /// jumps, a drag on the thumb scrolls.
     pub bar: Option<TableScroll>,
-    /// One rect per rendered tab label, with the tab index it selects.
-    pub tabs: Vec<(usize, Rect)>,
-    /// One rect per rendered action button.
-    pub buttons: Vec<(RawButton, Rect)>,
 }
 
 /// The raw viewer's top-right action buttons (UI-8):
@@ -8996,7 +9250,7 @@ pub(crate) enum ActivityHitKind {
         expanded: bool,
     },
     /// The `🔍 input` detail line of an expanded entry (UI-6 item 3). Its own
-    /// one-row hit, layered ABOVE the entry's block hit, so clicking exactly
+    /// one-row hit, pushed ABOVE the entry's block hit, so clicking exactly
     /// this line opens the full-text modal instead of collapsing the entry.
     InputLine,
     /// The `🔍 request` detail line of an expanded entry (UI-7): clicking it
@@ -9012,7 +9266,7 @@ pub(crate) enum ActivityHitKind {
 }
 
 /// The resolved meaning of one activity click (UI-5), returned by
-/// [`hit_test_activity`] so the mouse handler stays a dumb dispatcher.
+/// [`activity_click`] so the mouse handler stays a dumb dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActivityClick {
     /// Toggle this entry's detail lines (single rows and run member rows).
@@ -9031,54 +9285,46 @@ pub(crate) enum ActivityClick {
     OpenRaw(ActivityKey, u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActivityHit {
-    pub key: ActivityKey,
-    pub y_start: u16,
-    pub height: u16,
-    pub kind: ActivityHitKind,
-}
-
-/// The activity panel's rendered layout for one frame: the panel rect plus the
-/// ordered hit-targets (request rows only — notes/in-flight are not clickable).
-/// Threaded back to the runtime so a left-click can be mapped to an entry.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ActivityChrome {
-    pub area: Rect,
-    pub hits: Vec<ActivityHit>,
-}
-
 /// Width of the leading `▸`/`▾` marker zone on a folded-run header — clicks in
 /// these leftmost panel columns toggle the fold; clicks past them are body
 /// clicks (expand-only). Covers `" ▸ "` plus one slack cell.
 const RUN_MARKER_ZONE: u16 = 4;
 
-/// Pure hit-test (unit-tested): what does the click at absolute `(col, row)`
-/// mean? `None` when the click is outside the panel, on the title border, or
-/// on a non-request line. Used by the mouse handler.
-pub(crate) fn hit_test_activity(
-    chrome: &ActivityChrome,
+/// What a click at column `col` on an activity target means (unit-tested).
+/// `rect` is where the map recorded the target: a run header splits it into
+/// zones — its first [`RUN_MARKER_ZONE`] cells toggle the fold, the rest
+/// only expands. Used by the mouse handler.
+pub(crate) fn activity_click(
+    rect: Rect,
+    key: ActivityKey,
+    kind: ActivityHitKind,
     col: u16,
-    row: u16,
-) -> Option<ActivityClick> {
-    let area = chrome.area;
-    // Outside the panel rect → not ours.
-    if col < area.x || col >= area.right() || row < area.y || row >= area.bottom() {
-        return None;
-    }
-    let hit = chrome
-        .hits
-        .iter()
-        .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
-    Some(match hit.kind {
-        ActivityHitKind::InputLine => ActivityClick::OpenInput(hit.key.clone()),
-        ActivityHitKind::RawLine { id } => ActivityClick::OpenRaw(hit.key.clone(), id),
-        ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
-        ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
-            ActivityClick::RunToggle(hit.key.clone())
+) -> ActivityClick {
+    match kind {
+        ActivityHitKind::InputLine => ActivityClick::OpenInput(key),
+        ActivityHitKind::RawLine { id } => ActivityClick::OpenRaw(key, id),
+        ActivityHitKind::Entry => ActivityClick::Entry(key),
+        ActivityHitKind::RunHeader { .. } if col < rect.x.saturating_add(RUN_MARKER_ZONE) => {
+            ActivityClick::RunToggle(key)
         }
-        ActivityHitKind::RunHeader { .. } => ActivityClick::RunExpand(hit.key.clone()),
-    })
+        ActivityHitKind::RunHeader { .. } => ActivityClick::RunExpand(key),
+    }
+}
+
+/// One activity target: `height` rows from `y`, the panel's full width,
+/// clipped to the panel (`area`) so its border rows and anything past its
+/// edge are never part of it.
+fn activity_target(
+    area: Rect,
+    y: u16,
+    height: u16,
+    key: ActivityKey,
+    kind: ActivityHitKind,
+) -> (Rect, ClickTarget) {
+    (
+        Rect::new(area.x, y, area.width, height).intersection(area),
+        ClickTarget::Activity { key, kind },
+    )
 }
 
 /// Per-frame column widths for the activity rows (Z 2026-07-15 "최대 넓이"):
@@ -9199,7 +9445,7 @@ fn draw_activity(
     view: &DashboardView,
     chrome: &Chrome,
     now: SystemTime,
-) -> ActivityChrome {
+) -> Vec<(Rect, ClickTarget)> {
     let in_flight = &view.in_flight;
     let capacity = area.height.saturating_sub(1) as usize; // top border
 
@@ -9244,27 +9490,20 @@ fn draw_activity(
         for request in in_flight.iter().rev().take(capacity) {
             let elapsed = now.duration_since(request.started_at).unwrap_or_default();
             // Working spinner differs by backend group: Claude gets the braille
-            // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
-            // colors as the group labels — so you can tell what's running where
-            // at a glance. Pre-routing rows (no account yet) are a dim braille.
-            let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
-                Some(BackendGroup::Codex) => (SpinnerKind::Block.glyph(anim_frame), Color::Cyan),
-                Some(BackendGroup::Claude) => {
-                    (SpinnerKind::Braille.glyph(anim_frame), Color::Magenta)
-                }
-                Some(BackendGroup::Grok) => (SpinnerKind::Block.glyph(anim_frame), Color::Yellow),
-                Some(BackendGroup::OpenRouter) => {
-                    (SpinnerKind::Block.glyph(anim_frame), Color::Green)
-                }
-                Some(BackendGroup::Gemini) => {
-                    (SpinnerKind::Block.glyph(anim_frame), Color::LightBlue)
-                }
-                None => (SpinnerKind::Braille.glyph(anim_frame), Color::DarkGray),
+            // orbit, every other group a quarter-block orbit, each in its group
+            // label's colour ([`group_color`]) — so you can tell what's running
+            // where at a glance. Pre-routing rows (no account yet) are a dim
+            // braille.
+            let group = request.account.as_deref().and_then(|a| group_of(view, a));
+            let glyph = match group {
+                Some(BackendGroup::Claude) | None => SpinnerKind::Braille.glyph(anim_frame),
+                Some(_) => SpinnerKind::Block.glyph(anim_frame),
             };
+            let spinner = group_color(group.map(BackendGroup::as_str));
             let mut spans = vec![
                 // Mirror the completed row's stamp spacing (`▸ HH:MM:SS  `):
                 // spinner+2 spaces so the following `kind` column lines up.
-                Span::styled(format!(" {glyph} "), Style::new().fg(color)),
+                Span::styled(format!(" {glyph} "), spinner),
                 Span::styled(
                     format!("{}  ", format::clock_hms_utc(request.started_at)),
                     dim(),
@@ -9287,7 +9526,7 @@ fn draw_activity(
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             // `[model effort]` badge while in flight (issue #2, 2a): filled at
             // routing time (req11) with the same per-request values the finish
@@ -9371,7 +9610,7 @@ fn draw_activity(
     // is the only traffic allowed to group; everything else renders 1:1.
     // Scrolling walks RENDER rows (a folded run is one step of history).
     let body_top = area.y.saturating_add(1);
-    let mut hits: Vec<ActivityHit> = Vec::new();
+    let mut hits: Vec<(Rect, ClickTarget)> = Vec::new();
     for row in rows.iter().skip(scroll) {
         if lines.len() >= capacity {
             break;
@@ -9408,14 +9647,10 @@ fn draw_activity(
                 }
                 // Only request rows are clickable (notes have no key).
                 if let Some(key) = entry.activity_key() {
-                    push_raw_line_hit(&mut hits, &key, entry, row_y, height);
-                    push_input_line_hit(&mut hits, &key, entry, row_y, height);
-                    hits.push(ActivityHit {
-                        key,
-                        y_start: row_y,
-                        height,
-                        kind: ActivityHitKind::Entry,
-                    });
+                    let block = ActivityHitKind::Entry;
+                    hits.push(activity_target(area, row_y, height, key.clone(), block));
+                    push_input_line_hit(&mut hits, area, &key, entry, row_y, height);
+                    push_raw_line_hit(&mut hits, area, &key, entry, row_y, height);
                 }
             }
             ActivityRow::Run { start, len } => {
@@ -9440,12 +9675,8 @@ fn draw_activity(
                     view.gradient,
                 ));
                 if let Some(key) = key {
-                    hits.push(ActivityHit {
-                        key,
-                        y_start: row_y,
-                        height: 1,
-                        kind: ActivityHitKind::RunHeader { expanded },
-                    });
+                    let header = ActivityHitKind::RunHeader { expanded };
+                    hits.push(activity_target(area, row_y, 1, key, header));
                 }
                 if expanded {
                     for entry in run {
@@ -9482,14 +9713,11 @@ fn draw_activity(
                             }
                         }
                         if let Some(key) = entry.activity_key() {
-                            push_raw_line_hit(&mut hits, &key, entry, member_y, member_height);
-                            push_input_line_hit(&mut hits, &key, entry, member_y, member_height);
-                            hits.push(ActivityHit {
-                                key,
-                                y_start: member_y,
-                                height: member_height,
-                                kind: ActivityHitKind::Entry,
-                            });
+                            let block = ActivityHitKind::Entry;
+                            let (y, h) = (member_y, member_height);
+                            hits.push(activity_target(area, y, h, key.clone(), block));
+                            push_input_line_hit(&mut hits, area, &key, entry, y, h);
+                            push_raw_line_hit(&mut hits, area, &key, entry, y, h);
                         }
                     }
                 }
@@ -9518,7 +9746,7 @@ fn draw_activity(
     let openai_rows: Vec<u16> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.style.bg == Some(OPENAI_ACTIVITY_BG))
+        .filter(|(_, line)| line.style.bg == Some(palette::OPENAI_ACTIVITY_BG))
         .map(|(index, _)| body_top.saturating_add(index as u16))
         .filter(|y| *y < area.bottom())
         .collect();
@@ -9527,17 +9755,19 @@ fn draw_activity(
     for y in openai_rows {
         frame.buffer_mut().set_style(
             Rect::new(area.x, y, area.width, 1),
-            Style::new().bg(OPENAI_ACTIVITY_BG),
+            Style::new().bg(palette::OPENAI_ACTIVITY_BG),
         );
     }
-    ActivityChrome { area, hits }
+    hits
 }
-
-const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
 
 fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
     match endpoint {
-        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(OPENAI_ACTIVITY_BG)),
+        crate::tui::Endpoint::OpenAi => line.style(
+            Style::new()
+                .bg(palette::OPENAI_ACTIVITY_BG)
+                .fg(palette::OPENAI_ACTIVITY_FG),
+        ),
         crate::tui::Endpoint::Anthropic => line,
     }
 }
@@ -9626,7 +9856,7 @@ fn folded_run_line(
         " {} → (",
         pad_cells(&account, ACTIVITY_EMAIL_W)
     )));
-    spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
+    spans.push(Span::styled("all 2xx", Style::new().fg(THEME.done)));
     spans.push(Span::raw(")"));
     endpoint_line(Line::from(spans), *endpoint)
 }
@@ -9685,9 +9915,9 @@ fn completed_line(
                 .map(|a| row_account_name(a, mask, abbrev))
                 .unwrap_or_else(|| "?".to_string());
             let status_style = if *status < 400 {
-                Style::new().fg(Color::Green)
+                Style::new().fg(THEME.done)
             } else {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             };
             // method+path intentionally NOT on the collapsed row (Z
             // 2026-07-15 "쓸데 없는 데이터"): it is constant noise
@@ -9732,7 +9962,7 @@ fn completed_line(
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             spans.extend(cells::pad_spans(
                 activity_meta_spans(
@@ -9765,7 +9995,7 @@ fn completed_line(
             if cost_usd.is_some_and(|usd| usd >= 1.0) {
                 spans.push(Span::styled(
                     cost_cell,
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::new().fg(THEME.warn).add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::raw(cost_cell));
@@ -9797,7 +10027,7 @@ fn completed_line(
         CompletedBody::Note { text, error } => {
             let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
             let style = if *error {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             } else {
                 Style::new()
             };
@@ -9900,9 +10130,9 @@ fn completed_detail_lines(
             .unwrap_or_else(|| "?".to_string()),
     ));
     let status_color = if *status < 400 {
-        Color::Green
+        THEME.done
     } else {
-        Color::Red
+        THEME.fail
     };
     lines.push(Line::from(vec![
         Span::styled("       status  ", dim()),
@@ -10004,7 +10234,10 @@ fn completed_detail_lines(
                     format_cost(cost_cr),
                     format_cost(cost_cc),
                 )),
-                Span::styled(format_cost(cost_total), Style::new().fg(Color::Green)),
+                Span::styled(
+                    format_cost(cost_total),
+                    Style::new().fg(palette::COST_TOTAL),
+                ),
             ]));
         }
         None => lines.push(indent("tokens", "—".to_string())),
@@ -10032,8 +10265,8 @@ fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
 /// Register the one-row `InputLine` hit for `entry`'s `🔍 input` detail line,
 /// but only when that line was actually rendered this frame (the entry is
 /// expanded AND the line was not clipped by the panel's line budget). Pushed
-/// BEFORE the caller's block-level `Entry` hit so `hit_test_activity`'s
-/// first-match resolves this exact row to "open the modal" (UI-6 item 3).
+/// AFTER the caller's block-level `Entry` hit, so it lies on top of the block
+/// in the map and this exact row resolves to "open the modal" (UI-6 item 3).
 /// `row_y` is the entry's main row; detail lines follow it, so the input line
 /// sits at `row_y + 1 + offset`, and `offset + 1 < height` (height counts the
 /// main row plus rendered detail lines) proves it is on screen.
@@ -10041,10 +10274,12 @@ fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
 /// (UI-7), when the entry is expanded AND that line survived the panel's line
 /// budget. The request line is ALWAYS the first detail line (offset 0), so it
 /// sits at `row_y + 1`; `height > 1` proves at least one detail line rendered.
-/// Pushed BEFORE the block-level `Entry` hit so first-match resolves the row
-/// to "open the raw viewer" — same layering as [`push_input_line_hit`].
+/// Pushed AFTER the block-level `Entry` hit (and the input line), so the row
+/// resolves to "open the raw viewer" — same layering as
+/// [`push_input_line_hit`].
 fn push_raw_line_hit(
-    hits: &mut Vec<ActivityHit>,
+    hits: &mut Vec<(Rect, ClickTarget)>,
+    area: Rect,
     key: &ActivityKey,
     entry: &Completed,
     row_y: u16,
@@ -10052,18 +10287,21 @@ fn push_raw_line_hit(
 ) {
     if let CompletedBody::Request { id, .. } = &entry.body {
         if height > 1 {
-            hits.push(ActivityHit {
-                key: key.clone(),
-                y_start: row_y.saturating_add(1),
-                height: 1,
-                kind: ActivityHitKind::RawLine { id: *id },
-            });
+            let kind = ActivityHitKind::RawLine { id: *id };
+            hits.push(activity_target(
+                area,
+                row_y.saturating_add(1),
+                1,
+                key.clone(),
+                kind,
+            ));
         }
     }
 }
 
 fn push_input_line_hit(
-    hits: &mut Vec<ActivityHit>,
+    hits: &mut Vec<(Rect, ClickTarget)>,
+    area: Rect,
     key: &ActivityKey,
     entry: &Completed,
     row_y: u16,
@@ -10071,12 +10309,14 @@ fn push_input_line_hit(
 ) {
     if let Some(offset) = completed_input_line_offset(entry) {
         if offset + 1 < height {
-            hits.push(ActivityHit {
-                key: key.clone(),
-                y_start: row_y.saturating_add(1).saturating_add(offset),
-                height: 1,
-                kind: ActivityHitKind::InputLine,
-            });
+            let y = row_y.saturating_add(1).saturating_add(offset);
+            hits.push(activity_target(
+                area,
+                y,
+                1,
+                key.clone(),
+                ActivityHitKind::InputLine,
+            ));
         }
     }
 }
@@ -10096,23 +10336,27 @@ fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
 /// (compact/title/suggest/count/…) stay dim so user rows dominate the eye.
 fn kind_style(kind: &str) -> Style {
     match kind {
-        "user" => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        "security" => Style::new().fg(Color::Yellow),
-        "compact" | "summary" | "recap" => Style::new().fg(Color::Blue),
-        "subagent" | "sdk" => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        "user" => THEME.text().add_modifier(Modifier::BOLD),
+        "security" => Style::new().fg(THEME.warn),
+        "compact" | "summary" | "recap" => Style::new().fg(palette::KIND_CONTROL),
+        "subagent" | "sdk" => Style::new()
+            .fg(palette::KIND_SUBAGENT)
+            .add_modifier(Modifier::DIM),
         _ => dim(),
     }
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, grok =
-/// yellow, gemini = light blue, unknown = gray. Shared by the account table
-/// (req5) and the activity log (req7) so the group reads the same everywhere.
+/// yellow, openrouter = green, gemini = light blue, unknown = gray. Shared by
+/// the account table (req5), the activity log (req7) and its in-flight
+/// spinners so the group reads the same everywhere.
 fn group_color(group: Option<&str>) -> Style {
     match group {
-        Some("codex") => Style::new().fg(Color::Cyan),
-        Some("claude") => Style::new().fg(Color::Magenta),
-        Some("grok") => Style::new().fg(Color::Yellow),
-        Some("gemini") => Style::new().fg(Color::LightBlue),
+        Some("codex") => Style::new().fg(palette::CODEX),
+        Some("claude") => Style::new().fg(palette::CLAUDE),
+        Some("grok") => Style::new().fg(palette::GROK),
+        Some("openrouter") => Style::new().fg(palette::OPENROUTER),
+        Some("gemini") => Style::new().fg(palette::GEMINI),
         _ => dim(),
     }
 }
@@ -10158,11 +10402,6 @@ fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
     gt::rainbow(gt::phase(char_idx, gradient_t(frame), speed), gt::LUMA)
 }
 
-/// Solid-gradient base colors per headline family: truecolor anchors of the
-/// groups' ANSI families (claude = magenta, codex = cyan).
-const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
-const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
-
 /// Render-ready gradient tuning (UI-8), resolved ONCE per document from
 /// config `tui_gradient` at view-build time: hex colors parsed (unparseable →
 /// built-in base), speed sanitized (non-finite/non-positive → 1.0). `Copy` —
@@ -10187,8 +10426,8 @@ impl GradientCfg {
         };
         Self {
             speed,
-            claude: parse_hex_color(&cfg.claude).unwrap_or(CLAUDE_GRADIENT_BASE),
-            codex: parse_hex_color(&cfg.codex).unwrap_or(CODEX_GRADIENT_BASE),
+            claude: parse_hex_color(&cfg.claude).unwrap_or(palette::CLAUDE_GRADIENT_BASE),
+            codex: parse_hex_color(&cfg.codex).unwrap_or(palette::CODEX_GRADIENT_BASE),
             max_effort: cfg.max_effort.as_deref().and_then(parse_hex_color),
         }
     }
@@ -10256,9 +10495,9 @@ fn model_name_spans(
 }
 
 /// Render the effort token with its per-level styling (TUI UI-6 item 6):
-/// `xhigh` → a static [`Color::LightRed`] bold (distinct, animation-free);
+/// `xhigh` → a static [`palette::EFFORT_XHIGH`] (light red) bold (distinct, animation-free);
 /// `max` → the rainbow marquee when `effects_on`, else a static
-/// [`Color::LightMagenta`] bold; every other effort inherits the group color.
+/// [`palette::EFFORT_MAX`] (light magenta) bold; every other effort inherits the group color.
 /// The concatenated span text is always exactly `effort`.
 fn effort_spans(
     group: Option<&str>,
@@ -10271,7 +10510,7 @@ fn effort_spans(
         "xhigh" => vec![Span::styled(
             effort.to_string(),
             Style::new()
-                .fg(Color::LightRed)
+                .fg(palette::EFFORT_XHIGH)
                 .add_modifier(Modifier::BOLD),
         )],
         // Config `tui_gradient.max_effort` swaps the rainbow for a solid
@@ -10287,7 +10526,7 @@ fn effort_spans(
         "max" => vec![Span::styled(
             effort.to_string(),
             Style::new()
-                .fg(Color::LightMagenta)
+                .fg(palette::EFFORT_MAX)
                 .add_modifier(Modifier::BOLD),
         )],
         _ => vec![Span::styled(effort.to_string(), group_color(group))],
@@ -10374,9 +10613,9 @@ fn log_line(line: &LogLine, mask: bool) -> Line<'static> {
     use tracing::Level;
 
     let (label, style) = if line.level == Level::ERROR {
-        ("ERROR", Style::new().fg(Color::Red))
+        ("ERROR", Style::new().fg(THEME.crit))
     } else if line.level == Level::WARN {
-        (" WARN", Style::new().fg(Color::Yellow))
+        (" WARN", Style::new().fg(THEME.warn))
     } else if line.level == Level::INFO {
         (" INFO", Style::new())
     } else if line.level == Level::DEBUG {
@@ -10481,7 +10720,7 @@ fn model_active_marker(m: &ModelUsageDoc, now: SystemTime, frame: usize) -> Span
         };
         Span::styled(format!(" {glyph}"), group_color(Some(m.group.as_str())))
     } else if model_is_recent(m.last_used_ms, now) {
-        Span::styled(" ●", Style::new().fg(Color::Green))
+        Span::styled(" ●", Style::new().fg(THEME.ok))
     } else {
         Span::raw("  ")
     }
@@ -10632,6 +10871,35 @@ fn strip_per_line(widths: &[Vec<usize>], width: u16) -> usize {
     .unwrap_or(1)
 }
 
+/// Width of a packed strip line of `per_line` entries over `widths`, every
+/// field aligned down its entry column — what twolab-tui's packer measures
+/// in `packed_grid::per_line`.
+fn strip_line_width(widths: &[Vec<usize>], per_line: usize) -> usize {
+    GridPlan {
+        per_line,
+        columns: packed_grid::columns(widths, &[], per_line),
+    }
+    .line_width()
+}
+
+/// The most entries a packed line of `room` cells could ever hold: an
+/// aligned column is never narrower than the entry on its first line, so a
+/// line of `n` is at least the first `n` entries side by side — past the
+/// count where those overrun, no packing of any entries fits.
+fn strip_most_per_line(widths: &[Vec<usize>], room: usize) -> usize {
+    let mut used = 0usize;
+    for (n, entry) in widths.iter().enumerate() {
+        let own = entry.iter().sum::<usize>() + entry.len().saturating_sub(1);
+        used =
+            used.saturating_add(own)
+                .saturating_add(if n > 0 { packed_grid::ENTRY_GAP } else { 0 });
+        if used > room {
+            return n;
+        }
+    }
+    widths.len()
+}
+
 /// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
 /// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
 /// entries fit a line. A drag override keeps its height; packing then
@@ -10669,13 +10937,21 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             // The most entries the lines hold at k per line, for the
             // largest k at which the packer puts at least k of them on a
             // line — it may put more, which only leaves a line spare.
+            // The packer's choice for those entries is at least k exactly
+            // when some count from k up fits, and it is the largest that
+            // does; no count past `most` can, so only counts from k to
+            // `most` are measured (a full search per k was O(n³) a frame).
             let lines = usize::from(height - 1);
-            (2..=total)
+            let room = usize::from(width.saturating_sub(STRIP_MARGIN));
+            let most = strip_most_per_line(&widths, room);
+            (2..=most)
                 .rev()
                 .find_map(|k| {
                     let shown = total.min(lines * k);
-                    let per_line = strip_per_line(&widths[..shown], width);
-                    (per_line >= k).then_some(StripPlan {
+                    let per_line = (k..=most.min(shown))
+                        .rev()
+                        .find(|&n| strip_line_width(&widths[..shown], n) <= room)?;
+                    Some(StripPlan {
                         shown,
                         per_line,
                         height,
@@ -10712,7 +10988,7 @@ fn draw_models_strip_packed(
     section(frame, area, &title);
     let grid = PackedGrid::new(strip_entries(view, shown, ctx.now, ctx.frame))
         .min_per_line(2)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let inner = Rect {
         x: area.x.saturating_add(STRIP_MARGIN),
         y: area.y.saturating_add(1),
@@ -10875,7 +11151,7 @@ fn draw_models_full(
     if view.model_usage.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no model usage yet — send a request through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " models ");
         frame.render_widget(empty, body);
@@ -10922,12 +11198,12 @@ fn draw_models_table(
             let (group_cell, name_cell) =
                 model_name_cells(m, active, ctx.frame, view.tui_effects, view.gradient);
             let ok_err = Line::from(vec![
-                Span::styled(format::human_count(m.ok), Style::new().fg(Color::Green)),
+                Span::styled(format::human_count(m.ok), Style::new().fg(THEME.done)),
                 Span::raw("/"),
                 Span::styled(
                     format::human_count(m.errors),
                     if m.errors > 0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.fail)
                     } else {
                         dim()
                     },
@@ -10955,7 +11231,7 @@ fn draw_models_table(
             cells.push(Cell::from(in_flight_span(m.in_flight)));
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -11056,7 +11332,7 @@ fn draw_model_detail(
             } else {
                 String::new()
             },
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ),
     ]));
     // The counts on a fact table: requests and cost on the left, the four
@@ -11064,11 +11340,11 @@ fn draw_model_detail(
     // is too narrow), each figure right-aligned on its last digit. A cache
     // class the upstream never reported, or a cost no rate prices, is `—` —
     // never a made-up 0 (req9).
-    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+    let facts = FactTable::new(THEME).max_columns(2).facts([
         Fact::new("requests", format::human_count(m.requests)),
-        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(Color::Green)),
+        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(THEME.done)),
         Fact::new("errors", format::human_count(m.errors)).style(if m.errors > 0 {
-            Style::new().fg(Color::Red)
+            Style::new().fg(THEME.fail)
         } else {
             dim()
         }),
@@ -11170,7 +11446,7 @@ fn draw_heatmap(
     if total == 0 {
         lines.push(Line::from(Span::styled(
             " no windowed activity yet",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         frame.render_widget(Paragraph::new(lines), body);
         return;
@@ -11266,7 +11542,7 @@ fn keybar_after(
     let room = width.saturating_sub(cells::spans_width(&lead) as u16);
     let bar = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
         .no_more()
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .line(room);
     let mut spans = lead;
     spans.extend(bar.spans);
@@ -11305,7 +11581,7 @@ fn field_line(
     let mut state = field.clone();
     twolab_tui::composer::Composer::new()
         .placeholder(placeholder)
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .line(&mut state, width)
 }
 
@@ -11326,7 +11602,7 @@ fn field_bar(
     let natural = |hints: &[(&'static str, &'static str)]| {
         let line = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
             .no_more()
-            .theme(KEYBAR_THEME)
+            .theme(THEME)
             .line(u16::MAX);
         cells::spans_width(&line.spans) as u16
     };
@@ -11349,17 +11625,6 @@ fn field_bar(
     (keybar_after(lead, hints, width), field_w)
 }
 
-/// The theme every twolab-tui widget on the dashboard draws with (key bars,
-/// confirm gates, pickers): ANSI colours with labels in the terminal's
-/// default foreground (as before the move to KeyHints) — ANSI grey labels
-/// would be near-invisible on a light-background terminal. Under `NO_COLOR`
-/// the frame loop's `decolor` pass strips the colours; what the widgets mark
-/// with weight (a bold marked option, a reversed cursor row) survives it.
-const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
-    text_secondary: Color::Reset,
-    ..twolab_tui::Theme::ansi()
-};
-
 /// A loading label (sessions, the keys title, the raw viewer) on twolab-tui's
 /// shimmer, `age` after it appeared: still for 600 ms — a load that ends
 /// sooner never sweeps — then a band passes across it every 4 s. On the
@@ -11374,7 +11639,7 @@ fn loading_label(
 ) -> Vec<Span<'static>> {
     twolab_tui::shimmer::Shimmer::new(label)
         .style(style)
-        .spans_at(age, &KEYBAR_THEME.with_motion(motion))
+        .spans_at(age, &THEME.with_motion(motion))
 }
 
 /// The spinner frame beside a loading label: `frame`, or the first glyph held
@@ -11427,7 +11692,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 ("Cancel", "n · Esc · Enter · any other key".into()),
             ],
             marked: ACCOUNT_GATE_MARK,
-            color: Color::Red,
+            color: THEME.crit,
         }),
         Mode::ConfirmReset { idx } => {
             let target = account(idx);
@@ -11493,7 +11758,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 question,
                 options,
                 marked: ACCOUNT_GATE_MARK,
-                color: Color::Yellow,
+                color: THEME.warn,
             })
         }
         Mode::ConfigConfirm { .. } => Some(GateCard {
@@ -11504,7 +11769,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 ("Cancel", "n · Esc".to_string()),
             ],
             marked: chrome.confirm_choice.min(1),
-            color: Color::Yellow,
+            color: THEME.warn,
         }),
         _ => None,
     }
@@ -11518,7 +11783,13 @@ const GATE_MAX_WIDTH: u16 = 100;
 /// as tall as its question needs, over whatever surface summoned it (the
 /// accounts table, MAIN, the config editor) — the layout underneath does not
 /// move while the gate is open.
-fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
+fn draw_gate(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    hits: &mut Hits,
+) {
     use twolab_tui::choice_form::{ChoiceForm, ChoiceOption, ChoiceState};
     let Some(gate) = gate_card(view, ctx, chrome) else {
         return;
@@ -11535,12 +11806,12 @@ fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &C
     .no_other()
     // The footer row under the card carries the keys (fitted like every bar).
     .hints(false)
-    .theme(KEYBAR_THEME);
+    .theme(THEME);
     let mut state = ChoiceState::at(gate.marked);
     // A gate taller than the room windows its options (`⋯ N more`) instead
     // of cutting them.
     let body = form.height(&state, width.saturating_sub(2));
-    if let Some(inner) = footer_card(frame, body, gate.title, gate.color) {
+    if let Some(inner) = footer_card(frame, hits, body, gate.title, gate.color) {
         frame.render_stateful_widget(&form, inner, &mut state);
     }
 }
@@ -11553,9 +11824,16 @@ fn card_width(full: Rect) -> u16 {
 
 /// Clear and frame a card of `body` rows (plus its border) standing on the
 /// two footer rows, [`card_width`] wide, titled in `color`; the header and
-/// tab rows always stay uncovered. Returns the rect inside the border, or
-/// `None` when not even one row fits.
-fn footer_card(frame: &mut Frame, body: u16, title: &str, color: Color) -> Option<Rect> {
+/// tab rows always stay uncovered. The card is a surface in `hits`, over
+/// what lies beneath it (a toast, a row). Returns the rect inside the
+/// border, or `None` when not even one row fits.
+fn footer_card(
+    frame: &mut Frame,
+    hits: &mut Hits,
+    body: u16,
+    title: &str,
+    color: Color,
+) -> Option<Rect> {
     let full = frame.area();
     let height = body.saturating_add(2).min(full.height.saturating_sub(4));
     if height < 3 {
@@ -11575,6 +11853,7 @@ fn footer_card(frame: &mut Frame, body: u16, title: &str, color: Color) -> Optio
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    hits.push(area, ClickTarget::Surface(Surface::Card));
     Some(inner)
 }
 
@@ -11617,7 +11896,7 @@ pub(crate) fn login_list(idx: usize) -> twolab_tui::select_list::SelectList {
             "the sign-in runs in this client; the account is injected into the daemon",
             dim(),
         ))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     select_at(&mut list, idx);
     list
 }
@@ -11625,14 +11904,14 @@ pub(crate) fn login_list(idx: usize) -> twolab_tui::select_list::SelectList {
 /// Draw the new-login picker as a card standing on the footer (the footer
 /// row lists its keys). It used to be one footer line that lost OpenRouter,
 /// Gemini and its own Enter/Esc off the right edge at 80 columns.
-fn draw_login_picker(frame: &mut Frame, chrome: &Chrome) {
+fn draw_login_picker(frame: &mut Frame, chrome: &Chrome, hits: &mut Hits) {
     use twolab_tui::render::Renderable;
     let Mode::NewLogin { idx } = chrome.mode else {
         return;
     };
     let list = login_list(idx);
     let body = list.desired_height(card_width(frame.area()).saturating_sub(2));
-    if let Some(inner) = footer_card(frame, body, "new login", Color::Cyan) {
+    if let Some(inner) = footer_card(frame, hits, body, "new login", THEME.accent) {
         frame.render_widget(&list, inner);
     }
 }
@@ -11878,7 +12157,7 @@ fn copy_mode_banner(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         cells::pad(text, usize::from(width), cells::Align::Left),
         Style::new()
-            .fg(KEYBAR_THEME.accent)
+            .fg(THEME.accent)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
     ))
 }
@@ -11894,11 +12173,11 @@ fn outcome_spans(outcome: twolab_tui::banner::Outcome, text: &str) -> Vec<Span<'
     let mut spans = vec![
         Span::styled(
             kind.glyph(),
-            kind.style(&KEYBAR_THEME).add_modifier(Modifier::BOLD),
+            kind.style(&THEME).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
     ];
-    if let Some(line) = Flash::new(outcome, text).theme(KEYBAR_THEME).line() {
+    if let Some(line) = Flash::new(outcome, text).theme(THEME).line() {
         spans.extend(line.spans);
     }
     spans
@@ -11919,36 +12198,48 @@ fn status_row(msg: Option<&StatusMsg>, mask: bool, width: u16) -> Line<'static> 
 
 /// Status messages with several facts — a multi-account refresh with
 /// failures — as twolab-tui toast cards stacked in the top-right corner of
-/// `area` (under the tab row, above the footer): the outcome's word in the
-/// border, its glyph and the summary, then one line per fact and `+N more`
+/// `area` (under the tab row, above the footer, and under any modal, gate
+/// or picker): the outcome's word in the border, its glyph and the summary, then one line per fact and `+N more`
 /// past four. Each stays for its kind's time (8 s for a failure) on the
 /// dashboard's clock, so a burst is read one card after another. Up to two
 /// thirds of the width, so long errors are not cut early on a wide terminal;
 /// at 64 columns or fewer a card becomes a one-row banner. Account names
-/// are masked like the status row.
-fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+/// are masked like the status row. Returns each drawn toast's rect as its
+/// click target ([`ClickTarget::Toast`]), first drawn first.
+fn draw_toasts(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: &Chrome,
+    mask: bool,
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::toast::{Anchor, Toast, ToastStack, DEFAULT_MAX_WIDTH};
     let cap = (area.width.saturating_mul(2) / 3).max(DEFAULT_MAX_WIDTH);
-    let shown: Vec<Toast> = chrome
+    let (ids, shown): (Vec<_>, Vec<Toast>) = chrome
         .toasts
-        .visible(chrome.clock)
-        .into_iter()
-        .map(|t| {
-            Toast::new(t.kind_of(), masked_text(t.title(), mask))
+        .entries(chrome.clock)
+        .map(|(id, t, _)| {
+            let toast = Toast::new(t.kind_of(), masked_text(t.title(), mask))
                 .lines(t.body_lines().iter().map(|l| masked_text(l, mask)))
                 .ttl(t.ttl_of())
-                .max_width(cap)
+                .max_width(cap);
+            (id, toast)
         })
-        .collect();
+        .unzip();
     if shown.is_empty() {
-        return;
+        return Vec::new();
     }
-    ToastStack::new(&shown)
+    let layout = ToastStack::new(&shown)
         .anchor(Anchor::TopRight)
         .queued(chrome.toasts.waiting())
         .dropped(chrome.toasts.dropped())
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .render(area, frame.buffer_mut());
+    // The layout's index is into `shown`, which runs in the queue's order.
+    layout
+        .toasts
+        .into_iter()
+        .filter_map(|(i, rect)| Some((rect, ClickTarget::Toast(*ids.get(i)?))))
+        .collect()
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Option<u16> {
@@ -12079,6 +12370,139 @@ mod tests {
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashMap};
     use twolab_tui::composer::{ComposerState, Mask};
+
+    /// The targets of one kind a click can still reach, in paint order:
+    /// `pick` names the kind (account rows, tabs, …). One covered at its
+    /// first cell by a later surface (an overlay, a modal) is left out.
+    fn reachable<U>(hits: &Hits, pick: impl Fn(&ClickTarget) -> Option<U>) -> Vec<(Rect, U)> {
+        hits.iter()
+            .filter(|&(rect, target)| hits.hit(rect.x, rect.y) == Some((rect, target)))
+            .filter_map(|(rect, target)| pick(target).map(|u| (rect, u)))
+            .collect()
+    }
+
+    /// The account rows a click reaches this frame: rect and display index.
+    fn account_rows(main: &MainChrome) -> Vec<(Rect, usize)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::AccountRow(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    fn separators(main: &MainChrome) -> Vec<SeparatorHit> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Separator(sep) => Some(*sep),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(_, sep)| sep)
+        .collect()
+    }
+
+    fn settings(main: &MainChrome) -> Vec<(Rect, SettingAction)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Setting(action) => Some(*action),
+            _ => None,
+        })
+    }
+
+    /// A config value cell a click reaches: where, which row, what it does.
+    struct ConfigCell {
+        area: Rect,
+        row: usize,
+        action: ConfigAction,
+    }
+
+    fn config_cells(main: &MainChrome) -> Vec<ConfigCell> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::ConfigRow { row, action } => Some((*row, *action)),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(area, (row, action))| ConfigCell { area, row, action })
+        .collect()
+    }
+
+    /// The sessions table's data rows as one rect: their targets together.
+    fn sessions_rows(main: &MainChrome) -> Option<Rect> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::SessionsRow(_) => Some(()),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(rect, ())| rect)
+        .reduce(|a, b| a.union(b))
+    }
+
+    /// The open context menu as the frame's map has it: the popup's rect
+    /// and the item a click lands on.
+    struct MenuSeen<'a> {
+        area: Rect,
+        hits: &'a Hits,
+    }
+
+    impl MenuSeen<'_> {
+        fn of(hits: &Hits) -> Option<MenuSeen<'_>> {
+            let menu = ClickTarget::Surface(Surface::Menu);
+            let area = hits.iter().find(|(_, t)| **t == menu)?.0;
+            Some(MenuSeen { area, hits })
+        }
+
+        fn hit(&self, col: u16, row: u16) -> Option<usize> {
+            match self.hits.hit_test(col, row) {
+                Some(ClickTarget::MenuItem(i)) => Some(*i),
+                _ => None,
+            }
+        }
+    }
+
+    /// The raw viewer's payload tabs a click reaches: index and rect.
+    fn raw_tabs(main: &MainChrome) -> Vec<(usize, Rect)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::RawTab(i) => Some(*i),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(rect, i)| (i, rect))
+        .collect()
+    }
+
+    /// The map `targets` make when pushed in order.
+    fn map_of(targets: &[(Rect, ClickTarget)]) -> Hits {
+        let mut map = Hits::new();
+        map.extend(targets.iter().cloned());
+        map
+    }
+
+    /// What a click at `(col, row)` means if it lands on the activity panel,
+    /// resolved as the mouse handler does: the map's target and its rect.
+    fn activity_at(hits: &Hits, col: u16, row: u16) -> Option<ActivityClick> {
+        match hits.hit(col, row)? {
+            (rect, ClickTarget::Activity { key, kind }) => {
+                Some(activity_click(rect, key.clone(), *kind, col))
+            }
+            _ => None,
+        }
+    }
+
+    /// The activity targets a click reaches this frame, in paint order.
+    fn activity_targets(main: &MainChrome) -> Vec<(Rect, ActivityKey, ActivityHitKind)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Activity { key, kind } => Some((key.clone(), *kind)),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(rect, (key, kind))| (rect, key, kind))
+        .collect()
+    }
+
+    /// The tab under `(col, row)`, if a tab is what is there.
+    fn tab_at(hits: &Hits, col: u16, row: u16) -> Option<Overlay> {
+        match hits.hit_test(col, row) {
+            Some(ClickTarget::Tab(overlay)) => Some(*overlay),
+            _ => None,
+        }
+    }
 
     fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
         ModelUsageDoc {
@@ -12564,13 +12988,13 @@ mod tests {
             let (rows, hits) = render_with_hits(&view, &chrome, w, h);
             let frame = rows.join("\n");
             let bar = hits.table_scroll.expect("60 sessions overflow");
-            let table = hits.sessions_table.expect("table drawn");
+            let table = sessions_rows(&hits).expect("table drawn");
             assert_eq!(
                 bar.track.x,
-                table.rows.right(),
+                table.right(),
                 "{w}x{h}: right of the rows\n{frame}"
             );
-            assert_eq!(bar.track.y, table.rows.y, "{w}x{h}: beside the data rows");
+            assert_eq!(bar.track.y, table.y, "{w}x{h}: beside the data rows");
             if w >= SIDE_BY_SIDE_AT {
                 assert!(bar.track.x < w - 46, "{w}x{h}: on the list, not the detail");
             }
@@ -13376,6 +13800,70 @@ mod tests {
         assert!(!bold_at(other, "Remove the account"), "the other is plain");
     }
 
+    /// A toast never covers a question still waiting for its answer: on a
+    /// short terminal the remove / reset gate and the login picker stand
+    /// where the toast card is, and every row of the card is the card's own
+    /// text with the toast up or not (the toast used to be drawn over it,
+    /// hiding the `y` it was asking about). The footer stays the footer.
+    #[test]
+    fn a_toast_stays_under_the_confirm_gate_and_the_login_picker() {
+        use twolab_tui::toast::{Toast, ToastKind};
+        let view = usage_control_view();
+        let chrome = |mode: Mode, toast: bool| {
+            let mut chrome = chrome_overlay(Overlay::Accounts);
+            chrome.mode = mode;
+            if toast {
+                let toast = Toast::new(ToastKind::Fail, "refresh: 1 ok, 5 FAILED")
+                    .lines((2..=6).map(|n| format!("claude:a{n}@x.com: upstream 50{n}")));
+                chrome.toasts.push(toast, Duration::ZERO);
+            }
+            chrome
+        };
+        // With nothing asking, the toast is drawn at each size.
+        for (w, h) in [(80u16, 12u16), (80, 16), (179, 43)] {
+            let frame = render(&view, &chrome(Mode::Normal, true), w, h);
+            assert!(frame.contains("5 FAILED"), "{w}x{h}: {frame}");
+        }
+        let mut covered = 0;
+        for (mode, title) in [
+            (Mode::ConfirmRemove { idx: 0 }, "┌ remove account "),
+            (Mode::ConfirmReset { idx: 0 }, "┌ "),
+            (Mode::NewLogin { idx: 0 }, "┌ new login "),
+        ] {
+            for (w, h) in [(80u16, 12u16), (80, 16), (179, 43)] {
+                let bare = render_rows(&view, &chrome(mode, false), w, h);
+                let both = render_rows(&view, &chrome(mode, true), w, h);
+                let top = bare
+                    .iter()
+                    .position(|r| r.starts_with(title))
+                    .unwrap_or_else(|| panic!("{mode:?} {w}x{h}: {bare:#?}"));
+                let card = usize::from(card_width(Rect::new(0, 0, w, h)));
+                let cut = |r: &String| r.chars().take(card).collect::<String>();
+                for y in top..bare.len() {
+                    assert_eq!(cut(&both[y]), cut(&bare[y]), "{mode:?} {w}x{h} row {y}");
+                }
+                // And a click there lands on the card, not the toast under it.
+                let (_, hits) = render_with_hits(&view, &chrome(mode, true), w, h);
+                let toast = hits
+                    .hits
+                    .iter()
+                    .find(|(_, t)| matches!(t, ClickTarget::Toast(_)))
+                    .map(|(rect, _)| rect)
+                    .expect("the toast is recorded");
+                let y = u16::try_from(top).expect("row").max(toast.y);
+                if y < toast.bottom() {
+                    assert_eq!(
+                        hits.hits.hit_test(toast.x, y),
+                        Some(&ClickTarget::Surface(Surface::Card)),
+                        "{mode:?} {w}x{h}"
+                    );
+                    covered += 1;
+                }
+            }
+        }
+        assert!(covered >= 3, "each card covered the toast somewhere");
+    }
+
     #[test]
     fn row_account_name_strips_group_prefix_and_abbreviates_domain() {
         let abbrev = crate::config::default_domain_abbrev();
@@ -13412,7 +13900,7 @@ mod tests {
             .level(level)
             .text(text, bold)
             .label(false)
-            .theme(KEYBAR_THEME);
+            .theme(THEME);
         match marker {
             Some(glyph) => meter.marker(glyph),
             None => meter,
@@ -13742,6 +14230,7 @@ mod tests {
             usage_scroll: 0,
             logs_scroll: None,
             logs_selection: None,
+            logs_frozen: None,
             copy_mode: false,
             input_modal: None,
             raw_modal: None,
@@ -14396,8 +14885,10 @@ mod tests {
                     "misc/mystery 3 11 2 40 4 —",
                 ],
             ),
+            // Row 3: the second bucket's row (the first bucket and its two
+            // models are rows 0–2).
             (
-                1,
+                3,
                 "2024-10-03",
                 vec![
                     "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
@@ -14573,7 +15064,8 @@ mod tests {
         ] {
             let mut chrome = chrome_overlay(Overlay::Usage);
             chrome.usage_gran = gran;
-            chrome.usage_scroll = 1;
+            // The second bucket's row at the top.
+            chrome.usage_scroll = usage_rows(&view, gran).0[1];
             let rows = render_rows(&view, &chrome, 160, 50);
             assert!(
                 [label, count, tokens, cost]
@@ -15587,7 +16079,7 @@ mod tests {
             let mid = assert_loading_label_shimmers("loading raw record…", at);
             let (cells, _) = label_cells(&mid, "loading raw record…");
             assert!(
-                cells.iter().all(|c| c.fg == KEYBAR_THEME.wait),
+                cells.iter().all(|c| c.fg == THEME.wait),
                 "{w}x{h}: the band keeps the wait colour: {cells:?}"
             );
         }
@@ -15922,9 +16414,8 @@ mod tests {
         let on1 = model_name_spans(Some("claude"), "fable-5", 8, true, GradientCfg::default());
         assert!(on0.len() > 1, "gradient splits the name per char");
         assert!(
-            on0.iter()
-                .enumerate()
-                .all(|(i, s)| s.style.fg == Some(gradient_solid(CLAUDE_GRADIENT_BASE, 0, i, 1.0))),
+            on0.iter().enumerate().all(|(i, s)| s.style.fg
+                == Some(gradient_solid(palette::CLAUDE_GRADIENT_BASE, 0, i, 1.0))),
             "fable-5 uses the solid claude/magenta gradient (herdr 단색 mode)"
         );
         assert_ne!(fg(&on0), fg(&on1), "gradient drifts with the frame");
@@ -15947,7 +16438,8 @@ mod tests {
         assert!(codex
             .iter()
             .enumerate()
-            .all(|(i, s)| s.style.fg == Some(gradient_solid(CODEX_GRADIENT_BASE, 0, i, 1.0))));
+            .all(|(i, s)| s.style.fg
+                == Some(gradient_solid(palette::CODEX_GRADIENT_BASE, 0, i, 1.0))));
         // Effects OFF: a single static bold group-colored span.
         let off = model_name_spans(Some("claude"), "fable-5", 0, false, GradientCfg::default());
         assert_eq!(off.len(), 1);
@@ -15981,15 +16473,20 @@ mod tests {
                 max_effort: Some("".into()),
             });
             assert_eq!(cfg.speed, 1.0, "speed {bad_speed} sanitized");
-            assert_eq!(cfg.claude, CLAUDE_GRADIENT_BASE);
-            assert_eq!(cfg.codex, CODEX_GRADIENT_BASE);
+            assert_eq!(cfg.claude, palette::CLAUDE_GRADIENT_BASE);
+            assert_eq!(cfg.codex, palette::CODEX_GRADIENT_BASE);
             assert_eq!(cfg.max_effort, None);
         }
         // Defaults: speed 1.0, the built-in anchors, rainbow kept.
         let def = GradientCfg::default();
         assert_eq!(
             (def.speed, def.claude, def.codex, def.max_effort),
-            (1.0, CLAUDE_GRADIENT_BASE, CODEX_GRADIENT_BASE, None)
+            (
+                1.0,
+                palette::CLAUDE_GRADIENT_BASE,
+                palette::CODEX_GRADIENT_BASE,
+                None
+            )
         );
     }
 
@@ -16153,15 +16650,16 @@ mod tests {
         for (w, h) in [(80u16, 24u16), (179, 43)] {
             let (rows, hits) = render_with_hits(&view, &chrome, w, h);
             let frame = rows.join("\n");
-            let raw = hits.raw_modal.expect("the raw viewer drew");
-            assert_eq!(raw.tabs.len(), 2, "{w}x{h}:\n{frame}");
+            assert!(hits.raw_modal.is_some(), "the raw viewer drew");
+            let tabs = raw_tabs(&hits);
+            assert_eq!(tabs.len(), 2, "{w}x{h}:\n{frame}");
             for (i, label) in ["Request", "Response"].into_iter().enumerate() {
-                let (index, rect) = raw.tabs[i];
+                let (index, rect) = tabs[i];
                 assert_eq!(index, i);
                 let row = &rows[usize::from(rect.y)];
                 assert_eq!(row_cells(row, rect.x, rect.width), label, "{w}x{h}: {row}");
             }
-            let strip = &rows[usize::from(raw.tabs[0].1.y)];
+            let strip = &rows[usize::from(tabs[0].1.y)];
             assert!(strip.contains("Request │ Response"), "{w}x{h}: {strip}");
             let at = rows
                 .iter()
@@ -16182,6 +16680,7 @@ mod tests {
         }
         let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
         let frame = rows.join("\n");
+        let tabs = raw_tabs(&hits);
         let raw = hits.raw_modal.expect("drawn");
         let bar = raw.bar.expect("17 lines overflow 80x24");
         assert!(frame.contains("lines 1–11 of 17"), "{frame}");
@@ -16211,8 +16710,8 @@ mod tests {
         chrome.raw_modal.as_mut().expect("open").scroll = 0;
         let mut buf = render_buffer(&view, &chrome, 80, 24);
         twolab_tui::theme::decolor(&mut buf);
-        let (_, req) = raw.tabs[0];
-        let (_, resp) = raw.tabs[1];
+        let (_, req) = tabs[0];
+        let (_, resp) = tabs[1];
         assert!(buf[(req.x, req.y)].modifier.contains(Modifier::BOLD));
         assert!(!buf[(resp.x, resp.y)].modifier.contains(Modifier::BOLD));
     }
@@ -16340,27 +16839,30 @@ mod tests {
         assert!(first.contains("POST /v1/messages"));
         // The hit registers on the request line's row (first detail line) and
         // resolves to OpenRaw.
+        let panel = Rect::new(0, 0, 80, 20);
         let mut hits = Vec::new();
-        push_raw_line_hit(&mut hits, &key, &entry, 5, 4);
+        push_raw_line_hit(&mut hits, panel, &key, &entry, 5, 4);
         // The hit carries the entry's activity id so the opener can pin the
         // exact row under a same-ms ActivityKey collision (MUST-FIX).
         let eid = match &entry.body {
             CompletedBody::Request { id, .. } => *id,
             _ => unreachable!("seeded a request"),
         };
-        assert_eq!(hits[0].kind, ActivityHitKind::RawLine { id: eid });
-        assert_eq!((hits[0].y_start, hits[0].height), (6, 1));
-        let chrome = ActivityChrome {
-            area: Rect::new(0, 0, 80, 20),
-            hits,
-        };
         assert_eq!(
-            hit_test_activity(&chrome, 10, 6),
+            hits[0].1,
+            ClickTarget::Activity {
+                key: key.clone(),
+                kind: ActivityHitKind::RawLine { id: eid }
+            }
+        );
+        assert_eq!((hits[0].0.y, hits[0].0.height), (6, 1));
+        assert_eq!(
+            activity_at(&map_of(&hits), 10, 6),
             Some(ActivityClick::OpenRaw(key.clone(), eid))
         );
         // A collapsed entry (height 1: no detail lines rendered) registers none.
         let mut none = Vec::new();
-        push_raw_line_hit(&mut none, &key, &entry, 5, 1);
+        push_raw_line_hit(&mut none, panel, &key, &entry, 5, 1);
         assert!(none.is_empty());
     }
 
@@ -17573,14 +18075,13 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout recorded").activity;
-        let input_hit = layout
-            .hits
-            .iter()
-            .find(|h| h.kind == ActivityHitKind::InputLine)
+        let main = hits.expect("layout recorded");
+        let (input_hit, _, _) = activity_targets(&main)
+            .into_iter()
+            .find(|(_, _, kind)| *kind == ActivityHitKind::InputLine)
             .expect("the 🔍 input line is its own hit target");
         assert_eq!(
-            hit_test_activity(&layout, layout.area.x + 8, input_hit.y_start),
+            activity_at(&main.hits, input_hit.x + 8, input_hit.y),
             Some(ActivityClick::OpenInput(key.clone())),
             "clicking the input line opens the modal, never collapses the row"
         );
@@ -18190,7 +18691,7 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_activity_maps_row_to_entry_and_ignores_outside() {
+    fn activity_click_maps_row_to_entry_and_ignores_outside() {
         let area = Rect {
             x: 0,
             y: 10,
@@ -18211,47 +18712,37 @@ mod tests {
         };
         // Entry 1 occupies rows 11..14 (expanded: 3 rows), entry 2 is a
         // folded-run HEADER on row 14.
-        let chrome = ActivityChrome {
-            area,
-            hits: vec![
-                ActivityHit {
-                    key: k1.clone(),
-                    y_start: 11,
-                    height: 3,
-                    kind: ActivityHitKind::Entry,
-                },
-                ActivityHit {
-                    key: k2.clone(),
-                    y_start: 14,
-                    height: 1,
-                    kind: ActivityHitKind::RunHeader { expanded: false },
-                },
-            ],
-        };
+        let chrome = map_of(&[
+            activity_target(area, 11, 3, k1.clone(), ActivityHitKind::Entry),
+            activity_target(
+                area,
+                14,
+                1,
+                k2.clone(),
+                ActivityHitKind::RunHeader { expanded: false },
+            ),
+        ]);
         // Clicks within entry 1's row span (any of 11,12,13) map to k1.
         assert_eq!(
-            hit_test_activity(&chrome, 5, 11),
+            activity_at(&chrome, 5, 11),
             Some(ActivityClick::Entry(k1.clone()))
         );
-        assert_eq!(
-            hit_test_activity(&chrome, 5, 13),
-            Some(ActivityClick::Entry(k1))
-        );
+        assert_eq!(activity_at(&chrome, 5, 13), Some(ActivityClick::Entry(k1)));
         // Run header row 14: the marker zone toggles, the body expands.
         assert_eq!(
-            hit_test_activity(&chrome, RUN_MARKER_ZONE - 1, 14),
+            activity_at(&chrome, RUN_MARKER_ZONE - 1, 14),
             Some(ActivityClick::RunToggle(k2.clone()))
         );
         assert_eq!(
-            hit_test_activity(&chrome, RUN_MARKER_ZONE, 14),
+            activity_at(&chrome, RUN_MARKER_ZONE, 14),
             Some(ActivityClick::RunExpand(k2))
         );
         // The title/border row (y=10) and below the last entry map to nothing.
-        assert_eq!(hit_test_activity(&chrome, 5, 10), None);
-        assert_eq!(hit_test_activity(&chrome, 5, 15), None);
+        assert_eq!(activity_at(&chrome, 5, 10), None);
+        assert_eq!(activity_at(&chrome, 5, 15), None);
         // Outside the panel horizontally / vertically → None.
-        assert_eq!(hit_test_activity(&chrome, 99, 12), None);
-        assert_eq!(hit_test_activity(&chrome, 5, 0), None);
+        assert_eq!(activity_at(&chrome, 99, 12), None);
+        assert_eq!(activity_at(&chrome, 5, 0), None);
     }
 
     fn assert_c2a_tab_strip(
@@ -18273,12 +18764,13 @@ mod tests {
                 format!("{expected_header:<width$}", width = width as usize)
             );
             assert_eq!(tabs.len(), 10, "one hit target per tab");
-            for (hit, (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
-                assert_eq!(hit.overlay, *overlay);
-                assert_eq!(hit.area, Rect::new(*x, 1, label.len() as u16, 1));
-                assert!(hit.area.right() <= width, "{label} must not be clipped");
-                for col in hit.area.x..hit.area.right() {
-                    assert_eq!(hit_test_tabs(&tabs, col, 1), Some(*overlay), "{label}");
+            let map = map_of(&tabs);
+            for ((area, target), (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
+                assert_eq!(*target, ClickTarget::Tab(*overlay));
+                assert_eq!(*area, Rect::new(*x, 1, label.len() as u16, 1));
+                assert!(area.right() <= width, "{label} must not be clipped");
+                for col in area.x..area.right() {
+                    assert_eq!(tab_at(&map, col, 1), Some(*overlay), "{label}");
                     let cell = &buffer[(col, 1)];
                     assert_eq!(cell.fg, Color::Cyan, "{label}");
                     assert_eq!(
@@ -18293,11 +18785,11 @@ mod tests {
                     .iter()
                     .any(|(label, x, _)| col >= *x && col < *x + label.len() as u16)
                 {
-                    assert_eq!(hit_test_tabs(&tabs, col, 1), None, "separator/padding");
+                    assert_eq!(tab_at(&map, col, 1), None, "separator/padding");
                 }
                 for row in [0, 2] {
                     assert_eq!(buffer[(col, row)].symbol(), " ", "one-row strip");
-                    assert_eq!(hit_test_tabs(&tabs, col, row), None);
+                    assert_eq!(tab_at(&map, col, row), None);
                 }
             }
         }
@@ -18396,31 +18888,29 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let tabs = hits.expect("layout").tabs;
+        let map = hits.expect("layout").hits;
+        let tabs = reachable(&map, |t| match t {
+            ClickTarget::Tab(overlay) => Some(*overlay),
+            _ => None,
+        });
         assert_eq!(tabs.len(), TABS.len(), "one hit target per tab");
-        for (hit, (label, overlay)) in tabs.iter().zip(TABS) {
-            assert_eq!(hit.overlay, *overlay);
-            assert_eq!(hit.area.width as usize, label.chars().count());
+        for ((area, tab), (label, overlay)) in tabs.iter().zip(TABS) {
+            assert_eq!(tab, overlay);
+            assert_eq!(area.width as usize, label.chars().count());
             // A click anywhere on the label maps to its overlay.
+            assert_eq!(tab_at(&map, area.x, area.y), Some(*overlay), "{label}");
             assert_eq!(
-                hit_test_tabs(&tabs, hit.area.x, hit.area.y),
-                Some(*overlay),
-                "{label}"
-            );
-            assert_eq!(
-                hit_test_tabs(&tabs, hit.area.right() - 1, hit.area.y),
+                tab_at(&map, area.right() - 1, area.y),
                 Some(*overlay),
                 "{label} right edge"
             );
         }
         // The separator between the first two labels maps to nothing.
-        let gap_x = tabs[0].area.right() + 1;
-        assert_eq!(hit_test_tabs(&tabs, gap_x, tabs[0].area.y), None);
+        let (first, _) = tabs[0];
+        let gap_x = first.right() + 1;
+        assert_eq!(tab_at(&map, gap_x, first.y), None);
         // A different row maps to nothing.
-        assert_eq!(
-            hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
-            None
-        );
+        assert_eq!(tab_at(&map, first.x, first.y + 1), None);
     }
 
     #[test]
@@ -18707,8 +19197,8 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let settings = hits.expect("layout").settings;
-        let actions: Vec<SettingAction> = settings.iter().map(|h| h.action).collect();
+        let settings = settings(&hits.expect("layout"));
+        let actions: Vec<SettingAction> = settings.iter().map(|&(_, action)| action).collect();
         assert!(actions.contains(&SettingAction::SchedMode));
         assert!(actions.contains(&SettingAction::CodexModel));
         assert!(actions.contains(&SettingAction::CodexEffort));
@@ -18737,10 +19227,10 @@ mod tests {
             let buf = render_buffer(&view, &chrome, w, 43);
             let bar = row_of(&rows, " sched ");
             let frame = rows[bar].clone();
-            for hit in &hits.settings {
-                assert_eq!(usize::from(hit.area.y), bar, "{frame}");
-                let drawn = cells_of(&buf, hit.area);
-                let want = match hit.action {
+            for (area, action) in settings(&hits) {
+                assert_eq!(usize::from(area.y), bar, "{frame}");
+                let drawn = cells_of(&buf, area);
+                let want = match action {
                     SettingAction::SchedMode => view.select_params.mode.label().to_string(),
                     SettingAction::CodexModel => "模型-一二".into(),
                     SettingAction::CodexEffort => "bypass".into(),
@@ -18752,16 +19242,19 @@ mod tests {
                     drawn.replace(' ', ""),
                     want,
                     "{:?} at {w}:\n{frame}",
-                    hit.action
+                    action
                 );
                 assert_eq!(
-                    usize::from(hit.area.width),
+                    usize::from(area.width),
                     cells::width(&want),
                     "{:?} rect is the value's cells at {w}:\n{frame}",
-                    hit.action
+                    action
                 );
             }
-            let actions: Vec<SettingAction> = hits.settings.iter().map(|h| h.action).collect();
+            let actions: Vec<SettingAction> = settings(&hits)
+                .into_iter()
+                .map(|(_, action)| action)
+                .collect();
             match w {
                 179 => {
                     assert!(frame.contains("claude 14 acc") && frame.contains("gemini 1 acc"));
@@ -18978,9 +19471,11 @@ mod tests {
         chrome.menu_anchor = Some((30, 20));
         let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
         let frame = rows.join("\n");
-        let menu = hits.menu.expect("menu drawn");
-        assert!(menu.above, "opened above the clicked row:\n{frame}");
-        assert!(menu.area.bottom() <= 20, "row 20 stays visible:\n{frame}");
+        let menu = MenuSeen::of(&hits.hits).expect("menu drawn");
+        assert!(
+            menu.area.bottom() <= 20,
+            "opened above the clicked row; row 20 stays visible:\n{frame}"
+        );
         assert_eq!(menu.area.x, 30, "lines up with the click:\n{frame}");
         let row = |label: &str| {
             rows.iter()
@@ -19440,7 +19935,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let hits = hits.expect("main chrome").config_rows;
+        let hits = config_cells(&hits.expect("main chrome"));
         assert!(!hits.is_empty(), "editable value cells recorded");
         for h in &hits {
             assert!(h.area.x > 2, "value cells start after the label column");
@@ -19500,7 +19995,7 @@ mod tests {
             let line = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
             let text = (0..h).map(line).collect::<Vec<_>>().join("\n");
             assert!(!text.contains("limitsper"), "{text}");
-            let hits = hits.expect("main chrome").config_rows;
+            let hits = config_cells(&hits.expect("main chrome"));
             assert!(hits.len() > 3, "value cells recorded at {w}x{h}");
             let col = hits[0].area.x;
             assert!(hits.iter().all(|h| h.area.x == col), "one value column");
@@ -19577,12 +20072,13 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("activity layout recorded").activity;
-        assert!(!layout.hits.is_empty(), "the request row is a hit target");
-        let hit = &layout.hits[0];
+        let main = hits.expect("activity layout recorded");
+        let targets = activity_targets(&main);
+        assert!(!targets.is_empty(), "the request row is a hit target");
+        let (hit, _, _) = targets[0];
         // A click on the row's first line maps back to the same key.
         assert_eq!(
-            hit_test_activity(&layout, layout.area.x + 1, hit.y_start),
+            activity_at(&main.hits, hit.x + 1, hit.y),
             Some(ActivityClick::Entry(key.clone()))
         );
 
@@ -19614,9 +20110,9 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout").activity;
+        let main = hits.expect("layout");
         assert!(
-            layout.hits.is_empty(),
+            activity_targets(&main).is_empty(),
             "a note line is not a clickable hit target"
         );
     }
@@ -20787,29 +21283,43 @@ mod tests {
         // that skips hidden wide-glyph continuation cells by design.
         let buffer = rendered.buffer;
         let hit = hit.unwrap();
-        let openai_hit = hit
-            .hits
-            .iter()
-            .find(|h| {
-                h.key == openai.activity_key().unwrap() && matches!(h.kind, ActivityHitKind::Entry)
-            })
-            .unwrap();
-        for y in 1..openai_hit.y_start + openai_hit.height {
+        let openai_entry = ClickTarget::Activity {
+            key: openai.activity_key().unwrap(),
+            kind: ActivityHitKind::Entry,
+        };
+        let (openai_hit, _) = hit.iter().find(|(_, t)| *t == openai_entry).unwrap();
+        for y in 1..openai_hit.bottom() {
             for x in 0..160 {
-                assert_eq!(buffer[(x, y)].bg, OPENAI_ACTIVITY_BG, "cell ({x},{y})");
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    palette::OPENAI_ACTIVITY_BG,
+                    "cell ({x},{y})"
+                );
             }
         }
-        let anthropic_y = openai_hit.y_start + openai_hit.height;
+        let anthropic_y = openai_hit.bottom();
         assert_eq!(
             buffer[(159, anthropic_y)].bg,
             Color::Reset,
             "Anthropic endpoint routed to Codex keeps original background"
         );
-        let red_status = buffer
-            .content()
-            .iter()
-            .any(|c| c.symbol() == "5" && c.fg == Color::Red && c.bg == OPENAI_ACTIVITY_BG);
+        let red_status = buffer.content().iter().any(|c| {
+            c.symbol() == "5" && c.fg == Color::Red && c.bg == palette::OPENAI_ACTIVITY_BG
+        });
         assert!(red_status, "error foreground remains red on dark gray");
+        // Text without a colour of its own reads light on the dark row, also
+        // on a light terminal whose default foreground is near black.
+        let plain: Vec<Color> = (1..openai_hit.bottom())
+            .flat_map(|y| (0..160).map(move |x| (x, y)))
+            .map(|(x, y)| &buffer[(x, y)])
+            .filter(|c| c.symbol().chars().any(char::is_alphanumeric))
+            .map(|c| c.fg)
+            .collect();
+        assert!(
+            plain.iter().all(|fg| *fg != Color::Reset),
+            "no letter on the dark row takes the terminal's default foreground: {plain:?}"
+        );
+        assert!(plain.contains(&palette::OPENAI_ACTIVITY_FG), "{plain:?}");
         for y in 0..=anthropic_y {
             let text: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
             println!(
@@ -20842,7 +21352,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         for x in 0..160 {
-            assert_eq!(buffer[(x, 1)].bg, OPENAI_ACTIVITY_BG);
+            assert_eq!(buffer[(x, 1)].bg, palette::OPENAI_ACTIVITY_BG);
         }
         let text: String = (0..160).map(|x| buffer[(x, 1)].symbol()).collect();
         assert!(text.contains("3×"), "{text}");
@@ -21341,7 +21851,17 @@ mod tests {
                 ..chrome
             };
             let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
-            (view, rows, hits.models_strip)
+            let entries: Vec<packed_grid::GridHit> = reachable(&hits.hits, |t| match t {
+                ClickTarget::StripEntry { group, model } => view
+                    .model_usage
+                    .iter()
+                    .position(|m| &m.group == group && &m.model == model),
+                _ => None,
+            })
+            .into_iter()
+            .map(|(rect, index)| packed_grid::GridHit { rect, index })
+            .collect();
+            (view, rows, entries)
         };
         let (view, rows, quiet) = strip(0);
         let frame = rows.join("\n");
@@ -21941,13 +22461,13 @@ mod tests {
         for (h, visible) in [(43u16, 21usize), (30, 8)] {
             let (rows, hits) = render_with_hits(&view, &chrome, 179, h);
             let frame = rows.join("\n");
-            assert_eq!(hits.account_rows.len(), visible, "{frame}");
+            assert_eq!(account_rows(&hits).len(), visible, "{frame}");
             let accounts = row_of(&rows, " accounts · sort ");
-            for (pos, hit) in hits.account_rows.iter().enumerate() {
-                assert_eq!(usize::from(hit.area.y), accounts + 2 + pos);
-                assert_eq!(hit.display_idx, pos);
+            for (pos, (area, display_idx)) in account_rows(&hits).into_iter().enumerate() {
+                assert_eq!(usize::from(area.y), accounts + 2 + pos);
+                assert_eq!(display_idx, pos);
             }
-            let ys: Vec<(u16, PaneId)> = hits.separators.iter().map(|s| (s.y, s.pane)).collect();
+            let ys: Vec<(u16, PaneId)> = separators(&hits).iter().map(|s| (s.y, s.pane)).collect();
             assert_eq!(
                 ys,
                 vec![
@@ -22212,6 +22732,107 @@ mod tests {
             None,
             "108 + 70 + 2 > 179"
         );
+    }
+
+    /// The drag-height plan as it was searched before: for every k from
+    /// all the models down, the packer's full search over the entries k
+    /// per line would show — O(n³) a frame. The bounded search must agree.
+    fn strip_plan_full_search(view: &DashboardView, width: u16, height: u16) -> StripPlan {
+        let total = view.model_usage.len();
+        let widths: Vec<Vec<usize>> = strip_entries(view, total, UNIX_EPOCH, 0)
+            .iter()
+            .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+            .collect();
+        let height = height.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT);
+        let lines = usize::from(height - 1);
+        (2..=total)
+            .rev()
+            .find_map(|k| {
+                let shown = total.min(lines * k);
+                let per_line = strip_per_line(&widths[..shown], width);
+                (per_line >= k).then_some(StripPlan {
+                    shown,
+                    per_line,
+                    height,
+                })
+            })
+            .unwrap_or(StripPlan {
+                shown: total.min(usize::from(height - 2)),
+                per_line: 1,
+                height,
+            })
+    }
+
+    /// A dragged strip's packing measures only the counts that can fit (the
+    /// first entries side by side bound them) instead of re-running the
+    /// packer's whole search for every candidate: the plan is the same for
+    /// every fixture — few and many models, names short and long, narrow
+    /// and wide terminals, every drag height up to 12 — and a strip of 200
+    /// models, dragged tall, plans and draws every entry it says it shows.
+    #[test]
+    fn dragged_strip_packing_keeps_its_plan_with_the_bounded_search() {
+        let models = |n: usize| -> Vec<ModelUsageDoc> {
+            (0..n)
+                .map(|i| {
+                    let group = ["claude", "codex", "grok", "gemini"][i % 4];
+                    let name = format!("m{i}-{}", "x".repeat((i * 7) % 23));
+                    model_row(group, &name, 1_000_000 - i as u64 * 997, 500 + i as u64)
+                })
+                .collect()
+        };
+        let mut packed = 0;
+        for n in [1usize, 2, 3, 5, 9, 17, 33] {
+            let view = view_with(models(n));
+            for width in [80u16, 120, 152, 179, 220, 300, 400] {
+                for height in PANE_MIN_HEIGHT..=12 {
+                    let plan = strip_plan(&view, width, Some(height));
+                    assert_eq!(
+                        plan,
+                        strip_plan_full_search(&view, width, height),
+                        "{n} models, {width} wide, {height} tall"
+                    );
+                    packed += usize::from(plan.per_line >= 2);
+                }
+            }
+        }
+        assert!(packed > 50, "the fixtures pack: {packed}");
+        // The line width the plan measures is the packer's own.
+        let view = view_with(models(17));
+        let widths: Vec<Vec<usize>> = strip_entries(&view, 17, UNIX_EPOCH, 0)
+            .iter()
+            .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+            .collect();
+        for room in [60usize, 151, 219, 399] {
+            let ours = (2..=17)
+                .rev()
+                .find(|&k| strip_line_width(&widths, k) <= room)
+                .unwrap_or(1);
+            assert_eq!(
+                Some(ours).filter(|&k| k >= 2),
+                packed_grid::per_line(&widths, &[], room, 2)
+            );
+            if ours >= 2 {
+                assert!(strip_most_per_line(&widths, room) >= ours, "{room}");
+            }
+        }
+
+        let view = view_with(models(200));
+        let plan = strip_plan(&view, 400, Some(12));
+        assert!(plan.per_line >= 2, "{plan:?}");
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(12);
+        let (rows, hits) = render_with_hits(&view, &chrome, 400, 60);
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains(&format!(" models — top {} of 200 by tokens", plan.shown)),
+            "{plan:?}\n{frame}"
+        );
+        let entries = hits
+            .hits
+            .iter()
+            .filter(|(_, t)| matches!(t, ClickTarget::StripEntry { .. }))
+            .count();
+        assert_eq!(entries, plan.shown, "{frame}");
     }
 
     /// Rule 4, pure: the largest per-line count whose aligned line fits,
@@ -22727,6 +23348,10 @@ mod tests {
     /// together: the two touch different rows (the four rule rows vs the
     /// strip's two packed lines), so the merged frame carries both changes
     /// and nothing else (previous digest 8_543_463_821_239_879_891).
+    /// Not re-pinned when every colour in the drawing code moved to the
+    /// palette (theme sweep, 2026-11-06): each literal became the `THEME`
+    /// field that holds the same named ANSI colour (or a palette const of
+    /// the same hue), so the frame is identical, text and styles.
     const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
@@ -22742,6 +23367,294 @@ mod tests {
         assert_eq!(
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
+        );
+    }
+
+    /// The theme sweep's guard: every colour the dashboard draws comes from
+    /// `mod palette` — a field of the dashboard [`THEME`] or a named
+    /// categorical hue. A `Color::` literal, a `Stylize` colour helper, or a
+    /// second colour theme (`Theme::ansi()`, `dark()`, `light()`,
+    /// `default()`, `from_env()`; `mono()` is `NO_COLOR`'s), in
+    /// the non-test part of any TUI source (comments aside) fails here, with
+    /// its lines — the palette module in this file is the one exception.
+    #[test]
+    fn colour_literals_live_only_in_the_palette() {
+        // ratatui's `Stylize` colour helpers (`.red()`, `.on_blue()`) are
+        // literals by another name.
+        const STYLIZE: [&str; 16] = [
+            "black",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "gray",
+            "dark_gray",
+            "light_red",
+            "light_green",
+            "light_yellow",
+            "light_blue",
+            "light_magenta",
+            "light_cyan",
+            "white",
+        ];
+        let sources = [
+            ("ui.rs", include_str!("ui.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("activity.rs", include_str!("activity.rs")),
+            ("clip.rs", include_str!("clip.rs")),
+            ("event.rs", include_str!("event.rs")),
+            ("format.rs", include_str!("format.rs")),
+            ("logs.rs", include_str!("logs.rs")),
+            ("triage.rs", include_str!("triage.rs")),
+            ("view.rs", include_str!("view.rs")),
+        ];
+        let mut stray = Vec::new();
+        for (name, src) in sources {
+            let lines: Vec<&str> = src.lines().collect();
+            let tests = lines
+                .iter()
+                .position(|l| *l == "mod tests {")
+                .unwrap_or(lines.len());
+            // The palette: from `mod palette {` to its closing brace.
+            let palette = match lines.iter().position(|l| *l == "mod palette {") {
+                Some(open) => {
+                    let close = open
+                        + lines[open..]
+                            .iter()
+                            .position(|l| *l == "}")
+                            .expect("palette end");
+                    assert!(close < tests, "the palette sits before the tests");
+                    open..close + 1
+                }
+                None => 0..0,
+            };
+            assert_eq!(
+                name == "ui.rs",
+                !palette.is_empty(),
+                "the palette is in ui.rs"
+            );
+            stray.extend(
+                lines[..tests]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !palette.contains(i))
+                    .filter(|(_, l)| !l.trim_start().starts_with("//"))
+                    .filter(|(_, l)| {
+                        l.contains("Color::")
+                            || [
+                                "Theme::ansi(",
+                                "Theme::dark(",
+                                "Theme::light(",
+                                "Theme::default(",
+                                "Theme::from_env(",
+                            ]
+                            .iter()
+                            // Asking the environment whether `NO_COLOR` is
+                            // set is not drawing with a second theme.
+                            .any(|t| l.contains(t) && !l.contains(".is_mono()"))
+                            || STYLIZE.iter().any(|c| {
+                                l.contains(&format!(".{c}()")) || l.contains(&format!(".on_{c}()"))
+                            })
+                    })
+                    .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim())),
+            );
+        }
+        assert!(
+            stray.is_empty(),
+            "colours outside `mod palette` — name the THEME field (or add a palette \
+             const with its reason):\n{}",
+            stray.join("\n")
+        );
+    }
+
+    /// Two hues the theme sweep fixed. A running request's spinner wears
+    /// its group label's colour for every group: the spinner kept its own
+    /// hue table, where openrouter was green while `group_color` drew the
+    /// openrouter label dim, like an unknown group. And a `user` turn's
+    /// kind tag is the terminal's default foreground in bold, as its doc
+    /// always said — it was ANSI white, near-invisible on a light terminal.
+    #[test]
+    fn running_spinners_wear_their_group_colour_and_user_tags_the_default_text() {
+        use crate::routing::BackendGroup;
+        let (mut view, _) = crowded_view();
+        let now = SystemTime::now();
+        view.in_flight = BackendGroup::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &group)| {
+                let account = view
+                    .snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.group == group)
+                    .expect("an account per group");
+                InFlight {
+                    id: i as u64 + 1,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
+                    account: Some(account.id.0.clone()),
+                    group: Some(group.as_str().into()),
+                    model: Some("m".into()),
+                    effort: None,
+                    fast: false,
+                    kind: Some("user".into()),
+                    user_id: None,
+                    tenant: None,
+                    excerpt: None,
+                    client_name: None,
+                    started_at: now,
+                }
+            })
+            .collect();
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).expect("terminal");
+        let buf = terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, now);
+            })
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Newest first: the rows run Gemini … Claude.
+        for (y, group) in (1u16..).zip(BackendGroup::ALL.iter().rev()) {
+            let label = group_color(Some(group.as_str()));
+            assert!(
+                label.fg.is_some_and(|fg| fg != THEME.muted),
+                "{group:?} has a hue of its own: {label:?}"
+            );
+            assert_eq!(
+                Some(buf[(1, y)].fg),
+                label.fg,
+                "{group:?} spinner, row {y}:\n{text}"
+            );
+            let x = rows[usize::from(y)]
+                .find("user")
+                .map(|b| cells::width(&rows[usize::from(y)][..b]) as u16)
+                .unwrap_or_else(|| panic!("kind tag, row {y}:\n{text}"));
+            for dx in 0..4 {
+                let cell = &buf[(x + dx, y)];
+                assert_eq!(cell.fg, Color::Reset, "user tag, row {y}:\n{text}");
+                assert!(cell.modifier.contains(Modifier::BOLD), "{text}");
+            }
+        }
+    }
+
+    /// One selected style: the cursor row of llmux's own tables (the
+    /// accounts table on MAIN, the models table on the stats tab) and the
+    /// focus a twolab-tui widget draws (the compact account list) all wear
+    /// [`selected_style`] — reverse video with no colour of its own, so it
+    /// reads the same under `NO_COLOR` — and the rows around them do not.
+    #[test]
+    fn a_selection_wears_the_one_selected_style_on_every_surface() {
+        let sel = selected_style();
+        assert_eq!(sel, THEME.selected(), "the widgets' selection too");
+        assert!(sel.add_modifier.contains(Modifier::REVERSED), "{sel:?}");
+        assert_eq!((sel.fg, sel.bg), (None, None), "no colour of its own");
+        let wears = |buf: &ratatui::buffer::Buffer, x: u16, y: usize| {
+            buf[(x, y as u16)].modifier.contains(sel.add_modifier)
+        };
+        // The cell where `needle` starts on `row`.
+        let at = |row: &str, needle: &str| {
+            let byte = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+            cells::width(&row[..byte]) as u16
+        };
+
+        // MAIN's accounts table: the `>` row, from the marker through the
+        // name, and not the row under it.
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let ctx = frame_ctx(&view, &chrome);
+        let second = view.snapshot.accounts[ctx.order[1]].id.0.clone();
+        let chrome = cursor_on(&view, &chrome, &second);
+        let buf = render_buffer(&view, &chrome, 179, 43);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        for x in 0..12 {
+            assert!(wears(&buf, x, y), "accounts cursor row, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y - 1), "the row above, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y + 1), "the row below, cell {x}:\n{text}");
+        }
+
+        // The stats tab's models table: the cursor's row, not the other.
+        let view = view_with(vec![
+            model_row("codex", "gpt-5.5", 700, 300),
+            model_row("claude", "claude-sonnet-4-5", 100, 50),
+        ]);
+        let chrome = Chrome {
+            model_cursor: 1,
+            ..chrome_overlay(Overlay::Stats)
+        };
+        let buf = render_buffer(&view, &chrome, 160, 30);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let other = row_of(&rows, "gpt-5.5");
+        let x = at(&rows[other], "gpt-5.5");
+        let cursor = rows
+            .iter()
+            .position(|r| r.find("sonnet").is_some_and(|_| at(r, "sonnet") <= x + 7))
+            .unwrap_or_else(|| panic!("{text}"));
+        let name = at(&rows[cursor], "sonnet");
+        for dx in 0..6 {
+            assert!(wears(&buf, name + dx, cursor), "models cursor row:\n{text}");
+            assert!(!wears(&buf, x + dx, other), "models other row:\n{text}");
+        }
+
+        // The compact account list (twolab-tui `agent_list`, drawn with
+        // THEME): its focused entry, not the next.
+        let (view, _) = compact_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            mode: Mode::Select { idx: 0 },
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let buf = render_buffer(&view, &chrome, 40, 14);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = row_of(&rows, "›✗");
+        let x = at(&rows[y], "›✗");
+        for dx in 0..6 {
+            assert!(wears(&buf, x + dx, y), "compact focus:\n{text}");
+            assert!(!wears(&buf, x + dx, y + 1), "compact next entry:\n{text}");
+        }
+
+        // And no selection is built by hand: outside the copy-mode banner
+        // (a banner, not a selection) the drawing code never reverses a
+        // style itself.
+        let src = include_str!("ui.rs");
+        let code = &src[..src.find("\nmod tests {").expect("tests module")];
+        let banner = code
+            .find("\nfn copy_mode_banner(")
+            .expect("copy_mode_banner");
+        let banner = banner..banner + code[banner..].find("\n}\n").expect("its end");
+        let mut offset = 0;
+        let mut by_hand = Vec::new();
+        for (i, line) in code.split('\n').enumerate() {
+            if line.contains("Modifier::REVERSED")
+                && !line.trim_start().starts_with("//")
+                && !banner.contains(&offset)
+            {
+                by_hand.push(format!("ui.rs:{}: {}", i + 1, line.trim()));
+            }
+            offset += line.len() + 1;
+        }
+        assert!(
+            by_hand.is_empty(),
+            "a selection drawn by hand — use selected_style():\n{}",
+            by_hand.join("\n")
         );
     }
 
@@ -23540,11 +24453,10 @@ mod tests {
             let fold = fold_at(view, &ctx, chrome, w);
             let plan = fold.plan()?;
             let (rows, hits) = render_with_hits(view, chrome, w, 80);
-            let starts: Vec<(usize, u16)> = hits
-                .account_rows
-                .iter()
-                .filter(|h| plan.members.contains(&h.display_idx))
-                .map(|h| (h.display_idx, h.area.x))
+            let starts: Vec<(usize, u16)> = account_rows(&hits)
+                .into_iter()
+                .filter(|(_, idx)| plan.members.contains(idx))
+                .map(|(area, idx)| (idx, area.x))
                 .collect();
             println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
             let columns = plan.grid.plan(w).expect("the plan's width").columns;
@@ -23663,15 +24575,16 @@ mod tests {
         let frame = rows.join("\n");
         let accounts = row_of(&rows, " accounts · sort ");
         let band = row_of(&rows, " scheduler · poller ");
+        let sep = separators(&hits)[0];
         assert_eq!(
-            (hits.separators[0].y, hits.separators[0].pane_top),
+            (sep.y, sep.pane_top),
             (band as u16, accounts as u16),
             "{frame}"
         );
         let click = |id: &str, column: u16, row: u16| {
             let mut app = fold_app();
             app.fold_exhausted = true;
-            app.account_row_chrome = hits.account_rows.clone();
+            app.hits = hits.hits.clone();
             let down = MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column,
@@ -23699,7 +24612,7 @@ mod tests {
             click(&live_id(n), x, y as u16);
         }
         // Every hit maps a visible account once.
-        let mut seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        let mut seen: Vec<usize> = account_rows(&hits).into_iter().map(|(_, i)| i).collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..21).collect::<Vec<_>>(), "{frame}");
     }
@@ -24018,7 +24931,7 @@ mod tests {
         // Every account is on screen exactly once, in the table's order.
         let ctx = frame_ctx(&view, &chrome);
         let (_, hits) = render_with_hits(&view, &chrome, 80, 30);
-        let seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        let seen: Vec<usize> = account_rows(&hits).into_iter().map(|(_, i)| i).collect();
         assert_eq!(seen, (0..ctx.order.len()).collect::<Vec<_>>(), "{frame}");
 
         let rows = render_rows(&view, &chrome, 179, 30);
@@ -24045,6 +24958,76 @@ mod tests {
             title.contains(" · ◌ 10 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
             "{title}"
         );
+    }
+
+    /// The active account's spinner turns with the frame in the compact
+    /// list, and holds its first glyph under reduced motion
+    /// (`LLMUX_REDUCED_MOTION`), as every other spinner does.
+    #[test]
+    fn compact_list_spinner_holds_still_under_reduced_motion() {
+        let (view, _) = compact_view();
+        let name = fold_name(13);
+        let entry = |motion, frame| {
+            let chrome = Chrome {
+                compact_accounts: true,
+                motion,
+                frame,
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let rows = render_rows(&view, &chrome, 80, 30);
+            let row = &rows[row_of(&rows, &name)];
+            let at = usize::from(col_of(row, &name));
+            row.chars().nth(at - 2).expect("glyph")
+        };
+        let full = twolab_tui::Motion::Full;
+        assert_eq!(entry(full, 0), '⠋');
+        assert_ne!(entry(full, 3), '⠋', "it turns with the frame");
+        let reduced = twolab_tui::Motion::Reduced;
+        for frame in [0, 3, 7] {
+            assert_eq!(entry(reduced, frame), '⠋', "frame {frame} holds still");
+        }
+    }
+
+    /// Two accounts with the same email under two providers read the same
+    /// once the provider is dropped, and the compact list has no group
+    /// column: those two show their provider (`codex:me@example.com`),
+    /// masked or not, while a unique name stays short.
+    #[test]
+    fn compact_list_names_the_provider_where_two_entries_would_read_the_same() {
+        let (mut view, _) = compact_view();
+        rename_account(&mut view, &live_id(1), "claude:me@example.com");
+        rename_account(&mut view, &live_id(15), "codex:me@example.com");
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let frame = rows.join("\n");
+        for id in ["claude:me@example.com", "codex:me@example.com"] {
+            assert!(frame.contains(&format!(" {id} ")), "{id}:\n{frame}");
+        }
+        assert!(frame.contains(" u02@ex.io "), "{frame}");
+        assert!(!frame.contains("claude:u02"), "a unique name stays short");
+
+        let abbrev = crate::config::default_domain_abbrev();
+        let ids = [
+            "claude:me@example.com",
+            "codex:me@example.com",
+            "claude:u02@ex.io",
+        ];
+        let plain = compact_labels(ids.into_iter(), false, &abbrev);
+        assert_eq!(
+            plain,
+            ["claude:me@example.com", "codex:me@example.com", "u02@ex.io"]
+        );
+        let masked = compact_labels(ids.into_iter(), true, &abbrev);
+        assert!(masked[0].starts_with("claude:") && masked[1].starts_with("codex:"));
+        assert_eq!(masked[0]["claude:".len()..], masked[1]["codex:".len()..]);
+        assert!(
+            !masked.iter().any(|l| l.contains("me@example.com")),
+            "{masked:?}"
+        );
+        assert!(!masked[2].contains(':'), "{masked:?}");
     }
 
     /// The switcher's cursor is the list's focus: `›` and the selected
@@ -24093,9 +25076,9 @@ mod tests {
     fn compact_entry_clicks_open_the_same_account_as_its_table_row() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (view, chrome) = compact_view();
-        let press = |hits: &[AccountRowHit], button: MouseButton, column: u16, row: u16| {
+        let press = |hits: &Hits, button: MouseButton, column: u16, row: u16| {
             let mut app = fold_app();
-            app.account_row_chrome = hits.to_vec();
+            app.hits = hits.clone();
             let down = MouseEvent {
                 kind: MouseEventKind::Down(button),
                 column,
@@ -24111,23 +25094,256 @@ mod tests {
         for n in [1usize, 7, 10] {
             let row = accounts + 1 + (n + 1) % 2;
             let x = col_of(&rows[row], &fold_name(n)) + 1;
-            let app = press(&hits.account_rows, MouseButton::Left, x, row as u16);
+            let app = press(&hits.hits, MouseButton::Left, x, row as u16);
             assert_eq!(
                 app.account_modal.as_ref().map(|m| m.account.clone()),
                 Some(live_id(n)),
                 "#{n}:\n{frame}"
             );
-            let app = press(&hits.account_rows, MouseButton::Right, x, row as u16);
+            let app = press(&hits.hits, MouseButton::Right, x, row as u16);
             assert_eq!(app.menu_account, Some(live_id(n)), "#{n}:\n{frame}");
         }
         // The table row of #7 at 179x43 opens the same account.
         let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
         let y = row_of(&rows, &format!(" 7  {}", fold_name(7)));
-        let app = press(&hits.account_rows, MouseButton::Left, 10, y as u16);
+        let app = press(&hits.hits, MouseButton::Left, 10, y as u16);
         assert_eq!(
             app.account_modal.as_ref().map(|m| m.account.clone()),
             Some(live_id(7))
         );
+    }
+
+    /// A left click at `(column, row)`, as crossterm delivers it.
+    fn left_click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// The hit map's paint order: the account modal, drawn over the
+    /// accounts table, covers every row of it — a click on a row is the
+    /// modal's (swallowed, the modal stays pinned), at 80×24 and 179×43 —
+    /// and its `esc close` button from the same frame closes it.
+    #[test]
+    fn hit_map_a_modal_over_the_account_rows_takes_their_clicks() {
+        let (view, mut chrome) = live_view();
+        let id = live_id(1);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            chrome.account_modal = None;
+            let (_, under) = render_with_hits(&view, &chrome, w, h);
+            let rows = account_rows(&under);
+            assert!(rows.len() > 5, "{w}x{h}: the rows beneath");
+            chrome.account_modal = Some(AccountModal::new(id.clone()));
+            let (drawn, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = drawn.join("\n");
+            let layout = hits.account_modal.clone().expect("the modal drew");
+            assert!(
+                hits.hits
+                    .iter()
+                    .any(|(_, t)| matches!(t, ClickTarget::AccountRow(_))),
+                "{w}x{h}: the rows are recorded, beneath the modal"
+            );
+            assert!(
+                account_rows(&hits).is_empty(),
+                "{w}x{h}: no row is reachable under the modal:\n{frame}"
+            );
+            let mut app = fold_app();
+            app.hits = hits.hits.clone();
+            let mut modal = AccountModal::new(id.clone());
+            super::super::adopt_modal_layout(&mut modal.state, layout.clone());
+            app.account_modal = Some(modal);
+            let mut over = 0;
+            for (row, _) in &rows {
+                let (x, y) = (row.x + 2, row.y);
+                let target = hits.hits.hit_test(x, y);
+                assert!(
+                    matches!(
+                        target,
+                        Some(
+                            ClickTarget::Surface(Surface::Modal)
+                                | ClickTarget::ModalScrollbar
+                                | ClickTarget::ModalClose
+                        )
+                    ),
+                    "{w}x{h}: the modal is on top at {x},{y}: {target:?}"
+                );
+                if target == Some(&ClickTarget::ModalClose) {
+                    continue;
+                }
+                over += usize::from(layout.outer.contains((x, y).into()));
+                assert!(app.on_mouse(left_click(x, y), Some(&view)));
+                assert_eq!(
+                    app.account_modal.as_ref().map(|m| m.account.as_str()),
+                    Some(id.as_str()),
+                    "{w}x{h}: the row at {x},{y} did not re-pin the modal"
+                );
+                assert_eq!(app.menu_account, None);
+            }
+            assert!(over > 0, "{w}x{h}: some rows lie under the popup itself");
+            let close = layout.close.expect("`esc close` drawn");
+            assert_eq!(
+                hits.hits.hit_test(close.x, close.y),
+                Some(&ClickTarget::ModalClose)
+            );
+            assert!(app.on_mouse(left_click(close.x, close.y), Some(&view)));
+            assert!(app.account_modal.is_none(), "{w}x{h}: esc close closes it");
+        }
+    }
+
+    /// The hit map's paint order: the context menu lies over the rows below
+    /// the one it was opened on, so a click on an item there runs the item
+    /// (delete: the confirm gate) — the row beneath does not open its modal.
+    #[test]
+    fn hit_map_a_menu_item_over_an_account_row_runs_the_item() {
+        let (view, mut chrome) = live_view();
+        let (_, under) = render_with_hits(&view, &chrome, 179, 43);
+        let rows = account_rows(&under);
+        let (first, idx) = rows[0];
+        let order = view.display_order(chrome.account_sort, SystemTime::now());
+        let pinned = view.snapshot.accounts[order[idx]].id.0.clone();
+        chrome.mode = Mode::ContextMenu { idx, item: 0 };
+        chrome.menu_account = Some(pinned.clone());
+        chrome.menu_anchor = Some((first.x + 10, first.y));
+        let (drawn, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let frame = drawn.join("\n");
+        let delete = hits
+            .hits
+            .area_of(&ClickTarget::MenuItem(3))
+            .expect("delete has a rect");
+        let (x, y) = (delete.x + 1, delete.y);
+        assert!(
+            hits.hits.iter().any(|(row, t)| {
+                matches!(t, ClickTarget::AccountRow(_)) && row.contains((x, y).into())
+            }),
+            "delete lies over an account row recorded beneath it:\n{frame}"
+        );
+        assert_eq!(hits.hits.hit_test(x, y), Some(&ClickTarget::MenuItem(3)));
+        let mut app = fold_app();
+        app.hits = hits.hits.clone();
+        app.mode = chrome.mode;
+        app.menu_account = Some(pinned);
+        app.menu_anchor = chrome.menu_anchor;
+        assert!(app.on_mouse(left_click(x, y), Some(&view)));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx }, "{frame}");
+        assert!(app.account_modal.is_none(), "the row beneath stayed shut");
+    }
+
+    /// The hit map's paint order: an expanded entry's `🔍 input` and
+    /// `🔍 request` lines lie inside its block, pushed after it, so a click
+    /// on either opens its viewer while the block's other rows toggle the
+    /// entry.
+    #[test]
+    fn hit_map_the_input_line_lies_over_its_entry_block() {
+        let entry = completed_with_excerpt(Some("user"), "hello there");
+        let key = key_of(&entry);
+        let CompletedBody::Request { id, .. } = entry.body else {
+            unreachable!("a request")
+        };
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded_activity = Some(key.clone());
+        let (drawn, hits) = render_with_hits(&view, &chrome, 120, 40);
+        let frame = drawn.join("\n");
+        let target = |kind| ClickTarget::Activity {
+            key: key.clone(),
+            kind,
+        };
+        let block = hits
+            .hits
+            .area_of(&target(ActivityHitKind::Entry))
+            .expect("the entry's block");
+        let input = hits
+            .hits
+            .area_of(&target(ActivityHitKind::InputLine))
+            .expect("the input line");
+        let raw = hits
+            .hits
+            .area_of(&target(ActivityHitKind::RawLine { id }))
+            .expect("the request line");
+        for line in [input, raw] {
+            assert!(
+                block.contains(line.as_position()) && block.height > 2,
+                "{line:?} is inside the block {block:?}:\n{frame}"
+            );
+        }
+        // With a kind line the detail lines read request, kind, input: the
+        // request line is the block's second row and the input line its
+        // fourth, so neither covers the other.
+        assert_eq!(raw.y, block.y + 1, "{frame}");
+        assert_eq!(input.y, block.y + 3, "{frame}");
+        let col = block.x + 8;
+        assert_eq!(
+            activity_at(&hits.hits, col, input.y),
+            Some(ActivityClick::OpenInput(key.clone()))
+        );
+        assert_eq!(
+            activity_at(&hits.hits, col, raw.y),
+            Some(ActivityClick::OpenRaw(key.clone(), id))
+        );
+        assert_eq!(
+            activity_at(&hits.hits, col, block.y),
+            Some(ActivityClick::Entry(key.clone()))
+        );
+        let mut app = fold_app();
+        app.hits = hits.hits.clone();
+        app.expanded_activity = Some(key.clone());
+        assert!(app.on_mouse(left_click(col, input.y), Some(&view)));
+        assert_eq!(app.input_modal.as_ref().map(|m| &m.key), Some(&key));
+        assert_eq!(
+            app.expanded_activity.as_ref(),
+            Some(&key),
+            "the entry did not collapse"
+        );
+    }
+
+    /// The hit map is rebuilt by every draw: drawing a resized frame into the
+    /// record the event loop holds gives exactly the record a fresh one
+    /// would — no rect of the last frame survives — so a row the old frame
+    /// had where the new one has nothing takes no click, and a frame without
+    /// a view leaves no record at all.
+    #[test]
+    fn hit_map_is_cleared_each_frame_and_a_resize_drops_old_rects() {
+        let (view, chrome) = live_view();
+        let draw_into = |hits: &mut Option<MainChrome>, view: Option<&DashboardView>, w, h| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            terminal
+                .draw(|f| draw(f, view, &chrome, hits))
+                .expect("draw");
+        };
+        let mut hits = None;
+        draw_into(&mut hits, Some(&view), 179, 43);
+        let before = hits.clone().expect("a record");
+        draw_into(&mut hits, Some(&view), 80, 24);
+        let after = hits.clone().expect("a record");
+        let mut fresh = None;
+        draw_into(&mut fresh, Some(&view), 80, 24);
+        assert_eq!(after.hits, fresh.expect("a record").hits);
+        let screen = Rect::new(0, 0, 80, 24);
+        assert!(
+            after.hits.iter().all(|(r, _)| screen.union(r) == screen),
+            "every rect is on the 80x24 screen"
+        );
+        // An accounts row reached column 100 then: a click there opened its
+        // account. The next frame's record replaces the map, as the event
+        // loop does, and the same click takes nothing.
+        let (row, _) = account_rows(&before)[0];
+        let (x, y) = (100, row.y);
+        assert!(row.right() > x);
+        let mut app = fold_app();
+        app.hits = before.hits.clone();
+        assert!(app.on_mouse(left_click(x, y), Some(&view)), "a row then");
+        assert!(app.account_modal.take().is_some());
+        app.hits = after.hits.clone();
+        assert!(!app.on_mouse(left_click(x, y), Some(&view)), "nothing now");
+        assert!(app.account_modal.is_none());
+        // No view (the connecting screen): no record, so an empty map.
+        draw_into(&mut hits, None, 80, 24);
+        assert_eq!(hits, None);
+        assert!(hits.unwrap_or_default().hits.is_empty());
     }
 
     /// `v` is on the accounts footer — `compact`, or `table` while the list
