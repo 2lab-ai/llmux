@@ -474,7 +474,10 @@ pub(crate) fn draw(
         height: 2,
     };
     frame.render_widget(Clear, footer_area);
-    draw_footer(frame, footer_area, chrome, ctx.mask);
+    let footer_field = draw_footer(frame, footer_area, chrome, ctx.mask);
+    if let Some(hits) = hits.as_mut() {
+        hits.field_width = hits.field_width.or(footer_field);
+    }
     // Usage context uses only the spare status row; flashes and modal chrome win.
     if chrome
         .status_line
@@ -627,7 +630,13 @@ fn draw_main(
     let (tabs, tabs_room) = draw_tabs(frame, tabs_area, chrome.overlay);
     let header_tail = draw_header(frame, header_area, view, chrome, now, tabs_room);
     draw_tabs_tail(frame, tabs_area, header_tail);
-    let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
+    // A table that would show fewer than COMPACT_BELOW rows and hide the
+    // rest gives way to the compact list, which shows more of them.
+    let account_rows = if table_crowded(snapshot.accounts.len(), fold.plan(), table_height) {
+        draw_accounts_compact(frame, table_area, view, ctx, chrome)
+    } else {
+        draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout)
+    };
     draw_middle(frame, middle_area, view, &middle);
     let models_strip = if strip_height > 0 {
         draw_models_strip(frame, strip_area, view, ctx, now, strip)
@@ -689,6 +698,7 @@ fn draw_main(
         logs_area: None,
         table_scroll: None,
         raw_modal: None,
+        field_width: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -910,10 +920,17 @@ fn draw_accounts_overlay(
 ) -> Vec<AccountRowHit> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    // `v`: the compact list — a title row and a row per account.
+    let compact = chrome.compact_accounts && !snapshot.accounts.is_empty();
+    let table_height =
+        (snapshot.accounts.len().max(1) as u16).saturating_add(if compact { 1 } else { 2 });
     let [table_area, detail_area] =
         Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
-    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = if compact {
+        draw_accounts_compact(frame, table_area, view, ctx, chrome)
+    } else {
+        draw_accounts(frame, table_area, view, ctx, chrome)
+    };
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
@@ -3756,26 +3773,36 @@ fn draw_config_overlay(
             }
         }
     }
-    // Edit prompt line (config-editor v1). The confirm gate is the card
+    // Edit prompt line (config-editor v1): the value in a twolab-tui
+    // composer field, the format hint after it. The confirm gate is the card
     // above the footer (`draw_gate`).
+    let mut field_width = None;
     if let Some(action) = editing {
-        let hint = action.input_hint().unwrap_or("");
-        let prompt = Line::from(vec![
-            Span::styled(" edit ", Style::new().fg(Color::Cyan)),
-            Span::raw(format!("{}▏", chrome.config_input)),
-            Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
-        ]);
+        let lead = " edit ";
+        let hint = format!("   ({})", action.input_hint().unwrap_or(""));
+        let room = inner.width.saturating_sub(cells::width(lead) as u16);
+        let width = room
+            .saturating_sub(cells::width(&hint) as u16)
+            .max(FIELD_MIN.min(room));
+        let mut spans = vec![Span::styled(lead, Style::new().fg(Color::Cyan))];
+        spans.extend(field_line(&chrome.field, "", width).spans);
+        spans.push(Span::styled(hint, dim()));
         frame.render_widget(
-            Paragraph::new(prompt),
+            Paragraph::new(cells::truncate_line(
+                Line::from(spans),
+                usize::from(inner.width),
+            )),
             Rect {
                 y: list_area.bottom() + 1,
                 height: 1,
                 ..inner
             },
         );
+        field_width = Some(width);
     }
     if let Some(hits) = hits.as_mut() {
         hits.config_rows = hit_rows;
+        hits.field_width = field_width;
     }
 }
 
@@ -6071,6 +6098,318 @@ fn draw_accounts_with(
     hits
 }
 
+/// MAIN uses the compact account list instead of the table when the table
+/// would show fewer account rows than this and still hide some.
+const COMPACT_BELOW: usize = 5;
+
+/// Cells a compact entry keeps at the least: focus mark, glyph, a space and
+/// eleven cells of the name; narrower than that the list takes fewer
+/// columns and counts the rest.
+const COMPACT_ENTRY_MIN: u16 = 14;
+
+/// Blank cells between two columns of the compact list.
+const COMPACT_GAP: u16 = 2;
+
+/// Whether MAIN's accounts table, `height` rows tall (title and header
+/// included), would show fewer than [`COMPACT_BELOW`] account rows and still
+/// hide some — with the fold's block counted when the fold applies.
+fn table_crowded(accounts: usize, fold: Option<&FoldPlan>, height: u16) -> bool {
+    let lines = usize::from(height.saturating_sub(2));
+    let rows = accounts - fold.map_or(0, |f| f.members.len());
+    let hidden =
+        rows.saturating_sub(lines) + fold.map_or(0, |f| f.hidden(lines.saturating_sub(rows)));
+    rows.min(lines) < COMPACT_BELOW && hidden > 0
+}
+
+/// What the compact account list says an account is doing. Seven states,
+/// each with its own glyph, every glyph one cell on a CJK terminal; the
+/// twolab-tui `agent_list` has six, so `spent` and `paused` share a state's
+/// tone and tally slot (cooling's, stale's) and llmux draws their glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactKind {
+    /// Authentication failed (`✗`).
+    Error,
+    /// Over a 5h / 7d / Fable ceiling until the window resets (`◌`).
+    Spent,
+    /// Parked by a cooldown (`◉`).
+    Cooling,
+    /// The scheduler's current account (`⠋`, turning).
+    Active,
+    /// Eligible (`◦`).
+    Ok,
+    /// Paused by the operator (`ǁ`).
+    Paused,
+    /// Its usage is too old to trust (`?`).
+    Stale,
+}
+
+impl CompactKind {
+    fn of(gate: Option<IneligibleReason>, is_current: bool) -> CompactKind {
+        match gate {
+            None if is_current => CompactKind::Active,
+            None => CompactKind::Ok,
+            Some(IneligibleReason::AuthUnhealthy) => CompactKind::Error,
+            Some(
+                IneligibleReason::FiveHourOverThreshold
+                | IneligibleReason::SevenDayOverThreshold
+                | IneligibleReason::FableWeeklyExhausted,
+            ) => CompactKind::Spent,
+            Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => {
+                CompactKind::Cooling
+            }
+            Some(IneligibleReason::Paused) => CompactKind::Paused,
+            Some(IneligibleReason::UsageStale) => CompactKind::Stale,
+        }
+    }
+
+    /// The `agent_list` state: tone, sort priority and tally slot.
+    fn state(self) -> twolab_tui::agent_list::AgentState {
+        use twolab_tui::agent_list::AgentState as S;
+        match self {
+            CompactKind::Error => S::Failed,
+            CompactKind::Spent | CompactKind::Cooling => S::Waiting,
+            CompactKind::Active => S::Working,
+            CompactKind::Ok => S::Idle,
+            CompactKind::Paused | CompactKind::Stale => S::Unknown,
+        }
+    }
+
+    /// The glyph llmux draws over the state's own, for the two states the
+    /// library has no glyph for.
+    fn glyph(self) -> Option<&'static str> {
+        match self {
+            CompactKind::Spent => Some("◌"),
+            CompactKind::Paused => Some("ǁ"),
+            _ => None,
+        }
+    }
+
+    /// How the tally counts it.
+    fn word(self) -> &'static str {
+        match self {
+            CompactKind::Error => "error",
+            CompactKind::Spent => "spent",
+            CompactKind::Cooling => "cooling",
+            CompactKind::Active => "active",
+            CompactKind::Ok => "ok",
+            CompactKind::Paused => "paused",
+            CompactKind::Stale => "stale",
+        }
+    }
+}
+
+/// The word at the right of a compact entry: the state, with what it is
+/// waiting on (`7d spent`, `cooling 45m10s`, `error 401`).
+fn compact_word(
+    account: &AccountSnapshot,
+    gate: Option<IneligibleReason>,
+    kind: CompactKind,
+    now: SystemTime,
+) -> String {
+    let left = |until: Option<SystemTime>| {
+        until
+            .and_then(|t| t.duration_since(now).ok())
+            .map(select::compact_duration)
+    };
+    match (kind, gate) {
+        (CompactKind::Error, _) => account
+            .auth_failure_status
+            .map_or_else(|| "auth error".to_string(), |s| format!("error {s}")),
+        (CompactKind::Spent, Some(IneligibleReason::FiveHourOverThreshold)) => "5h spent".into(),
+        (CompactKind::Spent, Some(IneligibleReason::FableWeeklyExhausted)) => "fbl spent".into(),
+        (CompactKind::Spent, _) => "7d spent".into(),
+        (CompactKind::Cooling, Some(IneligibleReason::FableCoolingDown)) => {
+            match left(account.fable_cooldown_until(now)) {
+                Some(t) => format!("fbl cooling {t}"),
+                None => "fbl cooling".into(),
+            }
+        }
+        (CompactKind::Cooling, _) => match left(account.cooldown_until) {
+            Some(t) => format!("cooling {t}"),
+            None => "cooling".into(),
+        },
+        (kind, _) => kind.word().into(),
+    }
+}
+
+/// The compact account list (`v` on the accounts tab; MAIN's own choice
+/// when the table would show fewer than [`COMPACT_BELOW`] rows): a
+/// twolab-tui `agent_list` with one row per account — focus mark, state
+/// glyph, name, the state's word — in the table's order, running down and
+/// then across in as many columns as fit. The title keeps the sort, says
+/// what the accounts are doing in one line (`agent_list` tally) and counts
+/// what does not fit (`+N more`). The focused account (the switcher's or a
+/// gate's cursor) is highlighted and kept in view; each entry is the same
+/// click target as its table row.
+fn draw_accounts_compact(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) -> Vec<AccountRowHit> {
+    use twolab_tui::agent_list::{AgentItem, AgentList, AgentListState, AgentState, Sort, Tally};
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let (kinds, items): (Vec<CompactKind>, Vec<AgentItem>) = ctx
+        .order
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| {
+            let account = &snapshot.accounts[idx];
+            let gate = select::eligibility(account, params, ctx.now, ctx.headers_only);
+            let kind = CompactKind::of(gate, snapshot.is_current(&account.id));
+            let label = row_account_name(&account.id.0, ctx.mask, &view.domain_abbrev);
+            let item = AgentItem::new(kind.state(), label)
+                .word(compact_word(account, gate, kind, ctx.now))
+                .focused(selected == Some(pos));
+            (kind, item)
+        })
+        .unzip();
+    let n = items.len();
+    // Columns: as many as the accounts need, each as wide as the widest
+    // entry, never narrower than COMPACT_ENTRY_MIN.
+    let rows = usize::from(area.height.saturating_sub(1));
+    let natural = items
+        .iter()
+        .map(|i| {
+            let word = i.word.as_deref().map_or(0, cells::width);
+            3 + cells::width(&i.label).min(usize::from(NAME_COL_MAX)) + 1 + word
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let fit = (area.width.saturating_add(COMPACT_GAP) / (COMPACT_ENTRY_MIN + COMPACT_GAP)).max(1);
+    let cols = n.div_ceil(rows.max(1)).clamp(1, usize::from(fit)) as u16;
+    let col_w = ((area.width.saturating_sub((cols - 1) * COMPACT_GAP)) / cols).min(natural.max(1));
+    // The window: from the top, or moved just far enough to show the focus.
+    let room = rows * usize::from(cols);
+    let start = selected.filter(|&f| f >= room).map_or(0, |f| f + 1 - room);
+    let hidden = n.saturating_sub(room);
+
+    // Title: the sort, the count (and the groups when they fit), the tally
+    // with each state's glyph — the list's legend — and `+N more`.
+    let mut slots: Vec<(AgentState, Vec<CompactKind>)> = Vec::new();
+    for &kind in &kinds {
+        let state = kind.state();
+        match slots.iter_mut().find(|(s, _)| *s == state) {
+            Some((_, held)) if !held.contains(&kind) => held.push(kind),
+            Some(_) => {}
+            None => slots.push((state, vec![kind])),
+        }
+    }
+    let mut tally = Tally::new(items.iter().map(|i| i.state))
+        .glyphs(true)
+        .empty("no accounts")
+        .theme(KEYBAR_THEME);
+    // A slot two llmux states share names both (`spent+cooling`); a slot
+    // that holds only `spent` or only `paused` shows that state's glyph.
+    let mut glyph_swaps: Vec<(char, &'static str)> = Vec::new();
+    for (state, mut held) in slots {
+        // In declaration order.
+        held.sort_by_key(|k| *k as u8);
+        let words: Vec<&str> = held.iter().map(|k| k.word()).collect();
+        tally = tally.word(state, words.join("+"));
+        if let [only] = held.as_slice() {
+            if let Some(glyph) = only.glyph() {
+                glyph_swaps.push((state.still(), glyph));
+            }
+        }
+    }
+    let tally_line = |width: u16| -> Vec<Span<'static>> {
+        tally
+            .line(width)
+            .spans
+            .into_iter()
+            .map(|mut span| {
+                let swap = glyph_swaps
+                    .iter()
+                    .find(|(lib, _)| span.content.starts_with(*lib));
+                if let Some(&(lib, glyph)) = swap {
+                    let rest = span.content[lib.len_utf8()..].to_string();
+                    span.content = format!("{glyph}{rest}").into();
+                }
+                span
+            })
+            .collect()
+    };
+    let more = if hidden > 0 {
+        format!(" · +{hidden} more ")
+    } else {
+        " ".to_string()
+    };
+    let sort = chrome.account_sort.label();
+    let groups = accounts_title(sort, view, &ctx.order, "", 0);
+    let grouped = format!("{} · ", groups.trim_end());
+    let plain = format!(" accounts · sort {sort} · {n} · ");
+    let room_for = |lead: &str| {
+        area.width
+            .saturating_sub((cells::width(lead) + cells::width(&more)) as u16)
+    };
+    let tally_wide = cells::spans_width(&tally_line(u16::MAX)) as u16;
+    let lead = if tally_wide <= room_for(&grouped) {
+        grouped
+    } else {
+        plain
+    };
+    let mut title = vec![Span::raw(lead.clone())];
+    title.extend(tally_line(room_for(&lead)));
+    title.push(Span::raw(more));
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .title(cells::truncate_line(
+                Line::from(title),
+                usize::from(area.width),
+            )),
+        area,
+    );
+
+    // Entries, column by column; each column holds exactly the rows it can
+    // show, so the count of what is hidden lives in the title.
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let mut hits = Vec::new();
+    for c in 0..cols {
+        let from = start + usize::from(c) * rows;
+        let to = (from + rows).min(n);
+        if from >= to || body.is_empty() {
+            break;
+        }
+        let rect = Rect {
+            x: body.x + c * (col_w + COMPACT_GAP),
+            width: col_w,
+            ..body
+        };
+        // The words only when every entry keeps its whole name beside its
+        // word; else the glyph says the state and the name gets the room.
+        let list = AgentList::new(&items[from..to])
+            .sort(Sort::Given)
+            .words(col_w >= natural)
+            .frame(ctx.frame)
+            .empty("no accounts")
+            .theme(KEYBAR_THEME);
+        let mut state = AgentListState::new();
+        frame.render_stateful_widget(&list, rect, &mut state);
+        for &(i, r) in &state.layout().items {
+            let pos = from + i;
+            if let Some(glyph) = kinds[pos].glyph() {
+                if let Some(cell) = frame.buffer_mut().cell_mut((r.x + 1, r.y)) {
+                    cell.set_symbol(glyph);
+                }
+            }
+            hits.push(AccountRowHit {
+                area: r,
+                display_idx: pos,
+            });
+        }
+    }
+    hits
+}
+
 /// One account's table cells as parts: the table turns them into a row
 /// ([`account_row`]), MAIN's fold block into text fields ([`fold_fields`]),
 /// so both show the same strings in the same styles.
@@ -6320,6 +6659,13 @@ struct FoldPlan {
 }
 
 impl FoldPlan {
+    /// Members the block cannot show when only its first `lines` lines fit
+    /// the pane (the compact list's crowding test counts them).
+    fn hidden(&self, lines: usize) -> usize {
+        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
+        self.members.len().saturating_sub(shown)
+    }
+
     /// Lines the block takes: the field header, then one line per
     /// `per_line` entries.
     fn lines(&self) -> usize {
@@ -8595,6 +8941,9 @@ pub(crate) struct MainChrome {
     /// the input modal, `None` only means "no raw modal drawn this frame" —
     /// the raw modal owns its content and never closes on entry aging.
     pub raw_modal: Option<RawModalChrome>,
+    /// Cells the open text field (add key · limits · config value) was drawn
+    /// in this frame — its window follows the caret from there.
+    pub field_width: Option<u16>,
 }
 
 /// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
@@ -10926,6 +11275,82 @@ fn keybar_after(
     Line::from(spans)
 }
 
+/// The fewest cells a text field is given (its `❯` column and ten cells of
+/// text); past that the hints after it drop whole instead.
+const FIELD_MIN: u16 = 12;
+
+/// A footer field this wide still leaves every hint after it in view.
+const FIELD_ROOMY: u16 = 24;
+
+/// The keys of a text field (add key · limits · config value), Enter's label
+/// first: the prompt's bar and the `?` help read this one table.
+fn field_keys(enter: &'static str) -> [(&'static str, &'static str); 5] {
+    [
+        ("Enter", enter),
+        ("Esc", "cancel"),
+        ("←→ Home/End", "move"),
+        ("ctrl+u/k/w", "cut"),
+        ("ctrl+y", "put back"),
+    ]
+}
+
+/// A text field as one line `width` cells wide (twolab-tui composer): `❯`,
+/// the window of the value around the caret (a reversed cell), `‹` / `›`
+/// when the value runs past either side, `placeholder` dim while empty. A
+/// masked field draws `∙` glyphs only. The field's window is moved on a
+/// copy; the runtime moves its own the same way ([`MainChrome::field_width`]).
+fn field_line(
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    width: u16,
+) -> Line<'static> {
+    let mut state = field.clone();
+    twolab_tui::composer::Composer::new()
+        .placeholder(placeholder)
+        .theme(KEYBAR_THEME)
+        .line(&mut state, width)
+}
+
+/// A footer prompt with a text field: `label`, the field, then the key bar
+/// ([`field_keys`]: Enter and Esc first, then the editing keys). On a wide
+/// row every hint keeps its place and the field takes the rest; otherwise
+/// the field keeps room for Enter, Esc and the `… +N more` that counts the
+/// editing keys, never less than [`FIELD_MIN`] cells. Returns the line and
+/// the field's width.
+fn field_bar(
+    label: &'static str,
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> (Line<'static>, u16) {
+    use twolab_tui::key_hints::KeyHints;
+    let natural = |hints: &[(&'static str, &'static str)]| {
+        let line = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
+            .no_more()
+            .theme(KEYBAR_THEME)
+            .line(u16::MAX);
+        cells::spans_width(&line.spans) as u16
+    };
+    // The field and the two spaces after it.
+    let room = width
+        .saturating_sub(cells::width(label) as u16 + 1)
+        .saturating_sub(2);
+    let all = natural(hints);
+    let (keep, rest) = hints.split_at(hints.len().min(2));
+    let counted = cells::width(&format!("  … +{} more", rest.len())) as u16;
+    let essential = natural(keep) + if rest.is_empty() { 0 } else { counted };
+    let field_w = if room >= all + FIELD_ROOMY {
+        room - all
+    } else {
+        room.saturating_sub(essential).max(FIELD_MIN.min(room))
+    };
+    let mut lead = vec![Span::raw(label), Span::raw(" ")];
+    lead.extend(field_line(field, placeholder, field_w).spans);
+    lead.push(Span::raw("  "));
+    (keybar_after(lead, hints, width), field_w)
+}
+
 /// The theme every twolab-tui widget on the dashboard draws with (key bars,
 /// confirm gates, pickers): ANSI colours with labels in the terminal's
 /// default foreground (as before the move to KeyHints) — ANSI grey labels
@@ -11273,6 +11698,10 @@ fn help_groups(chrome: &Chrome) -> Vec<twolab_tui::key_hints::HintGroup<'static>
         groups.push(group(title, &overlay_hints(overlay, chrome, true).1));
     }
     groups.push(group("switcher (s)", &SELECT_KEYS));
+    groups.push(group(
+        "text fields (add key · limits · config)",
+        &field_keys("apply"),
+    ));
     groups.push(group("keys: model picker (f)", &KEYS_PICKER_KEYS));
     groups.push(group("raw viewer", &RAW_KEYS));
     groups.push(group("other", &OTHER_KEYS));
@@ -11337,6 +11766,16 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("a", "add"),
                 ("n", "login"),
                 ("r", "remove"),
+                // The view toggles: `V` first — its label is the one only
+                // this group has, so it is the one the `?` help must show.
+                (
+                    "V",
+                    if chrome.compact_accounts {
+                        "table"
+                    } else {
+                        "compact"
+                    },
+                ),
                 ("u", "used/left"),
                 ("t", "eta/utc"),
                 ("o", "sort"),
@@ -11514,21 +11953,18 @@ fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         .render(area, frame.buffer_mut());
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Option<u16> {
     let status = status_row(chrome.status_line.as_ref(), mask, area.width);
+    let mut field_width = None;
     let keybar = match chrome.mode {
         // Copy mode (`v`) owns the bar over every surface and prompt: the
         // mouse is the terminal's now, and this row says so and how to get
         // it back. The status row above keeps its message — it may be the
         // very text being selected.
         _ if chrome.copy_mode => copy_mode_banner(area.width),
-        // Config-editor prompts render their own inline hint line inside the
-        // overlay; the keybar mirrors the essentials.
-        Mode::ConfigEdit { .. } => keybar(
-            Some("edit"),
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
+        // Config-editor prompts render their own inline field and hint line
+        // inside the overlay; the keybar lists the field's keys.
+        Mode::ConfigEdit { .. } => keybar(Some("edit"), &field_keys("apply"), area.width),
         // The gate card above names the setting and its old → new value.
         Mode::ConfigConfirm { .. } => keybar(
             Some("confirm"),
@@ -11564,32 +12000,30 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             keybar(title, &hints, area.width)
         }
         Mode::Select { .. } => keybar(None, &SELECT_KEYS, area.width),
-        // The typed key is shown ONLY as a masked width — never the raw
-        // characters (AGENTS.md credential rule).
-        Mode::EditLimits { .. } => keybar_after(
-            vec![
-                Span::raw(" limits (5h,7d,fbl %): "),
-                Span::styled(
-                    format!("{}▏", chrome.limits_input),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
-        Mode::AddKey => keybar_after(
-            vec![
-                Span::raw(" add account — key: "),
-                Span::styled(
-                    "•".repeat(chrome.add_input_len),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "add"), ("Esc", "cancel")],
-            area.width,
-        ),
+        Mode::EditLimits { .. } => {
+            let (bar, width) = field_bar(
+                " limits (5h,7d,fbl %)",
+                &chrome.field,
+                "empty = global",
+                &field_keys("apply"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
+        // The key is a masked composer: the field draws one `∙` per
+        // character and can draw nothing else (AGENTS.md credential rule).
+        Mode::AddKey => {
+            let (bar, width) = field_bar(
+                " add account — key",
+                &chrome.field,
+                "paste an API key",
+                &field_keys("add"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
         Mode::ContextMenu { .. } => keybar(
             None,
             &[
@@ -11636,6 +12070,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
+    field_width
 }
 
 #[cfg(test)]
@@ -11645,6 +12080,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashMap};
+    use twolab_tui::composer::{ComposerState, Mask};
 
     fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
         ModelUsageDoc {
@@ -12792,28 +13228,41 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::EditLimits { idx: 0 };
-        chrome.limits_input = "80,90".into();
+        // The field is a composer now: `❯` and the value, the caret a
+        // reversed cell after it (it was a literal `▏`).
+        chrome.field = ComposerState::with_text("80,90").single_line();
         let wide = render_rows(&view, &chrome, 80, 24);
         let bar = wide[wide.len() - 1].clone();
         assert!(
-            bar.contains("80,90▏") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
+            bar.contains("❯ 80,90") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
             "{bar}"
         );
         let narrow = render_rows(&view, &chrome, 40, 24);
         let bar = narrow[narrow.len() - 1].clone();
-        assert!(bar.contains("80,90▏"), "{bar}");
+        assert!(bar.contains("❯ 80,90"), "{bar}");
         assert!(bar.contains("… +"), "{bar}");
         assert!(
             !bar.contains("Enter a ") && !bar.trim_end().ends_with("Ente"),
             "{bar}"
         );
 
+        // A 30-character key: the masked field scrolls (`‹` says more is to
+        // the left) instead of drawing all 30 bullets and pushing the keys
+        // off; at 56 columns Esc and the count of the rest stay, at 80 Enter
+        // and Esc both do.
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::AddKey;
-        chrome.add_input_len = 30;
+        chrome.field = ComposerState::with_text(&"k".repeat(30)).masked(Mask::default());
         let bar = render_rows(&view, &chrome, 56, 24).pop().expect("footer");
-        assert!(bar.contains(&"•".repeat(30)), "masked width kept: {bar}");
-        assert!(bar.contains("… +"), "{bar}");
+        assert!(bar.contains("‹ ∙∙∙"), "masked and scrolled: {bar}");
+        assert!(!bar.contains("kk"), "{bar}");
+        assert!(bar.contains("Esc cancel") && bar.contains("… +"), "{bar}");
+        let bar = render_rows(&view, &chrome, 80, 24).pop().expect("footer");
+        assert!(bar.contains("‹ ∙∙∙") && !bar.contains("kk"), "{bar}");
+        assert!(
+            bar.contains("Enter add") && bar.contains("Esc cancel"),
+            "{bar}"
+        );
     }
 
     /// The raw viewer's legend sits on its bottom border above the footer and
@@ -13325,11 +13774,11 @@ mod tests {
             confirm_choice: 0,
             reset_held: None,
             config_saved: Default::default(),
-            add_input_len: 0,
+            field: Default::default(),
             quota_display_override: None,
             reset_absolute: false,
             fold_exhausted: false,
-            limits_input: String::new(),
+            compact_accounts: false,
             attach: None,
             keys: Default::default(),
         }
@@ -23437,6 +23886,265 @@ mod tests {
         );
         assert_each_member_shows_its_status(&rows, &frame);
     }
+
+    // --- compact account list (twolab-tui agent_list) ----------------------
+
+    /// [`live_view`] with the fold off and an account in every state the
+    /// compact list tells apart: #1 failed auth (401), #8 cooling for 45m,
+    /// #9 with usage an hour old; #5 is paused, #4 over its 5h ceiling, the
+    /// members 7d-spent, #13 and #18 the current accounts, the other five
+    /// ok.
+    fn compact_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = live_view();
+        let now = SystemTime::now();
+        let accounts = &mut view.snapshot.accounts;
+        accounts[0].healthy = false;
+        accounts[0].auth_failure_status = Some(401);
+        accounts[7].cooldown_until = Some(now + Duration::from_secs(45 * 60 + 30));
+        let stale = &mut accounts[8];
+        for window in [&mut stale.five_hour, &mut stale.seven_day]
+            .into_iter()
+            .flatten()
+        {
+            window.fetched_at = now - Duration::from_secs(3_600);
+        }
+        (view, fold_off(&chrome))
+    }
+
+    /// The compact list's glyph for each state, and the word an entry says.
+    const COMPACT_STATES: [(usize, &str, &str); 7] = [
+        (1, "✗", "error 401"),
+        (4, "◌", "5h spent"),
+        (2, "◌", "7d spent"),
+        (8, "◉", "cooling 45m"),
+        (13, "⠋", "active"),
+        (10, "◦", "ok"),
+        (5, "ǁ", "paused"),
+    ];
+
+    /// At 80×24 MAIN's accounts pane is four rows: the table showed two
+    /// accounts under its header and `+19 more`. The pane now holds the
+    /// compact list — an entry per account (focus mark, state glyph, name)
+    /// running down and across five columns, so ten accounts show — and
+    /// the title keeps the sort and the count, adds the one-line tally and
+    /// counts the rest. At 179×43 every row fits and the table stays.
+    #[test]
+    fn main_trades_a_crowded_table_for_the_compact_list() {
+        let (view, chrome) = compact_view();
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(
+            table_crowded(21, None, 4),
+            "the 80x24 pane: 2 rows, 19 hidden"
+        );
+        assert!(!table_crowded(21, None, 7), "five rows are enough");
+        assert!(!table_crowded(2, None, 4), "nothing hidden");
+        assert_eq!(ctx.order.len(), 21);
+
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        let title = &rows[accounts];
+        assert!(
+            title.contains(" accounts · sort name · 21 · ✗ 1 error · "),
+            "{frame}"
+        );
+        assert!(title.contains(" · +11 more "), "{frame}");
+        assert!(rows[accounts + 3].starts_with(" scheduler "), "{frame}");
+        let pane = rows[accounts + 1..accounts + 3].join("\n");
+        assert!(
+            !pane.contains("group") && !pane.contains("CLAUDE"),
+            "{frame}"
+        );
+        // Down, then across: #1 and #2 in the first column, #9 and #10 in
+        // the fifth; names cut to the column (`u08-fixtur…`), #11 on no row.
+        for (n, row) in [(1, 1), (2, 2), (7, 1), (8, 2), (9, 1), (10, 2)] {
+            let name: String = fold_name(n).chars().take(10).collect();
+            assert!(rows[accounts + row].contains(&name), "#{n}:\n{frame}");
+        }
+        assert!(rows[accounts + 1].contains("✗ u01@ex.io"), "{frame}");
+        assert!(rows[accounts + 2].contains("◉ u08-fixtur…"), "{frame}");
+        assert!(rows[accounts + 1].contains("? u09@ex.io"), "{frame}");
+        assert!(!frame.contains(&fold_name(11)), "{frame}");
+
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 (");
+        assert!(rows[accounts + 1].starts_with("   group "), "{frame}");
+        assert!(!rows[accounts].contains("✗ 1 error"), "{frame}");
+    }
+
+    /// `v` on the accounts tab: one row per account with its state's glyph
+    /// — each one cell, on a CJK terminal too — its name and what it waits
+    /// on, in the table's order; the title's tally names every state with
+    /// its glyph. A tally slot two states share names both.
+    #[test]
+    fn compact_list_gives_each_state_its_glyph_and_word() {
+        let (view, _) = compact_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let rows = render_rows(&view, &chrome, 80, 30);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        assert!(rows[accounts + 1].starts_with(" ✗ u01@ex.io "), "{frame}");
+        for (n, glyph, word) in COMPACT_STATES.iter().copied().chain([(9, "?", "stale")]) {
+            let ch = glyph.chars().next().expect("glyph");
+            assert_eq!(
+                (
+                    unicode_width::UnicodeWidthChar::width(ch),
+                    unicode_width::UnicodeWidthChar::width_cjk(ch)
+                ),
+                (Some(1), Some(1)),
+                "{glyph} is one cell"
+            );
+            let name = fold_name(n);
+            let y = row_of(&rows, &format!("{glyph} {name} "));
+            let at = usize::from(col_of(&rows[y], &name));
+            let entry: String = rows[y].chars().skip(at).take(34).collect();
+            assert!(
+                entry.contains(&format!(" {word}")),
+                "#{n} says {word:?}: {entry:?}\n{frame}"
+            );
+        }
+        // Every account is on screen exactly once, in the table's order.
+        let ctx = frame_ctx(&view, &chrome);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 30);
+        let seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        assert_eq!(seen, (0..ctx.order.len()).collect::<Vec<_>>(), "{frame}");
+
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
+        assert!(
+            title.contains(
+                " · ✗ 1 error · ◉ 11 spent+cooling · ⠋ 2 active · ◦ 5 ok · ? 2 paused+stale "
+            ),
+            "{title}"
+        );
+        // A slot one llmux state holds alone shows that state's glyph.
+        let (view, chrome0) = live_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..fold_off(&chrome0)
+        };
+        let chrome = Chrome {
+            overlay: Overlay::Accounts,
+            ..chrome
+        };
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
+        assert!(
+            title.contains(" · ◌ 10 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
+            "{title}"
+        );
+    }
+
+    /// The switcher's cursor is the list's focus: `›` and the selected
+    /// (reversed) style on its entry, and a cursor past the last entry that
+    /// fits moves the list just far enough to show it, the rest counted.
+    #[test]
+    fn compact_list_highlights_and_follows_the_cursor() {
+        let (view, _) = compact_view();
+        let (w, h) = (40u16, 14u16);
+        for idx in [0usize, 20] {
+            let chrome = Chrome {
+                compact_accounts: true,
+                mode: Mode::Select { idx },
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let buf = render_buffer(&view, &chrome, w, h);
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let frame = rows.join("\n");
+            let name = fold_name(idx + 1);
+            let y = row_of(&rows, &format!("›{}", if idx == 0 { "✗" } else { "◦" }));
+            assert!(rows[y].contains(&name), "{frame}");
+            let x = col_of(&rows[y], "›");
+            assert!(
+                buf[(x, y as u16)].modifier.contains(Modifier::REVERSED)
+                    && buf[(x + 4, y as u16)].modifier.contains(Modifier::REVERSED),
+                "{frame}"
+            );
+            let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+            assert!(rows[accounts].contains(" more "), "{frame}");
+            // Only the focused entry is marked.
+            let detail = row_of(&rows, " detail ");
+            let marks: usize = rows[accounts + 1..detail]
+                .iter()
+                .map(|r| r.matches('›').count())
+                .sum();
+            assert_eq!(marks, 1, "{frame}");
+        }
+    }
+
+    /// A compact entry is its account's click target, like the table row:
+    /// a left click opens that account's detail modal, a right click its
+    /// context menu, on the same account the table row would.
+    #[test]
+    fn compact_entry_clicks_open_the_same_account_as_its_table_row() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (view, chrome) = compact_view();
+        let press = |hits: &[AccountRowHit], button: MouseButton, column: u16, row: u16| {
+            let mut app = fold_app();
+            app.account_row_chrome = hits.to_vec();
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(app.on_mouse(down, Some(&view)), "click at {column},{row}");
+            app
+        };
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        for n in [1usize, 7, 10] {
+            let row = accounts + 1 + (n + 1) % 2;
+            let x = col_of(&rows[row], &fold_name(n)) + 1;
+            let app = press(&hits.account_rows, MouseButton::Left, x, row as u16);
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.clone()),
+                Some(live_id(n)),
+                "#{n}:\n{frame}"
+            );
+            let app = press(&hits.account_rows, MouseButton::Right, x, row as u16);
+            assert_eq!(app.menu_account, Some(live_id(n)), "#{n}:\n{frame}");
+        }
+        // The table row of #7 at 179x43 opens the same account.
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let y = row_of(&rows, &format!(" 7  {}", fold_name(7)));
+        let app = press(&hits.account_rows, MouseButton::Left, 10, y as u16);
+        assert_eq!(
+            app.account_modal.as_ref().map(|m| m.account.clone()),
+            Some(live_id(7))
+        );
+    }
+
+    /// `v` is on the accounts footer — `compact`, or `table` while the list
+    /// shows — and in the `?` help, where the accounts group shows it even
+    /// at 179×43 (the hints the grid cuts off there are the ones the
+    /// dashboard group lists too).
+    #[test]
+    fn the_compact_key_is_on_the_accounts_footer_and_in_the_help() {
+        let (view, _) = compact_view();
+        for (compact, label) in [(false, "V compact"), (true, "V table")] {
+            let chrome = Chrome {
+                compact_accounts: compact,
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let rows = render_rows(&view, &chrome, 179, 43);
+            assert!(rows[42].contains(label), "{}", rows[42]);
+        }
+        let rows = render_rows(&view, &chrome_attach(Overlay::Misc), 179, 43);
+        assert!(
+            rows.iter().any(|r| r.contains(" v    compact ")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
     #[test]
     fn usage_history_failure_summary_visible_in_expanded_main_band() {
         let (mut view, name) = rich_account_view();
