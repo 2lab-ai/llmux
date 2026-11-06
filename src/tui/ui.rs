@@ -150,7 +150,7 @@ mod palette {
     pub(super) const GROK: Color = Color::Yellow;
     /// The gemini group.
     pub(super) const GEMINI: Color = Color::LightBlue;
-    /// The openrouter group (its in-flight spinner).
+    /// The openrouter group.
     pub(super) const OPENROUTER: Color = Color::Green;
     /// Truecolor anchor of the claude family's headline-model gradient (the
     /// `tui_gradient.claude` default; magenta's family).
@@ -166,8 +166,6 @@ mod palette {
     pub(super) const EFFORT_MAX: Color = Color::LightMagenta;
 
     // Message kinds in the activity log.
-    /// A `user` turn: the row the eye should land on.
-    pub(super) const KIND_USER: Color = Color::White;
     /// The mechanical control turns (`compact`, `summary`, `recap`): a quiet
     /// hue that still reads apart from the dim noise kinds.
     pub(super) const KIND_CONTROL: Color = Color::Blue;
@@ -9327,27 +9325,20 @@ fn draw_activity(
         for request in in_flight.iter().rev().take(capacity) {
             let elapsed = now.duration_since(request.started_at).unwrap_or_default();
             // Working spinner differs by backend group: Claude gets the braille
-            // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
-            // colors as the group labels — so you can tell what's running where
-            // at a glance. Pre-routing rows (no account yet) are a dim braille.
-            let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
-                Some(BackendGroup::Codex) => (SpinnerKind::Block.glyph(anim_frame), palette::CODEX),
-                Some(BackendGroup::Claude) => {
-                    (SpinnerKind::Braille.glyph(anim_frame), palette::CLAUDE)
-                }
-                Some(BackendGroup::Grok) => (SpinnerKind::Block.glyph(anim_frame), palette::GROK),
-                Some(BackendGroup::OpenRouter) => {
-                    (SpinnerKind::Block.glyph(anim_frame), palette::OPENROUTER)
-                }
-                Some(BackendGroup::Gemini) => {
-                    (SpinnerKind::Block.glyph(anim_frame), palette::GEMINI)
-                }
-                None => (SpinnerKind::Braille.glyph(anim_frame), THEME.muted),
+            // orbit, every other group a quarter-block orbit, each in its group
+            // label's colour ([`group_color`]) — so you can tell what's running
+            // where at a glance. Pre-routing rows (no account yet) are a dim
+            // braille.
+            let group = request.account.as_deref().and_then(|a| group_of(view, a));
+            let glyph = match group {
+                Some(BackendGroup::Claude) | None => SpinnerKind::Braille.glyph(anim_frame),
+                Some(_) => SpinnerKind::Block.glyph(anim_frame),
             };
+            let spinner = group_color(group.map(BackendGroup::as_str));
             let mut spans = vec![
                 // Mirror the completed row's stamp spacing (`▸ HH:MM:SS  `):
                 // spinner+2 spaces so the following `kind` column lines up.
-                Span::styled(format!(" {glyph} "), Style::new().fg(color)),
+                Span::styled(format!(" {glyph} "), spinner),
                 Span::styled(
                     format!("{}  ", format::clock_hms_utc(request.started_at)),
                     dim(),
@@ -10180,9 +10171,7 @@ fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
 /// (compact/title/suggest/count/…) stay dim so user rows dominate the eye.
 fn kind_style(kind: &str) -> Style {
     match kind {
-        "user" => Style::new()
-            .fg(palette::KIND_USER)
-            .add_modifier(Modifier::BOLD),
+        "user" => THEME.text().add_modifier(Modifier::BOLD),
         "security" => Style::new().fg(THEME.warn),
         "compact" | "summary" | "recap" => Style::new().fg(palette::KIND_CONTROL),
         "subagent" | "sdk" => Style::new()
@@ -10193,13 +10182,15 @@ fn kind_style(kind: &str) -> Style {
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, grok =
-/// yellow, gemini = light blue, unknown = gray. Shared by the account table
-/// (req5) and the activity log (req7) so the group reads the same everywhere.
+/// yellow, openrouter = green, gemini = light blue, unknown = gray. Shared by
+/// the account table (req5), the activity log (req7) and its in-flight
+/// spinners so the group reads the same everywhere.
 fn group_color(group: Option<&str>) -> Style {
     match group {
         Some("codex") => Style::new().fg(palette::CODEX),
         Some("claude") => Style::new().fg(palette::CLAUDE),
         Some("grok") => Style::new().fg(palette::GROK),
+        Some("openrouter") => Style::new().fg(palette::OPENROUTER),
         Some("gemini") => Style::new().fg(palette::GEMINI),
         _ => dim(),
     }
@@ -22897,6 +22888,81 @@ mod tests {
              const with its reason):\n{}",
             stray.join("\n")
         );
+    }
+
+    /// Two hues the theme sweep fixed. A running request's spinner wears
+    /// its group label's colour for every group: the spinner kept its own
+    /// hue table, where openrouter was green while `group_color` drew the
+    /// openrouter label dim, like an unknown group. And a `user` turn's
+    /// kind tag is the terminal's default foreground in bold, as its doc
+    /// always said — it was ANSI white, near-invisible on a light terminal.
+    #[test]
+    fn running_spinners_wear_their_group_colour_and_user_tags_the_default_text() {
+        use crate::routing::BackendGroup;
+        let (mut view, _) = crowded_view();
+        let now = SystemTime::now();
+        view.in_flight = BackendGroup::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &group)| {
+                let account = view
+                    .snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.group == group)
+                    .expect("an account per group");
+                InFlight {
+                    id: i as u64 + 1,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
+                    account: Some(account.id.0.clone()),
+                    group: Some(group.as_str().into()),
+                    model: Some("m".into()),
+                    effort: None,
+                    fast: false,
+                    kind: Some("user".into()),
+                    user_id: None,
+                    tenant: None,
+                    excerpt: None,
+                    client_name: None,
+                    started_at: now,
+                }
+            })
+            .collect();
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).expect("terminal");
+        let buf = terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, now);
+            })
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Newest first: the rows run Gemini … Claude.
+        for (y, group) in (1u16..).zip(BackendGroup::ALL.iter().rev()) {
+            let label = group_color(Some(group.as_str()));
+            assert!(
+                label.fg.is_some_and(|fg| fg != THEME.muted),
+                "{group:?} has a hue of its own: {label:?}"
+            );
+            assert_eq!(
+                Some(buf[(1, y)].fg),
+                label.fg,
+                "{group:?} spinner, row {y}:\n{text}"
+            );
+            let x = rows[usize::from(y)]
+                .find("user")
+                .map(|b| cells::width(&rows[usize::from(y)][..b]) as u16)
+                .unwrap_or_else(|| panic!("kind tag, row {y}:\n{text}"));
+            for dx in 0..4 {
+                let cell = &buf[(x + dx, y)];
+                assert_eq!(cell.fg, Color::Reset, "user tag, row {y}:\n{text}");
+                assert!(cell.modifier.contains(Modifier::BOLD), "{text}");
+            }
+        }
     }
 
     /// One selected style: the cursor row of llmux's own tables (the
