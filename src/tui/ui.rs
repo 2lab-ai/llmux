@@ -526,6 +526,12 @@ pub(crate) fn draw(
         }
     }
 
+    // Status messages with several facts float over MAIN and any overlay,
+    // in the corner under the tab row — and under every modal, gate and
+    // picker drawn after them, so a toast never covers a question that is
+    // still waiting for its answer (a short terminal stacks them).
+    draw_toasts(frame, overlay_area, chrome, ctx.mask);
+
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
     // centered, scrollable full-text box. Its max-scroll (or a close signal
     // when the entry aged out) rides back on the hit record so the runtime can
@@ -567,9 +573,6 @@ pub(crate) fn draw(
     // stands on the footer, over whichever surface opened it.
     draw_gate(frame, view, &ctx, chrome);
     draw_login_picker(frame, chrome);
-    // Status messages with several facts float over everything but the
-    // footer, in the corner under the tab row.
-    draw_toasts(frame, overlay_area, chrome, ctx.mask);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -12022,8 +12025,8 @@ fn status_row(msg: Option<&StatusMsg>, mask: bool, width: u16) -> Line<'static> 
 
 /// Status messages with several facts — a multi-account refresh with
 /// failures — as twolab-tui toast cards stacked in the top-right corner of
-/// `area` (under the tab row, above the footer): the outcome's word in the
-/// border, its glyph and the summary, then one line per fact and `+N more`
+/// `area` (under the tab row, above the footer, and under any modal, gate
+/// or picker): the outcome's word in the border, its glyph and the summary, then one line per fact and `+N more`
 /// past four. Each stays for its kind's time (8 s for a failure) on the
 /// dashboard's clock, so a burst is read one card after another. Up to two
 /// thirds of the width, so long errors are not cut early on a wide terminal;
@@ -13610,6 +13613,51 @@ mod tests {
         assert!(bold_at(marked, "Cancel"), "and is bold");
         let other = row_with("1) Remove the account");
         assert!(!bold_at(other, "Remove the account"), "the other is plain");
+    }
+
+    /// A toast never covers a question still waiting for its answer: on a
+    /// short terminal the remove / reset gate and the login picker stand
+    /// where the toast card is, and every row of the card is the card's own
+    /// text with the toast up or not (the toast used to be drawn over it,
+    /// hiding the `y` it was asking about). The footer stays the footer.
+    #[test]
+    fn a_toast_stays_under_the_confirm_gate_and_the_login_picker() {
+        use twolab_tui::toast::{Toast, ToastKind};
+        let view = usage_control_view();
+        let chrome = |mode: Mode, toast: bool| {
+            let mut chrome = chrome_overlay(Overlay::Accounts);
+            chrome.mode = mode;
+            if toast {
+                let toast = Toast::new(ToastKind::Fail, "refresh: 1 ok, 5 FAILED")
+                    .lines((2..=6).map(|n| format!("claude:a{n}@x.com: upstream 50{n}")));
+                chrome.toasts.push(toast, Duration::ZERO);
+            }
+            chrome
+        };
+        // With nothing asking, the toast is drawn at each size.
+        for (w, h) in [(80u16, 12u16), (80, 16), (179, 43)] {
+            let frame = render(&view, &chrome(Mode::Normal, true), w, h);
+            assert!(frame.contains("5 FAILED"), "{w}x{h}: {frame}");
+        }
+        for (mode, title) in [
+            (Mode::ConfirmRemove { idx: 0 }, "┌ remove account "),
+            (Mode::ConfirmReset { idx: 0 }, "┌ "),
+            (Mode::NewLogin { idx: 0 }, "┌ new login "),
+        ] {
+            for (w, h) in [(80u16, 12u16), (80, 16), (179, 43)] {
+                let bare = render_rows(&view, &chrome(mode, false), w, h);
+                let both = render_rows(&view, &chrome(mode, true), w, h);
+                let top = bare
+                    .iter()
+                    .position(|r| r.starts_with(title))
+                    .unwrap_or_else(|| panic!("{mode:?} {w}x{h}: {bare:#?}"));
+                let card = usize::from(card_width(Rect::new(0, 0, w, h)));
+                let cut = |r: &String| r.chars().take(card).collect::<String>();
+                for y in top..bare.len() {
+                    assert_eq!(cut(&both[y]), cut(&bare[y]), "{mode:?} {w}x{h} row {y}");
+                }
+            }
+        }
     }
 
     #[test]
