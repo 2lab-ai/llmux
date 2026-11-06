@@ -1,7 +1,7 @@
-//! Log console state: a bounded ring of tracing [`LogLine`]s (newest last,
-//! auto-follow — the renderer shows the tail). The `l` key now summons a
-//! full-screen Logs overlay (issue #5), so there is no panel-size toggle. Pure
-//! state — rendering lives in `ui`.
+//! Log console state: a bounded ring of tracing [`LogLine`]s (newest last).
+//! The `l` key summons the Logs overlay (issue #5), a pager over the whole
+//! ring that follows the tail until scrolled back. Pure state — rendering
+//! lives in `ui`.
 
 use std::collections::VecDeque;
 
