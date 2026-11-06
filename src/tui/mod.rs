@@ -65,7 +65,9 @@ fn no_color() -> bool {
 /// Whether the dashboard's twolab-tui animations hold still:
 /// `LLMUX_REDUCED_MOTION` set to anything non-empty when the process started.
 /// The attach connecting screen's spinner keeps its first glyph and its
-/// label is plain bold; the clock still counts. Read once.
+/// label is plain bold; the clock still counts. The loading labels (sessions,
+/// keys title, raw viewer) drop their shimmer band for plain bold, and their
+/// spinners hold their first glyph. Read once.
 fn motion() -> twolab_tui::Motion {
     static MOTION: std::sync::OnceLock<twolab_tui::Motion> = std::sync::OnceLock::new();
     *MOTION.get_or_init(|| match std::env::var_os("LLMUX_REDUCED_MOTION") {
@@ -439,6 +441,10 @@ pub(crate) struct KeysPanel {
     pub scroll: usize,
     /// A query is in flight.
     pub loading: bool,
+    /// The dashboard clock when the panel started loading: the title's
+    /// `loading…` shimmer sweeps from there. A re-query while one is still
+    /// in flight keeps it — the label has not changed.
+    pub loading_since: Duration,
     /// The last query's failure, shown instead of rows.
     pub error: Option<String>,
     /// The last successful answer (shared, so a Chrome clone is cheap).
@@ -669,6 +675,9 @@ pub(crate) struct Chrome {
     /// Percent of the raw-io file consumed by the in-flight streaming load
     /// (`bytes_read*100/file_len`), shown in the overlay title. 100 at rest.
     pub sessions_pct: u8,
+    /// The dashboard clock when the in-flight load began: its loading label's
+    /// shimmer sweeps from there.
+    pub sessions_since: Duration,
     /// Cursor row in the Sessions overlay's session list.
     pub session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles).
@@ -864,6 +873,9 @@ pub(crate) struct RawModal {
     pub hscroll: u16,
     /// Animation frame for the Loading spinner (advances with the shared tick).
     pub spin: usize,
+    /// The dashboard clock when it opened: the Loading label's shimmer sweeps
+    /// from there.
+    pub since: Duration,
     /// Action feedback ("copied … → pbcopy" / "saved → …") with its outcome
     /// and when it was set, shown in place of the key legend. The app drops
     /// it from the frame's chrome once [`STATUS_TTL`] has passed, so the draw
@@ -1160,6 +1172,8 @@ struct App {
     /// Percent of the raw-io file the in-flight streaming load has consumed,
     /// carried on each partial and shown in the overlay title. 100 at rest.
     sessions_pct: u8,
+    /// The dashboard clock when the in-flight load began.
+    sessions_since: Duration,
     /// Sender handed to the `spawn_blocking` load task by `open_sessions`; the
     /// event loop owns the receiver and applies each progressive partial. `None`
     /// only in unit tests that never run `event_loop` (they drive overlay state
@@ -1318,6 +1332,7 @@ impl App {
             sessions: Vec::new(),
             sessions_loading: false,
             sessions_pct: 100,
+            sessions_since: Duration::ZERO,
             sessions_tx: None,
             session_cursor: 0,
             session_sort: SessionSort::default(),
@@ -1552,6 +1567,7 @@ impl App {
             sessions: self.sessions.clone(),
             sessions_loading: self.sessions_loading,
             sessions_pct: self.sessions_pct,
+            sessions_since: self.sessions_since,
             session_cursor: self.session_cursor,
             session_sort: self.session_sort,
             account_sort: self.account_sort,
@@ -2325,6 +2341,7 @@ impl App {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: self.clock_at(Instant::now()),
             flash: None,
             state,
         });
@@ -2963,6 +2980,9 @@ impl App {
             self.keys.doc = None;
         }
         self.keys.generation += 1;
+        if !self.keys.loading {
+            self.keys.loading_since = self.clock_at(Instant::now());
+        }
         self.keys.loading = true;
         self.keys.error = None;
         self.pending_keys = Some(KeysQuery {
@@ -3624,6 +3644,7 @@ impl App {
         }
         self.sessions_loading = true;
         self.sessions_pct = 0;
+        self.sessions_since = self.clock_at(Instant::now());
         if let Some(tx) = self.sessions_tx.clone() {
             // read + parse + fold is blocking IO/CPU → off the runtime onto the
             // blocking pool so the event loop keeps rendering and taking input.
@@ -7972,6 +7993,45 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Sessions);
     }
 
+    /// The loading labels' shimmer sweeps from when their load began, on the
+    /// dashboard clock: opening the sessions overlay and the keys panel's
+    /// first query stamp it; a keys re-query while one is still in flight
+    /// keeps the stamp (the label has not changed), and a new load after the
+    /// answer restarts it.
+    #[test]
+    fn loading_labels_sweep_from_when_their_load_began() {
+        let ago = |secs| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("monotonic clock far enough from its origin")
+        };
+        let minute = Duration::from_secs(60);
+        let mut app = remote_app();
+        app.started = ago(60);
+        app.open_sessions();
+        let since = app.chrome().sessions_since;
+        assert!(since >= minute && since < minute * 2, "{since:?}");
+
+        app.open_keys();
+        let first = app.keys.loading_since;
+        assert!(first >= minute && first < minute * 2, "{first:?}");
+        app.started = ago(180); // two minutes on
+        app.on_key_keys(KeyCode::Char('r'), None);
+        assert!(app.keys.loading, "a refresh is in flight");
+        assert_eq!(app.keys.loading_since, first, "still the same loading…");
+        let (_, doc) = keys_view_and_doc();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.on_key_keys(KeyCode::Char('r'), None);
+        assert!(
+            app.keys.loading_since > first + minute,
+            "a new load restarts the sweep: {:?}",
+            app.keys.loading_since
+        );
+    }
+
     // --- account upsert wording (re-login over an existing account) --------
 
     /// L-6: a login/add over an EXISTING identity replaces its credentials —
@@ -8670,6 +8730,7 @@ mod tests {
             scroll: 3,
             hscroll: 5,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
         });
@@ -8715,6 +8776,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: RawModalState::Loading,
         });
@@ -8752,6 +8814,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: RawModalState::Loading,
         });
@@ -8848,6 +8911,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
         });
@@ -8907,6 +8971,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
         });
@@ -10428,6 +10493,7 @@ mod tests {
             scroll: 0,
             hscroll: 0,
             spin: 0,
+            since: Duration::ZERO,
             flash: Some((StatusMsg::fail("clipboard tool not found"), now)),
             state: RawModalState::Failed("gone".into()),
         });

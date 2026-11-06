@@ -73,6 +73,15 @@ and `+N more` past four lines. The card stays for 8 seconds (5 for a
 warning); a newer card replaces it, and at 64 columns or fewer it is a
 one-row banner instead.
 
+A label that waits on a load — `loading sessions…` and then the title's
+`loading… N%` in the sessions tab, `· loading…` in the keys title,
+`loading raw record…` in the raw viewer — is still for 0.6 seconds after the
+load starts (a quicker load never moves), then a band of light passes across
+it every 4 seconds. The band is weight only — dim at rest, bold at its crest —
+so it also shows under `NO_COLOR`; the words never change. With
+`LLMUX_REDUCED_MOTION` set to any non-empty value the label is plain bold and
+its spinner holds still.
+
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
   and column header). Activity takes every row that is left, and at least 4
@@ -515,8 +524,9 @@ On a narrow terminal the table sheds its widest, lowest-value columns (the
 `└ group/model` labels stay readable down to 80 columns.
 
 The title always states the active question (`window 24h · 2 model(s) · N
-requests`). A pending query says `loading…` and a failed one says why — a
-filtered or failed view is never redrawn as unfiltered data or as zeros.
+requests`). A pending query says `loading…`, with a band of light passing
+across it, and a failed one says why — a filtered or failed view is never
+redrawn as unfiltered data or as zeros.
 With explicit models selected, requests that failed before routing (no model
 attributed) drop out; under `all models` they stay, so the admin view still
 accounts for every observed completion.

@@ -53,7 +53,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | meter | llmux | the original of the crate's meter | no visible change; moving it re-pins the 179×43 frame digest for every account row | later |
 | packed_grid | llmux | the original, twice (fold and models strip) | one packer and click rects per strip entry; largest digest change | later |
 | rule | fx | 28 section rules drawn as block borders | only differs on CJK-wide terminals; needs a host setting first | later |
-| shimmer | Codex | loading labels are plain text | cosmetic | later |
+| shimmer | Codex | loading labels are plain text | a band of light passes across `loading…` while it waits (sessions, keys title, raw viewer); plain bold under reduced motion | done |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
 | agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
