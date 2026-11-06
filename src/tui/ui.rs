@@ -102,6 +102,104 @@ fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
+thread_local! {
+    /// This frame's [`Chrome::ambiguous_wide`], set by [`draw`] before it
+    /// draws anything, so every section rule reads it without the flag
+    /// riding through each pane's signature. Thread-local rather than a
+    /// global: a test frame drawn with it on never leaks into a frame drawn
+    /// beside it.
+    static AMBIGUOUS_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cells of rule twolab-tui `Rule` draws before a title (`── accounts`).
+const RULE_LEAD: usize = 2;
+
+/// The cells a section rule's title takes beyond its text: the
+/// [`RULE_LEAD`] and a space each side (`── accounts ─`).
+const RULE_TITLE_PAD: usize = RULE_LEAD + 2;
+
+/// A section heading as twolab-tui draws it: a `Rule` with `title` at its
+/// left (surrounding spaces trimmed — the rule adds its own), in the
+/// default foreground like the block borders it replaced. `wide` (the
+/// terminal draws East-Asian Ambiguous glyphs two cells wide) switches `─`
+/// to its ASCII fallback `-`.
+fn section_rule(title: &str, wide: bool) -> twolab_tui::rule::Rule {
+    twolab_tui::rule::Rule::new()
+        .label(title.trim().to_string())
+        .ambiguous_wide(wide)
+}
+
+/// Draw a section heading on `area`'s first row ([`section_rule`]) and
+/// return the rows under it — what `Block::new().borders(Borders::TOP)`
+/// gave the section's body. On a terminal that draws Ambiguous glyphs wide
+/// the rule also stops short by the extra cells its title's own Ambiguous
+/// characters (`—`, `·`) take there, so the row ends at the right edge
+/// instead of wrapping.
+fn section(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    if area.height == 0 {
+        return area;
+    }
+    let wide = AMBIGUOUS_WIDE.with(std::cell::Cell::get);
+    let width = if wide {
+        area.width
+            .saturating_sub(ambiguous_extra(title.trim()) as u16)
+    } else {
+        area.width
+    };
+    frame.render_widget(
+        section_rule(title, wide),
+        Rect {
+            width,
+            height: 1,
+            ..area
+        },
+    );
+    Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    }
+}
+
+/// Where Ambiguous glyphs draw two cells wide, blank the last cells of the
+/// rule `row` that `text` — everything on the row, its title included —
+/// pushes past the right edge: for a legend laid on a rule after
+/// [`section`] drew it (which stopped short by the title's alone).
+fn rule_stop_short(frame: &mut Frame, row: Rect, text: &str) {
+    if !AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        return;
+    }
+    let extra = (ambiguous_extra(text) as u16).min(row.width);
+    let buf = frame.buffer_mut();
+    for x in row.right() - extra..row.right() {
+        buf[(x, row.y)].reset();
+    }
+}
+
+/// The cells `text` takes beyond its width when Ambiguous glyphs are drawn
+/// two cells wide.
+fn ambiguous_extra(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width_cjk().saturating_sub(text.width())
+}
+
+/// Cells a section title takes on its rule: its text plus
+/// [`RULE_TITLE_PAD`] — what a legend drawn after the title starts past.
+fn section_title_width(title: &str) -> usize {
+    cells::width(title.trim()) + RULE_TITLE_PAD
+}
+
+/// `n` cells of the rule glyph for a hand-drawn rule (the band's top
+/// border): `─`, or `-` when Ambiguous glyphs are drawn wide.
+fn rule_fill(n: usize) -> String {
+    let glyph = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        twolab_tui::rule::ASCII
+    } else {
+        twolab_tui::rule::SOLID
+    };
+    std::iter::repeat_n(glyph, n).collect()
+}
+
 /// `value`'s share of `max` as a twolab-tui mini bar (`▰▰▰▱▱▱`, empty cells
 /// dim) `width` cells wide. With nothing to compare against — `max` zero,
 /// every row empty — the share cannot be computed and the bar reads `—`
@@ -251,6 +349,7 @@ pub(crate) fn draw(
     // No activity panel hit-targets until MAIN draws one this frame (cleared so
     // a stale layout from a previous frame can never mis-map a click).
     *hits = None;
+    AMBIGUOUS_WIDE.with(|wide| wide.set(chrome.ambiguous_wide));
     let Some(view) = view else {
         draw_connecting(frame, chrome);
         return;
@@ -788,9 +887,9 @@ fn draw_accounts_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" detail "));
-        frame.render_widget(empty, detail_area);
+        )));
+        let body = section(frame, detail_area, " detail ");
+        frame.render_widget(empty, body);
     } else {
         draw_detail(frame, detail_area, view, ctx, chrome);
     }
@@ -959,15 +1058,13 @@ fn draw_daily_chart(
         .style(dim());
     let [plot_area, legend_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
-        )
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
+    let plot_body = section(
+        frame,
+        plot_area,
+        &format!(" tokens per day — last {chart_days}d · d cycles "),
+    );
+    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
+    frame.render_widget(chart, plot_body);
     // Legend: ● model (share%) — one line, dim separators.
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (i, ((group, model), total)) in ranked.iter().enumerate() {
@@ -1030,9 +1127,9 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
     let shown = total.min(CLIENT_PANEL_ROWS);
     let title = format!(" clients — top {shown} of {total} by requests (metadata.user_id) ");
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Rows the windowed heatmap panel needs: a title/header pair + one row per
@@ -1093,12 +1190,16 @@ fn draw_usage_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             hint,
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(format!(
-            " usage — {} · {cost_warning} · ALL 0 buckets ",
-            gran.label()
         )));
-        frame.render_widget(empty, area);
+        let body = section(
+            frame,
+            area,
+            &format!(
+                " usage — {} · {cost_warning} · ALL 0 buckets ",
+                gran.label()
+            ),
+        );
+        frame.render_widget(empty, body);
         return None;
     }
 
@@ -1138,14 +1239,17 @@ fn draw_usage_overlay(
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
     // Widest first. The last form is exactly as wide as the pre-scope title,
     // so any width that fit it still shows the warning, ALL and qualifier.
+    // Each is measured as its section rule draws it (lead included), and
+    // the short form joins tokens and cost with a space like the tight one,
+    // so an 80-column overlay keeps `N buckets` under the rule's lead.
     let full = format!(
         " usage — {label} · {cost_warning} · ALL {n} buckets · Σ {tok} tok · Σ {cost}{unpriced} "
     );
     let short = format!(
-        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
+        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok {cost}{unpriced} "
     );
     let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
-    let fits = |t: &str| cells::width(t) <= usize::from(area.width);
+    let fits = |t: &str| section_title_width(t) <= usize::from(area.width);
     let title = if fits(&full) {
         full
     } else if fits(&short) {
@@ -1243,9 +1347,9 @@ fn draw_usage_overlay(
         Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
     let table = Table::new(trows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
     buckets.get(scroll).map(|(_, label, _)| {
         format!(
             "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
@@ -1456,18 +1560,18 @@ fn draw_sessions_overlay(
         let loading = Paragraph::new(Line::from(vec![
             Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
             Span::styled("loading sessions…", dim()),
-        ]))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(loading, area);
+        ]));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(loading, body);
         return;
     }
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(empty, body);
         return;
     }
     let table_chrome = if area.width >= SIDE_BY_SIDE_AT {
@@ -1574,9 +1678,9 @@ fn draw_sessions_table(
         format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
     };
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
     // Data rows start under the top border + header row.
     let rows_rect = Rect {
         x: area.x,
@@ -1662,8 +1766,8 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             Span::raw(session_span_label(s)),
         ]),
     ];
-    let detail = Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(" session "));
-    frame.render_widget(detail, area);
+    let body = section(frame, area, " session ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Display label for a session's grouping key: the user_id, or `(ungrouped)` for
@@ -1878,9 +1982,9 @@ fn draw_perf_overlay(
             "no perf data yet — collecting starts with this daemon version (metric v1); \
              send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" perf "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " perf ");
+        frame.render_widget(empty, body);
         return;
     }
     let series = match chrome.perf_day_off {
@@ -1967,9 +2071,9 @@ fn draw_perf_chart(
         ranked
     };
     if ranked.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())))
-            .block(Block::new().borders(Borders::TOP).title(title.to_string()));
-        frame.render_widget(empty, area);
+        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())));
+        let body = section(frame, area, title);
+        frame.render_widget(empty, body);
         return;
     }
     let span_days = days as usize;
@@ -2065,11 +2169,9 @@ fn draw_perf_chart(
         .style(dim());
     let [plot_area, legend_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(Block::new().borders(Borders::TOP).title(title.to_string()))
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
+    let plot_body = section(frame, plot_area, title);
+    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
+    frame.render_widget(chart, plot_body);
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
         if i > 0 {
@@ -2171,14 +2273,10 @@ fn draw_perf_health(
     }
     let mut constraints = vec![Constraint::Length(7)];
     constraints.extend(groups.iter().map(|_| Constraint::Fill(1)));
-    let block = Block::new().borders(Borders::TOP).title(match title {
-        Some(t) => t.to_string(),
-        None => " provider health (observed) ".to_string(),
-    });
+    let body = section(frame, area, title.unwrap_or(" provider health (observed) "));
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, body);
 }
 
 /// Per-(group, model, fast) series table over the span: samples, error %,
@@ -2247,12 +2345,16 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
         Constraint::Length(8),
     ];
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(format!(
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(
+        frame,
+        area,
+        &format!(
             " series ({scope}) — {} of {total} · est = post-first-delta (measured only) ",
             cursor.saturating_add(1).min(total.max(1))
-        )));
-    frame.render_widget(table, area);
+        ),
+    );
+    frame.render_widget(table, body);
 }
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
@@ -2807,11 +2909,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
             bytes(f.activity_log_bytes),
         ))),
     ];
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" misc — keys · build · daemon ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = section(frame, area, " misc — keys · build · daemon ");
     // The facts keep their rows at the bottom; the key grid takes the rest
     // and, when it does not fit, ends in `… +N more` — never cut silently.
     let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
@@ -3550,11 +3648,11 @@ fn draw_config_overlay(
 ) {
     frame.render_widget(Clear, area);
     let rows = config_rows(view, chrome);
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" config — Enter/click value edits · read-only rows are skipped ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = section(
+        frame,
+        area,
+        " config — Enter/click value edits · read-only rows are skipped ",
+    );
     // The edit prompt takes the last two rows while a value is being typed.
     let editing = match chrome.mode {
         Mode::ConfigEdit { action } => Some(action),
@@ -5658,14 +5756,13 @@ fn draw_accounts_with(
             hidden,
         )
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(block);
-        frame.render_widget(empty, area);
+        )));
+        frame.render_widget(empty, body);
         return Vec::new();
     }
     let selected = cursor_pos(chrome, ctx.order.len());
@@ -5734,16 +5831,15 @@ fn draw_accounts_with(
     };
 
     let table_widget = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    // With the fold, the table stops at its own rows so the block can take
-    // the lines below them.
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    // With the fold, the table stops at its own rows (and its header) so
+    // the fold block can take the lines below them.
     let table_area = match fold {
         Some(_) => Rect {
-            height: area.height.min((table.len() as u16).saturating_add(2)),
-            ..area
+            height: body.height.min((table.len() as u16).saturating_add(1)),
+            ..body
         },
-        None => area,
+        None => body,
     };
     frame.render_widget(table_widget, table_area);
     // Row hit map (UI-3 U11): table row `i` renders at area.y + 2 + i (top
@@ -7456,9 +7552,11 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
 
 /// The band's left title: today's `poller` and `totals` lines, word for
 /// word and style for style, joined with ` · `; `totals = None` leaves
-/// ` · totals …` for the mode row.
+/// ` · totals …` for the mode row. It opens with the same two-cell lead as
+/// every other section rule (`── scheduler · …`, [`section`]).
 fn band_title_spans_from(poller: &str, totals: Option<&[Span<'static>]>) -> Vec<Span<'static>> {
     let mut spans = vec![
+        Span::raw(rule_fill(RULE_LEAD)),
         Span::raw(" scheduler · "),
         Span::styled("poller ", dim()),
         Span::raw(poller.to_string()),
@@ -7575,14 +7673,22 @@ fn draw_band(
         (!geometry.totals_on_mode_row).then_some(summary.totals.as_slice()),
     );
     let title_w = Line::from(title.clone()).width();
-    title.push(Span::raw(
-        "─".repeat(geometry.detail_title_x.saturating_sub(title_w)),
-    ));
+    title.push(Span::raw(rule_fill(
+        geometry.detail_title_x.saturating_sub(title_w),
+    )));
     let detail_title_w = Line::from(BAND_DETAIL_TITLE).width();
     title.push(Span::raw(BAND_DETAIL_TITLE));
-    title.push(Span::raw("─".repeat(
-        width.saturating_sub(geometry.detail_title_x + detail_title_w),
-    )));
+    // Where Ambiguous glyphs draw wide, the titles' own (`·`, `…`) take
+    // extra cells: the tail stops short by them, as [`section`] does.
+    let wide_extra = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        let text: String = title.iter().map(|span| span.content.as_ref()).collect();
+        ambiguous_extra(&text)
+    } else {
+        0
+    };
+    title.push(Span::raw(rule_fill(width.saturating_sub(
+        geometry.detail_title_x + detail_title_w + wide_extra,
+    ))));
     frame.render_widget(
         Paragraph::new(Line::from(title)),
         Rect { height: 1, ..area },
@@ -7685,8 +7791,8 @@ fn draw_summary(frame: &mut Frame, area: Rect, parts: &SummaryParts) {
     totals.extend(parts.totals.iter().cloned());
     lines.push(Line::from(totals));
     lines.extend(parts.tail.iter().cloned());
-    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " scheduler ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the scheduler summary's parts (see [`SummaryParts`]).
@@ -8090,10 +8196,8 @@ fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
     ];
     lines.extend(parts.auth.clone());
     lines.extend(parts.reset.clone());
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" detail · h / click account: full history ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " detail · h / click account: full history ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the selected account's [`DetailParts`]; `None` when the order is
@@ -9093,7 +9197,6 @@ fn draw_activity(
     } else {
         format!(" activity — {} in flight ", in_flight.len())
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
     // Paragraph styles graphemes, but resets wide-glyph continuation cells.
     // Apply the row background to the final buffer so both those cells and
     // the unused trailing width share the endpoint color.
@@ -9104,7 +9207,8 @@ fn draw_activity(
         .map(|(index, _)| body_top.saturating_add(index as u16))
         .filter(|y| *y < area.bottom())
         .collect();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, &title);
+    frame.render_widget(Paragraph::new(lines), body);
     for y in openai_rows {
         frame.buffer_mut().set_style(
             Rect::new(area.x, y, area.width, 1),
@@ -10343,11 +10447,9 @@ fn draw_models_strip_packed(
         })
         .collect();
     let title = strip_title(view, shown);
-    let title_w = Line::from(title.as_str()).width();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(title)),
-        area,
-    );
+    let title_w = section_title_width(&title);
+    let body = section(frame, area, &title);
+    frame.render_widget(Paragraph::new(lines), body);
     let legend_w = Line::from(STRIP_LEGEND).width();
     if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
         frame.render_widget(
@@ -10358,6 +10460,12 @@ fn draw_models_strip_packed(
                 legend_w as u16,
                 1,
             ),
+        );
+        // The legend's own `·` push the rule's tail on a wide terminal.
+        rule_stop_short(
+            frame,
+            Rect { height: 1, ..area },
+            &format!("{title}{STRIP_LEGEND}"),
         );
     }
 }
@@ -10467,9 +10575,9 @@ fn draw_models_strip(
     };
     let title = strip_title(view, shown);
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Detailed model view body: the full scrollable table beside (or above) the
@@ -10485,9 +10593,9 @@ fn draw_models_full(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no model usage yet — send a request through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" models "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " models ");
+        frame.render_widget(empty, body);
         return;
     }
     if area.width >= SIDE_BY_SIDE_AT {
@@ -10619,9 +10727,9 @@ fn draw_models_table(
         view.data_quality.cost
     );
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Drill-down panel for the cursored model row: token + cache split, account
@@ -10743,8 +10851,8 @@ fn draw_model_detail(
         dim(),
     )));
 
-    let block = Block::new().borders(Borders::TOP).title(" model detail ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " model detail ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// The heatmap cells for `window`, or an empty slice when the doc carries no
@@ -10780,7 +10888,7 @@ fn draw_heatmap(
     let cells = heatmap_cells(view, window);
     let total = cells.len();
     let title = format!(" token heatmap — {} (best-effort) ", window.label());
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
 
     let mut lines: Vec<Line> = Vec::new();
     // The accuracy contract (mandatory): a visible best-effort qualifier so the
@@ -10794,7 +10902,7 @@ fn draw_heatmap(
             " no windowed activity yet",
             Style::new().fg(Color::Yellow),
         )));
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(Paragraph::new(lines), body);
         return;
     }
 
@@ -10839,7 +10947,7 @@ fn draw_heatmap(
             dim(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// A footer keybar fitted to `width` cells by twolab-tui's
@@ -12958,6 +13066,7 @@ mod tests {
             input_modal: None,
             raw_modal: None,
             account_modal: None,
+            ambiguous_wide: false,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -19929,8 +20038,11 @@ mod tests {
         out
     }
 
+    // The title opens with the section rule's two-cell lead (`── `) like
+    // every other heading; ` detail `, set past the widest title the band
+    // can show, moves two cells right with it, and the tail is two shorter.
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ──────────────────────────────";
+        "── scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ────────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -20255,7 +20367,7 @@ mod tests {
             );
             let detail_at: String = rows[sched].chars().skip(w as usize - 48).collect();
             assert_eq!(
-                detail_at.starts_with(" detail "),
+                detail_at.starts_with("── detail "),
                 w >= SIDE_BY_SIDE_AT,
                 "{w}x{h}:\n{frame}"
             );
@@ -20810,11 +20922,14 @@ mod tests {
 
     /// Review item 6: a long poller back-off list pushes `totals …` out of
     /// the title onto the mode row, which then ends with the totals text,
-    /// carries its own `│` right of the block, and cuts nothing.
+    /// carries its own `│` right of the block, and cuts nothing. Two
+    /// backed-off accounts since the title took the section rule's two-cell
+    /// lead: with three, the bare title alone now needs 181 columns, and at
+    /// 179 MAIN keeps the plain scheduler and detail panes instead.
     #[test]
     fn totals_ride_the_mode_row_when_the_title_is_full() {
         let (mut view, chrome) = recompose_view();
-        for n in [1, 2, 3] {
+        for n in [1, 2] {
             if let Some(health) = view.poll_health.get_mut(&rid("claude", n)) {
                 health.consecutive_failures = 3;
             }
@@ -21036,7 +21151,16 @@ mod tests {
     /// each entry two cells wider), dollars in the default colour over dim
     /// cents and a dim `$` instead of all green; every other cell unchanged
     /// (previous digest 7_483_902_083_238_678_069).
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
+    /// Re-pinned the same day for the section headings on twolab-tui's
+    /// `Rule`: the four rule rows in this frame (accounts, the band's top
+    /// border, models, activity) open with the rule's two-cell lead, so
+    /// each title reads `── accounts · …` (was ` accounts · …`), two cells
+    /// right; the band's ` detail ` (set past the widest band title) and
+    /// the strip legend move right with them, styles with their text, and
+    /// each row's closing fill is two cells shorter. Every row is still 179
+    /// cells, and every other cell is unchanged (previous digest
+    /// 11_040_274_043_730_846_167).
+    const FOLD_OFF_179X43_DIGEST: u64 = 1_964_428_486_266_220_399;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -21052,6 +21176,99 @@ mod tests {
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
         );
+    }
+
+    /// Section headings are twolab-tui rules: each opens with the rule's
+    /// two-cell lead and a space, then its title, and runs the whole width
+    /// — on MAIN at 80×24 (the accounts title clipped with `…`, never
+    /// silently) and at 179×43, where the band's top border opens the same
+    /// way.
+    #[test]
+    fn section_headings_are_rules_with_a_lead_across_the_width() {
+        let (view, chrome) = recompose_view();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let mut headings = vec![
+                row_of(&rows, " accounts · sort "),
+                row_of(&rows, " activity — "),
+            ];
+            if w == 179 {
+                headings.push(row_of(&rows, " scheduler · poller "));
+                headings.push(row_of(&rows, " models — top "));
+            }
+            for y in headings {
+                assert!(rows[y].starts_with("── "), "{w}x{h} row {y}:\n{frame}");
+                assert_eq!(cells::width(&rows[y]), usize::from(w), "{w}x{h} row {y}");
+                assert!(!rows[y].trim_end().is_empty(), "{w}x{h} row {y}");
+            }
+            // The rule clips a title too long for its row with `…`.
+            let accounts = &rows[row_of(&rows, " accounts · sort ")];
+            if w == 80 {
+                assert!(accounts.contains('…'), "{accounts}");
+            }
+        }
+        // The strip's legend starts past the title as the rule draws it.
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let models = &rows[row_of(&rows, " models — top ")];
+        assert!(
+            models.contains("(g: all) ── group · model · share"),
+            "{models}"
+        );
+    }
+
+    /// `LLMUX_AMBIGUOUS_WIDE=1` (`Chrome::ambiguous_wide`): on MAIN and on
+    /// every overlay with section headings, each rule draws ASCII `-` for
+    /// `─` and, measured as a terminal that draws East-Asian Ambiguous
+    /// glyphs two cells wide, ends at the right edge (its title's own `·`
+    /// and `—` included). Rows that are not rules draw exactly as before.
+    #[test]
+    fn ambiguous_wide_rules_draw_ascii_and_end_at_the_edge() {
+        use unicode_width::UnicodeWidthStr;
+        let (view, mut chrome) = recompose_view();
+        let surfaces = [
+            (Overlay::None, 80u16, 24u16),
+            (Overlay::None, 179, 43),
+            (Overlay::Accounts, 100, 30),
+            (Overlay::Stats, 100, 30),
+            (Overlay::Usage, 100, 30),
+            (Overlay::Sessions, 100, 30),
+            (Overlay::Perf, 100, 30),
+            (Overlay::Misc, 100, 30),
+            (Overlay::Config, 100, 30),
+        ];
+        for (overlay, w, h) in surfaces {
+            chrome.overlay = overlay;
+            chrome.ambiguous_wide = false;
+            let narrow = render_rows(&view, &chrome, w, h);
+            chrome.ambiguous_wide = true;
+            let wide = render_rows(&view, &chrome, w, h);
+            let frame = wide.join("\n");
+            let rules: Vec<usize> = (0..narrow.len())
+                .filter(|&y| narrow[y].starts_with("── "))
+                .collect();
+            assert!(
+                !rules.is_empty(),
+                "{overlay:?} {w}x{h} has a rule:\n{frame}"
+            );
+            for (y, (before, after)) in narrow.iter().zip(&wide).enumerate() {
+                if !rules.contains(&y) {
+                    assert_eq!(before, after, "{overlay:?} {w}x{h} row {y}");
+                    continue;
+                }
+                assert!(after.starts_with("-- "), "{overlay:?} row {y}:\n{frame}");
+                assert!(!after.contains('─'), "{overlay:?} row {y}: {after}");
+                assert!(
+                    after.trim_end().width_cjk() <= usize::from(w),
+                    "{overlay:?} {w}x{h} row {y} overflows a wide terminal: {after}"
+                );
+                let word = |row: &str| {
+                    let title: String = row.chars().skip(3).collect();
+                    title.split(' ').next().map(str::to_string)
+                };
+                assert_eq!(word(before), word(after), "{overlay:?} row {y}");
+            }
+        }
     }
 
     /// The backend group of fixture account `n`.

@@ -52,7 +52,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
 | meter | llmux | the original of the crate's meter | no visible change; moving it re-pins the 179×43 frame digest for every account row | later |
 | packed_grid | llmux | the original, twice (fold and models strip) | one packer and click rects per strip entry; largest digest change | later |
-| rule | fx | 28 section rules drawn as block borders | only differs on CJK-wide terminals; needs a host setting first | later |
+| rule | fx | 28 section rules drawn as block borders | every section heading is a library rule (`── accounts ──`); with `LLMUX_AMBIGUOUS_WIDE=1` the rules draw ASCII `-` and end at the right edge on a terminal that draws `─` two cells wide | done |
 | shimmer | Codex | loading labels are plain text | cosmetic | later |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
