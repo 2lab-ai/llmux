@@ -305,9 +305,10 @@ pub(crate) fn draw(
         }
     }
 
-    // A confirm gate (remove / reset / config) stands on the footer, over
-    // whichever surface opened it.
+    // A confirm gate (remove / reset / config) or the new-login picker
+    // stands on the footer, over whichever surface opened it.
     draw_gate(frame, view, &ctx, chrome);
+    draw_login_picker(frame, chrome);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -3135,12 +3136,6 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
     ]
 }
 
-/// Number of rows the config editor shows — the key handler clamps its
-/// cursor with this (rows are static per view shape).
-pub(crate) fn config_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
-    config_rows(view, chrome).len()
-}
-
 /// What the editor shows as the value of `action`'s row — the "old" side of
 /// the confirm gate's `old → new`.
 pub(crate) fn config_row_value(
@@ -3163,11 +3158,217 @@ pub(crate) fn config_row_action(
     config_rows(view, chrome).get(idx).and_then(|r| r.action)
 }
 
+/// Widest the config editor's value column gets; a longer value ends in `…`.
+const CFG_VALUE_MAX: usize = 24;
+/// Cells in front of a config row's name: the cursor glyph and its space.
+const CFG_CURSOR_CELLS: usize = 2;
+/// What the editor's list shows below its rows: what the state tags mean.
+const CFG_LEGEND: &str =
+    "live = applies now · restart = next daemon start · session = this TUI only";
+
+/// The row the config cursor rests on: `cursor`, or the next editable row
+/// (read-only rows are skipped), or the last editable one.
+fn config_rest(rows: &[CfgRow], cursor: usize) -> usize {
+    rows.iter()
+        .enumerate()
+        .skip(cursor)
+        .find(|(_, r)| r.action.is_some())
+        .or_else(|| rows.iter().enumerate().rfind(|(_, r)| r.action.is_some()))
+        .map_or(0, |(i, _)| i)
+}
+
+/// First row in view for a list of `max_rows` rows whose cursor rests on
+/// `rest`: the window [`select_at`] leaves — the cursor's row last once the
+/// list scrolls.
+fn config_window_start(rest: usize, max_rows: usize) -> usize {
+    rest.saturating_sub(max_rows.max(1) - 1)
+}
+
+/// The config editor's list (twolab-tui `select_list`): one item per schema
+/// row, the name a section column (shown on a section's first row and on the
+/// first row in view) plus the label, the description `value  state  note`
+/// in a column measured on the widest name — so a label never runs into its
+/// value. Read-only rows are the list's disabled rows: dim, marked
+/// `(disabled)` with the place the value is managed as the reason, and
+/// skipped by the cursor. One line per row; what does not fit ends in `…`.
+/// Built fresh for each draw and key, its cursor moved onto `rest`.
+fn config_list(
+    rows: &[CfgRow],
+    chrome: &Chrome,
+    rest: usize,
+    start: usize,
+    max_rows: usize,
+    width: u16,
+) -> twolab_tui::select_list::SelectList {
+    use twolab_tui::select_list::{RowDisplay, SelectItem, SelectList};
+    let names = config_names(rows, start);
+    let col = config_value_column(rows, &names, width);
+    let value_w = config_value_width(rows, col, width);
+    // Cells the description column has; unlimited when it moves under the
+    // list (the list clips that note itself).
+    let room = if col > 0 {
+        (width as usize).saturating_sub(col)
+    } else {
+        usize::MAX
+    };
+    let items = rows
+        .iter()
+        .zip(names)
+        .map(|(row, name)| {
+            let value = pad_cells(&row.value, value_w);
+            let Some(action) = row.action else {
+                // `{value} (disabled: {note})` lines its reason up with the
+                // state column of the editable rows.
+                let reason = if row.note.is_empty() {
+                    "read-only"
+                } else {
+                    row.note
+                };
+                return SelectItem::new(name)
+                    .description(format!("{value} "))
+                    .disabled(reason);
+            };
+            let state = match row.state {
+                CfgState::Live => "live",
+                CfgState::Restart => "restart",
+                CfgState::Session => "session",
+                CfgState::ReadOnly => "ro",
+            };
+            let mut desc = format!("{value}  {state:<7}").trim_end().to_string();
+            // A restart-only save this session: the value shown is still the
+            // EFFECTIVE boot value; the note carries the pending one.
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(saved) = chrome.config_saved.get(&action) {
+                notes.push(format!("saved: {saved} (restart)"));
+            }
+            if !row.note.is_empty() {
+                notes.push(row.note.to_string());
+            }
+            // The notes are cut with `…` where the column ends — never the
+            // state tag in front of them.
+            let left = room.saturating_sub(cells::width(&desc) + 2);
+            if !notes.is_empty() && left > 0 {
+                desc.push_str("  ");
+                desc.push_str(&cells::truncate(&notes.join("  "), left));
+            }
+            SelectItem::new(name).description(desc)
+        })
+        .collect();
+    let mut list = SelectList::new(items)
+        .numbered(false)
+        .row_display(RowDisplay::SingleLine)
+        .max_rows(max_rows)
+        .footer(Line::styled(CFG_LEGEND, dim()))
+        .theme(KEYBAR_THEME);
+    select_at(&mut list, rest);
+    list
+}
+
+/// Each config row's name: a section column — the section on its first row
+/// and on `start`, the first row in view; blank below — then the label.
+fn config_names(rows: &[CfgRow], start: usize) -> Vec<String> {
+    let section_w = rows
+        .iter()
+        .map(|r| cells::width(r.section))
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let first = i == 0 || i == start || rows[i - 1].section != row.section;
+            let section = if first { row.section } else { "" };
+            format!("{}  {}", pad_cells(section, section_w), row.label)
+        })
+        .collect()
+}
+
+/// The value column's width: the widest value, at most [`CFG_VALUE_MAX`],
+/// and narrower still when the column starting at `col` would otherwise
+/// leave no room for the state tag after it (`restart`, 7 cells).
+fn config_value_width(rows: &[CfgRow], col: usize, width: u16) -> usize {
+    let widest = rows
+        .iter()
+        .map(|r| cells::width(&r.value))
+        .max()
+        .unwrap_or(0)
+        .min(CFG_VALUE_MAX);
+    if col == 0 {
+        return widest;
+    }
+    widest.min((width as usize).saturating_sub(col + 2 + 7).max(4))
+}
+
+/// Where the select list puts its description (value) column in `width`
+/// cells — its own rule (library gap: the list does not report it): two cells
+/// past the widest cursor + name + ` (disabled)`, at most 70 % of the width,
+/// and 0 (descriptions move under the list) when fewer than 20 cells would be
+/// left for it. Pinned against the rendered frame by the config tests.
+fn config_value_column(rows: &[CfgRow], names: &[String], width: u16) -> usize {
+    let width = width as usize;
+    if width <= 1 {
+        return 0;
+    }
+    let widest = rows
+        .iter()
+        .zip(names)
+        .map(|(row, name)| {
+            CFG_CURSOR_CELLS
+                + cells::width(name)
+                + if row.action.is_none() {
+                    cells::width(" (disabled)")
+                } else {
+                    0
+                }
+        })
+        .max()
+        .unwrap_or(0);
+    let col = (widest + 2).min((width - 1).min((width * 70 / 100).max(1)));
+    if width.saturating_sub(col) < 20 {
+        0
+    } else {
+        col
+    }
+}
+
+/// Where the cursor of the config editor goes after `key` from
+/// `chrome.config_cursor`: the list's own movement (read-only rows skipped,
+/// PgUp/PgDn/Home/End), stopping at the ends instead of wrapping.
+pub(crate) fn config_cursor_after(
+    view: &DashboardView,
+    chrome: &Chrome,
+    key: twolab_tui::KeyInput,
+) -> usize {
+    let rows = config_rows(view, chrome);
+    let rest = config_rest(&rows, chrome.config_cursor);
+    let mut list = config_list(
+        &rows,
+        chrome,
+        rest,
+        0,
+        twolab_tui::select_list::DEFAULT_MAX_ROWS,
+        u16::MAX,
+    );
+    list.key(key);
+    let now = list.selected().unwrap_or(rest);
+    let wrapped = match key.key {
+        twolab_tui::Key::Up => now > rest,
+        twolab_tui::Key::Down => now < rest,
+        _ => false,
+    };
+    if wrapped {
+        rest
+    } else {
+        now
+    }
+}
+
 /// Config overlay (`c`) — the config EDITOR (config-editor v1, trinity
 /// contract C6): every schema field listed with an honest apply-state label;
 /// editable rows activate on Enter or a click on the value cell. `live` =
 /// applies now (holder-backed), `restart` = persisted, effective next start,
 /// `session` = this TUI only, read-only rows say where the value is managed.
+/// The rows are a twolab-tui `select_list` ([`config_list`]): when they do
+/// not all fit, `▴`/`▾` and `N of M` say so.
 fn draw_config_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -3177,136 +3378,71 @@ fn draw_config_overlay(
 ) {
     frame.render_widget(Clear, area);
     let rows = config_rows(view, chrome);
-    let cursor = chrome.config_cursor.min(rows.len().saturating_sub(1));
-    // Reserve the last two rows for the edit/confirm prompt line + padding.
-    let body_h = area.height.saturating_sub(3) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" config — Enter/click value edits · read-only rows are skipped ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The edit prompt takes the last two rows while a value is being typed.
+    let editing = match chrome.mode {
+        Mode::ConfigEdit { action } => Some(action),
+        _ => None,
+    };
+    let list_area = Rect {
+        height: inner
+            .height
+            .saturating_sub(if editing.is_some() { 2 } else { 0 }),
+        ..inner
+    };
+    // The list's frame: a spacer row above and below the rows (`▴` / `▾`,
+    // `N of M`) and the legend line under them.
+    let max_rows = usize::from(list_area.height.saturating_sub(3)).max(1);
+    let rest = config_rest(&rows, chrome.config_cursor);
+    let start = config_window_start(rest, max_rows);
+    let list = config_list(&rows, chrome, rest, start, max_rows, list_area.width);
+    frame.render_widget(&list, list_area);
+
+    // Record each visible editable row's VALUE cell as its click target
+    // (contract: click the control, not the whole row). The rows sit one per
+    // line under the top spacer, from `start`.
+    let col = config_value_column(&rows, &config_names(&rows, start), list_area.width);
     let mut hit_rows: Vec<ConfigHit> = Vec::new();
-    let mut last_section = "";
-    // Build (section header + row) lines, tracking which screen line each row
-    // lands on for the hit list; scroll so the cursor stays visible.
-    let mut row_lines: Vec<(usize, Option<usize>)> = Vec::new(); // (line idx, row idx)
-    for (i, row) in rows.iter().enumerate() {
-        if row.section != last_section {
-            last_section = row.section;
-            row_lines.push((row_lines.len(), None));
-        }
-        row_lines.push((row_lines.len(), Some(i)));
-    }
-    // Find the cursor's line to derive scroll.
-    let cursor_line = row_lines
-        .iter()
-        .find(|(_, r)| *r == Some(cursor))
-        .map(|(l, _)| *l)
-        .unwrap_or(0);
-    let scroll = cursor_line.saturating_sub(body_h.saturating_sub(1));
-    for (line_idx, row_idx) in row_lines.iter().skip(scroll).take(body_h) {
-        match row_idx {
-            None => {
-                // Section header: derive from the first row at or after this line.
-                let section = rows
-                    .iter()
-                    .enumerate()
-                    .scan("", |prev, (_, r)| {
-                        let is_new = r.section != *prev;
-                        *prev = r.section;
-                        Some((is_new, r.section))
-                    })
-                    .filter(|(is_new, _)| *is_new)
-                    .map(|(_, s)| s)
-                    .nth(
-                        row_lines[..*line_idx]
-                            .iter()
-                            .filter(|(_, r)| r.is_none())
-                            .count(),
-                    )
-                    .unwrap_or("");
-                lines.push(Line::from(Span::styled(
-                    format!(" {section}"),
-                    dim().add_modifier(Modifier::BOLD),
-                )));
-            }
-            Some(i) => {
-                let row = &rows[*i];
-                let selected = *i == cursor;
-                let marker = if selected { "▸" } else { " " };
-                let (state_label, state_style) = match row.state {
-                    CfgState::Live => ("live", Style::new().fg(Color::Green)),
-                    CfgState::Restart => ("restart", Style::new().fg(Color::Yellow)),
-                    CfgState::Session => ("session", dim()),
-                    CfgState::ReadOnly => ("ro", dim()),
-                };
-                let value_style = if row.action.is_some() {
-                    if selected {
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new().fg(Color::Cyan)
-                    }
-                } else {
-                    dim()
-                };
-                let label_span = if selected {
-                    Span::styled(
-                        format!(" {marker} {:<18}", row.label),
-                        Style::new().add_modifier(Modifier::REVERSED),
-                    )
-                } else {
-                    Span::styled(format!(" {marker} {:<18}", row.label), dim())
-                };
-                let value_txt = pad_cells(&row.value, 28);
-                // Record the VALUE cell as the click target (contract: click
-                // the control, not the whole row).
-                if let Some(action) = row.action {
-                    let y = area.y + 1 + (lines.len() as u16);
-                    let x = area.x + 22;
-                    if y < area.bottom() {
-                        hit_rows.push(ConfigHit {
-                            area: Rect {
-                                x,
-                                y,
-                                width: 28,
-                                height: 1,
-                            },
-                            row: *i,
-                            action,
-                        });
-                    }
-                }
-                let mut spans = vec![
-                    label_span,
-                    Span::styled(value_txt, value_style),
-                    Span::styled(format!(" {state_label:<8}"), state_style),
-                ];
-                // A restart-only save this session: the value shown is still
-                // the EFFECTIVE boot value; the note carries the pending one.
-                if let Some(saved) = row.action.and_then(|a| chrome.config_saved.get(&a)) {
-                    spans.push(Span::styled(
-                        format!(" saved: {saved} (restart)"),
-                        Style::new().fg(Color::Yellow),
-                    ));
-                }
-                if !row.note.is_empty() {
-                    spans.push(Span::styled(format!(" {}", row.note), dim()));
-                }
-                lines.push(Line::from(spans));
+    if col > 0 && usize::from(list_area.height) >= max_rows + 3 {
+        let width = (config_value_width(&rows, col, list_area.width) as u16)
+            .min(list_area.width.saturating_sub(col as u16));
+        for (line, i) in (start..rows.len().min(start + max_rows)).enumerate() {
+            if let Some(action) = rows[i].action {
+                hit_rows.push(ConfigHit {
+                    area: Rect {
+                        x: list_area.x + col as u16,
+                        y: list_area.y + 1 + line as u16,
+                        width,
+                        height: 1,
+                    },
+                    row: i,
+                    action,
+                });
             }
         }
     }
     // Edit prompt line (config-editor v1). The confirm gate is the card
     // above the footer (`draw_gate`).
-    if let Mode::ConfigEdit { action } = chrome.mode {
+    if let Some(action) = editing {
         let hint = action.input_hint().unwrap_or("");
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
+        let prompt = Line::from(vec![
             Span::styled(" edit ", Style::new().fg(Color::Cyan)),
             Span::raw(format!("{}▏", chrome.config_input)),
             Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
-        ]));
+        ]);
+        frame.render_widget(
+            Paragraph::new(prompt),
+            Rect {
+                y: list_area.bottom() + 1,
+                height: 1,
+                ..inner
+            },
+        );
     }
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" config — Enter/click value edits · live|restart|session|ro ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
     if let Some(hits) = hits.as_mut() {
         hits.config_rows = hit_rows;
     }
@@ -10563,10 +10699,7 @@ fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &C
     let Some(gate) = gate_card(view, ctx, chrome) else {
         return;
     };
-    let full = frame.area();
-    // A card, not a sheet: on a wide terminal the surface beside it stays in
-    // view.
-    let width = full.width.min(GATE_MAX_WIDTH);
+    let width = card_width(frame.area());
     let [(yes, yes_keys), (no, no_keys)] = gate.options;
     let form = ChoiceForm::new(
         gate.question,
@@ -10580,31 +10713,104 @@ fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &C
     .hints(false)
     .theme(KEYBAR_THEME);
     let mut state = ChoiceState::at(gate.marked);
-    // Leave the header + tab rows and the two footer rows uncovered; a gate
-    // taller than that windows its options (`⋯ N more`) instead of cutting.
-    let room = full.height.saturating_sub(4);
-    let height = form
-        .height(&state, width.saturating_sub(2))
-        .saturating_add(2)
-        .min(room);
+    // A gate taller than the room windows its options (`⋯ N more`) instead
+    // of cutting them.
+    let body = form.height(&state, width.saturating_sub(2));
+    if let Some(inner) = footer_card(frame, body, gate.title, gate.color) {
+        frame.render_stateful_widget(&form, inner, &mut state);
+    }
+}
+
+/// Width of a card standing on the footer: a card, not a sheet — on a wide
+/// terminal the surface beside it stays in view.
+fn card_width(full: Rect) -> u16 {
+    full.width.min(GATE_MAX_WIDTH)
+}
+
+/// Clear and frame a card of `body` rows (plus its border) standing on the
+/// two footer rows, [`card_width`] wide, titled in `color`; the header and
+/// tab rows always stay uncovered. Returns the rect inside the border, or
+/// `None` when not even one row fits.
+fn footer_card(frame: &mut Frame, body: u16, title: &str, color: Color) -> Option<Rect> {
+    let full = frame.area();
+    let height = body.saturating_add(2).min(full.height.saturating_sub(4));
     if height < 3 {
-        return;
+        return None;
     }
     let area = Rect {
         x: full.x,
         y: full.bottom().saturating_sub(2 + height),
-        width,
+        width: card_width(full),
         height,
     };
-    let style = Style::new().fg(gate.color);
+    let style = Style::new().fg(color);
     let block = Block::bordered().border_style(style).title(Span::styled(
-        format!(" {} ", gate.title),
+        format!(" {title} "),
         style.add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    frame.render_stateful_widget(&form, inner, &mut state);
+    Some(inner)
+}
+
+/// Move a freshly built [`SelectList`](twolab_tui::select_list::SelectList)
+/// onto item `target` the way a person would — Down from the first enabled
+/// row — stopping at the first enabled row at or after it (or the last one).
+/// The list cannot be told its cursor (library gap), and a list moved down
+/// from the top scrolls the same way every time: the cursor's row is the
+/// window's last once it scrolls, which [`config_window_start`] relies on.
+fn select_at(list: &mut twolab_tui::select_list::SelectList, target: usize) {
+    use twolab_tui::{Key, KeyInput};
+    for _ in 0..list.items().len() {
+        let Some(at) = list.selected() else { return };
+        if at >= target {
+            return;
+        }
+        list.key(KeyInput::new(Key::Down));
+        if list.selected().is_some_and(|now| now <= at) {
+            // Wrapped past the last enabled row: step back onto it.
+            list.key(KeyInput::new(Key::Up));
+            return;
+        }
+    }
+}
+
+/// The new-login provider picker (twolab-tui `select_list`) with its cursor
+/// on `idx`: one row per provider, numbered `1.`–`5.`, with how its sign-in
+/// runs beside it. Built fresh from `Mode::NewLogin { idx }` for the draw
+/// and the keys alike, so the mode stays the one source of truth.
+pub(crate) fn login_list(idx: usize) -> twolab_tui::select_list::SelectList {
+    use twolab_tui::select_list::{RowDisplay, SelectItem, SelectList};
+    let items = super::LoginKind::ALL
+        .iter()
+        .map(|k| SelectItem::new(k.label()).description(k.flow()))
+        .collect();
+    let mut list = SelectList::new(items)
+        .row_display(RowDisplay::SingleLine)
+        .max_rows(super::LoginKind::ALL.len())
+        .footer(Line::styled(
+            "the sign-in runs in this client; the account is injected into the daemon",
+            dim(),
+        ))
+        .theme(KEYBAR_THEME);
+    select_at(&mut list, idx);
+    list
+}
+
+/// Draw the new-login picker as a card standing on the footer (the footer
+/// row lists its keys). It used to be one footer line that lost OpenRouter,
+/// Gemini and its own Enter/Esc off the right edge at 80 columns.
+fn draw_login_picker(frame: &mut Frame, chrome: &Chrome) {
+    use twolab_tui::render::Renderable;
+    let Mode::NewLogin { idx } = chrome.mode else {
+        return;
+    };
+    let list = login_list(idx);
+    let body = list.desired_height(card_width(frame.area()).saturating_sub(2));
+    if let Some(inner) = footer_card(frame, body, "new login", Color::Cyan) {
+        frame.render_widget(&list, inner);
+    }
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
@@ -10850,31 +11056,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             ],
             area.width,
         ),
-        Mode::NewLogin { idx } => {
-            // Provider picker: the cursor row is shown highlighted; Enter
-            // opens the browser for that provider.
-            let mut spans = vec![Span::raw(" new login — ")];
-            for (i, kind) in super::LoginKind::ALL.iter().enumerate() {
-                let label = kind.label();
-                if i == idx {
-                    spans.push(Span::styled(
-                        format!("[{label}]"),
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    spans.push(Span::styled(format!(" {label} "), dim()));
-                }
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::raw(" "));
-            spans.push(key("↑↓"));
-            spans.push(Span::raw(" pick  "));
-            spans.push(key("Enter"));
-            spans.push(Span::raw(" open  "));
-            spans.push(key("Esc"));
-            spans.push(Span::raw(" cancel"));
-            Line::from(spans)
-        }
+        // Provider picker: the rows are the card above (`draw_login_picker`);
+        // this bar lists its keys. Any other key cancels.
+        Mode::NewLogin { .. } => keybar(
+            Some("new login"),
+            &[
+                ("1-5", "pick"),
+                ("↑/k ↓/j", "move"),
+                ("Enter", "open browser"),
+                ("Esc", "cancel"),
+            ],
+            area.width,
+        ),
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
 }
@@ -16643,6 +16836,94 @@ mod tests {
             "a label-column click hits no control"
         );
     }
+    /// The new-login picker is one row per provider with its digit, and at
+    /// 80 columns nothing is off-screen — the old one-line footer lost
+    /// OpenRouter, Gemini and its own Enter/Esc keys past the right edge.
+    #[test]
+    fn new_login_picker_fits_80_columns() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::NewLogin { idx: 3 };
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        for (n, kind) in super::super::LoginKind::ALL.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(kind.label()))
+                .unwrap_or_else(|| panic!("{} missing:\n{frame}", kind.label()));
+            assert!(
+                row.contains(&format!("{}. {}", n + 1, kind.label())),
+                "{row}"
+            );
+            assert!(row.contains(kind.flow()), "the whole row fits: {row}");
+        }
+        assert!(frame.contains("› 4. OpenRouter"), "the cursor row: {frame}");
+        let footer = rows[rows.len() - 1].clone();
+        for hint in ["1-5 pick", "Enter open browser", "Esc cancel"] {
+            assert!(footer.contains(hint), "{footer}");
+        }
+    }
+
+    /// The config editor's value column is measured on the widest label, so
+    /// no label runs into its value (`per-account limitsper account` at 80
+    /// columns); every recorded click rect sits on its row's value; read-only
+    /// rows are marked; a list that scrolls says `N of M` with a `▾`; notes
+    /// that do not fit end in `…`.
+    #[test]
+    fn config_labels_never_touch_values() {
+        let view = view_with(Vec::new());
+        let chrome = chrome_overlay(Overlay::Config);
+        let rows = config_rows(&view, &chrome);
+        for (w, h) in [(80u16, 24u16), (120, 30), (179, 43)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            let mut hits = None;
+            let buf = terminal
+                .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+                .expect("draw")
+                .buffer
+                .clone();
+            let line = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+            let text = (0..h).map(line).collect::<Vec<_>>().join("\n");
+            assert!(!text.contains("limitsper"), "{text}");
+            let hits = hits.expect("main chrome").config_rows;
+            assert!(hits.len() > 3, "value cells recorded at {w}x{h}");
+            let col = hits[0].area.x;
+            assert!(hits.iter().all(|h| h.area.x == col), "one value column");
+            let (top, bottom) = (hits[0].area.y, hits[hits.len() - 1].area.y);
+            for y in top..=bottom {
+                assert_eq!(
+                    buf[(col - 1, y)].symbol(),
+                    " ",
+                    "a gap before the value column on row {y} at {w}x{h}:\n{text}"
+                );
+            }
+            for hit in &hits {
+                let value = &rows[hit.row].value;
+                let cell: String = (hit.area.x..hit.area.right())
+                    .map(|x| buf[(x, hit.area.y)].symbol())
+                    .collect();
+                let shown = cell.trim_end().trim_end_matches('…');
+                assert!(
+                    value.starts_with(shown),
+                    "the click rect of {:?} shows {cell:?}, not {value:?}",
+                    hit.action
+                );
+            }
+            assert!(text.contains("per-account limits (disabled)"), "{text}");
+            assert!(
+                text.contains(&format!(" of {}", rows.len())),
+                "position: {text}"
+            );
+            assert!(text.contains('▾'), "more below: {text}");
+        }
+        let narrow = render_rows(&view, &chrome, 80, 24);
+        assert!(
+            narrow.iter().any(|r| r.trim_end().ends_with('…')),
+            "a note that does not fit is cut with …:\n{}",
+            narrow.join("\n")
+        );
+    }
+
     #[test]
     fn tab_bar_renders_all_labels_and_marks_the_active_surface() {
         let view = view_with(Vec::new());
