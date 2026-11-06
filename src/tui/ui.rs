@@ -17,6 +17,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use twolab_tui::fact_table::{Fact, FactTable};
 use twolab_tui::meter::{Fill, Meter};
+use twolab_tui::packed_grid::{self, GridPlan, PackedGrid};
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
 use twolab_tui::trend_chart::{Series, TrendChart};
@@ -507,9 +508,11 @@ fn draw_main(
     draw_tabs_tail(frame, tabs_area, header_tail);
     let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
     draw_middle(frame, middle_area, view, &middle);
-    if strip_height > 0 {
-        draw_models_strip(frame, strip_area, view, ctx, now, strip);
-    }
+    let models_strip = if strip_height > 0 {
+        draw_models_strip(frame, strip_area, view, ctx, now, strip)
+    } else {
+        Vec::new()
+    };
     let activity = draw_activity(frame, activity_area, view, chrome, now);
     // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
     // pane above it. With no model strip the activity border resizes the
@@ -548,6 +551,7 @@ fn draw_main(
         tabs,
         separators,
         account_rows,
+        models_strip,
         menu,
         sessions_table: None,
         config_rows: Vec::new(),
@@ -5435,17 +5439,26 @@ fn draw_accounts_with(
     let table: Vec<usize> = (0..ctx.order.len())
         .filter(|pos| fold.is_none_or(|f| !f.members.contains(pos)))
         .collect();
+    // The fold block sits directly under the table's rows. It is drawn
+    // first — the rows are its own, the table below never reaches them — so
+    // the title can count the members it could not show.
+    let (fold_hits, fold_hidden) = match fold {
+        Some(fold) => {
+            let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
+            draw_fold(frame, area, top, fold)
+        }
+        None => (Vec::new(), 0),
+    };
     // The title carries the active within-group order (`o` toggles it), so the
     // operator never has to guess why two rows swapped — plus the per-group
     // account counts and, when the pane is shorter than the table, how many
     // accounts it cannot show (never a silent cut): hidden table rows, then
-    // the folded accounts on the fold lines below the pane's edge.
+    // the folded accounts the block could not show.
     let title = if snapshot.accounts.is_empty() {
         format!(" accounts · sort {} ", chrome.account_sort.label())
     } else {
         let lines = usize::from(area.height.saturating_sub(2));
-        let hidden = table.len().saturating_sub(lines)
-            + fold.map_or(0, |f| f.hidden(lines.saturating_sub(table.len())));
+        let hidden = table.len().saturating_sub(lines) + fold_hidden;
         accounts_title(
             chrome.account_sort.label(),
             view,
@@ -5560,10 +5573,7 @@ fn draw_accounts_with(
             display_idx: pos,
         })
         .collect();
-    if let Some(fold) = fold {
-        let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
-        hits.extend(draw_fold(frame, area, top, fold));
-    }
+    hits.extend(fold_hits);
     hits
 }
 
@@ -5743,9 +5753,6 @@ fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
     Row::new(cells)
 }
 
-/// Blank cells between two fold entries on one line.
-const FOLD_ENTRY_GAP: usize = 3;
-
 /// What MAIN's fold (`z`) does this frame — decided in [`draw_main`] and
 /// stated in the accounts title, so the toggle never claims a fold that did
 /// not happen.
@@ -5807,16 +5814,15 @@ struct FoldPlan {
     /// Display positions (`ctx.order` indices) of the folded accounts, in
     /// table order.
     members: Vec<usize>,
-    /// One entry per member, in table order: its table cells as fields.
-    entries: Vec<Vec<FoldField>>,
-    /// Index into `members` of the account under the cursor, if folded.
-    cursor: Option<usize>,
+    /// The block: one entry per member, in table order — its table cells as
+    /// fields under a dim header word each — packed by twolab-tui's
+    /// [`PackedGrid`], the entry under the cursor selected.
+    grid: PackedGrid<'static>,
     /// The status text every member shares, shown once in the accounts
     /// title; `None` = the statuses differ, each entry has its own field.
     shared_status: Option<String>,
-    /// Entries per line, and each entry column's field widths.
+    /// Entries per line.
     per_line: usize,
-    columns: Vec<Vec<usize>>,
 }
 
 impl FoldPlan {
@@ -5825,38 +5831,14 @@ impl FoldPlan {
     fn lines(&self) -> usize {
         1 + self.members.len().div_ceil(self.per_line)
     }
-
-    /// Members the block cannot show when only its first `lines` lines fit
-    /// the pane.
-    fn hidden(&self, lines: usize) -> usize {
-        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
-        self.members.len().saturating_sub(shown)
-    }
 }
 
-/// One field of a fold entry: the header word over it, its alignment and
-/// the table cell's text.
-struct FoldField {
-    header: &'static str,
-    right: bool,
-    spans: Vec<Span<'static>>,
-    /// The widest form a clock tick can give this field ([`FoldBounds`]);
-    /// 0 for a field only a poll or an event can change.
-    min: usize,
-}
-
-impl FoldField {
-    /// Cells the field's column must hold for this entry: the live text,
-    /// or its widest clock-driven form when that is wider — so a value
-    /// past that form (a 100-day countdown) widens the column, never cut.
-    fn width(&self) -> usize {
-        self.spans
-            .iter()
-            .map(Span::width)
-            .sum::<usize>()
-            .max(self.min)
-    }
-}
+/// One field of a fold entry: the header word over it, and the table
+/// cell's text as a grid field — right-aligned for the numbers, with the
+/// widest form a clock tick can give it ([`FoldBounds`]; 0 for a field only
+/// a poll or an event can change) as its `widest`, so a value past that
+/// form (a 100-day countdown) widens the column, never cut.
+type FoldField = (&'static str, packed_grid::Field<'static>);
 
 /// The widest form of each fold field the clock alone can change (rule B:
 /// a tick never moves the fold), formatted by the same code as the live
@@ -5917,15 +5899,13 @@ impl FoldBounds {
 /// colors kept, only the fill bar goes), and the status field is left out
 /// when the label column shows the status every member shares.
 fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<FoldField> {
-    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| FoldField {
-        header,
-        right,
-        spans,
-        min: 0,
+    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| {
+        let field = packed_grid::Field::new(spans);
+        (header, if right { field.right() } else { field })
     };
-    let bounded = |mut field: FoldField, min: usize| {
-        field.min = min;
-        field
+    let bounded = |(header, mut field): FoldField, min: usize| {
+        field.widest = min;
+        (header, field)
     };
     // Only a drawn gauge has a countdown that ticks; a bare state (`○ cold`,
     // `-`) changes on a poll.
@@ -5959,41 +5939,6 @@ fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<F
         fields.push(field("tok", false, vec![Span::raw(tokens)]));
     }
     fields
-}
-
-/// Field widths per entry column when `per_line` entries share a line:
-/// column `c` holds entries `c`, `c + per_line`, …, and each of its fields
-/// is as wide as its widest entry or its header.
-fn fold_columns(widths: &[Vec<usize>], headers: &[usize], per_line: usize) -> Vec<Vec<usize>> {
-    (0..per_line)
-        .map(|c| {
-            headers
-                .iter()
-                .enumerate()
-                .map(|(f, &header)| {
-                    widths
-                        .iter()
-                        .skip(c)
-                        .step_by(per_line)
-                        .map(|w| w[f])
-                        .max()
-                        .unwrap_or(0)
-                        .max(header)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Width of one entry: its fields and the one-cell gap between each pair.
-fn fold_entry_width(column: &[usize]) -> usize {
-    column.iter().sum::<usize>() + column.len().saturating_sub(1)
-}
-
-/// Width of a full fold line: the entries and the gaps between them.
-fn fold_line_width(columns: &[Vec<usize>]) -> usize {
-    columns.iter().map(|c| fold_entry_width(c)).sum::<usize>()
-        + FOLD_ENTRY_GAP * columns.len().saturating_sub(1)
 }
 
 /// The fold for this frame ([`Fold`]), planned with the table's own
@@ -6070,18 +6015,18 @@ fn fold_plan(
             fold_fields(parts, shared_status.is_none(), &bounds)
         })
         .collect();
-    let widths: Vec<Vec<usize>> = entries
-        .iter()
-        .map(|entry| entry.iter().map(FoldField::width).collect())
-        .collect();
-    let headers: Vec<usize> = entries[0]
-        .iter()
-        .map(|f| Line::from(f.header).width())
-        .collect();
-    let Some((per_line, columns)) = (1..=members.len()).rev().find_map(|per_line| {
-        let columns = fold_columns(&widths, &headers, per_line);
-        (fold_line_width(&columns) <= usize::from(width)).then_some((per_line, columns))
-    }) else {
+    let headers: Vec<&'static str> = entries[0].iter().map(|(header, _)| *header).collect();
+    // The cursor's entry is drawn the way the table draws the row under
+    // the cursor: reverse video (the theme's `selected`).
+    let grid = PackedGrid::new(
+        entries
+            .into_iter()
+            .map(|entry| entry.into_iter().map(|(_, field)| field).collect()),
+    )
+    .headers(headers)
+    .cursor(members.iter().position(|&pos| selected == Some(pos)))
+    .theme(KEYBAR_THEME);
+    let Some(GridPlan { per_line, .. }) = grid.plan(width) else {
         return Fold::TooNarrow;
     };
     // The fold never makes the pane taller (rule A): its header line plus
@@ -6090,115 +6035,43 @@ fn fold_plan(
         return Fold::SavesNoRow;
     }
     Fold::Applied(FoldPlan {
-        cursor: members.iter().position(|&pos| selected == Some(pos)),
         members,
-        entries,
+        grid,
         shared_status,
         per_line,
-        columns,
     })
 }
 
-/// Lay one entry's (or the header's) fields out at the column widths, a
-/// one-cell gap between fields; `reversed` paints the whole entry the way
-/// the table paints the row under the cursor.
-fn fold_cells(
-    fields: impl Iterator<Item = (Vec<Span<'static>>, bool)>,
-    widths: &[usize],
-    reversed: bool,
-) -> Vec<Span<'static>> {
-    let paint = |style: Style| {
-        if reversed {
-            style.add_modifier(Modifier::REVERSED)
-        } else {
-            style
-        }
+/// Draw the fold block from row `top` down, from the table's left column,
+/// and return a click target per drawn entry, mapped to its account's
+/// display position, and how many members it could not show. When the
+/// pane is too short for every line the block's last line says `+N more`
+/// (the accounts title counts them too); with no row left at all, every
+/// member is hidden.
+fn draw_fold(
+    frame: &mut Frame,
+    area: Rect,
+    top: u16,
+    fold: &FoldPlan,
+) -> (Vec<AccountRowHit>, usize) {
+    let block = Rect {
+        y: top,
+        height: area.bottom().saturating_sub(top),
+        ..area
     };
-    let blank = |n: usize| Span::styled(" ".repeat(n), paint(Style::new()));
-    let mut out = Vec::new();
-    for (f, ((spans, right), &width)) in fields.zip(widths).enumerate() {
-        if f > 0 {
-            out.push(blank(1));
-        }
-        let fill = width.saturating_sub(spans.iter().map(Span::width).sum());
-        if right && fill > 0 {
-            out.push(blank(fill));
-        }
-        out.extend(
-            spans
-                .into_iter()
-                .map(|span| Span::styled(span.content, paint(span.style))),
-        );
-        if !right && fill > 0 {
-            out.push(blank(fill));
-        }
+    if block.is_empty() {
+        return (Vec::new(), fold.members.len());
     }
-    out
-}
-
-/// Draw the fold block from row `top` down, from the table's left column
-/// (lines past the pane's bottom are cut, and counted in its title), and
-/// return a click target per visible entry, mapped to its account's display
-/// position.
-fn draw_fold(frame: &mut Frame, area: Rect, top: u16, fold: &FoldPlan) -> Vec<AccountRowHit> {
-    let gap = || Span::raw(" ".repeat(FOLD_ENTRY_GAP));
-    // Line 0: the dim field header over every entry column.
-    let mut header = Vec::new();
-    for (c, widths) in fold.columns.iter().enumerate() {
-        if c > 0 {
-            header.push(gap());
-        }
-        let fields = fold.entries[0]
-            .iter()
-            .map(|f| (vec![Span::styled(f.header, dim())], f.right));
-        header.extend(fold_cells(fields, widths, false));
-    }
-    let mut lines = vec![(Line::from(header), Vec::new())];
-    for (i, chunk) in fold.entries.chunks(fold.per_line).enumerate() {
-        let mut spans = Vec::new();
-        let mut x = 0;
-        let mut targets = Vec::new();
-        for (c, entry) in chunk.iter().enumerate() {
-            if c > 0 {
-                spans.push(gap());
-                x += FOLD_ENTRY_GAP;
-            }
-            let member = i * fold.per_line + c;
-            let fields = entry.iter().map(|f| (f.spans.clone(), f.right));
-            spans.extend(fold_cells(
-                fields,
-                &fold.columns[c],
-                fold.cursor == Some(member),
-            ));
-            let width = fold_entry_width(&fold.columns[c]);
-            targets.push((x, width, fold.members[member]));
-            x += width;
-        }
-        lines.push((Line::from(spans), targets));
-    }
-    let mut hits = Vec::new();
-    for (i, (line, targets)) in lines.into_iter().enumerate() {
-        let y = top.saturating_add(i as u16);
-        if y >= area.bottom() {
-            break;
-        }
-        let row = Rect {
-            y,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(Paragraph::new(line), row);
-        hits.extend(targets.into_iter().map(|(x, width, pos)| AccountRowHit {
-            area: Rect {
-                x: area.x.saturating_add(x as u16),
-                y,
-                width: width as u16,
-                height: 1,
-            },
-            display_idx: pos,
-        }));
-    }
-    hits
+    let drawn = fold.grid.render_layout(block, frame.buffer_mut());
+    let hits = drawn
+        .hits
+        .iter()
+        .map(|hit| AccountRowHit {
+            area: hit.rect,
+            display_idx: fold.members[hit.index],
+        })
+        .collect();
+    (hits, drawn.hidden)
 }
 
 /// Status column: active (green) / ready (default) / the concrete blocking
@@ -8202,6 +8075,9 @@ pub(crate) struct MainChrome {
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
+    /// The models strip's click targets this frame: one per drawn model
+    /// (packed entry or table row), `index` into `model_usage`.
+    pub models_strip: Vec<packed_grid::GridHit>,
     pub menu: Option<MenuChrome>,
     pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
@@ -9809,17 +9685,14 @@ fn model_label_spans(
     (group, name)
 }
 
-/// Fields of one packed models-strip entry: marker · group · model · share ·
-/// req · tok · $ · last.
-const STRIP_FIELDS: usize = 8;
-/// Spaces between two packed entries on one line.
-const STRIP_ENTRY_GAP: usize = 3;
+/// Cells the packed strip keeps left of its grid: the breathing room the
+/// marker's leading space gives the table's marker column. In the grid the
+/// marker is its glyph alone, one cell in every entry column, so the packer
+/// measures every column alike and the first entry still sits one cell in.
+const STRIP_MARGIN: u16 = 1;
 /// The dim column legend a packed strip carries in its border fill (the
 /// packed layout has no header row).
 const STRIP_LEGEND: &str = " group · model · share · req · tok · $ · last ";
-
-/// Display width of each [`STRIP_FIELDS`] field of one entry.
-type StripWidths = [usize; STRIP_FIELDS];
 
 /// The models strip's plan for one frame, decided once in [`draw_main`]:
 /// `per_line >= 2` packs that many entries per line under a one-row title
@@ -9843,88 +9716,84 @@ fn strip_last(m: &ModelUsageDoc, now: SystemTime) -> String {
     }
 }
 
-/// Widest `last` cell, for the packing decision: `N in-flight` with N at
-/// its type's widest (`ModelUsageDoc::in_flight` is a u32) — wider than any
-/// age (`compact_duration`, 6–7 cells), `now` or `—`. Rendering aligns on
-/// the live text; only the decision uses this, so the strip's height does
-/// not change when a model starts or stops running or its age ticks.
-fn strip_last_bound() -> usize {
-    format!("{} in-flight", u32::MAX).chars().count()
+/// Widest `last` cell: `N in-flight` with N at its type's widest
+/// (`ModelUsageDoc::in_flight` is a u32) — wider than any age
+/// (`compact_duration`, 6–7 cells), `now` or `—`. Every packed entry
+/// reserves it, so neither the strip's height nor any of its columns moves
+/// when a model starts or stops running or its age ticks.
+fn strip_last_widest() -> String {
+    format!("{} in-flight", u32::MAX)
 }
 
-/// [`strip_entry_widths`] with the time-driven `last` cell at its bound —
-/// what [`strip_plan`] decides on.
-fn strip_entry_bound(m: &ModelUsageDoc) -> StripWidths {
-    let mut widths = strip_entry_widths(m, UNIX_EPOCH);
-    widths[STRIP_FIELDS - 1] = strip_last_bound();
-    widths
-}
-
-/// Display width (terminal cells) of each field exactly as the packed strip
-/// renders it — the uppercase group word, the model name (wide CJK names
-/// count two cells per character), the counts.
-fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
-    let cells = |text: String| Line::from(text).width();
-    [
-        2,
-        cells(m.group.to_uppercase()),
-        cells(m.model.clone()),
-        MODEL_BAR_WIDTH,
-        cells(format::human_count(m.requests)),
-        cells(format::human_count(model_total(m))),
-        cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-            .line()
-            .width(),
-        cells(strip_last(m, now)),
+/// One packed models-strip entry as twolab-tui grid fields — marker ·
+/// group · model · share · req · tok · $ · last — each drawn as the table
+/// draws its cell. The marker drops its leading space ([`STRIP_MARGIN`]);
+/// the share bar reserves its full width (it reads `—` when no model has
+/// tokens) and `last` its widest form ([`strip_last_widest`]).
+fn strip_fields(
+    m: &ModelUsageDoc,
+    max_total: u64,
+    view: &DashboardView,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<packed_grid::Field<'static>> {
+    let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+    let (group, name) = model_label_spans(m, active, frame, view.tui_effects, view.gradient);
+    let marker = model_active_marker(m, now, frame);
+    let glyph: String = marker.content.chars().skip(1).collect();
+    let mut share = packed_grid::Field::new(
+        share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+            .style(group_color(Some(m.group.as_str())))
+            .spans(),
+    );
+    share.widest = MODEL_BAR_WIDTH;
+    vec![
+        packed_grid::Field::new(Span::styled(glyph, marker.style)),
+        packed_grid::Field::new(group),
+        packed_grid::Field::new(name),
+        share,
+        packed_grid::Field::new(format::human_count(m.requests)),
+        packed_grid::Field::new(format::human_count(model_total(m))),
+        packed_grid::Field::new(cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line()),
+        packed_grid::Field::new(Span::styled(strip_last(m, now), dim()))
+            .widest(&strip_last_widest()),
     ]
 }
 
-/// Per-column field maxima for `entries` laid out row-major, `per_line` to a
-/// line — every field aligns down its entry column. Past the first column
-/// the marker drops its leading breathing space (the entry gap already
-/// separates it), so it is one cell there.
-fn strip_columns(entries: &[StripWidths], per_line: usize) -> Vec<StripWidths> {
-    let mut columns = vec![[0; STRIP_FIELDS]; per_line.min(entries.len())];
-    for (i, entry) in entries.iter().enumerate() {
-        let column = &mut columns[i % per_line];
-        for (have, want) in column.iter_mut().zip(entry) {
-            *have = (*have).max(*want);
-        }
-    }
-    for column in columns.iter_mut().skip(1) {
-        column[0] = column[0].min(1);
-    }
-    columns
-}
-
-/// Width of one packed line: fields 1 space apart, entries
-/// [`STRIP_ENTRY_GAP`] apart.
-fn strip_line_width(columns: &[StripWidths]) -> usize {
-    columns
+/// The first `n` models as one entry each ([`strip_fields`]), in strip
+/// order — the share bars scaled to the busiest model of them all.
+fn strip_entries(
+    view: &DashboardView,
+    n: usize,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<Vec<packed_grid::Field<'static>>> {
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
+    view.model_usage
         .iter()
-        .map(|c| c.iter().sum::<usize>() + STRIP_FIELDS - 1)
-        .sum::<usize>()
-        + STRIP_ENTRY_GAP * columns.len().saturating_sub(1)
+        .take(n)
+        .map(|m| strip_fields(m, max_total, view, now, frame))
+        .collect()
 }
 
-/// Whether `entries`, `per_line` to a line, fit `width` without clipping.
-fn strip_fits(entries: &[StripWidths], per_line: usize, width: u16) -> bool {
-    strip_line_width(&strip_columns(entries, per_line)) <= usize::from(width)
-}
-
-/// Rule 4, pure: the largest entries-per-line count (2..=entries) whose
-/// packed line fits `width`; 1 (= today's table) when not even two fit.
-fn strip_per_line(entries: &[StripWidths], width: u16) -> usize {
-    (2..=entries.len())
-        .rev()
-        .find(|&k| strip_fits(entries, k, width))
-        .unwrap_or(1)
+/// Rule 4, pure: the most entries per line (two or more) whose aligned
+/// line fits `width` beside the margin — twolab-tui's packer; 1 (= today's
+/// table) when not even two fit.
+fn strip_per_line(widths: &[Vec<usize>], width: u16) -> usize {
+    packed_grid::per_line(
+        widths,
+        &[],
+        usize::from(width.saturating_sub(STRIP_MARGIN)),
+        2,
+    )
+    .unwrap_or(1)
 }
 
 /// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
 /// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
 /// entries fit a line. A drag override keeps its height; packing then
-/// shows as many entries as its lines hold.
+/// shows as many entries as its lines hold. Decided on the fields the grid
+/// draws, every clock-driven one at its widest form — so at a fixed clock.
 fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan {
     let total = view.model_usage.len();
     if total == 0 {
@@ -9934,7 +9803,10 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             height: 0,
         };
     }
-    let widths: Vec<StripWidths> = view.model_usage.iter().map(strip_entry_bound).collect();
+    let widths: Vec<Vec<usize>> = strip_entries(view, total, UNIX_EPOCH, 0)
+        .iter()
+        .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+        .collect();
     match drag.map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT)) {
         None => {
             let shown = total.min(MODEL_STRIP_ROWS);
@@ -9951,103 +9823,60 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             }
         }
         Some(height) => {
+            // The most entries the lines hold at k per line, for the
+            // largest k at which the packer puts at least k of them on a
+            // line — it may put more, which only leaves a line spare.
             let lines = usize::from(height - 1);
             (2..=total)
                 .rev()
-                .map(|k| (k, total.min(lines * k)))
-                .find(|&(k, shown)| strip_fits(&widths[..shown], k, width))
-                .map_or(
-                    StripPlan {
-                        shown: total.min(usize::from(height - 2)),
-                        per_line: 1,
-                        height,
-                    },
-                    |(per_line, shown)| StripPlan {
+                .find_map(|k| {
+                    let shown = total.min(lines * k);
+                    let per_line = strip_per_line(&widths[..shown], width);
+                    (per_line >= k).then_some(StripPlan {
                         shown,
                         per_line,
                         height,
-                    },
-                )
+                    })
+                })
+                .unwrap_or(StripPlan {
+                    shown: total.min(usize::from(height - 2)),
+                    per_line: 1,
+                    height,
+                })
         }
     }
 }
 
-/// Packed models strip: `plan.per_line` entries per line, row-major, every
-/// field aligned down its entry column; the title is today's, with the
-/// column legend in the border fill when it fits.
+/// Packed models strip on twolab-tui's [`PackedGrid`]: `plan.per_line`
+/// entries per line, row-major, every field aligned down its entry column;
+/// the title is today's, with the column legend in the border fill when it
+/// fits. Returns a click target per drawn entry, carrying its model's index
+/// in the strip order.
 fn draw_models_strip_packed(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     plan: StripPlan,
-) {
-    let now = ctx.now;
+) -> Vec<packed_grid::GridHit> {
     let per_line = plan.per_line.max(1);
     let shown = plan
         .shown
-        .min(usize::from(area.height.saturating_sub(1)) * per_line);
-    let entries = &view.model_usage[..shown.min(view.model_usage.len())];
-    let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
-    let columns = strip_columns(&widths, per_line);
-    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
-    let frame_n = ctx.frame;
-    let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
-        let w = Line::from(field.clone()).width();
-        spans.extend(field);
-        if width > w {
-            spans.push(Span::raw(" ".repeat(width - w)));
-        }
-    };
-    let lines: Vec<Line> = entries
-        .chunks(per_line)
-        .map(|line| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (j, m) in line.iter().enumerate() {
-                if j > 0 {
-                    spans.push(Span::raw(" ".repeat(STRIP_ENTRY_GAP)));
-                }
-                let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-                let (group, name) =
-                    model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
-                let marker = model_active_marker(m, now, frame_n);
-                let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
-                    vec![if j == 0 {
-                        marker
-                    } else {
-                        Span::styled(
-                            marker.content.chars().skip(1).collect::<String>(),
-                            marker.style,
-                        )
-                    }],
-                    vec![group],
-                    name,
-                    share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
-                        .style(group_color(Some(m.group.as_str())))
-                        .spans(),
-                    vec![Span::raw(format::human_count(m.requests))],
-                    vec![Span::raw(format::human_count(model_total(m)))],
-                    cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-                        .line()
-                        .spans,
-                    vec![Span::styled(strip_last(m, now), dim())],
-                ];
-                for (f, field) in fields.into_iter().enumerate() {
-                    if f > 0 {
-                        spans.push(Span::raw(" "));
-                    }
-                    pad(&mut spans, field, columns[j][f]);
-                }
-            }
-            Line::from(spans)
-        })
-        .collect();
+        .min(usize::from(area.height.saturating_sub(1)) * per_line)
+        .min(view.model_usage.len());
     let title = strip_title(view, shown);
     let title_w = Line::from(title.as_str()).width();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(title)),
-        area,
-    );
+    frame.render_widget(Block::new().borders(Borders::TOP).title(title), area);
+    let grid = PackedGrid::new(strip_entries(view, shown, ctx.now, ctx.frame))
+        .min_per_line(2)
+        .theme(KEYBAR_THEME);
+    let inner = Rect {
+        x: area.x.saturating_add(STRIP_MARGIN),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(STRIP_MARGIN),
+        height: area.height.saturating_sub(1),
+    };
+    let hits = grid.render_hits(inner, frame.buffer_mut());
     let legend_w = Line::from(STRIP_LEGEND).width();
     if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
         frame.render_widget(
@@ -10060,6 +9889,7 @@ fn draw_models_strip_packed(
             ),
         );
     }
+    hits
 }
 
 /// ` models — top N of M by tokens — {scope} (g: all) ` — shared by the
@@ -10081,6 +9911,8 @@ fn strip_title(view: &DashboardView, shown: usize) -> String {
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
 /// drop the bar so the column set stays readable (req29). A plan that packs
 /// two or more entries per line renders [`draw_models_strip_packed`].
+/// Returns a click target per drawn model — its entry, or its table row —
+/// carrying the model's index in the strip order.
 fn draw_models_strip(
     frame: &mut Frame,
     area: Rect,
@@ -10088,10 +9920,9 @@ fn draw_models_strip(
     ctx: &FrameCtx,
     now: SystemTime,
     plan: StripPlan,
-) {
+) -> Vec<packed_grid::GridHit> {
     if plan.per_line >= 2 {
-        draw_models_strip_packed(frame, area, view, ctx, plan);
-        return;
+        return draw_models_strip_packed(frame, area, view, ctx, plan);
     }
     // Fill the pane: rows follow the AREA height (border + header take 2), so
     // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
@@ -10170,6 +10001,17 @@ fn draw_models_strip(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
     frame.render_widget(table, area);
+    // Data row `i` sits under the title and the header row.
+    (0..shown)
+        .map(|index| packed_grid::GridHit {
+            rect: Rect {
+                y: area.y + 2 + index as u16,
+                height: 1,
+                ..area
+            },
+            index,
+        })
+        .collect()
 }
 
 /// Detailed model view body: the full scrollable table beside (or above) the
@@ -19488,6 +19330,62 @@ mod tests {
         );
     }
 
+    /// The packed strip on twolab-tui's packed grid: one click rect per
+    /// drawn entry, on the entry's own cells and carrying its model's
+    /// index; and the columns sit on the widest `last` form, so a model
+    /// starting to run (`12 in-flight` where `9s` was) moves no entry —
+    /// llmux's own packer aligned on the live text, and the second column
+    /// slid sideways.
+    #[test]
+    fn packed_strip_entries_are_clickable_and_never_slide() {
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let with_last = |in_flight: u32| {
+            let (mut view, chrome) = fold_view();
+            for m in &mut view.model_usage {
+                m.in_flight = in_flight;
+                m.last_used_ms = ms(now - Duration::from_secs(9));
+            }
+            (view, chrome)
+        };
+        let strip = |in_flight: u32| {
+            let (view, chrome) = with_last(in_flight);
+            let chrome = Chrome {
+                fold_exhausted: false,
+                ..chrome
+            };
+            let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+            (view, rows, hits.models_strip)
+        };
+        let (view, rows, quiet) = strip(0);
+        let frame = rows.join("\n");
+        let title = row_of(&rows, " models — top 5 of 6 ");
+        assert_eq!(quiet.len(), 5, "{frame}");
+        for hit in &quiet {
+            let row = &rows[usize::from(hit.rect.y)];
+            let cells: String = row
+                .chars()
+                .skip(usize::from(hit.rect.x))
+                .take(usize::from(hit.rect.width))
+                .collect();
+            let model = &view.model_usage[hit.index].model;
+            assert!(
+                cells.contains(model.as_str()),
+                "{model} in {cells:?}\n{frame}"
+            );
+            assert!(hit.rect.y > title as u16, "{frame}");
+        }
+        let indexes: Vec<usize> = quiet.iter().map(|h| h.index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
+        let (_, busy_rows, busy) = strip(12);
+        assert!(
+            busy_rows[title + 1].contains("12 in-flight"),
+            "{}",
+            busy_rows.join("\n")
+        );
+        assert_eq!(busy, quiet, "no entry moved");
+    }
+
     /// Index of the first row containing `needle`, with the frame in the
     /// panic message.
     fn row_of(rows: &[String], needle: &str) -> usize {
@@ -20327,14 +20225,24 @@ mod tests {
         );
     }
 
-    /// Rule 4, pure: the largest per-line count whose aligned line fits.
+    /// Rule 4, pure: the largest per-line count whose aligned line fits,
+    /// on twolab-tui's packer — the same breakpoints as llmux's own: the
+    /// marker is one cell in every column and the strip keeps one cell of
+    /// margin, where the first column's marker used to carry it.
     #[test]
     fn strip_per_line_packs_the_most_entries_that_fit() {
-        // 2+6+15+10+6+9+9+11 fields + 7 gaps = 75 cells; past the first
-        // column the marker is 1 cell, so a second entry adds 3 + 74.
-        let entry: StripWidths = [2, 6, 15, 10, 6, 9, 9, 11];
-        let five = [entry; 5];
-        assert_eq!(strip_line_width(&strip_columns(&five, 2)), 75 + 3 + 74);
+        // 1+6+15+10+6+9+9+11 fields + 7 gaps = 74 cells; a second entry
+        // adds 3 + 74, the margin 1.
+        let entry = vec![1, 6, 15, 10, 6, 9, 9, 11];
+        let five = vec![entry; 5];
+        let line = |widths: &[Vec<usize>], k: usize| {
+            GridPlan {
+                per_line: k,
+                columns: packed_grid::columns(widths, &[], k),
+            }
+            .line_width()
+        };
+        assert_eq!(usize::from(STRIP_MARGIN) + line(&five, 2), 1 + 74 + 3 + 74);
         assert_eq!(strip_per_line(&five, 179), 2);
         assert_eq!(strip_per_line(&five, 152), 2);
         assert_eq!(strip_per_line(&five, 151), 1, "below two → today's table");
@@ -20343,9 +20251,9 @@ mod tests {
         assert_eq!(strip_per_line(&five[..1], 400), 1, "one entry never packs");
         // Columns align per entry column: a long name in column 0 does not
         // widen column 1.
-        let mut long = five;
+        let mut long = five.clone();
         long[2][2] = 30;
-        let columns = strip_columns(&long, 2);
+        let columns = packed_grid::columns(&long, &[], 2);
         assert_eq!((columns[0][2], columns[1][2]), (30, 15));
     }
 
@@ -20782,7 +20690,17 @@ mod tests {
     /// fixture at 80×24 and with `t`, `u` or the fold on. The one change is
     /// off this frame: a cursor row's bar keeps its empty part un-reversed
     /// (`cursor_row_quota_bar_keeps_its_fill_visible`).
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
+    /// Re-pinned 2026-11-06 for the fold and the models strip on twolab-tui's
+    /// `packed_grid`: only the strip's two packed lines change. The second
+    /// entry column starts nine cells further right (`2 in-flight` then
+    /// fourteen spaces before `CLAUDE claude-opus-5`, was five): every entry
+    /// now reserves the widest `last` form, `4294967295 in-flight`, that the
+    /// packing decision already used, so a model starting or stopping never
+    /// slides the column; and the first entry's leading blank cell no longer
+    /// carries the marker's colour (the grid sits one cell in instead of the
+    /// marker carrying the space). Packing, heights and every other cell
+    /// unchanged (previous digest 11_040_274_043_730_846_167).
+    const FOLD_OFF_179X43_DIGEST: u64 = 5_918_267_090_182_877_317;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -21494,7 +21412,8 @@ mod tests {
                 .map(|h| (h.display_idx, h.area.x))
                 .collect();
             println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
-            Some((plan.per_line, plan.columns.clone(), starts))
+            let columns = plan.grid.plan(w).expect("the plan's width").columns;
+            Some((plan.per_line, columns, starts))
         };
         let (base_view, base_chrome) = live_view();
         for w in [fold_bound(&base_view, &base_chrome), 179, 250] {
@@ -21651,8 +21570,11 @@ mod tests {
     }
 
     /// The `+N more` count on a short terminal: table rows first, then the
-    /// fold block — N counts the hidden table rows plus the accounts on the
-    /// fold lines the pane cannot show.
+    /// fold block — N counts the hidden table rows plus the accounts the
+    /// block cannot show. The block (twolab-tui's packed grid) says it on
+    /// its own last line instead of stopping at the pane's edge, so that
+    /// line holds `+5 more` where the third entry line was cut (the title
+    /// read `+3 more` then).
     #[test]
     fn fold_on_a_short_terminal_counts_the_hidden_entries() {
         let (view, chrome) = live_view();
@@ -21662,12 +21584,13 @@ mod tests {
         let band = row_of(&rows, " scheduler · poller ");
         assert_eq!(band - accounts, 18, "{frame}");
         assert!(
-            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +3 more "),
+            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +5 more "),
             "{frame}"
         );
         assert!(rows[accounts + 14].starts_with("   group "), "{frame}");
-        assert!(rows[band - 1].contains(&fold_name(12)), "{frame}");
-        assert!(!frame.contains(&fold_name(14)), "{frame}");
+        assert!(rows[band - 2].contains(&fold_name(7)), "{frame}");
+        assert_eq!(rows[band - 1].trim_end(), "+5 more", "{frame}");
+        assert!(!frame.contains(&fold_name(11)), "{frame}");
     }
 
     /// Membership is recomputed every frame: an account whose 7d window
