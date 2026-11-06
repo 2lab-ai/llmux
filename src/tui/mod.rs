@@ -514,6 +514,13 @@ pub(crate) struct Chrome {
     /// Config-editor cursor row + the edit/confirm prompt text.
     pub config_cursor: usize,
     pub config_input: String,
+    /// The marked option of the config confirm gate (0 = apply, 1 = cancel):
+    /// Enter answers it, ↑↓ move it. The account gates (remove / reset) keep
+    /// their mark on Cancel, so Enter there never spends or deletes anything.
+    pub confirm_choice: usize,
+    /// The redemption this client still holds, if any — the reset gate names
+    /// it (and its request id) for as long as the gate is open.
+    pub reset_held: Option<PendingRedemption>,
     /// Restart-only values saved THIS session (action → new value): the row
     /// keeps showing the effective boot value, and this map drives an
     /// explicit "saved: X (restart)" note — pending must never masquerade
@@ -930,6 +937,8 @@ struct App {
     /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
     config_cursor: usize,
     config_input: String,
+    /// The marked option of the config confirm gate ([`Chrome::confirm_choice`]).
+    confirm_choice: usize,
     /// Pending confirmed settings request awaiting y/n (built at edit time so
     /// confirm applies EXACTLY what was validated).
     config_pending: Option<crate::proxy::server::SettingsRequest>,
@@ -1068,6 +1077,7 @@ impl App {
             account_sort: triage::AccountSort::default(),
             config_cursor: 0,
             config_input: String::new(),
+            confirm_choice: 0,
             config_pending: None,
             config_pending_value: None,
             config_saved: Default::default(),
@@ -1290,6 +1300,8 @@ impl App {
             account_sort: self.account_sort,
             config_cursor: self.config_cursor,
             config_input: self.config_input.clone(),
+            confirm_choice: self.confirm_choice,
+            reset_held: self.pending_redemption.clone(),
             config_saved: self.config_saved.clone(),
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
@@ -2843,11 +2855,13 @@ impl App {
         // Scheduler mode applies through its own live path
         // (toggle_scheduler_mode) — enter the confirm gate directly.
         if action == ui::ConfigAction::SchedMode {
-            self.config_input =
-                confirm_prompt(action, &crate::proxy::server::SettingsRequest::default());
+            self.open_config_confirm(
+                action,
+                &crate::proxy::server::SettingsRequest::default(),
+                view,
+            );
             self.config_pending = None;
             self.config_pending_value = None;
-            self.mode = Mode::ConfigConfirm { action };
             return;
         }
         // Toggle actions: build the request from the CURRENT view value.
@@ -2856,12 +2870,46 @@ impl App {
             return self.set_status("config: value unavailable".into());
         };
         if action.needs_confirm() {
-            self.config_input = confirm_prompt(action, &req);
+            self.open_config_confirm(action, &req, view);
             self.config_pending = Some(req);
-            self.mode = Mode::ConfigConfirm { action };
         } else {
             self.send_settings(req, None, view);
         }
+    }
+
+    /// Open the confirm gate for `req`: the question names the setting and
+    /// its current → new value, and the mark starts on Apply (Enter always
+    /// applied on this gate).
+    fn open_config_confirm(
+        &mut self,
+        action: ui::ConfigAction,
+        req: &crate::proxy::server::SettingsRequest,
+        view: Option<&DashboardView>,
+    ) {
+        let old = self.config_current_value(action, view);
+        self.config_input = confirm_prompt(action, req, &old, view);
+        self.confirm_choice = 0;
+        self.mode = Mode::ConfigConfirm { action };
+    }
+
+    /// The value a config row holds now, as the gate's "old" side: the value
+    /// saved this session (restart rows) when there is one, else what the
+    /// editor shows.
+    fn config_current_value(
+        &self,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) -> String {
+        let saved = self.config_saved.get(&action).cloned();
+        if action == ui::ConfigAction::RawIoRetention {
+            return saved
+                .and_then(|d| d.parse::<u64>().ok())
+                .or_else(|| view.map(|v| v.config_facts.raw_io_retention_days))
+                .map_or_else(|| "?".into(), retention_label);
+        }
+        saved
+            .or_else(|| view.and_then(|v| ui::config_row_value(v, &self.chrome(), action)))
+            .unwrap_or_else(|| "?".into())
     }
 
     /// Build the SettingsRequest a TOGGLE row produces (inverse of the
@@ -2942,10 +2990,9 @@ impl App {
                                 })
                             };
                         if needs {
-                            self.config_input = confirm_prompt(action, &req);
+                            self.open_config_confirm(action, &req, view);
                             self.config_pending = Some(req);
                             self.config_pending_value = Some(raw.trim().to_string());
-                            self.mode = Mode::ConfigConfirm { action };
                         } else {
                             self.send_settings(req, Some((action, raw.trim().to_string())), view);
                         }
@@ -2956,16 +3003,18 @@ impl App {
         }
     }
 
-    /// Keys on the confirm gate (Mode::ConfigConfirm): `y`/Enter applies the
-    /// pending request, anything declining cancels with no change.
+    /// Keys on the confirm gate (Mode::ConfigConfirm): `1` / `y` apply the
+    /// pending request, `2` / `n` / Esc cancel with no change, ↑↓ move the
+    /// mark and Enter answers it (Apply until moved — Enter always applied
+    /// here). Other keys do nothing.
     fn on_key_config_confirm(
         &mut self,
         code: KeyCode,
         action: ui::ConfigAction,
         view: Option<&DashboardView>,
     ) {
-        match code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+        match gate_answer(code, self.confirm_choice) {
+            GateAnswer::Confirm => {
                 self.config_input.clear();
                 self.mode = Mode::Normal;
                 if action == ui::ConfigAction::SchedMode {
@@ -2978,14 +3027,15 @@ impl App {
                     self.send_settings(req, origin, view);
                 }
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            GateAnswer::Cancel => {
                 self.config_input.clear();
                 self.config_pending = None;
                 self.config_pending_value = None;
                 self.mode = Mode::Normal;
                 self.set_status("config: cancelled".into());
             }
-            _ => {}
+            GateAnswer::Moved(choice) => self.confirm_choice = choice,
+            GateAnswer::Ignored => {}
         }
     }
 
@@ -3524,8 +3574,9 @@ impl App {
         ));
     }
 
-    /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `y`
-    /// redeems ONE reset, anything else closes the dialog.
+    /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `1` /
+    /// `y` redeems ONE reset, anything else — Enter included, the gate keeps
+    /// its mark on Cancel — closes the dialog.
     ///
     /// Closing is NOT abandoning: a redemption this client is still holding
     /// stays held (and the daemon keeps its own pending receipt), so reopening
@@ -3552,11 +3603,11 @@ impl App {
                 self.mode = Mode::ConfirmReset { idx };
                 self.set_reset_confirm_status(idx, view);
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            _ if gate_answer(code, ui::ACCOUNT_GATE_MARK) == GateAnswer::Confirm => {
                 self.submit_reset(idx, view);
                 self.mode = Mode::Normal;
             }
-            // Any other key (Esc/n/q/…) closes the dialog only.
+            // Any other key (Esc/n/2/Enter/q/…) closes the dialog only.
             _ => {
                 self.mode = Mode::Normal;
                 self.set_status(match self.pending_redemption.as_ref() {
@@ -4229,8 +4280,9 @@ impl App {
     }
 
     /// Key handling for `Mode::ConfirmRemove` — a destructive delete gate.
-    /// `y` confirms the removal; any other key cancels. Arrow/j/k move the
-    /// target row so the operator can pick which account to delete.
+    /// `1` / `y` confirm the removal; any other key (Enter included — the
+    /// gate keeps its mark on Cancel) cancels. Arrow/j/k move the target row
+    /// so the operator can pick which account to delete.
     fn on_key_confirm_remove(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
         let len = view.map_or(0, |v| v.snapshot.accounts.len());
         if len == 0 {
@@ -4249,11 +4301,11 @@ impl App {
                     idx: (idx + 1).min(len - 1),
                 };
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            _ if gate_answer(code, ui::ACCOUNT_GATE_MARK) == GateAnswer::Confirm => {
                 self.submit_remove(idx, view);
                 self.mode = Mode::Normal;
             }
-            // Any other key (Esc/n/q/…) cancels — delete is never silent.
+            // Any other key (Esc/n/2/Enter/q/…) cancels — delete is never silent.
             _ => {
                 self.mode = Mode::Normal;
                 self.set_status("remove cancelled".into());
@@ -4814,17 +4866,85 @@ pub(crate) fn reset_confirm_status(
     owned: Option<u64>,
     applicable: Option<u64>,
 ) -> String {
-    let inventory = match owned {
+    let inventory = reset_inventory(owned, applicable);
+    format!(
+        "redeem ONE rate-limit reset for {account}? ({inventory}) — y confirms, Esc cancels; \
+         this spends a reset upstream and cannot be undone"
+    )
+}
+
+/// An account's reset inventory as the gate and its status line say it.
+pub(crate) fn reset_inventory(owned: Option<u64>, applicable: Option<u64>) -> String {
+    match owned {
         None => "inventory unknown".to_string(),
         Some(owned) => match applicable {
             Some(applicable) => format!("{owned} owned · {applicable} applicable now"),
             None => format!("{owned} owned · applicable unknown"),
         },
+    }
+}
+
+/// A crossterm key as twolab-tui's [`KeyInput`](twolab_tui::KeyInput), the
+/// input every catalog widget takes. The handlers see only the key code
+/// (Ctrl-C is handled above them), so no modifiers are set. Written here
+/// rather than through the crate's `crossterm` feature, which would change
+/// the lockfiles of llmux and the three islands crates for ten lines.
+fn key_input(code: KeyCode) -> Option<twolab_tui::KeyInput> {
+    use twolab_tui::Key;
+    let key = match code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        _ => return None,
     };
-    format!(
-        "redeem ONE rate-limit reset for {account}? ({inventory}) — y confirms, Esc cancels; \
-         this spends a reset upstream and cannot be undone"
-    )
+    Some(twolab_tui::KeyInput::new(key))
+}
+
+/// What a key does on a two-option confirm gate (option 1 confirms, option 2
+/// cancels — the card drawn by `ui::draw_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAnswer {
+    Confirm,
+    Cancel,
+    /// ↑↓ / Tab moved the mark to this option.
+    Moved(usize),
+    Ignored,
+}
+
+/// Run `code` through the gate's [`ChoiceForm`](twolab_tui::choice_form::ChoiceForm)
+/// with option `marked` marked: digits answer at once, Enter answers the
+/// marked option, Esc cancels, ↑↓ / Tab move the mark. `y` and `n` stay as
+/// aliases for options 1 and 2 (the keys these gates always had).
+fn gate_answer(code: KeyCode, marked: usize) -> GateAnswer {
+    use twolab_tui::choice_form::{ChoiceAnswer, ChoiceEvent, ChoiceForm, ChoiceState};
+    match code {
+        KeyCode::Char('y' | 'Y') => return GateAnswer::Confirm,
+        KeyCode::Char('n' | 'N') => return GateAnswer::Cancel,
+        _ => {}
+    }
+    let Some(key) = key_input(code) else {
+        return GateAnswer::Ignored;
+    };
+    let form = ChoiceForm::new("", ["confirm", "cancel"]).no_other();
+    let mut state = ChoiceState::at(marked);
+    match form.key(&mut state, key) {
+        ChoiceEvent::Answered(ChoiceAnswer::Option(0)) => GateAnswer::Confirm,
+        ChoiceEvent::Answered(_) | ChoiceEvent::Cancelled => GateAnswer::Cancel,
+        ChoiceEvent::Moved => GateAnswer::Moved(state.selected()),
+        ChoiceEvent::Edited | ChoiceEvent::Ignored => GateAnswer::Ignored,
+    }
 }
 
 /// Map a daemon-side control error onto a client outcome. The two errors that
@@ -5889,35 +6009,93 @@ fn settings_status(applied: &[&str], restart: &[&str]) -> String {
     }
 }
 
-/// The y/n confirm prompt for a blast-radius change.
-fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::SettingsRequest) -> String {
+/// Raw-io retention in days as the confirm gate says it.
+fn retention_label(days: u64) -> String {
+    if days == 0 {
+        "keep forever".into()
+    } else {
+        format!("{days}d")
+    }
+}
+
+/// The confirm gate's question for a blast-radius config change: the
+/// setting, its current value `old` → the new one, and what applying it
+/// does — on two lines, so the card keeps the consequence in view.
+fn confirm_prompt(
+    action: ui::ConfigAction,
+    req: &crate::proxy::server::SettingsRequest,
+    old: &str,
+    view: Option<&DashboardView>,
+) -> String {
     use ui::ConfigAction as A;
-    match action {
-        A::SchedMode => "flip scheduler mode (live scheduling policy)?".into(),
-        A::RoutingEnabled => format!(
-            "set routing.enabled = {} (reroutes LIVE traffic)?",
-            req.routing_enabled.unwrap_or_default()
-        ),
-        A::RawIoEnabled => format!(
-            "set raw-io capture = {} (writes FULL request/response payloads to disk)?",
-            req.raw_io_enabled.unwrap_or_default()
-        ),
-        A::Upstream => format!(
-            "set upstream = {} (restart required; wrong URL breaks ALL requests)?",
-            req.upstream.clone().unwrap_or_default()
-        ),
-        A::CodexUpstream => format!(
-            "set codex upstream = {} (restart required)?",
-            req.codex_upstream.clone().unwrap_or_default()
-        ),
-        A::Ceiling5h | A::Ceiling7d | A::CeilingFbl => {
-            "set a ceiling to 0% (locks that window's scheduling)?".into()
+    let onoff = |v: Option<bool>| if v.unwrap_or_default() { "on" } else { "off" };
+    let pct = |v: Option<f64>| format!("{:.0}%", v.unwrap_or_default() * 100.0);
+    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+    let (change, effect) = match action {
+        A::SchedMode => {
+            use crate::config::SchedulerMode;
+            let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
+            let next = match current {
+                SchedulerMode::Default => SchedulerMode::RoundRobin,
+                SchedulerMode::RoundRobin => SchedulerMode::Default,
+            };
+            (
+                format!(
+                    "Change scheduler mode: {} → {}?",
+                    current.label(),
+                    next.label()
+                ),
+                "It changes the live scheduling policy.".to_string(),
+            )
         }
-        A::RawIoRetention => format!(
-            "reduce raw-io retention to {}d (older history will be pruned)?",
-            req.raw_io_retention_days.unwrap_or_default()
+        A::RoutingEnabled => (
+            format!(
+                "Set routing.enabled: {old} → {}?",
+                onoff(req.routing_enabled)
+            ),
+            "It reroutes LIVE traffic.".to_string(),
         ),
-        _ => "apply this change?".into(),
+        A::RawIoEnabled => (
+            format!("Set raw-io capture: {old} → {}?", onoff(req.raw_io_enabled)),
+            if req.raw_io_enabled.unwrap_or_default() {
+                "It writes FULL request/response payloads to disk.".to_string()
+            } else {
+                "Request/response payloads stop being written to disk.".to_string()
+            },
+        ),
+        A::Upstream => (
+            format!("Set upstream: {old} → {}?", text(&req.upstream)),
+            "Restart required; a wrong URL breaks ALL requests.".to_string(),
+        ),
+        A::CodexUpstream => (
+            format!("Set codex upstream: {old} → {}?", text(&req.codex_upstream)),
+            "Restart required.".to_string(),
+        ),
+        A::Ceiling5h => (
+            format!("Set 5h ceiling: {old} → {}?", pct(req.five_hour_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::Ceiling7d => (
+            format!("Set 7d ceiling: {old} → {}?", pct(req.seven_day_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::CeilingFbl => (
+            format!("Set fbl ceiling: {old} → {}?", pct(req.fable_weekly_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::RawIoRetention => (
+            format!(
+                "Reduce raw-io retention: {old} → {}?",
+                retention_label(req.raw_io_retention_days.unwrap_or_default())
+            ),
+            "Older history will be pruned.".to_string(),
+        ),
+        _ => ("Apply this change?".to_string(), String::new()),
+    };
+    if effect.is_empty() {
+        change
+    } else {
+        format!("{change}\n{effect}")
     }
 }
 
@@ -8889,6 +9067,169 @@ mod tests {
             ControlOp::Reset { account, .. } => assert_eq!(account, "claude:a@x.com"),
             other => panic!("expected a redemption, got {other:?}"),
         }
+    }
+
+    /// Render the app's current frame as one string (the runtime's own draw
+    /// call, on a test backend).
+    fn render_app(app: &App, view: &DashboardView, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        let chrome = app.chrome();
+        let mut hits = None;
+        terminal
+            .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Age the status line past its TTL, as five seconds of waiting would.
+    fn expire_status(app: &mut App) {
+        if let Some((_, at)) = app.status.as_mut() {
+            *at = Instant::now()
+                .checked_sub(STATUS_TTL + Duration::from_secs(1))
+                .expect("monotonic clock far enough from its origin");
+        }
+        assert_eq!(app.status_line(), None, "the status line expired");
+    }
+
+    /// The reset gate names its account, the inventory and the numbered
+    /// choices for as long as it is open — after the five-second status line
+    /// is gone too (the bug: the footer then read a bare `redeem ONE reset?`).
+    #[test]
+    fn reset_gate_names_its_account_after_the_status_line_expires() {
+        let mut view = control_view();
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        let order = view.display_order(Default::default(), SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].id.0 == "codex:c@x.com")
+            .expect("codex row");
+        app.mode = Mode::ConfirmReset { idx: codex_pos };
+        expire_status(&mut app);
+        for (w, h) in [(80, 24), (179, 43)] {
+            let frame = render_app(&app, &view, w, h);
+            assert!(frame.contains("codex:c@x.com"), "{frame}");
+            assert!(frame.contains("Redeem ONE rate-limit reset"), "{frame}");
+            assert!(frame.contains("3 owned"), "{frame}");
+            assert!(frame.contains("1) Redeem one reset"), "{frame}");
+            assert!(
+                frame.contains("❯ 2) Cancel"),
+                "the mark rests on Cancel: {frame}"
+            );
+            assert!(frame.contains("1/y redeem"), "{frame}");
+        }
+        // A held redemption is named with its request id instead.
+        app.pending_redemption = Some(PendingRedemption {
+            account: "codex:c@x.com".into(),
+            request_id: "rid-7".into(),
+            credit_id: None,
+        });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("UNRESOLVED redemption"), "{frame}");
+        assert!(frame.contains("rid-7"), "{frame}");
+    }
+
+    /// The remove gate says WHICH account it deletes (it used to read
+    /// `remove selected?`), follows the cursor, and keeps "any other key
+    /// cancels": Enter and `2` cancel, only `1` / `y` remove.
+    #[test]
+    fn remove_gate_names_the_account_and_only_1_or_y_remove() {
+        let view = control_view();
+        let order = view.display_order(Default::default(), SystemTime::now());
+        let name = |idx: usize| view.snapshot.accounts[order[idx]].id.0.clone();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('r'), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains(&format!("Remove {}", name(0))), "{frame}");
+        app.on_key_confirm_remove(KeyCode::Down, 0, Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 1 });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains(&format!("Remove {}", name(1))), "{frame}");
+
+        for cancel in [
+            KeyCode::Enter,
+            KeyCode::Char('2'),
+            KeyCode::Tab,
+            KeyCode::Char('q'),
+        ] {
+            app.mode = Mode::ConfirmRemove { idx: 1 };
+            app.on_key_confirm_remove(cancel, 1, Some(&view));
+            assert_eq!(app.mode, Mode::Normal, "{cancel:?} closes the gate");
+            assert_eq!(
+                app.take_pending_remove(),
+                None,
+                "{cancel:?} removes nothing"
+            );
+        }
+        app.mode = Mode::ConfirmRemove { idx: 1 };
+        app.on_key_confirm_remove(KeyCode::Char('1'), 1, Some(&view));
+        assert_eq!(
+            app.take_pending_remove(),
+            Some(name(1)),
+            "1 removes the named account"
+        );
+    }
+
+    /// The config gate states the setting and its old → new value on the
+    /// card; ↑↓ move the mark, Enter answers it (Apply until moved), `2` and
+    /// `n` cancel.
+    #[test]
+    fn config_gate_states_old_and_new_and_enter_answers_the_mark() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.activate_config_action(ui::ConfigAction::RoutingEnabled, Some(&view));
+        assert!(
+            matches!(app.mode, Mode::ConfigConfirm { .. }),
+            "{:?}",
+            app.mode
+        );
+        expire_status(&mut app);
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("Set routing.enabled: off → on?"), "{frame}");
+        assert!(frame.contains("reroutes LIVE traffic"), "{frame}");
+        assert!(frame.contains("❯ 1) Apply"), "{frame}");
+
+        // Moving the mark to Cancel makes Enter cancel.
+        app.on_key_config_confirm(KeyCode::Down, ui::ConfigAction::RoutingEnabled, Some(&view));
+        assert_eq!(app.confirm_choice, 1);
+        assert!(render_app(&app, &view, 80, 24).contains("❯ 2) Cancel"));
+        app.on_key_config_confirm(
+            KeyCode::Enter,
+            ui::ConfigAction::RoutingEnabled,
+            Some(&view),
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.config_pending.is_none(),
+            "Enter on Cancel applies nothing"
+        );
+
+        // Reopening starts on Apply again; a ceiling driven to 0 names both values.
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "0".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, Some(&view));
+        assert_eq!(app.confirm_choice, 0);
+        let p = (view.select_params.five_hour_max * 100.0).round();
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(
+            frame.contains(&format!("Set 5h ceiling: {p}% → 0%?")),
+            "{frame}"
+        );
+        app.on_key_config_confirm(KeyCode::Char('2'), ui::ConfigAction::Ceiling5h, Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "2 cancels");
     }
 
     /// The redemption id is minted ONCE by the client and held before the
