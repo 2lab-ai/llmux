@@ -62,6 +62,22 @@ fn no_color() -> bool {
     *NO_COLOR.get_or_init(|| twolab_tui::Theme::from_env().is_mono())
 }
 
+/// Whether the terminal draws East-Asian Ambiguous glyphs two cells wide
+/// (common with Korean, Japanese and Chinese locales): `LLMUX_AMBIGUOUS_WIDE=1`
+/// when the process started. Then the dashboard's section rules use their
+/// ASCII fallback (`-- accounts ---`), because `─` would take two cells and
+/// push each rule past the right edge. Read once, like `NO_COLOR`.
+fn ambiguous_wide() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| ambiguous_wide_from(std::env::var_os("LLMUX_AMBIGUOUS_WIDE").as_deref()))
+}
+
+/// `LLMUX_AMBIGUOUS_WIDE`'s value as the setting: on for `1`, off for
+/// anything else (unset, empty, `0`).
+fn ambiguous_wide_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -675,6 +691,9 @@ pub(crate) struct Chrome {
     /// when closed. Like the input modal it stores only an identity; the body
     /// is rebuilt from the snapshot every frame.
     pub account_modal: Option<AccountModal>,
+    /// `LLMUX_AMBIGUOUS_WIDE=1` at startup: the terminal draws East-Asian
+    /// Ambiguous glyphs two cells wide, so section rules draw in ASCII.
+    pub ambiguous_wide: bool,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -1487,6 +1506,7 @@ impl App {
                 m
             }),
             account_modal: self.account_modal.clone(),
+            ambiguous_wide: ambiguous_wide(),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -6452,6 +6472,19 @@ fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String>
 
 #[cfg(test)]
 mod tests {
+    /// `LLMUX_AMBIGUOUS_WIDE=1` turns the ASCII rules on; unset, empty,
+    /// `0` or any other value leaves the box-drawn rules.
+    #[test]
+    fn ambiguous_wide_is_on_only_for_1() {
+        use std::ffi::OsStr;
+        let on = super::ambiguous_wide_from;
+        assert!(on(Some(OsStr::new("1"))));
+        for off in ["", "0", "true", " 1"] {
+            assert!(!on(Some(OsStr::new(off))), "{off:?}");
+        }
+        assert!(!on(None));
+    }
+
     #[test]
     fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
         let p = super::parse_limits_input;

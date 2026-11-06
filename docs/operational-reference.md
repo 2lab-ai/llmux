@@ -59,6 +59,19 @@ dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
 (errors, failures, a nearly spent window) is bold instead.
 
+Each pane and overlay section opens with a rule: two cells of `─`, its
+title, then `─` to the right edge (`── accounts · sort name · … ────`). A
+title too long for its row ends in `…`. The scheduler and detail band's top
+border opens the same way. Some terminals draw East-Asian Ambiguous glyphs
+two cells wide (a common setting with Korean, Japanese and Chinese locales).
+There `─` takes two cells, so a rule would run past the right edge. Start
+the dashboard with `LLMUX_AMBIGUOUS_WIDE=1` and the rules draw ASCII `-`
+instead (`-- accounts · sort name · … ----`). Each rule also stops a few
+cells short, by the extra cells its own `·` and `—` take there, so it ends
+at the right edge. Any other value, or none, keeps `─`. The dashboard reads
+the variable once when it starts, like `NO_COLOR`. It changes only the
+rules: table rows, gauges and the popups' box borders draw as before.
+
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
   and column header). Activity takes every row that is left, and at least 4
