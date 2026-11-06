@@ -296,6 +296,12 @@ request source, HTTP status when observed, safe OAuth reason, resulting auth
 state, and usage retry deadline / consecutive failures. The expanded detail pane (including MAIN)
 prioritizes the last permanent auth reason over a later usage-poll error.
 
+The account modal and the request-input modal size themselves to what they show (capped at
+80% of the screen) instead of always taking 80%. When the body is taller than the modal it
+scrolls with `↑↓`/`j k`, `PgUp`/`PgDn` and `Home`/`End` (or the mouse wheel), a scrollbar on the
+right shows where you are, and the bottom border says which rows are in view (`1-14 of 53`).
+Quota windows read as a bar with what is left and when it resets.
+
 `! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
 account; the history distinguishes an OAuth `invalid_grant` from other failures.
 `! auth X` means no HTTP status was available — it does not prove credentials
