@@ -807,9 +807,12 @@ pub(crate) struct RawModal {
     /// Index into the Ready content's tab list (2 or 4 tabs, UI-8); clamped
     /// at draw/use time so a stale index can never panic.
     pub tab: usize,
-    pub scroll: u16,
-    /// Horizontal pan in display cells (UI-8; clamped like `scroll`).
-    pub hscroll: u16,
+    /// First body row in view, in rows wrapped at the modal's width
+    /// (clamped by the frame that draws it).
+    pub scroll: usize,
+    /// The body view's cache across frames (measured rows, long lines
+    /// wrapped at the width) — one per opened modal.
+    pub view: ui::RawBodyView,
     /// Animation frame for the Loading spinner (advances with the shared tick).
     pub spin: usize,
     /// Action feedback ("copied … → pbcopy" / "saved → …"), shown in place of
@@ -1052,6 +1055,8 @@ struct App {
     /// payload-tab rects + top-right action buttons. Same record/read cycle
     /// as `activity_chrome`; empty while the modal is closed.
     raw_chrome: ui::RawModalChrome,
+    /// A press-drag-release on the raw viewer's body scrollbar.
+    raw_drag: twolab_tui::scrollbar::ScrollbarDrag,
     /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
     /// top-border row of a pane, dragging it resizes the pane ABOVE it.
     separator_chrome: Vec<ui::SeparatorHit>,
@@ -1239,6 +1244,7 @@ impl App {
             table_drag: Default::default(),
             config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
+            raw_drag: Default::default(),
             separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
@@ -1739,8 +1745,8 @@ impl App {
             return true;
         }
         // The raw viewer (UI-7) owns the mouse the same way when open; UI-8
-        // adds clickable payload tabs + the top-right action buttons and a
-        // horizontal wheel pan.
+        // adds clickable payload tabs + the top-right action buttons, and the
+        // body's scrollbar takes a press and a drag.
         if self.raw_modal.is_some() {
             let hit = |r: &ratatui::layout::Rect| {
                 mouse.column >= r.x
@@ -1762,14 +1768,32 @@ impl App {
                         .iter()
                         .find(|(_, r)| hit(r))
                         .map(|&(i, _)| i);
+                    let bar = self.raw_chrome.bar;
                     if let Some(btn) = button {
                         self.raw_modal_action(btn);
                     } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
                         modal.tab = idx;
                         modal.scroll = 0;
-                        modal.hscroll = 0;
+                    } else if let (Some(bar), Some(modal)) = (bar, self.raw_modal.as_mut()) {
+                        // The body's scrollbar: a press on the track jumps,
+                        // one on the thumb grabs it for the drag below.
+                        if let Some(top) =
+                            self.raw_drag
+                                .press(bar.pos, bar.track, mouse.column, mouse.row)
+                        {
+                            modal.scroll = top;
+                        }
                     }
                 }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let (Some(bar), Some(modal)) = (self.raw_chrome.bar, self.raw_modal.as_mut())
+                    {
+                        if let Some(top) = self.raw_drag.drag(bar.pos, bar.track, mouse.row) {
+                            modal.scroll = top;
+                        }
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.raw_drag.release(),
                 kind => {
                     if let Some(modal) = self.raw_modal.as_mut() {
                         match kind {
@@ -1778,12 +1802,6 @@ impl App {
                             }
                             MouseEventKind::ScrollDown => {
                                 modal.scroll = modal.scroll.saturating_add(3)
-                            }
-                            MouseEventKind::ScrollLeft => {
-                                modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN)
-                            }
-                            MouseEventKind::ScrollRight => {
-                                modal.hscroll = modal.hscroll.saturating_add(RAW_PAN)
                             }
                             _ => {}
                         }
@@ -2326,19 +2344,21 @@ impl App {
             title,
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: ui::RawBodyView::default(),
             spin: 0,
             flash: None,
             state,
         });
+        self.raw_drag.release();
     }
 
     /// Key handling while the raw viewer is open (UI-7/UI-8): Esc/q/Enter
-    /// close, ←/→/Tab/h/l walk the payload tabs (both offsets reset — tabs
-    /// have independent sizes), arrows/PgUp/PgDn/Home/End scroll, H/L pan
-    /// horizontally, and c/C/a/s/S fire the copy/curl/copy-all/save/save-all
-    /// actions (same as the top-right buttons). Everything else is swallowed
-    /// so nothing leaks beneath the modal.
+    /// close, ←/→/Tab/h/l walk the payload tabs (the scroll resets — tabs
+    /// have independent sizes), arrows/PgUp/PgDn/Home/End scroll (a page is
+    /// the view's height, from the last frame), and c/C/a/s/S fire the
+    /// copy/curl/copy-all/save/save-all actions (same as the top-right
+    /// buttons). Long lines wrap at the width, so nothing pans sideways.
+    /// Everything else is swallowed so nothing leaks beneath the modal.
     fn on_key_raw_modal(&mut self, code: KeyCode) {
         let Some(modal) = self.raw_modal.as_mut() else {
             return;
@@ -2347,26 +2367,26 @@ impl App {
             RawModalState::Ready(content) => content.tabs.len().max(1),
             _ => 1,
         };
+        let page = match self.raw_chrome.page {
+            0 => usize::from(MODAL_PAGE),
+            page => page,
+        };
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.raw_modal = None,
             KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
                 modal.tab = (modal.tab + 1) % tab_count;
                 modal.scroll = 0;
-                modal.hscroll = 0;
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 modal.tab = (modal.tab + tab_count - 1) % tab_count;
                 modal.scroll = 0;
-                modal.hscroll = 0;
             }
-            KeyCode::Char('H') => modal.hscroll = modal.hscroll.saturating_sub(RAW_PAN),
-            KeyCode::Char('L') => modal.hscroll = modal.hscroll.saturating_add(RAW_PAN),
             KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
-            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
-            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(page),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(page),
             KeyCode::Home => modal.scroll = 0,
-            KeyCode::End => modal.scroll = u16::MAX,
+            KeyCode::End => modal.scroll = usize::MAX,
             KeyCode::Char('c') => self.raw_modal_action(ui::RawButton::Copy),
             KeyCode::Char('C') => self.raw_modal_action(ui::RawButton::CopyCurl),
             KeyCode::Char('a') => self.raw_modal_action(ui::RawButton::CopyAll),
@@ -6060,12 +6080,11 @@ async fn event_loop(
                     None => app.account_modal = None,
                 }
             }
-            // Clamp the raw viewer's scroll offsets against what this frame
+            // Clamp the raw viewer's scroll offset against what this frame
             // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
             // clamp — the modal owns its content and never closes on aging.
             if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
-                modal.scroll = modal.scroll.min(raw.max_scroll.0);
-                modal.hscroll = modal.hscroll.min(raw.max_scroll.1);
+                modal.scroll = modal.scroll.min(raw.max_scroll);
             }
         }
     }
@@ -6179,9 +6198,6 @@ fn encode_query_value(value: &str) -> String {
 
 /// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
 const MODAL_PAGE: u16 = 10;
-
-/// Horizontal pan step for the raw viewer (UI-8), in display cells.
-const RAW_PAN: u16 = 8;
 
 /// Cap on queued (not-yet-dispatched) exports (UI-8). Single-flight dispatch
 /// already bounds concurrent work to one; this bounds the BACKLOG so a user
@@ -8053,6 +8069,10 @@ mod tests {
         let main = hits.unwrap_or_default();
         app.sessions_chrome = main.sessions_table;
         app.table_scroll = main.table_scroll;
+        app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
+        if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
+            modal.scroll = modal.scroll.min(raw.max_scroll);
+        }
         let buffer = terminal.backend().buffer().clone();
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
@@ -8147,6 +8167,100 @@ mod tests {
         assert_eq!(app.keys.scroll, 1);
         app.on_mouse(left(MouseEventKind::ScrollDown, 50, 10), Some(&view));
         assert_eq!(app.keys.scroll, 2, "the wheel scrolls like ↓");
+    }
+
+    /// The raw viewer's body scrolls by wrapped rows: PgDn moves a view's
+    /// height, a press low on its scrollbar jumps to the end and the same
+    /// press drags back to the top, and a click on a tab — at the rect the
+    /// strip drew — switches to it and starts at the top.
+    #[test]
+    fn raw_viewer_scrollbar_drags_and_tabs_click_where_drawn() {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let body = format!(r#"{{"content":"{}"}}"#, "ab".repeat(600));
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            None,
+            None,
+            None,
+            Some(200),
+            body.as_bytes(),
+            b"{}",
+            1 << 20,
+            None,
+            None,
+            None,
+        );
+        let content = ui::raw_content_from_record(
+            ui::RawGeneral {
+                lines: Vec::new(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                base_url: "http://localhost:3456".into(),
+            },
+            &record,
+        );
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: "raw".into(),
+            tab: 0,
+            scroll: 0,
+            view: Default::default(),
+            spin: 0,
+            flash: None,
+            state: RawModalState::Ready(std::sync::Arc::new(content)),
+        });
+        let view = empty_view();
+        draw_and_adopt(&mut app, &view, 80, 24);
+        let raw = app.raw_chrome.clone();
+        let bar = raw.bar.expect("1200 cells of string overflow 80x24");
+        let scroll = |app: &App| app.raw_modal.as_ref().map(|m| m.scroll);
+
+        app.on_key(press(KeyCode::PageDown), None);
+        assert_eq!(scroll(&app), Some(raw.page), "a page is the view's height");
+        app.on_key(press(KeyCode::PageUp), None);
+        assert_eq!(scroll(&app), Some(0));
+
+        let last = bar.track.bottom() - 1;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            None,
+        );
+        assert_eq!(
+            scroll(&app),
+            Some(raw.max_scroll),
+            "track click jumps to the end"
+        );
+        app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 3, 0), None);
+        assert_eq!(scroll(&app), Some(0), "the held thumb drags to the top");
+        app.on_mouse(left(MouseEventKind::Up(MouseButton::Left), 3, 0), None);
+        app.on_mouse(
+            left(MouseEventKind::Drag(MouseButton::Left), bar.track.x, last),
+            None,
+        );
+        assert_eq!(scroll(&app), Some(0), "released: no drag");
+
+        app.on_key(press(KeyCode::End), None);
+        draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(
+            scroll(&app),
+            Some(raw.max_scroll),
+            "End clamps to the last row"
+        );
+        let (index, rect) = raw.tabs[1];
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
+            None,
+        );
+        let modal = app.raw_modal.as_ref().expect("still open");
+        assert_eq!(
+            (modal.tab, modal.scroll),
+            (index, 0),
+            "Response, from the top"
+        );
     }
 
     /// The sessions table follows its cursor, so its scrollbar moves the
@@ -8819,24 +8933,24 @@ mod tests {
             title: "raw".into(),
             tab: 0,
             scroll: 3,
-            hscroll: 5,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
         });
-        // Tab advances and resets BOTH offsets (tabs have independent sizes).
+        // Tab advances and resets the scroll (tabs have independent sizes).
         app.on_key(press(KeyCode::Tab), None);
         let modal = app.raw_modal.as_ref().unwrap();
         assert_eq!(modal.tab, 1);
         assert_eq!(modal.scroll, 0);
-        assert_eq!(modal.hscroll, 0);
-        // ← wraps back around the 2-tab ring; H/L pan horizontally.
+        // ← wraps back around the 2-tab ring. Long lines wrap at the width,
+        // so H/L no longer pan: they are swallowed like any unbound key.
         app.on_key(press(KeyCode::Left), None);
         assert_eq!(app.raw_modal.as_ref().unwrap().tab, 0);
         app.on_key(press(KeyCode::Char('L')), None);
-        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, RAW_PAN);
         app.on_key(press(KeyCode::Char('H')), None);
-        assert_eq!(app.raw_modal.as_ref().unwrap().hscroll, 0);
+        let modal = app.raw_modal.as_ref().unwrap();
+        assert_eq!((modal.tab, modal.scroll), (0, 0), "H/L moved nothing");
         // Scroll keys move; unbound keys are swallowed beneath the modal.
         app.on_key(press(KeyCode::Down), None);
         assert_eq!(app.raw_modal.as_ref().unwrap().scroll, 1);
@@ -8864,7 +8978,7 @@ mod tests {
             title: String::new(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: RawModalState::Loading,
@@ -8901,7 +9015,7 @@ mod tests {
             title: String::new(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: RawModalState::Loading,
@@ -8983,7 +9097,7 @@ mod tests {
             tabs: vec![ui::RawTabContent {
                 label: "Request",
                 lines: Vec::new(),
-                width: 0,
+                long_lines: false,
                 body_text: "body".into(),
                 curl: "curl".into(),
             }],
@@ -8997,7 +9111,7 @@ mod tests {
             title: String::new(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
@@ -9042,7 +9156,7 @@ mod tests {
             tabs: vec![ui::RawTabContent {
                 label: "Request",
                 lines: Vec::new(),
-                width: 0,
+                long_lines: false,
                 body_text: "body".into(),
                 curl: "curl".into(),
             }],
@@ -9056,7 +9170,7 @@ mod tests {
             title: String::new(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: RawModalState::Ready(std::sync::Arc::new(content)),
