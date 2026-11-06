@@ -15,6 +15,7 @@ use ratatui::widgets::{
     Table, Wrap,
 };
 use ratatui::Frame;
+use twolab_tui::fact_table::{Fact, FactTable};
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
 use twolab_tui::trend_chart::{Series, TrendChart};
@@ -2673,42 +2674,32 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     use twolab_tui::key_hints::KeyHelp;
     frame.render_widget(Clear, area);
-    let bytes = |b: Option<u64>| match b {
-        Some(b) => format!("{}B", format::human_count(b)),
-        None => "—".into(),
-    };
+    let bytes = |b: Option<u64>| b.map(|b| format!("{}B", format::human_count(b)));
     let f = &view.config_facts;
-    let facts = vec![
-        Line::default(),
-        Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   llmux {} · daemon pid {} · port {} · up {}",
-            view.display_version(),
-            view.pid,
-            view.port,
-            format::countdown(view.uptime)
-        ))),
-        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   config {}",
-            view.config_path.clone().unwrap_or_else(|| "—".into())
-        ))),
-        Line::from(Span::raw(format!(
-            "   accounts {} · raw-io {} ({}) · activity log {}",
-            view.snapshot.accounts.len(),
-            if f.raw_io_enabled { "on" } else { "off" },
-            bytes(f.raw_io_bytes),
-            bytes(f.activity_log_bytes),
-        ))),
-    ];
+    // The build and daemon facts on a fact table: two columns when the pane
+    // holds them — the build on the left, the daemon on the right — figures
+    // right-aligned on their last digit, `—` for a size not measured yet.
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("llmux", view.display_version()),
+        Fact::new("daemon pid", view.pid.to_string()),
+        Fact::new("port", view.port.to_string()),
+        Fact::new("up", format::countdown(view.uptime)),
+        Fact::new("accounts", view.snapshot.accounts.len().to_string()),
+        Fact::new("raw-io", if f.raw_io_enabled { "on" } else { "off" }),
+        Fact::maybe("raw-io store", bytes(f.raw_io_bytes)),
+        Fact::maybe("activity log", bytes(f.activity_log_bytes)),
+    ]);
+    // A path, not a figure: its own row under the table.
+    let config = FactTable::new(KEYBAR_THEME).fact(Fact::maybe("config", view.config_path.clone()));
     let block = Block::new()
         .borders(Borders::TOP)
         .title(" misc — keys · build · daemon ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // The facts keep their rows at the bottom; the key grid takes the rest
-    // and, when it does not fit, ends in `… +N more` — never cut silently.
-    let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
+    // The facts keep their rows at the bottom (a blank row, the table, the
+    // config path); the key grid takes the rest and, when it does not fit,
+    // ends in `… +N more` — never cut silently.
+    let facts_h = (facts.height(inner.width) + 2).min(inner.height.saturating_sub(2));
     let help_area = Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(1),
@@ -2719,14 +2710,18 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
         help_area,
     );
-    frame.render_widget(
-        Paragraph::new(facts),
-        Rect {
-            y: help_area.bottom(),
-            height: facts_h,
-            ..inner
-        },
-    );
+    let [_, table_area, config_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(Rect {
+        y: help_area.bottom(),
+        height: facts_h,
+        ..inner
+    });
+    frame.render_widget(&facts, table_area);
+    frame.render_widget(&config, config_area);
 }
 
 /// One editable (or honestly-labeled read-only) config row's action
@@ -10475,24 +10470,6 @@ fn draw_model_detail(
             group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
         ),
         Span::styled(m.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" req   ", dim()),
-        Span::raw(format!("{} (", format::human_count(m.requests))),
-        Span::styled(
-            format!("{} ok", format::human_count(m.ok)),
-            Style::new().fg(Color::Green),
-        ),
-        Span::raw("/"),
-        Span::styled(
-            format!("{} err", format::human_count(m.errors)),
-            if m.errors > 0 {
-                Style::new().fg(Color::Red)
-            } else {
-                dim()
-            },
-        ),
-        Span::raw(")"),
         Span::styled(
             if m.in_flight > 0 {
                 format!(" · {} in-flight", m.in_flight)
@@ -10502,44 +10479,49 @@ fn draw_model_detail(
             Style::new().fg(Color::Cyan),
         ),
     ]));
+    // The counts on a fact table: requests and cost on the left, the four
+    // token classes on the right (one column under the other when the pane
+    // is too narrow), each figure right-aligned on its last digit. A cache
+    // class the upstream never reported, or a cost no rate prices, is `—` —
+    // never a made-up 0 (req9).
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("requests", format::human_count(m.requests)),
+        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(Color::Green)),
+        Fact::new("errors", format::human_count(m.errors)).style(if m.errors > 0 {
+            Style::new().fg(Color::Red)
+        } else {
+            dim()
+        }),
+        Fact::maybe("cost", model_cost(m).map(twolab_tui::fact_table::money)),
+        Fact::new("tokens in", format::human_count(m.tokens_in)),
+        Fact::new("tokens out", format::human_count(m.tokens_out)),
+        Fact::maybe("cache read", m.cache_read.map(format::human_count)),
+        Fact::maybe("cache write", m.cache_creation.map(format::human_count)),
+    ]);
+    lines.extend(facts.lines(area.width));
+    // The rest is text, its labels on the facts' indent.
+    let pad = " ".repeat(twolab_tui::fact_table::INDENT);
+    let label = |l: &str| Span::styled(format!("{pad}{l:<8}"), dim());
     lines.push(Line::from(vec![
-        Span::styled(" tok   ", dim()),
-        Span::raw(format!(
-            "in {} · out {}",
-            format::human_count(m.tokens_in),
-            format::human_count(m.tokens_out)
-        )),
-    ]));
-    // Cache split — explicit "—" when the upstream did not report it (req9),
-    // and a reminder that quota windows are account-level only (req27).
-    lines.push(Line::from(vec![
-        Span::styled(" cache ", dim()),
-        Span::raw(format!(
-            "read {} · creation {}",
-            opt_count(m.cache_read),
-            opt_count(m.cache_creation)
-        )),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" last  ", dim()),
+        label("last"),
         Span::raw(model_age_compact(m.last_used_ms, now)),
         Span::styled(" ago", dim()),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" effort", dim()),
-        Span::raw(format!(" {}", counts(&m.efforts))),
+        label("effort"),
+        Span::raw(counts(&m.efforts)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" route ", dim()),
+        label("route"),
         Span::raw(counts(&m.endpoints)),
     ]));
-    lines.push(Line::from(Span::styled(" accounts", dim())));
+    lines.push(Line::from(label("accounts")));
     if m.accounts.is_empty() {
-        lines.push(Line::from(Span::styled("   —", dim())));
+        lines.push(Line::from(Span::styled(format!("{pad}  —"), dim())));
     } else {
         for a in &m.accounts {
             lines.push(Line::from(vec![
-                Span::raw(format!("   {} ", masked_name(&a.name, ctx.mask))),
+                Span::raw(format!("{pad}  {} ", masked_name(&a.name, ctx.mask))),
                 Span::styled(
                     format!(
                         "{} req · in {}/out {}",
@@ -10555,7 +10537,7 @@ fn draw_model_detail(
     // Quota windows are an account/provider fact, never per-model (req27) — make
     // that explicit so the per-account list above isn't read as a model limit.
     lines.push(Line::from(Span::styled(
-        " quota is account-level (see accounts table)",
+        format!("{pad}quota is account-level (see accounts table)"),
         dim(),
     )));
 
@@ -12324,7 +12306,12 @@ mod tests {
         // and the daemon facts keep their rows.
         let small = render_rows(&view, &chrome, 80, 24).join("\n");
         assert!(small.contains("… +"), "{small}");
-        assert!(small.contains("accounts 2 · raw-io"), "{small}");
+        let facts = small
+            .lines()
+            .find(|r| r.contains("llmux  ") && r.contains("accounts"))
+            .unwrap_or_else(|| panic!("{small}"));
+        assert!(facts.trim_end().ends_with(" 2"), "{small}");
+        assert!(small.contains("raw-io "), "{small}");
     }
 
     /// The hand-built prompts are fitted like every other bar: on a narrow
@@ -13030,6 +13017,91 @@ mod tests {
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    /// The drill-down's counts were free text (`req 3.7k (3.7k ok/14 err)`,
+    /// `tok in 41.2M · out 6.9M`, `cache read 38.0M · creation —`), so no
+    /// figure lined up with another and the cost was not there. They are a
+    /// fact table now: requests and cost on the left, the four token classes
+    /// on the right, every figure right-aligned on its last digit, and `—`
+    /// for a class the upstream never reported.
+    #[test]
+    fn model_detail_counts_line_up_in_two_columns() {
+        let mut m = model_row("claude", "claude-opus-4-8", 41_200_000, 6_900_000);
+        m.requests = 3_665;
+        m.ok = 3_651;
+        m.errors = 14;
+        m.in_flight = 2;
+        m.cache_read = Some(38_000_000);
+        m.cache_creation = None;
+        m.cost_usd = 397.5;
+        let view = view_with(vec![m]);
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Stats), 179, 43);
+        let text = rows.join("\n");
+        let row = |label: &str| {
+            rows.iter()
+                .find(|r| r.contains(&format!("  {label}  ")))
+                .unwrap_or_else(|| panic!("{label}:\n{text}"))
+                .as_str()
+        };
+        // The column where `needle` ends on `row`, in cells.
+        let end = |row: &str, needle: &str| {
+            let at = row
+                .rfind(needle)
+                .unwrap_or_else(|| panic!("{needle}: {row}"));
+            cells::width(&row[..at]) + cells::width(needle)
+        };
+        // Two columns: each left fact shares its row with a token class.
+        assert!(row("requests").contains("tokens in"), "{text}");
+        assert!(row("ok").contains("tokens out"), "{text}");
+        assert!(row("errors").contains("cache read"), "{text}");
+        assert!(row("cost").contains("cache write"), "{text}");
+        // Figures end on one column per side.
+        let left = end(row("requests"), "3.7k ");
+        assert_eq!(end(row("ok"), "3.7k "), left, "{text}");
+        assert_eq!(end(row("errors"), "14 "), left, "{text}");
+        assert_eq!(end(row("cost"), "$397.50 "), left, "{text}");
+        let right = end(row("requests"), "41.2M");
+        assert_eq!(end(row("ok"), "6.9M"), right, "{text}");
+        assert_eq!(end(row("errors"), "38.0M"), right, "{text}");
+        // A cache class nobody reported is unknown, not zero.
+        assert_eq!(end(row("cost"), "—"), right, "{text}");
+        assert!(text.contains("claude-opus-4-8 · 2 in-flight"), "{text}");
+    }
+
+    /// The misc tab's build and daemon facts were two run-on lines
+    /// (`llmux … · daemon pid 1 · port 3456 · up 1s`); they are a fact table
+    /// now — the build on the left, the daemon on the right, figures on
+    /// their last digit, `—` for a size not measured yet — and take the
+    /// same rows as before.
+    #[test]
+    fn misc_facts_line_up_build_left_daemon_right() {
+        let mut view = view_with(Vec::new());
+        view.config_path = Some("/home/me/.config/llmux/config.toml".into());
+        view.config_facts.raw_io_enabled = true;
+        view.config_facts.raw_io_bytes = Some(12_400_000);
+        for (w, h) in [(179, 43), (80, 24)] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Misc), w, h);
+            let text = rows.join("\n");
+            let at = rows
+                .iter()
+                .position(|r| r.starts_with("  llmux  "))
+                .unwrap_or_else(|| panic!("{text}"));
+            let facts: Vec<&str> = rows[at..at + 5].iter().map(|r| r.trim_end()).collect();
+            assert_eq!(
+                facts,
+                [
+                    "  llmux       0.0 (test)    accounts           0",
+                    "  daemon pid           1    raw-io            on",
+                    "  port              3456    raw-io store  12.4MB",
+                    "  up                  1s    activity log       —",
+                    "  config  /home/me/.config/llmux/config.toml",
+                ],
+                "{text}"
+            );
+            // The facts sit right above the footer rows, as they did.
+            assert_eq!(at + 5, usize::from(h) - 2, "{text}");
+        }
     }
 
     // --- issue #5: MAIN-always + summoned overlays -------------------------
