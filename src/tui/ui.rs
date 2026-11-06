@@ -9,15 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+    Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, Wrap,
 };
 use ratatui::Frame;
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
+use twolab_tui::trend_chart::{Series, TrendChart};
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -810,7 +810,14 @@ fn draw_stats_overlay(
     ])
     .areas(area);
     if chart_height > 0 {
-        draw_daily_chart(frame, chart_area, view, ctx, chrome.chart_days);
+        draw_daily_chart(
+            frame,
+            chart_area,
+            view,
+            ctx,
+            chrome.chart_days,
+            chart_theme(),
+        );
     }
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
@@ -833,139 +840,118 @@ fn draw_stats_overlay(
 }
 
 /// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
-/// U14): border/title + plot rows + x-axis labels + legend line.
+/// U14): title rule + plot rows + x axis + x-axis labels + legend line.
 const DAILY_CHART_HEIGHT: u16 = 13;
 /// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
 /// overlay — UI-3 U14 period selection).
 pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
-/// Max model lines plotted at once (top by window tokens); more would turn
-/// minimal into noise.
-const DAILY_CHART_SERIES: usize = 4;
-/// Line colors by rank — chosen to stay distinct on dark terminals and to
-/// echo the group hues used elsewhere.
-const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
-    [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
 
-/// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
-/// the selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]),
-/// modern-minimal — no grid, dim axes,
-/// a single legend line with colored dots. Data = the daily fold carried on
-/// the document (history filled by the persisted-request replay).
+/// The theme both trend charts draw with (tokens per day, perf t/s). The
+/// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank, so
+/// this carries the hues the charts always had — magenta, cyan, yellow,
+/// green, distinct on dark terminals. Under `NO_COLOR` the charts draw with
+/// [`twolab_tui::Theme::mono`] instead ([`chart_theme`]), where a glyph at
+/// every sample (`* + x o`, also in the legend) tells the series apart.
+const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
+    accent: Color::Magenta,
+    wait: Color::Cyan,
+    done: Color::Yellow,
+    fail: Color::Green,
+    ..KEYBAR_THEME
+};
+
+/// [`CHART_THEME`], or mono under `NO_COLOR` — the frame loop's `decolor`
+/// pass alone would leave four identical lines.
+fn chart_theme() -> twolab_tui::Theme {
+    if super::no_color() {
+        twolab_tui::Theme::mono()
+    } else {
+        CHART_THEME
+    }
+}
+
+/// The one renderer of both trend charts (tokens per day, perf t/s): a top
+/// rule carrying `title`, then the twolab-tui trend chart — braille lines for
+/// the top four series, dim axes with three labels each, gaps where a day has
+/// no data, and a legend that counts the series it leaves out (`+N more`).
+fn draw_trend_chart(frame: &mut Frame, area: Rect, title: &str, chart: &TrendChart) {
+    let block = Block::new().borders(Borders::TOP).title(title.to_string());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(chart, inner);
+}
+
+/// Tokens-per-Day line chart (UI-3 U14): one line per top model over the
+/// selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]), legend
+/// `model share%` with each model's share of every token in the span. Data =
+/// the daily fold carried on the document (history filled by the
+/// persisted-request replay). A day with no record at all — before history
+/// starts, or while nothing was recorded — is a gap; on a recorded day a
+/// model that served nothing reads 0.
 fn draw_daily_chart(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chart_days: u64,
+    theme: twolab_tui::Theme,
 ) {
     let chart_days = chart_days.clamp(2, 366);
-    let today = ctx
-        .now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
-    let start = today.saturating_sub(chart_days.saturating_sub(1));
-    // Rank models by window total, then build one (x=day-offset, y=tokens)
-    // series per top model, zero-filled across the whole span so a quiet day
-    // reads as a drop to zero, not a gap.
+    let (start, today) = perf_window(ctx.now, chart_days);
     // Bounded on BOTH ends: a future-dated replay row (clock skew) must not
     // index past the series (review R1 MUST-FIX 2).
     let in_span = |r: &&crate::dashboard::DailyUsageDoc| r.day >= start && r.day <= today;
+    let tokens = |r: &crate::dashboard::DailyUsageDoc| {
+        r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation
+    };
+    let days = chart_days as usize;
+    let mut recorded = vec![false; days];
     let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
     for r in view.daily_usage.iter().filter(&in_span) {
+        recorded[(r.day - start) as usize] = true;
         *totals
             .entry((r.group.as_str(), r.model.as_str()))
-            .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
+            .or_default() += tokens(r);
     }
+    // Rank models by span total; the chart draws the top four and counts
+    // the rest in its legend.
     let mut ranked: Vec<((&str, &str), u64)> = totals.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(DAILY_CHART_SERIES);
-    if ranked.is_empty() {
-        return;
-    }
     let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
-    let days = chart_days as usize;
-    let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
-    for (s, serie) in series.iter_mut().enumerate() {
-        for (i, point) in serie.iter_mut().enumerate() {
-            point.0 = i as f64;
-        }
-        let _ = s;
-    }
-    let mut y_max = 0f64;
-    for r in view.daily_usage.iter().filter(&in_span) {
-        if let Some(idx) = ranked
-            .iter()
-            .position(|((g, m), _)| *g == r.group && *m == r.model)
-        {
-            let x = (r.day - start) as usize;
-            let y = (r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation) as f64;
-            series[idx][x].1 += y;
-            y_max = y_max.max(series[idx][x].1);
-        }
-    }
-    let y_max = y_max.max(1.0);
-
-    let datasets: Vec<Dataset> = series
+    let rank: std::collections::HashMap<(&str, &str), usize> = ranked
         .iter()
         .enumerate()
-        .map(|(i, data)| {
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(DAILY_CHART_COLORS[i]))
-                .data(data)
-        })
+        .map(|(i, (key, _))| (*key, i))
         .collect();
-    let day_label = |d: u64| {
-        let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
-        let full = format::month_day_hm(at, 0);
-        full.split(' ').next().unwrap_or("").to_string()
-    };
-    let x_axis = Axis::default()
-        .bounds([0.0, (days - 1) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + chart_days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format::human_count((y_max / 2.0) as u64), dim()),
-            Span::styled(format::human_count(y_max as u64), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
-        )
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
-    // Legend: ● model (share%) — one line, dim separators.
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model), total)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
+    let blank: Vec<Option<f64>> = recorded.iter().map(|r| r.then_some(0.0)).collect();
+    let mut points = vec![blank; ranked.len()];
+    for r in view.daily_usage.iter().filter(&in_span) {
+        let i = rank[&(r.group.as_str(), r.model.as_str())];
+        if let Some(y) = points[i][(r.day - start) as usize].as_mut() {
+            *y += tokens(r) as f64;
         }
-        spans.push(Span::styled(
-            "● ".to_string(),
-            Style::new().fg(DAILY_CHART_COLORS[i]),
-        ));
-        spans.push(Span::raw(format!("{} ", abbrev_model(Some(group), model))));
-        spans.push(Span::styled(
-            format!("({:.1}%)", *total as f64 * 100.0 / grand as f64),
-            dim(),
-        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+    let series = ranked
+        .iter()
+        .zip(points)
+        .map(|(((group, model), total), points)| {
+            Series::new(abbrev_model(Some(group), model), points)
+                .note(format!("{:.1}%", *total as f64 * 100.0 / grand as f64))
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + chart_days / 2),
+            day_label(today),
+        ])
+        .empty("no tokens in this span")
+        .theme(theme);
+    draw_trend_chart(
+        frame,
+        area,
+        &format!(" tokens per day — last {chart_days}d · d cycles "),
+        &chart,
+    );
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -1837,9 +1823,6 @@ fn perf_series_for_day(view: &DashboardView, off: u64, now: SystemTime) -> Vec<P
     rows
 }
 
-/// Colors for the perf chart series (rank order, distinct on dark terminals).
-const PERF_CHART_COLORS: [Color; 4] = [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
-
 /// Perf overlay (`p`, perf telemetry v1 — "observed performance"): a daily
 /// e2e tokens/sec chart for the top series, a date × provider health matrix,
 /// and the per-(model, fast) series table. Passive telemetry from real
@@ -1894,7 +1877,7 @@ fn draw_perf_overlay(
     ])
     .areas(area);
     if chart_h > 0 {
-        draw_perf_chart(frame, chart_area, view, ctx, days, &title);
+        draw_perf_chart(frame, chart_area, view, ctx, days, &title, chart_theme());
         draw_perf_health(frame, health_area, view, ctx, days, None);
     } else {
         draw_perf_health(frame, health_area, view, ctx, days, Some(&title));
@@ -1920,9 +1903,11 @@ fn day_label(d: u64) -> String {
     full.split(' ').next().unwrap_or("").to_string()
 }
 
-/// Daily e2e tokens/sec line chart: one braille line per top series over the
-/// span. A day without throughput samples plots 0 (trend view; the tables
-/// stay the honest `—` surface).
+/// Daily e2e tokens/sec line chart: one line per top series over the span,
+/// on the same renderer as the tokens chart ([`draw_trend_chart`]). A day
+/// without throughput samples is a GAP, never a fabricated 0 (contract C5);
+/// a day with fewer than five samples is drawn dim — low traffic is itself a
+/// signal, but must not read as a confident trend point.
 fn draw_perf_chart(
     frame: &mut Frame,
     area: Rect,
@@ -1930,13 +1915,15 @@ fn draw_perf_chart(
     ctx: &FrameCtx,
     days: u64,
     title: &str,
+    theme: twolab_tui::Theme,
 ) {
     let (start, today) = perf_window(ctx.now, days);
     let in_span = |r: &&crate::dashboard::DailyPerfDoc| r.day >= start && r.day <= today;
-    // Rank series by window output; plot the top 4.
-    let ranked = {
-        let mut totals: std::collections::BTreeMap<(&str, &str, Option<bool>), u64> =
-            Default::default();
+    // Rank series by window output; the chart draws the top four and counts
+    // the rest in its legend.
+    type Key<'a> = (&'a str, &'a str, Option<bool>);
+    let ranked: Vec<(Key, u64)> = {
+        let mut totals: std::collections::BTreeMap<Key, u64> = Default::default();
         for r in view.daily_perf.iter().filter(&in_span) {
             *totals
                 .entry((r.group.as_str(), r.model.as_str(), r.fast))
@@ -1944,126 +1931,52 @@ fn draw_perf_chart(
         }
         let mut ranked: Vec<_> = totals.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(PERF_CHART_COLORS.len());
         ranked
     };
-    if ranked.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())))
-            .block(Block::new().borders(Borders::TOP).title(title.to_string()));
-        frame.render_widget(empty, area);
-        return;
-    }
-    let span_days = days as usize;
-    // Per-day per-series raw sums → tps points. A day WITHOUT throughput
-    // samples is a GAP, never a fabricated 0 (contract C5): each series is
-    // split into contiguous sampled segments and each segment becomes its
-    // own same-colored dataset, so the line breaks over quiet days.
-    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
+    // Per-day per-series raw sums (output tokens, e2e ms, samples) → t/s.
+    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; days as usize]; ranked.len()];
     for r in view.daily_perf.iter().filter(&in_span) {
+        if r.tps_n == 0 {
+            continue;
+        }
         if let Some(idx) = ranked
             .iter()
             .position(|((g, m, f), _)| *g == r.group && *m == r.model && *f == r.fast)
         {
-            let x = (r.day - start) as usize;
-            if r.tps_n > 0 {
-                let slot = sums[idx][x].get_or_insert((0, 0, 0));
-                slot.0 += r.output_tokens;
-                slot.1 += r.e2e_ms;
-                slot.2 += r.tps_n;
-            }
+            let slot = sums[idx][(r.day - start) as usize].get_or_insert((0, 0, 0));
+            slot.0 += r.output_tokens;
+            slot.1 += r.e2e_ms;
+            slot.2 += r.tps_n;
         }
     }
-    // Segments split on BOTH gaps and confidence flips: low-sample (n<5)
-    // stretches render dim so a thin day can't read as a confident trend
-    // point; quiet days stay gaps (never a fabricated 0).
-    let mut y_max = 1f64;
-    // (series rank, low-confidence?, points)
-    type Segment = (usize, bool, Vec<(f64, f64)>);
-    let mut segments: Vec<Segment> = Vec::new();
-    for (idx, day_sums) in sums.iter().enumerate() {
-        let mut current: Vec<(f64, f64)> = Vec::new();
-        let mut current_low = false;
-        for (x, slot) in day_sums.iter().enumerate() {
-            match slot {
-                Some((out, ms, n)) if *ms > 0 => {
-                    let y = *out as f64 * 1000.0 / *ms as f64;
-                    y_max = y_max.max(y);
-                    let low = *n < 5;
-                    if low != current_low && !current.is_empty() {
-                        let last = *current.last().expect("non-empty");
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                        // Connect across the flip only INTO the dim segment
-                        // — a low-confidence point must never be repainted
-                        // at full brightness (review MUST-FIX: dim = n<5).
-                        if low {
-                            current.push(last);
-                        }
-                    }
-                    current_low = low;
-                    current.push((x as f64, y));
-                }
-                _ => {
-                    if !current.is_empty() {
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                    }
-                }
-            }
-        }
-        if !current.is_empty() {
-            segments.push((idx, current_low, current));
-        }
-    }
-    let datasets: Vec<Dataset> = segments
+    let series = ranked
         .iter()
-        .map(|(idx, low, data)| {
-            let style = if *low {
-                dim()
-            } else {
-                Style::new().fg(PERF_CHART_COLORS[*idx])
-            };
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(style)
-                .data(data)
+        .zip(&sums)
+        .map(|(((group, model, fast), _), day_sums)| {
+            let tps = day_sums.iter().map(|slot| match slot {
+                Some((out, ms, _)) if *ms > 0 => Some(*out as f64 * 1000.0 / *ms as f64),
+                _ => None,
+            });
+            let low = day_sums
+                .iter()
+                .map(|slot| slot.is_some_and(|(_, _, n)| n < 5));
+            Series::new(perf_series_label(group, model, *fast), tps).low(low)
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + days / 2),
+            day_label(today),
+        ])
+        .y_unit("e2e t/s")
+        .low_note("dim = n<5")
+        .empty(if ranked.is_empty() {
+            "no requests in this span"
+        } else {
+            "no throughput samples in this span"
         })
-        .collect();
-    let x_axis = Axis::default()
-        .bounds([0.0, (span_days.saturating_sub(1)) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format!("{:.0}", y_max / 2.0), dim()),
-            Span::styled(format!("{y_max:.0} t/s"), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(Block::new().borders(Borders::TOP).title(title.to_string()))
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
-        }
-        spans.push(Span::styled("● ", Style::new().fg(PERF_CHART_COLORS[i])));
-        spans.push(Span::raw(perf_series_label(group, model, *fast)));
-    }
-    spans.push(Span::styled(
-        "   (e2e t/s · dim = n<5 — estimated post-delta rates in the table below)",
-        dim(),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+        .theme(theme);
+    draw_trend_chart(frame, area, title, &chart);
 }
 
 /// Date × provider health matrix: per day and backend group — sample count,
@@ -16992,6 +16905,174 @@ mod tests {
         ];
         let text = render(&view, &chrome_overlay(Overlay::Stats), 200, 50);
         assert!(text.contains("tokens per day"), "chart still renders");
+    }
+
+    /// Tokens-per-day rows for the trend-chart tests: history starts five
+    /// days back, nothing at all was recorded three days back, and on the
+    /// day two back only fable served (codex read 0 that day).
+    fn trend_view() -> DashboardView {
+        use crate::dashboard::{DailyPerfDoc, DailyUsageDoc};
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_secs()
+            / 86_400;
+        let usage = |d: u64, group: &str, model: &str, tokens_in: u64| DailyUsageDoc {
+            day: today - d,
+            group: group.into(),
+            model: model.into(),
+            tokens_in,
+            tokens_out: 50_000,
+            cache_read: 0,
+            cache_creation: 0,
+        };
+        view.daily_usage = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                let mut rows = vec![usage(d, "claude", "claude-fable-5", 100_000 * (d + 1))];
+                if d != 2 {
+                    rows.push(usage(d, "codex", "gpt-5.6-sol", 0));
+                }
+                rows
+            })
+            .collect();
+        let perf = |d: u64, model: &str, tps_n: u64, output_tokens: u64| DailyPerfDoc {
+            day: today - d,
+            group: "codex".into(),
+            model: model.into(),
+            fast: Some(false),
+            requests: 10,
+            ok: 9,
+            errors: 1,
+            tps_n,
+            output_tokens,
+            e2e_ms: 20_000,
+            measured_n: 6,
+            measured_output: 3_000,
+            post_ttft_ms: 10_000,
+            ttfb_n: 8,
+            ttfb_ms_sum: 1_600,
+        };
+        view.daily_perf = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                // Day one back is thin for gpt-5.5: two samples.
+                let n = if d == 1 { 2 } else { 8 };
+                [
+                    perf(d, "gpt-5.5", n, 6_000),
+                    perf(d, "gpt-5.6-sol", 8, 2_000),
+                ]
+            })
+            .collect();
+        view
+    }
+
+    /// One trend chart drawn on its own `w`×13 terminal (the overlays'
+    /// slice): `draw` gets the frame and the theme.
+    fn render_trend(w: u16, draw: impl FnOnce(&mut Frame, &FrameCtx)) -> ratatui::buffer::Buffer {
+        let view = trend_view();
+        let ctx = frame_ctx(&view, &chrome_overlay(Overlay::Stats));
+        let mut terminal =
+            Terminal::new(TestBackend::new(w, DAILY_CHART_HEIGHT)).expect("terminal");
+        terminal.draw(|f| draw(f, &ctx)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Under `NO_COLOR` both trend charts told their series apart by colour
+    /// only — four identical lines, legend `●` dots (two cells on CJK-wide
+    /// terminals). Mono now marks every sample with its series' glyph
+    /// (`*` `+` `x` `o`, the same glyph in the legend), and no chart cell
+    /// carries a colour.
+    #[test]
+    fn trend_charts_tell_series_apart_without_colour() {
+        let view = trend_view();
+        let mono = twolab_tui::Theme::mono();
+        let tokens = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, mono);
+        });
+        let perf = render_trend(80, |f, ctx| {
+            draw_perf_chart(f, f.area(), &view, ctx, 14, " perf ", mono);
+        });
+        for buf in [&tokens, &perf] {
+            let rows = buffer_rows(buf);
+            let text = rows.join("\n");
+            assert!(!text.contains('●'), "{text}");
+            assert!(
+                buf.content()
+                    .iter()
+                    .all(|c| (c.fg, c.bg) == (Color::Reset, Color::Reset)),
+                "{text}"
+            );
+            // Five sampled days per series, one glyph each.
+            let plot = rows[1..10].join("\n");
+            assert_eq!(plot.matches('*').count(), 5, "{text}");
+            assert_eq!(plot.matches('+').count(), 5, "{text}");
+        }
+        let legend = |buf: &ratatui::buffer::Buffer| buffer_rows(buf)[12].trim_end().to_string();
+        assert_eq!(legend(&tokens), "* fable-5 90.7%  + gpt-5.6-sol 9.3%");
+        assert_eq!(
+            legend(&perf),
+            "* codex gpt-5.5  + codex gpt-5.6-sol  (dim = n<5)"
+        );
+        // The thin day (two samples) is the one dim glyph of its series.
+        let dim_stars = perf
+            .content()
+            .iter()
+            .filter(|c| c.symbol() == "*" && c.modifier.contains(Modifier::DIM))
+            .count();
+        assert_eq!(dim_stars, 1, "{}", buffer_rows(&perf).join("\n"));
+        // In colour the lines keep the hues they always had, rank by rank.
+        let colour = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, CHART_THEME);
+        });
+        assert_eq!(colour[(0, 12)].fg, Color::Magenta);
+        let second = buffer_rows(&colour)[12].find("⠒⠒ gpt").expect("legend");
+        let second = cells::width(&buffer_rows(&colour)[12][..second]) as u16;
+        assert_eq!(colour[(second, 12)].fg, Color::Cyan);
+    }
+
+    /// The tokens chart zero-filled the whole span, so a fourteen-day span
+    /// over five days of history drew nine days of a flat 0 and a cliff
+    /// into the first real day. Days before history — and a day with no
+    /// record at all — are gaps now; a recorded day on which a model served
+    /// nothing still reads 0.
+    #[test]
+    fn tokens_chart_draws_nothing_before_history_or_on_unrecorded_days() {
+        let view = trend_view();
+        let buf = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, twolab_tui::Theme::mono());
+        });
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Plot rows 1–9 right of the `650.0k│` gutter: 73 cells for 14 days;
+        // the first recorded day (index 8) is at cell 44.
+        let plot: Vec<Vec<&str>> = (1..10)
+            .map(|y| (7..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        for row in &plot {
+            assert!(row[..44].iter().all(|s| *s == " "), "{text}");
+        }
+        // Day index 10 (three back) is unrecorded: no glyph of either
+        // series in its column, and no line through it.
+        let day10 = (10.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        for row in &plot {
+            assert_eq!(row[day10], " ", "{text}");
+        }
+        // Codex served nothing two days back while fable did: a `+` on the
+        // zero row in that day's column.
+        let day11 = (11.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        assert_eq!(plot[8][day11], "+", "{text}");
     }
 
     #[test]

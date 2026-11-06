@@ -57,7 +57,10 @@ terminal cutting a hint in half.
 With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
 dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
-(errors, failures, a nearly spent window) is bold instead.
+(errors, failures, a nearly spent window) is bold instead. The two trend
+charts (tokens per day in `stats`, tokens/sec in `perf`) then mark every
+sample with its series' glyph — `*`, `+`, `x`, `o`, the same glyph in the
+legend — so four lines stay apart without colour.
 
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
@@ -231,7 +234,7 @@ attached — instead of showing an empty pane. `l`/`Esc` goes back, `q` quits.
 
 The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
 
-- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series, y = end-to-end output tokens/sec (`Σoutput / Σduration` per day).
+- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series (the top four; the legend counts the rest as `+N more`), y = end-to-end output tokens/sec (`Σoutput / Σduration` per day). A day with fewer than 5 throughput samples is drawn dim and the legend says `(dim = n<5)`; a day without samples is a gap. The `stats` tab's tokens-per-day chart is the same chart over token totals, its legend giving each model's share of every token in the span; a day with no recorded request at all — before the history starts, for example — is a gap there too, while a recorded day on which a model served nothing reads 0.
 - **Provider health matrix** — one row per day, one column per provider: request count, error %, average TTFB (time to first upstream body byte), and e2e t/s. A day with no traffic renders `—`, never a fabricated `0`.
 - **Series table** — per `(provider, model, fast)` over the span (`j`/`k` scroll): requests, error %, output tokens, `e2e t/s`, `est t/s`, average TTFB, and measured coverage (`measured/throughput` samples).
 
