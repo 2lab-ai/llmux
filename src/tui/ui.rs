@@ -410,15 +410,16 @@ pub(crate) fn draw(
         Overlay::Usage => {
             let bar;
             (usage_scope, bar) = draw_usage_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.table_scroll = bar;
+            if let Some(main) = hits.as_mut() {
+                main.record_table_scroll(bar);
             }
         }
         Overlay::Logs => {
             let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.logs = Some(pos);
-                hits.logs_area = Some(overlay_area);
+            if let Some(main) = hits.as_mut() {
+                main.hits.push(overlay_area, ClickTarget::LogsPager);
+                main.logs = Some(pos);
+                main.logs_area = Some(overlay_area);
             }
         }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
@@ -427,8 +428,8 @@ pub(crate) fn draw(
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
         Overlay::Keys => {
             let bar = draw_keys_overlay(frame, overlay_area, view, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.table_scroll = bar;
+            if let Some(main) = hits.as_mut() {
+                main.record_table_scroll(bar);
             }
         }
     }
@@ -711,8 +712,6 @@ fn draw_main(
     *hits = Some(MainChrome {
         hits: map,
         menu,
-        sessions_table: None,
-        config_rows: Vec::new(),
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal: None,
         account_modal: None,
@@ -1705,7 +1704,7 @@ fn draw_sessions_overlay(
         frame.render_widget(empty, body);
         return;
     }
-    let (table_chrome, bar) = if area.width >= SIDE_BY_SIDE_AT {
+    let (rows, bar) = if area.width >= SIDE_BY_SIDE_AT {
         let [list_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
         let tc = draw_sessions_table(frame, list_area, ctx, chrome);
@@ -1714,9 +1713,9 @@ fn draw_sessions_overlay(
     } else {
         draw_sessions_table(frame, area, ctx, chrome)
     };
-    if let Some(hits) = hits.as_mut() {
-        hits.sessions_table = table_chrome;
-        hits.table_scroll = bar;
+    if let Some(main) = hits.as_mut() {
+        main.hits.extend(rows);
+        main.record_table_scroll(bar);
     }
 }
 
@@ -1729,7 +1728,7 @@ fn draw_sessions_table(
     area: Rect,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> (Option<SessionsChrome>, Option<TableScroll>) {
+) -> (Vec<(Rect, ClickTarget)>, Option<TableScroll>) {
     let total = chrome.sessions.len();
     let cursor = chrome.session_cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
@@ -1835,11 +1834,17 @@ fn draw_sessions_table(
         height: area.height.saturating_sub(2),
     };
     let _ = ctx;
-    let table_chrome = (rows_rect.height > 0).then_some(SessionsChrome {
-        rows: rows_rect,
-        start,
-    });
-    (table_chrome, bar)
+    let rows = (0..rows_rect.height)
+        .map(|k| {
+            let row = Rect {
+                y: rows_rect.y + k,
+                height: 1,
+                ..rows_rect
+            };
+            (row, ClickTarget::SessionsRow(start + usize::from(k)))
+        })
+        .collect();
+    (rows, bar)
 }
 
 /// Drill-down pane for the cursored session: the grouping confidence, the full
@@ -3102,14 +3107,6 @@ impl ConfigAction {
     }
 }
 
-/// One clickable config value cell (config-editor v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConfigHit {
-    pub area: Rect,
-    pub row: usize,
-    pub action: ConfigAction,
-}
-
 /// How a config row applies (trinity contract C6 3-state honesty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CfgState {
@@ -3777,22 +3774,19 @@ fn draw_config_overlay(
     // (contract: click the control, not the whole row). The rows sit one per
     // line under the top spacer, from `start`.
     let col = config_value_column(&rows, &config_names(&rows, start), list_area.width);
-    let mut hit_rows: Vec<ConfigHit> = Vec::new();
+    let mut hit_rows: Vec<(Rect, ClickTarget)> = Vec::new();
     if col > 0 && usize::from(list_area.height) >= max_rows + 3 {
         let width = (config_value_width(&rows, col, list_area.width) as u16)
             .min(list_area.width.saturating_sub(col as u16));
         for (line, i) in (start..rows.len().min(start + max_rows)).enumerate() {
             if let Some(action) = rows[i].action {
-                hit_rows.push(ConfigHit {
-                    area: Rect {
-                        x: list_area.x + col as u16,
-                        y: list_area.y + 1 + line as u16,
-                        width,
-                        height: 1,
-                    },
-                    row: i,
-                    action,
-                });
+                let cell = Rect {
+                    x: list_area.x + col as u16,
+                    y: list_area.y + 1 + line as u16,
+                    width,
+                    height: 1,
+                };
+                hit_rows.push((cell, ClickTarget::ConfigRow { row: i, action }));
             }
         }
     }
@@ -3824,7 +3818,7 @@ fn draw_config_overlay(
         field_width = Some(width);
     }
     if let Some(hits) = hits.as_mut() {
-        hits.config_rows = hit_rows;
+        hits.hits.extend(hit_rows);
         hits.field_width = field_width;
     }
 }
@@ -8834,15 +8828,6 @@ pub(crate) const TABS: &[(&str, Overlay)] = &[
     ("config", Overlay::Config),
 ];
 
-/// The sessions table's clickable data area for one frame: `rows` covers the
-/// data rows only (border + header excluded); a click at `rows.y + k` selects
-/// session `start + k`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SessionsChrome {
-    pub rows: Rect,
-    pub start: usize,
-}
-
 /// Minimum drag-set pane height (top border + one content row) and a sanity
 /// ceiling (UI-3 U7/U8) — the layout solver squeezes overflow anyway, this
 /// just keeps the override numbers honest.
@@ -8911,6 +8896,19 @@ pub(crate) enum ClickTarget {
         key: ActivityKey,
         kind: ActivityHitKind,
     },
+    /// A config row's value cell (config-editor v1): `row` is its index in
+    /// the config rows; a click activates it exactly like Enter.
+    ConfigRow { row: usize, action: ConfigAction },
+    /// A data row of the sessions table (mouse select): the session index
+    /// it shows, or would show — a row past the last session takes the
+    /// click and selects nothing.
+    SessionsRow(usize),
+    /// The open keys, sessions or usage table's scrollbar track: a press
+    /// jumps there or grabs the thumb ([`MainChrome::table_scroll`] has the
+    /// maths the drag after it uses).
+    TableScrollbar,
+    /// The Logs overlay's pager: a press there starts a text selection.
+    LogsPager,
 }
 
 /// A surface drawn over what came before it.
@@ -8933,12 +8931,6 @@ pub(crate) struct MainChrome {
     /// Every click target this frame drew, in paint order.
     pub hits: Hits,
     pub menu: Option<twolab_tui::menu::MenuLayout>,
-    /// Sessions overlay table layout this frame (issue: sessions mouse
-    /// select): the data-row rect + the index of its first visible session.
-    pub sessions_table: Option<SessionsChrome>,
-    /// Config overlay clickable value cells this frame (config-editor v1):
-    /// row index + action, so a click activates exactly like Enter.
-    pub config_rows: Vec<ConfigHit>,
     /// Set by `draw` after rendering the input modal (UI-6 item 3): `Some`
     /// is where the modal drew — its clamped scroll position and scrollbar
     /// track, which the runtime's keys and mouse act on; `None` means no
@@ -8966,6 +8958,17 @@ pub(crate) struct MainChrome {
     /// Cells the open text field (add key · limits · config value) was drawn
     /// in this frame — its window follows the caret from there.
     pub field_width: Option<u16>,
+}
+
+impl MainChrome {
+    /// The open table's scrollbar as drawn: its track is a click target,
+    /// its maths stay for the drag that follows a press on it.
+    fn record_table_scroll(&mut self, bar: Option<TableScroll>) {
+        if let Some(bar) = bar {
+            self.hits.push(bar.track, ClickTarget::TableScrollbar);
+        }
+        self.table_scroll = bar;
+    }
 }
 
 /// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
@@ -12127,6 +12130,34 @@ mod tests {
         })
     }
 
+    /// A config value cell a click reaches: where, which row, what it does.
+    struct ConfigCell {
+        area: Rect,
+        row: usize,
+        action: ConfigAction,
+    }
+
+    fn config_cells(main: &MainChrome) -> Vec<ConfigCell> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::ConfigRow { row, action } => Some((*row, *action)),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(area, (row, action))| ConfigCell { area, row, action })
+        .collect()
+    }
+
+    /// The sessions table's data rows as one rect: their targets together.
+    fn sessions_rows(main: &MainChrome) -> Option<Rect> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::SessionsRow(_) => Some(()),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(rect, ())| rect)
+        .reduce(|a, b| a.union(b))
+    }
+
     /// The map `targets` make when pushed in order.
     fn map_of(targets: &[(Rect, ClickTarget)]) -> Hits {
         let mut map = Hits::new();
@@ -12648,13 +12679,13 @@ mod tests {
             let (rows, hits) = render_with_hits(&view, &chrome, w, h);
             let frame = rows.join("\n");
             let bar = hits.table_scroll.expect("60 sessions overflow");
-            let table = hits.sessions_table.expect("table drawn");
+            let table = sessions_rows(&hits).expect("table drawn");
             assert_eq!(
                 bar.track.x,
-                table.rows.right(),
+                table.right(),
                 "{w}x{h}: right of the rows\n{frame}"
             );
-            assert_eq!(bar.track.y, table.rows.y, "{w}x{h}: beside the data rows");
+            assert_eq!(bar.track.y, table.y, "{w}x{h}: beside the data rows");
             if w >= SIDE_BY_SIDE_AT {
                 assert!(bar.track.x < w - 46, "{w}x{h}: on the list, not the detail");
             }
@@ -19525,7 +19556,7 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let hits = hits.expect("main chrome").config_rows;
+        let hits = config_cells(&hits.expect("main chrome"));
         assert!(!hits.is_empty(), "editable value cells recorded");
         for h in &hits {
             assert!(h.area.x > 2, "value cells start after the label column");
@@ -19585,7 +19616,7 @@ mod tests {
             let line = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
             let text = (0..h).map(line).collect::<Vec<_>>().join("\n");
             assert!(!text.contains("limitsper"), "{text}");
-            let hits = hits.expect("main chrome").config_rows;
+            let hits = config_cells(&hits.expect("main chrome"));
             assert!(hits.len() > 3, "value cells recorded at {w}x{h}");
             let col = hits[0].area.x;
             assert!(hits.iter().all(|h| h.area.x == col), "one value column");
