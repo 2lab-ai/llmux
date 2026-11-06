@@ -265,7 +265,12 @@ pub(crate) fn draw(
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
-        Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
+        Overlay::Logs => {
+            let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.logs = Some(pos);
+            }
+        }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
@@ -519,6 +524,7 @@ fn draw_main(
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
         account_modal_max_scroll: None,
+        logs: None,
         raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
@@ -1320,10 +1326,62 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Logs overlay (`l`): a full-screen log tail (was the `l` size-cycle panel).
-fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
+/// Logs overlay (`l`): the whole log ring in a twolab-tui
+/// [`Pager`](twolab_tui::pager::Pager) — long lines wrap, `~` past the end,
+/// the bottom rule says how far down the view is (`NN%`). It follows new
+/// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
+/// once scrolled back. Returns where it drew, so the runtime can turn the
+/// next key or wheel step into a row offset.
+fn draw_logs_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> twolab_tui::scrollbar::ScrollPos {
+    use twolab_tui::pager::Pager;
+    use twolab_tui::scrollbar::ScrollPos;
+
     frame.render_widget(Clear, area);
-    draw_logs(frame, area, view);
+    let lines: Vec<Line<'static>> = if view.logs.is_empty() {
+        // Say so instead of a blank pane (the same in attach mode, where the
+        // lines come from the daemon's document).
+        vec![
+            Line::from(Span::styled(" no log lines yet", dim())),
+            Line::from(Span::styled(
+                " new lines appear here as the daemon logs them",
+                dim(),
+            )),
+        ]
+    } else {
+        view.logs
+            .iter()
+            .map(|line| log_line(line, view.email_anonymous))
+            .collect()
+    };
+    let n = view.logs.len();
+    let count = if n == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{n} lines")
+    };
+    let title = match chrome.logs_scroll {
+        _ if n == 0 => "logs".to_string(),
+        None => format!("logs · {count} · following"),
+        Some(_) => format!("logs · {count} · scrolled back — End follows"),
+    };
+    let pager = Pager::new(title, lines)
+        .hints(false)
+        .theme(KEYBAR_THEME)
+        .scroll_to(chrome.logs_scroll.unwrap_or(usize::MAX));
+    frame.render_widget(&pager, area);
+    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
+    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
+    let view_h = area.height.saturating_sub(chrome_rows) as usize;
+    ScrollPos::of(
+        pager.content_height(area.width),
+        view_h,
+        pager.scroll_offset(),
+    )
 }
 
 /// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
@@ -8244,6 +8302,9 @@ pub(crate) struct MainChrome {
     /// clamps the stored scroll, `None` means no modal was open OR its pinned
     /// account left the snapshot (→ close it).
     pub account_modal_max_scroll: Option<u16>,
+    /// Where the Logs overlay's pager drew this frame (`None`: not open), so
+    /// a scroll key or wheel step moves from what is on screen.
+    pub logs: Option<twolab_tui::scrollbar::ScrollPos>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
@@ -9670,26 +9731,9 @@ fn activity_meta_spans(
     }
 }
 
-/// Bottom log console: the tail of the tracing ring, newest line on the
-/// bottom row (auto-follow), level-colored prefix, no wrapping (long lines
-/// truncate — the console is a glance surface, not a pager).
-fn draw_logs(frame: &mut Frame, area: Rect, view: &DashboardView) {
-    let block = Block::new().borders(Borders::TOP).title(" logs ");
-    let capacity = area.height.saturating_sub(1) as usize; // top border
-                                                           // `view.logs` is oldest→newest; take the newest `capacity` lines.
-    let start = view.logs.len().saturating_sub(capacity);
-    let lines: Vec<Line> = view.logs[start..]
-        .iter()
-        .map(|line| log_line(line, view.email_anonymous))
-        .collect();
-    // Bottom-align: pad above so the newest line hugs the bottom edge.
-    let mut padded: Vec<Line> = Vec::with_capacity(capacity);
-    padded.resize_with(capacity.saturating_sub(lines.len()), Line::default);
-    padded.extend(lines);
-    frame.render_widget(Paragraph::new(padded).block(block), area);
-}
-
-fn log_line(line: &LogLine, mask: bool) -> Line<'_> {
+/// One tracing line as the Logs overlay shows it: a level-coloured prefix,
+/// then the text with emails masked under `email_anonymous`.
+fn log_line(line: &LogLine, mask: bool) -> Line<'static> {
     use tracing::Level;
 
     let (label, style) = if line.level == Level::ERROR {
@@ -11058,8 +11102,17 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("q", "quit"),
             ],
         ),
-        // Logs overlay: full-screen tail; l/Esc back.
-        Overlay::Logs => (Some("logs"), vec![("l/Esc", "back"), ("q", "quit")]),
+        // Logs overlay: the log ring in a pager; End follows new lines.
+        Overlay::Logs => (
+            Some("logs"),
+            vec![
+                ("l/Esc", "back"),
+                ("↑/k ↓/j", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Home/End", "top/follow"),
+                ("q", "quit"),
+            ],
+        ),
         Overlay::Perf => (
             Some("perf"),
             vec![
@@ -12654,6 +12707,7 @@ mod tests {
             perf_day_off: None,
             usage_gran: Default::default(),
             usage_scroll: 0,
+            logs_scroll: None,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -13511,7 +13565,10 @@ mod tests {
                 Overlay::Stats,
                 " stats — g/Esc back  ↑/k ↓/j model  PgUp/PgDn page  w window  q quit",
             ),
-            (Overlay::Logs, " logs — l/Esc back  q quit"),
+            (
+                Overlay::Logs,
+                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  q quit",
+            ),
         ] {
             let mut chrome = chrome_overlay(overlay);
             for status in [None, Some("switched to codex@example.com")] {
@@ -13769,11 +13826,75 @@ mod tests {
             text: "proxy started on :3456".into(),
         }];
         let text = render(&view, &chrome_overlay(Overlay::Logs), 160, 30);
-        assert!(text.contains("logs"), "logs overlay titled");
+        assert!(
+            text.contains("logs · 1 line · following"),
+            "logs overlay titled"
+        );
         assert!(
             text.contains("proxy started on :3456"),
             "logs overlay shows the tail"
         );
+    }
+
+    fn log_lines(n: usize) -> Vec<crate::logging::LogLine> {
+        (0..n)
+            .map(|i| crate::logging::LogLine {
+                level: tracing::Level::INFO,
+                text: format!("log line {i:03}"),
+            })
+            .collect()
+    }
+
+    /// Before any line arrives the Logs overlay says so — locally and
+    /// attached — instead of a blank pane.
+    #[test]
+    fn logs_overlay_says_when_there_are_no_lines_yet() {
+        let view = view_with(Vec::new());
+        for chrome in [chrome_overlay(Overlay::Logs), chrome_attach(Overlay::Logs)] {
+            let rows = render_rows(&view, &chrome, 80, 24);
+            assert_eq!(rows[3].trim_end(), " no log lines yet", "{rows:#?}");
+            assert!(rows[4].contains("new lines appear here"), "{rows:#?}");
+        }
+    }
+
+    /// The Logs pager at 80x24: following, the newest line sits on the last
+    /// content row and the rule reads 100%; scrolled to the top it shows the
+    /// oldest line at 0%; a long line wraps instead of being cut. The pager
+    /// reports where it drew so the runtime can scroll from there.
+    #[test]
+    fn logs_overlay_pages_through_the_ring_with_a_position() {
+        let mut view = view_with(Vec::new());
+        view.logs = log_lines(100);
+        view.logs.push(crate::logging::LogLine {
+            level: tracing::Level::WARN,
+            text: format!("long {} end-of-long-line", "word ".repeat(30)),
+        });
+        let mut chrome = chrome_overlay(Overlay::Logs);
+        let rows = render_rows(&view, &chrome, 80, 24);
+        // Overlay rows 2..22: title row, 18 content rows, the bottom rule.
+        assert!(
+            rows[2].contains("logs · 101 lines · following"),
+            "{rows:#?}"
+        );
+        assert!(rows[20].contains("end-of-long-line"), "{rows:#?}");
+        assert!(rows[18].contains("  WARN long word"), "wrapped: {rows:#?}");
+        assert!(rows[17].contains("log line 099"), "{rows:#?}");
+        assert!(rows[21].contains(" 100% "), "{rows:#?}");
+
+        chrome.logs_scroll = Some(0);
+        let rows = render_rows(&view, &chrome, 80, 24);
+        assert!(rows[2].contains("scrolled back — End follows"), "{rows:#?}");
+        assert!(rows[3].contains("log line 000"), "{rows:#?}");
+        assert!(rows[21].contains(" 0% "), "{rows:#?}");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let pos = hits.and_then(|h| h.logs).expect("logs position reported");
+        assert_eq!((pos.top, pos.viewport), (0, 18));
+        assert_eq!(pos.max, 103 - 18, "101 lines, the long one on 3 rows");
     }
 
     /// Sessions overlay (issue #34): renders the folded session list with the

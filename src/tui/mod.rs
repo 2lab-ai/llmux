@@ -73,6 +73,7 @@ use crossterm::terminal::{enable_raw_mode, Clear, ClearType, EnterAlternateScree
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+use twolab_tui::scrollbar::ScrollPos;
 
 use crate::config::AccountConfig;
 use crate::dashboard::{CodexSettingsDoc, DashboardDoc};
@@ -657,6 +658,9 @@ pub(crate) struct Chrome {
     /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
     /// recent at the top).
     pub usage_scroll: usize,
+    /// Logs-overlay position: `None` follows the newest line (the pager
+    /// sits at the bottom), `Some(top)` holds the view at wrapped row `top`.
+    pub logs_scroll: Option<usize>,
     /// The click-opened input-text modal (UI-6 item 3), or `None` when closed.
     /// Drawn last over MAIN; its content is looked up from `view.completed` by
     /// the stored key every frame, so it works identically in local and attach
@@ -1065,6 +1069,11 @@ struct App {
     /// the granularity changes so a deep hourly scroll can't strand the
     /// monthly table past its last row.
     usage_scroll: usize,
+    /// Logs-overlay position (`None` = follow the tail); see
+    /// [`Chrome::logs_scroll`].
+    logs_scroll: Option<usize>,
+    /// Where the Logs pager drew last frame: what a scroll key moves from.
+    logs_pos: twolab_tui::scrollbar::ScrollPos,
     /// The click-opened input-text modal (UI-6 item 3); `None` when closed. The
     /// scroll offset is clamped after each draw against the wrapped line count
     /// the render pass reports (`MainChrome::input_modal_max_scroll`).
@@ -1177,6 +1186,8 @@ impl App {
             quota_display_override: None,
             usage_gran: activity::UsageGran::default(),
             usage_scroll: 0,
+            logs_scroll: None,
+            logs_pos: Default::default(),
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -1407,6 +1418,7 @@ impl App {
             perf_day_off: self.perf_day_off,
             usage_gran: self.usage_gran,
             usage_scroll: self.usage_scroll,
+            logs_scroll: self.logs_scroll,
             input_modal: self.input_modal.clone(),
             // The Loading spinner rides the shared frame counter (set here so
             // the stored modal itself never needs a per-tick mutation).
@@ -1716,6 +1728,19 @@ impl App {
         {
             if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
                 self.open_tab(tab, view);
+                return true;
+            }
+        }
+        // The wheel scrolls the Logs pager three rows a step; reaching the
+        // bottom follows new lines again.
+        if self.overlay == Overlay::Logs && self.mode == Mode::Normal {
+            let step: isize = match mouse.kind {
+                MouseEventKind::ScrollUp => -3,
+                MouseEventKind::ScrollDown => 3,
+                _ => 0,
+            };
+            if step != 0 {
+                self.scroll_logs_to(|pos| Some(pos.top.saturating_add_signed(step).min(pos.max)));
                 return true;
             }
         }
@@ -2575,10 +2600,38 @@ impl App {
     /// Key handling for the Logs overlay (`l`). `l`/`Esc` closes back to MAIN;
     /// `q` quits. The tail is full-screen, so there is no size cycle anymore.
     fn on_key_logs(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('l') | KeyCode::Esc => self.overlay = Overlay::None,
-            _ => {}
+        let code = match code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Char('l') | KeyCode::Esc => {
+                self.overlay = Overlay::None;
+                return;
+            }
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('j') => KeyCode::Down,
+            other => other,
+        };
+        if let Some(key) = key_input(code) {
+            self.scroll_logs_to(|pos| pos.on_key(key));
+        }
+    }
+
+    /// Open the Logs overlay at the newest line, following new ones.
+    fn open_logs(&mut self) {
+        self.logs_scroll = None;
+        self.overlay = Overlay::Logs;
+    }
+
+    /// Move the Logs pager to the row `to` picks from where it was drawn
+    /// last. Reaching the bottom follows the tail again; `None` from `to`
+    /// leaves the view alone.
+    fn scroll_logs_to(&mut self, to: impl FnOnce(ScrollPos) -> Option<usize>) {
+        let pos = self.logs_pos;
+        let pos = pos.with_top(self.logs_scroll.unwrap_or(pos.max));
+        if let Some(top) = to(pos) {
+            self.logs_scroll = (top < pos.max).then_some(top);
         }
     }
 
@@ -3301,6 +3354,7 @@ impl App {
             }
             // Same entry behavior as `K`: open AND ask the durable store.
             Overlay::Keys => self.open_keys(),
+            Overlay::Logs => self.open_logs(),
             other => self.overlay = other,
         }
     }
@@ -3429,7 +3483,7 @@ impl App {
             // usage refresh when the reset counts are absent/stale (.prd/16).
             KeyCode::Char('a') => self.open_accounts(view),
             KeyCode::Char('g') => self.open_stats(view),
-            KeyCode::Char('l') => self.overlay = Overlay::Logs,
+            KeyCode::Char('l') => self.open_logs(),
             // Observed performance (perf telemetry v1): daily tok/s + health.
             KeyCode::Char('p') => self.overlay = Overlay::Perf,
             // Session timeline (issue #34): read + fold the persisted raw-io log.
@@ -5809,6 +5863,14 @@ async fn event_loop(
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
             app.setting_chrome = main.settings;
+            // The Logs pager clamps a held offset itself; one at (or past)
+            // the bottom follows the tail again.
+            if let Some(pos) = main.logs {
+                app.logs_pos = pos;
+                if app.logs_scroll.is_some_and(|top| top >= pos.max) {
+                    app.logs_scroll = None;
+                }
+            }
             // Reconcile the input modal (UI-6 item 3) against what the frame
             // could actually render: `Some(max)` clamps the scroll to the
             // wrapped line count, `None` means the entry aged out of the ring
@@ -7426,6 +7488,37 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Logs);
         app.on_key_logs(KeyCode::Char('l'));
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    /// The Logs pager follows the tail until a key scrolls it back; Home goes
+    /// to the oldest line, End (or scrolling down to the bottom) follows again,
+    /// the wheel moves three rows, and reopening starts at the tail.
+    #[test]
+    fn logs_pager_scrolls_back_and_end_follows_the_tail_again() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        assert_eq!(app.logs_scroll, None, "opens following the tail");
+        // What the last frame drew: 120 rows through a 20-row view.
+        app.logs_pos = ScrollPos::of(120, 20, 100);
+        app.on_key_logs(KeyCode::Up);
+        assert_eq!(app.logs_scroll, Some(99), "↑ leaves the tail");
+        app.on_key_logs(KeyCode::PageUp);
+        assert_eq!(app.logs_scroll, Some(79), "PgUp moves a page");
+        app.on_key_logs(KeyCode::Home);
+        assert_eq!(app.logs_scroll, Some(0), "Home: the oldest line");
+        app.on_key_logs(KeyCode::Char('j'));
+        assert_eq!(app.logs_scroll, Some(1), "j is ↓");
+        app.on_key_logs(KeyCode::End);
+        assert_eq!(app.logs_scroll, None, "End follows again");
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 10, 10), None);
+        assert_eq!(app.logs_scroll, Some(97), "wheel up three rows");
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 10), None);
+        assert_eq!(app.logs_scroll, None, "back at the bottom: following");
+        app.on_key_logs(KeyCode::Home);
+        app.on_key_logs(KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key_main(KeyCode::Char('l'), None);
+        assert_eq!(app.logs_scroll, None, "reopened at the tail");
     }
 
     /// `s` opens the Sessions overlay (issue #34); arrows move the cursor within
