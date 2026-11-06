@@ -14836,7 +14836,7 @@ mod tests {
                     " copy mode — mouse released for selecting; press v/Esc to return",
                     "{w}x{h} {overlay:?}"
                 );
-                assert_eq!(row(h - 2).trim_end(), " refresh failed: retry later");
+                assert_eq!(row(h - 2).trim_end(), " ✗ fail refresh failed: retry later");
                 assert!(
                     (0..w).all(|x| buf[(x, h - 1)].modifier.contains(Modifier::REVERSED)),
                     "the whole row is the banner"
@@ -21850,8 +21850,9 @@ mod tests {
     /// style, unchanged (previous digest 11_040_274_043_730_846_167).
     /// Re-pinned the same day when copy mode joined (round 2 of #232): MAIN's
     /// key bar gains `v copy mode` after `↑↓ scroll` (the bottom row's text
-    /// and its key cell's Cyan bold run); every other row unchanged.
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_178_084_734_170_114_220;
+    /// and its key cell's Cyan bold run); every other row unchanged
+    /// (previous digest 11_178_084_734_170_114_220).
+    const FOLD_OFF_179X43_DIGEST: u64 = 16_419_190_790_333_588_667;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
